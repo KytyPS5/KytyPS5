@@ -116,12 +116,12 @@ jobs:
             audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests shader_recompiler_compute_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|gpu_command_lane|gpu_command_lane_interrupt_batching|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -205,14 +205,14 @@ jobs:
             --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests shader_recompiler_compute_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests experimental_settings_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|gpu_command_lane|gpu_command_lane_interrupt_batching|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -312,6 +312,8 @@ jobs:
             libasound2-dev \
             libdbus-1-dev \
             libgl1-mesa-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
             libpulse-dev \
             libudev-dev \
             libwayland-dev \
@@ -397,7 +399,17 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|gpu_command_lane|gpu_command_lane_interrupt_batching|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|experimental_settings|virtual_memory_allocation)$'
+
+      - name: Test interrupt batching with Lavapipe
+        shell: bash
+        run: |
+          icd="$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)"
+          test -n "$icd"
+          export VK_ICD_FILENAMES="$icd"
+          export VK_DRIVER_FILES="$icd"
+          ctest --test-dir _Build/linux --output-on-failure --verbose --timeout 120 \
+            -R '^(gpu_command_lane|gpu_command_lane_interrupt_batching)$'
 
       - name: Install
         shell: bash

@@ -14,6 +14,7 @@ struct ResourceSpecialization {
 		uint32_t               descriptor_swizzle              = DstSel(4, 5, 6, 7);
 		bool                   zero_stride_oob                 = false;
 		bool                   scalar_empty                    = false;
+		bool                   uses_dma                        = false;
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
 		uint32_t               indirect_mapping_offset         = 0;
 		uint32_t               indirect_search_iterations      = 0;

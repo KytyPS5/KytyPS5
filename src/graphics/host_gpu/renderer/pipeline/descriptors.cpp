@@ -720,6 +720,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
+	const auto& graphics = m_context.GetGraphics();
+	const auto limit =
+	    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+	    (graphics.StorageMinAlignment() - 1);
+	const auto max_native_size = std::min(ShaderRecompiler::IR::BufferResource::MaxNativeReadSize, limit);
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -733,11 +738,20 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 		}
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
-			continue;
-		}
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
+			if (metadata.uses_dma) {
+				const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+				const auto address = descriptor.Base48();
+				auto size = descriptor.GetSize();
+				if (address == 0 || size == 0) continue;
+				if (descriptor.NumRecords() == UINT32_MAX) {
+					size = std::min(size, max_native_size);
+				}
+				// Heap descriptors can span separate mappings with unmapped gaps.
+				m_context.FindMappedBuffers(address, size);
+				continue;
+			}
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
@@ -768,11 +782,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					}
 				}
 				//  PPSA15246
-				const auto& graphics = m_context.GetGraphics();
-				const auto  limit =
-				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
-				    (graphics.StorageMinAlignment() - 1);
-				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+				size = std::min(size, max_native_size);
 			}
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {

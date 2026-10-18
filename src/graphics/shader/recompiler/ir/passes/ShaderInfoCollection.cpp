@@ -333,8 +333,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			if (kind == ResourceKind::IndirectBuffer && op != ValueOpcode::ReadConstBuffer) {
 				info.subgroup_local_invocation_id = true;
 			}
+			info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 			if (kind == ResourceKind::Buffer) {
-				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}

@@ -130,6 +130,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+void RenderContext::FindMappedBuffers(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+			ranges.emplace_back(start, end);
+		});
+	}
+	for (const auto& [start, end]: ranges) {
+		(void)m_buffer_cache.FindBuffer(start, end - start);
+	}
+}
+
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");

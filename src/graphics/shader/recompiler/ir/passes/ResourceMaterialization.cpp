@@ -1849,6 +1849,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		buffer.uses_dma           = base.read && !base.written && !base.formatted && !base.scalar &&
+		    descriptor.NumRecords() != UINT32_MAX &&
+		    descriptor.Base48() != 0u && !buffer.zero_stride_oob &&
+		    !Source(program, base.source)->indirect_descriptor.has_value() &&
+		    descriptor.GetSize() > BufferResource::MaxNativeReadSize;
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -1996,6 +2001,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.packed_stride              = source.packed_stride;
 		buffer.descriptor_format          = source.descriptor_format;
 		buffer.descriptor_swizzle         = source.descriptor_swizzle;
+		buffer.uses_dma                   = source.uses_dma;
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
@@ -2116,7 +2122,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				continue;
 			}
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
-				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
+				auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
 				const bool native_oob = memory.kind == ResourceKind::Buffer &&
 				    specialization.buffers[memory.resource].zero_stride_oob &&
 				    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer;
@@ -2168,6 +2174,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 						default: break;
 					}
 					inst.ReplaceUsesWith(result);
+				} else if (memory.kind == ResourceKind::Buffer && buffers[memory.resource].uses_dma) {
+					EXIT_IF(!memory.SupportsIndirectBufferLoad(inst.GetOpcode()));
+					memory.kind = ResourceKind::IndirectBuffer;
+					program.info.uses_dma = true;
 				}
 				continue;
 			}

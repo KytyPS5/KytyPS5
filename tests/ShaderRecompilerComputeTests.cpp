@@ -6294,14 +6294,14 @@ public:
     void *mapped = nullptr;
     Require(name, "allocation",
             LibKernel::Memory::KernelAllocateDirectMemory(
-                0, LibKernel::Memory::KernelGetDirectMemorySize(), 3 * page, page, 0, &direct) ==
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 7 * page, page, 0, &direct) ==
                     0 &&
-                LibKernel::Memory::KernelMapDirectMemory(&mapped, 3 * page, 0x3, 0, direct, page) ==
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 7 * page, 0x3, 0, direct, page) ==
                     0,
             "guest allocation failed");
     const auto base = reinterpret_cast<uint64_t>(mapped);
     auto *words = static_cast<u32 *>(mapped);
-    std::fill_n(words, 3 * page / sizeof(u32), 0x12345678u);
+    std::fill_n(words, 7 * page / sizeof(u32), 0x12345678u);
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     auto &cache = context.GetBufferCache();
@@ -6328,6 +6328,34 @@ public:
             cache.IsRegionRegistered(base, sizeof(u32)) &&
                 cache.IsRegionRegistered(base + 2 * page, sizeof(u32)),
             "captured scalar tables were not cached before indexed shader reads");
+    context.MapMemory(base + 4 * page, page);
+    context.MapMemory(base + 6 * page, page);
+    program.info.buffers.push_back({.uses_dma = true});
+    ShaderBufferResource heap{};
+    heap.UpdateAddress48(base + 4 * page);
+    heap.fields[2] = 3 * page;
+    resources.buffers.push_back({.dword_count = 4});
+    std::copy_n(heap.fields, 4, resources.buffers[0].dwords.begin());
+    auto &storage_limit = context.GetGraphics().physical_device_properties.limits.maxStorageBufferRange;
+    const auto original_limit = storage_limit;
+    storage_limit = page;
+    auto sentinel = heap;
+    sentinel.fields[1] |= 0x3fffu << 16u;
+    sentinel.fields[2] = UINT32_MAX;
+    std::copy_n(sentinel.fields, 4, resources.buffers[0].dwords.begin());
+    executor.FindBuffers(stages);
+    Require(name, "sentinel heap residency bound",
+            cache.IsRegionRegistered(base + 4 * page, page) &&
+                !cache.IsRegionRegistered(base + 6 * page, page),
+            "sentinel DMA discovery cached memory past the native range limit");
+    std::copy_n(heap.fields, 4, resources.buffers[0].dwords.begin());
+    executor.FindBuffers(stages);
+    storage_limit = original_limit;
+    Require(name, "paged heap residency",
+            cache.IsRegionRegistered(base + 4 * page, page) &&
+                !cache.IsRegionRegistered(base + 5 * page, page) &&
+                cache.IsRegionRegistered(base + 6 * page, page),
+            "heap discovery skipped a mapped segment or registered its unmapped gap");
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
     auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
@@ -6409,12 +6437,12 @@ public:
         std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
                         0x12345678u, 0xfedcba98u},
         "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
-    context.UnmapMemory(base, 3 * page);
+    context.UnmapMemory(base, 7 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
     Require(name, "release",
-            LibKernel::Memory::KernelMunmap(base, 3 * page) == 0 &&
-                LibKernel::Memory::KernelReleaseDirectMemory(direct, 3 * page) == 0,
+            LibKernel::Memory::KernelMunmap(base, 7 * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, 7 * page) == 0,
             "guest allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
@@ -33636,6 +33664,63 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
+TestCase PagedHeapBufferLoads(u32 wave, bool zero_format = false, bool coherent_pair = false) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x1440000000ull;
+  const u32 SourceIndex = coherent_pair ? 0x2d034e6u : 0x2d034e7u;
+  const uint64_t SourceAddress = GuestBase + uint64_t{SourceIndex} * 4u;
+  constexpr auto page = BufferCache::CACHING_PAGESIZE;
+  const auto SourcePage = SourceAddress & ~uint64_t{page - 1};
+  const auto SourceWord = (SourceAddress - SourcePage) / 4u;
+  TestCase test;
+  test.name = zero_format ? (wave == 32 ? "PagedHeapBufferLoads32ZeroFormat"
+                                        : "PagedHeapBufferLoads64ZeroFormat")
+                          : (wave == 32 ? "PagedHeapBufferLoads32" : "PagedHeapBufferLoads64");
+  if (coherent_pair)
+    test.name = wave == 32 ? "PagedHeapCoherentPair32" : "PagedHeapCoherentPair64";
+  const u32 components = coherent_pair ? 2u : 4u;
+  test.initial.resize(page / 4u, 0xa5a5a5a5u);
+  for (u32 i = 0; i < 4; ++i) test.initial[SourceWord + i] = 0x12345678u + i;
+  test.expected = test.initial;
+  std::copy_n(test.initial.begin() + SourceWord, components, test.expected.begin());
+  if (coherent_pair)
+    std::copy_n(test.initial.begin() + SourceWord + 1, components,
+                test.expected.begin() + components);
+  const u32 reads = coherent_pair ? 3u : 2u;
+  std::fill_n(test.expected.begin() + (reads - 1) * components, components, 0u);
+  test.user_data = MakeStructuredStorageBufferData(0, page);
+  ShaderBufferResource descriptor{};
+  descriptor.UpdateAddress48(GuestBase);
+  descriptor.fields[1] |= 4u << 16u;
+  descriptor.fields[2] = 0x20280000u;
+  descriptor.fields[3] = zero_format ? 0x10000204u : 0x10005204u;
+  std::copy_n(descriptor.fields, 4, test.user_data.begin() + 8);
+  test.has_user_data = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  for (u32 i = 0; i < reads; ++i) {
+    AppendVMovLiteral(&test.code, 20, i + 1 == reads ? descriptor.NumRecords() : SourceIndex + i);
+    test.code.insert(test.code.end(), {EncodeMubuf0(coherent_pair ? 0x0d : 0x0e, 0, true, false) |
+                                           (coherent_pair ? 1u << 15u : 0u),
+                                       EncodeMubuf1(0, 2, 20)});
+    for (u32 component = 0; component < components; ++component)
+      AppendStoreVgpr(&test.code, component, i * components + component);
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{SourcePage, 0}};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  if (coherent_pair) {
+    test.required_spirv.push_back("OpAtomicLoad %ulong");
+    test.required_spirv.push_back("Int64Atomics");
+  }
+  test.expected_buffer_resources = std::vector<u32>{1};
+  test.opcodes = {O::V_MOV_B32, coherent_pair ? O::BUFFER_LOAD_DWORDX2 : O::BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u) {
   const bool scalar = width == 1u;
   const bool xyz = width == 3u;
@@ -52189,6 +52274,25 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--paged-heap-host-only") == 0) {
+    for (const u32 wave : {32u, 64u}) {
+      (void)CompileCase(PagedHeapBufferLoads(wave), 64u);
+      (void)CompileCase(PagedHeapBufferLoads(wave, true), 64u);
+      (void)CompileCase(PagedHeapBufferLoads(wave, true, true), 64u);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--paged-heap-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, PagedHeapBufferLoads(32));
+    RunCase(&vulkan, PagedHeapBufferLoads(64));
+    RunCase(&vulkan, PagedHeapBufferLoads(32, true));
+    RunCase(&vulkan, PagedHeapBufferLoads(64, true));
+    RunCase(&vulkan, PagedHeapBufferLoads(32, true, true));
+    RunCase(&vulkan, PagedHeapBufferLoads(64, true, true));
+    vulkan.CheckBdaSyncUploads();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
@@ -53026,6 +53130,12 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  RunCase(&vulkan, PagedHeapBufferLoads(32));
+  RunCase(&vulkan, PagedHeapBufferLoads(64));
+  RunCase(&vulkan, PagedHeapBufferLoads(32, true));
+  RunCase(&vulkan, PagedHeapBufferLoads(64, true));
+  RunCase(&vulkan, PagedHeapBufferLoads(32, true, true));
+  RunCase(&vulkan, PagedHeapBufferLoads(64, true, true));
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

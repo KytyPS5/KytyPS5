@@ -1647,6 +1647,24 @@ void TestReachableMaximumPhi() {
   }
 }
 
+void TestLargeBufferResidency() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  plan.info.buffers[0].read = true;
+  plan.descriptor_sources[0].dwords[1] = Value(16u << 16u);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const std::array<uint32_t, 1> data{0x1000u};
+  for (const uint32_t records : {uint32_t(BufferResource::MaxNativeReadSize / 16u) + 1u,
+                                  UINT32_MAX}) {
+    plan.descriptor_sources[0].dwords[2] = Value(records);
+    CompileSrtWalker(plan);
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, specialization) &&
+              specialization.buffers[0].uses_dma == (records != UINT32_MAX),
+          "large finite buffers lost BDA residency or a sentinel bypassed the native range cap");
+  }
+}
+
 void TestArrayColorComparison() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
@@ -1744,6 +1762,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestLargeBufferResidency();
   TestArrayColorComparison();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();

@@ -80,7 +80,8 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
-		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
+		return (kind == ResourceKind::Buffer || kind == ResourceKind::IndirectBuffer) &&
+		       opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
 		       !typed && !formatted && data_bits == 32u;
 	}
 
@@ -117,6 +118,7 @@ struct ExportInfo {
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	static constexpr uint64_t MaxNativeReadSize = uint64_t {256} * 1024 * 1024;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
@@ -132,6 +134,7 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	bool                   uses_dma           = false;
 	bool                   live               = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;

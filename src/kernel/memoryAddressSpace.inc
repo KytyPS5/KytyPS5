@@ -1173,6 +1173,17 @@ private:
 	}
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static bool FreeRegionChanged(uint64_t vaddr, const MEMORY_BASIC_INFORMATION& queried) {
+		MEMORY_BASIC_INFORMATION current {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &current, sizeof(current)) == 0) {
+			return false;
+		}
+		return current.State != MEM_FREE || current.BaseAddress != queried.BaseAddress ||
+		       current.RegionSize != queried.RegionSize;
+	}
+#endif
+
 	void ReserveGuestRegions() {
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
@@ -1200,13 +1211,24 @@ private:
 
 				if (info.State == MEM_FREE && reserve_end > reserve_start &&
 				    reserve_end - reserve_start > MinimumRegionSize) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+					if (const auto callback = g_test_before_guest_reserve) {
+						g_test_before_guest_reserve = nullptr;
+						callback(reserve_start, reserve_end - reserve_start);
+					}
+#endif
 					auto* ptr = VirtualAlloc2(
 					    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
 					    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+					const auto error = GetLastError();
+					// Another host thread can allocate inside the hole after the query; rescan it.
+					if (ptr == nullptr && FreeRegionChanged(next_addr, info)) {
+						continue;
+					}
 					if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
 						EXIT("failed to reserve guest address space at 0x%016" PRIx64
-						     ", size 0x%016" PRIx64 "\n",
-						     reserve_start, reserve_end - reserve_start);
+						     ", size 0x%016" PRIx64 ", error %lu\n",
+						     reserve_start, reserve_end - reserve_start, error);
 					}
 					AddFreeUnlocked(reserve_start, reserve_end - reserve_start);
 					m_owned.emplace_back(reserve_start, reserve_end - reserve_start);

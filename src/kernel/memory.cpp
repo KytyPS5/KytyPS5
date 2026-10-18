@@ -195,6 +195,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
 static callback_func_t g_test_backing_read                         = nullptr;
+static callback_func_t g_test_before_guest_reserve                 = nullptr;
 #endif
 
 #include "memoryAddressSpace.inc"
@@ -3631,6 +3632,10 @@ void TestBeforeNextBackingMap(callback_func_t callback) {
 
 void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
+}
+
+void TestBeforeNextGuestReserve(callback_func_t callback) {
+	g_test_before_guest_reserve = callback;
 }
 
 void TestFailNextPhysicalMemoryUnmap() {

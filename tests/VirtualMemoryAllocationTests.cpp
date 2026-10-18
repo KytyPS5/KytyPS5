@@ -154,6 +154,27 @@ void CheckFailed(const char* test, int result, const char* action) {
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr uint64_t RacedAllocationSize = 0x10000;
+constexpr uint64_t GuestMinimumReserve = 0x1000000;
+uint64_t           g_raced_hole_start  = 0;
+uint64_t           g_raced_hole_size   = 0;
+uint64_t           g_raced_allocation  = 0;
+
+// A host thread allocating inside a free hole between the boot scan's query and its reserve.
+void OccupyGuestReserveHole(uintptr_t start, size_t size) {
+	if (size <= GuestMinimumReserve + RacedAllocationSize) {
+		Libs::LibKernel::Memory::TestBeforeNextGuestReserve(OccupyGuestReserveHole);
+		return;
+	}
+	g_raced_hole_start = start;
+	g_raced_hole_size  = size;
+	g_raced_allocation = reinterpret_cast<uint64_t>(
+	    VirtualAlloc(reinterpret_cast<void*>(start + size - RacedAllocationSize),
+	                 RacedAllocationSize, MEM_RESERVE, PAGE_NOACCESS));
+}
+#endif
+
 void InitSubsystems() {
 	static bool initialized = false;
 	if (initialized) {
@@ -191,6 +212,9 @@ void InitSubsystems() {
 	      "failed to read flexible memory size from param.json");
 	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Libs::LibKernel::Memory::TestBeforeNextGuestReserve(OccupyGuestReserveHole);
+#endif
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
 	initialized = true;
@@ -702,6 +726,36 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestGuestReserveSurvivesConcurrentHostAllocation() {
+	const char* test = "GuestReserveSurvivesConcurrentHostAllocation";
+
+	Check(test,
+	      g_raced_allocation != 0 &&
+	          g_raced_allocation == g_raced_hole_start + g_raced_hole_size - RacedAllocationSize,
+	      "the racing host allocation was not placed inside a scanned hole");
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<const void*>(g_raced_allocation), &info, sizeof(info)) !=
+	              0 &&
+	          info.State == MEM_RESERVE &&
+	          reinterpret_cast<uint64_t>(info.AllocationBase) == g_raced_allocation &&
+	          info.RegionSize == RacedAllocationSize,
+	      "the racing host allocation did not survive the guest reservation");
+	Check(test,
+	      !Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(g_raced_allocation,
+	                                                             RacedAllocationSize),
+	      "the guest address space claimed the racing host allocation");
+	Check(test,
+	      Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(
+	          g_raced_hole_start, g_raced_hole_size - RacedAllocationSize),
+	      "the rest of the raced hole was left unreserved");
+
+	std::printf("[host]    %-48s ok (hole 0x%016" PRIx64 "+0x%" PRIx64 ")\n", test,
+	            g_raced_hole_start, g_raced_hole_size);
+}
+#endif
 
 void TestSparseBackingReadPreservesResidency() {
 	const char*        test        = "SparseBackingReadPreservesResidency";
@@ -5356,6 +5410,9 @@ int main(int argc, char** argv) {
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestBufferRangeReportsSummariseRepeats);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestGuestReserveSurvivesConcurrentHostAllocation);
+#endif
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
 	RunTest(TestSparseReadDuringDirectCommit);

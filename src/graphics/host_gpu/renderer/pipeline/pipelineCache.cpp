@@ -1002,27 +1002,31 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	bool created = false;
+	PipelineCreateResult create_result = PipelineCreateResult::ResourceFailure;
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		created = CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input,
-		                                 vertex_info, ps_input_info, programs, static_params,
-		                                 m_driver_cache);
+		create_result = CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input,
+		                                       vertex_info, ps_input_info, programs, static_params,
+		                                       m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	if (!created) {
-		// The host rejected this configuration. Remember it so later draws with the
-		// same state skip creation instead of stalling on repeated failures.
-		if (m_failed_graphics_pipelines.size() < 4096) {
-			m_failed_graphics_pipelines.insert(key);
-		} else {
-			static std::atomic_bool cap_warned = false;
-			if (!cap_warned.exchange(true, std::memory_order_relaxed)) {
-				PipelineCacheLog("Vulkan pipeline cache: too many rejected configurations; "
-				                 "further failures will retry creation");
+	if (create_result != PipelineCreateResult::Created) {
+		if (create_result == PipelineCreateResult::Rejected) {
+			// The host deterministically rejected this configuration. Remember it so
+			// later draws with the same state skip creation instead of stalling on
+			// repeated failures. Resource failures are not cached: later draws retry
+			// creation once memory is available again.
+			if (m_failed_graphics_pipelines.size() < 4096) {
+				m_failed_graphics_pipelines.insert(key);
+			} else {
+				static std::atomic_bool cap_warned = false;
+				if (!cap_warned.exchange(true, std::memory_order_relaxed)) {
+					PipelineCacheLog("Vulkan pipeline cache: too many rejected configurations; "
+					                 "further failures will retry creation");
+				}
 			}
 		}
 		return nullptr;

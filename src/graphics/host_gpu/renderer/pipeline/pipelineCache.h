@@ -180,8 +180,9 @@ private:
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
-	// Configurations the host rejected (unsupported state or limits). Remembered so later
-	// draws with the same state skip creation instead of aborting or retrying every frame.
+	// Configurations the host deterministically rejected (unsupported state or limits).
+	// Remembered so later draws with the same state skip creation instead of aborting
+	// or retrying every frame. Transient resource failures are never stored here.
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_failed_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
@@ -190,8 +191,12 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
-// Returns false when the host rejected the configuration; the pipeline is left empty.
-bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+// How graphics pipeline creation finished. Rejected is a deterministic host rejection
+// (safe to remember); ResourceFailure is transient (out of memory: retry, do not cache).
+// The pipeline is left empty unless the result is Created.
+enum class PipelineCreateResult { Created, Rejected, ResourceFailure };
+PipelineCreateResult CreatePipelineInternal(GraphicContext& graphics,
+                                            PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
                             std::span<const ShaderVertexInputInfo> vertex_info,

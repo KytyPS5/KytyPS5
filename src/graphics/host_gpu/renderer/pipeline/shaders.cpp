@@ -262,8 +262,27 @@ static void LogSkippedPipelineConfig(const std::string& details) {
 	                                      details));
 }
 
+// Reports a transient pipeline-creation failure (throttled). The configuration is not
+// cached as rejected, so later draws retry creation once memory is available again.
+static void LogPipelineResourceExhausted(const std::string& details) {
+	static std::atomic_uint log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) >= 8) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Graphics pipeline creation ran out of memory ({}). Draws using this "
+	                  "configuration will be retried.\n",
+	                  details));
+}
+
+static bool IsOutOfMemory(vk::Result result) {
+	return result == vk::Result::eErrorOutOfHostMemory ||
+	       result == vk::Result::eErrorOutOfDeviceMemory;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+PipelineCreateResult CreatePipelineInternal(GraphicContext& graphics,
+                                            PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
                             std::span<const ShaderVertexInputInfo> vertex_info,
@@ -524,9 +543,11 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	}
 	if (result != vk::Result::eSuccess || pipeline.pipeline_layout == nullptr) {
-		LogSkippedPipelineConfig(fmt::format("vkCreatePipelineLayout result={} VS={} PS={}",
-		                                     vk::to_string(result), vertex_program.id,
-		                                     ps_active ? pixel_program.id : 0));
+		// Layout creation over fixed small inputs only fails on exhausted host/device
+		// memory: transient, so the caller retries instead of caching the rejection.
+		LogPipelineResourceExhausted(fmt::format("vkCreatePipelineLayout result={} VS={} PS={}",
+		                                         vk::to_string(result), vertex_program.id,
+		                                         ps_active ? pixel_program.id : 0));
 		DestroyPartialPipeline(graphics, pipeline);
 		if (tess_control_shader_module != nullptr) {
 			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -534,7 +555,7 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		if (tess_eval_shader_module != nullptr) {
 			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 		}
-		return false;
+		return PipelineCreateResult::ResourceFailure;
 	}
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
@@ -612,21 +633,23 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
 	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
-		// The host rejected this configuration (unsupported sample count, exceeded
-		// limits, ...). Report it and let the caller skip the draw.
+		// Out-of-memory results are transient: report them and let the caller retry
+		// instead of caching a rejection. Anything else is a deterministic host
+		// rejection (unsupported sample count, exceeded limits, ...); report it and
+		// let the caller skip the draw.
 		std::string color_formats;
 		for (uint32_t i = 0; i < rendering.color_count; i++) {
 			color_formats += vk::to_string(rendering.color_formats[i]);
 			color_formats += ' ';
 		}
-		LogSkippedPipelineConfig(fmt::format(
+		const auto details = fmt::format(
 		    "vkCreateGraphicsPipelines result={} VS={} PS={} topology={} colors=[{}]depth={} "
 		    "stencil={} samples={} stages={} dynamic_states={}",
 		    vk::to_string(result), vertex_program.id, ps_active ? pixel_program.id : 0,
 		    vk::to_string(static_params.topology), color_formats,
 		    vk::to_string(rendering.depth_format), vk::to_string(rendering.stencil_format),
 		    static_params.samples, shader_stage_count,
-		    static_cast<uint32_t>(dynamic_states.size())));
+		    static_cast<uint32_t>(dynamic_states.size()));
 		DestroyPartialPipeline(graphics, pipeline);
 		if (tess_control_shader_module != nullptr) {
 			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -634,7 +657,12 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		if (tess_eval_shader_module != nullptr) {
 			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 		}
-		return false;
+		if (IsOutOfMemory(result)) {
+			LogPipelineResourceExhausted(details);
+			return PipelineCreateResult::ResourceFailure;
+		}
+		LogSkippedPipelineConfig(details);
+		return PipelineCreateResult::Rejected;
 	}
 
 	if (tess_control_shader_module != nullptr) {
@@ -643,7 +671,7 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
-	return true;
+	return PipelineCreateResult::Created;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

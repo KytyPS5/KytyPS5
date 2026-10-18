@@ -351,6 +351,11 @@ struct PthreadMutexPrivate {
 	uint32_t                count     = 0;
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
+	// Blocked lockers take FIFO tickets and an unlock hands the mutex to the oldest one, so a
+	// thread that relocks in a loop can't starve a waiter that is still waking up.
+	uint64_t                ticket_head = 0;
+	uint64_t                ticket_tail = 0;
+	std::vector<uint64_t>   abandoned_tickets;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1261,6 +1266,17 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+// Advances the queue head past waiters that timed out. Called with mutex->m held.
+static void NativeMutexSkipAbandonedTickets(PthreadMutexPrivate* mutex) {
+	auto& abandoned = mutex->abandoned_tickets;
+	for (auto it = std::find(abandoned.begin(), abandoned.end(), mutex->ticket_head);
+	     it != abandoned.end();
+	     it = std::find(abandoned.begin(), abandoned.end(), mutex->ticket_head)) {
+		abandoned.erase(it);
+		mutex->ticket_head++;
+	}
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1286,41 +1302,44 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return EDEADLK;
 	}
 
-	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
-	} else if (*timeout_us == 0) {
-		if (mutex->owner != nullptr) {
-			return ETIMEDOUT;
-		}
-	} else {
-		const auto deadline =
-		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
-		while (mutex->owner != nullptr) {
+	if (mutex->owner == nullptr && mutex->ticket_head == mutex->ticket_tail) {
+		mutex->owner = self;
+		mutex->count = 1;
+		return OK;
+	}
+	if (timeout_us != nullptr && *timeout_us == 0) {
+		return ETIMEDOUT;
+	}
+
+	const uint64_t ticket  = mutex->ticket_tail++;
+	const auto     my_turn = [mutex, ticket] {
+		return mutex->owner == nullptr && mutex->ticket_head == ticket;
+	};
+	const auto deadline = timeout_us != nullptr
+	                          ? std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us)
+	                          : std::chrono::steady_clock::time_point::max();
+	while (!my_turn()) {
+		auto poll = std::chrono::steady_clock::duration(std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		if (timeout_us != nullptr) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
+				mutex->abandoned_tickets.push_back(ticket);
+				NativeMutexSkipAbandonedTickets(mutex);
+				lock.unlock();
+				mutex->cv.notify_all();
 				return ETIMEDOUT;
 			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			mutex->cv.wait_for(lock, poll);
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
+			poll = std::min(poll, deadline - now);
+		}
+		mutex->cv.wait_for(lock, poll);
+		if (!my_turn()) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
 		}
 	}
+	mutex->ticket_head++;
+	NativeMutexSkipAbandonedTickets(mutex);
 
 	mutex->owner = self;
 	mutex->count = 1;
@@ -1346,7 +1365,7 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 		return EBUSY;
 	}
 
-	if (mutex->owner != nullptr) {
+	if (mutex->owner != nullptr || mutex->ticket_head != mutex->ticket_tail) {
 		return EBUSY;
 	}
 
@@ -1377,10 +1396,14 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 		return OK;
 	}
 
-	mutex->owner = nullptr;
-	mutex->count = 0;
+	mutex->owner         = nullptr;
+	mutex->count         = 0;
+	const bool has_queue = mutex->ticket_head != mutex->ticket_tail;
 	lock.unlock();
-	mutex->cv.notify_one();
+	// Only the oldest waiter may take it, so wake them all to let it find its turn.
+	if (has_queue) {
+		mutex->cv.notify_all();
+	}
 
 	return OK;
 }

@@ -3266,7 +3266,8 @@ private:
 	bool IndirectBufferAccess(const Inst& inst) const {
 		const auto opcode = inst.GetOpcode();
 		if (opcode != ValueOpcode::StoreBufferU32 && opcode != ValueOpcode::StoreBufferU8 &&
-		    opcode != ValueOpcode::StoreBufferU32x4 && opcode != ValueOpcode::LoadBufferU32x2 &&
+		    opcode != ValueOpcode::StoreBufferU32x4 && opcode != ValueOpcode::LoadBufferU32 &&
+		    opcode != ValueOpcode::LoadBufferU32x2 &&
 		    opcode != ValueOpcode::LoadBufferU32x3 && opcode != ValueOpcode::LoadBufferU32x4) return false;
 		const auto index = inst.Flags<MemoryFlags>().index;
 		if (index >= m_program.memory_info.size()) return false;
@@ -3369,13 +3370,6 @@ private:
 			if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
 				plan.retain_reads |= handle.GetOpcode() == ValueOpcode::GetSamplerResource ||
 				    (memory->kind == ResourceKind::ScalarAddress && !UsesOnlyImageDescriptors(*read));
-			} else if (std::ranges::any_of(read->Uses(), [&](const Use& use) {
-				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
-				       std::ranges::any_of(use.user->Uses(), [&](const Use& consumer) {
-					       return !IndirectBufferAccess(*consumer.user);
-				       });
-			    })) {
-				plan.retain_reads = true;
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
@@ -3838,6 +3832,9 @@ private:
 			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 			return finish();
 		}
+		if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
+			    return use.user->GetOpcode() == ValueOpcode::LoadBufferU32;
+		    })) return false;
 		if (table_source.dword_count == 4u && !plan.split_offsets &&
 		    plan.selection_anchor != nullptr && SetExactTableMaximum(key, indirect)) {
 			indirect.table_scalar = true;
@@ -4324,6 +4321,19 @@ private:
 				}
 				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,
 				            memory.resource * 4u, false);
+			}
+		}
+		for (auto& plan: m_indirect_descriptors) {
+			if (plan.handle->GetOpcode() != ValueOpcode::GetBufferResource || plan.reads[0] == nullptr ||
+			    plan.retain_reads) continue;
+			for (uint32_t word = 0; word < plan.read_dwords; ++word) {
+				if (std::ranges::any_of(plan.reads[word]->Uses(), [&](const Use& use) {
+					    return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
+					           FindIndirectDescriptor(*use.user) == nullptr;
+				    })) {
+					plan.retain_reads = true;
+					break;
+				}
 			}
 		}
 	}

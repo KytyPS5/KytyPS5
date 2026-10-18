@@ -6312,6 +6312,22 @@ public:
     context.InitializeGpu(nullptr);
     context.MapMemory(base, page);
     context.MapMemory(base + 2 * page, page);
+    ShaderModule module;
+    auto &program = module.info;
+    program.stage = ShaderType::Compute;
+    program.info.uses_dma = true;
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    resources.specialization_reads = {{base, sizeof(u32)}, {base + 2 * page, sizeof(u32)}};
+    ShaderStageRuntime runtime{&module, &resources};
+    PreparedBindings bindings;
+    RenderExecutor executor(context);
+    executor.PrepareBindings(runtime, bindings);
+    std::array<PreparedBindings*, 1> stages{&bindings};
+    executor.FindBuffers(stages);
+    Require(name, "scalar table residency",
+            cache.IsRegionRegistered(base, sizeof(u32)) &&
+                cache.IsRegionRegistered(base + 2 * page, sizeof(u32)),
+            "captured scalar tables were not cached before indexed shader reads");
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
     auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
@@ -40540,7 +40556,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
   constexpr std::array<u32, 8> destination_records{16, 1, 4, 24, 48, 4, 32, 44};
   const auto alignment = static_cast<u32>(vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                                              .limits.minStorageBufferOffsetAlignment);
-  const auto slot_bytes = (512u + alignment - 1u) / alignment * alignment;
+  const auto slot_bytes = (u32(BufferCache::CACHING_PAGESIZE) + alignment - 1u) / alignment * alignment;
   for (const u32 wave : {32u, 64u}) {
     for (const u32 count : {0u, 1u, 8u}) {
       TestCase test;
@@ -40566,7 +40582,8 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       test.compute_info.group_id[0] = true;
       test.compute_info.workgroup_register = 2;
       test.compute_info.thread_ids_num = 1;
-      test.bda_mappings = {{0u, 0u}};
+      test.bda_mappings = {{0u, 0u}}; // Only the scalar table is mapped for BDA reads.
+      test.forbidden_spirv = {"convert_indirect_buffer_format", "indirect_buffer_format_geometry"};
       for (u32 key = 0; key < 8u; ++key) {
         const auto src = slot_bytes * (key + 2u);
         const auto dst = slot_bytes * (key + 10u);
@@ -40591,89 +40608,24 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           test.expected[slot_bytes * (key + 10u) / 4u + lane] =
               lane < source_records[key] ? 0x80000001u + key * 0x10000u + lane : 0u;
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
-      if (count == 0u) {
-        u32 formatted_reads = 0;
-        for (const auto* block : compiled.program.blocks) {
-          for (const auto& inst : *block) {
-            if (inst.GetOpcode() != ValueOpcode::LoadBufferU32) continue;
-            const auto& memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
-            formatted_reads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
-          }
+      u32 formatted_reads = 0;
+      for (const auto* block : compiled.program.blocks) {
+        for (const auto& inst : *block) {
+          if (inst.GetOpcode() != ValueOpcode::LoadBufferU32) continue;
+          const auto& memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
+          formatted_reads += memory.kind == ResourceKind::Buffer && memory.formatted;
         }
-        Require(test.name, "runtime zero loop bound", formatted_reads == 1u,
-                "runtime loop count must retain the GPU formatted source read");
       }
-      Require(test.name, "finite writable descriptors",
-              compiled.resources.buffers.size() == std::max(1u, count),
-              "the bounded loop lost or overprobed a destination");
+      Require(test.name, "resident formatted sources", formatted_reads == (count == 0u ? 0u : 1u),
+              "bounded formatted source reads must use uploaded buffer descriptors");
+      Require(test.name, "finite source and destination descriptors",
+              compiled.resources.buffers.size() == 2u * std::max(1u, count),
+              "the bounded loop lost or overprobed a source or destination");
       test.storage_buffer_ranges.resize(compiled.resources.buffers.size());
       for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
         const auto& descriptor = compiled.resources.buffers[resource].dwords;
         test.storage_buffer_ranges[resource] =
             {descriptor[0], std::max(4u, descriptor[2] * 4u)};
-      }
-      if (count == 8u) {
-        std::set<u32> nonuniform;
-        std::vector<u32> stores;
-        u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
-        u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
-        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
-        bool geometry_pure = true, geometry_cases = true;
-        for (size_t offset = 5; offset < compiled.spirv.size();) {
-          const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
-          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
-          if (opcode == spv::OpName) {
-            const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
-            if (name == "get_bda_pointer") bda_function = words[1];
-            if (name == "convert_indirect_buffer_format") conversion_function = words[1];
-            if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
-          }
-          if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
-            nonuniform.insert(words[1]);
-          if (opcode == spv::OpStore) stores.push_back(words[1]);
-          if (opcode == spv::OpFunction) {
-            function = words[2];
-            conversion_definitions += function == conversion_function;
-            geometry_definitions += function == geometry_function;
-          }
-          if (function == geometry_function && function != 0u) {
-            geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
-                             opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
-              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
-            }
-          }
-          if (opcode == spv::OpFunctionCall) {
-            if (words[3] == bda_function) ++bda_calls;
-            if (words[3] == conversion_function) ++conversion_calls;
-            if (words[3] == geometry_function) ++geometry_calls;
-          }
-          if (opcode == spv::OpFunctionEnd) function = 0;
-          offset += words.size();
-        }
-        Require(test.name, "one shared formatted conversion",
-                conversion_definitions == 1u &&
-                    conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
-                "formatted loads must call one conversion function across virtual halves");
-        Require(test.name, "one shared pure format geometry",
-                geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
-                "format geometry duplicated, lost a format/default or acquired memory accesses");
-        Require(test.name, "one shared indirect store per virtual half",
-                std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
-                    (wave > vulkan.SubgroupSize() ? 2 : 1),
-                "formatted identity lowering duplicated the store per descriptor");
-        Require(test.name, "shared formatted payload read", bda_calls <= 12u,
-                "formatted source load duplicated BDA reads per format or component");
-        std::printf("[compute] BoundedFormattedBufferCopy%u: %zu SPIR-V words, %u BDA calls\n",
-                    wave, compiled.spirv.size(), bda_calls);
       }
       auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(test, compiled, output);
@@ -52227,6 +52179,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
     RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--formatted-buffer-copy-only") == 0) {
+    VulkanHarness vulkan;
+    CheckBoundedFormattedBufferCopy(vulkan);
+    vulkan.CheckBdaSyncUploads();
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {

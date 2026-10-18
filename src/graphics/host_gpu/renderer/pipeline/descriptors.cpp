@@ -726,6 +726,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout = program.bindings;
+		if (program.info.uses_dma) {
+			// Captured scalar tables can also have indexed reads left in the shader.
+			for (const auto [address, size]: snapshot.specialization_reads) {
+				if (size != 0) (void)cache.FindBuffer(address, size);
+			}
+		}
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;

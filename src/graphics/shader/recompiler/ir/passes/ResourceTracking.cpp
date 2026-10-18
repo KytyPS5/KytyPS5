@@ -3823,9 +3823,6 @@ private:
 				return;
 			}
 		}
-		if (m_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
-			Fail(pc, "sampled image/sampler pair limit exceeded");
-		}
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}
 

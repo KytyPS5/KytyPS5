@@ -655,6 +655,14 @@ void EmitStoreCompletion(EmitterState& state) {
 	                          spv::MemorySemanticsImageMemoryMask));
 }
 
+void EmitDataCacheInvalidate(EmitterState& state) {
+	// RDNA2 GL0/GL1 invalidation makes vector memory visible without a workgroup rendezvous.
+	state.builder.AddFunction(
+	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask |
+	                          spv::MemorySemanticsImageMemoryMask));
+}
+
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	if (!tessellation && ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {

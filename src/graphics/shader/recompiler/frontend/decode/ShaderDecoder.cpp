@@ -566,6 +566,9 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_BARRIER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_barrier", inst.pc));
+		case Opcode::BUFFER_GL0_INV:
+		case Opcode::BUFFER_GL1_INV:
+			return fmt::format("0x{:08x}: {}", inst.pc, magic_enum::enum_name(inst.opcode));
 		case Opcode::V_NOP:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
 		case Opcode::S_ENDPGM:

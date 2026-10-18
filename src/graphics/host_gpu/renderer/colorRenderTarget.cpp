@@ -220,8 +220,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
 	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
-	                            rt.cmask.addr != 0 && samples == 1 &&
-	                            !rt.info.fmask_compression_enable &&
+	                            rt.cmask.addr != 0 &&
 	                            !rt.attrib3.write_vrs_rate_hint_to_cmask;
 	if (has_dcc || has_cmask) {
 		TileSizeAlign metadata_size {};
@@ -233,7 +232,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		} else {
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
 		}
-		// DCC owns the clear when both planes are enabled; single-sample CMASK stays expanded.
+		// DCC owns the clear when both planes are enabled.
 		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
 		desc.info.metadata.clear_word =

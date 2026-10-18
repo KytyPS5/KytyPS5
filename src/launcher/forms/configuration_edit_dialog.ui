@@ -482,6 +482,12 @@
          <property name="title"><string>Rendering compatibility</string></property>
          <layout class="QVBoxLayout" name="renderingCompatibilityLayout">
           <item>
+           <widget class="QLabel" name="label_rendering_compatibility">
+            <property name="text"><string>These settings may help with rendering bugs at a slight performance cost.</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item>
            <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
             <property name="toolTip"><string>Can fix missing textures and incorrect transparency (Resident Evil 2).</string></property>
             <property name="text"><string>Accurate texture synchronization</string></property>

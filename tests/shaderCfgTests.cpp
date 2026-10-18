@@ -1967,6 +1967,59 @@ void TestNggVertexEntryState() {
   }
 }
 
+void TestNativeDataCacheInvalidation() {
+  using namespace ShaderRecompiler;
+  // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT.
+  const std::array cache_ops = {0xe1c40000u, 0u, 0xbf8c0000u,
+                               0xe1c80000u, 0u, 0xbf8c0000u, EncodeSopp(0x01)};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(cache_ops, decoded);
+  for (const uint32_t index : {0u, 2u}) {
+    const auto &inst = decoded.instructions[index];
+    Check(inst.opcode == (index == 0 ? Decoder::Opcode::BUFFER_GL0_INV
+                                    : Decoder::Opcode::BUFFER_GL1_INV) &&
+              inst.word_count == 2 && inst.src_count == 0 && inst.data_dwords == 0 &&
+              inst.dst.kind == Decoder::OperandKind::Unknown,
+          "RDNA2 cache invalidation acquired a buffer operand or lost its encoding");
+  }
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  options.input_info.compute = &compute;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    compute.threads_num[0] = compute.wave_size = options.wave_size = wave_size;
+    const auto minimal = RecompileForTest(cache_ops, options);
+    CheckSpirvBinaryValidates(minimal.spirv);
+    Check(minimal.program.info.buffers.empty(),
+          "cache invalidation introduced a phantom buffer binding");
+    const auto source = DisassembleSpirvBinary(minimal.spirv);
+    const auto first = source.find("OpMemoryBarrier %uint_1 %uint_2114");
+    const auto second = source.find("OpMemoryBarrier %uint_1 %uint_2114", first + 1);
+    Check(first != std::string::npos && second != std::string::npos &&
+              source.find("OpMemoryBarrier", second + 1) == std::string::npos &&
+              source.find("OpControlBarrier") == std::string::npos,
+          "cache invalidation must fence device memory once per wave without convergence");
+
+    const std::array reload = {
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 0, 0),
+        0xe1c40000u, 0u, 0xbf8c0000u,
+        EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(1, 0, 0),
+        EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(1, 0, 0), EncodeSopp(0x01),
+    };
+    const auto result = RecompileForTest(reload, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto store = result.ir_dump.find("StoreBufferU32");
+    const auto fence = result.ir_dump.find("DataCacheInvalidate");
+    const auto load = result.ir_dump.find("LoadBufferU32");
+    Check(store < fence && fence < load && load != std::string::npos &&
+              result.program.info.coherent_buffers &&
+              DisassembleSpirvBinary(result.spirv).find(" Coherent") != std::string::npos,
+          "plain buffer reload lost its cache fence order or coherent visibility");
+  }
+}
+
 void TestNativeStoreCompletion() {
   using namespace ShaderRecompiler;
   const std::array register_wait = {EncodeSopk(0x17, 4, static_cast<int16_t>(0x9234)), EncodeSopp(0x01)};
@@ -16620,6 +16673,7 @@ int main() {
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
+  TestNativeDataCacheInvalidation();
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestVopcCmpxClassF16Decoder();

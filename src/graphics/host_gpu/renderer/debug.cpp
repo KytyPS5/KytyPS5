@@ -294,16 +294,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
-		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
-		    rt.dcc_addr.addr != 0x0000000000000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
-				     " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
-				     rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
-				logged = true;
-			}
-		}
 	}
 }
 

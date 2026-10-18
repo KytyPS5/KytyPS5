@@ -81,9 +81,6 @@ public:
 
 private:
 	struct MetaDataInfo {
-		enum class Type : uint8_t { CMask, FMask, HTile };
-
-		Type type;
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
 	};

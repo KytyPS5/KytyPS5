@@ -57,6 +57,18 @@ static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, 
 	}
 }
 
+// The last mapping a thread read the backing through (GuestBackingStore::TryReadBacking), while
+// the mappings keep their generation: the GPU thread reads guest memory word by word for shader
+// resources, and a lookup each time costs it a lock and a map search.
+struct GuestBackingReadCache {
+	const void* store      = nullptr;
+	uint64_t    generation = 0;
+	uint64_t    vaddr      = 0;
+	uint64_t    end        = 0;
+	uint64_t    offset     = 0;
+};
+static thread_local GuestBackingReadCache t_backing_read_cache;
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -284,7 +296,7 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		MapsWriteLock lock(*this);
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -294,7 +306,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		MapsWriteLock lock(*this);
 		const auto      end   = vaddr + size;
 		auto            first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
@@ -332,6 +344,16 @@ public:
 			return false;
 		}
 
+		// A read within the mapping read last, mapped the same since: no lock and no search.
+		// Reading through the backing is safe whatever the mappings; only the translation must
+		// be current, and the generation says so.
+		auto&      cache      = t_backing_read_cache;
+		const auto generation = m_generation.load(std::memory_order_acquire);
+		if (cache.store == this && cache.generation == generation && vaddr >= cache.vaddr &&
+		    vaddr + size <= cache.end) {
+			std::memcpy(data, m_backing_base + cache.offset + (vaddr - cache.vaddr), size);
+			return true;
+		}
 		std::shared_lock lock(m_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_read != nullptr) {
@@ -366,6 +388,10 @@ public:
 			const auto  offset = entry.backing_offset + current - entry.vaddr;
 			std::memcpy(destination + (current - vaddr), m_backing_base + offset, bytes);
 			current += bytes;
+		}
+		if (end <= first->second.vaddr + first->second.size) {
+			cache = {this, generation, first->second.vaddr, first->second.vaddr + first->second.size,
+			         first->second.backing_offset};
 		}
 		return true;
 	}
@@ -409,13 +435,13 @@ public:
 		}
 
 		{
-			std::lock_guard lock(m_mutex);
+			MapsWriteLock lock(*this);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
-		std::lock_guard lock(m_mutex);
+		MapsWriteLock lock(*this);
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
@@ -439,7 +465,7 @@ public:
 		const auto            end = vaddr + size;
 		std::vector<MapEntry> targets;
 		{
-			std::lock_guard lock(m_mutex);
+			MapsWriteLock lock(*this);
 			auto            current = vaddr;
 			while (current < end) {
 				MapEntry entry {};
@@ -501,7 +527,7 @@ public:
 
 		MapEntry old {};
 		{
-			std::lock_guard lock(m_mutex);
+			MapsWriteLock lock(*this);
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
 				auto entry = std::prev(next);
@@ -527,7 +553,7 @@ public:
 			const bool unmapped =
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
-				std::lock_guard lock(m_mutex);
+				MapsWriteLock lock(*this);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -571,7 +597,7 @@ public:
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		MapsWriteLock lock(*this);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -581,7 +607,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		MapsWriteLock lock(*this);
 		RemoveMappingsUnlocked(vaddr, size);
 
 		if (placeholder_preserved != nullptr) {
@@ -780,9 +806,25 @@ private:
 	int m_fd = -1;
 #endif
 
+	// The exclusive lock of m_mutex; the mappings may change under it, so releasing it gives
+	// them a new generation (see TryReadBacking).
+	class MapsWriteLock final {
+	public:
+		explicit MapsWriteLock(GuestBackingStore& store): m_store(store) { m_store.m_mutex.lock(); }
+		~MapsWriteLock() {
+			m_store.m_generation.fetch_add(1, std::memory_order_release);
+			m_store.m_mutex.unlock();
+		}
+		KYTY_CLASS_NO_COPY(MapsWriteLock);
+
+	private:
+		GuestBackingStore& m_store;
+	};
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
+	std::atomic<uint64_t>        m_generation {1};
 	std::map<uint64_t, MapEntry> m_maps;
 };
 

@@ -2342,12 +2342,14 @@ void TestNewShaderRecompilerScalarVectorAlu() {
 }
 
 void TestNewShaderRecompilerTrapTemporaries() {
-  // Atelier Yumia uses trap temporaries (TTMP3 is scalar operand code 0x73) as
-  // scratch scalar registers. They decode into the slots past the SGPR file.
+  // Atelier Yumia uses trap temporaries as scratch scalar registers. RDNA2 maps
+  // TTMP0-15 to scalar operand codes 108-123; the reporter first hit 0x73 and
+  // then 0x6f (TTMP3). They decode into the slots past the SGPR file.
   const uint32_t shader[] = {
-      EncodeSMovB32(0, 129),          // s0 = 1
-      EncodeSop2(0x00, 115, 0, 129),  // s_add_u32 ttmp3, s0, 1
-      EncodeSop2(0x00, 2, 115, 1),    // s_add_u32 s2, ttmp3, s1
+      EncodeSMovB32(0, 129),         // s0 = 1
+      EncodeSop2(0x00, 111, 0, 129), // s_add_u32 ttmp3, s0, 1
+      EncodeSop2(0x00, 2, 111, 1),   // s_add_u32 s2, ttmp3, s1
+      EncodeSop2(0x00, 3, 2, 1),     // s_add_u32 s3, s2, s1 (keeps s2 live)
       0xbf810000u,
   };
 
@@ -2359,6 +2361,12 @@ void TestNewShaderRecompilerTrapTemporaries() {
         "new decoder did not decode TTMP destination");
   Check((result.decoded_dump.find("s_add_u32 s2, ttmp3, s1") != std::string::npos),
         "new decoder did not decode TTMP source");
+  // TTMP3 (code 111) decodes to scalar slot 109. The translated adds must read
+  // that slot, so a wrong-register translation cannot pass these checks.
+  Check((result.ir_dump.find("ScalarAddCarryU32 s2, s109, s1") != std::string::npos),
+        "TTMP source did not lower through scalar slot s109");
+  Check((result.ir_dump.find("ScalarAddCarryU32 s3, s2, s1") != std::string::npos),
+        "chained scalar add did not keep the TTMP-fed value live");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

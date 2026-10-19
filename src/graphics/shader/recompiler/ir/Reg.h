@@ -7,10 +7,11 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 enum class ScalarReg : uint16_t {};
 enum class VectorReg : uint16_t {};
 
-// Trap temporaries (TTMP0-11, operand codes 112-123) behave as extra scalar registers.
-// They are decoded into the slots right after the SGPRs.
+// Trap temporaries behave as extra scalar registers past the SGPR file.
+// RDNA2 (PS5) maps TTMP0-15 to operand codes 108-123; pre-RDNA parts exposed
+// only the TTMP0-11 subset at 112-123, which this range also covers.
 constexpr uint32_t NumSgprs      = 106;
-constexpr uint32_t NumTrapRegs   = 12;
+constexpr uint32_t NumTrapRegs   = 16;
 constexpr uint32_t NumScalarRegs = NumSgprs + NumTrapRegs;
 constexpr uint32_t NumVectorRegs = 256;
 

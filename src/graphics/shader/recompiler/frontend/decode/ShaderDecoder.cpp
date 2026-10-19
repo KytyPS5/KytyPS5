@@ -221,9 +221,10 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 }
 
 // Trap temporaries behave as extra scalar registers past the SGPR file.
+// RDNA2 maps TTMP0-15 to codes 108-123 (pre-RDNA parts exposed 112-123).
 static void DecodeTrapReg(uint32_t code, Operand& operand) {
 	operand.kind = OperandKind::Sgpr;
-	operand.reg  = IR::NumSgprs + (code - 112u);
+	operand.reg  = IR::NumSgprs + (code - 108u);
 }
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
@@ -234,7 +235,7 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		operand.reg  = code;
 		return;
 	}
-	if (code >= 112u && code <= 123u) {
+	if (code >= 108u && code <= 123u) {
 		DecodeTrapReg(code, operand);
 		return;
 	}
@@ -291,7 +292,7 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		operand.reg  = code;
 		return;
 	}
-	if (code >= 112u && code <= 123u) {
+	if (code >= 108u && code <= 123u) {
 		DecodeTrapReg(code, operand);
 		return;
 	}

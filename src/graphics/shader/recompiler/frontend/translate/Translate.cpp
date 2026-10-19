@@ -171,8 +171,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 	if (code < 106u) {
 		return ir.GetScalarReg(static_cast<IR::ScalarReg>(code));
 	}
-	if (code >= 112u && code <= 123u) {
-		return ir.GetScalarReg(static_cast<IR::ScalarReg>(IR::NumSgprs + (code - 112u)));
+	if (code >= 108u && code <= 123u) {
+		return ir.GetScalarReg(static_cast<IR::ScalarReg>(IR::NumSgprs + (code - 108u)));
 	}
 	switch (code) {
 		case 106u: return ir.GetVccLo();

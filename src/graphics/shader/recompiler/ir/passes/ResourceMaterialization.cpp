@@ -149,9 +149,12 @@ bool ValidatePackedUnormSampling(const ResourcePlan& program, const ResourceSnap
 	return true;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer };
+enum class SamplerClass : uint8_t { Float, Integer, Compare };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
+	if (image.depth_compare) {
+		return SamplerClass::Compare;
+	}
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
 	               image.numeric_class == Prospero::TextureNumericClass::Sint
 	           ? SamplerClass::Integer : SamplerClass::Float;
@@ -834,7 +837,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::vector<std::array<uint32_t, 2>> mapping;
+	std::vector<std::array<uint32_t, 3>> mapping;
 	std::vector<Binding>                bindings;
 };
 
@@ -1837,7 +1840,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type == SamplerClass::Integer;
+		samplers[index].depth_compare         = binding.type == SamplerClass::Compare;
 	}
 	for (uint32_t index = 0; index < sampler_plan.bindings.size(); index++) {
 		const auto& binding = sampler_plan.bindings[index];

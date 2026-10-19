@@ -805,7 +805,8 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 		if (root.integer_border != integer) {
 			const auto found = std::ranges::find_if(samplers, [&](const auto& candidate) {
 				return candidate.snapshot_index == root.snapshot_index &&
-				       candidate.integer_border == integer;
+				       candidate.integer_border == integer &&
+				       candidate.depth_compare == root.depth_compare;
 			});
 			if (found == samplers.end()) ctx.Fail(inst, "has no typed sampler variant");
 			index = static_cast<uint32_t>(found - samplers.begin());

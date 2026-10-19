@@ -1279,6 +1279,35 @@ void TestSignedStorageSpecialization() {
   }
 }
 
+void TestCompareSamplerUsesOwnVariant() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  program.descriptor_sources[program.info.images[1].source].dwords[1] = Value(
+      static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u);
+  program.info.images[0].depth_compare = true;
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "compare sampler materialization failed");
+  ApplyResourceSpecialization(program, specialization);
+  const auto &samplers = program.info.samplers;
+  const auto &pairs = program.info.sampled_pairs;
+  Check(pairs.size() == 3 && samplers.size() == 3 && snapshot.samplers.size() == 2,
+        "shared compare sampler did not get its own variant");
+  for (const auto &pair : pairs) {
+    const auto &sampler = samplers[pair.sampler];
+    Check(sampler.depth_compare == program.info.images[pair.image].depth_compare &&
+              !sampler.integer_border && !sampler.force_point_filtering,
+          "sampler compare state does not match its paired image");
+  }
+  Check(samplers[pairs[1].sampler].snapshot_index == samplers[pairs[2].sampler].snapshot_index &&
+            pairs[1].sampler != pairs[2].sampler,
+        "compare and plain variants do not share the guest sampler descriptor");
+}
+
 void TestIndirectImageSamplerClasses(bool mixed) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
@@ -1372,6 +1401,7 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestCompareSamplerUsesOwnVariant();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   std::puts("ResourceMaterializationTests: all cases passed");

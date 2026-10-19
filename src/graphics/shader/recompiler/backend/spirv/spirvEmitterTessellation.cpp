@@ -12,7 +12,9 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& tess     = state.input_info.vertex->tess;
 	const auto  variable = state.tess_variables.at(static_cast<uint32_t>(kind));
 	EXIT_IF(variable == 0);
-	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+	const bool  patch    = kind == Attribute::PatchOutput || kind == Attribute::PatchInput;
+	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput ||
+	                   kind == Attribute::PatchInput;
 	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
@@ -26,13 +28,13 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
-	if (kind == Attribute::PatchOutput) {
+	if (patch) {
 		address =
 		    EmitBinaryU32(state, spv::OpISub, address, ConstantU32(state, state.tess_patch_base));
 	}
 	const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
 	const auto stride = local ? tess.ls_stride : tess.hs_stride;
-	const auto offset = kind == Attribute::PatchOutput ? address
+	const auto offset = patch ? address
 	                                                   : EmitBinaryU32(state, spv::OpUMod, address,
 	                                                                   ConstantU32(state, stride));
 	const auto attribute =
@@ -42,7 +44,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 2)),
 	                  ConstantU32(state, 3));
 	const auto type = TypePointer(state, storage, TypeU32(state));
-	if (kind == Attribute::LocalOutput || kind == Attribute::PatchOutput) {
+	if (kind == Attribute::LocalOutput || patch) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
@@ -60,7 +62,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 void DefineTessellationInterfaces(EmitterState& state) {
 	using Attribute = IR::TessellationAttribute;
-	std::array<bool, 6> used {};
+	std::array<bool, 7> used {};
 	uint32_t            patch_begin = UINT32_MAX, patch_end = 0;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
@@ -69,7 +71,8 @@ void DefineTessellationInterfaces(EmitterState& state) {
 				continue;
 			const auto kind = inst.Arg(0).U32();
 			used.at(kind)   = true;
-			if (kind == static_cast<uint32_t>(Attribute::PatchOutput)) {
+			if (kind == static_cast<uint32_t>(Attribute::PatchOutput) ||
+			    kind == static_cast<uint32_t>(Attribute::PatchInput)) {
 				EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
 				patch_begin = std::min(patch_begin, inst.Arg(1).U32());
 				patch_end   = std::max(patch_end, inst.Arg(1).U32() + 4u);
@@ -84,14 +87,29 @@ void DefineTessellationInterfaces(EmitterState& state) {
 	for (uint32_t index = 0; index < used.size(); index++) {
 		if (!used[index]) continue;
 		const auto kind    = static_cast<Attribute>(index);
-		const bool input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+		const bool patch   = kind == Attribute::PatchOutput || kind == Attribute::PatchInput;
+		const bool input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput ||
+		                   kind == Attribute::PatchInput;
 		const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 		uint32_t   type;
 		if (kind == Attribute::Factor) {
 			type = array(TypeF32(state), 4u);
-		} else if (kind == Attribute::PatchOutput) {
-			state.tess_patch_base = patch_begin;
-			type = array(TypeU32Vector(state, 4), (patch_end - patch_begin + 15u) / 16u);
+		} else if (patch) {
+			if (tess.patch_end != 0u) {
+				// Shared layout from the HS analysis, so the HS outputs and DS inputs match:
+				// the per-patch area starts right after the per-control-point data.
+				const uint32_t base = tess.hs_stride * tess.output_control_points;
+				EXIT_NOT_IMPLEMENTED(patch_begin < base ||
+				                     (kind == Attribute::PatchInput && patch_end > tess.patch_end));
+				state.tess_patch_base = base;
+				type = array(TypeU32Vector(state, 4),
+				             (std::max(patch_end, tess.patch_end) - base + 15u) / 16u);
+			} else {
+				// No per-patch outputs were found in the HS, so nothing can be read back.
+				EXIT_NOT_IMPLEMENTED(kind == Attribute::PatchInput);
+				state.tess_patch_base = patch_begin;
+				type = array(TypeU32Vector(state, 4), (patch_end - patch_begin + 15u) / 16u);
+			}
 		} else {
 			const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
 			const auto stride = local ? tess.ls_stride : tess.hs_stride;
@@ -114,9 +132,9 @@ void DefineTessellationInterfaces(EmitterState& state) {
 		} else {
 			state.builder.AddAnnotation(
 			    spv::OpDecorate, variable, spv::DecorationLocation,
-			    kind == Attribute::PatchOutput ? (tess.hs_stride + 15u) / 16u : 0u);
+			    patch ? (tess.hs_stride + 15u) / 16u : 0u);
 		}
-		if (kind == Attribute::Factor || kind == Attribute::PatchOutput) {
+		if (kind == Attribute::Factor || patch) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);
 		}
 	}

@@ -130,6 +130,9 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_control_points = 0;
 	uint32_t ls_stride             = 0;
 	uint32_t hs_stride             = 0;
+	// Per-patch area written by the HS: bytes [hs_stride * output_control_points, patch_end).
+	// Shared by HS and DS so their per-patch interface layouts match.
+	uint32_t patch_end             = 0;
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;

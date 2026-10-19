@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <memory>
@@ -202,6 +203,24 @@ private:
 	using ImagePageTable = MultiLevelPageTable<Bucket, 20, 44, 14>;
 	static_assert(ImagePageTable::kPageBits == ImagePageBits);
 
+	// Registered images per page of the image page table. Written under m_lock, read without it.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts() = default;
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t kLeafBits = 10;
+		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
+		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
+
+		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize> m_leaves {};
+	};
+
 	// The ImageVersion() counters, in chunks that never move: images keep a pointer to theirs.
 	class ImageVersions final {
 	public:
@@ -388,6 +407,7 @@ private:
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;
+	RegisteredPageCounts                              m_registered_pages;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;

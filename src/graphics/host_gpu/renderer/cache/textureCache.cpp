@@ -237,6 +237,34 @@ void TextureCache::AttachImageVersion(ImageId id) {
 	image.StateChanged();
 }
 
+TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
+	for (auto& leaf: m_leaves) {
+		delete leaf.load(std::memory_order_relaxed);
+	}
+}
+
+void TextureCache::RegisteredPageCounts::Add(size_t page, int32_t delta) {
+	auto& slot = m_leaves[page >> kLeafBits];
+	auto* leaf = slot.load(std::memory_order_relaxed);
+	if (leaf == nullptr) {
+		leaf = new Leaf {};
+		slot.store(leaf, std::memory_order_release);
+	}
+	(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+	                                          std::memory_order_release);
+}
+
+bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive) const noexcept {
+	for (auto page = first; page < last_exclusive; page++) {
+		const auto* leaf = m_leaves[page >> kLeafBits].load(std::memory_order_acquire);
+		if (leaf != nullptr &&
+		    (*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	const auto& data  = image.info.data;
@@ -250,6 +278,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	    .address = data.address, .size = static_cast<uint32_t>(data.size), .id = id};
 	ForEachPage(data.address, data.size, [this, &entry](uint64_t page) {
 		m_image_page_table[page].entries.push_back(entry);
+		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
 	image.StateChanged();
@@ -278,6 +307,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 		entries.erase(entry);
+		m_registered_pages.Add(page, -1);
 	});
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
@@ -2299,6 +2329,13 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	// Images register their pages before they are tracked, so CPU writes to pages without one
+	// have nothing to invalidate. Most write faults land there and need not wait for the lock.
+	ImagePageTable::PageRange pages {};
+	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
+	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);

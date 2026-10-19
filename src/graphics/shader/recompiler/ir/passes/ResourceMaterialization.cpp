@@ -1757,8 +1757,19 @@ bool IndirectBufferTableRefused(const Program& program, std::span<const Descript
 	return !clean.EvaluateDescriptor(0, value) || BufferTableGpuWritten(value, runtime);
 }
 
+uint64_t PlanUserDataRegisters(const ResourcePlan& plan) {
+	uint64_t registers = 0;
+	for (const auto& inst: plan.value_storage) {
+		if (inst.GetOpcode() == ValueOpcode::GetUserData) {
+			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+			if (reg < 64u) {
+				registers |= uint64_t {1} << reg;
 			}
 		}
+	}
+	return registers;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	CopyPlanHeader(program, plan);

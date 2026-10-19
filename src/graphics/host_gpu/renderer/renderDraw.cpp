@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -649,6 +650,9 @@ struct DrawIndexBufferSource {
 	uint64_t      size      = 0;
 	vk::IndexType type      = vk::IndexType::eUint16;
 	uint32_t      guest_element_size = 0;
+	// Indices from address that lie inside INDEX_BUFFER_SIZE; later ones read as zero.
+	uint32_t readable = UINT32_MAX;
+	uint32_t count    = 0;
 };
 
 struct PreparedIndexBuffer {
@@ -893,9 +897,10 @@ static bool ResolvePrimitiveRestart(const CommandBuffer&         buffer,
 	return false;
 }
 
-                           uint32_t color_output_mask, DrawRenderState& state) {
 // False when a stage's descriptors could not be derived. The draw is then dropped.
 static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+                           uint32_t color_output_mask, DrawRenderState& state,
+                           const std::array<uint8_t, 3>* payload_user_sgprs) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -923,7 +928,8 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    payload_user_sgprs);
 	bool vertex_ready = true;
 	for (uint32_t stage = 0; stage < state.programs.VertexStageCount(); stage++) {
 		vertex_ready = vertex_ready && static_cast<bool>(state.programs.vertex[stage]) &&
@@ -935,11 +941,14 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 }
 
 static bool PrepareDrawShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+                               DrawRenderState&              state,
+                               const std::array<uint8_t, 3>* payload_user_sgprs = nullptr) {
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	return RefreshShaders(buffer, draw, color_output_mask, state, payload_user_sgprs);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1021,9 +1030,27 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		return prepared;
 	}
 	prepared.type = source.type;
+	auto& cache   = buffer.GetContext().GetBufferCache();
 	if (source.host_data != nullptr) {
-		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		auto& stream    = cache.GetUtilityBuffer(MemoryUsage::Stream);
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
+		prepared.buffer = stream.Handle();
+	} else if (source.readable < source.count) {
+		// Pad on the GPU: the readable indices may be GPU-written, and the rest read as zero.
+		const uint64_t readable_bytes = source.size;
+		const uint64_t padded_bytes =
+		    (static_cast<uint64_t>(source.count) * source.guest_element_size + 3u) & ~uint64_t {3};
+		auto& stream                = cache.GetUtilityBuffer(MemoryUsage::Stream);
+		const auto [mapped, offset] = stream.Map(padded_bytes, 16);
+		EXIT_IF(mapped == nullptr);
+		stream.Commit();
+		stream.Fill(offset, padded_bytes, 0);
+		if (readable_bytes != 0) {
+			const auto [indices, indices_offset] =
+			    cache.ObtainBuffer(source.address, readable_bytes, false);
+			stream.CopyFrom(buffer, *indices, indices_offset, offset, readable_bytes);
+		}
+		prepared.offset = offset;
 		prepared.buffer = stream.Handle();
 	} else {
 		auto [buffer_ptr, offset] =
@@ -1095,6 +1122,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return true;
 }
 
+// The count dword, when there is one, caps the records on the GPU.
 static void EmitIndirectDraw(vk::CommandBuffer vk_buffer, const DrawCallInfo& draw,
                              const DrawIndirectArgs&             records,
                              const std::pair<Buffer*, uint64_t>& args_buffer,
@@ -1270,7 +1298,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	uint32_t   mesh_groups = 0;
+	// A mesh program takes indirect records through the task shader.
+	const bool task_front = mesh_active && emit.indirect.address != 0;
+	EXIT_IF(task_front != (mesh_active && state.vertex_info[0].mesh.task_payload));
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
@@ -1280,16 +1310,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			            "continuing draw (primitive=%u indexed=%u)\n",
 			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
 		}
+	}
+	uint32_t mesh_groups = 0;
+	if (mesh_active && !task_front) {
+		const auto& mesh = state.vertex_info[0].mesh;
 		if (mesh.primitives_per_group == 0) {
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
+		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		const auto  plan =
+		    PlanMeshDraw(MeshShapeOf(mesh, limits), draw.index_count, draw.instance_count);
+		if (plan.action == DispatchPlanAction::SkipEmpty) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		const auto primitives = plan.primitives;
+		mesh_groups           = plan.groups_x;
+		if (plan.action == DispatchPlanAction::SkipOverLimit) {
 			static std::atomic<uint64_t> rejected {0};
 			const auto total = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
 			if (total <= 32) {
@@ -1305,11 +1342,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	if (mesh_active && draw.IsIndexed()) {
+		// The task front only learns each record's first index on the GPU.
+		const uint64_t bytes =
+		    task_front ? index_source.size
+		               : static_cast<uint64_t>(std::min(draw.index_count, index_source.readable)) *
+		                     index_source.guest_element_size;
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		if (bytes != 0) {
+			(void)m_context.GetBufferCache().FindBuffer(index_source.address, bytes);
+		}
 	}
 	StreamHold stream_hold(m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream));
 	LogDrawPhase(draw.Name(), "PrepareBindings");
@@ -1335,12 +1377,47 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
+	std::pair<Buffer*, uint64_t> count_buffer {};
 	if (emit.indirect.address != 0) {
 		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 		                  (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                    : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+		if (emit.indirect.count_address != 0) {
+			count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
+			                                                       sizeof(uint32_t), false);
+			EXIT_IF((count_buffer.second & 3u) != 0);
+		}
+	}
+	vk::DeviceAddress verify_header = 0;
+	vk::DeviceAddress task_header   = 0;
+	vk::DeviceAddress task_records  = 0;
+	vk::DeviceAddress task_count    = 0;
+	if (task_front) {
+		task_records = args_buffer.first->BufferDeviceAddress() + args_buffer.second;
+		if (count_buffer.first != nullptr) {
+			task_count = count_buffer.first->BufferDeviceAddress() + count_buffer.second;
+		}
+		const MeshIndirectVerifyPacket packet {
+		    .shape              = MeshShapeOf(state.vertex_info[0].mesh,
+		                                      m_context.GetGraphics().mesh_shader_properties),
+		    .max_count          = emit.indirect.count,
+		    .counted            = count_buffer.first != nullptr,
+		    .indexed            = draw.IsIndexed(),
+		    .index_element_size = index_source.guest_element_size,
+		    .index_base         = index_source.address,
+		    .index_buffer_size  = draw.IsIndexed() ? draw.index_count : 0u};
+		if (m_mesh_indirect_verify) {
+			verify_header = MeshIndirectVerify().Begin(packet, task_records, task_count,
+			                                           emit.indirect.stride, emit.indirect.address);
+		}
+		task_header = verify_header;
+		if (task_header == 0 && packet.indexed) {
+			const auto header =
+			    MeshIndirectHeaderOf(packet, task_records, task_count, emit.indirect.stride, 0);
+			auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			task_header  = stream.BufferDeviceAddress() + stream.Copy(&header, sizeof(header), 16);
 		}
 	}
 	if (draw.IsIndexed()) {
@@ -1349,7 +1426,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, verify_header != 0, task_front && draw.IsIndexed());
+	EXIT_IF(pipeline.task_front != task_front);
 	const auto&                 stencil_export = state.depth_info.stencil_export;
 	std::array<vk::Pipeline, 8> stencil_bit_pipelines {};
 	if (stencil_export.bits != 0) {
@@ -1387,17 +1465,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	if (!CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages)) {
+		return;
+	}
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
+	// A task front shares the push constants with the mesh and pixel stages.
 	const auto draw_stages =
 	    vk::ShaderStageFlagBits::eFragment |
-	    (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex);
+	    (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex) |
+	    (task_front ? vk::ShaderStageFlagBits::eTaskEXT : vk::ShaderStageFlags {});
+	// The mesh index bound follows the user clip planes and is pushed after them.
 	const auto draw_dwords =
-	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
+	    std::min(PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id),
+	             PushData::MeshDrawDwordCount);
+	if (task_front) {
+		struct {
+			uint64_t records;
+			uint64_t count;
+			uint32_t max_count;
+			uint32_t stride;
+		} const task_data {task_header != 0 ? task_header : task_records,
+		                   task_header != 0 ? 0 : task_count, emit.indirect.count,
+		                   emit.indirect.stride};
+		static_assert(sizeof(task_data) == PushData::MeshDrawDwordCount * sizeof(uint32_t));
+		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0, sizeof(task_data),
+		                        &task_data);
+	} else if (draw_dwords != 0) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
 		if (mesh_active) {
 			draw_data = {draw.index_count,
@@ -1457,6 +1553,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
+	if (args_buffer.first != nullptr && !task_front && !buffer.IndirectArgsBarrierHolds()) {
 		// The arguments may come from any earlier GPU write; the barrier cannot sit in a pass.
 		m_context.GetCommandScheduler().EndRendering();
 		vk::MemoryBarrier barrier {};
@@ -1478,23 +1575,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_active) {
+	if (task_front) {
+		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.IsIndexed()) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
 	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+		EmitIndirectDraw(vk_buffer, draw, emit.indirect, args_buffer, count_buffer);
 	}
+	// The query counts the guest draw once, not the stencil replays, and ends in its pass.
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	if (task_front && verify_header != 0) {
+		m_context.GetCommandScheduler().EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTaskShaderEXT,
+		                          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
+		                          nullptr);
+		MeshIndirectVerify().Commit();
+	}
 	if (stencil_export.bits != 0) {
 		RecordStencilExportReplay(
 		    vk_buffer, stencil_export, stencil_bit_pipelines, rendering.num_color_attachments, [&] {
 			    if (args_buffer.first == nullptr) {
 				    EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+			    } else {
+				    EmitIndirectDraw(vk_buffer, draw, emit.indirect, args_buffer, count_buffer);
 			    }
 		    });
 	}
@@ -1544,6 +1652,53 @@ static bool Refuse(IndirectDrawResult* refusal, IndirectDrawResult reason) {
 	return false;
 }
 
+static bool PayloadUserSgpr(uint32_t location, uint32_t user_sgprs, uint8_t& sgpr) {
+	if (location == Pm4::SH_NOP) {
+		sgpr = ShaderMeshInputInfo::NoPayloadSgpr;
+		return true;
+	}
+	if (location < Pm4::SPI_SHADER_USER_DATA_GS_0 || location > Pm4::SPI_SHADER_USER_DATA_GS_31 ||
+	    location - Pm4::SPI_SHADER_USER_DATA_GS_0 >= user_sgprs) {
+		return false;
+	}
+	sgpr = static_cast<uint8_t>(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+	return true;
+}
+
+static bool PayloadUserSgprs(const CommandBuffer& buffer, const DrawIndirectArgs& records,
+                             std::array<uint8_t, 3>& sgprs) {
+	const auto user_sgprs = buffer.GetShaders().GetVs().gs_regs.rsrc2.user_sgpr;
+	return PayloadUserSgpr(records.vertex_offset_register, user_sgprs, sgprs[0]) &&
+	       PayloadUserSgpr(records.instance_offset_register, user_sgprs, sgprs[1]) &&
+	       PayloadUserSgpr(records.index_offset_register, user_sgprs, sgprs[2]);
+}
+
+// Why a mesh program's packet stays on the CPU, or Drawn.
+static IndirectDrawResult MeshTaskFrontRefusal(const GraphicContext&   graphics,
+                                               const CommandBuffer&    buffer,
+                                               const DrawIndirectArgs& records, bool indexed,
+                                               bool mesh_indirect, IndirectDrawResult disabled) {
+	if (!mesh_indirect) {
+		return disabled;
+	}
+	if (!graphics.task_shader_enabled) {
+		return IndirectDrawResult::MissingFeature;
+	}
+	// A fast-launch subgroup is one point the prologue never fetches an index for.
+	if (indexed && ((buffer.GetRegisters().GetShaderStages() >> 19u) & 3u) != 0) {
+		return IndirectDrawResult::MeshFastLaunchIndexed;
+	}
+	const auto& limits = graphics.mesh_shader_properties;
+	if (records.count > limits.maxTaskWorkGroupCount[0] ||
+	    records.count > limits.maxTaskWorkGroupTotalCount) {
+		return IndirectDrawResult::MeshTaskLimit;
+	}
+	std::array<uint8_t, 3> sgprs {};
+	if (!PayloadUserSgprs(buffer, records, sgprs)) {
+		return IndirectDrawResult::MeshOffsetRegister;
+	}
+	return IndirectDrawResult::Drawn;
+}
 
 struct IndirectStagePlan {
 	bool                   merged              = false;
@@ -1584,6 +1739,21 @@ static IndirectDrawResult ClassifyIndirectDraw(const GraphicContext& graphics,
 	    Libs::LibKernel::Memory::ClampRangeSize(records.count_address, sizeof(uint32_t)) !=
 	        sizeof(uint32_t)) {
 		return IndirectDrawResult::ArgsUnmapped;
+	}
+	plan.merged = (hw.GetShaderStages() & 0x20u) != 0;
+	if (plan.merged) {
+		if (const auto refusal =
+		        MeshTaskFrontRefusal(graphics, buffer, records, indexed, mesh_indirect,
+		                             IndirectDrawResult::MergedGeometry);
+		    refusal != IndirectDrawResult::Drawn) {
+			return refusal;
+		}
+	} else {
+		plan.native_mesh_refusal = MeshTaskFrontRefusal(
+		    graphics, buffer, records, indexed, mesh_indirect, IndirectDrawResult::MeshStage);
+	}
+	if (plan.Payload() != nullptr) {
+		EXIT_IF(!PayloadUserSgprs(buffer, records, plan.payload_sgprs));
 	}
 	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
 		return IndirectDrawResult::QuadList;
@@ -1635,6 +1805,28 @@ static IndirectDrawResult IndirectStageRefusal(const GraphicContext&    graphics
 		                              records.instance_offset_register != Pm4::SH_NOP ||
 		                              records.index_offset_register != Pm4::SH_NOP;
 		return offset_registers ? IndirectDrawResult::OffsetRegister : IndirectDrawResult::Drawn;
+	}
+	if (!plan.merged && plan.native_mesh_refusal != IndirectDrawResult::Drawn) {
+		return plan.native_mesh_refusal;
+	}
+	if (state.programs.VertexStageCount() != 1) {
+		return plan.merged ? IndirectDrawResult::MergedGeometry : IndirectDrawResult::MeshStage;
+	}
+	if (vertex.mesh.primitives_per_group == 0) {
+		return IndirectDrawResult::MeshNoGroups;
+	}
+	if (!vertex.mesh.task_payload ||
+	    vertex.stage.program->workgroup_storage_bytes +
+	            ShaderRecompiler::IR::MeshTaskPayloadDwordCount * sizeof(uint32_t) >
+	        graphics.mesh_shader_properties.maxMeshPayloadAndSharedMemorySize) {
+		return IndirectDrawResult::MeshPayloadLimit;
+	}
+	// A register the host plan reads would be evaluated from its pre-packet value.
+	for (const auto sgpr: plan.payload_sgprs) {
+		if (sgpr != ShaderMeshInputInfo::NoPayloadSgpr &&
+		    ((vertex.stage.program->plan_user_data_registers >> (8u + sgpr)) & 1u) != 0) {
+			return IndirectDrawResult::MeshOffsetRegister;
+		}
 	}
 	return IndirectDrawResult::Drawn;
 }
@@ -1753,15 +1945,20 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const 
 			break;
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
-	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	const auto element_size      = index_source.guest_element_size;
+	index_source.readable        = std::min(args.index_count, args.index_limit);
+	index_source.size            = static_cast<uint64_t>(index_source.readable) * element_size;
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 
+	index_source.count = args.index_count;
+
+	// 8-bit indices are widened on the host; the indices past INDEX_BUFFER_SIZE stay zero.
 	std::vector<uint16_t> expanded_indices;
-	if (index_source.guest_element_size == 1) {
-		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
+	if (element_size == 1) {
+		EXIT_NOT_IMPLEMENTED(index_source.readable != 0 && args.index_addr == nullptr);
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
-		expanded_indices.resize(args.index_count);
-		for (uint32_t i = 0; i < args.index_count; i++) {
+		expanded_indices.assign(args.index_count, 0);
+		for (uint32_t i = 0; i < index_source.readable; i++) {
 			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
 		index_source.host_data = expanded_indices.data();
@@ -1771,7 +1968,21 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (indirect.address != 0) {
+		if (!PrepareDrawShaders(buffer, draw, state, plan.Payload())) {
+			ResetBindings();
+			return true;
+		}
+		if (const auto result =
+		        IndirectStageRefusal(m_context.GetGraphics(), state, indirect, plan);
+		    result != IndirectDrawResult::Drawn) {
+			ResetBindings();
+			return Refuse(refusal, result);
+		}
+	}
+	if (indirect.address != 0
+	        ? !PrepareDrawTargets(buffer, draw, args.render_target_slice_offset, state)
+	        : !PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
 	}
@@ -1779,7 +1990,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  args.base_vertex, args.first_instance, args.indirect);
+	                                  args.base_vertex, args.first_instance, indirect);
 	if (emit) {
 		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, *emit, index_source,
 		                    primitive_restart);

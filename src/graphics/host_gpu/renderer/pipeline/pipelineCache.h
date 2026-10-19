@@ -213,6 +213,7 @@ public:
 		bool     uses_push_descriptors = false;
 		bool     uses_image_heap       = false;
 		uint64_t layout_signature      = 0;
+		bool     task_front            = false;
 	};
 
 	struct GraphicsPrograms {
@@ -231,7 +232,8 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo&         pixel_info,
+	                    const std::array<uint8_t, 3>* payload_user_sgprs = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
@@ -241,7 +243,8 @@ public:
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs, bool task_verify = false,
+	                              bool task_indexed = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -258,11 +261,14 @@ private:
 		uint64_t                 ps_shader_id = 0;
 		PipelineVertexInputState vertex_input;
 		PipelineStaticParameters static_params;
+		bool                     task_verify  = false;
+		bool                     task_indexed = false;
 
 		bool operator==(const GraphicsPipelineKey& other) const {
 			return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
 			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
-			       static_params == other.static_params;
+			       static_params == other.static_params && task_verify == other.task_verify &&
+			       task_indexed == other.task_indexed;
 		}
 	};
 
@@ -311,6 +317,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
+                            vk::PipelineCache driver_cache, PipelineLibraries* libraries = nullptr,
+                            bool task_verify = false, bool task_indexed = false);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

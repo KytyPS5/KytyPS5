@@ -3,9 +3,11 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_mesh_indirect_task_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -387,6 +389,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
+                            vk::PipelineCache driver_cache, PipelineLibraries* libraries,
+                            bool task_verify, bool task_indexed) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -406,6 +410,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
+	vk::ShaderModule task_shader_module         = nullptr;
+	const bool       task_front                 = mesh && vs_input_info.mesh.task_payload;
+	EXIT_NOT_IMPLEMENTED(task_front && !graphics.task_shader_enabled);
+	if (task_front) {
+		task_shader_module = CompileSPV(GPU_MESH_INDIRECT_TASK_SPV, graphics.device);
+	}
+	pipeline.task_front = task_front;
+	const auto shape    = MeshShapeOf(vs_input_info.mesh, graphics.mesh_shader_properties);
+	const std::array<uint32_t, 9> task_constants {
+	    shape.primitive_size, shape.primitive_step,  shape.primitives_per_group,
+	    shape.max_groups[0],  shape.max_groups[1],   shape.max_groups[2],
+	    shape.max_total,      task_verify ? 1u : 0u, task_indexed ? 1u : 0u};
+	std::array<vk::SpecializationMapEntry, task_constants.size()> task_entries {};
+	for (uint32_t index = 0; index < task_entries.size(); index++) {
+		task_entries[index] = {index, static_cast<uint32_t>(index * sizeof(uint32_t)),
+		                       sizeof(uint32_t)};
+	}
+	const vk::SpecializationInfo task_specialization {static_cast<uint32_t>(task_entries.size()),
+	                                                  task_entries.data(), sizeof(task_constants),
+	                                                  task_constants.data()};
 
 	if (rect_list) {
 		const auto shaders =
@@ -428,6 +452,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
+	if (task_front) {
+		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
+		                                       .module = task_shader_module,
+		                                       .pName  = "main",
+		                                       .pSpecializationInfo = &task_specialization};
+	}
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           NativeShaderStage(vertex_info[i].logical_stage),
@@ -612,6 +642,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> vertex_bindings;
 	std::vector<vk::DescriptorSetLayoutBinding> pixel_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
+	if (task_front) {
+		graphics_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+	}
 	bool vertex_image_heap = false;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
@@ -943,6 +976,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+	}
+	if (task_shader_module != nullptr) {
+		graphics.device.destroyShaderModule(task_shader_module, nullptr);
 	}
 }
 

@@ -104,6 +104,10 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	// GS_VGPR_COMP_CNT / ES_VGPR_COMP_CNT: the last VGPR the SPI pre-loads for each half.
 	uint32_t                 gs_vgpr_component_count = 0;
 	uint32_t                 es_vgpr_component_count = 0;
+	static constexpr uint8_t NoPayloadSgpr           = 0xff;
+	// Task-launched: draw parameters and start vertex/instance/index SGPRs come from the payload.
+	bool                   task_payload = false;
+	std::array<uint8_t, 3> payload_user_sgprs {NoPayloadSgpr, NoPayloadSgpr, NoPayloadSgpr};
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {

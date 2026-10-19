@@ -14,6 +14,7 @@ enum class DispatchPlanAction : uint8_t {
 	Record,
 	SkipEmpty,
 	SkipOverLimit,
+	SkipUnrepresentable,
 };
 
 struct DispatchPlan {
@@ -62,6 +63,95 @@ PlanComputeDispatch(std::array<uint32_t, 3> counts, std::array<uint32_t, 3> loca
 	return static_cast<uint64_t>(count) + first_element <= max_ids + 1u &&
 	       static_cast<uint64_t>(instances) + first_instance <= max_ids + 1u &&
 	       static_cast<uint64_t>(count) * instances <= max_ids;
+}
+
+[[nodiscard]] constexpr uint32_t MeshInputPrimitiveCount(uint32_t vertices, uint32_t size,
+                                                         uint32_t step) noexcept {
+	return vertices < size ? 0u : (vertices - size) / step + 1u;
+}
+
+struct MeshDrawShape {
+	uint32_t                primitive_size       = 1;
+	uint32_t                primitive_step       = 1;
+	uint32_t                primitives_per_group = 1;
+	std::array<uint32_t, 3> max_groups {};
+	uint32_t                max_total = 0;
+};
+
+struct MeshDrawPlan {
+	DispatchPlanAction action     = DispatchPlanAction::Record;
+	uint32_t           primitives = 0;
+	uint32_t           groups_x   = 0;
+	uint32_t           groups_y   = 0;
+};
+
+[[nodiscard]] constexpr MeshDrawPlan PlanMeshDraw(const MeshDrawShape& shape, uint32_t count,
+                                                  uint32_t instances) noexcept {
+	MeshDrawPlan plan {};
+	plan.primitives = MeshInputPrimitiveCount(count, shape.primitive_size, shape.primitive_step);
+	if (plan.primitives == 0 || instances == 0) {
+		plan.action = DispatchPlanAction::SkipEmpty;
+		return plan;
+	}
+	plan.groups_x = (plan.primitives - 1u) / shape.primitives_per_group + 1u;
+	plan.groups_y = instances;
+	if (!MeshWorkGroupsWithinLimits(plan.groups_x, plan.groups_y, shape.max_groups,
+	                                shape.max_total)) {
+		plan.action = DispatchPlanAction::SkipOverLimit;
+	}
+	return plan;
+}
+
+struct MeshIndirectRecord {
+	uint32_t count          = 0;
+	uint32_t instances      = 0;
+	uint32_t first_vertex   = 0;
+	uint32_t first_instance = 0;
+};
+
+// What the CPU replay does with one non-indexed record; the task shader derives it the same way.
+[[nodiscard]] constexpr MeshDrawPlan
+DeriveMeshIndirectRecord(const MeshDrawShape& shape, const MeshIndirectRecord& record) noexcept {
+	if (record.count == 0 || record.instances == 0) {
+		return {.action = DispatchPlanAction::SkipEmpty};
+	}
+	if (!DrawCountsRepresentable(record.count, record.instances, record.first_vertex,
+	                             record.first_instance)) {
+		return {.action = DispatchPlanAction::SkipUnrepresentable};
+	}
+	return PlanMeshDraw(shape, record.count, record.instances);
+}
+
+struct MeshIndexedRecord {
+	uint32_t count          = 0;
+	uint32_t instances      = 0;
+	uint32_t first_index    = 0;
+	uint32_t base_vertex    = 0;
+	uint32_t first_instance = 0;
+};
+
+// The base vertex reaches the shader only through its SGPR.
+[[nodiscard]] constexpr MeshDrawPlan
+DeriveMeshIndexedRecord(const MeshDrawShape& shape, const MeshIndexedRecord& record) noexcept {
+	return DeriveMeshIndirectRecord(shape,
+	                                {record.count, record.instances, 0, record.first_instance});
+}
+
+struct IndexWindow {
+	uint64_t address = 0;
+	// Indices from `address` that lie inside INDEX_BUFFER_SIZE; later ones read as zero.
+	uint32_t readable = 0;
+};
+
+// An indirect record's indices; an INDEX_BUFFER_SIZE of zero was never set and bounds nothing.
+[[nodiscard]] constexpr IndexWindow IndirectIndexWindow(uint64_t base, uint32_t element_size,
+                                                        uint32_t buffer_size,
+                                                        uint32_t first_index) noexcept {
+	const uint64_t address = base + static_cast<uint64_t>(first_index) * element_size;
+	if (buffer_size == 0) {
+		return {address, std::numeric_limits<uint32_t>::max()};
+	}
+	return {address, buffer_size > first_index ? buffer_size - first_index : 0u};
 }
 
 } // namespace Libs::Graphics

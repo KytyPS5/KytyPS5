@@ -215,7 +215,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+    : Buffer(graphics, scheduler, usage, 0,
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {
 	Scheduler().RegisterStreamBuffer(this);
 }

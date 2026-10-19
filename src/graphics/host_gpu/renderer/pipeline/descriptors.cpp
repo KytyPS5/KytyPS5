@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -37,6 +38,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -848,8 +851,22 @@ static vk::DescriptorBufferInfo NativeUploadShared(RenderContext&            con
 	return info;
 }
 
+static bool MeshIndirectSwitch(const char* name) {
+	const char* text = std::getenv(name);
+	return text != nullptr && text[0] != '\0' && std::strcmp(text, "0") != 0;
+}
+
+RenderExecutor::RenderExecutor(RenderContext& context)
+    : m_context(context), m_mesh_indirect(!MeshIndirectSwitch("KYTY_NO_MESH_INDIRECT")) {}
 
 RenderExecutor::~RenderExecutor() = default;
+
+MeshIndirectVerifier& RenderExecutor::MeshIndirectVerify() {
+	if (m_mesh_indirect_verifier == nullptr) {
+		m_mesh_indirect_verifier = std::make_unique<MeshIndirectVerifier>(m_context);
+	}
+	return *m_mesh_indirect_verifier;
+}
 
 ThreadDispatcher& RenderExecutor::ThreadDispatch() {
 	if (m_thread_dispatch == nullptr) {
@@ -1400,6 +1417,9 @@ bool RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
+	if (pipeline.task_front) {
+		push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+	}
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;

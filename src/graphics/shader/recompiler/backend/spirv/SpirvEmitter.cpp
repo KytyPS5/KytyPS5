@@ -8,9 +8,91 @@
 #include <array>
 #include <cstdio>
 #include <fmt/format.h>
+#include <span>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint64_t WorkgroupStorageBound(std::span<const uint32_t> spirv) {
+	struct Layout {
+		uint64_t size  = 0;
+		uint64_t align = 1;
+	};
+	std::unordered_map<uint32_t, Layout>   types;
+	std::unordered_map<uint32_t, uint64_t> constants;
+	std::unordered_map<uint32_t, uint32_t> pointees;
+	std::unordered_set<uint32_t>           blocks;
+	const auto                             align_up = [](uint64_t value, uint64_t align) {
+		return (value + align - 1u) / align * align;
+	};
+	uint64_t separate = 0;
+	uint64_t aliased  = 0;
+	for (size_t at = 5; at < spirv.size();) {
+		const auto op    = static_cast<spv::Op>(spirv[at] & 0xffffu);
+		const auto count = spirv[at] >> 16u;
+		if (count == 0 || at + count > spirv.size()) {
+			break;
+		}
+		const auto word = [&](uint32_t index) { return spirv[at + index]; };
+		switch (op) {
+			case spv::OpDecorate:
+				if (word(2) == spv::DecorationBlock) {
+					blocks.insert(word(1));
+				}
+				break;
+			case spv::OpConstant: constants[word(2)] = word(3); break;
+			case spv::OpTypeBool: types[word(1)] = {4, 4}; break;
+			case spv::OpTypeInt:
+			case spv::OpTypeFloat: types[word(1)] = {word(2) / 8u, word(2) / 8u}; break;
+			case spv::OpTypeVector: {
+				const auto component = types[word(2)];
+				types[word(1)]       = {component.size * word(3),
+				                        component.align * (word(3) == 2u ? 2u : 4u)};
+				break;
+			}
+			case spv::OpTypeArray: {
+				const auto element = types[word(2)];
+				types[word(1)]     = {align_up(element.size, element.align) * constants[word(3)],
+				                      element.align};
+				break;
+			}
+			case spv::OpTypeStruct: {
+				Layout layout {};
+				for (uint32_t member = 2; member < count; member++) {
+					const auto field = types[word(member)];
+					layout.size      = align_up(layout.size, field.align) + field.size;
+					layout.align     = std::max(layout.align, field.align);
+				}
+				layout.size    = align_up(layout.size, layout.align);
+				types[word(1)] = layout;
+				break;
+			}
+			case spv::OpTypePointer:
+				if (word(2) == spv::StorageClassWorkgroup) {
+					pointees[word(1)] = word(3);
+				}
+				break;
+			case spv::OpVariable:
+				if (word(3) == spv::StorageClassWorkgroup) {
+					const auto type   = pointees[word(1)];
+					const auto layout = types[type];
+					if (blocks.contains(type)) {
+						aliased = std::max(aliased, layout.size);
+					} else {
+						separate += layout.size + layout.align - 1u;
+					}
+				}
+				break;
+			case spv::OpFunction: at = spirv.size(); continue;
+			default: break;
+		}
+		at += count;
+	}
+	return separate + aliased;
+}
 
 namespace {
 

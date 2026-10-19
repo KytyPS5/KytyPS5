@@ -1306,6 +1306,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+				// Indices past INDEX_BUFFER_SIZE read zero.
+				const auto index_readable =
+				    entry_ir.ULessThan(input_vertex, draw(IR::PushData::MeshIndexBoundParameter));
 				const auto index_low    = draw(4);
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
 				                                           entry_ir.IMul(input_vertex, index_bytes));
@@ -1317,7 +1320,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				const auto packed_index = entry_ir.Emit(
 				    IR::ValueOpcode::LoadAddressU32,
 				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
+				     entry_ir.LogicalAnd(
+				         entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices)),
+				         index_readable)},
 				    IR::MemoryFlags {.index = memory_index});
 				const auto index = IR::U32(entry_ir.Emit(
 				    IR::ValueOpcode::BitFieldUExtract,

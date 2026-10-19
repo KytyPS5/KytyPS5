@@ -761,6 +761,14 @@ void DefineModule(EmitterState& state) {
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
+		if (state.input_info.vertex->mesh.task_payload) {
+			const auto pointer = TypeU32ArrayPointer(
+			    state, spv::StorageClassTaskPayloadWorkgroupEXT, IR::MeshTaskPayloadDwordCount);
+			state.mesh_payload_variable = state.builder.DefineGlobalVariable(
+			    pointer, spv::StorageClassTaskPayloadWorkgroupEXT);
+			state.interface_variables.push_back(state.mesh_payload_variable);
+			state.builder.AddName(state.mesh_payload_variable, "task_payload");
+		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {

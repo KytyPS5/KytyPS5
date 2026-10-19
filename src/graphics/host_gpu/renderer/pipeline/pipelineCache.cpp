@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -321,6 +322,8 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 		PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
 	}
 	PipelineKeyHash::Mix(hash, XXH3_64bits(&key.static_params, sizeof(key.static_params)));
+	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.task_verify));
+	PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.task_indexed));
 	return hash;
 }
 
@@ -555,6 +558,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
+		const auto workgroup_bytes = ShaderRecompiler::Spirv::WorkgroupStorageBound(result.spirv);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -562,7 +566,13 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program =
+		        [&] {
+			        auto info                    = std::move(result.program).TakeCompiledInfo();
+			        info.workgroup_storage_bytes = workgroup_bytes;
+			        return info;
+		        }(),
+		    .handle = {.id = ++next_shader_id, .module = module},
 		};
 	}
 
@@ -771,6 +781,11 @@ struct PipelineCache::ProgramCache {
 			}
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			const auto plan_registers =
+			    ShaderRecompiler::IR::PlanUserDataRegisters(entry->second.resource_plan);
+			for (auto& built: entry->second.permutations) {
+				built.program.plan_user_data_registers = plan_registers;
+			}
 			Permutation* permutation = nullptr;
 			if (!entry->second.FindPermutation<true>(runtime, push_data_cursor, any_start,
 			                                         permutation, refused)) {
@@ -795,13 +810,15 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
 		    entry->second.FunctionCode()));
-		const auto& permutation = entry->second.permutations.back();
 		if (!entry->second.permutations.back().handle) {
 			const auto reason = std::move(entry->second.permutations.back().reason);
 			entry->second.permutations.pop_back();
 			refuse(0, reason);
 			return {};
 		}
+		auto& permutation = entry->second.permutations.back();
+		permutation.program.plan_user_data_registers =
+		    ShaderRecompiler::IR::PlanUserDataRegisters(entry->second.resource_plan);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -1134,7 +1151,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    const std::array<uint8_t, 3>* payload_user_sgprs) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	for (auto& stage: vertex_info) {
 		stage.param_duplicate_mask = 0;
@@ -1162,6 +1180,16 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
+		constexpr auto payload_bytes =
+		    ShaderRecompiler::IR::MeshTaskPayloadDwordCount * sizeof(uint32_t);
+		if (payload_user_sgprs != nullptr && m_graphics.task_shader_enabled &&
+		    payload_bytes <= limits.maxTaskPayloadSize &&
+		    payload_bytes <= limits.maxTaskPayloadAndSharedMemorySize &&
+		    mesh.lds_size_dwords * sizeof(uint32_t) + payload_bytes <=
+		        limits.maxMeshPayloadAndSharedMemorySize) {
+			mesh.task_payload       = true;
+			mesh.payload_user_sgprs = *payload_user_sgprs;
+		}
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
@@ -1456,7 +1484,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool task_verify,
+    bool task_indexed) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1480,6 +1509,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
 	}
 	key.ps_shader_id            = ps_id;
+	key.task_verify             = vs_input_info.mesh.task_payload && task_verify;
+	key.task_indexed            = vs_input_info.mesh.task_payload && task_indexed;
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
@@ -1647,6 +1678,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache,
+		                       m_libraries.get(), key.task_verify, key.task_indexed);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 

@@ -443,10 +443,17 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
-		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
+		key.insert(key.end(),
+		           {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		            mesh.scratch_size_dwords, mesh.input_primitive, mesh.primitives_per_group,
+		            mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
+		            mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch),
+		            mesh.gs_vgpr_component_count, mesh.es_vgpr_component_count,
+		            static_cast<uint32_t>(mesh.task_payload)});
+		if (mesh.task_payload) {
+			key.insert(key.end(), mesh.payload_user_sgprs.begin(), mesh.payload_user_sgprs.end());
+		}
+	}
 	key.push_back(info.param_duplicate_mask);
 	for (uint32_t location = 0; location < 32u; location++) {
 		if ((info.param_duplicate_mask & (1u << location)) != 0) {

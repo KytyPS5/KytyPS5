@@ -7190,6 +7190,126 @@ void TestFlatAliasOfSmoothInputDuplicates() {
         "mesh shader did not copy out the duplicate of output 1 at location 5");
 }
 
+// The task front's mesh variant reads the packet's offset SGPRs from the task payload.
+void TestMeshTaskPayloadVariant() {
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t mesh_shader[] = {
+      EncodeSMovB32(20, 255), 0x1003u,
+      EncodeSMovB32(124, 20), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop2(0x25, 5, 12, 5),                  // v_add_nc_u32 v5, s12, v5
+      EncodeMubuf0(0x0c), EncodeMubuf1(0, 2, 5),   // buffer_load_dword v0, v5, s[8:11]
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 16> user_data{};
+  // A null V# would fold the load, and with it the start-vertex read, to zero.
+  user_data[8] = 0x1000u;
+  user_data[10] = 64u;
+  user_data[11] = 3u << 28u;
+  ShaderVertexInputInfo mesh_input{};
+  auto &mesh = mesh_input.mesh;
+  mesh.threads_num[0] = 32;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 32;
+  mesh.vertices_per_group = 32;
+  mesh.max_vertices = 32;
+  mesh.max_primitives = 32;
+  mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kPointList);
+  mesh.host_subgroup_size = 32;
+  mesh.wave_size = 32;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.emit_debug_info = true; // The checks find SPIR-V objects by OpName.
+  options.wave_size = 32;
+  options.user_data = user_data;
+  options.input_info.vertex = &mesh_input;
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(
+      ShaderRecompiler::TranslateProgram(mesh_shader, options).program);
+  const auto plan_registers = ShaderRecompiler::IR::PlanUserDataRegisters(plan);
+  Check(plan_registers == 0xf00u,
+        "the plan did not name exactly the V# registers it evaluates on the host");
+  auto direct = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                 PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(direct.spirv);
+  const auto direct_source = DisassembleSpirvBinary(direct.spirv);
+  Check(direct_source.find("TaskPayloadWorkgroupEXT") == std::string::npos,
+        "a direct mesh module declared a task payload");
+  mesh.task_payload = true;
+  mesh.payload_user_sgprs = {4, ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr};
+  auto variant = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                  PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(variant.spirv);
+  const auto variant_source = DisassembleSpirvBinary(variant.spirv);
+  Check(CountSourceOccurrences(variant_source, "OpVariable %_ptr_TaskPayloadWorkgroupEXT") == 1 &&
+            SpirvSourceHasInstructionUsing(variant_source, "OpEntryPoint", "%task_payload"),
+        "the task-launched mesh variant does not take one payload through its interface");
+  // Draw dword 0 and the start-vertex slot come from the payload, not from push constants.
+  Check(CountSourceOccurrences(variant_source, "OpAccessChain %_ptr_TaskPayloadWorkgroupEXT_uint "
+                                               "%task_payload") >= 2,
+        "the variant read its draw parameters or start vertex elsewhere");
+  // The mesh allocation counters are two Workgroup dwords; the payload is not Workgroup storage.
+  Check(ShaderRecompiler::Spirv::WorkgroupStorageBound(direct.spirv) >= 2 * sizeof(uint32_t) &&
+            ShaderRecompiler::Spirv::WorkgroupStorageBound(variant.spirv) ==
+                ShaderRecompiler::Spirv::WorkgroupStorageBound(direct.spirv),
+        "the Workgroup storage bound missed the mesh shared arrays or counted the payload");
+  mesh.task_payload = false;
+  mesh.payload_user_sgprs = {ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr};
+  Check(RecompileForTest(mesh_shader, options, nullptr, nullptr, PushData::MeshDrawDwordCount)
+                .spirv == direct.spirv,
+        "a direct mesh module changed after its task variant was built");
+  std::vector<uint32_t> direct_key;
+  std::vector<uint32_t> variant_key;
+  BuildStageStaticKey(mesh_input, direct_key);
+  mesh.task_payload = true;
+  BuildStageStaticKey(mesh_input, variant_key);
+  Check(direct_key != variant_key, "the task variant shares the direct mesh program's key");
+
+  // Fast launch uses the same variant: the task front leaves draw dword 1 zero.
+  constexpr std::array<uint8_t, 3> no_sgprs{ShaderMeshInputInfo::NoPayloadSgpr,
+                                            ShaderMeshInputInfo::NoPayloadSgpr,
+                                            ShaderMeshInputInfo::NoPayloadSgpr};
+  mesh.fast_launch = true;
+  mesh.primitives_per_group = 1;
+  mesh.vertices_per_group = 1;
+  mesh.task_payload = false;
+  mesh.payload_user_sgprs = no_sgprs;
+  const auto fast_direct = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                            PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(fast_direct.spirv);
+  Check(DisassembleSpirvBinary(fast_direct.spirv).find("TaskPayloadWorkgroupEXT") ==
+            std::string::npos,
+        "a direct fast-launch mesh module declared a task payload");
+  std::vector<uint32_t> fast_direct_key;
+  BuildStageStaticKey(mesh_input, fast_direct_key);
+  mesh.task_payload = true;
+  mesh.payload_user_sgprs = {4, ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr};
+  const auto fast_variant = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                             PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(fast_variant.spirv);
+  const auto fast_source = DisassembleSpirvBinary(fast_variant.spirv);
+  Check(CountSourceOccurrences(fast_source, "OpVariable %_ptr_TaskPayloadWorkgroupEXT") == 1 &&
+            SpirvSourceHasInstructionUsing(fast_source, "OpEntryPoint", "%task_payload") &&
+            CountSourceOccurrences(fast_source, "OpAccessChain %_ptr_TaskPayloadWorkgroupEXT_uint "
+                                                "%task_payload %uint_1") == 1 &&
+            CountSourceOccurrences(fast_source, "OpAccessChain %_ptr_TaskPayloadWorkgroupEXT_uint "
+                                                "%task_payload %uint_6") == 1,
+        "the fast-launch variant read its subgroup offsets or start vertex elsewhere");
+  std::vector<uint32_t> fast_variant_key;
+  BuildStageStaticKey(mesh_input, fast_variant_key);
+  Check(fast_variant_key != fast_direct_key && fast_variant_key != variant_key,
+        "the fast-launch task variant shares another mesh program's key");
+  mesh.task_payload = false;
+  mesh.payload_user_sgprs = no_sgprs;
+  Check(RecompileForTest(mesh_shader, options, nullptr, nullptr, PushData::MeshDrawDwordCount)
+                .spirv == fast_direct.spirv,
+        "a direct fast-launch mesh module changed after its task variant was built");
+}
+
 void TestPixelDefaultValueInputs() {
   ShaderPixelInputInfo ps{};
   ps.input_num = 2;
@@ -12873,6 +12993,7 @@ void TestMeshInputAssembly() {
     uint32_t wave_size = 64;
     bool fast_launch = false;
     uint32_t threads = 256;
+    uint32_t readable = UINT32_MAX;
   };
   std::vector<Case> cases = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
@@ -12934,6 +13055,13 @@ void TestMeshInputAssembly() {
       {Prospero::PrimitiveType::kTriList, 256, 256, 0, 64, 0, 0, 11,
        0x82001520, 0x154ff000, 192, 193, 194, 0, 75, false, 32, false, 256},
   };
+  // Vertex 170 is the last index inside INDEX_BUFFER_SIZE, then the first past it.
+  cases.push_back({Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
+                   0x40000309, 0x00c09000, 6, 7, 8, 340, 0xabcc, true, 64, false, 256, 171});
+  cases.push_back({Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
+                   0x40000309, 0x00c09000, 6, 7, 8, 340, UINT32_MAX, false, 64, false, 256, 170});
+  cases.push_back({Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, 5, 0x40000309,
+                   0x00c09000, 6, 7, 8, 340, 5, false, 64, false, 256, 0});
   for (const uint32_t wave_size : {32u, 64u}) {
     for (const uint32_t threads : {wave_size, 2u * wave_size}) {
       for (const uint32_t group : {0u, 1u, 11u}) {
@@ -12972,8 +13100,9 @@ void TestMeshInputAssembly() {
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
+    // The readable index bound is draw parameter 6 (PushData::MeshIndexBoundParameter).
     const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
+                             test.address_low, 0x12, test.readable};
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
@@ -18605,6 +18734,7 @@ int main() {
   TestFlatAliasOfCustomInput();
   TestFlatAliasOfSmoothInputDuplicates();
   TestPixelDefaultValueInputs();
+  TestMeshTaskPayloadVariant();
   TestVop3F16InterpolationTranslation();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();

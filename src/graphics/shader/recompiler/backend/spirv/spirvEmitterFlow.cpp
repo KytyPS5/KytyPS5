@@ -763,12 +763,33 @@ uint32_t EmitLaneId(EmitterState& state) {
 	           : EmitSubgroupLocalInvocationId(state);
 }
 
+static uint32_t EmitMeshPayloadLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassTaskPayloadWorkgroupEXT),
+	    pointer, state.mesh_payload_variable, ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto index  = inst.Arg(0).U32();
-	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+	const bool index_bound = index == IR::PushData::MeshIndexBoundParameter;
+	if (state.program.stage != ShaderType::Mesh ||
+	    (index >= IR::PushData::MeshDrawDwordCount && !index_bound)) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	if (state.mesh_payload_variable != 0) {
+		return EmitMeshPayloadLoad(state, index_bound ? IR::MeshTaskPayloadIndexBound : index);
+	}
+	return EmitPushDataLoad(
+	    state, ConstantU32(state, index_bound ? IR::PushData::MeshIndexBoundDword(
+	                                                state.input_info.vertex->user_clip_planes)
+	                                          : index));
+}
+
 uint32_t EmitDispatchThreadInRange(EmitterState& state) {
 	const auto load_push = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
@@ -810,6 +831,16 @@ uint32_t EmitDispatchThreadInRange(EmitterState& state) {
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	if (state.mesh_payload_variable != 0) {
+		const auto& sgprs = state.input_info.vertex->mesh.payload_user_sgprs;
+		// Written in this order by the command processor, so the last naming of a register wins.
+		for (uint32_t slot = static_cast<uint32_t>(sgprs.size()); slot-- > 0;) {
+			if (sgprs[slot] != ShaderMeshInputInfo::NoPayloadSgpr &&
+			    IR::RegIndex(reg) == 8u + sgprs[slot]) {
+				return EmitMeshPayloadLoad(state, IR::PushData::MeshDrawDwordCount + slot);
+			}
+		}
+	}
 
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {

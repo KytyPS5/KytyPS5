@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/dispatchHazard.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -50,11 +51,17 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+// Nonzero address: the GPU reads up to count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
 	uint64_t address = 0;
 	uint32_t count   = 0;
 	uint32_t stride  = 0;
+	// Guest dword that caps the record count on the GPU, or 0.
+	uint64_t count_address = 0;
+	// The SH registers the packet writes each record's start vertex, instance and index to.
+	uint32_t vertex_offset_register   = Pm4::SH_NOP;
+	uint32_t instance_offset_register = Pm4::SH_NOP;
+	uint32_t index_offset_register    = Pm4::SH_NOP;
 };
 
 struct DrawIndexArgs {
@@ -66,7 +73,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
-	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	// Indices from index_addr past this many lie outside INDEX_BUFFER_SIZE and read as zero.
+	uint32_t index_limit = UINT32_MAX;
+	// With indirect records, index_addr is the index base and index_count INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
 };
 
@@ -94,6 +103,11 @@ enum class IndirectDrawResult : uint8_t {
 	IndexBufferUnmapped,
 	CustomRestart,
 	MeshStage,
+	MeshFastLaunchIndexed,
+	MeshTaskLimit,
+	MeshNoGroups,
+	MeshOffsetRegister,
+	MeshPayloadLimit,
 	OffsetRegister,
 };
 
@@ -224,6 +238,7 @@ private:
 };
 
 class ThreadDispatcher;
+class MeshIndirectVerifier;
 
 class RenderExecutor {
 public:
@@ -311,6 +326,7 @@ private:
 	                                                     uint32_t group_y, uint32_t group_z,
 	                                                     uint32_t mode);
 	[[nodiscard]] ThreadDispatcher&     ThreadDispatch();
+	[[nodiscard]] MeshIndirectVerifier& MeshIndirectVerify();
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -341,7 +357,10 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::unique_ptr<ThreadDispatcher>     m_thread_dispatch;
+	std::unique_ptr<MeshIndirectVerifier> m_mesh_indirect_verifier;
+	// KYTY_NO_MESH_INDIRECT; the verifier is a test hook.
 	bool m_mesh_indirect        = true;
+	bool m_mesh_indirect_verify = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

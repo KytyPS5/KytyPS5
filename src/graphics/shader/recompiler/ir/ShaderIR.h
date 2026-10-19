@@ -421,6 +421,9 @@ inline constexpr uint32_t NullBufferByteOffset = 252;
 inline constexpr uint32_t NullBufferRange      = 4;
 
 static_assert(sizeof(PushData) == 128);
+// Task payload: mesh draw dwords, start vertex/instance/index for the user SGPRs, index bound.
+inline constexpr uint32_t MeshTaskPayloadDwordCount = PushData::MeshDrawDwordCount + 4;
+inline constexpr uint32_t MeshTaskPayloadIndexBound = PushData::MeshDrawDwordCount + 3;
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
@@ -721,6 +724,10 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// Bit r: the host resource plan evaluates user-data register r.
+	uint64_t plan_user_data_registers = 0;
+	// Spirv::WorkgroupStorageBound of the module.
+	uint64_t                      workgroup_storage_bytes = 0;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 };

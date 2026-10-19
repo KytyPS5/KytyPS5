@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "gpu_test_shaders/gpu_test_mesh_indirect_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -35,6 +36,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/dispatchGuard.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -594,6 +596,16 @@ struct RenderExecutorTestAccess {
                                  .indirect = records},
                                 &refusal);
     return drawn ? IndirectDrawResult::Drawn : refusal;
+  }
+
+  static bool &MeshIndirect(RenderExecutor &executor) { return executor.m_mesh_indirect; }
+
+  static bool &MeshIndirectVerify(RenderExecutor &executor) {
+    return executor.m_mesh_indirect_verify;
+  }
+
+  static MeshIndirectVerifier::Totals MeshIndirectTotals(RenderExecutor &executor) {
+    return executor.MeshIndirectVerify().GetTotals();
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -1624,6 +1636,239 @@ void CheckDispatchWorkGroupGuard() {
   Require(name, "draw invocation overflow",
           !DrawCountsRepresentable(0x0A566840u, 0x100u, 0, 0),
           "a draw whose total invocations overflow 32 bits was accepted");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+struct MeshIndirectCase {
+  MeshDrawShape shape;
+  MeshIndirectRecord record;
+  DispatchPlanAction action;
+  uint32_t groups_x = 0;
+  uint32_t groups_y = 0;
+};
+
+// Hand-computed CPU replay decisions for one non-indexed record each.
+std::vector<MeshIndirectCase> MeshIndirectCases() {
+  constexpr MeshDrawShape tri_list{3, 3, 4, {16, 8, 1}, 64};
+  constexpr MeshDrawShape tri_strip{3, 1, 4, {16, 8, 1}, 64};
+  constexpr MeshDrawShape points{1, 1, 1, {16, 8, 1}, 64};
+  constexpr MeshDrawShape lines{2, 2, 2, {16, 8, 1}, 64};
+  constexpr MeshDrawShape no_z{1, 1, 1, {16, 8, 0}, 64};
+  constexpr MeshDrawShape wide{1, 1, 1, {0xffffffffu, 0xffffffffu, 1}, 0xffffffffu};
+  // What PrepareProgram gives fast launch: one point, so one subgroup, per mesh group.
+  constexpr MeshDrawShape fast_launch{1, 1, 1, {16, 8, 1}, 64};
+  using A = DispatchPlanAction;
+  return {
+      {tri_list, {2, 1, 0, 0}, A::SkipEmpty},
+      {tri_list, {3, 1, 0, 0}, A::Record, 1, 1},
+      {tri_list, {5, 1, 0, 0}, A::Record, 1, 1},
+      {tri_list, {12, 1, 0, 0}, A::Record, 1, 1},
+      {tri_list, {15, 1, 0, 0}, A::Record, 2, 1},
+      {tri_strip, {6, 1, 0, 0}, A::Record, 1, 1},
+      {tri_strip, {7, 1, 0, 0}, A::Record, 2, 1},
+      {lines, {5, 3, 0, 0}, A::Record, 1, 3},
+      {tri_list, {0, 1, 0, 0}, A::SkipEmpty},
+      {tri_list, {3, 0, 0, 0}, A::SkipEmpty},
+      {points, {16, 1, 0, 0}, A::Record, 16, 1},
+      {points, {17, 1, 0, 0}, A::SkipOverLimit},
+      {points, {1, 8, 0, 0}, A::Record, 1, 8},
+      {points, {1, 9, 0, 0}, A::SkipOverLimit},
+      {points, {16, 4, 0, 0}, A::Record, 16, 4},
+      {points, {16, 5, 0, 0}, A::SkipOverLimit},
+      {no_z, {1, 1, 0, 0}, A::SkipOverLimit},
+      {wide, {1, 1, 0xffffffffu, 0}, A::Record, 1, 1},
+      {wide, {2, 1, 0xffffffffu, 0}, A::SkipUnrepresentable},
+      {wide, {1, 1, 0, 0xffffffffu}, A::Record, 1, 1},
+      {wide, {1, 2, 0, 0xffffffffu}, A::SkipUnrepresentable},
+      {wide, {0x10000u, 0xffffu, 0, 0}, A::Record, 0x10000u, 0xffffu},
+      {wide, {0x10000u, 0x10000u, 0, 0}, A::SkipUnrepresentable},
+      {wide, {0x0A566840u, 0x100u, 0, 0}, A::SkipUnrepresentable},
+      // A fast-launch record's start vertex and instance only reach SGPRs.
+      {fast_launch, {1, 1, 0, 0}, A::Record, 1, 1},
+      {fast_launch, {5, 2, 7, 3}, A::Record, 5, 2},
+      {fast_launch, {16, 4, 100, 9}, A::Record, 16, 4},
+      {fast_launch, {17, 1, 3, 0}, A::SkipOverLimit},
+      {fast_launch, {1, 9, 0, 2}, A::SkipOverLimit},
+      {fast_launch, {9, 8, 1, 1}, A::SkipOverLimit},
+      {fast_launch, {0, 3, 5, 0}, A::SkipEmpty},
+      {fast_launch, {4, 0, 5, 1}, A::SkipEmpty},
+      {fast_launch, {2, 1, 0xfffffffeu, 0}, A::Record, 2, 1},
+      {fast_launch, {3, 1, 0xfffffffeu, 0}, A::SkipUnrepresentable},
+      {fast_launch, {1, 2, 0, 0xfffffffeu}, A::Record, 1, 2},
+      {fast_launch, {1, 3, 0, 0xfffffffeu}, A::SkipUnrepresentable},
+  };
+}
+
+struct MeshIndexedCase {
+  MeshDrawShape shape;
+  MeshIndexedRecord record;
+  uint64_t index_base = 0;
+  uint32_t element_size = 0;
+  uint32_t buffer_size = 0;
+  DispatchPlanAction action;
+  uint32_t groups_x = 0;
+  uint32_t groups_y = 0;
+  uint64_t address = 0;
+  uint32_t readable = 0;
+};
+
+// Hand-computed CPU replay decisions for one indexed record each.
+std::vector<MeshIndexedCase> MeshIndexedCases() {
+  constexpr MeshDrawShape tri_list{3, 3, 4, {16, 8, 1}, 64};
+  constexpr MeshDrawShape points{1, 1, 1, {16, 8, 1}, 64};
+  constexpr MeshDrawShape wide{1, 1, 1, {0xffffffffu, 0xffffffffu, 1}, 0xffffffffu};
+  constexpr uint64_t high = 0x0000001000000000ull;
+  using A = DispatchPlanAction;
+  return {
+      {tri_list, {3, 1, 0, 0, 0}, 0x1000, 2, 6, A::Record, 1, 1, 0x1000, 6},
+      {tri_list, {6, 1, 3, 5, 2}, 0x1000, 2, 6, A::Record, 1, 1, 0x1006, 3},
+      {tri_list, {15, 1, 4, 0, 0}, 0x1000, 4, 6, A::Record, 2, 1, 0x1010, 2},
+      {tri_list, {6, 2, 6, 0, 0}, 0x1000, 2, 6, A::Record, 1, 2, 0x100c, 0},
+      {tri_list, {3, 1, 9, 0, 0}, 0x1000, 2, 6, A::Record, 1, 1, 0x1012, 0},
+      {tri_list, {3, 1, 2, 0, 0}, 0x2000, 4, 0, A::Record, 1, 1, 0x2008, 0xffffffffu},
+      {tri_list, {2, 1, 0, 0, 0}, 0x1000, 2, 6, A::SkipEmpty, 0, 0, 0x1000, 6},
+      {tri_list, {0, 1, 0, 0, 0}, 0x1000, 2, 6, A::SkipEmpty, 0, 0, 0x1000, 6},
+      {tri_list, {3, 0, 0, 0, 0}, 0x1000, 2, 6, A::SkipEmpty, 0, 0, 0x1000, 6},
+      // The first index and the base vertex never enter the count checks.
+      {tri_list, {3, 1, 0xfffffffeu, 0xffffffffu, 0}, high, 4, 0x10, A::Record, 1, 1,
+       high + 0x3fffffff8ull, 0},
+      {wide, {1, 1, 0, 0, 0xffffffffu}, 0x1000, 2, 4, A::Record, 1, 1, 0x1000, 4},
+      {wide, {1, 2, 0, 0, 0xffffffffu}, 0x1000, 2, 4, A::SkipUnrepresentable, 0, 0, 0x1000, 4},
+      {wide, {0x10000u, 0x10000u, 0, 0, 0}, 0x1000, 2, 4, A::SkipUnrepresentable, 0, 0, 0x1000,
+       4},
+      {points, {16, 4, 1, 0, 0}, 0x1000, 2, 4, A::Record, 16, 4, 0x1002, 3},
+      {points, {17, 1, 0, 0, 0}, 0x1000, 2, 4, A::SkipOverLimit, 0, 0, 0x1000, 4},
+      {points, {16, 5, 0, 0, 0}, 0x1000, 2, 4, A::SkipOverLimit, 0, 0, 0x1000, 4},
+  };
+}
+
+void CheckMeshIndirectDerivation() {
+  constexpr const char *name = "MeshIndirectDerivation";
+  for (const auto &item : MeshIndexedCases()) {
+    const auto plan = DeriveMeshIndexedRecord(item.shape, item.record);
+    Require(name, "indexed record decision",
+            plan.action == item.action &&
+                (item.action != DispatchPlanAction::Record ||
+                 (plan.groups_x == item.groups_x && plan.groups_y == item.groups_y)),
+            "the shared indexed record formula differs from the hand-computed replay");
+    const auto window = IndirectIndexWindow(item.index_base, item.element_size,
+                                            item.buffer_size, item.record.first_index);
+    Require(name, "index window",
+            window.address == item.address && window.readable == item.readable,
+            "the index window differs from INDEX_BUFFER_SIZE read as zero past its end");
+    // DrawIndex checks the same counts before planning the mesh grid directly.
+    if (item.action != DispatchPlanAction::SkipUnrepresentable && item.record.count != 0 &&
+        item.record.instances != 0) {
+      const auto direct = PlanMeshDraw(item.shape, item.record.count, item.record.instances);
+      Require(name, "indexed direct planner",
+              DrawCountsRepresentable(item.record.count, item.record.instances, 0,
+                                      item.record.first_instance) &&
+                  direct.action == plan.action && direct.groups_x == plan.groups_x &&
+                  direct.groups_y == plan.groups_y,
+              "the direct mesh draw planner and the indexed record formula disagree");
+    }
+  }
+  for (const auto &item : MeshIndirectCases()) {
+    const auto plan = DeriveMeshIndirectRecord(item.shape, item.record);
+    Require(name, "record decision",
+            plan.action == item.action &&
+                (item.action != DispatchPlanAction::Record ||
+                 (plan.groups_x == item.groups_x && plan.groups_y == item.groups_y)),
+            "the shared mesh record formula differs from the hand-computed replay");
+    // The direct-draw planner is the same formula once DrawAuto's checks have passed.
+    if (item.action != DispatchPlanAction::SkipUnrepresentable && item.record.count != 0 &&
+        item.record.instances != 0) {
+      const auto direct = PlanMeshDraw(item.shape, item.record.count, item.record.instances);
+      Require(name, "direct planner", direct.action == plan.action &&
+                                          direct.groups_x == plan.groups_x &&
+                                          direct.groups_y == plan.groups_y,
+              "the direct mesh draw planner and the indirect record formula disagree");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// The verify snapshot is compared field by field; a perturbed GPU twin must be caught.
+void CheckMeshIndirectVerifyEntries() {
+  constexpr const char *name = "MeshIndirectVerifyEntries";
+  const MeshIndirectVerifyPacket packet{
+      .shape = {3, 3, 1, {16, 8, 1}, 64}, .max_count = 3, .counted = true};
+  const auto entry_for = [](uint32_t index, uint32_t count, MeshIndirectRecord record,
+                            bool drawn) {
+    std::array<uint32_t, MeshIndirectVerifyEntryDwords> entry{};
+    entry[0] = index + 1u;
+    entry[1] = std::min(count, 3u);
+    entry[2] = count;
+    if (drawn) {
+      entry[3] = record.count;
+      entry[4] = record.instances;
+      entry[5] = record.first_vertex;
+      entry[6] = record.first_instance;
+      const auto plan = DeriveMeshIndirectRecord({3, 3, 1, {16, 8, 1}, 64}, record);
+      if (plan.action == DispatchPlanAction::Record) {
+        entry[8] = plan.groups_x;
+        entry[9] = plan.groups_y;
+      }
+      entry[10] = record.count;
+      entry[10 + ShaderRecompiler::IR::PushData::MeshDrawDwordCount] = record.first_vertex;
+      entry[11 + ShaderRecompiler::IR::PushData::MeshDrawDwordCount] = record.first_instance;
+    }
+    return entry;
+  };
+  bool empty = false;
+  const auto good = entry_for(0, 2, {6, 2, 3, 1}, true);
+  Require(name, "matching snapshot",
+          MeshIndirectEntryAgrees(packet, 0, good, empty) && !empty,
+          "a snapshot that matches the CPU replay was reported as a mismatch");
+  Require(name, "empty record",
+          MeshIndirectEntryAgrees(packet, 1, entry_for(1, 2, {6, 0, 0, 0}, true), empty) &&
+              empty,
+          "an empty record was not counted as empty");
+  Require(name, "record past the count",
+          MeshIndirectEntryAgrees(packet, 2, entry_for(2, 2, {}, false), empty) && !empty,
+          "a record past the count dword was not expected to launch nothing");
+  for (const uint32_t word : {0u, 1u, 2u, 3u, 5u, 7u, 8u, 9u, 10u, 12u, 16u, 17u, 18u, 19u}) {
+    auto bad = good;
+    bad[word] ^= 1u;
+    Require(name, "perturbed snapshot", !MeshIndirectEntryAgrees(packet, 0, bad, empty),
+            "a perturbed task-front decision was accepted");
+  }
+  auto launched_past_count = entry_for(2, 2, {}, false);
+  launched_past_count[8] = launched_past_count[9] = 1;
+  Require(name, "launch past the count",
+          !MeshIndirectEntryAgrees(packet, 2, launched_past_count, empty),
+          "a task workgroup past the count that launched mesh groups was accepted");
+
+  // An indexed snapshot also carries the record's index window and its first index slot.
+  const MeshIndirectVerifyPacket indexed{.shape = {3, 3, 1, {16, 8, 1}, 64},
+                                         .max_count = 2,
+                                         .indexed = true,
+                                         .index_element_size = 2,
+                                         .index_base = 0x0000000100001000ull,
+                                         .index_buffer_size = 6};
+  std::array<uint32_t, MeshIndirectVerifyEntryDwords> indexed_good{};
+  const std::array<uint32_t, 5> indexed_record{6, 2, 4, 7, 1};
+  indexed_good[0] = 1;
+  indexed_good[1] = 2;
+  std::copy(indexed_record.begin(), indexed_record.end(), indexed_good.begin() + 3);
+  indexed_good[8] = 2;
+  indexed_good[9] = 2;
+  const std::array<uint32_t, 10> indexed_payload{6, 0, 0, 2, 0x1008, 1, 7, 1, 4, 2};
+  std::copy(indexed_payload.begin(), indexed_payload.end(), indexed_good.begin() + 10);
+  Require(name, "matching indexed snapshot",
+          MeshIndirectEntryAgrees(indexed, 0, indexed_good, empty) && !empty,
+          "an indexed snapshot that matches the CPU replay was reported as a mismatch");
+  for (uint32_t word = 3; word < 20; word++) {
+    auto bad = indexed_good;
+    bad[word] ^= 1u;
+    Require(name, "perturbed indexed snapshot",
+            !MeshIndirectEntryAgrees(indexed, 0, bad, empty),
+            "a perturbed indexed task-front decision was accepted");
+  }
+  auto as_auto = indexed;
+  as_auto.indexed = false;
+  Require(name, "indexed layout", !MeshIndirectEntryAgrees(as_auto, 0, indexed_good, empty),
+          "an indexed snapshot was accepted as a non-indexed record");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -7197,6 +7442,131 @@ public:
       next2(command, info);
     }
   };
+
+  // The task shader's GLSL twin of the record formula, run over the host table, bit for bit.
+  void CheckMeshIndirectDerivationOnGpu() {
+    constexpr const char *name = "MeshIndirectDerivationGpu";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    const auto cases = MeshIndirectCases();
+    const auto indexed_cases = MeshIndexedCases();
+    constexpr uint32_t case_words = 17;
+    constexpr uint32_t result_words = 5;
+    const auto auto_count = static_cast<uint32_t>(cases.size());
+    const auto count = auto_count + static_cast<uint32_t>(indexed_cases.size());
+    constexpr auto usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                           vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    {
+      Libs::Graphics::Buffer input(m_runtime_context, scheduler, MemoryUsage::Download, 0, usage,
+                   uint64_t{count} * case_words * sizeof(u32));
+      Libs::Graphics::Buffer output(m_runtime_context, scheduler, MemoryUsage::Download, 0, usage,
+                    uint64_t{count} * result_words * sizeof(u32));
+      auto *words = reinterpret_cast<u32 *>(input.Mapped().data());
+      const auto pack_shape = [](const MeshDrawShape &shape) {
+        return std::array<u32, 7>{shape.primitive_size, shape.primitive_step,
+                                  shape.primitives_per_group, shape.max_groups[0],
+                                  shape.max_groups[1], shape.max_groups[2], shape.max_total};
+      };
+      for (uint32_t index = 0; index < count; index++) {
+        std::array<u32, case_words> packed{};
+        if (index < auto_count) {
+          const auto &item = cases[index];
+          const auto shape = pack_shape(item.shape);
+          std::copy(shape.begin(), shape.end(), packed.begin() + 1);
+          packed[8] = item.record.count;
+          packed[9] = item.record.instances;
+          packed[10] = item.record.first_vertex;
+          packed[11] = item.record.first_instance;
+        } else {
+          const auto &item = indexed_cases[index - auto_count];
+          packed[0] = 1;
+          const auto shape = pack_shape(item.shape);
+          std::copy(shape.begin(), shape.end(), packed.begin() + 1);
+          packed[8] = item.record.count;
+          packed[9] = item.record.instances;
+          packed[10] = item.record.first_index;
+          packed[11] = item.record.base_vertex;
+          packed[12] = item.record.first_instance;
+          packed[13] = static_cast<u32>(item.index_base);
+          packed[14] = static_cast<u32>(item.index_base >> 32u);
+          packed[15] = item.element_size;
+          packed[16] = item.buffer_size;
+        }
+        std::copy(packed.begin(), packed.end(), words + index * case_words);
+      }
+      input.Flush(0, input.Size());
+      std::memset(output.Mapped().data(), 0xcd, output.Size());
+      output.Flush(0, output.Size());
+
+      const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0,
+                                       2 * sizeof(uint64_t)};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.pushConstantRangeCount = 1;
+      layout_info.pPushConstantRanges = &push;
+      vk::PipelineLayout layout = nullptr;
+      RequireVk(name, "layout", m_device.createPipelineLayout(&layout_info, nullptr, &layout),
+                "vkCreatePipelineLayout");
+      const auto module = CompileSPV(GPU_TEST_MESH_INDIRECT_SPV, m_device);
+      vk::ComputePipelineCreateInfo pipeline_info{};
+      pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+      pipeline_info.stage.module = module;
+      pipeline_info.stage.pName = "main";
+      pipeline_info.layout = layout;
+      vk::Pipeline pipeline = nullptr;
+      RequireVk(name, "pipeline",
+                m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+                "vkCreateComputePipelines");
+      const auto command = scheduler.Current().Handle();
+      const std::array<uint64_t, 2> addresses{input.BufferDeviceAddress(),
+                                              output.BufferDeviceAddress()};
+      command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+      command.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(addresses),
+                            addresses.data());
+      command.dispatch(count, 1, 1);
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                              vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
+                              nullptr);
+      scheduler.Finish();
+      output.Invalidate(0, output.Size());
+      const auto *results = reinterpret_cast<const u32 *>(output.Mapped().data());
+      for (uint32_t index = 0; index < count; index++) {
+        const auto *result = results + index * result_words;
+        MeshDrawPlan plan;
+        IndexWindow window;
+        if (index < auto_count) {
+          plan = DeriveMeshIndirectRecord(cases[index].shape, cases[index].record);
+        } else {
+          const auto &item = indexed_cases[index - auto_count];
+          plan = DeriveMeshIndexedRecord(item.shape, item.record);
+          window = IndirectIndexWindow(item.index_base, item.element_size, item.buffer_size,
+                                       item.record.first_index);
+        }
+        const bool recorded = plan.action == DispatchPlanAction::Record;
+        Require(name, "GPU record decision",
+                result[0] == (recorded ? plan.groups_x : 0u) &&
+                    result[1] == (recorded ? plan.groups_y : 0u),
+                "the task shader's record formula differs from DeriveMeshIndirectRecord");
+        Require(name, "GPU index window",
+                result[2] == static_cast<u32>(window.address) &&
+                    result[3] == static_cast<u32>(window.address >> 32u) &&
+                    result[4] == window.readable,
+                "the task shader's index window differs from IndirectIndexWindow");
+      }
+      m_device.destroyPipeline(pipeline);
+      m_device.destroyShaderModule(module);
+      m_device.destroyPipelineLayout(layout);
+    }
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok (%u records)\n", name, count);
+  }
 
   void CheckBufferCacheTransferBatch() {
     constexpr const char *name = "BufferCacheTransferBatch";
@@ -27250,6 +27620,845 @@ public:
         std::printf("[gpu]     %-32s ok\n", indirect_name);
       }
 
+      // A merged ES/GS stage drawn indirectly derives each record on the GPU.
+      if (m_draw_indirect_supported && m_task_supported &&
+          color_format == Prospero::BufferFormat::k32_32_32_32Float) {
+        constexpr const char *mesh_name = "GpuIndirectMeshTask";
+        constexpr uint64_t mesh_vertex_address = depth_address + 0x8800;
+        constexpr uint64_t mesh_source_address = depth_address + 0x9000;
+        constexpr uint64_t mesh_count_source_address = depth_address + 0x9800;
+        constexpr uint64_t mesh_args_address = depth_address + 0x5f000;
+        constexpr uint64_t mesh_count_address = depth_address + 0x5f800;
+        constexpr uint32_t vertex_register = Pm4::SPI_SHADER_USER_DATA_GS_0 + 4;
+        constexpr uint32_t instance_register = Pm4::SPI_SHADER_USER_DATA_GS_0 + 5;
+        LibKernel::Memory::InstallGpuResources(&context);
+        // Two corner triangles, one position per 32-byte vertex record.
+        constexpr std::array<float, 48> mesh_vertices{
+            -1.0f, -1.0f,  0, 0, 0, 0, 0, 0, -0.25f, -1.0f, 0, 0, 0, 0, 0, 0,
+            -1.0f, -0.25f, 0, 0, 0, 0, 0, 0,  1.0f,   1.0f, 0, 0, 0, 0, 0, 0,
+             0.25f, 1.0f,  0, 0, 0, 0, 0, 0,  1.0f,  0.25f, 0, 0, 0, 0, 0, 0};
+        std::memcpy(reinterpret_cast<void *>(mesh_vertex_address), mesh_vertices.data(),
+                    sizeof(mesh_vertices));
+        const ShaderBufferResource mesh_buffer{{
+            static_cast<u32>(mesh_vertex_address),
+            static_cast<u32>(mesh_vertex_address >> 32u) | (32u << 16u), 6,
+            DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u)}};
+        // One triangle per subgroup; s12/s13 are the start vertex and instance the packet names.
+        static const auto mesh_code = [] {
+          std::vector<u32> code;
+          AppendSMovLiteral(&code, 124, 0x1003u); // three vertices and one primitive
+          code.push_back(EncodeSopp(0x10, 9));    // s_sendmsg MSG_GS_ALLOC_REQ
+          code.push_back(EncodeVop2(0x25, 8, 13, 8));           // v_add_nc_u32 v8, s13, v8
+          code.push_back(EncodeVop2(0x0b, 6, InlineU32(3), 8)); // v_mul_u32_u24 v6, 3, v8
+          code.push_back(EncodeVop2(0x25, 5, Vgpr(5), 6));      // v_add_nc_u32 v5, v5, v6
+          code.push_back(EncodeVop2(0x25, 5, 12, 5));           // v_add_nc_u32 v5, s12, v5
+          code.push_back(EncodeMubuf0(0x0d, 0, true, false));
+          code.push_back(EncodeMubuf1(0, 2, 5)); // buffer_load_dwordx2 v[0:1], v5, s[8:11]
+          AppendVMovU32(&code, 2, 0);
+          AppendVMovLiteral(&code, 3, 0x3f800000u);
+          code.insert(code.end(), {EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3)});
+          AppendVMovLiteral(&code, 4, 0x00200400u); // vertices 0, 1 and 2
+          code.insert(code.end(), {EncodeExp0(0x14, 0x1), EncodeExp1(4, 0, 0, 0)});
+          AppendEnd(&code);
+          return code;
+        }();
+        // Fast launch: one triangle per subgroup, (v5 + s12 + v6 + s13), a thread per vertex.
+        const auto make_fast_code = [](u32 wave) {
+          std::vector<u32> code;
+          AppendSMovLiteral(&code, 124, 0x1003u); // three vertices and one primitive
+          code.push_back(EncodeSopp(0x10, 9));    // s_sendmsg MSG_GS_ALLOC_REQ
+          code.push_back(EncodeVop2(0x25, 6, 13, 6));           // v_add_nc_u32 v6, s13, v6
+          code.push_back(EncodeVop2(0x25, 5, 12, 5));           // v_add_nc_u32 v5, s12, v5
+          code.push_back(EncodeVop2(0x25, 5, Vgpr(6), 5));      // v_add_nc_u32 v5, v6, v5
+          code.push_back(EncodeVop2(0x0b, 5, InlineU32(3), 5)); // v_mul_u32_u24 v5, 3, v5
+          // The thread's index in the subgroup: s3[27:24] is the wave, mbcnt the lane.
+          code.push_back(EncodeSop2(0x20, 21, 3, InlineU32(24)));  // s_lshr_b32 s21, s3, 24
+          code.push_back(EncodeSop2(0x0e, 21, 21, InlineU32(15))); // s_and_b32 s21, s21, 15
+          code.push_back(EncodeSop2(0x1e, 21, 21, InlineU32(wave == 32u ? 5u : 6u))); // s_lshl_b32
+          code.insert(code.end(), {0xd7650007u, 0x000100c1u}); // v_mbcnt_lo_u32_b32 v7, -1, 0
+          code.insert(code.end(), {0xd7660007u, 0x00020ec1u}); // v_mbcnt_hi_u32_b32 v7, -1, v7
+          code.push_back(EncodeVop2(0x25, 7, 21, 7));           // v_add_nc_u32 v7, s21, v7
+          code.push_back(EncodeVop2(0x25, 5, Vgpr(7), 5));      // v_add_nc_u32 v5, v7, v5
+          code.push_back(EncodeMubuf0(0x0d, 0, true, false));
+          code.push_back(EncodeMubuf1(0, 2, 5)); // buffer_load_dwordx2 v[0:1], v5, s[8:11]
+          AppendVMovU32(&code, 2, 0);
+          AppendVMovLiteral(&code, 3, 0x3f800000u);
+          code.insert(code.end(), {EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3)});
+          AppendVMovLiteral(&code, 4, 0x00200400u); // vertices 0, 1 and 2
+          code.insert(code.end(), {EncodeExp0(0x14, 0x1), EncodeExp1(4, 0, 0, 0)});
+          AppendEnd(&code);
+          return code;
+        };
+        static const std::array<std::vector<u32>, 2> fast_code{make_fast_code(32),
+                                                               make_fast_code(64)};
+        static const auto mesh_pixel_code = [] {
+          std::vector<u32> code;
+          AppendVMovLiteral(&code, 0, 0x3e800000u);
+          AppendVMovLiteral(&code, 1, 0x3f000000u);
+          AppendVMovLiteral(&code, 2, 0x3f400000u);
+          AppendVMovLiteral(&code, 3, 0x3f800000u);
+          code.insert(code.end(), {EncodeExp0(0, 0xf), EncodeExp1(0, 1, 2, 3)});
+          AppendEnd(&code);
+          return code;
+        }();
+        const auto mesh_vs = reinterpret_cast<uint64_t>(mesh_code.data());
+        const std::array<uint64_t, 2> fast_vs{reinterpret_cast<uint64_t>(fast_code[0].data()),
+                                              reinterpret_cast<uint64_t>(fast_code[1].data())};
+        const auto mesh_ps = reinterpret_cast<uint64_t>(mesh_pixel_code.data());
+        ShaderMapUserData(mesh_vs,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+             .code_size_bytes = static_cast<u32>(mesh_code.size() * sizeof(u32))});
+        for (u32 i = 0; i < 2; i++) {
+          ShaderMapUserData(fast_vs[i],
+              {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+               .code_size_bytes = static_cast<u32>(fast_code[i].size() * sizeof(u32))});
+        }
+        ShaderMapUserData(mesh_ps,
+            {.type = Prospero::ShaderBinaryType::kPs,
+             .code_size_bytes = static_cast<u32>(mesh_pixel_code.size() * sizeof(u32))});
+        shaders.SetEsShaderBase(mesh_vs);
+        shaders.SetPsShaderBase(mesh_ps);
+        shaders.SetGsShaderResource2({.user_sgpr = 6});
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetGsUserSgpr(i, mesh_buffer.fields[i]);
+        }
+        const auto set_offsets = [&](u32 first_vertex, u32 first_instance) {
+          shaders.SetGsUserSgpr(4, first_vertex);
+          shaders.SetGsUserSgpr(5, first_instance);
+        };
+        registers.SetMaxOutputPerSubgroup(3);
+        registers.SetGsMaxVertOut(3);
+        registers.SetGsOutPrimType(2);
+        registers.SetNggSubgrpCntl(1);
+        registers.SetPsInControl(0x8000);
+        user_config.SetGeControl({1, 3});
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+        vk::PhysicalDeviceVulkan11Properties properties11{};
+        vk::PhysicalDeviceProperties2 properties2{};
+        properties2.pNext = &properties11;
+        m_physical_device.getProperties2(&properties2);
+        const auto saved_subgroup_size = m_runtime_context.subgroup_size;
+        m_runtime_context.subgroup_size = properties11.subgroupSize;
+        const auto &limits = m_runtime_context.mesh_shader_properties;
+        auto &buffers = context.GetBufferCache();
+        auto &mesh_indirect = RenderExecutorTestAccess::MeshIndirect(executor);
+        auto &mesh_verify = RenderExecutorTestAccess::MeshIndirectVerify(executor);
+        const bool mesh_default = mesh_indirect;
+        mesh_verify = false;
+
+        const auto read_pixels = [&] {
+          return ReadCachedTexel(mesh_name, context, sparse_color.image_id, {},
+                                 {extent, extent, 1});
+        };
+        const auto direct = [&](u32 count, u32 instances, u32 first_vertex,
+                                u32 first_instance) {
+          clear_rect();
+          set_offsets(first_vertex, first_instance);
+          RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(),
+              {.vertex_count = count, .instance_count = instances,
+               .first_vertex = first_vertex, .first_instance = first_instance,
+               .offset_source = DrawOffsetSource::IndirectArgs});
+          // Stale on purpose: a record that reached the shader through them would draw wrong.
+          set_offsets(5, 1);
+          return read_pixels();
+        };
+        std::array<u32, 32> uploaded{};
+        const auto upload = [&](std::initializer_list<u32> words) {
+          uploaded = {};
+          std::copy(words.begin(), words.end(), uploaded.begin());
+          std::memcpy(reinterpret_cast<void *>(mesh_source_address), uploaded.data(),
+                      sizeof(uploaded));
+          (void)buffers.ObtainBuffer(mesh_args_address, sizeof(uploaded), true);
+          buffers.CopyBuffer(mesh_args_address, mesh_source_address, sizeof(uploaded), false,
+                             false);
+        };
+        const auto set_count = [&](u32 count) {
+          std::memcpy(reinterpret_cast<void *>(mesh_count_source_address), &count,
+                      sizeof(count));
+          (void)buffers.ObtainBuffer(mesh_count_address, sizeof(count), true);
+          buffers.CopyBuffer(mesh_count_address, mesh_count_source_address, sizeof(count), false,
+                             false);
+        };
+        const auto submit = [&](IndirectDrawArgs args) {
+          args.args_addr = mesh_args_address;
+          if (args.vertex_offset_register == Pm4::SH_NOP) {
+            args.vertex_offset_register = vertex_register;
+          }
+          if (args.instance_offset_register == Pm4::SH_NOP) {
+            args.instance_offset_register = instance_register;
+          }
+          return RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(), args);
+        };
+        const auto gpu_owned = [&](const IndirectDrawArgs &args) {
+          return buffers.IsRegionGpuModified(mesh_args_address, sizeof(uploaded)) &&
+                 (args.count_addr == 0 ||
+                  buffers.IsRegionGpuModified(args.count_addr, sizeof(u32)));
+        };
+        const auto expect = [&](const char *what, IndirectDrawArgs args,
+                                const std::vector<u32> &expected) {
+          clear_rect();
+          Require(mesh_name, what, submit(args) == IndirectDrawResult::Drawn,
+                  "a merged ES/GS indirect draw fell back to reading its records on the CPU");
+          Require(mesh_name, what, gpu_owned(args),
+                  "the mesh indirect draw drained its GPU-written records");
+          Require(mesh_name, what, read_pixels() == expected,
+                  "a mesh indirect draw differs from the same draw with CPU-read records");
+        };
+        const auto refuse = [&](const char *what, IndirectDrawArgs args,
+                                IndirectDrawResult expected) {
+          Require(mesh_name, what, submit(args) == expected && gpu_owned(args),
+                  "a merged ES/GS indirect draw was not refused by name, or read its records");
+        };
+        const auto saved_stages = registers.GetShaderStages();
+        const IndirectDrawArgs counted{
+            .max_count = 2, .stride = 16, .count_addr = mesh_count_address};
+        // Fast launch takes one point per subgroup: a record counts subgroups, not vertices.
+        const auto set_mode = [&](bool fast, u32 wave) {
+          shaders.SetEsShaderBase(fast ? fast_vs[wave == 32u ? 0 : 1] : mesh_vs);
+          shaders.SetGsShaderResource2(
+              {.user_sgpr = 6, .es_vgpr_component_count = static_cast<uint8_t>(fast ? 1u : 0u)});
+          user_config.SetGeControl(fast ? HW::GeControl{1, 1} : HW::GeControl{1, 3});
+          user_config.SetPrimitiveType(fast ? Prospero::PrimitiveType::kPointList
+                                            : Prospero::PrimitiveType::kTriList);
+        };
+        for (const bool fast : {false, true}) {
+          const u32 unit = fast ? 1u : 3u;
+          for (const u32 wave : {32u, 64u}) {
+            set_mode(fast, wave);
+            registers.SetShaderStages(0x20u | (wave == 32u ? 0x00400000u : 0u) |
+                                      (fast ? 0x00080000u : 0u));
+            ShaderVertexInputInfo prepared{};
+            (void)PrepareProgram(shaders.GetVs(), registers, user_config, prepared);
+            const auto shape = MeshShapeOf(prepared.mesh, limits);
+            Require(mesh_name, "prepared mesh shape",
+                    prepared.mesh.fast_launch == fast && shape.primitive_size == unit &&
+                        shape.primitive_step == unit && shape.primitives_per_group == 1,
+                    "the fixture's mesh program is not the one-primitive-per-group shape");
+            clear_rect();
+            const auto blank = read_pixels();
+            const auto first = direct(unit, 1, 0, 0);
+            const auto second = direct(unit, 1, unit, 0);
+            const auto both = direct(2 * unit, 1, 0, 0);
+            Require(mesh_name, "direct references",
+                    first != blank && second != blank && first != second && both != first &&
+                        both != second,
+                    "the mesh fixture did not draw two distinct triangles");
+            Require(mesh_name, "direct instancing",
+                    direct(unit, 2, 0, 0) == both && direct(unit, 1, 0, 1) == second,
+                    "the mesh fixture did not offset its vertices by instance");
+
+            upload({unit, 1, 0, 0});
+            expect("single record", {}, first);
+            upload({unit, 1, unit, 0});
+            expect("start vertex from the record", {}, second);
+            upload({2 * unit, 1, 0, 0});
+            expect("two mesh groups", {}, both);
+            upload({unit, 2, 0, 0});
+            expect("instances", {}, both);
+            upload({unit, 1, 0, 1});
+            expect("start instance from the record", {}, second);
+            upload({0, 1, 0, 0});
+            expect("zero vertices", {}, blank);
+            upload({unit, 0, 0, 0});
+            expect("zero instances", {}, blank);
+
+            upload({unit, 1, 0, 0, unit, 1, unit, 0});
+            expect("two records", {.max_count = 2, .stride = 16}, both);
+            upload({unit, 1, 0, 0, 7, 7, 7, 7, unit, 1, unit, 0});
+            expect("two records with a stride", {.max_count = 2, .stride = 32}, both);
+            upload({unit, 1, 0, 0, unit, 1, unit, 0, unit, 1, unit, 0});
+            for (const u32 count : {0u, 1u, 2u, 3u}) {
+              set_count(count);
+              expect(count == 0   ? "count zero"
+                     : count == 1 ? "count below the bound"
+                     : count == 2 ? "count at the bound"
+                                  : "count past the bound",
+                     counted, count == 0 ? blank : count == 1 ? first : both);
+            }
+
+            // A record past maxMeshWorkGroupCount/TotalCount is skipped; its neighbours still draw.
+            std::vector<MeshIndirectRecord> over_limit{
+                {unit, limits.maxMeshWorkGroupCount[1] + 1u, 0, 0}};
+            if (limits.maxMeshWorkGroupCount[0] < 0xffffffffu / unit) {
+              over_limit.push_back({unit * (limits.maxMeshWorkGroupCount[0] + 1u), 1, 0, 0});
+            }
+            const u32 total_instances = std::min(limits.maxMeshWorkGroupCount[1], 2u);
+            const u32 total_groups = limits.maxMeshWorkGroupTotalCount / total_instances + 1u;
+            if (total_groups <= limits.maxMeshWorkGroupCount[0] &&
+                total_groups < 0xffffffffu / unit) {
+              over_limit.push_back({unit * total_groups, total_instances, 0, 0});
+            }
+            for (const auto &record : over_limit) {
+              Require(mesh_name, "over-limit fixture",
+                      DeriveMeshIndirectRecord(shape, record).action ==
+                          DispatchPlanAction::SkipOverLimit,
+                      "the over-limit record fits the device, so it proves nothing");
+              upload({record.count, record.instances, record.first_vertex, record.first_instance,
+                      unit, 1, unit, 0});
+              expect("record past the mesh group limit", {.max_count = 2, .stride = 16}, second);
+            }
+
+            // Verify mode snapshots each decision and checks it against the CPU formula later.
+            {
+              const auto before = RenderExecutorTestAccess::MeshIndirectTotals(executor);
+              mesh_verify = true;
+              upload({unit, 1, 0, 0, unit, 0, 0, 0, unit, 1, unit, 0});
+              set_count(3);
+              expect("verified count past the bound", counted, first);
+              upload({unit, 1, 0, 0, unit, 1, unit, 0, unit, 1, unit, 0});
+              set_count(1);
+              expect("verified count below the bound", counted, first);
+              upload({unit, limits.maxMeshWorkGroupCount[1] + 1u, 0, 0, unit, 1, unit, 0});
+              expect("verified record past the limit", {.max_count = 2, .stride = 16}, second);
+              scheduler.Finish();
+              mesh_verify = false;
+              const auto after = RenderExecutorTestAccess::MeshIndirectTotals(executor);
+              Require(mesh_name, "verify mode agrees",
+                      after.checked - before.checked == 6 && after.mismatched == before.mismatched &&
+                          after.unverified == before.unverified &&
+                          after.empty - before.empty == 2,
+                      "verify mode disagreed with the CPU formula or skipped records");
+            }
+
+            // Refusals are decided before anything reads the records.
+            upload({unit, 1, unit, 0});
+            // A fast-launch subgroup has no index to fetch; ordinary indexed records need a buffer.
+            refuse(fast ? "fast launch indexed" : "indexed without an index buffer",
+                   {.indexed = true},
+                   fast ? IndirectDrawResult::MeshFastLaunchIndexed
+                        : IndirectDrawResult::IndexBufferUnset);
+            refuse("register outside the GS user data",
+                   {.vertex_offset_register = Pm4::SPI_SHADER_USER_DATA_PS_0},
+                   IndirectDrawResult::MeshOffsetRegister);
+            refuse("register past the user SGPR count",
+                   {.vertex_offset_register = Pm4::SPI_SHADER_USER_DATA_GS_0 + 6},
+                   IndirectDrawResult::MeshOffsetRegister);
+            refuse("register the resource plan reads",
+                   {.vertex_offset_register = Pm4::SPI_SHADER_USER_DATA_GS_0},
+                   IndirectDrawResult::MeshOffsetRegister);
+            {
+              const auto saved_task_count = m_runtime_context.mesh_shader_properties
+                                                .maxTaskWorkGroupCount[0];
+              m_runtime_context.mesh_shader_properties.maxTaskWorkGroupCount[0] = 1;
+              refuse("records past maxTaskWorkGroupCount", {.max_count = 2, .stride = 16},
+                     IndirectDrawResult::MeshTaskLimit);
+              m_runtime_context.mesh_shader_properties.maxTaskWorkGroupCount[0] = saved_task_count;
+            }
+            mesh_indirect = false;
+            refuse("kill switch", {}, IndirectDrawResult::MergedGeometry);
+            mesh_indirect = mesh_default;
+
+            // Empty GPU-written records over an aliased depth surface keep their allocations.
+            upload({unit, 0, 0, 0});
+            alias_round_trips("GpuIndirectMeshAliasedDepth", [&] {
+              Require(mesh_name, "empty GPU-written mesh record",
+                      submit({}) == IndirectDrawResult::Drawn && gpu_owned({}),
+                      "an empty GPU-written mesh draw fell back to the CPU or drained");
+            });
+
+            // The GPU path leaves records GPU-owned; KYTY_NO_MESH_INDIRECT reads them on the CPU.
+            const auto place = [&](bool gpu_written, std::initializer_list<u32> words, u32 count) {
+              if (gpu_written) {
+                upload(words);
+                set_count(count);
+                return;
+              }
+              BufferCacheTestAccess::DrainBuffer(buffers, mesh_args_address, sizeof(uploaded));
+              BufferCacheTestAccess::DrainBuffer(buffers, mesh_count_address, sizeof(u32));
+              std::copy(words.begin(), words.end(), reinterpret_cast<u32 *>(mesh_args_address));
+              *reinterpret_cast<u32 *>(mesh_count_address) = count;
+            };
+            // CPU-written records reach the task front through an upload, not a drain.
+            place(false, {unit, 1, unit, 0}, 0);
+            clear_rect();
+            Require(mesh_name, "CPU-written record",
+                    submit({}) == IndirectDrawResult::Drawn && read_pixels() == second,
+                    "a CPU-written merged ES/GS record did not draw on the GPU");
+            for (const bool gpu : {true, false}) {
+              mesh_indirect = gpu;
+              {
+                place(gpu, {unit, 1, unit, 0}, 0);
+                CommandProcessor processor(context, 0);
+                processor.GetCtx() = registers;
+                processor.GetUcfg() = user_config;
+                processor.GetShCtx() = shaders;
+                processor.BufferInit();
+                processor.SetDrawIndirectArgsBaseAddress(mesh_args_address);
+                const std::array<u32, 5> packet{KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0u), 0u,
+                                                vertex_register, instance_register, 2u};
+                clear_rect();
+                Pm4Execution execution;
+                Require(mesh_name, "packet processed",
+                        processor.Process(execution, packet) == Pm4ProcessResult::Complete,
+                        "the DRAW_INDIRECT packet did not complete");
+                Require(mesh_name, "packet record ownership",
+                        buffers.IsRegionGpuModified(mesh_args_address, sizeof(uploaded)) == gpu,
+                        gpu ? "the command processor read the GPU-written mesh records"
+                            : "the kill switch did not read the records on the CPU");
+                Require(mesh_name, "packet SGPR patch",
+                        (processor.GetShCtx().GetVs().gs_user_sgpr.value[4] == unit) == !gpu,
+                        gpu ? "the GPU path patched the offset SGPR on the CPU"
+                            : "the kill switch no longer patches the offset SGPR");
+                Require(mesh_name, "packet pixels", read_pixels() == second,
+                        "a DRAW_INDIRECT packet with a merged ES/GS stage drew the wrong pixels");
+              }
+              {
+                place(gpu, {unit, 1, 0, 0, unit, 1, unit, 0}, 1);
+                CommandProcessor processor(context, 0);
+                processor.GetCtx() = registers;
+                processor.GetUcfg() = user_config;
+                processor.GetShCtx() = shaders;
+                processor.BufferInit();
+                processor.SetDrawIndirectArgsBaseAddress(mesh_args_address);
+                const std::array<u32, 10> packet{
+                    KYTY_PM4(10, Pm4::IT_DRAW_INDIRECT_MULTI, 0u), 0u, vertex_register,
+                    instance_register, 1u << 30u, 2u, static_cast<u32>(mesh_count_address),
+                    static_cast<u32>(mesh_count_address >> 32u), 16u, 2u};
+                clear_rect();
+                Pm4Execution execution;
+                Require(mesh_name, "multi packet processed",
+                        processor.Process(execution, packet) == Pm4ProcessResult::Complete,
+                        "the DRAW_INDIRECT_MULTI packet did not complete");
+                Require(mesh_name, "multi packet count ownership",
+                        buffers.IsRegionGpuModified(mesh_count_address, sizeof(u32)) == gpu,
+                        gpu ? "the command processor read the GPU-written count"
+                            : "the kill switch did not read the count on the CPU");
+                Require(mesh_name, "multi packet pixels", read_pixels() == first,
+                        "a counted multi-draw packet drew the wrong pixels");
+              }
+              scheduler.Begin(registers, user_config, shaders);
+            }
+            mesh_indirect = mesh_default;
+          }
+        }
+        // Indexed packets: indices past INDEX_BUFFER_SIZE read zero on both paths.
+        {
+          // Away from the other buffers, so draining a neighbour never drains the indices.
+          constexpr uint64_t index_address = depth_address + 0x70000;
+          // The CPU-written source sits beside the other sources, off the GPU-written page.
+          constexpr uint64_t index_source_address = depth_address + 0x9c00;
+          constexpr uint32_t index_bytes = 64;
+          const auto encode_indices = [](u32 element, std::initializer_list<u32> indices) {
+            std::array<uint8_t, index_bytes> bytes{};
+            u32 at = 0;
+            for (const u32 index : indices) {
+              std::memcpy(bytes.data() + at, &index, element);
+              at += element;
+            }
+            return bytes;
+          };
+          const auto upload_indices = [&](u32 element, std::initializer_list<u32> indices) {
+            const auto bytes = encode_indices(element, indices);
+            std::memcpy(reinterpret_cast<void *>(index_source_address), bytes.data(),
+                        bytes.size());
+            (void)buffers.ObtainBuffer(index_address, index_bytes, true);
+            buffers.CopyBuffer(index_address, index_source_address, index_bytes, false, false);
+          };
+          const auto indices_gpu_owned = [&] {
+            return buffers.IsRegionGpuModified(index_address, index_bytes);
+          };
+          const auto saved_task_shader = m_runtime_context.task_shader_enabled;
+          for (const bool merged : {true, false}) {
+            for (const u32 wave : {32u, 64u}) {
+              set_mode(false, wave);
+              // A native NGG stage is a GS binary with LDS and GS_EN clear (RE engine: 0x2000).
+              shaders.SetGsShaderResource2(
+                  {.user_sgpr = 6, .lds_size = static_cast<uint8_t>(merged ? 0u : 1u)});
+              registers.SetShaderStages((merged ? 0x20u : 0x00002000u) |
+                                        (wave == 32u ? 0x00400000u : 0u));
+              ShaderVertexInputInfo prepared{};
+              (void)PrepareProgram(shaders.GetVs(), registers, user_config, prepared);
+              Require(mesh_name, "indexed mesh program",
+                      prepared.logical_stage == ShaderType::Mesh && !prepared.mesh.fast_launch &&
+                          prepared.mesh.lds_size_dwords == (merged ? 0u : 128u) &&
+                          prepared.mesh.primitives_per_group == 1 &&
+                          prepared.mesh.wave_size == wave,
+                      "the fixture is not the one-triangle-per-group mesh program it names");
+              const char *mode = merged ? "indexed merged ES/GS" : "indexed mesh stage";
+              clear_rect();
+              const auto blank = read_pixels();
+              const auto first = direct(3, 1, 0, 0);
+              const auto second = direct(3, 1, 3, 0);
+              const auto both = direct(6, 1, 0, 0);
+              Require(mesh_name, mode,
+                      first != blank && second != blank && first != second && both != first &&
+                          both != second,
+                      "the indexed mesh fixture did not draw two distinct triangles");
+              for (const u32 element : {2u, 4u}) {
+                const u32 index_type = element == 2u ? 0u : 1u;
+                const auto indexed = [&](IndirectDrawArgs args, u32 size = 6) {
+                  args.indexed = true;
+                  args.index_type_and_size = index_type;
+                  args.index_base_addr = index_address;
+                  args.index_buffer_size = size;
+                  return args;
+                };
+                const auto expect_indexed = [&](const char *what, IndirectDrawArgs args,
+                                                const std::vector<u32> &expected) {
+                  expect(what, args, expected);
+                  Require(mesh_name, what, indices_gpu_owned(),
+                          "the indexed mesh draw drained its GPU-written indices");
+                };
+                upload_indices(element, {0, 1, 2, 3, 4, 5});
+                upload({3, 1, 0, 0, 0});
+                expect_indexed("indexed single record", indexed({}), first);
+                upload({3, 1, 3, 0, 0});
+                expect_indexed("first index from the record", indexed({}), second);
+                upload({3, 1, 0, 3, 0});
+                expect_indexed("base vertex from the record", indexed({}), second);
+                upload({3, 1, 0, 0, 1});
+                expect_indexed("indexed start instance from the record", indexed({}), second);
+                upload({6, 1, 0, 0, 0});
+                expect_indexed("two indexed mesh groups", indexed({}), both);
+                upload({3, 2, 0, 0, 0});
+                expect_indexed("indexed instances", indexed({}), both);
+                upload({0, 1, 0, 0, 0});
+                expect_indexed("zero indices", indexed({}), blank);
+                upload({3, 0, 0, 0, 0});
+                expect_indexed("zero indexed instances", indexed({}), blank);
+                upload({3, 1, 0, 0, 0, 3, 1, 3, 0, 0});
+                expect_indexed("two indexed records", indexed({.max_count = 2, .stride = 20}),
+                               both);
+                upload({3, 1, 0, 0, 0, 7, 7, 7, 3, 1, 3, 0, 0});
+                expect_indexed("two indexed records with a stride",
+                               indexed({.max_count = 2, .stride = 32}), both);
+                upload({3, 1, 0, 0, 0, 3, 1, 3, 0, 0, 3, 1, 3, 0, 0});
+                for (const u32 count : {0u, 1u, 2u, 3u}) {
+                  set_count(count);
+                  expect_indexed(count == 0   ? "indexed count zero"
+                                 : count == 1 ? "indexed count below the bound"
+                                 : count == 2 ? "indexed count at the bound"
+                                              : "indexed count past the bound",
+                                 indexed({.max_count = 2, .stride = 20,
+                                          .count_addr = mesh_count_address}),
+                                 count == 0 ? blank : count == 1 ? first : both);
+                }
+                upload({3, limits.maxMeshWorkGroupCount[1] + 1u, 0, 0, 0, 3, 1, 3, 0, 0});
+                expect_indexed("indexed record past the mesh group limit",
+                               indexed({.max_count = 2, .stride = 20}), second);
+                // One SGPR named for start index and base vertex holds the first index.
+                upload_indices(element, {0, 1, 2, 0, 1, 2});
+                upload({3, 1, 3, 0, 0});
+                expect_indexed("first index register named last",
+                               indexed({.vertex_offset_register = vertex_register,
+                                        .index_offset_register = vertex_register}),
+                               second);
+                // INDEX_BUFFER_SIZE = 5: index 5 reads zero, so the triangle is (1, 2, 0).
+                upload_indices(element, {0, 1, 2, 1, 2, 4});
+                upload({3, 1, 3, 0, 0});
+                expect_indexed("index past INDEX_BUFFER_SIZE reads zero", indexed({}, 5), first);
+                upload({3, 1, 5, 0, 0, 3, 1, 9, 0, 0});
+                expect_indexed("first index at or past INDEX_BUFFER_SIZE",
+                               indexed({.max_count = 2, .stride = 20}, 5), blank);
+              }
+              const auto indexed = [&](IndirectDrawArgs args, u32 size = 6) {
+                args.indexed = true;
+                args.index_base_addr = index_address;
+                args.index_buffer_size = size;
+                return args;
+              };
+
+              // Verify mode covers indexed records, their index windows and start-index slots.
+              {
+                const auto before = RenderExecutorTestAccess::MeshIndirectTotals(executor);
+                mesh_verify = true;
+                upload_indices(2, {0, 1, 2, 3, 4, 5});
+                upload({3, 1, 0, 0, 0, 3, 0, 0, 0, 0, 3, 1, 3, 0, 0});
+                set_count(3);
+                expect("verified indexed count past the bound",
+                       indexed({.max_count = 2, .stride = 20, .count_addr = mesh_count_address}),
+                       first);
+                upload({3, limits.maxMeshWorkGroupCount[1] + 1u, 0, 0, 0, 3, 1, 3, 0, 0});
+                expect("verified indexed record past the limit",
+                       indexed({.max_count = 2, .stride = 20}), second);
+                upload_indices(2, {0, 1, 2, 1, 2, 4});
+                upload({3, 1, 3, 0, 0});
+                expect("verified index past INDEX_BUFFER_SIZE", indexed({}, 5), first);
+                scheduler.Finish();
+                mesh_verify = false;
+                const auto after = RenderExecutorTestAccess::MeshIndirectTotals(executor);
+                Require(mesh_name, "verify mode agrees on indexed records",
+                        after.checked - before.checked == 5 &&
+                            after.mismatched == before.mismatched &&
+                            after.unverified == before.unverified &&
+                            after.empty - before.empty == 2,
+                        "verify mode disagreed with the CPU formula on indexed records");
+              }
+
+              // Refusals are decided before anything reads the records or the indices.
+              upload_indices(2, {0, 1, 2, 3, 4, 5});
+              upload({3, 1, 3, 0, 0});
+              const auto refuse_indexed = [&](const char *what, IndirectDrawArgs args,
+                                              IndirectDrawResult result) {
+                refuse(what, args, result);
+                Require(mesh_name, what, indices_gpu_owned(),
+                        "a refused indexed mesh draw drained its indices");
+              };
+              refuse_indexed("8-bit indices", indexed({.index_type_and_size = 2}),
+                             IndirectDrawResult::IndexType);
+              refuse_indexed("INDEX_BUFFER_SIZE unset", indexed({}, 0),
+                             IndirectDrawResult::IndexBufferUnset);
+              refuse_indexed("index buffer over 64 MiB", indexed({}, 0x2000001u),
+                             IndirectDrawResult::IndexBufferTooLarge);
+              {
+                auto args = indexed({});
+                args.index_base_addr = depth_address + allocation_size - 4;
+                Require(mesh_name, "unmapped index fixture",
+                        LibKernel::Memory::ClampRangeSize(args.index_base_addr, 12) != 12,
+                        "the index buffer past the allocation is mapped, so it proves nothing");
+                refuse_indexed("index buffer unmapped", args,
+                               IndirectDrawResult::IndexBufferUnmapped);
+              }
+              user_config.SetPrimitiveResetControl(1);
+              user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriStrip);
+              registers.SetPrimitiveResetIndex(5);
+              refuse_indexed("custom restart index", indexed({}), IndirectDrawResult::CustomRestart);
+              registers.SetPrimitiveResetIndex(0);
+              user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+              user_config.SetPrimitiveResetControl(0);
+              refuse_indexed("index register outside the GS user data",
+                             indexed({.index_offset_register = Pm4::SPI_SHADER_USER_DATA_PS_0}),
+                             IndirectDrawResult::MeshOffsetRegister);
+              refuse_indexed("index register past the user SGPR count",
+                             indexed({.index_offset_register = Pm4::SPI_SHADER_USER_DATA_GS_0 + 6}),
+                             IndirectDrawResult::MeshOffsetRegister);
+              refuse_indexed("index register the resource plan reads",
+                             indexed({.index_offset_register = Pm4::SPI_SHADER_USER_DATA_GS_0}),
+                             IndirectDrawResult::MeshOffsetRegister);
+              {
+                auto &task_count = m_runtime_context.mesh_shader_properties.maxTaskWorkGroupCount[0];
+                const auto saved_task_count = task_count;
+                task_count = 1;
+                refuse_indexed("indexed records past maxTaskWorkGroupCount",
+                               indexed({.max_count = 2, .stride = 20}),
+                               IndirectDrawResult::MeshTaskLimit);
+                task_count = saved_task_count;
+              }
+              m_runtime_context.task_shader_enabled = false;
+              refuse_indexed("no task shader", indexed({}), IndirectDrawResult::MissingFeature);
+              m_runtime_context.task_shader_enabled = saved_task_shader;
+              mesh_indirect = false;
+              refuse_indexed("indexed kill switch", indexed({}),
+                             merged ? IndirectDrawResult::MergedGeometry
+                                    : IndirectDrawResult::MeshStage);
+              mesh_indirect = mesh_default;
+
+              // Empty GPU-written indexed records over an aliased depth surface.
+              upload({3, 0, 0, 0, 0});
+              alias_round_trips("GpuIndirectMeshIndexedAliasedDepth", [&] {
+                Require(mesh_name, "empty GPU-written indexed mesh record",
+                        submit(indexed({})) == IndirectDrawResult::Drawn &&
+                            gpu_owned({}) && indices_gpu_owned(),
+                        "an empty GPU-written indexed mesh draw fell back to the CPU or drained");
+              });
+
+              // Records and indices stay GPU-owned; the CPU path patches SGPRs and draws the same.
+              const auto place_indexed = [&](bool gpu_written, std::initializer_list<u32> records,
+                                             u32 count, std::initializer_list<u32> indices) {
+                if (gpu_written) {
+                  upload_indices(2, indices);
+                  upload(records);
+                  set_count(count);
+                  return;
+                }
+                BufferCacheTestAccess::DrainBuffer(buffers, index_address, index_bytes);
+                BufferCacheTestAccess::DrainBuffer(buffers, mesh_args_address, sizeof(uploaded));
+                BufferCacheTestAccess::DrainBuffer(buffers, mesh_count_address, sizeof(u32));
+                const auto bytes = encode_indices(2, indices);
+                std::memcpy(reinterpret_cast<void *>(index_address), bytes.data(), bytes.size());
+                std::copy(records.begin(), records.end(),
+                          reinterpret_cast<u32 *>(mesh_args_address));
+                *reinterpret_cast<u32 *>(mesh_count_address) = count;
+              };
+              const auto run_packet = [&](bool gpu, std::span<const u32> packet, u32 size) {
+                CommandProcessor processor(context, 0);
+                processor.GetCtx() = registers;
+                processor.GetUcfg() = user_config;
+                processor.GetShCtx() = shaders;
+                processor.BufferInit();
+                processor.SetDrawIndirectArgsBaseAddress(mesh_args_address);
+                processor.SetIndexType(0);
+                processor.SetIndexBaseAddress(index_address);
+                processor.SetIndexBufferSize(size);
+                clear_rect();
+                Pm4Execution execution;
+                Require(mesh_name, "indexed packet processed",
+                        processor.Process(execution, packet) == Pm4ProcessResult::Complete,
+                        "the indexed indirect packet did not complete");
+                Require(mesh_name, "indexed packet ownership",
+                        buffers.IsRegionGpuModified(mesh_args_address, sizeof(uploaded)) == gpu &&
+                            indices_gpu_owned() == gpu,
+                        gpu ? "the command processor read the GPU-written mesh records or indices"
+                            : "the kill switch did not read the records on the CPU");
+                return processor.GetShCtx().GetVs().gs_user_sgpr.value[4];
+              };
+              for (const bool gpu : {true, false}) {
+                mesh_indirect = gpu;
+                {
+                  // Indices 1 and 2 plus base vertex 3, then the zero past the end: (4, 5, 3).
+                  place_indexed(gpu, {3, 1, 3, 3, 0}, 0, {0, 1, 2, 1, 2, 4});
+                  const std::array<u32, 5> packet{KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0u),
+                                                  0u, vertex_register, instance_register, 0u};
+                  const auto patched = run_packet(gpu, packet, 5);
+                  Require(mesh_name, "indexed packet SGPR patch", (patched == 3) == !gpu,
+                          gpu ? "the GPU path patched the base vertex SGPR on the CPU"
+                              : "the kill switch no longer patches the base vertex SGPR");
+                  Require(mesh_name, "indexed packet pixels", read_pixels() == second,
+                          "a DRAW_INDEX_INDIRECT packet past INDEX_BUFFER_SIZE drew the wrong "
+                          "pixels");
+                }
+                {
+                  place_indexed(gpu, {3, 1, 3, 0, 0}, 0, {0, 1, 2, 0, 1, 2});
+                  const std::array<u32, 5> packet{
+                      KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0u), 0u,
+                      vertex_register | (vertex_register << 16u),
+                      instance_register | (1u << 28u), 0u};
+                  (void)run_packet(gpu, packet, 6);
+                  Require(mesh_name, "first index register packet pixels",
+                          read_pixels() == second,
+                          "the first index did not land in the SGPR the packet names last");
+                }
+                {
+                  place_indexed(gpu, {3, 1, 0, 0, 0, 3, 1, 3, 3, 0}, 2, {0, 1, 2, 1, 2, 4});
+                  const std::array<u32, 10> packet{
+                      KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u), 0u, vertex_register,
+                      instance_register, 1u << 30u, 2u, static_cast<u32>(mesh_count_address),
+                      static_cast<u32>(mesh_count_address >> 32u), 20u, 0u};
+                  (void)run_packet(gpu, packet, 5);
+                  Require(mesh_name, "indexed multi packet count ownership",
+                          buffers.IsRegionGpuModified(mesh_count_address, sizeof(u32)) == gpu,
+                          gpu ? "the command processor read the GPU-written count"
+                              : "the kill switch did not read the count on the CPU");
+                  Require(mesh_name, "indexed multi packet pixels", read_pixels() == both,
+                          "a counted indexed multi-draw packet drew the wrong pixels");
+                }
+                scheduler.Begin(registers, user_config, shaders);
+              }
+              mesh_indirect = mesh_default;
+            }
+          }
+          // Indices past INDEX_BUFFER_SIZE are zero-padded on the GPU, not read from guest memory.
+          {
+            constexpr const char *pad_name = "GpuIndexedReplayPadding";
+            constexpr uint64_t reference_address = depth_address + 0x9d00;
+            constexpr uint64_t pad_args_address = depth_address + 0x9e00;
+            constexpr uint64_t pad_count_address = depth_address + 0x9f00;
+            static const auto plain_vertex_code = [] {
+              std::vector<u32> code{EncodeMubuf0(0x0d, 0, true, false),
+                                    EncodeMubuf1(0, 2, 5)}; // buffer_load_dwordx2 v[0:1], v5
+              AppendVMovU32(&code, 2, 0);
+              AppendVMovLiteral(&code, 3, 0x3f800000u);
+              code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3)});
+              AppendEnd(&code);
+              return code;
+            }();
+            const auto plain_vs = reinterpret_cast<uint64_t>(plain_vertex_code.data());
+            ShaderMapUserData(plain_vs,
+                {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+                 .code_size_bytes = static_cast<u32>(plain_vertex_code.size() * sizeof(u32))});
+            set_mode(false, 64);
+            shaders.SetEsShaderBase(plain_vs);
+            registers.SetShaderStages(0);
+            {
+              ShaderVertexInputInfo prepared{};
+              (void)PrepareProgram(shaders.GetVs(), registers, user_config, prepared);
+              Require(pad_name, "plain vertex program", prepared.logical_stage != ShaderType::Mesh,
+                      "the fixture became a mesh program, so it proves nothing");
+            }
+            const auto reference = [&](std::initializer_list<u32> indices) {
+              const auto bytes = encode_indices(2, indices);
+              std::memcpy(reinterpret_cast<void *>(reference_address), bytes.data(), bytes.size());
+              clear_rect();
+              RenderExecutorTestAccess::DrawIndex(
+                  executor, scheduler.Current(),
+                  {.index_count = static_cast<u32>(indices.size()),
+                   .index_addr = reinterpret_cast<const void *>(reference_address),
+                   .instance_count = 1, .index_type_and_size = 0});
+              return read_pixels();
+            };
+            clear_rect();
+            const auto blank = read_pixels();
+            const auto first = reference({0, 1, 2});
+            const auto second = reference({3, 4, 5});
+            const auto both = reference({0, 1, 2, 3, 4, 5});
+            Require(pad_name, "references",
+                    first != blank && second != blank && first != second && both != first &&
+                        both != second,
+                    "the plain vertex fixture did not draw two distinct triangles");
+            // Guest memory keeps stale indices; the GPU copy holds the ones the draw must read.
+            BufferCacheTestAccess::DrainBuffer(buffers, index_address, index_bytes);
+            const auto stale = encode_indices(2, {0, 1, 2, 3, 4, 5});
+            std::memcpy(reinterpret_cast<void *>(index_address), stale.data(), stale.size());
+            // A counted packet without the draw-count feature goes to the CPU replay.
+            auto &draw_count = m_runtime_context.draw_indirect_count_enabled;
+            const bool saved_draw_count = draw_count;
+            draw_count = false;
+            const auto run_padded = [&](std::span<const u32> packet,
+                                        std::initializer_list<u32> records, u32 count) {
+              upload_indices(2, {3, 4, 5, 1, 2, 4});
+              // The replay reads the records on the CPU, so they sit on a page no GPU writes.
+              std::copy(records.begin(), records.end(), reinterpret_cast<u32 *>(pad_args_address));
+              *reinterpret_cast<u32 *>(pad_count_address) = count;
+              CommandProcessor processor(context, 0);
+              processor.GetCtx() = registers;
+              processor.GetUcfg() = user_config;
+              processor.GetShCtx() = shaders;
+              processor.BufferInit();
+              processor.SetDrawIndirectArgsBaseAddress(pad_args_address);
+              processor.SetIndexType(0);
+              processor.SetIndexBaseAddress(index_address);
+              processor.SetIndexBufferSize(5);
+              clear_rect();
+              Pm4Execution execution;
+              Require(pad_name, "packet processed",
+                      processor.Process(execution, packet) == Pm4ProcessResult::Complete,
+                      "the indexed indirect packet did not complete");
+              Require(pad_name, "indices stay GPU-owned", indices_gpu_owned(),
+                      "the CPU replay drained the GPU-written indices to pad them");
+              return read_pixels();
+            };
+            {
+              // Indices 1 and 2 are readable, the third reads zero: (1, 2, 0).
+              const std::array<u32, 10> packet{
+                  KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u), 0u, Pm4::SH_NOP,
+                  Pm4::SH_NOP, 1u << 30u, 1u, static_cast<u32>(pad_count_address),
+                  static_cast<u32>(pad_count_address >> 32u), 20u, 0u};
+              Require(pad_name, "padded record", run_padded(packet, {3, 1, 3, 0, 0}, 1) == first,
+                      "a record past INDEX_BUFFER_SIZE drew stale or unpadded indices");
+            }
+            {
+              const std::array<u32, 10> packet{
+                  KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u), 0u, Pm4::SH_NOP,
+                  Pm4::SH_NOP, 1u << 30u, 2u, static_cast<u32>(pad_count_address),
+                  static_cast<u32>(pad_count_address >> 32u), 20u, 0u};
+              Require(pad_name, "padded multi record",
+                      run_padded(packet, {3, 1, 0, 0, 0, 3, 1, 3, 0, 0}, 2) == both,
+                      "a multi-draw record past INDEX_BUFFER_SIZE drew stale or unpadded indices");
+            }
+            draw_count = saved_draw_count;
+            scheduler.Begin(registers, user_config, shaders);
+            std::printf("[gpu]     %-32s ok\n", pad_name);
+          }
+          BufferCacheTestAccess::DrainBuffer(buffers, index_address, index_bytes);
+        }
+        set_mode(false, 32);
+        registers.SetShaderStages(saved_stages);
+        set_offsets(0, 0);
+        scheduler.Begin(registers, user_config, shaders);
+        BufferCacheTestAccess::DrainBuffer(buffers, mesh_args_address, sizeof(uploaded));
+        BufferCacheTestAccess::DrainBuffer(buffers, mesh_count_address, sizeof(u32));
+        m_runtime_context.subgroup_size = saved_subgroup_size;
+        LibKernel::Memory::InstallGpuResources(nullptr);
+        registers.SetMaxOutputPerSubgroup(0);
+        registers.SetGsMaxVertOut(0);
+        registers.SetGsOutPrimType(0);
+        registers.SetNggSubgrpCntl(0);
+        user_config.SetGeControl({});
+        std::printf("[gpu]     %-32s ok\n", mesh_name);
+      }
+
       // Captured format30 uses uncompressed mode9 at MRT2. Keep a blended
       // floating-point MRT live beside it, including sparse export routing.
       constexpr uint64_t packed_address = depth_address + 0x28000;
@@ -29081,6 +30290,8 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_draw_indirect_supported = false;
+  bool m_mesh_supported = false;
+  bool m_task_supported = false;
   bool m_robust_buffer_access2 = false;
   bool m_sparse_residency_supported = false;
   u32   m_skipped_cases          = 0;
@@ -29122,6 +30333,13 @@ private:
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.draw_indirect_count_enabled = m_draw_indirect_supported;
+    m_runtime_context.mesh_shader_enabled = m_mesh_supported;
+    m_runtime_context.task_shader_enabled = m_task_supported;
+    if (m_mesh_supported) {
+      vk::PhysicalDeviceProperties2 mesh_properties{};
+      mesh_properties.pNext = &m_runtime_context.mesh_shader_properties;
+      m_physical_device.getProperties2(&mesh_properties);
+    }
     m_runtime_context.sparse_residency_buffer_enabled = m_sparse_residency_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
@@ -29278,7 +30496,25 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
+    uint32_t mesh_extension_count = 0;
+    (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &mesh_extension_count,
+                                                                nullptr);
+    std::vector<vk::ExtensionProperties> mesh_extensions(mesh_extension_count);
+    (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &mesh_extension_count,
+                                                                mesh_extensions.data());
+    const bool mesh_extension =
+        std::ranges::any_of(mesh_extensions, [](const vk::ExtensionProperties &extension) {
+          return std::string_view(extension.extensionName.data()) ==
+                 VK_EXT_MESH_SHADER_EXTENSION_NAME;
+        });
+    vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
+    if (mesh_extension) {
+      available_mesh.pNext = available_features2.pNext;
+      available_features2.pNext = &available_mesh;
+    }
     m_physical_device.getFeatures2(&available_features2);
+    m_mesh_supported = mesh_extension && available_mesh.meshShader;
+    m_task_supported = m_mesh_supported && available_mesh.taskShader;
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
     Require("VulkanHarness", "dispatch",
@@ -29428,6 +30664,13 @@ private:
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
     device_info.pNext = &conditional_rendering;
+    vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features{};
+    if (m_mesh_supported) {
+      mesh_features.pNext = &conditional_rendering;
+      mesh_features.meshShader = true;
+      mesh_features.taskShader = m_task_supported;
+      device_info.pNext = &mesh_features;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     // The emulator requires and enables it; speculated buffer loads rely on it.
     device_features.robustBufferAccess = true;
@@ -29478,6 +30721,9 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_mesh_supported) {
+      device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
@@ -62513,6 +63759,16 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dispatch-guard-only") == 0) {
     CheckDispatchWorkGroupGuard();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-only") == 0) {
+    CheckMeshIndirectDerivation();
+    CheckMeshIndirectVerifyEntries();
+    VulkanHarness vulkan;
+    vulkan.CheckMeshIndirectDerivationOnGpu();
+    vulkan.CheckRasterization(false);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-ne-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxNeU16SdwaCompactVop3ExecMask());

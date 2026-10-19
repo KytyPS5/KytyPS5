@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <span>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   const Profile& profile               = DefaultProfile,
                                   bool emit_debug_info = false, std::string* refusal = nullptr);
 
+// Vulkan's bound on Workgroup storage: std430, worst variable order, Block variables alias.
+[[nodiscard]] uint64_t WorkgroupStorageBound(std::span<const uint32_t> spirv);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

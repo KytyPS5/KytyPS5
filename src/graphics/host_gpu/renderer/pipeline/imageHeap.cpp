@@ -375,6 +375,7 @@ void ImageHeap::Bury() {
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const DescriptorValue& value) {
 	auto [found, inserted] = view.elements.try_emplace(value, 0u);
 	if (inserted) {
+		found->second = Allocate();
 		if (found->second == 0u) {
 			view.elements.erase(found);
 			view.full = true;

@@ -61,6 +61,9 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Bit r for each user-data register r below 64 that the plan evaluates on the host.
+[[nodiscard]] uint64_t PlanUserDataRegisters(const ResourcePlan& plan);
+
 // Whether materialization would refuse buffer table `table_source` now; false when it cannot tell.
 bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
                                 uint32_t table_source, const SrtRuntime& runtime);

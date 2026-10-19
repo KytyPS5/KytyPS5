@@ -1,0 +1,116 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "gpu_mesh_indirect.inc"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint kPrimitiveSize = 1u;
+layout(constant_id = 1) const uint kPrimitiveStep = 1u;
+layout(constant_id = 2) const uint kPrimitivesPerGroup = 1u;
+layout(constant_id = 3) const uint kMaxGroupsX = 0u;
+layout(constant_id = 4) const uint kMaxGroupsY = 0u;
+layout(constant_id = 5) const uint kMaxGroupsZ = 0u;
+layout(constant_id = 6) const uint kMaxGroupsTotal = 0u;
+layout(constant_id = 7) const bool kVerify = false;
+layout(constant_id = 8) const bool kIndexed = false;
+
+const uint MESH_INDIRECT_VERIFY_HEADER_DWORDS = 12u;
+const uint MESH_INDIRECT_VERIFY_ENTRY_DWORDS = 20u;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+	uint words[];
+};
+
+// An indexed or verified packet's `records` names a MeshIndirectHeader instead.
+layout(push_constant, std430) uniform Parameters {
+	uint64_t records;
+	uint64_t count;
+	uint max_count;
+	uint stride;
+} parameters;
+
+taskPayloadSharedEXT uint payload[MESH_INDIRECT_PAYLOAD_DWORDS];
+
+uint64_t Address(Words words, uint index) {
+	return packUint2x32(uvec2(words.words[index], words.words[index + 1u]));
+}
+
+void main() {
+	uint64_t records = parameters.records;
+	uint64_t count_address = parameters.count;
+	uint max_count = parameters.max_count;
+	uint stride = parameters.stride;
+	uint capacity = 0u;
+	uint index_size = 0u;
+	uint64_t index_base = 0ul;
+	uint index_buffer_size = 0u;
+	if (kVerify || kIndexed) {
+		Words header = Words(parameters.records);
+		records = Address(header, 0u);
+		count_address = Address(header, 2u);
+		max_count = header.words[4];
+		stride = header.words[5];
+		capacity = header.words[6];
+		index_size = header.words[7];
+		index_base = Address(header, 8u);
+		index_buffer_size = header.words[10];
+	}
+	const uint index = gl_WorkGroupID.x;
+	uint count = 0u;
+	uint drawn = max_count;
+	if (count_address != 0ul) {
+		count = Words(count_address).words[0];
+		drawn = min(count, drawn);
+	}
+	uint record[5] = uint[5](0u, 0u, 0u, 0u, 0u);
+	uvec2 groups = uvec2(0u);
+	for (uint word = 0u; word < MESH_INDIRECT_PAYLOAD_DWORDS; word++) {
+		payload[word] = 0u;
+	}
+	if (index < drawn) {
+		Words source = Words(records + uint64_t(index) * uint64_t(stride));
+		for (uint word = 0u; word < (kIndexed ? 5u : 4u); word++) {
+			record[word] = source.words[word];
+		}
+		const MeshDrawShape shape = MeshDrawShape(kPrimitiveSize, kPrimitiveStep, kPrimitivesPerGroup,
+		                                          uvec3(kMaxGroupsX, kMaxGroupsY, kMaxGroupsZ),
+		                                          kMaxGroupsTotal);
+		// The CP writes a record's offsets only to the named user SGPRs (payload slots 6-8).
+		payload[0] = record[0];
+		if (kIndexed) {
+			groups = MeshIndexedGroups(shape, record[0], record[1], record[4]);
+			const uvec3 window = MeshIndexWindow(index_base, index_size, index_buffer_size, record[2]);
+			payload[MESH_INDIRECT_PAYLOAD_INDEX_BOUND] = window.z;
+			payload[3] = index_size;
+			payload[4] = window.x;
+			payload[5] = window.y;
+			payload[6] = record[3];
+			payload[7] = record[4];
+			payload[8] = record[2];
+		} else {
+			groups = MeshIndirectGroups(shape, uvec4(record[0], record[1], record[2], record[3]));
+			payload[6] = record[2];
+			payload[7] = record[3];
+		}
+	}
+	if (kVerify && index < capacity) {
+		Words entries = Words(parameters.records);
+		const uint base = MESH_INDIRECT_VERIFY_HEADER_DWORDS + index * MESH_INDIRECT_VERIFY_ENTRY_DWORDS;
+		entries.words[base + 1u] = drawn;
+		entries.words[base + 2u] = count;
+		for (uint word = 0u; word < 5u; word++) {
+			entries.words[base + 3u + word] = record[word];
+		}
+		entries.words[base + 8u] = groups.x;
+		entries.words[base + 9u] = groups.y;
+		for (uint word = 0u; word < MESH_INDIRECT_PAYLOAD_DWORDS; word++) {
+			entries.words[base + 10u + word] = payload[word];
+		}
+		entries.words[base] = index + 1u;
+	}
+	EmitMeshTasksEXT(groups.x, groups.y, 1u);
+}

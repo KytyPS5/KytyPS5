@@ -52,6 +52,7 @@ struct GraphicContext {
 	bool                                      draw_indirect_count_enabled           = false;
 	bool                                      sparse_residency_buffer_enabled       = false;
 	bool                                      mesh_shader_enabled                   = false;
+	bool                                      task_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;

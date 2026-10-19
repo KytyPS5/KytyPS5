@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -997,14 +998,18 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex);
+		// The VGT still fetches every index of the record; those past INDEX_BUFFER_SIZE read zero.
+		const auto window = IndirectIndexWindow(m_index_base_addr, IndexSize(), m_index_buffer_size,
+		                                        args.firstIndex);
 		executor.DrawIndex(m_submit_id, CurrentBuffer(),
-		                   {.index_count         = std::min(args.indexCount, max_indices),
-		                    .index_addr          = IndexAddress(args.firstIndex),
+		                   {.index_count         = args.indexCount,
+		                    .index_addr          = reinterpret_cast<const void*>(window.address),
 		                    .instance_count      = args.instanceCount,
 		                    .index_type_and_size = m_index_type_and_size,
 		                    .base_vertex         = args.vertexOffset,
 		                    .first_instance      = args.firstInstance,
-		                    .offset_source       = DrawOffsetSource::IndirectArgs});
+		                    .offset_source       = DrawOffsetSource::IndirectArgs,
+		                    .index_limit         = window.readable});
 	}
 }
 

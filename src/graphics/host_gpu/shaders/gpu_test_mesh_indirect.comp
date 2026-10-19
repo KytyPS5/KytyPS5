@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "gpu_mesh_indirect.inc"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+	uint words[];
+};
+
+// A case: indexed, shape (7 words), record (5), index base (2), element size, INDEX_BUFFER_SIZE.
+layout(push_constant, std430) uniform Parameters {
+	uint64_t cases;
+	uint64_t results;
+} parameters;
+
+void main() {
+	Words cases = Words(parameters.cases);
+	Words results = Words(parameters.results);
+	const uint base = gl_WorkGroupID.x * 17u;
+	const MeshDrawShape shape =
+		MeshDrawShape(cases.words[base + 1u], cases.words[base + 2u], cases.words[base + 3u],
+		              uvec3(cases.words[base + 4u], cases.words[base + 5u], cases.words[base + 6u]),
+		              cases.words[base + 7u]);
+	uint record[5];
+	for (uint word = 0u; word < 5u; word++) {
+		record[word] = cases.words[base + 8u + word];
+	}
+	uvec2 groups;
+	uvec3 window = uvec3(0u);
+	if (cases.words[base] != 0u) {
+		groups = MeshIndexedGroups(shape, record[0], record[1], record[4]);
+		window = MeshIndexWindow(packUint2x32(uvec2(cases.words[base + 13u], cases.words[base + 14u])),
+		                         cases.words[base + 15u], cases.words[base + 16u], record[2]);
+	} else {
+		groups = MeshIndirectGroups(shape, uvec4(record[0], record[1], record[2], record[3]));
+	}
+	const uint out_base = gl_WorkGroupID.x * 5u;
+	results.words[out_base] = groups.x;
+	results.words[out_base + 1u] = groups.y;
+	results.words[out_base + 2u] = window.x;
+	results.words[out_base + 3u] = window.y;
+	results.words[out_base + 4u] = window.z;
+}

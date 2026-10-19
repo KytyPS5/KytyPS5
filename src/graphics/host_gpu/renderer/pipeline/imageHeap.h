@@ -91,6 +91,7 @@ private:
 	};
 
 	struct Memory {
+		uint64_t                           base  = 0;
 		uint64_t                           size  = 0; // The mapped prefix of the table.
 		uint64_t                           table = 0; // The requested table size.
 		std::vector<uint32_t>              words;

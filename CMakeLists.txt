@@ -329,6 +329,22 @@ add_gpu_blit_shader(gpu_dispatch_threads gpu_dispatch_threads.comp)
 add_gpu_blit_shader(gpu_page_diff gpu_page_diff.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+set(gpu_mesh_indirect_include "${gpu_tiler_shader_dir}/gpu_mesh_indirect.inc")
+set(gpu_mesh_indirect_source "${gpu_tiler_shader_dir}/gpu_mesh_indirect.task")
+set(gpu_mesh_indirect_spv "${gpu_blit_generated_dir}/gpu_mesh_indirect_task.spv")
+set(gpu_mesh_indirect_header "${gpu_blit_generated_dir}/gpu_mesh_indirect_task_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_mesh_indirect_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        "-I${gpu_tiler_shader_dir}" -o "${gpu_mesh_indirect_spv}" "${gpu_mesh_indirect_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_mesh_indirect_spv} -DOUTPUT=${gpu_mesh_indirect_header}
+	        -DSYMBOL=GPU_MESH_INDIRECT_TASK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_mesh_indirect_source}" "${gpu_mesh_indirect_include}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -627,8 +643,26 @@ add_custom_command(
 	DEPENDS "${gpu_test_ms_depth_source}"
 	VERBATIM
 )
+set(gpu_test_mesh_indirect_source
+	"${gpu_tiler_shader_dir}/gpu_test_mesh_indirect.comp")
+set(gpu_test_mesh_indirect_spv
+	"${gpu_test_generated_dir}/gpu_test_mesh_indirect.spv")
+set(gpu_test_mesh_indirect_header
+	"${gpu_test_generated_dir}/gpu_test_mesh_indirect_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_test_mesh_indirect_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        "-I${gpu_tiler_shader_dir}" -o "${gpu_test_mesh_indirect_spv}"
+	        "${gpu_test_mesh_indirect_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_mesh_indirect_spv}
+	        -DOUTPUT=${gpu_test_mesh_indirect_header} -DSYMBOL=GPU_TEST_MESH_INDIRECT_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_test_mesh_indirect_source}" "${gpu_mesh_indirect_include}"
+	VERBATIM
+)
 target_sources(shader_recompiler_compute_tests PRIVATE
-	"${gpu_test_ms_depth_header}")
+	"${gpu_test_ms_depth_header}" "${gpu_test_mesh_indirect_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
@@ -712,6 +746,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_mesh_indirect
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	add_test(NAME graphics_dispatch_guard
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-guard-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher

@@ -20290,8 +20290,8 @@ private:
             "shaderStorageImageWriteWithoutFormat is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderImageGatherExtended == true &&
-                available_derivatives.computeDerivativeGroupQuads == true,
-            "image gather or compute derivative quads are not supported");
+                available_derivatives.computeDerivativeGroupLinear == true,
+            "image gather or linear compute derivatives are not supported");
     Require("VulkanHarness", "dispatch",
             available_features11.storageBuffer16BitAccess == true &&
                 available_features12.storageBuffer8BitAccess == true,
@@ -20376,7 +20376,7 @@ private:
     device_features13.synchronization2 = true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
-    derivatives.computeDerivativeGroupQuads = true;
+    derivatives.computeDerivativeGroupLinear = true;
     // Requesting a feature the device does not support fails device creation, so the
     // rasterization feature chain is only chained in when every part is available.
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
@@ -37432,6 +37432,40 @@ TestCase ImageSampleAndGather() {
   return test;
 }
 
+TestCase ImageGetLodComputeLaneQuads() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x06, 20, Vgpr(0)));
+  AppendVMovLiteral(&code, 22, 0x3e000000u);
+  code.push_back(EncodeVop2(0x08, 20, Vgpr(20), 22));
+  AppendVMovLiteral(&code, 21, 0x3f000000u);
+  code.push_back(EncodeMimg0(0x60, 0x3));
+  code.push_back(EncodeMimg1(10, 20));
+  code.push_back(EncodeVop2(0x1a, 23, InlineU32(3), 1));
+  code.push_back(EncodeVop2(0x25, 23, Vgpr(0), 23));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 23, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 23, 64);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageGetLodComputeLaneQuads";
+  test.code = code;
+  test.expected.assign(128, 0x40000000u);
+  test.expected_float_tolerance = 0.25f;
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32,     O::V_MUL_F32,
+                  O::IMAGE_GET_LOD, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.image_width = test.image_height = 16;
+  for (u32 size = 16; size >= 1u; size /= 2u) {
+    test.sampled_image_rgba_mips.push_back(MakeRgbaImage(size, size));
+  }
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = 8;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 2;
+  return test;
+}
+
 TestCase ImageCubeGradientsPreserveDerivatives() {
   using O = ShaderOpcode;
   TestCase test;
@@ -42799,6 +42833,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadA16UintCoordsOnGpu);
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
+  AddCase(ImageGetLodComputeLaneQuads);
   AddCase(ImageSampleAndGather);
   AddCase(ImageCubeGradientsPreserveDerivatives);
   AddCase(ImageGatherExplicitLod);
@@ -48655,6 +48690,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Wave64CrossHalfLaneAndLds());
     RunCase(&vulkan, Wave64RawMasksAndScalarBranch());
     RunCase(&vulkan, Wave64PartialMultidimensionalWorkgroup());
+    RunCase(&vulkan, ImageGetLodComputeLaneQuads());
     RunCase(&vulkan, Wave64AppendConsumeHighHalf());
     RunCase(&vulkan, VectorAddcWritesPerLaneCarryOut());
     RunCase(&vulkan, VectorVop3BCarryOutWritesSgprMask());

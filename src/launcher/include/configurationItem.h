@@ -28,6 +28,8 @@ public:
 	void               SetRunning(bool state);
 	void               SetCompatibilityEditable(bool editable);
 	[[nodiscard]] bool IsRunning() const { return m_running; }
+	// Install size text shown in the list's Size column; "—" until it has been calculated.
+	[[nodiscard]] QString SizeText() const;
 	QComboBox*         GetStatusCombo() { return m_status_combo; }
 	QLineEdit*         GetCommentEdit() { return m_comment_edit; }
 

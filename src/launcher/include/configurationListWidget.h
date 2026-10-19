@@ -72,6 +72,8 @@ protected slots:
 
 private:
 	void               SelectItem(QTreeWidgetItem* witem);
+	void               UpdateGridDetails();
+	void                          SelectFirstVisibleItem();
 	void               ShowContextMenu(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();

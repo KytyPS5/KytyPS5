@@ -23,10 +23,18 @@
 #include <QCursor>
 #include <QDesktopServices>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
+#include <QFutureWatcher>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QVBoxLayout>
+#include <QtConcurrentRun>
+#include <filesystem>
 #include <QHeaderView>
 #include <QIcon>
 #include <QInputDialog>
@@ -39,6 +47,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
 #include <QPointer>
 #include <QProcess>
@@ -150,21 +159,124 @@ class GameGridDelegate: public QStyledItemDelegate {
 public:
 	using QStyledItemDelegate::QStyledItemDelegate;
 
+	// PS5-style carousel: a single row of square tiles; only the selected one is enlarged and
+	// outlined. The slider value is the size of the selected tile.
 	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
-		return option.decorationSize + QSize(16, 24 + option.fontMetrics.lineSpacing() * 2);
+		const int big = option.decorationSize.width() * 3 / 4;
+		return QSize(big + 12, big + 12);
 	}
 
-protected:
-	void initStyleOption(QStyleOptionViewItem* option, const QModelIndex& index) const override {
-		const auto image_size = option->decorationSize;
-		QStyledItemDelegate::initStyleOption(option, index);
-		option->decorationSize      = image_size;
-		option->decorationPosition  = QStyleOptionViewItem::Top;
-		option->decorationAlignment = Qt::AlignCenter;
-		option->displayAlignment    = Qt::AlignHCenter | Qt::AlignTop;
-		option->features |= QStyleOptionViewItem::WrapText;
+	void paint(QPainter* painter, const QStyleOptionViewItem& option,
+	           const QModelIndex& index) const override {
+		const int  side = option.decorationSize.width();
+		const auto* view = dynamic_cast<const GameGridView*>(option.widget);
+		qreal      t    = view != nullptr ? view->TileScale(index.row())
+		                                  : ((option.state & QStyle::State_Selected) ? 1.0 : 0.0);
+		const bool selected = t > 0.5;
+		t                   = t * t * (3.0 - 2.0 * t);
+		const int  tile     = qRound(side / 2.0 + (side * 3 / 4.0 - side / 2.0) * t);
+		const QRect cell    = option.rect;
+		const QRect rect(cell.left() + (cell.width() - tile) / 2, cell.top() + 6, tile, tile);
+
+		painter->save();
+		painter->setRenderHint(QPainter::Antialiasing);
+		painter->setRenderHint(QPainter::SmoothPixmapTransform);
+
+		QPainterPath clip;
+		clip.addRoundedRect(rect, 12, 12);
+		painter->setClipPath(clip);
+		painter->fillRect(rect, QColor(30, 34, 44));
+		const auto icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
+		if (!icon.isNull()) {
+			const auto pixmap = icon.pixmap(QSize(tile, tile));
+			painter->drawPixmap(rect, pixmap.scaled(rect.size(), Qt::KeepAspectRatioByExpanding,
+			                                        Qt::SmoothTransformation));
+		}
+		painter->setClipping(false);
+
+		if (selected) {
+			painter->setPen(QPen(Qt::white, 3));
+			painter->setBrush(Qt::NoBrush);
+			painter->drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 14, 14);
+
+			const auto name = index.data(Qt::DisplayRole).toString();
+			if (!name.isEmpty()) {
+				auto label_font = option.font;
+				label_font.setPointSizeF(option.font.pointSizeF() * 1.1);
+				label_font.setWeight(QFont::DemiBold);
+				painter->setFont(label_font);
+				painter->setPen(Qt::white);
+				const QRect label(rect.center().x() - 180, rect.bottom() + 8, 360, 24);
+				painter->drawText(label, Qt::AlignHCenter | Qt::AlignTop,
+				                  QFontMetrics(label_font).elidedText(name, Qt::ElideRight, label.width()));
+			}
+		}
+		painter->restore();
 	}
 };
+
+static void ShowGameInfo(QWidget* parent, ConfigurationItem* item) {
+	const auto& info = item->GetInfo();
+	auto* dialog = new QDialog(parent);
+	dialog->setAttribute(Qt::WA_DeleteOnClose);
+	dialog->setWindowTitle(QObject::tr("Game information"));
+
+	auto* icon = new QLabel(dialog);
+	QPixmap pixmap;
+	pixmap.loadFromData(GameContent::ReadFile(info.basedir, QStringLiteral("sce_sys/icon0.png"),
+	                                          GameContent::MaxImageSize));
+	if (!pixmap.isNull()) {
+		icon->setPixmap(pixmap.scaled(160, 160, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+	}
+	icon->setFixedSize(160, 160);
+
+	auto* name = new QLabel(info.name.isEmpty() ? info.title_id : info.name, dialog);
+	auto  name_font = name->font();
+	name_font.setPointSizeF(name_font.pointSizeF() * 1.5);
+	name_font.setBold(true);
+	name->setFont(name_font);
+	name->setWordWrap(true);
+
+	const auto value = [](const QString& s) { return s.isEmpty() ? QObject::tr("Unknown") : s; };
+	auto* size = new QLabel(item->SizeText(), dialog);
+	auto* form = new QFormLayout;
+	form->addRow(QObject::tr("Title name"), new QLabel(value(info.name), dialog));
+	form->addRow(QObject::tr("Title ID"), new QLabel(value(info.title_id), dialog));
+	form->addRow(QObject::tr("Version"), new QLabel(value(info.gameVersion), dialog));
+	form->addRow(QObject::tr("Size"), size);
+	form->addRow(QObject::tr("Location"), new QLabel(value(info.game_path.isEmpty() ? info.basedir : info.game_path), dialog));
+
+	auto* text = new QVBoxLayout;
+	text->addWidget(name);
+	text->addLayout(form);
+	text->addStretch();
+	auto* top = new QHBoxLayout;
+	top->addWidget(icon, 0, Qt::AlignTop);
+	top->addLayout(text, 1);
+	auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+	QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+	auto* layout = new QVBoxLayout(dialog);
+	layout->addLayout(top);
+	layout->addWidget(buttons);
+	dialog->setMinimumWidth(480);
+
+	// The list already calculates the size in the background; follow it if it is still running.
+	auto* poll = new QTimer(dialog);
+	QObject::connect(poll, &QTimer::timeout, dialog, [poll, size, guard = QPointer<ConfigurationItem>(item)] {
+		if (guard == nullptr) {
+			poll->stop();
+			return;
+		}
+		size->setText(guard->SizeText());
+		if (guard->SizeText() != QStringLiteral("\u2014")) {
+			poll->stop();
+		}
+	});
+	if (item->SizeText() == QStringLiteral("\u2014")) {
+		poll->start(300);
+	}
+	dialog->show();
+}
 
 static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_list->setAlternatingRowColors(false);
@@ -187,9 +299,13 @@ static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_grid->setSelectionMode(QAbstractItemView::SingleSelection);
 	ui->cfgs_grid->setSelectionBehavior(QAbstractItemView::SelectRows);
 	ui->cfgs_grid->setEditTriggers(QAbstractItemView::NoEditTriggers);
-	ui->cfgs_grid->setSpacing(8);
+	ui->cfgs_grid->setFlow(QListView::LeftToRight);
+	ui->cfgs_grid->setWrapping(false);
+	ui->cfgs_grid->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+	ui->cfgs_grid->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	ui->cfgs_grid->setMouseTracking(true);
+	ui->cfgs_grid->setSpacing(4);
 	ui->cfgs_grid->setUniformItemSizes(true);
-	ui->cfgs_grid->setWordWrap(true);
 	ui->cfgs_grid->setItemDelegate(new GameGridDelegate(ui->cfgs_grid));
 	ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
 }
@@ -298,12 +414,18 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	});
 	connect(m_ui->cfgs_grid, &QListView::customContextMenuRequested, this,
 	        [this](const QPoint& pos) {
-		        ShowContextMenu(m_ui->cfgs_list->itemFromIndex(m_ui->cfgs_grid->indexAt(pos)));
+		        const auto index = m_ui->cfgs_grid->indexAt(pos);
+		        if (index.isValid()) {
+			        ShowContextMenu(m_ui->cfgs_list->itemFromIndex(index));
+		        }
 	        });
 	connect(m_ui->grid_view_button, &QToolButton::toggled, this, [this](bool grid) {
 		m_ui->grid_size_slider->setVisible(grid);
 		auto* view = grid ? static_cast<QAbstractItemView*>(m_ui->cfgs_grid) : m_ui->cfgs_list;
 		m_ui->game_views->setCurrentWidget(view);
+		if (grid && m_selected_item == nullptr) {
+			SelectFirstVisibleItem();
+		}
 		view->setCurrentIndex(view->currentIndex().siblingAtColumn(GAME_NAME_COLUMN));
 		view->scrollTo(view->currentIndex());
 		view->setFocus();
@@ -323,9 +445,20 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	ReadSettings();
 	m_ui->grid_size_slider->setVisible(m_ui->grid_view_button->isChecked());
 	const auto resize_grid = [this](int width) {
-		m_ui->cfgs_grid->setIconSize(QSize(width, width * 9 / 16));
+		m_ui->cfgs_grid->setIconSize(QSize(width, width));
 	};
 	resize_grid(m_ui->grid_size_slider->value());
+	m_ui->cfgs_grid->SetPlayHandler([this] {
+		if (m_selected_item != nullptr && !m_selected_item->IsRunning() && m_run_enabled) {
+			emit Run();
+		}
+	});
+	m_ui->cfgs_grid->SetInfoHandler([this] {
+		if (m_selected_item != nullptr) {
+			ShowGameInfo(this, m_selected_item);
+		}
+	});
+	m_ui->cfgs_grid->SetMenuHandler([this] { ShowContextMenu(m_selected_item); });
 	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this, resize_grid](int width) {
 		resize_grid(width);
 		if (!m_ui->grid_size_slider->isSliderDown()) {
@@ -846,6 +979,20 @@ void ConfigurationListWidget::ScanGameDirectory() {
 	}
 	m_ui->cfgs_list->setCurrentItem(selected_item);
 	SelectItem(selected_item);
+	if (selected_item == nullptr && m_ui->grid_view_button->isChecked()) {
+		SelectFirstVisibleItem();
+	}
+}
+
+void ConfigurationListWidget::SelectFirstVisibleItem() {
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = m_ui->cfgs_list->topLevelItem(index);
+		if (!item->isHidden()) {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			return;
+		}
+	}
 }
 
 void ConfigurationListWidget::edit_configuration() {
@@ -1205,6 +1352,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	if (item == nullptr) {
 		m_selected_item = nullptr;
 		m_ui->cfgs_list->SetBackgroundImage({});
+		UpdateGridDetails();
 		m_ui->edit_button->setEnabled(false);
 		m_ui->delete_button->setEnabled(false);
 		emit Select();
@@ -1216,8 +1364,26 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 
 	m_selected_item = item;
 	m_ui->cfgs_list->SetBackgroundImage(item->GetInfo().basedir);
+	UpdateGridDetails();
 
 	emit Select();
+}
+
+void ConfigurationListWidget::UpdateGridDetails() {
+	if (m_selected_item == nullptr) {
+		m_ui->cfgs_grid->SetBackgroundImage({});
+		m_ui->cfgs_grid->SetTrophyInfo({}, {}, {});
+		return;
+	}
+	const auto& info = m_selected_item->GetInfo();
+	m_ui->cfgs_grid->SetBackgroundImage(info.basedir);
+	unsigned earned = 0, total = 0, percent = 0;
+	if (TrophyViewerDialog::GetProgress(&info, m_runtime_directory, earned, total, percent)) {
+		m_ui->cfgs_grid->SetTrophyInfo(info.name, QStringLiteral("%1%").arg(percent),
+		                               QStringLiteral("%1/%2").arg(earned).arg(total));
+	} else {
+		m_ui->cfgs_grid->SetTrophyInfo(info.name, {}, {});
+	}
 }
 
 void ConfigurationListWidget::list_itemDoubleClicked(QTreeWidgetItem* witem, int /*column*/) {

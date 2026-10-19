@@ -14,6 +14,8 @@ public:
 	explicit TrophyViewerDialog(QWidget* parent = nullptr);
 
 	static bool HasTrophyData(const Configuration* info);
+	static bool GetProgress(const Configuration* info, const QString& runtime_directory,
+	                        unsigned& earned, unsigned& total, unsigned& percent);
 	static void ShowForGame(const Configuration* info, const QString& runtime_directory,
 	                        QWidget* parent);
 	static void ShowOverview(const std::vector<const Configuration*>& games,

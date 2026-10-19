@@ -281,6 +281,18 @@ QPixmap LoadGameArt(const Configuration* game, int height) {
 
 } // namespace
 
+bool TrophyViewerDialog::GetProgress(const Configuration* info, const QString& runtime_directory,
+                                     unsigned& earned, unsigned& total, unsigned& percent) {
+	if (info == nullptr || !HasTrophyData(info)) {
+		return false;
+	}
+	const auto progress = GetGameProgress(info, runtime_directory);
+	earned              = progress.earned;
+	total               = progress.total;
+	percent             = progress.Percentage();
+	return true;
+}
+
 void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& games,
                                       const QString& runtime_directory, QWidget* parent) {
 	QDialog dialog(parent);

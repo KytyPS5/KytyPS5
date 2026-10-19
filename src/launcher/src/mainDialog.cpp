@@ -139,17 +139,23 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
-	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint |
+	                            Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
-		Update();
+	const auto update_title_sound = [this]() {
 		const auto* item = m_ui->widget->GetSelectedItem();
 		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
 		                           ? item->GetInfo().basedir
 		                           : QString());
+	};
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this, update_title_sound]() {
+		Update();
+		update_title_sound();
 	});
+	// The first game is selected while the widget is built, before this connection exists.
+	update_title_sound();
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
@@ -178,11 +184,22 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
 		m_update_checker->SetGameRunning(state != QProcess::NotRunning);
+		if (state == QProcess::Running) {
+			m_main_dialog->showMinimized();
+		}
 		if (state == QProcess::NotRunning) {
+			m_main_dialog->setWindowState(m_main_dialog->windowState() & ~Qt::WindowMinimized);
+			m_main_dialog->show();
+			m_main_dialog->raise();
+			m_main_dialog->activateWindow();
 			if (m_running_item != nullptr) {
 				m_running_item->SetRunning(false);
 			}
 			Update();
+			const auto* selected = m_ui->widget->GetSelectedItem();
+			if (selected != nullptr) {
+				m_title_sound.SetTitle(selected->GetInfo().basedir);
+			}
 		}
 	});
 

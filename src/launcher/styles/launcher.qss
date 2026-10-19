@@ -1,11 +1,12 @@
 QListView#cfgs_grid {
-    background: palette(base);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b1d3a, stop:1 #05080f);
     border: 1px solid palette(mid);
-    color: palette(text);
+    color: white;
+    outline: 0;
 }
 
 QListView#cfgs_grid::item {
-    padding: 8px;
+    background: transparent;
 }
 
 GameListTreeWidget#cfgs_list {

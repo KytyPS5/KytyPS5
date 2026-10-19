@@ -350,7 +350,7 @@
            </property>
           </column>
          </widget>
-         <widget class="QListView" name="cfgs_grid"/>
+         <widget class="GameGridView" name="cfgs_grid"/>
         </widget>
        </item>
       </layout>
@@ -372,6 +372,11 @@
    <class>GameListTreeWidget</class>
    <extends>QTreeWidget</extends>
    <header>gameListTreeWidget.h</header>
+  </customwidget>
+  <customwidget>
+   <class>GameGridView</class>
+   <extends>QListView</extends>
+   <header>gameGridView.h</header>
   </customwidget>
  </customwidgets>
  <resources/>

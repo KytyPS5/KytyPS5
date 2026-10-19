@@ -25,7 +25,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
 			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
 			return;
-		case O::S_SETREG_B32: EmitControlNop(); return;
+		case O::S_SETREG_B32:
+		case O::S_SETREG_IMM32_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: return;
 

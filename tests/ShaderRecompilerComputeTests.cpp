@@ -21280,6 +21280,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::S_CBRANCH_EXECNZ:
   case Opcode::S_SENDMSG:
   case Opcode::S_SETREG_B32:
+  case Opcode::S_SETREG_IMM32_B32:
   case Opcode::S_SLEEP:
   case Opcode::S_TTRACEDATA:
   case Opcode::S_INST_PREFETCH:

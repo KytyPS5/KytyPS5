@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/frontend/decode/MemoryOps.h"
 #include "graphics/shader/recompiler/frontend/decode/ScalarAluOps.h"
 #include "graphics/shader/recompiler/frontend/decode/VectorAluOps.h"
+#include "graphics/shader/recompiler/ir/Reg.h"
 
 #include <algorithm>
 #include <bit>
@@ -219,12 +220,22 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 	}
 }
 
+// Trap temporaries behave as extra scalar registers past the SGPR file.
+static void DecodeTrapReg(uint32_t code, Operand& operand) {
+	operand.kind = OperandKind::Sgpr;
+	operand.reg  = IR::NumSgprs + (code - 108u);
+}
+
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return;
+	}
+	if (code >= 108u && code <= 123u) {
+		DecodeTrapReg(code, operand);
 		return;
 	}
 	if (code >= 128u && code <= 192u) {
@@ -278,6 +289,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return;
+	}
+	if (code >= 108u && code <= 123u) {
+		DecodeTrapReg(code, operand);
 		return;
 	}
 
@@ -360,29 +375,87 @@ Family GetInstructionFamily(uint32_t word) {
 	}
 }
 
+// Unsupported opcodes return before their operands are decoded, so their trailing literal or
+// DPP/SDWA dword would otherwise be decoded as the next instruction. Recover the encoded length.
+static uint32_t EncodedWordCount(Family family, std::span<const uint32_t> code, uint32_t word_index,
+                                 uint32_t decoded_words) {
+	const uint32_t word         = code[word_index];
+	const auto     vop_extended = [](uint32_t src0) {
+		return src0 == 233u || src0 == 234u || src0 == 249u || src0 == 250u || src0 == 255u;
+	};
+	switch (family) {
+		case Family::SOP1: return (word & 0xffu) == 255u ? 2u : 1u;
+		case Family::SOP2:
+		case Family::SOPC:
+			return ((word & 0xffu) == 255u || ((word >> 8u) & 0xffu) == 255u) ? 2u : 1u;
+		case Family::SOPK: return ((word >> 23u) & 0x1fu) == 0x15u ? 2u : 1u;
+		case Family::VOP1:
+		case Family::VOPC: return vop_extended(word & 0x1ffu) ? 2u : 1u;
+		case Family::VOP2: {
+			switch ((word >> 25u) & 0x3fu) {
+				case 0x20u: // v_madmk_f32
+				case 0x21u: // v_madak_f32
+				case 0x2cu: // v_fmamk_f32
+				case 0x2du: // v_fmaak_f32
+				case 0x37u: // v_fmamk_f16
+				case 0x38u: // v_fmaak_f16
+					return 2u;
+				default: return vop_extended(word & 0x1ffu) ? 2u : 1u;
+			}
+		}
+		case Family::VOP3:
+		case Family::VOP3P: {
+			if (word_index + 1u >= code.size()) {
+				return decoded_words;
+			}
+			const uint32_t word1 = code[word_index + 1u];
+			const bool literal = (word1 & 0x1ffu) == 255u || ((word1 >> 9u) & 0x1ffu) == 255u ||
+			                     ((word1 >> 18u) & 0x1ffu) == 255u;
+			return literal ? 3u : 2u;
+		}
+		default: return decoded_words;
+	}
+}
+
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
-	switch (GetInstructionFamily(code[word_index])) {
-		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
-		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
-		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); return;
-		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); return;
-		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return;
-		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); return;
-		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); return;
-		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); return;
-		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); return;
-		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); return;
-		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return;
-		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return;
-		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return;
-		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return;
-		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return;
-		case Family::DS: DecodeDs(pc, code, word_index, inst); return;
-		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
-		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
-		default:
-			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+	const Family family = GetInstructionFamily(code[word_index]);
+	switch (family) {
+		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); break;
+		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); break;
+		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); break;
+		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); break;
+		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); break;
+		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); break;
+		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); break;
+		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); break;
+		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); break;
+		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); break;
+		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); break;
+		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); break;
+		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); break;
+		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); break;
+		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); break;
+		case Family::DS: DecodeDs(pc, code, word_index, inst); break;
+		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); break;
+		case Family::EXP: DecodeExp(pc, code, word_index, inst); break;
+		default: {
+			// An unknown encoding is almost always a trailing dword of the previous instruction
+			// (literal, DPP/SDWA or NSA word) that was not consumed, so show what preceded it.
+			std::string previous;
+			for (uint32_t i = word_index >= 4u ? word_index - 4u : 0u; i < word_index; i++) {
+				previous += fmt::format(" [0x{:08x}]=0x{:08x}", i * 4u, code[i]);
+			}
+			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x; preceding words:%s",
+			     pc, code[word_index], previous.c_str());
+		}
+	}
+
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		const uint32_t words = EncodedWordCount(family, code, word_index, inst.word_count);
+		if (words != inst.word_count && word_index + words <= code.size()) {
+			SetRawWords(inst, code, word_index, words);
+		}
 	}
 }
 
@@ -447,7 +520,10 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::FloatInlineConstant:
 			text = fmt::format("{:f}", std::bit_cast<float>(operand.value));
 			break;
-		case OperandKind::Sgpr: text = fmt::format("s{}", operand.reg); break;
+		case OperandKind::Sgpr:
+			text = operand.reg < IR::NumSgprs ? fmt::format("s{}", operand.reg)
+			                                    : fmt::format("ttmp{}", operand.reg - IR::NumSgprs);
+			break;
 		case OperandKind::Vgpr: text = fmt::format("v{}", operand.reg); break;
 		case OperandKind::VccLo: text = "vcc_lo"; break;
 		case OperandKind::VccHi: text = "vcc_hi"; break;
@@ -543,6 +619,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SETPC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_SETREG_IMM32_B32:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_imm32_b32 {}, {}",
+			                                               inst.pc, OperandToString(inst.src0).c_str(),
+			                                               OperandToString(inst.src1).c_str()));
 		case Opcode::S_SETREG_B32:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),

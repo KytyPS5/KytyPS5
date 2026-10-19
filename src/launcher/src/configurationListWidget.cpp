@@ -163,21 +163,17 @@ public:
 	// outlined. The slider value is the size of the selected tile.
 	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
 		const int big = option.decorationSize.width() * 3 / 4;
-		return QSize(big + 12, big + 12);
+		return QSize(option.decorationSize.width() / 2 + GameGridView::TileGap, big + 12);
 	}
 
 	void paint(QPainter* painter, const QStyleOptionViewItem& option,
 	           const QModelIndex& index) const override {
-		const int  side = option.decorationSize.width();
 		const auto* view = dynamic_cast<const GameGridView*>(option.widget);
-		qreal      t    = view != nullptr ? view->TileScale(index.row())
-		                                  : ((option.state & QStyle::State_Selected) ? 1.0 : 0.0);
-		const bool selected = t > 0.5;
-		t                   = t * t * (3.0 - 2.0 * t);
-		const int  tile     = qRound(side / 2.0 + (side * 3 / 4.0 - side / 2.0) * t);
-		const QRect cell    = option.rect;
-		const QRect rect(cell.left() + (cell.width() - tile) / 2, cell.top() + 6, tile, tile);
-
+		if (view == nullptr) {
+			return;
+		}
+		const bool  selected = view->TileScale(index.row()) > 0.5;
+		const QRect rect     = view->TileRect(index.row());
 		painter->save();
 		painter->setRenderHint(QPainter::Antialiasing);
 		painter->setRenderHint(QPainter::SmoothPixmapTransform);
@@ -188,7 +184,7 @@ public:
 		painter->fillRect(rect, QColor(30, 34, 44));
 		const auto icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
 		if (!icon.isNull()) {
-			const auto pixmap = icon.pixmap(QSize(tile, tile));
+			const auto pixmap = icon.pixmap(rect.size());
 			painter->drawPixmap(rect, pixmap.scaled(rect.size(), Qt::KeepAspectRatioByExpanding,
 			                                        Qt::SmoothTransformation));
 		}
@@ -304,7 +300,7 @@ static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_grid->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
 	ui->cfgs_grid->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	ui->cfgs_grid->setMouseTracking(true);
-	ui->cfgs_grid->setSpacing(4);
+	ui->cfgs_grid->setSpacing(0);
 	ui->cfgs_grid->setUniformItemSizes(true);
 	ui->cfgs_grid->setItemDelegate(new GameGridDelegate(ui->cfgs_grid));
 	ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);

@@ -21,6 +21,7 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QResizeEvent>
+#include <QScrollBar>
 #include <QString>
 #include <QTimer>
 #include <QVector>
@@ -83,6 +84,43 @@ public:
 
 	void SetMenuHandler(std::function<void()> handler) {
 		m_menu_handler = std::move(handler);
+	}
+
+public:
+	static constexpr int TileGap = 40;
+
+	// Tiles are packed left to right with a constant gap, so the enlarged selected tile does not
+	// make the spacing uneven.
+	QRect TileRect(int row) const {
+		const int side = iconSize().width();
+		const auto size = [&](int r) {
+			const qreal t = TileScale(r);
+			return qRound(side / 2.0 + side / 4.0 * (t * t * (3.0 - 2.0 * t)));
+		};
+		int x = Margin - horizontalScrollBar()->value();
+		for (int r = 0; r < row; ++r) {
+			if (!isRowHidden(r)) {
+				x += size(r) + TileGap;
+			}
+		}
+		const int s = size(row);
+		return QRect(x, 10, s, s);
+	}
+
+	QModelIndex indexAt(const QPoint& pos) const override {
+		const int rows = model() != nullptr ? model()->rowCount() : 0;
+		for (int row = 0; row < rows; ++row) {
+			if (isRowHidden(row)) {
+				continue;
+			}
+			const auto rect = TileRect(row);
+			if (QRect(rect.left() - TileGap / 2, rect.top(), rect.width() + TileGap,
+			          rect.height() + 30)
+			        .contains(pos)) {
+				return model()->index(row, 0);
+			}
+		}
+		return {};
 	}
 
 protected:

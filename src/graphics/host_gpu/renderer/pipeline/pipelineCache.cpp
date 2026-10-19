@@ -360,6 +360,27 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .shader_base                = params.Base(),
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
+	    .mapped_ranges = +[](void*, uint64_t address, uint64_t maximum,
+	                         std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+		    ranges.clear();
+		    const auto end = maximum > UINT64_MAX - address ? UINT64_MAX : address + maximum;
+		    for (auto current = address; current < end;) {
+			    Libs::LibKernel::Memory::VirtualQueryInfo info {};
+			    if (Libs::LibKernel::Memory::KernelVirtualQuery(
+			            reinterpret_cast<const void*>(current), 1, &info, sizeof(info)) != 0) break;
+			    const auto begin = std::max(current, uint64_t {info.start});
+			    const auto finish = std::min(end, uint64_t {info.end});
+			    if (finish <= current) break;
+			    if (info.is_committed && begin < finish) {
+				    const auto offset = begin - address;
+				    if (!ranges.empty() && ranges.back().first + ranges.back().second == offset)
+					    ranges.back().second += finish - begin;
+				    else ranges.emplace_back(offset, finish - begin);
+			    }
+			    current = finish;
+		    }
+		    return true;
+	    },
 	};
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {

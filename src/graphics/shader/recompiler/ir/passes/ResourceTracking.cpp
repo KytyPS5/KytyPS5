@@ -1038,6 +1038,7 @@ private:
 				                           a.table_stride != b.table_stride)) || a.indexed != b.indexed ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    a.signed_count != b.signed_count ||
+				    a.table_mapped != b.table_mapped ||
 				    !EquivalentValue(m_program, a.workgroup_key, b.workgroup_key) ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
@@ -3645,7 +3646,18 @@ private:
 					indirect.selector_first = Value(UINT32_MAX);
 					indirect.key_count = Value(33u);
 				} else {
-					return false;
+					if (m_program.stage != ShaderType::Pixel || m_shader_writes ||
+					    plan.read_dwords != 8u || plan.table_indexed || plan.split_offsets ||
+					    table_offset != 0u || table_immediate != 0u || key_inst == nullptr ||
+					    key_inst->GetOpcode() != ValueOpcode::ReadFirstLane ||
+					    !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+						    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw &&
+						        Implies(use.user->Arg(use.user->NumArgs() - 1u), key_inst->Arg(1));
+					    })) return false;
+					indirect.table_mapped = true;
+					indirect.table_scalar = true;
+					plan.table_read = plan.reads[0];
+					plan.retain_reads = true;
 				}
 			}
 			if ((table_offset & 3u) != 0u) return false;

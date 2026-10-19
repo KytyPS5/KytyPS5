@@ -496,6 +496,128 @@ void TestWorkgroupImageKey() {
   }
 }
 
+void TestMappedPixelImageTable() {
+  for (uint32_t mode = 0; mode < 4u; ++mode) {
+    Fixture fixture(ShaderType::Pixel);
+    const auto attribute = fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(3u)});
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32, {attribute, Value(0u)});
+    const auto floating = fixture.Emit(ValueOpcode::BitCastF32U32, {attribute});
+    const auto converted = fixture.Emit(ValueOpcode::ConvertS32F32, {floating});
+    const auto predicated = fixture.Emit(ValueOpcode::SelectU32, {active, converted, Value(0u)});
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {predicated, active});
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {key, Value(mode == 2u ? 4u : 5u)});
+    const auto base = fixture.Address(fixture.UserData(0u), fixture.UserData(1u));
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      if (mode == 2u && word >= 4u) {
+        words[word] = Value(0u);
+        continue;
+      }
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = mode == 1u ? 0u : word * 4u;
+      const auto word_offset = mode == 1u && word != 0u
+          ? fixture.Emit(ValueOpcode::IAdd32, {offset, Value(word * 4u)})
+          : offset;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {base, word_offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0xd0u));
+    }
+    const auto dimensions = fixture.Emit(ValueOpcode::BitFieldUExtract,
+        {words[2], Value(14u), Value(14u)});
+    fixture.Emit(ValueOpcode::ReferenceU32, {dimensions});
+    const auto image = fixture.Image(words);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    memory.image_r128 = mode == 2u;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture.ImageAddress(), mode == 0u ? Value(true) : active},
+        fixture.AddMemory(memory, 0x13cu));
+    if (mode != 3u) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+          "pixel table accepted an invalid first-lane mask, split offset, or R128 descriptor");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    const auto &source = plan.descriptor_sources[plan.info.images[0].source];
+    Check(source.indirect_descriptor && source.indirect_descriptor->table_mapped &&
+              source.indirect_descriptor->table_stride == 32u,
+          "interpolated pixel key did not retain its mapped image table");
+    Check(words[2].Instruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+              !fixture.program.memory_info[words[2].Instruction()->Flags<MemoryFlags>().index].planning_only,
+          "image table replaced descriptor dimensions with its selector");
+    EliminateDeadCode(fixture.program.blocks);
+    ValidateProgram(fixture.program, true);
+    LinearTestMemory data;
+    data.words.assign(32u, 0u);
+    data.fail_address = data.base + 32u;
+    for (uint32_t row = 0; row < 2u; ++row) {
+      data.words[row * 16u] = 0x20u + row;
+      data.words[row * 16u + 1u] = static_cast<uint32_t>(row == 0u
+          ? Libs::Graphics::Prospero::BufferFormat::k32Float
+          : Libs::Graphics::Prospero::BufferFormat::k8UScaled) << 20u;
+      data.words[row * 16u + 2u] = 3u | (3u << 14u);
+      data.words[row * 16u + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    }
+    const std::array<uint32_t, 8> unrelated{
+        0x43800000u, 0x43100000u, 0x0003c003u, 0xd0900facu,
+        0x00000001u, 0x00000a00u, 0x42400000u, 0x00000000u};
+    std::copy(unrelated.begin(), unrelated.end(), data.words.begin() + 24u);
+    const std::array<uint32_t, 2> user_data {0x1000u, 0u};
+    SrtRuntime runtime {.user_data = user_data, .userdata = &data,
+        .read_specialization_memory = ReadLinearTestMemory,
+        .mapped_ranges = +[](void *userdata, uint64_t address, uint64_t maximum,
+                             std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
+          const auto &memory = *static_cast<LinearTestMemory *>(userdata);
+          if (maximum == 4u) {
+            if (address >= 0x2000u && address <= 0x2100u) ranges = {{0u, 4u}};
+            return true;
+          }
+          if (address != memory.base || maximum != (uint64_t{1} << 32u)) return false;
+          ranges = {{0u, 32u}, {64u, 64u}};
+          return true;
+        }};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "mapped pixel image table failed to materialize");
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    Check(snapshot.flattened_srt[mapping] == 2u &&
+              specialization.images[0].indirect_search_iterations == 2u &&
+              snapshot.flattened_srt[mapping + 1u] == 0u &&
+              snapshot.flattened_srt[mapping + 3u] == 64u &&
+              snapshot.images[snapshot.flattened_srt[mapping + 2u]].dwords[0] == 0x20u &&
+              snapshot.images[snapshot.flattened_srt[mapping + 4u]].dwords[0] == 0x21u,
+          "mapped image discovery lost sparse keys or retained unmapped texture data");
+    data.fail_address = data.base;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "unreadable mapped image table was accepted");
+    data.fail_address = UINT64_MAX;
+    runtime.mapped_ranges = +[](void *, uint64_t, uint64_t,
+                               std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
+      ranges = {{0u, uint64_t{MaxIndirectDescriptorProbes + 1u} * 32u}};
+      return true;
+    };
+    const auto reads = data.reads;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && data.reads == reads,
+          "oversized mapped image table read guest memory");
+    runtime.mapped_ranges = +[](void *, uint64_t, uint64_t,
+                               std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
+      ranges = {{0u, 32u}, {64u, uint64_t{MaxIndirectDescriptorProbes} * 32u}};
+      return true;
+    };
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && data.reads == reads + 1u,
+          "mapped image scan reset its probe budget between ranges");
+    runtime.mapped_ranges = nullptr;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "raw image pointer without a mapped extent was accepted");
+  }
+}
+
 enum class ImageKeyCase {
   BoundedFloat,
   MissingSaturation,
@@ -9908,6 +10030,7 @@ int main() {
     Run("workgroup image key", TestWorkgroupImageKey);
     Run("bounded workgroup image key", TestBoundedWorkgroupImageKey);
     Run("bounded float image key", TestBoundedFloatImageKey);
+    Run("mapped pixel image table", TestMappedPixelImageTable);
     Run("mixed image dimensions", [] { CheckImageTableKey(ImageKeyCase::MixedDimensions); });
     Run("mixed sampled conversions", [] { CheckImageTableKey(ImageKeyCase::MixedConversions); });
     Run("mixed gather rejection", [] { CheckImageTableKey(ImageKeyCase::MixedGather); });

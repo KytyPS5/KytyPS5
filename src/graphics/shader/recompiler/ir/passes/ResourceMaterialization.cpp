@@ -300,7 +300,8 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	const auto* table = Source(program, indirect.table_source);
 	return indirect.sources.empty() && (!indirect.selector || indirect.table_scalar) &&
 	       (indirect.key_count.IsEmpty() || indirect.table_maximum) && indirect.workgroup_axis == UINT32_MAX &&
-	       table != nullptr && table->dword_count == 4u;
+	       table != nullptr && (table->dword_count == 4u ||
+	                            (indirect.table_mapped && table->dword_count == 2u));
 }
 
 bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offset) {
@@ -714,6 +715,65 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			table_size = table.GetSize();
 		} else {
 			return false;
+		}
+		if (indirect.table_mapped) {
+			// SMEM offsets can cross gaps in the committed address space.
+			if (runtime.mapped_ranges == nullptr || table_value.dword_count != 2u ||
+			    indirect.table_stride != descriptor_bytes || indirect.table_offset != 0u ||
+			    indirect.table_immediate != 0u || indirect.pointer_table) return failed("mapped table geometry");
+			table_base &= AddressMask & ~uint64_t {3};
+			std::vector<std::pair<uint64_t, uint64_t>> ranges;
+			const auto extent = uint64_t {1} << 32u;
+			if (!runtime.mapped_ranges(runtime.userdata, table_base, extent, ranges) || ranges.empty())
+				return failed("mapped table extent");
+			const auto mapping_offset = snapshot.flattened_srt.size();
+			descriptors[resource_index] = {.dword_count = dword_count};
+			snapshot.flattened_srt.push_back(0u);
+			uint64_t previous_end = 0u;
+			uint64_t probes = 0u;
+			for (const auto& [offset, bytes]: ranges) {
+				if (offset < previous_end || offset > extent || bytes > extent - offset ||
+				    ((offset | bytes) & 3u) != 0u) return failed("mapped table range");
+				previous_end = offset + bytes;
+				auto first = (offset + descriptor_bytes - 1u) / descriptor_bytes * descriptor_bytes;
+				const auto count = first < previous_end ? (previous_end - first) / descriptor_bytes : 0u;
+				if (count > MaxIndirectDescriptorProbes - probes) return failed("mapped table probe limit");
+				probes += count;
+				while (first < previous_end && previous_end - first >= descriptor_bytes) {
+					const auto count = std::min<uint64_t>((previous_end - first) / descriptor_bytes,
+					                                      MaxIndirectDescriptorProbes / read_dwords);
+					keys.resize(count * read_dwords);
+					if (!ReadScalarTable(table_base, UINT64_MAX, first, runtime, keys))
+						return read_failed("mapped image table read", 0u, 0u, table_base, first, keys.size() * 4u);
+					for (uint32_t row = 0; row < count; ++row) {
+						DescriptorValue candidate {.dword_count = dword_count};
+						std::copy_n(keys.begin() + row * read_dwords, read_dwords, candidate.dwords.begin());
+						if (!normalize(candidate)) return normalization_failed(first, row, descriptor_bytes, "row");
+						if (!NullImageDescriptor(candidate)) {
+							ShaderTextureResource texture;
+							std::copy(candidate.dwords.begin(), candidate.dwords.end(), texture.fields);
+							std::vector<std::pair<uint64_t, uint64_t>> backing;
+							if (!runtime.mapped_ranges(runtime.userdata, texture.Base40(), 4u, backing)) return false;
+							if (backing.empty() || backing.front().first != 0u || backing.front().second < 4u) continue;
+						}
+						const auto ordinal = intern_candidate(candidate);
+						if (ordinal == 0u) continue;
+						snapshot.flattened_srt.push_back(static_cast<uint32_t>(first + row * descriptor_bytes));
+						snapshot.flattened_srt.push_back(ordinal);
+					}
+					first += count * descriptor_bytes;
+				}
+			}
+			if (descriptors.size() == children_begin) snapshot.flattened_srt.resize(mapping_offset);
+			else {
+				const auto count = static_cast<uint32_t>((snapshot.flattened_srt.size() - mapping_offset - 1u) / 2u);
+				snapshot.flattened_srt[mapping_offset] = count;
+				auto& root = specializations[resource_index];
+				root.indirect_root = resource_index;
+				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
+				root.indirect_search_iterations = std::bit_width(count);
+			}
+			return true;
 		}
 		if (byte_keys && table_size > UINT32_MAX) return failed("table geometry");
 		bool use_selector = selector != nullptr;

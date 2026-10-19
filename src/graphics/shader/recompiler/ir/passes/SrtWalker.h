@@ -47,6 +47,8 @@ struct SrtRuntime {
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
 	std::span<const uint32_t> local_size;
+	bool (*mapped_ranges)(void* userdata, uint64_t address, uint64_t maximum,
+	                      std::vector<std::pair<uint64_t, uint64_t>>& ranges) = nullptr;
 };
 
 class SrtReadCapture {
@@ -57,6 +59,8 @@ public:
 
 private:
 	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool MappedRanges(void* userdata, uint64_t address, uint64_t maximum,
+	                         std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;

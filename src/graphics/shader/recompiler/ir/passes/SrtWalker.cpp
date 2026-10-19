@@ -20,7 +20,14 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.userdata = this;
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? Read : nullptr;
+	runtime.mapped_ranges = m_source.mapped_ranges != nullptr ? MappedRanges : nullptr;
 	return runtime;
+}
+
+bool SrtReadCapture::MappedRanges(void* userdata, uint64_t address, uint64_t maximum,
+                                 std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	return capture.m_source.mapped_ranges(capture.m_source.userdata, address, maximum, ranges);
 }
 
 bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> values) {

@@ -149,6 +149,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::quick_exit(0);
 }
 
+/// Mount the selected title, load its additional-content configuration, and execute it.
 void Run(const RunOptions& options) {
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");

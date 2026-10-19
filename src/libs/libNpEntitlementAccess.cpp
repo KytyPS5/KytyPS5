@@ -167,6 +167,7 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
 
+/// Encode installed DLC as installed data, or local PSAL as license-only content.
 static NpEntitlementAccessAddcontEntitlementInfo
 MakeAddcontInfo(const Loader::AddContentEntry& entry, bool license_only = false) {
 	NpEntitlementAccessAddcontEntitlementInfo info {};
@@ -407,6 +408,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
 	           : NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
 }
 
+/// Count all visible entries and copy at most list_num; local licenses use service zero.
 static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
     uint32_t service_label, NpEntitlementAccessAddcontEntitlementInfo* list, uint32_t list_num,
     uint32_t* hit_num) {
@@ -445,6 +447,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 	return 0;
 }
 
+/// Resolve legacy, installed, then service-zero local entitlements, in that order.
 static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
     uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
     NpEntitlementAccessAddcontEntitlementInfo* info) {

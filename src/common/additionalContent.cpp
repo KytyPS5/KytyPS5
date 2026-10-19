@@ -1,5 +1,6 @@
 #include "common/additionalContent.h"
 
+#include "common/file.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <regex>
+#include <sstream>
 #include <system_error>
 
 namespace Common {
@@ -109,17 +111,29 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 	return entries;
 }
 
+/// Read title-matched license-only entries from a host file or archive member.
+/// Reject configurations above 64 KiB and incomplete reads before parsing sections.
 std::vector<AddContentEntry> ReadLocalEntitlements(const std::filesystem::path& file,
                                                   const std::string& title_id) {
-	std::error_code ec;
-	const auto size = std::filesystem::file_size(file, ec);
-	if (title_id.size() != 9 || ec || size > 64 * 1024) {
+	if (title_id.size() != 9) {
 		return {};
 	}
-	std::ifstream stream(file, std::ios::binary);
-	if (!stream) {
+	File input(file, File::Mode::Read);
+	if (input.IsInvalid()) {
 		return {};
 	}
+	const auto size = input.Size();
+	if (size == 0 || size > 64 * 1024) {
+		return {};
+	}
+	std::string contents(static_cast<size_t>(size), '\0');
+	uint32_t bytes_read = 0;
+	input.Read(contents.data(), static_cast<uint32_t>(size), &bytes_read);
+	if (bytes_read != size) {
+		return {};
+	}
+	std::istringstream stream(contents);
+	/// Remove surrounding whitespace without changing case-sensitive field values.
 	const auto trim = [](std::string value) {
 		const auto first = value.find_first_not_of(" \t\r\n");
 		return first == std::string::npos ? std::string {} :
@@ -130,6 +144,7 @@ std::vector<AddContentEntry> ReadLocalEntitlements(const std::filesystem::path& 
 	std::map<std::string, AddContentEntry> entries;
 	std::map<std::string, std::string> fields;
 	bool psal = false, invalid = false;
+	/// Accept the completed section only for this title, service zero and NO_EXTRA_DATA.
 	const auto flush = [&] {
 		const auto id = fields.find("content_id");
 		const auto status = fields.find("download_status");

@@ -2,7 +2,11 @@
 #define GAME_GRID_VIEW_H
 
 #include "gameContent.h"
+#include "trophyViewerDialog.h"
 
+#include <QFontMetrics>
+#include <QLocale>
+#include <vector>
 #include <functional>
 #include <utility>
 
@@ -56,6 +60,11 @@ public:
 		m_title    = title;
 		m_progress = progress;
 		m_earned   = earned;
+		viewport()->update();
+	}
+
+	void SetRecentTrophies(std::vector<TrophyViewerDialog::RecentTrophy> trophies) {
+		m_recent = std::move(trophies);
 		viewport()->update();
 	}
 
@@ -124,6 +133,61 @@ protected:
 		painter.setPen(Qt::NoPen);
 		for (int dx = -9; dx <= 9; dx += 9) {
 			painter.drawEllipse(more.center() + QPoint(dx, 0), 2, 2);
+		}
+		painter.restore();
+	}
+
+	void PaintRecent(QPainter& painter, const QRect& r) {
+		if (m_recent.empty()) {
+			return;
+		}
+		const int top = ButtonsTop() + 40 + 28;
+		painter.save();
+		painter.setRenderHint(QPainter::Antialiasing);
+		painter.setRenderHint(QPainter::SmoothPixmapTransform);
+		auto heading = font();
+		heading.setPointSizeF(font().pointSizeF() * 1.2);
+		heading.setBold(true);
+		painter.setFont(heading);
+		painter.setPen(Qt::white);
+		painter.drawText(QRect(Margin, top, 400, 26), Qt::AlignLeft | Qt::AlignVCenter,
+		                 tr("Latest activity"));
+
+		constexpr int gap    = 12;
+		constexpr int height = 84;
+		const int     count  = static_cast<int>(m_recent.size());
+		const int     width  = qBound(200, (r.width() - 2 * Margin - (count - 1) * gap) / count, 280);
+		const int     y      = top + 34;
+		for (int i = 0; i < count; ++i) {
+			const auto& t = m_recent[i];
+			const QRect card(Margin + i * (width + gap), y, width, height);
+			painter.setPen(Qt::NoPen);
+			painter.setBrush(QColor(0, 0, 0, 150));
+			painter.drawRoundedRect(card, 14, 14);
+			const QRect icon(card.left() + 8, card.top() + 8, 68, 68);
+			if (!t.icon.isNull()) {
+				painter.drawPixmap(icon, t.icon);
+			}
+			const int text_x = icon.right() + 10;
+			const int text_w = card.right() - text_x - 8;
+			auto      name_font = font();
+			name_font.setBold(true);
+			painter.setFont(name_font);
+			painter.setPen(Qt::white);
+			const QFontMetrics metrics(name_font);
+			painter.drawText(QRect(text_x, card.top() + 8, text_w, 22),
+			                 Qt::AlignLeft | Qt::AlignVCenter,
+			                 metrics.elidedText(t.name, Qt::ElideRight, text_w));
+			if (!t.cup.isNull()) {
+				painter.drawPixmap(QRect(text_x, card.top() + 33, 18, 18), t.cup);
+			}
+			painter.setFont(font());
+			painter.drawText(QRect(text_x + 24, card.top() + 31, text_w - 24, 22),
+			                 Qt::AlignLeft | Qt::AlignVCenter, t.category);
+			painter.setPen(QColor(170, 170, 175));
+			painter.drawText(QRect(text_x, card.top() + 54, text_w, 22),
+			                 Qt::AlignLeft | Qt::AlignVCenter,
+			                 QLocale().toString(t.earned, QLocale::ShortFormat));
 		}
 		painter.restore();
 	}
@@ -292,6 +356,7 @@ protected:
 
 			if (!m_title.isEmpty()) {
 				PaintButtons(painter);
+				PaintRecent(painter, r);
 				auto title_font = font();
 				title_font.setPointSizeF(font().pointSizeF() * 4.2);
 				title_font.setWeight(QFont::Black);
@@ -333,6 +398,7 @@ private:
 	QString               m_title;
 	QString               m_progress;
 	QString               m_earned;
+	std::vector<TrophyViewerDialog::RecentTrophy> m_recent;
 	QPixmap               m_prev;
 	QPoint                m_prev_pos;
 	qreal                 m_fade = 1.0;

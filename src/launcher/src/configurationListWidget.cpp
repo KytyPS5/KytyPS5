@@ -1373,6 +1373,7 @@ void ConfigurationListWidget::UpdateGridDetails() {
 	if (m_selected_item == nullptr) {
 		m_ui->cfgs_grid->SetBackgroundImage({});
 		m_ui->cfgs_grid->SetTrophyInfo({}, {}, {});
+		m_ui->cfgs_grid->SetRecentTrophies({});
 		return;
 	}
 	const auto& info = m_selected_item->GetInfo();
@@ -1384,6 +1385,8 @@ void ConfigurationListWidget::UpdateGridDetails() {
 	} else {
 		m_ui->cfgs_grid->SetTrophyInfo(info.name, {}, {});
 	}
+	m_ui->cfgs_grid->SetRecentTrophies(
+	    TrophyViewerDialog::GetRecent(&info, m_runtime_directory, 5));
 }
 
 void ConfigurationListWidget::list_itemDoubleClicked(QTreeWidgetItem* witem, int /*column*/) {

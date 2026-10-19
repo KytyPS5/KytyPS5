@@ -1,7 +1,10 @@
 #ifndef TROPHY_VIEWER_DIALOG_H
 #define TROPHY_VIEWER_DIALOG_H
 
+#include <QDateTime>
 #include <QDialog>
+#include <QPixmap>
+#include <QString>
 
 #include <vector>
 
@@ -13,6 +16,17 @@ class TrophyViewerDialog: public QDialog {
 public:
 	explicit TrophyViewerDialog(QWidget* parent = nullptr);
 
+	struct RecentTrophy {
+		QString   name;
+		QString   category;
+		QDateTime earned;
+		QPixmap   icon;
+		QPixmap   cup;
+	};
+
+	// Most recently earned trophies first.
+	static std::vector<RecentTrophy> GetRecent(const Configuration* info,
+	                                           const QString& runtime_directory, int count);
 	static bool HasTrophyData(const Configuration* info);
 	static bool GetProgress(const Configuration* info, const QString& runtime_directory,
 	                        unsigned& earned, unsigned& total, unsigned& percent);

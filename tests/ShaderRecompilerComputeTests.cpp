@@ -3849,11 +3849,15 @@ public:
                               clean_fill_value, false);
       buffer_cache.CopyBuffer(clean_cached_copy, clean_cached_source,
                               sizeof(clean_copy_words), false, false);
+      // A fill or copy of memory that is a buffer itself runs on the GPU, in GPU order, and its
+      // pages are the GPU's until it completes; of a copy, it stays a CPU write.
       Require("GpuCommandLane", "clean cached DMA ownership",
-              !buffer_cache.HasGpuDirtyBytes(clean_cached_fill,
-                                             sizeof(source_words)) &&
-                  !buffer_cache.HasGpuDirtyBytes(clean_cached_copy,
-                                                 sizeof(clean_copy_words)) &&
+              (buffer_cache.IsGuestBacked(clean_cached_fill, sizeof(source_words)) ||
+               !buffer_cache.HasGpuDirtyBytes(clean_cached_fill,
+                                              sizeof(source_words))) &&
+                  (buffer_cache.IsGuestBacked(clean_cached_copy, sizeof(clean_copy_words)) ||
+                   !buffer_cache.HasGpuDirtyBytes(clean_cached_copy,
+                                                  sizeof(clean_copy_words))) &&
                   buffer_cache.HasGpuDirtyBytes(immediate_dst,
                                                 sizeof(source_words)),
               "clean cached DMA acquired ownership or released a byte-disjoint "
@@ -4468,6 +4472,24 @@ public:
             "the GPU work after a copy did not read it");
     Require(name, "fill in guest memory", memory[fill_offset / 4] == 0x77777777u,
             "the fill did not reach guest memory");
+
+    // Shaders that write a buffer through formatted stores get a copy of guest memory instead, from
+    // the next frame boundary on; what the GPU wrote before is in guest memory then.
+    constexpr uint64_t formatted_offset = 0x400;
+    context.GetGpu().SendCommandSync([&] {
+      auto [buffer, offset] =
+          cache.ObtainBuffer(base + formatted_offset, sizeof(uint32_t), true, true);
+      Require(name, "formatted write before the boundary", buffer->IsGuestBacked(),
+              "the buffer stopped being guest memory before the frame boundary");
+      buffer->Fill(offset, sizeof(uint32_t), 0x88888888u);
+      cache.SettleGpuWrites();
+      cache.RunGarbageCollector();
+      Require(name, "copy after the boundary",
+              !cache.IsGuestBacked(base + formatted_offset, sizeof(uint32_t)),
+              "a buffer written through formatted stores is still guest memory");
+    });
+    Require(name, "formatted write kept", memory[formatted_offset / 4] == 0x88888888u,
+            "the GPU's write was lost when the buffer became a copy");
     context.GetGpu().SendCommandSync([&] { scheduler.Finish(); });
     context.UnmapMemory(base, allocation_size);
     LibKernel::Memory::InstallGpuResources(nullptr);
@@ -7660,8 +7682,11 @@ public:
                   ms_depth_desc.info.metadata.range &&
               texture_cache.IsMeta(ms_htile_address) &&
               !texture_cache.IsMetaCleared(ms_htile_address, 0) &&
-              !resources.GetBufferCache().HasGpuDirtyBytes(
-                  base + ms_stencil_offset, ms_stencil_size) &&
+              // The fill of memory that is a buffer itself ran on the GPU (see GpuCommandLane).
+              (resources.GetBufferCache().IsGuestBacked(base + ms_stencil_offset,
+                                                        ms_stencil_size) ||
+               !resources.GetBufferCache().HasGpuDirtyBytes(
+                   base + ms_stencil_offset, ms_stencil_size)) &&
               ms_stencil_alias &&
               texture_cache.GetImage(ms_stencil_alias).depth_id == ms_depth_image &&
               texture_cache.GetImage(ms_stencil_alias).backing.image == nullptr,
@@ -8421,9 +8446,12 @@ public:
       Require(name, "exact-disjoint image replacement",
               publish_replacement && publish_replacement != publish_image,
               "exact-format lookup did not replace the image");
+      // The fill of memory that is a buffer itself ran on the GPU (see GpuCommandLane).
       Require(name, "exact-disjoint image publication",
-              !resources.GetBufferCache().HasGpuDirtyBytes(
-                  base + publish_buffer_offset, sizeof(publish_buffer_value)),
+              resources.GetBufferCache().IsGuestBacked(base + publish_buffer_offset,
+                                                       sizeof(publish_buffer_value)) ||
+                  !resources.GetBufferCache().HasGpuDirtyBytes(
+                      base + publish_buffer_offset, sizeof(publish_buffer_value)),
               "clean neighboring buffer unexpectedly became GPU-owned");
       uint32_t published_image_backing = 0;
       uint32_t published_buffer_backing = 0;

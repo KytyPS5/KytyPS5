@@ -482,6 +482,35 @@ bool BufferCache::PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64
 	return published;
 }
 
+void BufferCache::DemoteGuestBackedBuffers() {
+	if (m_demote.empty()) {
+		return;
+	}
+	std::vector<BufferId> demote;
+	for (const auto id: m_demote) {
+		if (!IsBufferInvalid(id) && !m_slot_buffers[id].is_deleted &&
+		    m_slot_buffers[id].IsGuestBacked()) {
+			demote.push_back(id);
+		}
+	}
+	m_demote.clear();
+	if (demote.empty()) {
+		return;
+	}
+	// The GPU's writes to them are in guest memory once the work so far completes; the copies
+	// that take their place start from guest memory, as new buffers do.
+	m_scheduler.Finish();
+	for (const auto id: demote) {
+		const auto& buffer  = m_slot_buffers[id];
+		const auto  address = buffer.CpuAddress();
+		const auto  bytes   = buffer.Size();
+		(void)ForgetGuestBackedWrites(address, bytes);
+		m_memory_tracker.UnmarkRegionAsGpuModified(address, bytes);
+		m_memory_tracker.UntrackMemory(address, bytes);
+		DeleteBuffer(id);
+	}
+}
+
 bool BufferCache::ForgetGuestBackedWrites(uint64_t vaddr, uint64_t size) {
 	// By pages, as a read-back of a copy publishes them: the tracker owns whole pages.
 	bool written = false;
@@ -570,6 +599,17 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
 	if (new_buffer.IsGuestBacked()) {
+		// No copy notes a write here: the GPU writes the old buffer still has in flight are the new
+		// buffer's, or a CPU access of their pages would not wait for them (ReadBack). A write that
+		// is prepared but not recorded yet stays unsettled under the new buffer.
+		new_buffer.InheritGpuWrite(overlap.LastGpuWriteTick());
+		if (std::ranges::find(m_unsettled_writers, overlap_id) != m_unsettled_writers.end()) {
+			if (m_unsettled_writers.size() < MaxUnsettledWriters) {
+				m_unsettled_writers.push_back(new_id);
+			} else {
+				m_unsettled_everywhere = true;
+			}
+		}
 		// Guest memory holds the bytes already, except those only a copy of it holds: what the
 		// GPU wrote to a buffer that was a copy.
 		if (!overlap.IsGuestBacked()) {
@@ -613,7 +653,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	const auto flags     = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
-	const auto placement = m_import.Place(overlap.begin, overlap.end - overlap.begin);
+	const auto placement = m_copy_only.Intersects(overlap.begin, overlap.end - overlap.begin)
+	                           ? std::nullopt
+	                           : m_import.Place(overlap.begin, overlap.end - overlap.begin);
 	const auto id =
 	    placement ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags,
 	                                      overlap.end - overlap.begin, placement->memory,
@@ -860,6 +902,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written && buffer.IsGuestBacked()) {
 		m_guest_backed_writes.Add(vaddr, size, m_scheduler.CurrentTick());
+		if (is_texel_buffer && !m_copy_only.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			m_copy_only.Add(buffer.CpuAddress(), buffer.Size());
+			m_demote.push_back(id);
+		}
 	}
 	if (is_written) {
 		if (m_unsettled_writers.size() < MaxUnsettledWriters) {
@@ -988,7 +1034,7 @@ bool BufferCache::IsGuestBacked(uint64_t vaddr, uint64_t size) {
 			return buffer.IsGuestBacked();
 		}
 	}
-	return m_import.CanPlace(vaddr, size);
+	return !m_copy_only.Intersects(vaddr, size) && m_import.CanPlace(vaddr, size);
 }
 
 bool BufferCache::ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size) {
@@ -1069,6 +1115,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
+	DemoteGuestBackedBuffers();
 	m_guest_backed_writes.ForgetCompleted(m_scheduler.GetMasterSemaphore().KnownGpuTick());
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

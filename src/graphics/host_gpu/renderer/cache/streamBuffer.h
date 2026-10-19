@@ -84,6 +84,10 @@ public:
 	// submission can happen in between.
 	void               NoteGpuWrite() noexcept;
 	[[nodiscard]] uint64_t LastGpuWriteTick() const noexcept { return m_last_gpu_write_tick; }
+	// This buffer takes the place of another over the same memory, whose writes become its own.
+	void InheritGpuWrite(uint64_t tick) noexcept {
+		m_last_gpu_write_tick = tick > m_last_gpu_write_tick ? tick : m_last_gpu_write_tick;
+	}
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;

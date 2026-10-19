@@ -197,6 +197,9 @@ private:
 	// A read-back of a buffer that is guest memory itself: the GPU's writes there are complete,
 	// and nothing is copied. True when the range held GPU-written pages.
 	[[nodiscard]] bool ForgetGuestBackedWrites(uint64_t vaddr, uint64_t size);
+	// Buffers that are guest memory itself and that shaders write through formatted stores become
+	// copies (m_copy_only): at the next frame boundary, when no draw being prepared refers to them.
+	void DemoteGuestBackedBuffers();
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -219,6 +222,13 @@ private:
 	// Prepared for a GPU write that is not recorded yet. See SettleGpuWrites.
 	static constexpr size_t                           MaxUnsettledWriters = 256;
 	std::vector<BufferId>                             m_unsettled_writers;
+	// Memory that only buffers that are copies hold, and the buffers that are guest memory itself
+	// still to become copies (DemoteGuestBackedBuffers). Formatted stores write image-like data
+	// next to and over images; with the buffer as guest memory itself, Sonic Racing CrossWorlds
+	// rendered its world and cars black in some frames, and in every frame when the host GPU
+	// kept pace with the guest. As copies they render as before.
+	RangeSet                                          m_copy_only;
+	std::vector<BufferId>                             m_demote;
 	bool                                              m_unsettled_everywhere = false;
 	// Only tests set this: it keeps the copy path covered on a device where the CPU can read
 	// buffer memory.

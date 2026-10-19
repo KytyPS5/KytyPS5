@@ -68,7 +68,9 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	/// Return initialized BDA mappings; requires an active recording command buffer.
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept;
+	/// Return initialized page-fault bits; requires an active recording command buffer.
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
@@ -88,6 +90,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	/// Schedule the one-time clear before BDA mappings or faults can be consumed.
 	void EnsureBdaStorageInitialized();
 
 	bool IsBufferInvalid(BufferId id) const {

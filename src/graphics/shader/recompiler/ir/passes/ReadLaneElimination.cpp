@@ -103,8 +103,10 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 // Fragment subgroups may have no physical invocation at either endpoint.
 class WaveReductionMatcher {
 public:
+	/// Match one associative reduction operation within a single IR block.
 	WaveReductionMatcher(Block* block, ValueOpcode operation): block(block), operation(operation) {}
 
+	/// Prove a full-wave prefix reduction with valid endpoint reads and neutral masked seeds.
 	Value Match(const Inst& reduction) {
 		const auto* low  = Get(reduction.Arg(0), ValueOpcode::ReadLane);
 		const auto* high = Get(reduction.Arg(1), ValueOpcode::ReadLane);
@@ -138,9 +140,14 @@ public:
 				prefix = attempt.MatchRow(prefix, shift);
 			}
 			prefix = attempt.Unwrap(prefix);
-			if (prefix.IsEmpty() || attempt.saved_exec.IsEmpty()) return prefix;
+			if (prefix.IsEmpty()) return prefix;
 			const auto* seed = attempt.Get(prefix, ValueOpcode::SelectU32);
 			const auto neutral = operation == ValueOpcode::UMin32 ? UINT32_MAX : 0u;
+			if (attempt.saved_exec.IsEmpty()) {
+				// Literal full EXEC does not prove that a masked seed has a neutral fallback.
+				if (seed == nullptr || seed->Arg(2).Resolve() == Value(neutral)) return prefix;
+				continue;
+			}
 			if (seed != nullptr && seed->Arg(2).Resolve() == Value(neutral)) {
 				const auto predicate = seed->Arg(0).Resolve();
 				const auto* subset = attempt.Get(predicate, ValueOpcode::LogicalAnd);
@@ -155,12 +162,14 @@ public:
 	}
 
 private:
+	/// Return an instruction only when its opcode and defining block match the proof.
 	Inst* Get(Value value, ValueOpcode opcode) const {
 		auto* inst = value.Resolve().TryInstruction();
 		return inst != nullptr && inst->Parent() == block && inst->GetOpcode() == opcode
 		           ? inst : nullptr;
 	}
 
+	/// Accept literal full execution or one consistently witnessed symbolic full mask.
 	bool FullExec(Value predicate) {
 		predicate = predicate.Resolve();
 		if (predicate == Value(true)) return true;
@@ -176,6 +185,7 @@ private:
 		return false;
 	}
 
+	/// Strip only selects whose predicate is proven to enable every lane.
 	Value Unwrap(Value value) {
 		while (const auto* select = Get(value, ValueOpcode::SelectU32)) {
 			if (!FullExec(select->Arg(0))) break;
@@ -184,12 +194,14 @@ private:
 		return value.Resolve();
 	}
 
+	/// Require an unmasked row shift without inactive-lane or bounds overrides.
 	static bool IsRowShift(const Inst& inst, uint32_t shift) {
 		const auto flags = inst.Flags<DppMoveFlags>();
 		return flags.control == 0x110u + shift && flags.row_mask == 0xf &&
 		       flags.bank_mask == 0xf && !flags.fetch_inactive && !flags.bound_control && !flags.dpp8;
 	}
 
+	/// Trace a prefix row update back to the previous value using the selected operation.
 	Value MatchRow(Value value, uint32_t shift) {
 		const auto* update = Get(Unwrap(value), ValueOpcode::DppUpdateU32);
 		if (update == nullptr || !IsRowShift(*update, shift) || !FullExec(update->Arg(2))) return {};
@@ -211,6 +223,7 @@ private:
 
 } // namespace
 
+/// Fold proven lane reads and complete wave64 reductions while retaining unmatched chains.
 ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	ReadLaneStats stats;
 	if (wave_size != 32u && wave_size != 64u) {

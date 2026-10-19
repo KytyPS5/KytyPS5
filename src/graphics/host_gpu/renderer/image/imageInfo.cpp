@@ -76,6 +76,7 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
+/// Represent a guest mip view within host limits while preserving its physical layout.
 bool ImageInfo::NormalizeMipView(uint32_t& base_level, uint32_t level_count) {
 	if (level_count == 0 || base_level >= resources.levels ||
 	    level_count > resources.levels - base_level) return false;
@@ -101,6 +102,7 @@ bool ImageInfo::NormalizeMipView(uint32_t& base_level, uint32_t level_count) {
 	return true;
 }
 
+/// Compute guest storage layouts, retaining original offsets for rebased mip views.
 void ImageInfo::UpdateSize() {
 	if (guest_mip_levels != 0) {
 		EXIT_IF(guest_base_mip >= guest_mip_levels || resources.levels == 0 ||

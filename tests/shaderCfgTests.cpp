@@ -1297,6 +1297,7 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+/// Check that extra guest mip views preserve original offsets, array strides and tail layout.
 void TestOversizedGuestMipViews() {
   for (uint32_t layers : {1u, 2u}) {
     ImageInfo physical{};
@@ -11848,6 +11849,7 @@ void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
         "unreachable S_SETPC metadata suppressed a reachable scalar load component");
 }
 
+/// Compile dword jump tables with separate or reused selector and load-result registers.
 void TestNewShaderRecompilerSetpcDwordJumpTable(bool reuse_selector) {
   const uint32_t offset_reg = reuse_selector ? 106u : 6u;
   const uint32_t shader[] = {
@@ -16679,6 +16681,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
+/// Run shader decoding, control-flow, image-layout and SPIR-V construction regressions.
 int main() {
   using namespace Libs::Graphics;
 

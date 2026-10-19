@@ -30,6 +30,7 @@ namespace {
 	}
 }
 
+/// Choose supported creation flags, falling back for sampled compressed volumes.
 [[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
                                                    const ImageInfo& info) {
 	vk::ImageCreateFlags flags {};

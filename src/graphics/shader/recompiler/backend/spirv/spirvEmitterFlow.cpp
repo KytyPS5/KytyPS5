@@ -792,6 +792,7 @@ uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+/// Emit an unsigned maximum reduction, combining both emulated wave halves first.
 uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	auto value = ctx.Arg(inst, 0);
@@ -804,6 +805,7 @@ uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+/// Emit a bitwise OR reduction, combining both emulated wave halves first.
 uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	auto value = ctx.Arg(inst, 0);

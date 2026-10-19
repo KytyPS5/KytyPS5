@@ -92,6 +92,7 @@ struct ImageInfo {
 	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
+	/// Rebase an oversized guest mip selection without changing its physical allocation.
 	[[nodiscard]] bool NormalizeMipView(uint32_t& base_level, uint32_t level_count);
 	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;

@@ -167,6 +167,7 @@ struct BufferCacheTestAccess {
 
   static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
 
+  /// Model recycled device memory before the cache performs its first initialization.
   static void PoisonUnusedBdaStorage(BufferCache &cache) {
     cache.m_bda_pagetable_buffer.Fill(0, cache.m_bda_pagetable_buffer.Size(), 0xa5a5a5a5u);
     auto *faults = cache.m_fault_manager.GetFaultBuffer();
@@ -232,6 +233,7 @@ struct TileManagerTestAccess {
 };
 
 struct TextureCacheTestAccess {
+  /// Expose the production cache identity predicate for host-only regression tests.
   static bool SameBacking(const ImageInfo &cached, const ImageInfo &requested,
                           bool exact_format) {
     return TextureCache::SameBacking(cached, requested, exact_format);
@@ -1026,6 +1028,7 @@ void Require(const char *shader_name, const char *stage, bool value,
   }
 }
 
+/// Keep identical mip views reusable while distinguishing physically separate extra mips.
 void CheckOversizedMipCacheIdentity() {
   constexpr const char *name = "OversizedMipCacheIdentity";
   bool distinct = true;
@@ -5362,6 +5365,7 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  /// Read back poisoned BDA storage to verify the first GPU use clears mappings and faults.
   void CheckBdaInitialState() {
     constexpr const char *name = "BdaInitialState";
     EnsureRuntimeContext();
@@ -5580,6 +5584,7 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  /// Alternate extra mip views and verify their distinct texels through the texture cache.
   void CheckOversizedMipCacheContents() {
     constexpr const char *name = "OversizedMipCacheContents";
     constexpr uintptr_t base = 0x0000000206000000ull;
@@ -34492,6 +34497,7 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+/// Verify invalid guest addresses cannot alias a mapped page after packing or narrowing.
 TestCase FlatInvalidAddressDoesNotAliasMappedPage() {
   constexpr uint64_t offset = 0x110000000ull;
   constexpr uint64_t extended = Libs::LibKernel::Memory::kExtendedMemoryBase + offset;
@@ -42797,6 +42803,7 @@ TestCase DispatcherIrreducibleControlFlow() {
 
 #include "ShaderRayTracingGpuTests.inc"
 
+/// Assemble shader execution cases, including guest-address translation regressions.
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -48754,6 +48761,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+/// Run selected shader regressions or the full host and Vulkan test suite.
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 

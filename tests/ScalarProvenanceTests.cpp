@@ -619,12 +619,13 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
+/// Verify neutral inputs and reject malformed UMin, UMax and OR reduction proofs.
 void TestCompleteWaveReduction(ValueOpcode expected_operation) {
   const auto neutral = expected_operation == ValueOpcode::UMin32 ? UINT32_MAX : 0u;
   const auto expected_reduction = expected_operation == ValueOpcode::UMin32 ? ValueOpcode::SubgroupUMinU32 :
       expected_operation == ValueOpcode::UMax32 ? ValueOpcode::SubgroupUMaxU32 : ValueOpcode::SubgroupOrU32;
   enum class Case {
-    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
+    Masked, Subset, Literal, LiteralMasked, LiteralWrongNeutral, LiteralMove, Wave32,
     UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
@@ -632,7 +633,7 @@ void TestCompleteWaveReduction(ValueOpcode expected_operation) {
     Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation, MixedOperation
   };
   for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
-       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
+       Case::LiteralMasked, Case::LiteralWrongNeutral, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
        Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
        Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
        Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
@@ -645,7 +646,8 @@ void TestCompleteWaveReduction(ValueOpcode expected_operation) {
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
     const auto other_mask = fixture.Emit(ValueOpcode::IEqual32, {source, Value(7u)});
     const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
-    const bool literal = test == Case::Literal || test == Case::LiteralMasked;
+    const bool literal = test == Case::Literal || test == Case::LiteralMasked ||
+        test == Case::LiteralWrongNeutral;
     const auto enabled = literal ? Value(true) :
         fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
     auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
@@ -653,7 +655,7 @@ void TestCompleteWaveReduction(ValueOpcode expected_operation) {
       seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
     const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
         fixture.Emit(ValueOpcode::SelectU32,
-            {seed_mask, source, Value(test == Case::WrongNeutral ? ~neutral : neutral)});
+            {seed_mask, source, Value((test == Case::WrongNeutral || test == Case::LiteralWrongNeutral) ? ~neutral : neutral)});
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
     const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseXor32 : expected_operation;
@@ -859,6 +861,7 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+/// Run scalar provenance and wave-reduction proof regressions.
 int main() {
   try {
     TestImmediateFlatteningAndGvn();

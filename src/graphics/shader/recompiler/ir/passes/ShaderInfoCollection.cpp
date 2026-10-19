@@ -284,6 +284,7 @@ struct InputUsage {
 	}
 };
 
+/// Collect resource and subgroup feature requirements from the shader IR.
 void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs,
            const Inst& inst) {
 	auto& info = program.info;

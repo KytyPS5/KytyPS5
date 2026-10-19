@@ -144,6 +144,7 @@ TextureCache::~TextureCache() {
 	});
 }
 
+/// Check native backing compatibility, including the original rebased guest mip chain.
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
                                bool exact_format) {
 	if (cached.data.address != requested.data.address) {

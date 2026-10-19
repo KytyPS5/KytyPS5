@@ -423,6 +423,7 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	return true;
 }
 
+/// Recover a dword jump table, allowing its omitted load to reuse the selector register.
 bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_index,
                                 SetpcTargetInfo& info) {
 	if (setpc_index < 3u || setpc_index >= program.instructions.size()) {

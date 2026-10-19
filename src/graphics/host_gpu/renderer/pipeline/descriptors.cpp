@@ -757,7 +757,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
 							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
+								// Some titles (e.g. Saros past the main menu) bind a sentinel
+								// write whose base falls inside another stage's scalar
+								// specialization read. The CPU specialization was already
+								// captured before dispatch, so keep the write and continue
+								// rather than terminating.
+								static std::atomic_uint overlap_log_count = 0;
+								if (overlap_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+									LOGF("FindBuffers: scalar read [0x%010" PRIx64 " + 0x%" PRIx64
+									     "] overlaps sentinel buffer write base 0x%010" PRIx64 ";"
+								     " keeping write\n",
+								     read_address, read_size, address);
+								}
 							}
 						}
 					}
@@ -952,7 +963,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						// See FindBuffers above: specialization was captured on the CPU
+						// before dispatch, so log the alias and keep going instead of
+						// terminating the title (e.g. Saros past the main menu).
+						static std::atomic_uint commit_overlap_log_count = 0;
+						if (commit_overlap_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+							LOGF("CommitBindings: scalar read [0x%010" PRIx64 " + 0x%" PRIx64
+							     "] overlaps buffer write [0x%010" PRIx64 " + 0x%" PRIx64 "];"
+							     " continuing\n",
+							     address, size, written.address, written.size);
+						}
 					}
 				}
 			}

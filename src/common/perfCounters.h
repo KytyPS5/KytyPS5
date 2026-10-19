@@ -26,10 +26,12 @@ enum class Counter : uint8_t {
 	UploadCopies,    // copy regions of those uploads
 	Draws,
 	Dispatches,
-	RenderPasses,    // render passes begun on the host
-	Submissions,     // host queue submissions
-	ZeroSleeps,      // guest sleeps of no time (a guest thread spinning on a wait)
+	RenderPasses,      // render passes begun on the host
+	Submissions,       // host queue submissions
+	ZeroSleeps,        // guest sleeps of no time (a guest thread spinning on a wait)
 	FaultMicroseconds, // time in the handler of the faults counted by GuestFaults
+	LeftOutDraws,      // draws left out while their pipeline is built
+	ReadbackBytes,     // bytes copied from GPU images or buffers back to guest memory
 	Count,
 };
 
@@ -73,6 +75,8 @@ using Gauges                       = std::array<int64_t, GaugeCount>;
 		case Counter::Submissions: return "submissions";
 		case Counter::ZeroSleeps: return "zero_sleeps";
 		case Counter::FaultMicroseconds: return "fault_us";
+		case Counter::LeftOutDraws: return "left_out_draws";
+		case Counter::ReadbackBytes: return "readback_bytes";
 		case Counter::Count: break;
 	}
 	return "?";

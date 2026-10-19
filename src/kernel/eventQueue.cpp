@@ -397,6 +397,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
+	KYTY_TRACE_COLUMN(GuestEqueueWait);
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {

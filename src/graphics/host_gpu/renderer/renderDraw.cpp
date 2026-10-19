@@ -9,6 +9,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1176,6 +1177,7 @@ void RenderExecutor::NoteFlip() {
 	m_frame++;
 	RegionManager::NoteFrame();
 	PerfCounters::EndFrame();
+	Trace::EndFrame();
 	KYTY_PROFILER_FRAME();
 }
 

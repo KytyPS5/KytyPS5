@@ -85,6 +85,9 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
+			if (is_written) {
+				manager->EndHeat(manager->GetCpuAddr() + offset, bytes);
+			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {

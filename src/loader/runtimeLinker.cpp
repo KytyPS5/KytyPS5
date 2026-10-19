@@ -11,6 +11,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
@@ -32,6 +33,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -190,6 +192,10 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	if (Trace::Enabled() && record_id < g_stubbed_imports.size()) {
+		const auto& record = g_stubbed_imports[record_id];
+		Trace::Note("unresolved_import", record.name, record.program);
+	}
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -700,6 +706,23 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+			}
+			std::printf("\n");
+		}
+		// What the registers point at: a structure or buffer read wrong shows here.
+		const std::pair<const char*, uint64_t> registers[] = {
+		    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+		    {"rsi", info->rsi}, {"rdi", info->rdi}, {"r8", info->r8},   {"r9", info->r9},
+		    {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13},
+		    {"r14", info->r14}, {"r15", info->r15}};
+		for (const auto& [name, value]: registers) {
+			if (value < 0x10000 || !IsReadableRange(value, 128)) {
+				continue;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(value);
+			std::printf("[%s] = %016" PRIx64 ":", name, value);
+			for (int i = 0; i < 128; i++) {
+				std::printf("%s%02x", (i % 32 == 0) ? "\n " : " ", bytes[i]);
 			}
 			std::printf("\n");
 		}

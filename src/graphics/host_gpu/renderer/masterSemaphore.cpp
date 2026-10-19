@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "common/trace.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -103,6 +104,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	KYTY_TRACE_COLUMN(GpuWait);
+	const Trace::StackTimedScope wait_stack;
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;

@@ -5753,6 +5753,105 @@ public:
 
   // The texture cache enrolls a GPU-written image for a copy back to guest memory by the rule of
   // imageReadback.h: a tiny 2D image, not a tiny array or volume, and not a large tiled image.
+  // Guest threads that write into the memory of a GPU-written image each fault, and each fault
+  // saves the image to guest memory first (TextureCache::SaveGpuWrites). The first save makes the
+  // image the CPU's: a later save must not download it again, since that download writes the
+  // whole range and lands after the first thread's write (Sonic Racing CrossWorlds lost package
+  // data this way when its loader reused a render target's memory).
+  void CheckConcurrentImageSave() {
+    constexpr const char *name = "ConcurrentImageSave";
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    constexpr uint64_t image_size = uint64_t{width} * height * 4u; // four pages
+    constexpr uint64_t page = 0x1000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "image-save direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "image-save fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, image_size);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, allocation_size);
+    {
+      auto &texture_cache = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, image_size, vk::Format::eR8G8B8A8Unorm,
+                                 Prospero::BufferFormat::k8_8_8_8UNorm,
+                                 Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      const auto id = texture_cache.FindImage(desc);
+      vk::ClearValue clear{};
+      std::fill_n(clear.color.float32.data(), 4, 1.0f); // 0xff bytes
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      texture_cache.GetImage(id).MarkGpuModified();
+      scheduler.Finish();
+
+      const auto write_page = [&](uint64_t offset, uint8_t value) {
+        std::vector<uint8_t> bytes(page, value);
+        Libs::LibKernel::Memory::WriteBacking(base + offset, bytes.data(), page);
+      };
+      // The first thread's fault saves the image, then its write lands.
+      texture_cache.SaveGpuWrites(base, 1);
+      const auto first_download = texture_cache.GetImage(id).download_tick;
+      Require(name, "first save", first_download != 0 && !texture_cache.GetImage(id).SafeToDownload(),
+              "the first save did not download the image or left it to be downloaded again");
+      write_page(0, 0xa1);
+      // The second thread faulted before the first one marked the image as the CPU's.
+      texture_cache.SaveGpuWrites(base + page, 1);
+      write_page(page, 0xb2);
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick());
+      Require(name, "one download", texture_cache.GetImage(id).download_tick == first_download,
+              "the second save downloaded the image again");
+
+      std::vector<uint8_t> guest(image_size);
+      Require(name, "read guest memory",
+              Libs::LibKernel::Memory::TryReadBacking(base, guest.data(), image_size),
+              "image-save guest memory could not be read back");
+      const auto all_of = [&](uint64_t offset, uint64_t size, uint8_t value) {
+        return std::all_of(guest.begin() + static_cast<ptrdiff_t>(offset),
+                           guest.begin() + static_cast<ptrdiff_t>(offset + size),
+                           [value](uint8_t byte) { return byte == value; });
+      };
+      Require(name, "first thread's write", all_of(0, page, 0xa1),
+              "a later image download overwrote the first thread's write");
+      Require(name, "second thread's write", all_of(page, page, 0xb2),
+              "the second thread's write was lost");
+      Require(name, "GPU contents saved", all_of(2 * page, image_size - 2 * page, 0xff),
+              "the image's GPU contents did not reach guest memory");
+      texture_cache.GetImage(id).ClearGpuModified();
+    }
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image-save direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "image-save direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckTinyImageReadbackEnrolment() {
     constexpr const char *name = "TinyImageReadbackEnrolment";
     constexpr uintptr_t base = 0x0000000208400000ull;
@@ -46501,6 +46600,11 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckUnifiedImageViewCache();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-save-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckConcurrentImageSave();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
     CheckDepthTargetFootprints();
     return 0;
@@ -46725,6 +46829,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckTextureDecodeMemo();
   vulkan.CheckTinyImageReadbackEnrolment();
+  vulkan.CheckConcurrentImageSave();
   vulkan.CheckIdleCollectionKeepsGpuWrittenImages();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();

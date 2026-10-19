@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "loader/timer.h" // IWYU pragma: keep
 
 #include <fmt/format.h>
@@ -50,8 +51,10 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
+	static ::Trace::Site kyty_trace_lib_site {g_library, __func__};                                \
+	const ::Trace::Scope kyty_trace_lib_scope {kyty_trace_lib_site};                               \
 	if (PRINT_NAME_ENABLED) {                                                                      \
-		Libs::PrintName(g_library, g_module, __func__);                                              \
+		Libs::PrintName(g_library, g_module, __func__);                                            \
 	}
 
 namespace Loader {

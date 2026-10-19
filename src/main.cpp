@@ -99,6 +99,14 @@ static void PrintUsage() {
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --perf-counters                      Print what a frame costs (faults, draws, "
 	         "passes) every 30 frames.\n");
+	::printf(
+	    "  --trace-dir <path>                   Write frame times, hotspots, errors, hangs and\n"
+	    "                                       screenshots of a measured run to a folder.\n");
+	::printf("  --trace-screenshot-seconds <num>     Seconds between trace screenshots; 0: none.\n"
+	         "                                       Default: 10.\n");
+	::printf(
+	    "  --trace-hang-seconds <num>           Seconds without a frame before a trace reports\n"
+	    "                                       a hang. Default: 30.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
@@ -453,6 +461,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.pipeline_cache_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--bench-script") {
 			options.config.bench_script = Common::PathFromUtf8(value);
+		} else if (arg == "--trace-dir") {
+			options.config.trace_dir = Common::PathFromUtf8(value);
+		} else if (arg == "--trace-screenshot-seconds") {
+			if (!ParseUint32(value, options.config.trace_screenshot_seconds)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trace-hang-seconds") {
+			if (!ParseUint32(value, options.config.trace_hang_seconds)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--shader-log-folder") {
 			options.config.shader_log_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--command-buffer-dump") {

@@ -7,11 +7,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "common/trace.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/vertexSubgroupProbe.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -809,6 +810,13 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	if ((error || !skip) && Trace::Enabled()) {
+		// A traced run collects every message instead of stopping at the first error.
+		Trace::Note(error ? "vk_validation_error" : "vk_validation_warning",
+		            callback_data->pMessageIdName != nullptr ? callback_data->pMessageIdName : "?",
+		            callback_data->pMessage);
+		error = false;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);

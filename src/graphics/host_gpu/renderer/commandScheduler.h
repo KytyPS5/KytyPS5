@@ -59,6 +59,8 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Without waiting: whether the priority operations of submissions up to `tick` have run.
+	[[nodiscard]] bool PriorityOperationsDone(uint64_t tick);
 	// Runs the deferred operations of every submission so far. The caller has waited until
 	// they retired.
 	void                      RunRetiredOperations();

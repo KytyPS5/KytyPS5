@@ -99,9 +99,12 @@ public:
 	void               RequestFullSynchronization();
 	// GPU thread. A guest submission starts (see GuestWriteLog::BeginSubmission).
 	void BeginSubmission();
+
 	// GPU thread. The GPU thread itself wrote guest memory (WRITE_DATA, a label): a later
 	// draw of the same submission must see it, also on a page that stays open.
 	void RecordGpuThreadWrite(uint64_t vaddr, uint64_t size);
+	// The guest mapped or unmapped [vaddr, vaddr + size): only buffers there can have changed.
+	void RecordMappingChange(uint64_t vaddr, uint64_t size);
 	// A shader that writes through device addresses is being prepared. It can write any buffer,
 	// so it counts as a write of every buffer for a read-back (see readbackPlan.h).
 	void NoteAddressWrites() noexcept;

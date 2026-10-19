@@ -131,6 +131,9 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// The submission of the last download of the image to guest memory: the download writes the
+	// whole range when that submission ends (TextureCache::DownloadImageMemory).
+	uint64_t         download_tick  = 0;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

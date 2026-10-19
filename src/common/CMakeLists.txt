@@ -16,6 +16,7 @@ target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE
 		${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
+		${KYTY_THIRD_PARTY_DIR}/stb
 )
 
 target_link_libraries(common

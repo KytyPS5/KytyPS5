@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/perfCounters.h"
 #include "common/profiler.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/cacheCollection.h"
@@ -161,6 +162,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_TRACE_SCOPE("gpu", "DownloadBufferMemory");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -179,6 +181,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
+	PerfCounters::Add(PerfCounters::Counter::ReadbackBytes, total_size);
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
@@ -321,9 +324,17 @@ void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size)
 void BufferCache::InvalidateWrittenMemory(uint64_t fault_vaddr, bool window_is_mapped) {
 	// Each fault costs a signal and a protection change, which is slow under Rosetta. A game that
 	// rewrites buffers every frame faults on every page it touches, so one fault covers a window.
+	// On a native host a fault is cheap next to what the window costs: every page of it is then
+	// uploaded at its next use, on the GPU thread (Sonic Racing CrossWorlds uploaded four times the
+	// bytes it wrote, and ran ~40% slower in races).
+#if defined(__APPLE__)
+	constexpr bool UseWindow = true;
+#else
+	constexpr bool UseWindow = false;
+#endif
 	constexpr uint64_t WindowSize = 64 * 1024;
 	const auto         begin      = Common::AlignDown(fault_vaddr, WindowSize);
-	if (window_is_mapped && GuestRange {begin, WindowSize}.Valid() &&
+	if (UseWindow && window_is_mapped && GuestRange {begin, WindowSize}.Valid() &&
 	    !m_memory_tracker.IsRegionGpuModified(begin, WindowSize)) {
 		InvalidateMemory(begin, WindowSize);
 		return;
@@ -668,6 +679,7 @@ void BufferCache::EndUploadBatch() {
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
+	Trace::AddKeyed("upload_buffer", buffer.CpuAddress(), total_size);
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -762,6 +774,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		Trace::AddKeyed("upload_stream", vaddr, size);
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
@@ -898,6 +911,10 @@ void BufferCache::RecordGuestWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RecordGpuThreadWrite(uint64_t vaddr, uint64_t size) {
+	RecordGuestWrite(vaddr, size);
+}
+
+void BufferCache::RecordMappingChange(uint64_t vaddr, uint64_t size) {
 	RecordGuestWrite(vaddr, size);
 }
 

@@ -419,6 +419,42 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// A hot page stays open after a read-only upload (writeHeat.h). An upload for a GPU write must
+// protect it before its bytes are copied: a CPU write between the copy and the GPU-dirty state
+// would otherwise be hidden by the GPU's version of the page and lost at the next read-back.
+void TestHotPageProtectedBeforeGpuWriteUpload() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto read_upload = [&] {
+    tracker.ForEachUploadRange(address, page_size, false,
+                               [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  };
+  read_upload();
+  for (int write = 0; write < 2; write++) {
+    tracker.MarkRegionAsCpuModified(address, page_size);
+    read_upload();
+  }
+  Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+        "a page written after two uploads did not stay hot and open");
+
+  bool protected_during_copy = false;
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      [&]() noexcept { protected_during_copy = !IsWritable(memory); });
+  Check(protected_during_copy,
+        "a hot page was still writable while its bytes were copied for a GPU write");
+  Check(!tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.IsRegionGpuModified(address, page_size),
+        "the GPU-write upload did not hand the hot page to the GPU");
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1214,6 +1250,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestHotPageProtectedBeforeGpuWriteUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

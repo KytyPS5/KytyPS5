@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/perfCounters.h"
 #include "common/profiler.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -28,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -1895,14 +1897,28 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!image.SafeToDownload() || !CanDownload(image)) {
 		return false;
 	}
+	KYTY_TRACE_SCOPE("gpu", "DownloadImageMemory");
 	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	PerfCounters::Add(PerfCounters::Counter::ReadbackBytes, range.size);
+	auto& reusable = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	    reusable.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	// An image larger than the reusable buffer (a 4K target with its metadata) goes through a
+	// buffer of its own, held until the download has landed.
+	std::shared_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		temporary = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, range.size);
+		mapped    = temporary->Mapped().data();
+		offset    = 0;
+		if (mapped == nullptr) {
+			EXIT("TextureCache: failed to map a download buffer of 0x%" PRIx64 " bytes\n",
+			     range.size);
+		}
+	} else {
+		reusable.Commit();
 	}
-	download.Commit();
+	auto& download = temporary ? *temporary : reusable;
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -1925,11 +1941,21 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	// The download writes guest memory without a page fault: tell the watchers now, before the
 	// write can happen.
 	m_buffer_cache.WriteWatches().NotifyWrite(range.address, range.size);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
+	image.download_tick = m_scheduler.CurrentTick();
+	m_scheduler.DeferPriorityOperation([&reusable, temporary, range, mapped, offset] {
+		(temporary ? *temporary : reusable).Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
+	if (temporary) {
+		// Also every command buffer committed while it lived holds it (see queueCommits.h).
+		m_scheduler.DeferDestruction([held = std::move(temporary)] {});
+	}
 	return true;
+}
+
+bool TextureCache::DownloadPending(const Image& image) {
+	return image.download_tick != 0 && (!m_scheduler.IsFree(image.download_tick) ||
+	                                    !m_scheduler.PriorityOperationsDone(image.download_tick));
 }
 
 void TextureCache::SaveGpuWrites(uint64_t address, uint64_t size) {
@@ -1938,11 +1964,13 @@ void TextureCache::SaveGpuWrites(uint64_t address, uint64_t size) {
 	}
 	// TODO: a stencil plane (depth_id) the GPU wrote is not saved: no path downloads a stencil
 	// plane to guest memory yet.
+	// Also an image whose last download may not have reached guest memory yet: the caller is
+	// about to write, and that download writes the whole range when it lands.
 	const auto any_unsaved = [&] {
 		for (const auto id: FindImagesInRegion(address, size, false)) {
 			const auto* image = m_slot_images.try_get(id);
 			if (image != nullptr && image->registered && !image->depth_id &&
-			    image->SafeToDownload()) {
+			    (image->SafeToDownload() || DownloadPending(*image))) {
 				return true;
 			}
 		}
@@ -1965,12 +1993,22 @@ void TextureCache::SaveGpuWrites(uint64_t address, uint64_t size) {
 	auto                    round = [&] {
         std::scoped_lock lock {m_lock};
         for (const auto id: FindImagesInRegion(address, size, false)) {
-            const auto* image = m_slot_images.try_get(id);
-            if (image != nullptr && image->registered && !image->depth_id &&
-                image->SafeToDownload() && DownloadImageMemory(id)) {
-                tick = m_scheduler.CurrentTick();
-            }
-        }
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered || image->depth_id) {
+				continue;
+			}
+			if (image->SafeToDownload() && DownloadImageMemory(id)) {
+				// Guest memory now holds what the GPU wrote, and the CPU writes next: the image is
+				// the CPU's from here. Another thread that faults in the range before this one
+				// marks it (InvalidateCpuAliases) must not download it again: that second
+				// download would land after this thread's write and undo it.
+				image->MarkCpuDirty();
+			}
+			// Wait for the last download in any case, also one another thread recorded.
+			if (DownloadPending(*image)) {
+				tick = std::max(tick.value_or(0), image->download_tick);
+			}
+		}
         if (tick) {
             m_scheduler.Flush();
         }

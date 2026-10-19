@@ -157,6 +157,8 @@ private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	// The image's last download to guest memory has not landed yet.
+	[[nodiscard]] bool DownloadPending(const Image& image);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

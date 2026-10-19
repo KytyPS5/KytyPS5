@@ -132,6 +132,18 @@ std::filesystem::path GetBenchScript() {
 	return g_config->bench_script;
 }
 
+std::filesystem::path GetTraceDir() {
+	return g_config->trace_dir;
+}
+
+uint32_t GetTraceScreenshotSeconds() {
+	return g_config->trace_screenshot_seconds;
+}
+
+uint32_t GetTraceHangSeconds() {
+	return std::max(g_config->trace_hang_seconds, 5u);
+}
+
 std::filesystem::path GetPipelineCacheFolder() {
 	const auto variable = [](const char* name) {
 		const char* value = std::getenv(name);

@@ -5,8 +5,10 @@
 #include "common/file.h"
 #include "common/fileLock.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -486,6 +488,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		KYTY_TRACE_COLUMN(ShaderCompile);
+		const Trace::SlowScope slow_compile("slow_shader_compile", params.hash, 100);
 		const auto options =
 		    MakeOptions(stage, params.hash, user_data, params.back_code, input_info);
 		const char* stage_name = NamesOf(stage).stage_name;
@@ -1864,6 +1868,7 @@ void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
 			job = std::move(m_jobs.front());
 			m_jobs.pop_front();
 		}
+		KYTY_TRACE_COLUMN(PipelineCompile);
 		const auto begin = std::chrono::steady_clock::now();
 		if (job.compute) {
 			CreatePipelineInternal(m_graphics, job.target->pipeline, *job.compute,
@@ -1897,6 +1902,7 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(PipelineEntry& entry, const Dr
                                                   uint64_t frame) {
 	const auto ready = [&entry] { return entry.ready.load(std::memory_order_acquire); };
 	const auto leave_out = [this] {
+		PerfCounters::Add(PerfCounters::Counter::LeftOutDraws);
 		if (m_left_out_draws++ == 0) {
 			PipelineCacheLog("Pipelines: a draw is left out until its pipeline is built "
 			                 "(--pipeline-wait true waits instead)");
@@ -1913,6 +1919,7 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(PipelineEntry& entry, const Dr
 			return leave_out();
 		}
 		entry.grace_wait_frame = frame;
+		KYTY_TRACE_COLUMN(PipelineWait);
 		const auto begin       = std::chrono::steady_clock::now();
 		bool       built       = false;
 		{
@@ -1928,6 +1935,7 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(PipelineEntry& entry, const Dr
 	switch (PlanPipelineUse(effects, ready(), m_always_wait)) {
 		case PipelineUse::Draw: return &entry.pipeline;
 		case PipelineUse::Wait: {
+			KYTY_TRACE_COLUMN(PipelineWait);
 			Promote(entry);
 			std::unique_lock lock(m_jobs_mutex);
 			m_job_done.wait(lock, ready);
@@ -1940,6 +1948,7 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(PipelineEntry& entry, const Dr
 				return grace_wait();
 			}
 			m_reset_target_waits++;
+			KYTY_TRACE_COLUMN(PipelineWait);
 			Promote(entry);
 			const auto begin = std::chrono::steady_clock::now();
 			bool       built = false;

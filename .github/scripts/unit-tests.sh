@@ -104,6 +104,7 @@ local_only=(
 	texture_cache_depth_readback
 	texture_cache_htile_clear
 	texture_cache_image_overlap
+	texture_cache_image_save
 	texture_cache_image_views
 	texture_cache_layered_image
 	texture_cache_storage_sampled

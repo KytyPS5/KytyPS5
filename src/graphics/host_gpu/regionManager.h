@@ -168,6 +168,16 @@ public:
 		}
 	}
 
+	// The range is about to be uploaded for a GPU write: its hot pages lose their heat, so that
+	// they are protected before their bytes are copied, as at the end of a lease (writeHeat.h). An
+	// open page could take a CPU write after the copy; the GPU's version of the page would then
+	// hide that write, and a later read-back would overwrite it.
+	void EndHeat(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		ForgetOldHeat();
+		m_write_heat.Cool(start, end);
+	}
+
 	TrackingSpinLock lock;
 
 	// Ends the heat of every region, at its next use. Called from time to time, so that a page

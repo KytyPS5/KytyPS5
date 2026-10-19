@@ -86,6 +86,10 @@ struct ConfigOptions {
 	bool                   profiler_enabled            = false;
 	// Count the events that cost frame time and print them per frame (perfCounters.h).
 	bool                   perf_counters_enabled       = false;
+	// Empty: no trace (trace.h). Else the folder of a measured run's reports.
+	std::filesystem::path  trace_dir;
+	uint32_t               trace_screenshot_seconds        = 10;
+	uint32_t               trace_hang_seconds              = 30;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -134,6 +138,9 @@ LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 std::filesystem::path  GetPipelineCacheFolder();
 std::filesystem::path  GetBenchScript();
+std::filesystem::path  GetTraceDir();
+uint32_t               GetTraceScreenshotSeconds();
+uint32_t               GetTraceHangSeconds();
 
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();

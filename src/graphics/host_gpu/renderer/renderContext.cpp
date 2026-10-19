@@ -5,6 +5,7 @@
 #include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/timer.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/presentation/videoOut.h"
@@ -105,7 +106,10 @@ GuestSpan RenderContext::MappingAt(uint64_t vaddr) const {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.RequestFullSynchronization();
+	// The next device-address pass synchronizes the buffers of the new range only: the game's
+	// allocator maps and unmaps many times per frame, and a pass over every buffer each time cost
+	// Sonic Racing CrossWorlds ~5 ms per frame.
+	m_buffer_cache.RecordMappingChange(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -129,7 +133,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
-		m_buffer_cache.RequestFullSynchronization();
+		m_buffer_cache.RecordMappingChange(vaddr, size);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -164,6 +168,7 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		~UploadBatch() { cache.EndUploadBatch(); }
 	} upload_batch {m_buffer_cache};
 	if (!m_buffer_cache.TakeGuestWrites(m_bda_guest_writes)) {
+		Trace::AddKeyed("bda_sync_full", 0, 1);
 		KYTY_PROFILER_BLOCK("PrepareBda: every buffer");
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);

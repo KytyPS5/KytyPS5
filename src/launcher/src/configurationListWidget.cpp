@@ -173,8 +173,14 @@ public:
 			return;
 		}
 		const bool  selected = view->TileScale(index.row()) > 0.5;
-		const QRect rect     = view->TileRect(index.row());
+		const QRect slot     = view->TileRect(index.row());
+		const qreal pop      = view->PopScale(index.row());
+		const QSize psize(qRound(slot.width() * qMax<qreal>(pop, 0.0)),
+		                  qRound(slot.height() * qMax<qreal>(pop, 0.0)));
+		QRect rect(QPoint(0, 0), psize);
+		rect.moveCenter(slot.center());
 		painter->save();
+		painter->setOpacity(qBound<qreal>(0.0, pop * 1.5, 1.0));
 		painter->setRenderHint(QPainter::Antialiasing);
 		painter->setRenderHint(QPainter::SmoothPixmapTransform);
 
@@ -191,9 +197,23 @@ public:
 		painter->setClipping(false);
 
 		if (selected) {
-			painter->setPen(QPen(Qt::white, 3));
+			const QRectF outline = QRectF(rect).adjusted(-2, -2, 2, 2);
 			painter->setBrush(Qt::NoBrush);
-			painter->drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 14, 14);
+			painter->setPen(QPen(QColor(255, 255, 255, 110), 3));
+			painter->drawRoundedRect(outline, 14, 14);
+
+			// A bright comet circling the outline, with a soft halo.
+			QConicalGradient glow(outline.center(), view->GlowAngle());
+			glow.setColorAt(0.0, QColor(255, 255, 255, 255));
+			glow.setColorAt(0.22, QColor(120, 190, 255, 160));
+			glow.setColorAt(0.45, QColor(120, 190, 255, 0));
+			glow.setColorAt(1.0, QColor(255, 255, 255, 0));
+			painter->setPen(QPen(QBrush(glow), 9));
+			painter->setOpacity(painter->opacity() * 0.35);
+			painter->drawRoundedRect(outline, 14, 14);
+			painter->setOpacity(painter->opacity() / 0.35);
+			painter->setPen(QPen(QBrush(glow), 3.5));
+			painter->drawRoundedRect(outline, 14, 14);
 
 			const auto name = index.data(Qt::DisplayRole).toString();
 			if (!name.isEmpty()) {

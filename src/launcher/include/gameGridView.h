@@ -74,6 +74,29 @@ public:
 		return row >= 0 && row < m_scales.size() ? m_scales[row] : 0.0;
 	}
 
+	// Staggered pop-in: 0..1+ (overshoots slightly), one tile after another.
+	qreal PopScale(int row) const {
+		if (!m_intro) {
+			return 1.0;
+		}
+		const qreal t = qBound<qreal>(0.0, (m_intro_clock.elapsed() - qMin(row, 20) * 80) / 380.0, 1.0);
+		const qreal c = 1.70158;
+		const qreal u = t - 1.0;
+		return 1.0 + (c + 1.0) * u * u * u + c * u * u;
+	}
+
+	// Angle in degrees of the glow circling the selected tile's outline.
+	qreal GlowAngle() const {
+		return m_glow_clock.elapsed() * 0.18;
+	}
+
+	void PlayIntro() {
+		m_intro = true;
+		m_intro_clock.start();
+		StartAnimation();
+		viewport()->update();
+	}
+
 	void SetPlayHandler(std::function<void()> handler) {
 		m_play_handler = std::move(handler);
 	}
@@ -301,14 +324,20 @@ protected:
 				return;
 			}
 		}
-		if (event->button() == Qt::LeftButton && !indexAt(event->pos()).isValid()) {
+		if (event->button() == Qt::LeftButton) {
+			// Select by the drawn tile position; Qt's own cell layout differs from it.
+			const auto index = indexAt(event->pos());
+			if (!index.isValid()) {
+				return;
+			}
+			selectionModel()->setCurrentIndex(index, QItemSelectionModel::ClearAndSelect);
 			return;
 		}
 		QListView::mousePressEvent(event);
 	}
 
 	void mouseReleaseEvent(QMouseEvent* event) override {
-		if (!indexAt(event->pos()).isValid()) {
+		if (event->button() == Qt::LeftButton || !indexAt(event->pos()).isValid()) {
 			return;
 		}
 		QListView::mouseReleaseEvent(event);
@@ -362,11 +391,27 @@ protected:
 			m_fade = qMin(1.0, m_fade + dt * 0.6);
 			busy   = busy || m_fade < 1.0;
 		}
+		if (m_intro) {
+			if (m_intro_clock.elapsed() > 20 * 80 + 450) {
+				m_intro = false;
+			} else {
+				busy = true;
+			}
+		}
+		// The outline glow keeps animating while a game is selected.
+		if (selectionModel() != nullptr && !selectionModel()->selectedIndexes().isEmpty()) {
+			busy = true;
+		}
 		viewport()->update();
 		if (!busy) {
 			m_timer.stop();
 			m_prev = QPixmap();
 		}
+	}
+
+	void showEvent(QShowEvent* event) override {
+		QListView::showEvent(event);
+		PlayIntro();
 	}
 
 	void resizeEvent(QResizeEvent* event) override {
@@ -443,6 +488,9 @@ private:
 	QVector<qreal>        m_scales;
 	QTimer                m_timer;
 	QElapsedTimer         m_clock;
+	QElapsedTimer         m_intro_clock;
+	QElapsedTimer         m_glow_clock = [] { QElapsedTimer t; t.start(); return t; }();
+	bool                  m_intro = false;
 };
 
 #endif // GAME_GRID_VIEW_H

@@ -4413,6 +4413,61 @@ public:
     // waits for the write (no copy).
     Require(name, "GPU write in guest memory", memory[0x80] == 0x33333333u,
             "the GPU's write did not reach guest memory");
+
+    // A fill or a copy of the command processor (DMA_DATA) runs in GPU order: the GPU work
+    // recorded before it has not run yet and still reads the old bytes, as on the console.
+    constexpr uint64_t fill_offset = 0x300;
+    constexpr uint64_t copy_offset = 0x10000;
+    constexpr uint64_t copy_source_offset = 0x10040;
+    memory[fill_offset / 4] = 0x44444444u;
+    memory[copy_offset / 4] = 0x55555555u;
+    memory[copy_source_offset / 4] = 0x66666666u;
+    std::vector<u32> ordered;
+    context.GetGpu().SendCommandSync([&] {
+      auto readback = CreateHostBuffer(name, 4 * sizeof(uint32_t),
+                                       vk::BufferUsageFlagBits::eTransferDst, {0, 0, 0, 0});
+      const auto record_read = [&](uint64_t address, uint32_t slot) {
+        auto [buffer, offset] = cache.ObtainBuffer(address, sizeof(uint32_t), false);
+        auto &command = scheduler.Current();
+        command.EndRendering();
+        vk::MemoryBarrier before{};
+        before.sType = vk::StructureType::eMemoryBarrier;
+        before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                         vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                                         &before, 0, nullptr, 0, nullptr);
+        const vk::BufferCopy copy{offset, slot * sizeof(uint32_t), sizeof(uint32_t)};
+        command.Handle().copyBuffer(buffer->Handle(), readback.buffer, 1, &copy);
+      };
+      record_read(base + fill_offset, 0);
+      cache.FillBuffer(base + fill_offset, sizeof(uint32_t), 0x77777777u, false);
+      record_read(base + fill_offset, 1);
+      record_read(base + copy_offset, 2);
+      cache.CopyBuffer(base + copy_offset, base + copy_source_offset, sizeof(uint32_t), false,
+                       false);
+      record_read(base + copy_offset, 3);
+      vk::MemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+          &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      ordered = ReadBuffer(name, readback, 4);
+      DestroyBuffer(&readback);
+    });
+    Require(name, "work before a fill reads the old bytes", ordered[0] == 0x44444444u,
+            "the command processor's fill reached memory before earlier GPU work read it");
+    Require(name, "work after a fill reads the fill", ordered[1] == 0x77777777u,
+            "the GPU work after a fill did not read it");
+    Require(name, "work before a copy reads the old bytes", ordered[2] == 0x55555555u,
+            "the command processor's copy reached memory before earlier GPU work read it");
+    Require(name, "work after a copy reads the copy", ordered[3] == 0x66666666u,
+            "the GPU work after a copy did not read it");
+    Require(name, "fill in guest memory", memory[fill_offset / 4] == 0x77777777u,
+            "the fill did not reach guest memory");
     context.GetGpu().SendCommandSync([&] { scheduler.Finish(); });
     context.UnmapMemory(base, allocation_size);
     LibKernel::Memory::InstallGpuResources(nullptr);

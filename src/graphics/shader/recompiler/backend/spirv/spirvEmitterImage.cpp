@@ -810,8 +810,8 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		return first.dimension == second.dimension && first.cube == second.cube &&
 		       first.software_compare_func == second.software_compare_func &&
 		       IR::DescriptorBindingForImage(first) == IR::DescriptorBindingForImage(second) &&
-		       (inst.GetOpcode() != IR::ValueOpcode::ImageWrite ||
-		        first.shader_swizzle == second.shader_swizzle) &&
+		       first.conversion_format == second.conversion_format &&
+		       first.shader_swizzle == second.shader_swizzle &&
 		       first.mip_count == 1u && second.mip_count == 1u;
 	};
 	// Descriptor order is unrelated to image type. Share each typed access and
@@ -868,7 +868,10 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	const bool dref = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 	const bool scalar = dref && !gather;
 	const bool mixed = std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
-		return state.program.info.images[resource].numeric_class != image.numeric_class;
+		const auto& candidate = state.program.info.images[resource];
+		return candidate.numeric_class != image.numeric_class ||
+		       candidate.conversion_format != image.conversion_format ||
+		       candidate.shader_swizzle != image.shader_swizzle;
 	});
 	const auto native_type = [&](uint32_t resource) {
 		return scalar ? TypeF32(state) : ImageVectorType(
@@ -887,8 +890,7 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 		                         : state.program.info.images[resource].numeric_class,
 		                    scalar, candidate_mem, gather);
 	};
-	// RDNA returns register bits. Convert per typed run only when the join mixes
-	// numeric classes; homogeneous accesses keep their single conversion after it.
+	// Convert descriptor-dependent formats before joining the register bits.
 	const auto value = EmitImageAccess(
 	    ctx, inst, mixed ? TypeU32Vector(state, 4) : native_type(mem.resource),
 	    [&](uint32_t resource, uint32_t array_index) {

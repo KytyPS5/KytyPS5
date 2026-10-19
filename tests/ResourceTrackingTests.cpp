@@ -503,6 +503,7 @@ enum class ImageKeyCase {
   UnrelatedPredicate,
   MixedDimensions,
   MixedGather,
+  MixedConversions,
   PackedHalf,
   UnsignedBound,
   GuardedUnsignedBound,
@@ -635,12 +636,17 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   for (uint32_t key = 0; key < 8u; ++key) {
     std::array<uint32_t, 8> descriptor {};
     descriptor[0] = 0x20u + key;
-    descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+    const auto format = test_case == ImageKeyCase::MixedConversions && (key == 1u || key == 2u)
+        ? Libs::Graphics::Prospero::BufferFormat::k8UScaled
+        : Libs::Graphics::Prospero::BufferFormat::k32Float;
+    descriptor[1] = static_cast<uint32_t>(format) << 20u;
     descriptor[2] = 3u | (3u << 14u);
     const auto type = !mixed_dimensions || key == 0u
                           ? Libs::Graphics::Prospero::ImageType::kColor2D
                           : Libs::Graphics::Prospero::ImageType::kColor3D;
     descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u);
+    if (test_case == ImageKeyCase::MixedConversions && key == 2u)
+      descriptor[3] = Libs::Graphics::DstSel(5, 4, 7, 6) | (static_cast<uint32_t>(type) << 28u);
     std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x80u / 4u + key * 8u);
   }
   std::array<uint32_t, 6> data {0x1000u, 0u, 0x2000u, 128u << 16u, 2u, 0x14204u};
@@ -661,6 +667,13 @@ void CheckImageTableKey(ImageKeyCase test_case) {
   }
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
       "image table keys did not materialize");
+  if (test_case == ImageKeyCase::MixedConversions) {
+    Check(std::ranges::any_of(specialization.images, [](const auto &image) {
+            return image.conversion_format == Libs::Graphics::Prospero::BufferFormat::k8UScaled;
+          }) && std::ranges::any_of(specialization.images, [](const auto &image) {
+            return image.shader_swizzle == Libs::Graphics::DstSel(5, 4, 7, 6);
+          }), "mixed samples lost their descriptor-specific conversion or swizzle");
+  }
   if (material_key) {
     const auto mapping = specialization.images[0].indirect_mapping_offset;
     const auto adjacent_mapping = specialization.images[1].indirect_mapping_offset;
@@ -976,6 +989,22 @@ void TestImageHeapKinds() {
   root.depth_compare = true;
   Check(kind_of(Format::k32UInt, Type::kColor2DArray) == 0u,
         "depth comparison accepted an integer heap entry");
+  auto color = descriptor(Format::k8_8_8_8UNorm, Type::kColor2DArray);
+  bool requires_materialization = false;
+  Check(ImageHeapKind(root, color, &requires_materialization) == 0u &&
+            requires_materialization && float_kind == kind_of(Format::k32_32_32_32Float, Type::kColor2DArray),
+        "color comparison did not request materialization or disabled native depth comparison");
+  auto scaled_compare = descriptor(Format::k8_8UScaled, Type::kColor2DArray);
+  requires_materialization = false;
+  Check(ImageHeapKind(root, scaled_compare, &requires_materialization) == 0u &&
+            !requires_materialization,
+        "depth comparison requested materialization for a converted heap entry");
+  root.depth_compare = false;
+  auto scaled = descriptor(Format::k8_8UScaled, Type::kColor2DArray);
+  requires_materialization = false;
+  Check(ImageHeapKind(root, scaled, &requires_materialization) == 0u &&
+            requires_materialization,
+        "a scaled heap entry did not request shader conversion through materialization");
 }
 
 void TestBoundedImageViewEligibility() {
@@ -9880,6 +9909,7 @@ int main() {
     Run("bounded workgroup image key", TestBoundedWorkgroupImageKey);
     Run("bounded float image key", TestBoundedFloatImageKey);
     Run("mixed image dimensions", [] { CheckImageTableKey(ImageKeyCase::MixedDimensions); });
+    Run("mixed sampled conversions", [] { CheckImageTableKey(ImageKeyCase::MixedConversions); });
     Run("mixed gather rejection", [] { CheckImageTableKey(ImageKeyCase::MixedGather); });
     Run("packed half image key", [] { CheckImageTableKey(ImageKeyCase::PackedHalf); });
     Run("unsigned image key", [] { CheckImageTableKey(ImageKeyCase::UnsignedBound); });

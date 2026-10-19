@@ -176,8 +176,9 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
 		(*view)->changed_begin = (*view)->changed_end = 0;
 	}
-	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	const auto& selected = **view;
+	if (selected.requires_materialization) return false;
+	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	result = {.slots      = selected.buffer->BufferDeviceAddress(),
 	          .slot_count = static_cast<uint32_t>(selected.slots.size() - 1u),
 	          .kinds      = selected.kinds};
@@ -264,6 +265,11 @@ void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 }
 
 void ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {
+	if (view.requires_materialization && begin != end) {
+		view.requires_materialization = false;
+		begin = 0;
+		end = view.memory.size;
+	}
 	// A probe reads its descriptor from first + probe * step.
 	const uint64_t bytes = view.profile.r128 ? 16u : 32u;
 	auto probe = begin < view.first + bytes ? 0u : (begin - view.first - bytes) / view.step + 1u;
@@ -282,7 +288,8 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 	// A buried word stays null in every view until its descriptor changes.
 	auto& dead = view.memory.dead[offset];
 	if (dead != 0u && dead != DescriptorHash {}(value)) dead = 0u;
-	const auto kind = dead != 0u ? 0u : IR::ImageHeapKind(view.profile, value);
+	const auto kind = dead != 0u ? 0u : IR::ImageHeapKind(view.profile, value,
+	                                                   &view.requires_materialization);
 	Assign(view, offset, kind == 0u ? 0u : Intern(view, kind, value));
 }
 

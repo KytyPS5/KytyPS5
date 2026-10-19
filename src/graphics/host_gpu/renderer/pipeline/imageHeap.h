@@ -86,6 +86,7 @@ private:
 		size_t                  changed_end   = 0;
 		uint64_t                resolve_epoch = 0;
 		uint64_t                layout_epoch  = 0;
+		bool                    requires_materialization = false;
 	};
 
 	struct Memory {

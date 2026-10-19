@@ -786,7 +786,6 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				ImageHeapView view;
 				if (image_heap && runtime.image_heap != nullptr &&
 				    image.resource_class == ImageResourceClass::Sampled &&
-				    !image.depth_compare &&
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
 				                                view)) {
@@ -1115,7 +1114,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
-		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
+		            (image.numeric_class != Prospero::TextureNumericClass::Float ||
+		             image.conversion_format != Prospero::BufferFormat::kInvalid))) {
 			auto message = fmt::format(
 			    "sampled image descriptor {} uses unsupported format {}: root={} source={} "
 			    "first_use_pc={:#x} r128={} words={:08x},{:08x},{:08x},{:08x},"
@@ -1186,6 +1186,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const auto& base = program.info.images[root_index];
 		const bool storage_swizzle = base.unfiltered_access_only &&
 		    base.resource_class == ImageResourceClass::Storage;
+		const bool sampled_conversion = base.resource_class == ImageResourceClass::Sampled &&
+		    !base.unfiltered_access_only && !base.gather && !base.depth_compare;
 		const auto is_2d = [](Decoder::ImageDimension dimension) {
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
@@ -1225,8 +1227,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    (image_class.dimension == Decoder::ImageDimension::Dim2D || image_class.dimension == Decoder::ImageDimension::Dim3D);
 			if ((!same_coordinates && !volume_sample && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
 			     !unfiltered_coordinates) ||
-			    image.conversion_format != image_class.conversion_format ||
-			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
+			    (!sampled_conversion && image.conversion_format != image_class.conversion_format) ||
+			    (!storage_swizzle && !sampled_conversion && image.shader_swizzle != image_class.shader_swizzle)) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
@@ -1945,9 +1947,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
-uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
-	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, and
-	// entries that need shader-side conversion, read as null instead of failing the draw.
+uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value,
+                       bool* requires_materialization) {
+	// Conversion formats require ordinary materialization; invalid entries read as null.
 	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
 	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
 	const auto numeric_class =
@@ -1955,11 +1957,18 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
 	    DescriptorDimension(value, root.dimension) != root.dimension ||
 	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||
-	    ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid ||
 	    (root.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
 	     tile == Prospero::TileMode::kDepth) ||
 	    numeric_class == Prospero::TextureNumericClass::Unsupported ||
-	    (root.depth_compare && numeric_class != Prospero::TextureNumericClass::Float)) {
+	    (root.depth_compare &&
+	     (numeric_class != Prospero::TextureNumericClass::Float ||
+	      ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid))) {
+		value.dwords.fill(0u);
+		return 0u;
+	}
+	if (ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid ||
+	    (root.depth_compare && format == Prospero::BufferFormat::k8_8_8_8UNorm)) {
+		if (requires_materialization != nullptr) *requires_materialization = true;
 		value.dwords.fill(0u);
 		return 0u;
 	}

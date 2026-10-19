@@ -6164,6 +6164,18 @@ public:
                   ImageHeapTestAccess::MemoryCount(heap) == 1u,
               "an all-null table was not kept resident");
       draw();
+      const auto scaled = descriptor(30, Format::k8_8UScaled);
+      Libs::LibKernel::Memory::WriteBacking(idle_table, scaled.data(), sizeof(scaled));
+      (void)context.InvalidateMemory(idle_table, sizeof(scaled));
+      Require(name, "conversion fallback", !acquire(sampled, idle_table),
+              "a table requiring shader conversion was kept resident with null entries");
+      const std::array<uint32_t, 8> null_descriptor{};
+      Libs::LibKernel::Memory::WriteBacking(idle_table, null_descriptor.data(), sizeof(null_descriptor));
+      (void)context.InvalidateMemory(idle_table, sizeof(null_descriptor));
+      heap.BeginDraw();
+      Require(name, "conversion removed", acquire(sampled, idle_table) && view.kinds.empty(),
+              "a table stayed declined after its conversion entry was removed");
+      draw();
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
@@ -43053,6 +43065,22 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
                 "mixed image classes lost raw result bits or expanded per image");
         typed.numeric_class = Prospero::TextureNumericClass::Float;
         if (!fetch) compiled.program.info.samplers.pop_back();
+        if (mode == Access::Sample) {
+          typed.conversion_format = Prospero::BufferFormat::k8UScaled;
+          typed.shader_swizzle = DstSel(5, 4, 7, 6);
+          compiled.program.shader_info_complete = false;
+          CollectShaderInfo(compiled.program, {.compute = &compute});
+          const auto converted_spirv = ShaderRecompiler::Spirv::EmitProgram(
+              compiled.program, {.compute = &compute});
+          ValidateSpirv("IndirectImageMixedConversion", converted_spirv);
+          Require(test.name, "mixed converted image result",
+                  tools.Disassemble(converted_spirv, &text) &&
+                      CountText(text, image_opcode) == 3u * halves &&
+                      CountText(text, "OpFMul") >= halves,
+                  "mixed converted samples did not unpack before joining raw result bits");
+          typed.conversion_format = Prospero::BufferFormat::kInvalid;
+          typed.shader_swizzle = DstSel(4, 5, 6, 7);
+        }
         compiled.program.shader_info_complete = false;
         CollectShaderInfo(compiled.program, {.compute = &compute});
       }

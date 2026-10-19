@@ -1715,31 +1715,36 @@ void TestArrayColorComparison() {
       program.descriptor_sources.push_back(root);
       program.info.images[0].source = 3u;
       program.info.images[0].first_use_pc = 0x2200u;
-      for (const auto format : {Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm,
-                                Libs::Graphics::Prospero::BufferFormat::k32Float}) {
-        program.descriptor_sources[2].dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
-        auto indirect_plan = Extract(program);
-        uint32_t reads = 0;
-        const SrtRuntime runtime{.userdata = &reads,
-            .read_specialization_memory = RejectSpecializationRead};
-        Check(MaterializeResources(indirect_plan, runtime, snapshot, specialization),
-              "indirect comparison rejected mixed native and software candidates");
-        Check(specialization.images.size() == 2u &&
-                  specialization.images[0].software_compare_func == 1u &&
-                  specialization.images[1].software_compare_func ==
-                      (format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
-                           ? 1u : UINT32_MAX),
-              "indirect comparison lost a candidate's comparison mode");
-        ApplyResourceSpecialization(program, specialization);
-        Check(program.info.samplers[0].depth_compare ==
-                  (format == Libs::Graphics::Prospero::BufferFormat::k32Float),
-              "software-only comparison enabled native sampler comparison");
-        Check((DescriptorBindingForImage(program.info.images[0]) ==
-               DescriptorBindingForImage(program.info.images[1])) ==
-                  (format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm),
-              "mixed comparison candidates shared a binding kind");
-        program.info.images.resize(1u);
-        program.info.samplers[0].depth_compare = false;
+      for (const auto first_format : {Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm,
+                                      Libs::Graphics::Prospero::BufferFormat::k32Float}) {
+        program.descriptor_sources[0].dwords[1] = Value(static_cast<uint32_t>(first_format) << 20u);
+        for (const auto format : {Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm,
+                                  Libs::Graphics::Prospero::BufferFormat::k32Float}) {
+          program.descriptor_sources[2].dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
+          auto indirect_plan = Extract(program);
+          uint32_t reads = 0;
+          const SrtRuntime runtime{.userdata = &reads,
+              .read_specialization_memory = RejectSpecializationRead};
+          Check(MaterializeResources(indirect_plan, runtime, snapshot, specialization),
+                "indirect comparison rejected native or software candidates");
+          const auto first_compare = first_format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                                         ? 1u : UINT32_MAX;
+          const auto compare = format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                                   ? 1u : UINT32_MAX;
+          Check(specialization.images.size() == 2u &&
+                    specialization.images[0].software_compare_func == first_compare &&
+                    specialization.images[1].software_compare_func == compare,
+                "indirect comparison lost a candidate's comparison mode");
+          ApplyResourceSpecialization(program, specialization);
+          Check(program.info.samplers[0].depth_compare ==
+                    (first_compare == UINT32_MAX || compare == UINT32_MAX),
+                "sampler comparison did not follow the native candidates");
+          Check((DescriptorBindingForImage(program.info.images[0]) ==
+                 DescriptorBindingForImage(program.info.images[1])) == (format == first_format),
+                "comparison candidates used incorrect binding kinds");
+          program.info.images.resize(1u);
+          program.info.samplers[0].depth_compare = false;
+        }
       }
     }
   }

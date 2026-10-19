@@ -72,9 +72,19 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
-		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
-		     rt.attrib.num_samples, rt.attrib.num_fragments);
+	if (samples == 0) {
+		EXIT("unsupported render-target fragment count: fragments=%u\n", rt.attrib.num_fragments);
+	}
+	if (rt.attrib.num_samples != rt.attrib.num_fragments) {
+		// EQAA allows more coverage samples than storage fragments (e.g. 4x coverage with
+		// 2x storage). Vulkan has no EQAA equivalent, so keep the storage (fragment) count
+		// for the host image and ignore the extra coverage rather than terminating.
+		static std::atomic_uint eqaa_log_count = 0;
+		if (eqaa_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("RenderColorTarget: EQAA sample configuration samples=%u fragments=%u;"
+			     " using fragment count\n",
+			     rt.attrib.num_samples, rt.attrib.num_fragments);
+		}
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {

@@ -643,6 +643,12 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// Nonzero: the host GPU reads the draw's arguments here (DrawIndexArgs), and the fields
+	// above are unused.
+	uint64_t indirect_args_address = 0;
+	// The arguments' vertex and instance offsets apply. A native fetch adds the patched offsets
+	// itself, so they are left out of the copy the host GPU reads.
+	bool indirect_offsets = false;
 };
 
 struct DrawIndexBufferSource {
@@ -1017,7 +1023,19 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+                               const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                               std::pair<vk::Buffer, uint64_t> indirect_args) {
+	if (emit.indirect_args_address != 0) {
+		// HostReadsIndirectArgs leaves quad lists, which need the count, on the CPU.
+		EXIT_IF(indirect_args.first == nullptr ||
+		        ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy);
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(indirect_args.first, indirect_args.second, 1, 0);
+		} else {
+			vk_buffer.drawIndirect(indirect_args.first, indirect_args.second, 1, 0);
+		}
+		return;
+	}
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1383,13 +1401,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-	PreparedVertexBuffers vertex_bindings;
-	PreparedIndexBuffer   index_binding;
+	PreparedVertexBuffers           vertex_bindings;
+	PreparedIndexBuffer             index_binding;
+	std::pair<vk::Buffer, uint64_t> indirect_args;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (emit.indirect_args_address != 0) {
+			indirect_args = PrepareIndirectArgs(buffer, draw.IsIndexed(), emit);
+		}
 	}
+	// The mesh paths need the counts on the CPU (DrawIndex leaves them there).
+	EXIT_IF(mesh_active && emit.indirect_args_address != 0);
 	// The pixel shader reads the raw values of its triangle's three vertices, and the host has
 	// no pixel shader input for them: the triangles are drawn as patches, through tessellation
 	// shaders that hand the values over (see triangleVertexValueShader.h).
@@ -1515,7 +1539,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, indirect_args);
 	}
 
 	if (!draw.IsIndexed()) {
@@ -1555,7 +1579,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1570,19 +1594,26 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
-		return;
+	const bool        host_args = args.indirect_args_address != 0;
+	EXIT_IF(host_args && args.offset_source != DrawOffsetSource::IndirectArgs);
+	if (host_args &&
+	    (!HostReadsIndirectArgs(buffer) || args.index_count == 0 ||
+	     static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex8)) {
+		return false;
+	}
+	if (args.index_count == 0 || (!host_args && args.instance_count == 0)) {
+		return true;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		return true;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1608,7 +1639,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
-		return;
+		return true;
 	}
 
 	DrawIndexBufferSource index_source {};
@@ -1643,11 +1674,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	                        host_args ? 1u : args.instance_count, args.first_instance};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
-		return;
+		return true;
+	}
+	if (host_args && !HostReadsIndirectArgs(state)) {
+		ResetBindings();
+		return false;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
@@ -1663,10 +1698,81 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
 	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
 	emit.first_instance = native_indirect ? 0 : instance_offset;
+	emit.indirect_args_address = args.indirect_args_address;
+	emit.indirect_offsets      = !native_indirect;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
+	return true;
+}
+
+bool RenderExecutor::HostReadsIndirectArgs(const CommandBuffer& buffer) {
+	const auto& hw = buffer.GetRegisters();
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
+	    hw.GetRenderControl().copy_depth_to_color) {
+		return false;
+	}
+	switch (static_cast<CbColorMode>(hw.GetColorControl().mode)) {
+		case CbColorMode::Normal: return true;
+		case CbColorMode::Disable: {
+			// DepthStencilCopy: an override that marks the target dirty and valid.
+			const auto& override = hw.GetDepthRenderOverride();
+			return !override.force_z_dirty && !override.force_stencil_dirty;
+		}
+		default: return false;
+	}
+}
+
+bool RenderExecutor::HostReadsIndirectArgs(const DrawRenderState& state) const {
+	const auto& vertex = state.vertex_info[0];
+	if (vertex.stage.program->stage == ShaderType::Mesh) {
+		return false;
+	}
+	return !vertex.fetch_embedded ||
+	       m_context.GetGraphics().host.capabilities.draw_indirect_first_instance;
+}
+
+std::pair<vk::Buffer, uint64_t> RenderExecutor::PrepareIndirectArgs(CommandBuffer&      buffer,
+                                                                    bool                indexed,
+                                                                    const DrawEmitInfo& emit) {
+	static_assert(sizeof(vk::DrawIndexedIndirectCommand) == 5 * sizeof(uint32_t) &&
+	              sizeof(vk::DrawIndirectCommand) == 4 * sizeof(uint32_t));
+	const uint64_t size = indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                              : sizeof(vk::DrawIndirectCommand);
+	const auto [source, source_offset] =
+	    m_context.GetBufferCache().ObtainBuffer(emit.indirect_args_address, size, false);
+	EXIT_IF(source == nullptr);
+	auto& copy = AcquireScratch(size);
+	buffer.EndRendering();
+	const auto vk_buffer = buffer.Handle();
+	// After the GPU's writes of the arguments, and after earlier draws read the copy.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                          nullptr);
+	const vk::BufferCopy region {source_offset, 0, size};
+	vk_buffer.copyBuffer(source->Handle(), copy.Handle(), 1, &region);
+	if (!emit.indirect_offsets) {
+		// The last two dwords of both layouts: the vertex offset (or first vertex) and the
+		// first instance.
+		vk::MemoryBarrier copied {};
+		copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		copied.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &copied, 0, nullptr,
+		                          0, nullptr);
+		vk_buffer.fillBuffer(copy.Handle(), size - 2 * sizeof(uint32_t), 2 * sizeof(uint32_t), 0);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &after, 0, nullptr, 0,
+	                          nullptr);
+	return {copy.Handle(), 0};
 }
 
 Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
@@ -1692,6 +1798,7 @@ Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
 		                         vk::BufferUsageFlagBits::eStorageBuffer |
 		                             vk::BufferUsageFlagBits::eTransferSrc |
 		                             vk::BufferUsageFlagBits::eTransferDst |
+		                             vk::BufferUsageFlagBits::eIndirectBuffer |
 		                             vk::BufferUsageFlagBits::eShaderDeviceAddress,
 		                         size),
 		                     0});
@@ -1726,7 +1833,7 @@ Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1740,19 +1847,24 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
-		return;
+	const bool        host_args = args.indirect_args_address != 0;
+	EXIT_IF(host_args && args.offset_source != DrawOffsetSource::IndirectArgs);
+	if (host_args && !HostReadsIndirectArgs(buffer)) {
+		return false;
+	}
+	if (!host_args && (args.vertex_count == 0 || args.instance_count == 0)) {
+		return true;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		return true;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1772,18 +1884,22 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
+	                         host_args ? 1u : args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
-		return;
+		return true;
+	}
+	if (host_args && !HostReadsIndirectArgs(state)) {
+		ResetBindings();
+		return false;
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
@@ -1797,7 +1913,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
@@ -1811,10 +1927,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_vertex = native_indirect ? 0 :
 	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = native_indirect ? 0 : instance_offset;
+	emit.indirect_args_address = args.indirect_args_address;
+	emit.indirect_offsets      = !native_indirect;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 	ResetBindings();
+	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

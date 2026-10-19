@@ -50,6 +50,9 @@ struct HostCapabilities {
 	// VK_KHR_maintenance8: images can be copied between depth and color formats, and a sample
 	// can take a texel offset that is not a constant.
 	bool maintenance8 = false;
+	// An indirect draw can start at an instance other than 0 (drawIndirectFirstInstance). Without
+	// it, the host GPU reads the arguments only of draws whose first instance it zeroes.
+	bool draw_indirect_first_instance = false;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values.
 	uint32_t subgroup_supported_stages = 0;
@@ -81,6 +84,7 @@ struct HostCapabilities {
 		all.compute_subgroup_size_control = true;
 		all.block_texel_view              = true;
 		all.maintenance8                  = true;
+		all.draw_indirect_first_instance  = true;
 		all.subgroup_supported_stages     = ~0u;
 		all.subgroup_supported_operations = ~0u;
 		return all;

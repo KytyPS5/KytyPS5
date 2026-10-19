@@ -59,6 +59,10 @@ struct DrawIndexArgs {
 	int32_t          base_vertex                = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	// Nonzero: the host GPU reads the draw's arguments (a VkDrawIndexedIndirectCommand, as the
+	// guest lays them out) at this guest address. index_count is then the size of the index
+	// buffer in indices, and the other counts and offsets are unused.
+	uint64_t         indirect_args_address      = 0;
 	uint32_t         render_target_slice_offset = 0;
 };
 
@@ -68,6 +72,9 @@ struct DrawAutoArgs {
 	uint32_t         first_vertex               = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	// Nonzero: the host GPU reads the draw's arguments (a VkDrawIndirectCommand) at this guest
+	// address, and the counts and offsets above are unused.
+	uint64_t         indirect_args_address      = 0;
 	uint32_t         render_target_slice_offset = 0;
 };
 
@@ -179,8 +186,10 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// False only for a draw with indirect_args_address that the host GPU cannot read the
+	// arguments of (see HostReadsIndirectArgs): nothing was drawn, and the caller reads them.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -209,6 +218,18 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// Whether the host GPU can read the arguments of an indirect draw in this state: draws that
+	// a special color mode, a depth copy or a quad list turns into other work need the counts
+	// on the CPU.
+	[[nodiscard]] static bool HostReadsIndirectArgs(const CommandBuffer& buffer);
+	// The same once the draw's state is known: the mesh paths need the counts on the CPU, and a
+	// rewritten fetch keeps the arguments' first instance.
+	[[nodiscard]] bool HostReadsIndirectArgs(const DrawRenderState& state) const;
+	// Copies the arguments of an indirect draw for the host GPU to read, without the offsets a
+	// native fetch adds itself; returns the copy.
+	[[nodiscard]] std::pair<vk::Buffer, uint64_t> PrepareIndirectArgs(CommandBuffer&      buffer,
+	                                                                  bool                indexed,
+	                                                                  const DrawEmitInfo& emit);
 	void ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
 	                              const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,

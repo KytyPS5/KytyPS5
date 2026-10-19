@@ -115,6 +115,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	    facts.min_subgroup_size <= 64u && facts.max_subgroup_size >= 64u;
 	caps.block_texel_view          = facts.block_texel_view;
 	caps.maintenance8              = with_extension(facts.maintenance8, kMaintenance8Extension);
+	caps.draw_indirect_first_instance = facts.draw_indirect_first_instance;
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
 
@@ -155,6 +156,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.compute_subgroup_size_control, "a compute subgroup size of 64");
 	note(caps.block_texel_view, "block texel views");
 	note(caps.maintenance8, "depth/color image copies and dynamic sample offsets");
+	note(caps.draw_indirect_first_instance, "drawIndirectFirstInstance");
 	note(!decision.faults.pushed_buffers_have_no_size,
 	     "a buffer size table for pushed descriptors (driver defect)");
 	note(!decision.faults.no_per_vertex_inputs, "per-vertex pixel shader inputs (driver defect)");

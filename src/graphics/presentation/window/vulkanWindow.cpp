@@ -214,6 +214,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 
 	const auto& core                         = features2.features;
 	facts.depth_clamp                        = core.depthClamp == VK_TRUE;
+	facts.draw_indirect_first_instance       = core.drawIndirectFirstInstance == VK_TRUE;
 	facts.depth_bias_clamp                   = core.depthBiasClamp == VK_TRUE;
 	facts.sample_rate_shading                = core.sampleRateShading == VK_TRUE;
 	facts.shader_clip_distance               = core.shaderClipDistance == VK_TRUE;
@@ -601,6 +602,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.robustBufferAccess       = VK_TRUE;
 	device_features.depthBounds                           = caps.depth_bounds ? VK_TRUE : VK_FALSE;
 	device_features.depthClamp                            = caps.depth_clamp ? VK_TRUE : VK_FALSE;
+	device_features.drawIndirectFirstInstance = caps.draw_indirect_first_instance ? VK_TRUE : VK_FALSE;
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;

@@ -925,7 +925,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
-void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
@@ -934,7 +934,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	return m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -980,6 +980,31 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+
+	// Arguments the GPU wrote (a culling pass, often to no instances) are read by the host GPU:
+	// reading them here waits for the GPU to finish all work recorded so far. Patched offset
+	// registers and draw counts still need the values on the CPU.
+	if (count_addr == nullptr && max_count_or_count == 1 && registers.vertex_offset == Pm4::SH_NOP &&
+	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP &&
+	    (!indexed || m_index_buffer_size != 0)) {
+		const auto args_address = m_draw_indirect_args_base_addr + data_offset;
+		const auto args_size =
+		    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+		if (m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size)) {
+			const bool drawn =
+			    indexed ? DrawIndex({.index_count = m_index_buffer_size,
+			                         .index_addr  = reinterpret_cast<const void*>(m_index_base_addr),
+			                         .instance_count        = 1,
+			                         .offset_source         = DrawOffsetSource::IndirectArgs,
+			                         .indirect_args_address = args_address})
+			            : DrawIndexAuto({.instance_count        = 1,
+			                             .offset_source         = DrawOffsetSource::IndirectArgs,
+			                             .indirect_args_address = args_address});
+			if (drawn) {
+				return;
+			}
+		}
+	}
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
@@ -1096,11 +1121,11 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	                                                IsAsyncComputeQueue());
 }
 
-void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

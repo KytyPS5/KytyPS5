@@ -63,6 +63,7 @@ DeviceFacts FullFacts() {
 	f.subgroup_supported_stages                       = ~0u;
 	f.subgroup_supported_operations                   = ~0u;
 	f.depth_clamp                                     = true;
+	f.draw_indirect_first_instance                    = true;
 	f.depth_bias_clamp                                = true;
 	f.sample_rate_shading                             = true;
 	f.shader_clip_distance                            = true;

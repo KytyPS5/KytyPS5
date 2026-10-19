@@ -682,6 +682,7 @@ struct PipelineCache::ProgramCache {
 		    c.compute_subgroup_size_control,
 		    c.block_texel_view,
 		    c.maintenance8,
+		    c.draw_indirect_first_instance,
 		    c.subgroup_supported_stages,
 		    c.subgroup_supported_operations,
 		    f.pushed_buffers_have_no_size,

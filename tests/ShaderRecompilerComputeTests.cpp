@@ -420,14 +420,14 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
-  static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+  static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
-    executor.DrawIndex(0, command, args);
+    return executor.DrawIndex(0, command, args);
   }
 
-  static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
+  static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
-    executor.DrawAuto(0, command, args);
+    return executor.DrawAuto(0, command, args);
   }
 
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
@@ -18312,6 +18312,47 @@ public:
         }
       }
 
+      // When the GPU wrote the arguments (a culling pass), the host GPU reads them
+      // from guest memory: the CPU does not wait for the GPU. The native VS still
+      // adds the patched offsets exactly once, and a draw the GPU culled to no
+      // instances draws nothing.
+      constexpr uint64_t args_address = depth_address + 0x3f000;
+      for (const bool indexed : {false, true}) {
+        for (const uint32_t instances : {1u, 0u}) {
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          bool drawn = false;
+          if (indexed) {
+            // indexCount, instanceCount, firstIndex, vertexOffset, firstInstance
+            const std::array<u32, 5> args{3, instances, 0, 7, 5};
+            std::memcpy(reinterpret_cast<void *>(args_address), args.data(), sizeof(args));
+            drawn = RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                 .index_type_and_size = 1, .offset_source = DrawOffsetSource::IndirectArgs,
+                 .indirect_args_address = args_address});
+          } else {
+            // vertexCount, instanceCount, firstVertex, firstInstance
+            const std::array<u32, 4> args{3, instances, 7, 5};
+            std::memcpy(reinterpret_cast<void *>(args_address), args.data(), sizeof(args));
+            drawn = RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                {.offset_source = DrawOffsetSource::IndirectArgs,
+                 .indirect_args_address = args_address});
+          }
+          Require("GpuIndirectDrawArguments", indexed ? "indexed taken" : "auto taken", drawn,
+                  "the host GPU did not take a draw whose arguments it can read");
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            const auto expected = instances == 0 ? 0u
+                                  : component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+            Require("GpuIndirectDrawArguments", indexed ? "indexed" : "auto",
+                    pixels[component] == expected,
+                    instances == 0 ? "a draw culled to no instances drew"
+                                   : "native vertex or instance offset was applied twice");
+          }
+        }
+      }
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -20134,6 +20175,7 @@ private:
     // too (deviceSuitability.cpp requires it).
     device_features.vertexPipelineStoresAndAtomics = true;
     device_features.depthClamp = caps.depth_clamp;
+    device_features.drawIndirectFirstInstance = caps.draw_indirect_first_instance;
     device_features.depthBounds = caps.depth_bounds;
     device_features.shaderCullDistance = caps.cull_distance;
     device_info.pEnabledFeatures = &device_features;

@@ -46,6 +46,7 @@ struct DeviceFacts {
 	bool tessellation_shader                       = false;
 	bool shader_int64                              = false;
 	bool shader_float64                            = false;
+	bool draw_indirect_first_instance              = false;
 
 	// Vulkan 1.1 features.
 	bool storage_buffer_16bit_access = false;

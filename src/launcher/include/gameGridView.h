@@ -10,6 +10,7 @@
 #include <functional>
 #include <utility>
 
+#include <QApplication>
 #include <QElapsedTimer>
 #include <QFont>
 #include <QIcon>
@@ -64,6 +65,15 @@ public:
 		viewport()->update();
 	}
 
+	// A negative percent hides the controller battery readout.
+	void SetBattery(int percent, bool charging) {
+		if (m_battery != percent || m_charging != charging) {
+			m_battery  = percent;
+			m_charging = charging;
+			viewport()->update();
+		}
+	}
+
 	void SetRecentTrophies(std::vector<TrophyViewerDialog::RecentTrophy> trophies) {
 		m_recent = std::move(trophies);
 		viewport()->update();
@@ -94,6 +104,44 @@ public:
 		m_intro = true;
 		m_intro_clock.start();
 		StartAnimation();
+		viewport()->update();
+	}
+
+	// Controller navigation: 0 left, 1 right, 2 up, 3 down, 4 accept. Down moves focus from the
+	// tiles to the Play / info / menu buttons; accept presses the focused button.
+	void GamepadNav(int action) {
+		if (m_title.isEmpty()) {
+			m_focus = 0;
+		}
+		const auto key = [this](Qt::Key k) {
+			QKeyEvent press(QEvent::KeyPress, k, Qt::NoModifier);
+			QKeyEvent release(QEvent::KeyRelease, k, Qt::NoModifier);
+			QApplication::sendEvent(this, &press);
+			QApplication::sendEvent(this, &release);
+		};
+		switch (action) {
+			case 0:
+				if (m_focus == 0) key(Qt::Key_Left); else m_focus = qMax(1, m_focus - 1);
+				break;
+			case 1:
+				if (m_focus == 0) key(Qt::Key_Right); else m_focus = qMin(3, m_focus + 1);
+				break;
+			case 2: m_focus = 0; break;
+			case 3:
+				if (m_focus == 0 && !m_title.isEmpty()) m_focus = 1;
+				break;
+			case 4: {
+				const auto& handler = m_focus == 1 ? m_play_handler
+				                      : m_focus == 2 ? m_info_handler
+				                      : m_focus == 3 ? m_menu_handler
+				                                     : std::function<void()>();
+				if (handler) {
+					handler();
+				}
+				break;
+			}
+			default: break;
+		}
 		viewport()->update();
 	}
 
@@ -194,6 +242,13 @@ protected:
 		painter.setPen(Qt::NoPen);
 		for (int dx = -9; dx <= 9; dx += 9) {
 			painter.drawEllipse(more.center() + QPoint(dx, 0), 2, 2);
+		}
+		if (m_focus != 0) {
+			const auto& target = m_focus == 1 ? play : (m_focus == 2 ? info : more);
+			painter.setBrush(Qt::NoBrush);
+			painter.setPen(QPen(QColor(120, 190, 255), 3));
+			const auto ring = target.adjusted(-4, -4, 4, 4);
+			painter.drawRoundedRect(ring, ring.height() / 2.0, ring.height() / 2.0);
 		}
 		painter.restore();
 	}
@@ -330,6 +385,7 @@ protected:
 			if (!index.isValid()) {
 				return;
 			}
+			m_focus = 0;
 			selectionModel()->setCurrentIndex(index, QItemSelectionModel::ClearAndSelect);
 			return;
 		}
@@ -419,6 +475,85 @@ protected:
 		UpdateScaledBackground();
 	}
 
+	void PaintBattery(QPainter& p, const QRect& r) {
+		const QRect pill(r.right() - 120 - 14, 12, 120, 28);
+		p.save();
+		p.setRenderHint(QPainter::Antialiasing);
+		p.setPen(Qt::NoPen);
+		p.setBrush(QColor(0, 0, 0, 120));
+		p.drawRoundedRect(pill, 14, 14);
+
+		// Gamepad glyph.
+		const qreal gx = pill.left() + 12;
+		const qreal gy = pill.top() + 7;
+		QPainterPath pad;
+		pad.addRoundedRect(QRectF(gx + 3, gy + 1, 20, 11), 5, 5);
+		pad.addEllipse(QRectF(gx, gy + 5, 9, 9));
+		pad.addEllipse(QRectF(gx + 17, gy + 5, 9, 9));
+		p.setBrush(QColor(255, 255, 255, 230));
+		p.drawPath(pad.simplified());
+		p.setBrush(QColor(0, 0, 0, 150));
+		p.drawEllipse(QRectF(gx + 6, gy + 4, 3, 3));
+		p.drawEllipse(QRectF(gx + 17, gy + 4, 3, 3));
+
+		// Wired and not charging: a cable instead of the battery readout.
+		if (m_battery > 100) {
+			const QRectF plug(pill.left() + 52, pill.top() + 9, 12, 10);
+			p.setPen(QPen(QColor(255, 255, 255, 230), 2));
+			p.setBrush(Qt::NoBrush);
+			QPainterPath cable;
+			cable.moveTo(pill.left() + 40, pill.top() + 14);
+			cable.cubicTo(pill.left() + 44, pill.top() + 4, pill.left() + 48, pill.top() + 24,
+			              plug.left(), pill.top() + 14);
+			p.drawPath(cable);
+			p.setPen(Qt::NoPen);
+			p.setBrush(QColor(255, 255, 255, 230));
+			p.drawRoundedRect(plug, 2, 2);
+			p.drawRect(QRectF(plug.right(), pill.top() + 11, 5, 2));
+			p.drawRect(QRectF(plug.right(), pill.top() + 15, 5, 2));
+			p.restore();
+			return;
+		}
+
+		// Battery glyph.
+		const QRectF body(pill.left() + 46, pill.top() + 8, 26, 12);
+		p.setPen(QPen(QColor(255, 255, 255, 220), 1.5));
+		p.setBrush(Qt::NoBrush);
+		p.drawRoundedRect(body, 3, 3);
+		p.setPen(Qt::NoPen);
+		p.setBrush(QColor(255, 255, 255, 220));
+		p.drawRoundedRect(QRectF(body.right() + 1.5, body.top() + 3, 2.5, 6), 1, 1);
+		p.setBrush(m_charging ? QColor(80, 220, 120)
+		                      : (m_battery <= 20 ? QColor(240, 80, 80) : QColor(255, 255, 255)));
+		p.drawRoundedRect(QRectF(body.left() + 2, body.top() + 2,
+		                         (body.width() - 4) * qBound(0, m_battery, 100) / 100.0,
+		                         body.height() - 4),
+		                  1.5, 1.5);
+
+		if (m_charging) {
+			QPainterPath bolt;
+			const qreal bx = body.center().x();
+			const qreal by = body.center().y();
+			bolt.moveTo(bx + 2, by - 5);
+			bolt.lineTo(bx - 4, by + 1);
+			bolt.lineTo(bx - 0.5, by + 1);
+			bolt.lineTo(bx - 2, by + 5);
+			bolt.lineTo(bx + 4, by - 1);
+			bolt.lineTo(bx + 0.5, by - 1);
+			bolt.closeSubpath();
+			p.setBrush(QColor(20, 20, 20, 230));
+			p.drawPath(bolt);
+		}
+
+		auto f = font();
+		f.setBold(true);
+		p.setFont(f);
+		p.setPen(Qt::white);
+		p.drawText(QRect(pill.left() + 80, pill.top(), 38, pill.height()),
+		           Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("%1%").arg(m_battery));
+		p.restore();
+	}
+
 	void paintEvent(QPaintEvent* event) override {
 		{
 			QPainter   painter(viewport());
@@ -452,6 +587,9 @@ protected:
 			if (!m_progress.isEmpty()) {
 				PaintTrophyBox(painter, r);
 			}
+			if (m_battery >= 0) {
+				PaintBattery(painter, r);
+			}
 		}
 
 		QListView::paintEvent(event);
@@ -473,6 +611,7 @@ private:
 	std::function<void()> m_info_handler;
 	std::function<void()> m_menu_handler;
 	int                   m_hover = 0;
+	int                   m_focus = 0;
 	bool                  m_keep_deselected = false;
 	QString               m_path;
 	QPixmap               m_source;
@@ -491,6 +630,8 @@ private:
 	QElapsedTimer         m_intro_clock;
 	QElapsedTimer         m_glow_clock = [] { QElapsedTimer t; t.start(); return t; }();
 	bool                  m_intro = false;
+	int                   m_battery  = -1;
+	bool                  m_charging = false;
 };
 
 #endif // GAME_GRID_VIEW_H

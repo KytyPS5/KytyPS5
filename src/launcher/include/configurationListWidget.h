@@ -30,6 +30,9 @@ public:
 	void SetRunEnabled(bool flag) { m_run_enabled = flag; }
 	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
 	void SetControllerPreview(ControllerPreview* preview) { m_controller_preview = preview; }
+	void SetControllerBattery(int percent, bool charging);
+	// Controller navigation of the grid view; ignored unless the grid is shown in the active window.
+	void GamepadNavigate(int action);
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }

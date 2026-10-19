@@ -497,6 +497,17 @@ ConfigurationListWidget::~ConfigurationListWidget() {
 	delete m_ui;
 }
 
+void ConfigurationListWidget::SetControllerBattery(int percent, bool charging) {
+	m_ui->cfgs_grid->SetBattery(percent, charging);
+}
+
+void ConfigurationListWidget::GamepadNavigate(int action) {
+	if (m_ui->grid_view_button->isChecked() && m_ui->cfgs_grid->isVisible() &&
+	    m_ui->cfgs_grid->isActiveWindow() && QApplication::activeModalWidget() == nullptr) {
+		m_ui->cfgs_grid->GamepadNav(action);
+	}
+}
+
 void ConfigurationListWidget::changeEvent(QEvent* event) {
 	QWidget::changeEvent(event);
 	if (event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::PaletteChange) {

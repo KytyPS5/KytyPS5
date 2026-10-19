@@ -23,6 +23,9 @@ public:
 
 	void SetTitle(const QString& base);
 
+	// One-shot navigation click, played over the title music.
+	void PlayNavigation();
+
 private:
 	struct Sound {
 		std::vector<float> pcm;
@@ -51,6 +54,11 @@ private:
 	QString                                          m_base;
 	bool                                             m_audio_initialized = false;
 	SDL_AudioStream*                                 m_keepalive         = nullptr;
+	std::vector<SDL_AudioStream*>                    m_nav_streams;
+	QByteArray                                       m_nav_pcm;
+	int                                              m_nav_channels = 0;
+	int                                              m_nav_rate     = 0;
+	bool                                             m_nav_loaded   = false;
 
 	bool EnsureAudio();
 };

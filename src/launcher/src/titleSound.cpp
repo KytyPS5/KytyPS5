@@ -4,6 +4,7 @@
 #include "libs/ajm/atrac9_decoder.h"
 
 #include <QDebug>
+#include <QFile>
 #include <QtConcurrentRun>
 
 #include <SDL3/SDL.h>
@@ -185,8 +186,65 @@ void TitleSound::SetTitle(const QString& base) {
 	}));
 }
 
+void TitleSound::PlayNavigation() {
+	if (!EnsureAudio()) {
+		return;
+	}
+	if (!m_nav_loaded) {
+		m_nav_loaded = true;
+		QFile file(QStringLiteral(":/sounds/navigation.wav"));
+		if (file.open(QIODevice::ReadOnly)) {
+			const auto          wav = file.readAll();
+			SDL_AudioSpec       spec {};
+			Uint8*              buffer = nullptr;
+			Uint32              length = 0;
+			if (SDL_LoadWAV_IO(SDL_IOFromConstMem(wav.constData(), static_cast<size_t>(wav.size())),
+			                   true, &spec, &buffer, &length)) {
+				// Converted once to float so every playback uses the same format.
+				Uint8* converted     = nullptr;
+				int    converted_len = 0;
+				const SDL_AudioSpec dst {SDL_AUDIO_F32, spec.channels, spec.freq};
+				if (SDL_ConvertAudioSamples(&spec, buffer, static_cast<int>(length), &dst, &converted,
+				                            &converted_len)) {
+					m_nav_pcm      = QByteArray(reinterpret_cast<const char*>(converted), converted_len);
+					m_nav_channels = spec.channels;
+					m_nav_rate     = spec.freq;
+					SDL_free(converted);
+				}
+				SDL_free(buffer);
+			}
+		}
+	}
+	if (m_nav_pcm.isEmpty()) {
+		return;
+	}
+	for (auto it = m_nav_streams.begin(); it != m_nav_streams.end();) {
+		if (SDL_GetAudioStreamQueued(*it) == 0) {
+			SDL_DestroyAudioStream(*it);
+			it = m_nav_streams.erase(it);
+		} else {
+			++it;
+		}
+	}
+	const SDL_AudioSpec spec {SDL_AUDIO_F32, m_nav_channels, m_nav_rate};
+	auto* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+	if (stream == nullptr) {
+		return;
+	}
+	if (SDL_PutAudioStreamData(stream, m_nav_pcm.constData(), m_nav_pcm.size()) &&
+	    SDL_ResumeAudioStreamDevice(stream)) {
+		m_nav_streams.push_back(stream);
+	} else {
+		SDL_DestroyAudioStream(stream);
+	}
+}
+
 void TitleSound::Clear() {
 	m_timer.stop();
+	for (auto* s : m_nav_streams) {
+		SDL_DestroyAudioStream(s);
+	}
+	m_nav_streams.clear();
 	for (auto& v : m_voices) {
 		SDL_DestroyAudioStream(v.stream);
 	}

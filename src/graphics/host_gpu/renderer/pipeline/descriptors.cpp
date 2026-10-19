@@ -126,9 +126,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	bool image_read = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	if (!image_read && resource.read && !resource.written) {
+		auto& textures = context.GetTextureCache();
+		const auto image_id = textures.FindImageFromRange(address, size);
+		if (image_id) {
+			const auto& image = textures.GetImage(image_id);
+			// Raw depth copies need the current tiled bytes from the native depth image.
+			image_read = image.info.IsDepth() && image.info.data.address == address;
+		}
+	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    address, size, resource.written, image_read, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;

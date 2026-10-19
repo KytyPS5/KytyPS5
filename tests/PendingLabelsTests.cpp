@@ -116,6 +116,21 @@ void TestCompletionWakes() {
 	Check(wakes == 1, "a completion woke a writer that was shut down");
 }
 
+// A wait on a pending label does not read guest memory: the page can be the GPU's, and reading
+// it would wait for the host GPU.
+void TestCoveredReadSkipsMemory() {
+	PendingLabels labels;
+	// An address that faults if read: the read must come from the pending label alone.
+	const auto* unreadable = reinterpret_cast<const uint32_t*>(uintptr_t {0x10});
+	labels.Add({.address = Address(unreadable), .value = 6, .bytes = 4});
+	Check(labels.Read(unreadable) == 6, "a covered read did not come from the label");
+	const auto* unreadable64 = reinterpret_cast<const uint64_t*>(uintptr_t {0x20});
+	labels.Add({.address = Address(unreadable64), .value = 0x11, .bytes = 4});
+	labels.Add({.address = Address(unreadable64) + 4, .value = 0x22, .bytes = 4});
+	Check(labels.Read(unreadable64) == 0x0000002200000011ull,
+	      "two labels that cover a 64-bit read were not combined");
+}
+
 } // namespace
 
 int main() {
@@ -125,6 +140,7 @@ int main() {
 	TestMixedWidths();
 	TestInterruptOnlyKeepsOrder();
 	TestCompletionWakes();
+	TestCoveredReadSkipsMemory();
 	if (g_failures != 0) {
 		std::cerr << g_failures << " pending label check(s) failed\n";
 		return 1;

@@ -7,6 +7,8 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/copyWorkers.h"
+#include "graphics/host_gpu/gpuWriteTicks.h"
+#include "graphics/host_gpu/guestMemoryImport.h"
 #include "graphics/host_gpu/guestWriteLog.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -89,6 +91,15 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	// Whether a buffer over the range is (or would be made) guest memory itself
+	// (guestMemoryImport.h): the GPU reads what the CPU writes there, in GPU order.
+	[[nodiscard]] bool IsGuestBacked(uint64_t vaddr, uint64_t size);
+	// GPU thread. Reads or writes guest memory of a buffer that is guest memory itself, for the
+	// command processor: after the buffer's last GPU write, and without the fault of a page
+	// the GPU owns (through the direct-memory mapping). False when no such buffer holds the
+	// range; the caller then accesses guest memory as usual.
+	[[nodiscard]] bool ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size);
+	[[nodiscard]] bool WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -183,12 +194,19 @@ private:
 	// Copies the GPU-written bytes of the range from the buffer's memory to guest memory. The
 	// last GPU-side write of the buffer must have finished.
 	[[nodiscard]] bool PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// A read-back of a buffer that is guest memory itself: the GPU's writes there are complete,
+	// and nothing is copied. True when the range held GPU-written pages.
+	[[nodiscard]] bool ForgetGuestBackedWrites(uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	// Buffers over direct memory are guest memory itself where the host can import it.
+	GuestMemoryImport                                 m_import;
+	// What the GPU wrote to buffers that are guest memory, and when (gpuWriteTicks.h).
+	GpuWriteTicks                                     m_guest_backed_writes;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;

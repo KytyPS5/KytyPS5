@@ -102,7 +102,9 @@ public:
 			}
 		}
 #else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		// Sealable: the GPU can import the memory (see Graphics::GuestMemoryImport), which needs
+		// a memfd that cannot shrink.
+		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", MFD_ALLOW_SEALING));
 #endif
 		if (m_fd < 0) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
@@ -115,6 +117,10 @@ public:
 			m_fd = -1;
 			return;
 		}
+#if !defined(__APPLE__)
+		// Best effort: without the seal the GPU only cannot import the memory.
+		(void)fcntl(m_fd, F_ADD_SEALS, F_SEAL_SHRINK);
+#endif
 		auto* backing = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
 		if (backing == MAP_FAILED) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: writable alias failed: %d\n",
@@ -185,6 +191,94 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+
+	// The file that holds the direct memory, or -1 (only on Linux).
+	[[nodiscard]] int GetFileDescriptor() const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		return m_fd;
+#else
+		return -1;
+#endif
+	}
+
+	// Where [vaddr, vaddr + size) lies in the backing, when it is mapped there in one piece.
+	[[nodiscard]] bool TryTranslate(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		auto mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) {
+			return false;
+		}
+		--mapping;
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		uint64_t   first   = 0;
+		for (; current < end; ++mapping) {
+			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
+			    current >= mapping->second.vaddr + mapping->second.size) {
+				return false;
+			}
+			const auto& entry  = mapping->second;
+			const auto  offset = entry.backing_offset + current - entry.vaddr;
+			if (current == vaddr) {
+				first = offset;
+			} else if (offset != first + (current - vaddr)) {
+				return false;
+			}
+			current = std::min(end, entry.vaddr + entry.size);
+		}
+		*backing_offset = first;
+		return true;
+	}
+
+	// The largest range within [low, high) around [vaddr, vaddr + size) that is mapped from the
+	// backing in one piece, or false when [vaddr, vaddr + size) itself is not.
+	[[nodiscard]] bool TryContiguousExtent(uint64_t vaddr, uint64_t size, uint64_t low,
+	                                       uint64_t high, uint64_t* begin, uint64_t* end) {
+		uint64_t offset = 0;
+		if (low > vaddr || high < vaddr + size || !TryTranslate(vaddr, size, &offset)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		// Offsets are linear in the extent: offset(a) == offset + (a - vaddr).
+		const auto at = [&](uint64_t address) { return offset + address - vaddr; };
+		if (m_maps.upper_bound(vaddr) == m_maps.begin() ||
+		    m_maps.upper_bound(vaddr + size - 1) == m_maps.begin()) {
+			return false; // unmapped since
+		}
+		auto mapping = std::prev(m_maps.upper_bound(vaddr));
+		auto       first   = std::max(low, mapping->second.vaddr);
+		while (first > low && mapping != m_maps.begin()) {
+			const auto previous = std::prev(mapping);
+			const auto& entry   = previous->second;
+			if (entry.vaddr + entry.size != mapping->second.vaddr ||
+			    entry.backing_offset + entry.size != at(mapping->second.vaddr)) {
+				break;
+			}
+			mapping = previous;
+			first   = std::max(low, entry.vaddr);
+		}
+		mapping   = std::prev(m_maps.upper_bound(vaddr + size - 1));
+		auto last = std::min(high, mapping->second.vaddr + mapping->second.size);
+		while (last < high) {
+			const auto next = std::next(mapping);
+			if (next == m_maps.end()) {
+				break;
+			}
+			const auto& entry = next->second;
+			if (entry.vaddr != mapping->second.vaddr + mapping->second.size ||
+			    entry.backing_offset != at(entry.vaddr)) {
+				break;
+			}
+			mapping = next;
+			last    = std::min(high, entry.vaddr + entry.size);
+		}
+		*begin = first;
+		*end   = last;
+		return true;
+	}
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -750,6 +844,16 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	[[nodiscard]] int      GetBackingFileDescriptor() const {
+		return m_backing->GetFileDescriptor();
+	}
+	[[nodiscard]] bool TryTranslateBacking(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		return m_backing->TryTranslate(vaddr, size, offset);
+	}
+	[[nodiscard]] bool TryContiguousBacking(uint64_t vaddr, uint64_t size, uint64_t low,
+	                                        uint64_t high, uint64_t* begin, uint64_t* end) {
+		return m_backing->TryContiguousExtent(vaddr, size, low, high, begin, end);
+	}
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);

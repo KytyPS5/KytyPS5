@@ -124,7 +124,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
-		m_total_used_memory += buffer.Size();
+		if (!buffer.IsGuestBacked()) {
+			m_total_used_memory += buffer.Size();
+		}
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
@@ -137,8 +139,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
-		EXIT_IF(buffer.Size() > m_total_used_memory);
-		m_total_used_memory -= buffer.Size();
+		if (!buffer.IsGuestBacked()) {
+			EXIT_IF(buffer.Size() > m_total_used_memory);
+			m_total_used_memory -= buffer.Size();
+		}
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -163,6 +167,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	KYTY_TRACE_SCOPE("gpu", "DownloadBufferMemory");
+	if (buffer.IsGuestBacked()) {
+		// The GPU wrote guest memory itself; once its work completed there is nothing to copy.
+		return ForgetGuestBackedWrites(vaddr, size);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -249,7 +257,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
-    : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+    : m_graphics(graphics), m_scheduler(scheduler), m_import(graphics),
+      m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
@@ -421,7 +430,8 @@ std::optional<uint64_t> BufferCache::ReadBack(uint64_t vaddr, uint64_t size, boo
 	const auto last_write =
 	    unsettled ? current : std::max(buffer.LastGpuWriteTick(), m_address_write_tick);
 	const auto plan       = PlanReadback({
-	          .cpu_readable    = !m_read_back_through_gpu && !buffer.Mapped().empty(),
+	          .cpu_readable    = buffer.IsGuestBacked() ||
+	                             (!m_read_back_through_gpu && !buffer.Mapped().empty()),
 	          .last_write_tick = last_write,
 	          .current_tick    = current,
 	          .last_write_done = last_write < current && m_scheduler.IsFree(last_write),
@@ -452,6 +462,9 @@ std::optional<uint64_t> BufferCache::ReadBack(uint64_t vaddr, uint64_t size, boo
 }
 
 bool BufferCache::PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	if (buffer.IsGuestBacked()) {
+		return ForgetGuestBackedWrites(vaddr, size);
+	}
 	bool       published = false;
 	const auto memory    = buffer.Mapped();
 	m_memory_tracker.ForEachDownloadRange<false>(
@@ -467,6 +480,17 @@ bool BufferCache::PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	return published;
+}
+
+bool BufferCache::ForgetGuestBackedWrites(uint64_t vaddr, uint64_t size) {
+	// By pages, as a read-back of a copy publishes them: the tracker owns whole pages.
+	bool written = false;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    written = true;
+	    });
+	return written;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -545,8 +569,20 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
-	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
-	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	if (new_buffer.IsGuestBacked()) {
+		// Guest memory holds the bytes already, except those only a copy of it holds: what the
+		// GPU wrote to a buffer that was a copy.
+		if (!overlap.IsGuestBacked()) {
+			m_gpu_modified_ranges.ForEachInRange(
+			    overlap.CpuAddress(), overlap.Size(), [&](uint64_t start, uint64_t end) {
+				    new_buffer.CopyFrom(m_scheduler.Current(), overlap, overlap.Offset(start),
+				                        new_buffer.Offset(start), end - start);
+			    });
+		}
+	} else {
+		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+		                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	}
 	DeleteBuffer(overlap_id);
 }
 
@@ -556,14 +592,34 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	// The whole chunk around the first use (see bufferChunk.h).
 	const auto chunk =
 	    ChunkRange({vaddr, vaddr + size}, m_scheduler.Context().MappingAt(vaddr), s_chunk_size);
-	const auto end     = Common::AlignUp(chunk.end, CACHING_PAGESIZE);
-	vaddr              = Common::AlignDown(chunk.begin, CACHING_PAGESIZE);
-	size               = end - vaddr;
+	auto begin = Common::AlignDown(chunk.begin, CACHING_PAGESIZE);
+	auto end   = Common::AlignUp(chunk.end, CACHING_PAGESIZE);
+	// A buffer that is guest memory itself must be one piece of direct memory: the part of the
+	// chunk mapped in one piece around the request.
+	uint64_t piece_begin = 0;
+	uint64_t piece_end   = 0;
+	if (m_import.Enabled() &&
+	    LibKernel::Memory::ContiguousDirectMemory(vaddr, size, begin, end, &piece_begin,
+	                                              &piece_end)) {
+		piece_begin = Common::AlignUp(piece_begin, CACHING_PAGESIZE);
+		piece_end   = Common::AlignDown(piece_end, CACHING_PAGESIZE);
+		if (piece_begin <= vaddr && vaddr + size <= piece_end) {
+			begin = piece_begin;
+			end   = piece_end;
+		}
+	}
+	vaddr = begin;
+	size  = end - begin;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::Guest, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	const auto flags     = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	const auto placement = m_import.Place(overlap.begin, overlap.end - overlap.begin);
+	const auto id =
+	    placement ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags,
+	                                      overlap.end - overlap.begin, placement->memory,
+	                                      placement->offset)
+	              : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::Guest,
+	                                      overlap.begin, flags, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -573,14 +629,26 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
-	// A new buffer starts with guest bytes the GPU has not seen: it counts as a CPU write.
-	RecordGuestWrite(overlap.begin, overlap.end - overlap.begin);
+	if (!placement) {
+		// A new buffer starts with guest bytes the GPU has not seen: it counts as a CPU write.
+		RecordGuestWrite(overlap.begin, overlap.end - overlap.begin);
+	}
 	return id;
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
+	if (buffer.IsGuestBacked()) {
+		if (is_written) {
+			// Nothing to upload, but the pages become the GPU's: a CPU access waits for the
+			// writes to complete (ReadBack), and then finds them in guest memory.
+			m_memory_tracker.ForEachUploadRange(
+			    vaddr, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+			return false;
+		}
+		return is_texel_buffer && SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -770,7 +838,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written &&
 	    (size <= CACHING_PAGESIZE || (!is_texel_buffer && size <= StreamUploadLimit)) &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && !IsGuestBacked(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -790,6 +858,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (is_written && buffer.IsGuestBacked()) {
+		m_guest_backed_writes.Add(vaddr, size, m_scheduler.CurrentTick());
+	}
 	if (is_written) {
 		if (m_unsettled_writers.size() < MaxUnsettledWriters) {
 			m_unsettled_writers.push_back(id);
@@ -902,6 +973,60 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	return address + m_slot_buffers[id].Size() > vaddr;
 }
 
+bool BufferCache::IsGuestBacked(uint64_t vaddr, uint64_t size) {
+	if (!m_import.Enabled() || vaddr == 0) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner) {
+		const auto& buffer = m_slot_buffers[*owner];
+		if (buffer.IsInBounds(vaddr, size)) {
+			return buffer.IsGuestBacked();
+		}
+	}
+	return m_import.CanPlace(vaddr, size);
+}
+
+bool BufferCache::ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size) {
+	if (!m_import.Enabled() || vaddr == 0) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	const auto& buffer = m_slot_buffers[*owner];
+	if (!buffer.IsGuestBacked() || !buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	// Only the writes of these bytes: a command processor that misses a write it waits for
+	// (through device addresses) waits again.
+	const auto last_write = m_guest_backed_writes.LastWrite(vaddr, size);
+	if (last_write != 0 && !m_scheduler.IsFree(last_write)) {
+		if (last_write >= m_scheduler.CurrentTick()) {
+			m_scheduler.Flush();
+		}
+		m_scheduler.Wait(last_write);
+	}
+	return LibKernel::Memory::TryReadBacking(vaddr, data, size);
+}
+
+bool BufferCache::WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!m_import.Enabled() || vaddr == 0) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	const auto& buffer = m_slot_buffers[*owner];
+	if (!buffer.IsGuestBacked() || !buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	m_write_watches.NotifyWrite(vaddr, size);
+	return LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
@@ -940,6 +1065,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
+	m_guest_backed_writes.ForgetCompleted(m_scheduler.GetMasterSemaphore().KnownGpuTick());
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -966,6 +1092,10 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (buffer.IsGuestBacked()) {
+			// Costs no device memory.
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -1017,7 +1147,10 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		--it;
 	}
 	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
+		auto& buffer = m_slot_buffers[it->second];
+		if (buffer.IsGuestBacked()) {
+			continue;
+		}
 		const auto start  = std::max(buffer.CpuAddress(), vaddr);
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish && m_memory_tracker.IsRegionCpuModified(start, finish - start)) {

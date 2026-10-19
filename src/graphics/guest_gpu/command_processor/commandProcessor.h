@@ -115,6 +115,10 @@ public:
 	                           uint32_t interrupt_context_id);
 	// A 32-bit value as WAIT_REG_MEM and COND_EXEC see it: with the labels not written yet.
 	[[nodiscard]] uint32_t ReadLabel(const uint32_t* address);
+	// Guest memory as the command processor reads it: with pending labels, and without waiting
+	// for GPU work that does not write it (BufferCache::ReadGuestBacked).
+	template <typename T>
+	[[nodiscard]] T ReadMemory(const T* address);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);

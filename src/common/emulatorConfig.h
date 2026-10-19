@@ -66,6 +66,9 @@ struct ConfigOptions {
 	uint32_t               vblank_frequency            = 60;
 	// Guest frames (suspend points) recorded before the host GPU completes the oldest of them.
 	uint32_t               gpu_frames_in_flight        = 2;
+	// The GPU reads and writes guest direct memory in place where the host can import it
+	// (Graphics::GuestMemoryImport); otherwise buffers are copies, synchronized both ways.
+	bool                   gpu_guest_memory_import     = true;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -131,6 +134,7 @@ bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
 inline constexpr uint32_t MAX_GPU_FRAMES_IN_FLIGHT = 3;
 uint32_t                  GetGpuFramesInFlight();
+bool                      GetGpuGuestMemoryImport();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

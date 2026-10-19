@@ -74,6 +74,8 @@ static void PrintUsage() {
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --gpu-frames-in-flight <1-3>         Guest frames recorded ahead of the host GPU. "
 	         "Default: 2.\n");
+	::printf("  --gpu-guest-memory-import <0|1>      The GPU uses guest memory in place where the "
+	         "host can import it. Default: 1.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
@@ -409,6 +411,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid gpu index: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-guest-memory-import") {
+			if (value != "0" && value != "1") {
+				::printf("invalid guest memory import: %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_guest_memory_import = value == "1";
 		} else if (arg == "--gpu-frames-in-flight") {
 			if (!ParseUint32(value, options.config.gpu_frames_in_flight) ||
 			    options.config.gpu_frames_in_flight < 1 ||

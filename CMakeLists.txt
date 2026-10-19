@@ -443,6 +443,16 @@ add_executable(pending_labels_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(pending_labels_tests PRIVATE ${inc_headers})
 
+add_executable(guest_memory_window_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestMemoryWindowTests.cpp"
+)
+target_include_directories(guest_memory_window_tests PRIVATE ${inc_headers})
+
+add_executable(gpu_write_ticks_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuWriteTicksTests.cpp"
+)
+target_include_directories(gpu_write_ticks_tests PRIVATE ${inc_headers})
+
 add_executable(perf_counters_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PerfCountersTests.cpp"
 )
@@ -792,6 +802,8 @@ if(BUILD_TESTING)
 	add_test(NAME copy_workers COMMAND $<TARGET_FILE:copy_workers_tests>)
 	add_test(NAME frame_pacer COMMAND $<TARGET_FILE:frame_pacer_tests>)
 	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
+	add_test(NAME guest_memory_window COMMAND $<TARGET_FILE:guest_memory_window_tests>)
+	add_test(NAME gpu_write_ticks COMMAND $<TARGET_FILE:gpu_write_ticks_tests>)
 	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
 	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
 	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
@@ -878,6 +890,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_guest_backed
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-guest-backed-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -900,6 +914,8 @@ if(BUILD_TESTING)
 		copy_workers_tests
 		frame_pacer_tests
 		pending_labels_tests
+		guest_memory_window_tests
+		gpu_write_ticks_tests
 		readback_plan_tests
 		pipeline_use_tests
 		submit_plan_tests

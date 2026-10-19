@@ -4320,6 +4320,113 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A buffer over direct memory is guest memory itself where the host imports it
+  // (guestMemoryImport.h): the GPU reads what the CPU wrote without an upload,
+  // its writes are in guest memory once they complete, and the command processor
+  // reads them without the fault of a page the GPU owns.
+  void CheckBufferCacheGuestBacked() {
+    constexpr const char *name = "BufferCacheGuestBacked";
+    constexpr uintptr_t base = 0x0000000201700000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    if (CannotRun("graphics", name, m_dma_buf_import,
+                  "guest memory imported into the GPU",
+                  "VK_EXT_external_memory_dma_buf")) {
+      return;
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    auto *memory = static_cast<volatile uint32_t *>(mapped);
+    auto &cache = context.GetBufferCache();
+    context.MapMemory(base, allocation_size);
+    // Guest faults reach this renderer, as in the emulator.
+    LibKernel::Memory::InstallGpuResources(&context);
+
+    const auto read_on_gpu = [&](uint64_t address) {
+      uint32_t value = 0;
+      context.GetGpu().SendCommandSync([&] {
+        auto [buffer, offset] = cache.ObtainBuffer(address, sizeof(uint32_t), false);
+        Require(name, "guest-backed buffer", buffer->IsGuestBacked(),
+                "a buffer over direct memory is a copy");
+        auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{offset, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer->Handle(), readback.buffer, 1,
+                                                &copy);
+        vk::MemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+            &barrier, 0, nullptr, 0, nullptr);
+        scheduler.Finish();
+        value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+      });
+      return value;
+    };
+
+    memory[0x40] = 0x11111111u;
+    Require(name, "CPU bytes without an upload", read_on_gpu(base + 0x100) == 0x11111111u,
+            "the GPU did not read what the CPU wrote");
+    // The page is neither uploaded nor protected: the next write is seen as it is.
+    memory[0x40] = 0x22222222u;
+    Require(name, "a later CPU write", read_on_gpu(base + 0x100) == 0x22222222u,
+            "the GPU read a stale copy of guest memory");
+
+    uint32_t command_processor_value = 0;
+    context.GetGpu().SendCommandSync([&] {
+      auto [buffer, offset] = cache.ObtainBuffer(base + 0x200, sizeof(uint32_t), true);
+      buffer->Fill(offset, sizeof(uint32_t), 0x33333333u);
+      cache.SettleGpuWrites();
+      // The open submission holds the write: the read waits for it, without a fault.
+      Require(name, "command processor read",
+              cache.ReadGuestBacked(base + 0x200, &command_processor_value,
+                                    sizeof(command_processor_value)),
+              "the command processor could not read guest-backed memory");
+    });
+    Require(name, "GPU write seen by the command processor",
+            command_processor_value == 0x33333333u,
+            "the command processor read before the GPU write completed");
+    // A guest thread reads it as it is: the page is the GPU's until then, and the read
+    // waits for the write (no copy).
+    Require(name, "GPU write in guest memory", memory[0x80] == 0x33333333u,
+            "the GPU's write did not reach guest memory");
+    context.GetGpu().SendCommandSync([&] { scheduler.Finish(); });
+    context.UnmapMemory(base, allocation_size);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -4346,7 +4453,13 @@ public:
     constexpr uint32_t ring_fault_second_value = 0x4e5f6071u;
 
     EnsureRuntimeContext();
+    // The download ring and the collection of dirty copies: buffers are copies here, also on
+    // a host that imports guest memory (guestMemoryImport.h).
+    auto copy_config = HarnessConfig();
+    copy_config.gpu_guest_memory_import = false;
+    Config::Load(copy_config);
     RenderContext context(m_runtime_context);
+    Config::Load(HarnessConfig());
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -9394,6 +9507,9 @@ public:
           "contents");
       (void)texture_cache.FindTexture(gc_images[0], gc_image_desc_a);
       (void)texture_cache.FindTexture(gc_images[1], gc_image_desc_b);
+      // Where buffers are guest memory itself, the uploads read guest memory when they run,
+      // as a GPU does: they run before the stale bytes below are written.
+      scheduler.Finish();
       for (const auto image : gc_images) {
         texture_cache.MarkGpuWritten(image);
       }
@@ -19922,6 +20038,7 @@ public:
 private:
   u32   m_not_run_cases          = 0;
   HostGpu m_host;
+  bool m_dma_buf_import = false;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -19955,6 +20072,7 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.host = m_host;
+    m_runtime_context.dma_buf_import_enabled = m_dma_buf_import;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -20026,6 +20144,8 @@ private:
     DeviceDecision decision;
     std::string rejections;
     bool portability_subset = false;
+    // As the emulator: guest memory is imported where the device can (guestMemoryImport.h).
+    bool dma_buf_import = false;
     for (auto physical : physical_devices) {
       u32 queue_count = 0;
       physical.getQueueFamilyProperties(&queue_count, nullptr);
@@ -20066,6 +20186,13 @@ private:
       portability_subset = std::ranges::any_of(extensions, [](const auto &extension) {
         return std::strcmp(extension.extensionName, "VK_KHR_portability_subset") == 0;
       });
+      const auto has = [&](const char *wanted) {
+        return std::ranges::any_of(extensions, [&](const auto &extension) {
+          return std::strcmp(extension.extensionName, wanted) == 0;
+        });
+      };
+      dma_buf_import = has(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) &&
+                       has(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
       break;
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
@@ -20113,6 +20240,11 @@ private:
     if (portability_subset) {
       device_extensions.push_back("VK_KHR_portability_subset");
     }
+    if (dma_buf_import) {
+      device_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    }
+    m_dma_buf_import = dma_buf_import;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     if (caps.shared_int64_atomics) {
       workgroup_layout.workgroupMemoryExplicitLayout = true;
@@ -46690,6 +46822,11 @@ int RunSelectedCases(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-guest-backed-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheGuestBacked();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -46917,6 +47054,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
   vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
+  vulkan.CheckBufferCacheGuestBacked();
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

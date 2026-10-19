@@ -42,6 +42,11 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A buffer that is guest memory itself (guestMemoryImport.h): at `memory_offset` of the
+	// imported `memory`, which holds the guest bytes at `cpu_address`.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       vk::BufferUsageFlags flags, uint64_t size, vk::DeviceMemory memory,
+	       uint64_t memory_offset);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -51,6 +56,8 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
+	// The GPU reads and writes guest memory itself: nothing to upload or read back.
+	[[nodiscard]] bool               IsGuestBacked() const noexcept { return m_guest_backed; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
@@ -101,6 +108,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_guest_backed = false;
 	uint64_t                      m_last_gpu_write_tick = 0;
 	std::span<uint8_t>            m_mapped;
 };

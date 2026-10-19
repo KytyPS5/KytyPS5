@@ -34,6 +34,8 @@ names=(
 	file_lock
 	frame_pacer
 	gamepad_quit
+	gpu_write_ticks
+	guest_memory_window
 	guest_write_log
 	host_lowering
 	http_uri_parse
@@ -88,6 +90,7 @@ ctest_only=(
 # kernel_file_system needs one too: guest memory needs the GPU resources of a Vulkan device.
 local_only=(
 	buffer_cache_dirty_gc
+	buffer_cache_guest_backed
 	buffer_cache_ranges
 	color_render_target_1d
 	command_scheduler_timeline

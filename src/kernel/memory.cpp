@@ -875,6 +875,25 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+DirectMemoryFile GetDirectMemoryFile() {
+	if (g_guest_address_space == nullptr) {
+		return {};
+	}
+	return {g_guest_address_space->GetBackingFileDescriptor(),
+	        g_guest_address_space->GetBackingSize()};
+}
+
+bool TranslateDirectMemory(uint64_t vaddr, uint64_t size, uint64_t* file_offset) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryTranslateBacking(vaddr, size, file_offset);
+}
+
+bool ContiguousDirectMemory(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high,
+                            uint64_t* begin, uint64_t* end) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryContiguousBacking(vaddr, size, low, high, begin, end);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);

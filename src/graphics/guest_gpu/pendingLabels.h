@@ -92,29 +92,48 @@ public:
 	// with the labels not retired yet written over it, the newest last.
 	template <typename T>
 	[[nodiscard]] T Read(const T* address) {
+		// Another guest thread or the host GPU can write it: one load the compiler keeps.
+		return Read(address, [address] { return *static_cast<const volatile T*>(address); });
+	}
+
+	// The same, with `load` reading guest memory where no label covers it.
+	template <typename T, typename Load>
+	[[nodiscard]] T Read(const T* address, Load&& load) {
 		static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
-		// Another guest thread or the host GPU can write it: one load, not one the compiler keeps.
-		T value = *static_cast<const volatile T*>(address);
 		const auto begin = reinterpret_cast<uint64_t>(address);
 		const auto end   = begin + sizeof(T);
-		std::scoped_lock lock {m_mutex};
-		if (m_latest.empty()) {
-			return value;
-		}
-		std::vector<const Label*> overlapping;
-		for (auto it = m_latest.lower_bound(begin >= 7 ? begin - 7 : 0);
-		     it != m_latest.end() && it->first < end; ++it) {
-			if (it->first + it->second.bytes > begin) {
-				overlapping.push_back(&it->second);
+		std::vector<Label> overlapping;
+		{
+			std::scoped_lock lock {m_mutex};
+			for (auto it = m_latest.lower_bound(begin >= 7 ? begin - 7 : 0);
+			     it != m_latest.end() && it->first < end; ++it) {
+				if (it->first + it->second.bytes > begin) {
+					overlapping.push_back(it->second);
+				}
 			}
 		}
-		std::sort(overlapping.begin(), overlapping.end(),
-		          [](const Label* a, const Label* b) { return a->serial < b->serial; });
+		T     value {};
 		auto* bytes = reinterpret_cast<uint8_t*>(&value);
-		for (const auto* label: overlapping) {
-			const auto* source = reinterpret_cast<const uint8_t*>(&label->value);
-			for (uint32_t i = 0; i < label->bytes; i++) {
-				const auto at = label->address + i;
+		// Which bytes the labels give. Guest memory is read only for the others: a page that
+		// holds a pending label is often the GPU's, and reading it waits for the host GPU.
+		uint32_t covered = 0;
+		for (const auto& label: overlapping) {
+			for (uint32_t i = 0; i < label.bytes; i++) {
+				const auto at = label.address + i;
+				if (at >= begin && at < end) {
+					covered |= 1u << (at - begin);
+				}
+			}
+		}
+		if (covered != (1u << sizeof(T)) - 1u) {
+			value = load();
+		}
+		std::sort(overlapping.begin(), overlapping.end(),
+		          [](const Label& a, const Label& b) { return a.serial < b.serial; });
+		for (const auto& label: overlapping) {
+			const auto* source = reinterpret_cast<const uint8_t*>(&label.value);
+			for (uint32_t i = 0; i < label.bytes; i++) {
+				const auto at = label.address + i;
 				if (at >= begin && at < end) {
 					bytes[at - begin] = source[i];
 				}

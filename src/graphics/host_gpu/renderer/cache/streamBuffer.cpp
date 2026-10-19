@@ -109,7 +109,39 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, vk::DeviceMemory memory,
+               uint64_t memory_offset)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Guest),
+      m_cpu_address(cpu_address), m_size(size), m_coherent(true), m_guest_backed(true) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(memory == nullptr || size == 0);
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
+	RequireVulkanSuccess(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer),
+	                     "create a buffer over guest memory");
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(m_buffer, &requirements);
+	EXIT_IF(memory_offset % requirements.alignment != 0);
+	RequireVulkanSuccess(graphics.device.bindBufferMemory(m_buffer, memory, memory_offset),
+	                     "bind a buffer to guest memory");
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+	}
+}
+
 Buffer::~Buffer() {
+	if (m_guest_backed) {
+		m_graphics->device.destroyBuffer(m_buffer);
+		return;
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
@@ -135,7 +167,7 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 
 void Buffer::NoteGpuWrite() noexcept {
 	m_last_gpu_write_tick = m_scheduler->CurrentTick();
-	if (!m_mapped.empty()) {
+	if (!m_mapped.empty() || m_guest_backed) {
 		m_scheduler->NoteWriteTheCpuReads();
 	}
 }

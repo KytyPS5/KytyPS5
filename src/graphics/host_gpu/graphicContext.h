@@ -30,6 +30,9 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_external_memory_dma_buf and VK_KHR_external_memory_fd: guest memory can be imported
+	// (guestMemoryImport.h).
+	bool                               dma_buf_import_enabled                = false;
 	bool                               sample_rate_shading_enabled           = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// What the device enabled, not only what it supports, and the known defects of its driver.

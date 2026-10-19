@@ -100,6 +100,10 @@ uint32_t GetGpuFramesInFlight() {
 	return std::clamp(g_config->gpu_frames_in_flight, 1u, MAX_GPU_FRAMES_IN_FLIGHT);
 }
 
+bool GetGpuGuestMemoryImport() {
+	return g_config->gpu_guest_memory_import;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

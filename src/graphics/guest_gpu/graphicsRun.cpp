@@ -132,7 +132,9 @@ void GuestGpu::WriteCompletedLabels() {
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	for (const auto& label: m_completed_labels) {
 		if (label.bytes != 0) {
-			std::memcpy(reinterpret_cast<void*>(label.address), &label.value, label.bytes);
+			if (!buffer_cache.WriteGuestBacked(label.address, &label.value, label.bytes)) {
+				std::memcpy(reinterpret_cast<void*>(label.address), &label.value, label.bytes);
+			}
 			buffer_cache.RecordGpuThreadWrite(label.address, label.bytes);
 			m_labels->Retire(label);
 		}
@@ -387,7 +389,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(m_renderer.GetLabels()->Read(addr), ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadMemory(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -1399,7 +1401,19 @@ void CommandProcessor::WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t
 }
 
 uint32_t CommandProcessor::ReadLabel(const uint32_t* address) {
-	return m_renderer.GetLabels()->Read(address);
+	return ReadMemory(address);
+}
+
+template <typename T>
+T CommandProcessor::ReadMemory(const T* address) {
+	return m_renderer.GetLabels()->Read(address, [&] {
+		T value {};
+		if (!m_renderer.GetBufferCache().ReadGuestBacked(reinterpret_cast<uint64_t>(address),
+		                                                 &value, sizeof(T))) {
+			value = *static_cast<const volatile T*>(address);
+		}
+		return value;
+	});
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

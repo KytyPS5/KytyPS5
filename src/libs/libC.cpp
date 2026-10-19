@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/guestExit.h"
 #include "libs/guestPrintf.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
@@ -66,12 +67,6 @@ int GetArgc() {
 
 const char** GetArgv() {
 	return const_cast<const char**>(g_argv);
-}
-
-static KYTY_SYSV_ABI void exit(int code) {
-	PRINT_NAME();
-
-	::exit(code);
 }
 
 static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
@@ -809,7 +804,7 @@ LIB_DEFINE(InitLibC_1) {
 
 	LIB_OBJECT("P330P3dFF68", &LibC::g_need_flag);
 
-	LIB_FUNC("uMei1W9uyNo", LibC::exit);
+	LIB_FUNC("uMei1W9uyNo", GuestExit);
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
 	LIB_FUNC("9BcDykPmo1I", LibC::libc_error);
 	LIB_FUNC("bzQExy189ZI", LibC::init_env);

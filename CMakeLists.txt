@@ -536,6 +536,10 @@ add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 target_link_libraries(save_data_memory_tests common fmt::fmt)
 target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
 
+add_executable(guest_exit_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GuestExitTests.cpp")
+target_link_libraries(guest_exit_tests common)
+target_include_directories(guest_exit_tests PRIVATE ${inc_headers})
+
 add_executable(png_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PngEncTests.cpp")
 target_link_libraries(png_enc_tests common fmt::fmt)
 target_include_directories(png_enc_tests PRIVATE ${inc_headers})
@@ -650,6 +654,8 @@ if(BUILD_TESTING)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
+	add_test(NAME guest_exit COMMAND $<TARGET_FILE:guest_exit_tests>)
+	set_tests_properties(guest_exit PROPERTIES TIMEOUT 15)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
@@ -720,6 +726,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		guest_exit_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests

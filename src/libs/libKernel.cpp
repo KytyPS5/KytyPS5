@@ -16,6 +16,7 @@
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
 #include "libs/errno.h"
+#include "libs/guestExit.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/elf.h"
@@ -1687,12 +1688,6 @@ static void KYTY_SYSV_ABI KernelDebugRaiseExceptionOnReleaseMode(int /*c1*/, int
 
 static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 	PRINT_NAME();
-}
-
-static void KYTY_SYSV_ABI exit(int code) {
-	PRINT_NAME();
-
-	::exit(code);
 }
 
 static KYTY_SYSV_ABI MallocReplace* KernelGetSanitizerMallocReplaceExternal() {
@@ -3389,7 +3384,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("-ZR+hG7aDHw", LibKernel::KernelSleep);
 	LIB_FUNC("6c3rCVE-fTU", LibKernel::open);
 	LIB_FUNC("6xVpy0Fdq+I", LibKernel::sigprocmask);
-	LIB_FUNC("6Z83sYWFlA8", LibKernel::exit);
+	LIB_FUNC("6Z83sYWFlA8", GuestExit);
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);

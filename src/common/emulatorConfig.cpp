@@ -96,6 +96,10 @@ bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
 
+uint32_t GetGpuFramesInFlight() {
+	return std::clamp(g_config->gpu_frames_in_flight, 1u, MAX_GPU_FRAMES_IN_FLIGHT);
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

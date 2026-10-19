@@ -32,6 +32,7 @@ names=(
 	event_queue_lifetime
 	fence_retirement
 	file_lock
+	frame_pacer
 	gamepad_quit
 	guest_write_log
 	host_lowering

@@ -59,7 +59,9 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
-GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
+GuestGpu::GuestGpu(RenderContext& renderer)
+    : m_renderer(renderer),
+      m_frame_pacer(std::make_shared<FramePacer>(Config::GetGpuFramesInFlight())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
@@ -82,6 +84,7 @@ void GuestGpu::Shutdown() {
 		m_stopping  = true;
 		m_work_available.SignalAll();
 	}
+	m_frame_pacer->Stop();
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
@@ -202,12 +205,17 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
-	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	// finish the preceding graphics frame.
+	m_frame_pacer->WaitForRoom();
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
 	m_done_num++;
+}
+
+std::shared_ptr<FramePacer> GuestGpu::RecordFrame() {
+	m_frame_pacer->FrameRecorded();
+	return m_frame_pacer;
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -685,8 +693,6 @@ bool GuestGpu::Process(Submission& submission) {
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			cp.EmitGlobalBarrier();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -1405,7 +1411,10 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request, frame = m_renderer.GetGpu().RecordFrame()] {
+		    renderer.GetVideoOut().CompleteFlip(request);
+		    frame->FrameCompleted();
+	    });
 	GetScheduler().Flush();
 }
 
@@ -1425,7 +1434,10 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request, frame = m_renderer.GetGpu().RecordFrame()] {
+		    renderer.GetVideoOut().CompleteFlip(request);
+		    frame->FrameCompleted();
+	    });
 	GetScheduler().Flush();
 }
 
@@ -1451,9 +1463,11 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
+	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request,
+	     frame = m_renderer.GetGpu().RecordFrame()] {
 		    renderer.GetVideoOut().CompleteFlip(request);
 		    renderer.TriggerInterrupt(event_id, 0);
+		    frame->FrameCompleted();
 	    });
 	GetScheduler().Flush();
 }
@@ -1472,7 +1486,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	m_renderer.GetRenderExecutor().NoteFlip();
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id, frame = m_renderer.GetGpu().RecordFrame()] {
+		    m_renderer.GetVideoOut().CompleteFlip(request_id);
+		    frame->FrameCompleted();
+	    });
 	GetScheduler().Flush();
 }
 

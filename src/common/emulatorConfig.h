@@ -64,6 +64,8 @@ struct ConfigOptions {
 	bool                   amd_cpu_enabled             = false;
 	bool                   network_connected           = false;
 	uint32_t               vblank_frequency            = 60;
+	// Guest frames (suspend points) recorded before the host GPU completes the oldest of them.
+	uint32_t               gpu_frames_in_flight        = 2;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -127,6 +129,8 @@ bool     VrEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
+inline constexpr uint32_t MAX_GPU_FRAMES_IN_FLIGHT = 3;
+uint32_t                  GetGpuFramesInFlight();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

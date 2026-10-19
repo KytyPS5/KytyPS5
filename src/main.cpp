@@ -72,6 +72,8 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --gpu-frames-in-flight <1-3>         Guest frames recorded ahead of the host GPU. "
+	         "Default: 2.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
@@ -405,6 +407,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-frames-in-flight") {
+			if (!ParseUint32(value, options.config.gpu_frames_in_flight) ||
+			    options.config.gpu_frames_in_flight < 1 ||
+			    options.config.gpu_frames_in_flight > Config::MAX_GPU_FRAMES_IN_FLIGHT) {
+				::printf("invalid GPU frames in flight: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--vblank-frequency") {

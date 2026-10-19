@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/framePacer.h"
 
 #include <array>
 #include <atomic>
@@ -40,8 +41,12 @@ public:
 	            std::span<const uint32_t> constant_commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
-	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
+	// A guest frame boundary: ages the caches in order with the guest's work. It blocks the
+	// caller while Config::GetGpuFramesInFlight() recorded frames wait for the host GPU.
 	void SuspendPoint();
+	// Counts a flip the GPU thread records; the host GPU's completion of it calls
+	// FrameCompleted on the returned pacer.
+	[[nodiscard]] std::shared_ptr<FramePacer> RecordFrame();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
@@ -92,9 +97,9 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
-	// Completion callbacks can outlive GuestGpu during renderer shutdown.
-	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
-	    std::make_shared<std::binary_semaphore>(1);
+	// Frames recorded ahead of the host GPU. Completion callbacks can outlive GuestGpu during
+	// renderer shutdown.
+	std::shared_ptr<FramePacer> m_frame_pacer;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

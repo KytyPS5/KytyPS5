@@ -2879,16 +2879,24 @@ public:
                                       initial_cache_ticks.second + 1},
             "a suspend point did not age both caches exactly once");
 
-    std::binary_semaphore second_entered{0};
-    std::binary_semaphore second_returned{0};
-    std::jthread second([&] {
-      second_entered.release();
+    // A game calls AgcSuspendPoint several times a frame: suspend points never
+    // wait for the host GPU to complete earlier ones. Only recorded frames
+    // (flips) are bounded (framePacer.h, frame_pacer_tests).
+    std::binary_semaphore later_returned{0};
+    std::jthread later([&] {
       gpu.SuspendPoint();
-      second_returned.release();
+      gpu.SuspendPoint();
+      later_returned.release();
     });
-    second_entered.acquire();
-    const bool second_overtook_completion =
-        second_returned.try_acquire_for(std::chrono::milliseconds(100));
+    const bool later_overtook_completion =
+        later_returned.try_acquire_for(std::chrono::seconds(2));
+    if (!later_overtook_completion) {
+      signal(1);
+    }
+    later.join();
+    Require(name, "points do not wait for native completion",
+            later_overtook_completion,
+            "a suspend point waited for an earlier one's native completion");
 
     uint32_t compute_value = 0;
     std::array<uint32_t, 5> compute_commands{};
@@ -2904,20 +2912,17 @@ public:
     const bool compute_did_not_wait =
         compute_progress.try_acquire_for(std::chrono::seconds(2));
     signal(1);
-    second.join();
     compute.join();
     finish();
-    Require(name, "one outstanding point", !second_overtook_completion,
-            "a second suspend point returned before the first native completion");
     Require(name, "independent queue progress",
             compute_did_not_wait && host_lane_responded && compute_value == 33,
             "waiting for a previous suspend point blocked compute submissions "
             "or the host command lane");
-    Require(name, "frame count", gpu.GetFrameNum() == 2,
+    Require(name, "frame count", gpu.GetFrameNum() == 3,
             "suspend-point insertion did not advance the frame counter once");
     Require(name, "async cache lifetime",
-            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
-                                      initial_cache_ticks.second + 2},
+            cache_ticks() == std::pair{initial_cache_ticks.first + 3,
+                                      initial_cache_ticks.second + 3},
             "asynchronous work aged the caches between frame boundaries");
 
     // A marker must stay behind a stalled graphics stream, then clear its

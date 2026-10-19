@@ -430,6 +430,14 @@ if(LINUX)
 	target_link_libraries(copy_workers_tests Threads::Threads)
 endif()
 
+add_executable(frame_pacer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FramePacerTests.cpp"
+)
+target_include_directories(frame_pacer_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(frame_pacer_tests Threads::Threads)
+endif()
+
 add_executable(perf_counters_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PerfCountersTests.cpp"
 )
@@ -777,6 +785,7 @@ if(BUILD_TESTING)
 	add_test(NAME perf_counters COMMAND $<TARGET_FILE:perf_counters_tests>)
 	add_test(NAME guest_write_log COMMAND $<TARGET_FILE:guest_write_log_tests>)
 	add_test(NAME copy_workers COMMAND $<TARGET_FILE:copy_workers_tests>)
+	add_test(NAME frame_pacer COMMAND $<TARGET_FILE:frame_pacer_tests>)
 	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
 	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
 	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
@@ -883,6 +892,7 @@ if(BUILD_TESTING)
 		perf_counters_tests
 		guest_write_log_tests
 		copy_workers_tests
+		frame_pacer_tests
 		readback_plan_tests
 		pipeline_use_tests
 		submit_plan_tests

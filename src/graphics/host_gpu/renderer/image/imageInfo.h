@@ -75,6 +75,10 @@ struct ImageInfo {
 	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
 	vk::Extent3D                 extent           = {1, 1, 1};
 	ImageSubresources            resources;
+	// Original guest chain when the host represents only a subset of its mips.
+	vk::Extent3D                 guest_mip_extent = {0, 0, 0};
+	uint32_t                     guest_mip_levels = 0;
+	uint32_t                     guest_base_mip = 0;
 	uint32_t                     pitch           = 0;
 	uint32_t                     bytes_per_block = 0;
 	uint32_t                     samples         = 1;
@@ -88,6 +92,7 @@ struct ImageInfo {
 	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
+	[[nodiscard]] bool NormalizeMipView(uint32_t& base_level, uint32_t level_count);
 	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;

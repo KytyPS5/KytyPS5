@@ -619,14 +619,17 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
-void TestCompleteUMinReduction() {
+void TestCompleteWaveReduction(ValueOpcode expected_operation) {
+  const auto neutral = expected_operation == ValueOpcode::UMin32 ? UINT32_MAX : 0u;
+  const auto expected_reduction = expected_operation == ValueOpcode::UMin32 ? ValueOpcode::SubgroupUMinU32 :
+      expected_operation == ValueOpcode::UMax32 ? ValueOpcode::SubgroupUMaxU32 : ValueOpcode::SubgroupOrU32;
   enum class Case {
     Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
     UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
-    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation
+    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation, MixedOperation
   };
   for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
        Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
@@ -636,7 +639,7 @@ void TestCompleteUMinReduction() {
        Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
        Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
-       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation}) {
+       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation, Case::MixedOperation}) {
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
     const auto source = fixture.Emit(ValueOpcode::LaneId);
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
@@ -650,11 +653,10 @@ void TestCompleteUMinReduction() {
       seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
     const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
         fixture.Emit(ValueOpcode::SelectU32,
-            {seed_mask, source, Value(test == Case::WrongNeutral ? 0u : UINT32_MAX)});
+            {seed_mask, source, Value(test == Case::WrongNeutral ? ~neutral : neutral)});
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
-    const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseOr32 :
-                                                        ValueOpcode::UMin32;
+    const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseXor32 : expected_operation;
     for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
       DppMoveFlags flags{.control = 0x110u + shift};
       if (shift == 2) {
@@ -669,7 +671,9 @@ void TestCompleteUMinReduction() {
           {test == Case::DppSource ? source : prefix,
            test == Case::MoveExec ? mask : test == Case::LiteralMove ? Value(true) : enabled});
       move.Instruction()->SetFlags(flags);
-      const auto combined = fixture.Emit(operation, {move, prefix});
+      const auto row_operation = test == Case::MixedOperation && shift == 2 ?
+          (expected_operation == ValueOpcode::UMin32 ? ValueOpcode::UMax32 : ValueOpcode::UMin32) : operation;
+      const auto combined = fixture.Emit(row_operation, {move, prefix});
       const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
           {combined, test == Case::Previous ? source : prefix,
            test == Case::UpdateExec ? mask : enabled});
@@ -712,12 +716,12 @@ void TestCompleteUMinReduction() {
     const bool matches = test == Case::Masked || test == Case::Subset ||
         test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove;
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
-          ("UMin reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
+          ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
     if (matches) {
       const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
-      Check(reduction->GetOpcode() == ValueOpcode::SubgroupUMinU32 &&
+      Check(reduction->GetOpcode() == expected_reduction &&
                 reduction->Arg(0).Resolve() == seed.Resolve(),
-            "UMin reduction changed the neutral-masked input");
+            "wave reduction changed the neutral-masked input");
       RemoveIdentities(fixture.program);
       EliminateDeadCode(fixture.program.blocks);
       uint32_t updates = 0;
@@ -725,14 +729,14 @@ void TestCompleteUMinReduction() {
         updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
         Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
                   inst.GetOpcode() != ValueOpcode::Permlane16U32,
-              "UMin reduction retained unused endpoint or cross-row operations");
+              "wave reduction retained unused endpoint or cross-row operations");
       }
       Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
-            "UMin reduction destroyed an independently consumed prefix or kept its dead suffix");
+            "wave reduction destroyed an independently consumed prefix or kept its dead suffix");
       ValidateProgram(fixture.program, true);
     } else {
       Check(use.Instruction()->Arg(0).Resolve() == result,
-            "rejected UMin proof changed its original result");
+            "rejected wave reduction proof changed its original result");
     }
   }
 }
@@ -873,7 +877,9 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
-    TestCompleteUMinReduction();
+    TestCompleteWaveReduction(ValueOpcode::UMin32);
+    TestCompleteWaveReduction(ValueOpcode::UMax32);
+    TestCompleteWaveReduction(ValueOpcode::BitwiseOr32);
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

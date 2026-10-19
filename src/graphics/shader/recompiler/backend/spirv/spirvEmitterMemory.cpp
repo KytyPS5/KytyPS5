@@ -1373,6 +1373,26 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
+	// Validate the full guest address before packing or narrowing its page index.
+	// Addresses in the hole otherwise alias extended memory; high page bits can
+	// also wrap onto a valid entry when converted to the 32-bit table index.
+	const auto lower_valid = Binary(state, spv::OpULessThan, TypeBool(state), address,
+	                                ConstantU64(state, LOWER_ADDRESS_SIZE));
+	const auto extended_offset = Binary(
+	    state, spv::OpISub, type, address,
+	    ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto extended_valid = Binary(
+	    state, spv::OpULessThan, TypeBool(state), extended_offset,
+	    ConstantU64(state, LibKernel::Memory::kExtendedMemorySize));
+	const auto valid = Binary(state, spv::OpLogicalOr, TypeBool(state), lower_valid, extended_valid);
+	const auto valid_label = state.builder.AllocateId();
+	const auto invalid_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, valid_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, valid, valid_label, invalid_label);
+	EmitLabel(state, invalid_label);
+	state.builder.AddFunction(spv::OpReturnValue, ConstantU64(state, 0));
+	EmitLabel(state, valid_label);
+
 	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
 	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
 	const auto packed   = Select(

@@ -91,7 +91,29 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+void BufferCache::EnsureBdaStorageInitialized() {
+	if (m_bda_storage_initialized) return;
+	// Device-local allocations may contain recycled data. Zero is the missing-page
+	// sentinel; stale addresses must never be interpreted as live mappings.
+	// Do this on first GPU use, since construction has no recording command buffer.
+	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	auto* faults = m_fault_manager.GetFaultBuffer();
+	faults->Fill(0, faults->Size(), 0);
+	m_bda_storage_initialized = true;
+}
+
+Buffer* BufferCache::GetBdaPageTableBuffer() noexcept {
+	EnsureBdaStorageInitialized();
+	return &m_bda_pagetable_buffer;
+}
+
+Buffer* BufferCache::GetFaultBuffer() noexcept {
+	EnsureBdaStorageInitialized();
+	return m_fault_manager.GetFaultBuffer();
+}
+
 void BufferCache::Register(BufferId id) {
+	EnsureBdaStorageInitialized();
 	ChangeRegister<true>(id);
 }
 
@@ -687,10 +709,12 @@ void BufferCache::RunGarbageCollector() {
 }
 
 void BufferCache::ProcessFaultBuffer() {
+	EnsureBdaStorageInitialized();
 	m_fault_manager.ProcessFaultBuffer();
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	EnsureBdaStorageInitialized();
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = m_memory_tracker.TakeBdaSync();
 	pending.ForEach([&](uint64_t begin, uint64_t end) {

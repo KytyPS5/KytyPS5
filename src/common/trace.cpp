@@ -49,7 +49,8 @@ std::atomic<Site*> g_sites {nullptr};
 
 constexpr std::array<const char*, static_cast<size_t>(Column::Count)> COLUMN_NAMES = {
     "gpu_wait",      "shader_compile", "pipeline_compile",
-    "pipeline_wait", "frame_acquire",  "guest_equeue_wait"};
+    "pipeline_wait", "frame_acquire",  "guest_equeue_wait", "gpu_idle",
+    "gpu_command",   "gpu_graphics",   "gpu_compute"};
 
 // A thread that entered a timed site: its open sites, for threads.txt and hang.txt.
 struct ThreadState {
@@ -104,6 +105,7 @@ struct State {
 	PerfCounters::Snapshot                                   last_counters {};
 	std::array<uint64_t, static_cast<size_t>(Column::Count)> last_column_ns {};
 	std::array<uint64_t, static_cast<size_t>(Column::Count)> last_column_calls {};
+	std::array<uint64_t, static_cast<size_t>(Column::Count)> last_critical_ns {};
 
 	std::mutex                     anomalies_mutex;
 	std::map<std::string, Anomaly> anomalies;
@@ -125,9 +127,15 @@ std::array<Site, static_cast<size_t>(Column::Count)>& Columns() {
 	static std::array<Site, static_cast<size_t>(Column::Count)> columns = {
 	    Site {"column", COLUMN_NAMES[0]}, Site {"column", COLUMN_NAMES[1]},
 	    Site {"column", COLUMN_NAMES[2]}, Site {"column", COLUMN_NAMES[3]},
-	    Site {"column", COLUMN_NAMES[4]}, Site {"column", COLUMN_NAMES[5]}};
+	    Site {"column", COLUMN_NAMES[4]}, Site {"column", COLUMN_NAMES[5]},
+	    Site {"column", COLUMN_NAMES[6]}, Site {"column", COLUMN_NAMES[7]},
+	    Site {"column", COLUMN_NAMES[8]}, Site {"column", COLUMN_NAMES[9]}};
 	return columns;
 }
+
+// The time of each column on the critical thread (SetCriticalThread).
+std::array<std::atomic<uint64_t>, static_cast<size_t>(Column::Count)> g_critical_ns {};
+thread_local bool                                                     g_critical = false;
 
 ThreadState* CurrentThread() {
 	if (g_thread.state != nullptr) {
@@ -372,6 +380,10 @@ Site& ColumnSite(Column column) {
 	return Columns()[static_cast<size_t>(column)];
 }
 
+void SetCriticalThread() noexcept {
+	g_critical = true;
+}
+
 namespace {
 // KYTY_TRACE_TIMELINE: every timed span of 50 us or more, per thread, for timeline.csv.
 struct Span {
@@ -460,6 +472,14 @@ void Leave(Site& site, uint64_t nanoseconds) noexcept {
 	}
 	site.calls.fetch_add(1, std::memory_order_relaxed);
 	site.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+	if (g_critical) {
+		auto&      columns = Columns();
+		const auto index   = &site - columns.data();
+		if (index >= 0 && index < static_cast<ptrdiff_t>(columns.size())) {
+			g_critical_ns[static_cast<size_t>(index)].fetch_add(nanoseconds,
+			                                                    std::memory_order_relaxed);
+		}
+	}
 	auto longest = site.max_nanoseconds.load(std::memory_order_relaxed);
 	while (nanoseconds > longest && !site.max_nanoseconds.compare_exchange_weak(
 	                                    longest, nanoseconds, std::memory_order_relaxed)) {
@@ -487,7 +507,7 @@ void Initialize() {
 			             PerfCounters::NameOf(static_cast<PerfCounters::Counter>(i)));
 		}
 		for (const auto* name: COLUMN_NAMES) {
-			std::fprintf(state->frames, ",%s_ms,%s_n", name, name);
+			std::fprintf(state->frames, ",%s_ms,%s_n,%s_crit_ms", name, name, name);
 		}
 		for (size_t i = 0; i < PerfCounters::GaugeCount; i++) {
 			std::fprintf(state->frames, ",%s",
@@ -504,6 +524,8 @@ void Initialize() {
 		    state->start_ns + static_cast<uint64_t>(std::strtod(from, nullptr) * 1e9);
 		g_timeline = true;
 	}
+	Detail::g_prof_enabled.store(std::getenv("KYTY_TRACE_NO_PROF") == nullptr,
+	                             std::memory_order_relaxed);
 	Columns();
 	g_next_screenshot_ns.store(state->start_ns + state->screenshot_ns, std::memory_order_relaxed);
 	g_state = state;
@@ -544,6 +566,7 @@ void Shutdown() {
 		}
 	}
 	Detail::g_enabled.store(false, std::memory_order_release);
+	Detail::g_prof_enabled.store(false, std::memory_order_relaxed);
 	// The state stays: a timed site may still be running on another thread.
 }
 
@@ -658,9 +681,11 @@ void EndFrame() {
 			const auto& site  = Columns()[i];
 			const auto  ns    = site.nanoseconds.load(std::memory_order_relaxed);
 			const auto  calls = site.calls.load(std::memory_order_relaxed);
-			std::fprintf(state->frames, ",%.3f,%" PRIu64,
+			const auto  crit  = g_critical_ns[i].load(std::memory_order_relaxed);
+			std::fprintf(state->frames, ",%.3f,%" PRIu64 ",%.3f",
 			             static_cast<double>(ns - state->last_column_ns[i]) / 1e6,
-			             calls - state->last_column_calls[i]);
+			             calls - state->last_column_calls[i],
+			             static_cast<double>(crit - state->last_critical_ns[i]) / 1e6);
 		}
 		const auto gauges = PerfCounters::ReadGauges();
 		for (const auto gauge: gauges) {
@@ -671,6 +696,7 @@ void EndFrame() {
 	for (size_t i = 0; i < static_cast<size_t>(Column::Count); i++) {
 		state->last_column_ns[i]    = Columns()[i].nanoseconds.load(std::memory_order_relaxed);
 		state->last_column_calls[i] = Columns()[i].calls.load(std::memory_order_relaxed);
+		state->last_critical_ns[i]  = g_critical_ns[i].load(std::memory_order_relaxed);
 	}
 	state->last_counters = counters;
 	state->last_frame_ns = now;

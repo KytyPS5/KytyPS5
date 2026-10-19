@@ -31,10 +31,17 @@ namespace Trace {
 
 namespace Detail {
 inline std::atomic<bool> g_enabled {false};
+// Profiler blocks (profiler.h) are timed sites too, unless KYTY_TRACE_NO_PROF is set: there are
+// many, and timing them all slows a run down by a quarter.
+inline std::atomic<bool> g_prof_enabled {false};
 } // namespace Detail
 
 [[nodiscard]] inline bool Enabled() {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline bool ProfEnabled() {
+	return Detail::g_prof_enabled.load(std::memory_order_relaxed);
 }
 
 void Initialize();
@@ -67,10 +74,18 @@ enum class Column : uint8_t {
 	PipelineWait,    // a draw waits for its pipeline to be built
 	FrameAcquire,    // the presenter waits for a free frame
 	GuestEqueueWait, // a guest thread waits on an event queue (flips, vblanks, GPU events)
+	GpuIdle,         // the GPU-command thread waits for guest work (or for a blocked queue)
+	GpuCommand,      // the GPU-command thread runs a command another thread sent it
+	GpuGraphics,     // the GPU-command thread processes a graphics submission
+	GpuCompute,      // the GPU-command thread processes a compute submission
 	Count,
 };
 
 Site& ColumnSite(Column column);
+
+// The thread that bounds the frame rate (the GPU-command thread) calls it once: frames.csv also
+// has, for each column, the time of that thread alone (<column>_crit_ms).
+void SetCriticalThread() noexcept;
 
 void Enter(Site& site) noexcept;
 void Leave(Site& site, uint64_t nanoseconds) noexcept;
@@ -83,7 +98,8 @@ void Leave(Site& site, uint64_t nanoseconds) noexcept;
 
 class Scope final {
 public:
-	explicit Scope(Site& site) noexcept: m_site(site), m_on(Enabled()) {
+	explicit Scope(Site& site) noexcept: Scope(site, Enabled()) {}
+	Scope(Site& site, bool on) noexcept: m_site(site), m_on(on) {
 		if (m_on) {
 			m_begin = NowNs();
 			Enter(m_site);

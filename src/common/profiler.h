@@ -56,7 +56,7 @@ struct Lifecycle {
 	static ::Trace::Site KYTY_PROFILER_CONCAT(kyty_profiler_trace_site_,                           \
 	                                          line) {"prof", KYTY_PROFILER_TRACE_NAME(name)};      \
 	const ::Trace::Scope KYTY_PROFILER_CONCAT(kyty_profiler_trace_scope_, line) {                  \
-		KYTY_PROFILER_CONCAT(kyty_profiler_trace_site_, line)                                      \
+		KYTY_PROFILER_CONCAT(kyty_profiler_trace_site_, line), ::Trace::ProfEnabled()              \
 	}
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)

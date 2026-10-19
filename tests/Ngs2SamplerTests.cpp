@@ -1695,7 +1695,7 @@ void TestCustomModuleFallbacks() {
 		f.Render(1);
 		f.Render(1);
 		Check(f.voice.has_samples, "failed custom process dropped voice samples");
-		Check(CustomFx::process_calls == 1, "failed custom process was not warned about once");
+		Check(CustomFx::process_calls == 1, "failed custom process was not skipped after the first failure");
 	}
 }
 

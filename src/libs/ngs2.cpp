@@ -523,6 +523,7 @@ struct Ngs2VoiceInternal {
 		uint32_t             flags = 1;
 		bool                 control_warned = false;
 		bool                 render_warned  = false;
+		bool                 skipped        = false;
 	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
@@ -1206,7 +1207,13 @@ static void Ngs2InitModules(Ngs2RackInternal& rack) {
 				Ngs2UserFxContext context {
 				    rack.common[m].data(), module.param.data(),           module.work.data(),
 				    fx.user_data,          rack.option.common.max_voices, i};
-				EXIT_NOT_IMPLEMENTED(fx.setup(&context) != OK);
+				if (fx.setup(&context) != OK) {
+					// A failed setup leaves the module without valid state; skip it at
+					// render so the voice still plays unprocessed instead of aborting.
+					Log::WriteToConsoleAndLog(fmt::sprintf(
+					    "warning: NGS2 user-FX setup failed for module %u, skipping it\n", m));
+					module.skipped = true;
+				}
 			}
 		}
 	}
@@ -1436,7 +1443,10 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 					                           fx.user_data,
 					                           rack->option.common.max_voices,
 					                           i};
-					EXIT_NOT_IMPLEMENTED(fx.cleanup(&context) != OK);
+					if (fx.cleanup(&context) != OK) {
+						// Teardown must not fail; the rack is being destroyed anyway.
+						LOGF("warning: NGS2 user-FX cleanup failed for module %zu\n", m);
+					}
 				}
 			}
 			std::destroy_at(voices + i);
@@ -1811,10 +1821,34 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					}
 					continue;
 				}
-				EXIT_NOT_IMPLEMENTED(custom.module[m].source_buffer_id != 0 ||
-				                     custom.module[m].dest_buffer_id != 0);
-				auto&               module = voice.modules[m];
-				const auto&         fx     = voice.rack->fx[m];
+				auto& module = voice.modules[m];
+				if (module.skipped) {
+					continue;
+				}
+				if (custom.module[m].source_buffer_id != 0 ||
+				    custom.module[m].dest_buffer_id != 0) {
+					// Buffer-routed modules process out of place; without dedicated
+					// buffers the voice plays through unprocessed instead of aborting.
+					if (!module.render_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom module at index %zu uses buffer routing,"
+						    " skipping it\n",
+						    m));
+						module.render_warned = true;
+					}
+					continue;
+				}
+				const auto& fx = voice.rack->fx[m];
+				if (fx.process == nullptr) {
+					if (!module.render_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom module at index %zu has no process handler,"
+						    " skipping it\n",
+						    m));
+						module.render_warned = true;
+					}
+					continue;
+				}
 				std::vector<float*> channels(voice.channels);
 				for (uint32_t c = 0; c < voice.channels; ++c) {
 					channels[c] = voice.samples.data() + c * grain;
@@ -1830,7 +1864,19 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				                                  voice.channels,
 				                                  grain,
 				                                  voice.rack->ngs->option.sample_rate};
-				EXIT_NOT_IMPLEMENTED(fx.process(&context) != OK);
+				if (fx.process(&context) != OK) {
+					// A failing module stays skipped so one bad grain cannot spam
+					// the log or wedge the voice; it keeps playing unprocessed.
+					if (!module.render_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom module at index %zu failed processing,"
+						    " skipping it\n",
+						    m));
+						module.render_warned = true;
+					}
+					module.skipped = true;
+					continue;
+				}
 				module.flags = 0;
 			}
 		}
@@ -2405,8 +2451,18 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				};
 				const auto& fx     = *reinterpret_cast<const FxParam*>(param);
 				auto&       module = voice->modules[index];
-				EXIT_NOT_IMPLEMENTED(voice->rack->fx[index].control != 0 ||
-				                     fx.size != module.param.size());
+				if (voice->rack->fx[index].control != 0 || fx.size != module.param.size()) {
+					// An unhandled control or a size mismatch leaves the running params
+					// untouched instead of aborting; the module keeps its last state.
+					if (!module.control_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom control 0x%08" PRIx32
+						    " has no handler or mismatched size, ignoring it\n",
+						    param->id));
+						module.control_warned = true;
+					}
+					break;
+				}
 				std::memcpy(module.param.data(), fx.data, fx.size);
 				module.flags |= 2;
 				break;

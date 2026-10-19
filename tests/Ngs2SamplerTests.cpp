@@ -1598,6 +1598,107 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+namespace CustomFx {
+int process_calls = 0;
+int KYTY_SYSV_ABI FailSetup(Ngs2UserFxContext*) { return 1; }
+int KYTY_SYSV_ABI FailProcess(Ngs2UserFxProcessContext*) {
+	process_calls++;
+	return 1;
+}
+int KYTY_SYSV_ABI FailCleanup(Ngs2UserFxContext*) { return 1; }
+} // namespace CustomFx
+
+void TestCustomModuleFallbacks() {
+	// A failing user-FX setup marks the module skipped, but rack creation and
+	// teardown still succeed.
+	{
+		Ngs2Internal system {};
+		system.option.sample_rate       = 48000;
+		system.option.num_grain_samples = 256;
+		Ngs2UserFxOption fxopt {};
+		fxopt.setup       = CustomFx::FailSetup;
+		fxopt.cleanup     = CustomFx::FailCleanup;
+		fxopt.common_size = 4;
+		fxopt.param_size  = 4;
+		fxopt.work_size   = 4;
+		Ngs2CustomSamplerRackOption option {};
+		option.custom_rack_option.rack_option.size         = sizeof(Ngs2CustomSamplerRackOption);
+		option.custom_rack_option.rack_option.max_voices   = 1;
+		option.custom_rack_option.rack_option.max_matrices = 1;
+		option.custom_rack_option.rack_option.max_ports    = 1;
+		option.custom_rack_option.num_buffers               = 1;
+		option.custom_rack_option.num_modules               = 1;
+		option.custom_rack_option.module[0].module_id       = 0x1f;
+		option.custom_rack_option.module[0].option =
+		    reinterpret_cast<const Ngs2CustomModuleOption*>(&fxopt);
+		option.custom_rack_option.module[0].state_size = 4;
+		const auto*           base = &option.custom_rack_option.rack_option;
+		Ngs2ContextBufferInfo buf {};
+		Check(Ngs2RackQueryBufferSize(0x4001, base, &buf) == OK,
+		      "fx rack buffer query failed");
+		buf.host_buffer = std::malloc(buf.host_buffer_size);
+		Check(buf.host_buffer != nullptr, "fx rack host buffer alloc failed");
+		uintptr_t handle = 0;
+		Check(Ngs2RackCreate(reinterpret_cast<uintptr_t>(&system), 0x4001, base, &buf,
+		                       &handle) == OK,
+		      "rack with failing FX setup failed to create");
+		auto* rack   = reinterpret_cast<Ngs2RackInternal*>(handle);
+		auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+		Check(voices[0].modules[0].skipped, "failed FX setup did not mark the module skipped");
+		Ngs2ContextBufferInfo out {};
+		Check(Ngs2RackDestroy(handle, &out) == OK,
+		      "rack with failing FX cleanup failed to destroy");
+		std::free(out.host_buffer != nullptr ? out.host_buffer : buf.host_buffer);
+	}
+	// A buffer-routed module is skipped at render; voice samples pass through.
+	{
+		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
+		auto& custom = f.rack.option.custom_sampler.custom_rack_option;
+		custom.module[0].module_id      = 0x1f;
+		custom.module[0].dest_buffer_id = 1;
+		f.voice.modules.resize(1);
+		const int16_t pcm[] = {8192, 16384};
+		f.Queue(pcm, 2, 1);
+		f.Render(2);
+		Check(f.voice.has_samples, "routed custom module dropped voice samples");
+	}
+	// A control with no handler or mismatched size is ignored; params are kept.
+	{
+		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
+		auto& custom = f.rack.option.custom_sampler.custom_rack_option;
+		custom.module[0].module_id = 0x1f;
+		f.voice.modules.resize(1);
+		f.voice.modules[0].param.assign({0xAA, 0xBB, 0xCC, 0xDD});
+		const auto before_flags = f.voice.modules[0].flags;
+		struct Ctrl {
+			Ngs2VoiceParamHeader header;
+			const void*          data;
+			size_t               size;
+		} ctrl {{static_cast<uint16_t>(sizeof(Ctrl)), 0, 0x40001f00}, nullptr, 8};
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &ctrl.header) == OK,
+		      "mismatched custom control was not ignored");
+		Check(f.voice.modules[0].param == std::vector<uint8_t>({0xAA, 0xBB, 0xCC, 0xDD}),
+		      "ignored custom control modified module params");
+		Check(f.voice.modules[0].flags == before_flags,
+		      "ignored custom control touched module flags");
+	}
+	// A failing process handler is warned about once; the voice still renders.
+	{
+		CustomFx::process_calls = 0;
+		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
+		auto& custom = f.rack.option.custom_sampler.custom_rack_option;
+		custom.module[0].module_id = 0x1f;
+		f.voice.modules.resize(1);
+		f.rack.fx[0].process = CustomFx::FailProcess;
+		const int16_t pcm[] = {8192, 16384};
+		f.Queue(pcm, 2, 1);
+		f.Render(1);
+		f.Render(1);
+		Check(f.voice.has_samples, "failed custom process dropped voice samples");
+		Check(CustomFx::process_calls == 1, "failed custom process was not warned about once");
+	}
+}
+
 } // namespace
 
 int main() {
@@ -1620,6 +1721,7 @@ int main() {
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();
+	TestCustomModuleFallbacks();
 	TestLowPassResponse();
 	TestFilterHistoryAndChannels();
 	TestFilterUsesOutputRate();

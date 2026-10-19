@@ -54,6 +54,7 @@ static constexpr uint32_t AgcDmemOffset  = 0x40000;
 struct DriverDmem {
 	std::mutex mutex;
 	int64_t    physical_offset = -1;
+	uint64_t   virtual_base    = 0;
 };
 
 static DriverDmem g_driver_dmem;
@@ -4147,7 +4148,11 @@ int Initialize() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
 		return result;
 	}
-	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	const auto mapped_base = reinterpret_cast<uint64_t>(address);
+	if (mapped_base != DriverDmemBase) {
+		LOGF("AgcDriverDmem: mapped at 0x%016" PRIx64 " instead of hint 0x%016" PRIx64 "; using actual base\n",
+		     mapped_base, DriverDmemBase);
+	}
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
 		uint64_t code;
@@ -4161,7 +4166,7 @@ int Initialize() {
 	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
 	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
 	};
-	const auto base = DriverDmemBase + AgcDmemOffset;
+	const auto base = mapped_base + AgcDmemOffset;
 	const auto function_table = base + 0x60;
 	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
 	std::array<FunctionShaderBindings, 8> functions {};
@@ -4175,6 +4180,7 @@ int Initialize() {
 	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
 	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 	g_driver_dmem.physical_offset = physical_offset;
+	g_driver_dmem.virtual_base    = mapped_base;
 	return OK;
 }
 
@@ -4184,6 +4190,7 @@ static void ReleaseDmem() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(
 		            g_driver_dmem.physical_offset, DriverDmemSize) != OK);
 		g_driver_dmem.physical_offset = -1;
+		g_driver_dmem.virtual_base    = 0;
 	}
 }
 

@@ -11077,6 +11077,120 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckOrderedAppendRanks() {
+    constexpr const char *name = "OrderedAppendRanks";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t args = base + 0x8000;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    // Each wave stores its TG_SIZE ordered-append term at the slot
+    // DS_ORDERED_COUNT returns, so slot i must hold i: the term is the
+    // dispatch-order rank and waves are served in that order, whether or not
+    // the dispatch is split per workgroup.
+    std::vector<u32> code{EncodeSop2(0x27, 5, 4, 255),
+                          0x000b0006u,
+                          EncodeSMovB32(124, 5),
+                          EncodeSop1(0x04, 126, InlineU32(1)),
+                          EncodeVop1(0x01, 2, InlineU32(1)),
+                          EncodeDs0(0x3f, 0x300, true),
+                          EncodeDs1(3, 0, 2),
+                          EncodeSopp(0x0c, 0),
+                          EncodeVop2(0x1a, 1, InlineU32(2), 3),
+                          EncodeVop1(0x01, 4, 5),
+                          EncodeMubuf0(0x1c),
+                          EncodeMubuf1(4, 0, 1)};
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "ordered-append rank allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "ordered-append rank mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      for (u32 wave_size : {32u, 64u}) {
+        for (const auto groups :
+             {std::array{3u, 1u, 1u}, std::array{2u, 2u, 2u},
+              std::array{3u, 2u, 1u}}) {
+          // Direct dispatches of one-wave groups are split per workgroup.
+          for (bool indirect : {false, true}) {
+            const u32 count = groups[0] * groups[1] * groups[2];
+            cache.FillBuffer(base, 64 * sizeof(u32), sentinel, false);
+            cache.FillBuffer(0, sizeof(u32), 0, true);
+            shaders.SetCsShader(
+                {.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                 .num_thread_x = wave_size,
+                 .num_thread_y = 1,
+                 .num_thread_z = 1,
+                 .wave_size = static_cast<uint8_t>(wave_size),
+                 .user_sgpr = 4,
+                 .tg_size_en = true});
+            ShaderBufferResource output{};
+            output.UpdateAddress48(base);
+            output.fields[2] = 64 * sizeof(u32);
+            output.fields[3] =
+                DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+            for (u32 i = 0; i < 4; ++i)
+              shaders.SetCsUserSgpr(i, output.fields[i],
+                                    HW::UserSgprType::Unknown);
+            const u32 mode = wave_size == 32 ? 0x8049u : 0x49u;
+            if (indirect) {
+              LibKernel::Memory::WriteBacking(args, groups.data(),
+                                              sizeof(groups));
+              processor.DispatchIndirect(args, mode);
+            } else {
+              processor.DispatchDirect(groups[0], groups[1], groups[2], mode);
+            }
+            cache.CopyBuffer(base + 63 * sizeof(u32), 0, sizeof(u32), false,
+                             true);
+            cache.ReadMemory(base, 64 * sizeof(u32));
+            std::array<u32, 64> actual{}, expected;
+            expected.fill(sentinel);
+            for (u32 rank = 0; rank < count; ++rank)
+              expected[rank] = rank;
+            expected[63] = count;
+            Require(name, "readback",
+                    LibKernel::Memory::TryReadBacking(base, actual.data(),
+                                                      sizeof(actual)),
+                    "ordered-append rank output could not be read back");
+            Require(name, "dispatch-order ranks", actual == expected,
+                    "ordered-append terms or service order did not follow "
+                    "the dispatch order");
+          }
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "ordered-append rank unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "ordered-append rank release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -49925,6 +50039,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--ordered-dispatch-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckOrderedDispatch();
+    vulkan.CheckOrderedAppendRanks();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--zero-stride-binding-only") == 0) {
@@ -50185,6 +50300,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
+  vulkan.CheckOrderedAppendRanks();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();

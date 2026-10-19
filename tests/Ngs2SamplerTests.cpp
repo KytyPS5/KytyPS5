@@ -1598,6 +1598,38 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+void TestCustomRackBufferCount() {
+	// Atelier Yumia creates custom racks with num_buffers != 1. The count only names
+	// the game's internal routing buffers, so creation must succeed regardless.
+	for (uint32_t num_buffers: {0u, 2u, 8u}) {
+		Ngs2Internal system {};
+		system.option.sample_rate       = 48000;
+		system.option.num_grain_samples = 256;
+		Ngs2CustomSamplerRackOption option {};
+		option.custom_rack_option.rack_option.size         = sizeof(Ngs2CustomSamplerRackOption);
+		option.custom_rack_option.rack_option.max_voices   = 1;
+		option.custom_rack_option.rack_option.max_matrices = 1;
+		option.custom_rack_option.rack_option.max_ports    = 1;
+		option.custom_rack_option.num_buffers               = num_buffers;
+		option.custom_rack_option.num_modules               = 0;
+		const auto* base = &option.custom_rack_option.rack_option;
+		Ngs2ContextBufferInfo buf {};
+		Check(Ngs2RackQueryBufferSize(0x4001, base, &buf) == OK,
+		      "custom rack buffer query failed");
+		Check(buf.host_buffer_size != 0, "custom rack buffer query returned zero size");
+		buf.host_buffer = std::malloc(buf.host_buffer_size);
+		Check(buf.host_buffer != nullptr, "custom rack host buffer alloc failed");
+		uintptr_t   handle = 0;
+		const int   result = Ngs2RackCreate(reinterpret_cast<uintptr_t>(&system), 0x4001,
+		                                      base, &buf, &handle);
+		Check(result == OK, "custom rack with unusual buffer count failed to create");
+		Check(handle != 0, "custom rack create returned null handle");
+		Ngs2ContextBufferInfo out {};
+		Check(Ngs2RackDestroy(handle, &out) == OK, "custom rack destroy failed");
+		std::free(out.host_buffer != nullptr ? out.host_buffer : buf.host_buffer);
+	}
+}
+
 } // namespace
 
 int main() {
@@ -1620,6 +1652,7 @@ int main() {
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();
+	TestCustomRackBufferCount();
 	TestLowPassResponse();
 	TestFilterHistoryAndChannels();
 	TestFilterUsesOutputRate();

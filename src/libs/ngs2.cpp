@@ -1188,7 +1188,16 @@ static void Ngs2InitModules(Ngs2RackInternal& rack) {
 		return;
 	}
 	const auto& custom = rack.option.custom_sampler.custom_rack_option;
-	EXIT_NOT_IMPLEMENTED(custom.num_buffers != 1);
+	if (custom.num_buffers != 1) {
+		// num_buffers only names the game's internal routing buffers. Init wires 0x1f
+		// user-FX state and render processes those voices in place, with its own guard
+		// for non-zero buffer routing, so an unusual count alone is not a blocker.
+		// Keep going so titles using other counts (e.g. Atelier Yumia) can boot;
+		// genuinely routed buffers still trip the render-path check precisely.
+		Log::WriteToConsoleAndLog(fmt::sprintf(
+		    "warning: NGS2 custom rack declares num_buffers=%u, continuing without dedicated buffers\n",
+		    custom.num_buffers));
+	}
 	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(&rack + 1);
 	for (uint32_t m = 0; m < custom.num_modules; ++m) {
 		if (custom.module[m].module_id != 0x1f) {

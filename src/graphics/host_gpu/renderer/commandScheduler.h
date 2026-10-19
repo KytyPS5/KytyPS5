@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <chrono>
+#include <deque>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -136,6 +137,14 @@ private:
 	void RetireCallbackState(Common::UniqueFunction<void>&& callback);
 
 	MasterSemaphore              m_master;
+	// KYTY_GPU_TIME: a timestamp at the start and the end of each command buffer, and the host
+	// GPU's time between them added to PerfCounters::Counter::GpuMicroseconds once it completed.
+	void                                         StartGpuTimer();
+	void                                         StopGpuTimer(uint64_t tick);
+	static constexpr uint32_t                    GpuTimerSlots = 256;
+	vk::QueryPool                                m_gpu_timer_pool = nullptr;
+	uint32_t                                     m_gpu_timer_slot = 0;
+	std::deque<std::pair<uint64_t, uint32_t>>    m_gpu_timer_pending;
 	// Priority callbacks that finished while the scheduler shut down. They may own resources, so
 	// Shutdown destroys them once the queue is idle.
 	std::vector<Common::UniqueFunction<void>> m_retired_while_draining;

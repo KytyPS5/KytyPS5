@@ -32,6 +32,7 @@ enum class Counter : uint8_t {
 	FaultMicroseconds, // time in the handler of the faults counted by GuestFaults
 	LeftOutDraws,      // draws left out while their pipeline is built
 	ReadbackBytes,     // bytes copied from GPU images or buffers back to guest memory
+	GpuMicroseconds,   // host GPU time of the command buffers that completed (KYTY_GPU_TIME)
 	Count,
 };
 
@@ -77,6 +78,7 @@ using Gauges                       = std::array<int64_t, GaugeCount>;
 		case Counter::FaultMicroseconds: return "fault_us";
 		case Counter::LeftOutDraws: return "left_out_draws";
 		case Counter::ReadbackBytes: return "readback_bytes";
+		case Counter::GpuMicroseconds: return "gpu_us";
 		case Counter::Count: break;
 	}
 	return "?";

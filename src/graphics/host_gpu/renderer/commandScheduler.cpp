@@ -112,6 +112,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_gpu_timer_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_gpu_timer_pool);
+	}
 	Common::LockGuard lock(m_graphics.queue_mutex);
 	m_graphics.queue_commits.RemoveTimeline(m_queue_timeline);
 }
@@ -504,7 +507,49 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	StartGpuTimer();
 	return m_command;
+}
+
+void CommandScheduler::StartGpuTimer() {
+	static const bool enabled = std::getenv("KYTY_GPU_TIME") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	if (m_gpu_timer_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = 2 * GpuTimerSlots;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_gpu_timer_pool),
+		                     "create the GPU timer query pool");
+	}
+	const auto slot = m_gpu_timer_slot % GpuTimerSlots;
+	const auto cmd  = m_command.Handle();
+	cmd.resetQueryPool(m_gpu_timer_pool, 2 * slot, 2);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_gpu_timer_pool, 2 * slot);
+}
+
+void CommandScheduler::StopGpuTimer(uint64_t tick) {
+	if (m_gpu_timer_pool == nullptr) {
+		return;
+	}
+	m_gpu_timer_pending.emplace_back(tick, m_gpu_timer_slot % GpuTimerSlots);
+	m_gpu_timer_slot++;
+	const auto period = static_cast<double>(m_graphics.physical_device_properties.limits.timestampPeriod);
+	while (!m_gpu_timer_pending.empty() && m_master.IsFree(m_gpu_timer_pending.front().first)) {
+		std::array<uint64_t, 2> stamps {};
+		const auto slot = m_gpu_timer_pending.front().second;
+		if (m_graphics.device.getQueryPoolResults(m_gpu_timer_pool, 2 * slot, 2, sizeof(stamps),
+		                                          stamps.data(), sizeof(uint64_t),
+		                                          vk::QueryResultFlagBits::e64) ==
+		        vk::Result::eSuccess &&
+		    stamps[1] > stamps[0]) {
+			PerfCounters::Add(PerfCounters::Counter::GpuMicroseconds,
+			                  static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) *
+			                                        period / 1000.0));
+		}
+		m_gpu_timer_pending.pop_front();
+	}
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -522,6 +567,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                                   vk::PipelineStageFlagBits::eHost, {}, 1,
 		                                   &visible_to_cpu, 0, nullptr, 0, nullptr);
+	}
+	if (m_gpu_timer_pool != nullptr) {
+		m_command.EndRendering();
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+		                                  m_gpu_timer_pool,
+		                                  2 * (m_gpu_timer_slot % GpuTimerSlots) + 1);
 	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
@@ -565,6 +616,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	StopGpuTimer(tick);
 
 	m_command.m_buffer = nullptr;
 	{

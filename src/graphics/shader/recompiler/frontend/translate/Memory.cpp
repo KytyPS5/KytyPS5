@@ -924,12 +924,11 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 			return IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
 			                       {IR::Value(static_cast<uint32_t>(kind)), IR::Value(component)}));
 		};
-		auto group      = builtin(IR::StageInputKind::WorkgroupId, 2);
-		group           = ir.IAdd(ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 1)),
-		                          builtin(IR::StageInputKind::WorkgroupId, 1));
-		group           = ir.IAdd(ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 0)),
-		                          builtin(IR::StageInputKind::WorkgroupId, 0));
-		const auto wave = IR::U32(
+		const auto group = IR::U32(ir.Emit(IR::ValueOpcode::OrderedAppendGroupIndex,
+		                                   {builtin(IR::StageInputKind::WorkgroupId, 0),
+		                                    builtin(IR::StageInputKind::WorkgroupId, 1),
+		                                    builtin(IR::StageInputKind::WorkgroupId, 2)}));
+		const auto wave  = IR::U32(
 		    ir.Emit(IR::ValueOpcode::UDiv32, {builtin(IR::StageInputKind::LocalInvocationIndex, 0),
 		                                      IR::Value(program.info.ordered_append_wave_size)}));
 		const auto rank =

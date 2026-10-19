@@ -261,6 +261,7 @@ uint32_t              EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& 
 void                  EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitOrderedAppendWait(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitOrderedAppendRelease(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitOrderedAppendGroupIndex(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSharedAtomicMaskedOr32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst);

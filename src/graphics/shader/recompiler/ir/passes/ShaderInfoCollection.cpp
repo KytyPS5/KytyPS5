@@ -166,7 +166,6 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::WorkgroupId:
 			AddInput(info, kind, 0, 3, "gl_WorkGroupID");
 			break;
-		case StageInputKind::NumWorkgroups: AddInput(info, kind, 0, 3, "gl_NumWorkGroups"); break;
 		case StageInputKind::LocalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_LocalInvocationID");
 			break;
@@ -284,6 +283,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
+	info.uses_gds |= op == ValueOpcode::OrderedAppendGroupIndex;
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||

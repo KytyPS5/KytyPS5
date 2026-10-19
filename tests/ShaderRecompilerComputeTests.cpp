@@ -37017,7 +37017,7 @@ TestCase DsOrderedCountAddressAndExec(u32 wave_size, bool pixel_counter) {
 template <bool two_d> TestCase DsOrderedCountFollowsWaveLaunchOrder() {
   using O = ShaderOpcode;
   TestCase test;
-  // The 2D variant ranks waves by y * 4 + x, which needs NumWorkgroups.
+  // The 2D variant ranks waves by y * 4 + x, from the host's group counts.
   test.name = two_d ? "DsOrderedCountFollowsWaveLaunchOrder2D"
                     : "DsOrderedCountFollowsWaveLaunchOrder";
   auto &code = test.code;
@@ -37054,8 +37054,13 @@ template <bool two_d> TestCase DsOrderedCountFollowsWaveLaunchOrder() {
     test.expected.push_back((waves - wave) << 10u);
   }
   test.initial.assign(waves * 2u, 0xdeadbeefu);
-  test.gds_initial.assign(
-      ShaderRecompiler::IR::OrderedAppendReleaseCounter + 1u, 0);
+  // The host stores the dispatch's group counts next to the release counter.
+  test.gds_initial.assign(ShaderRecompiler::IR::OrderedAppendGroupCounts + 2u,
+                          0);
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts] =
+      two_d ? 4 : waves;
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts + 1u] =
+      two_d ? waves / 4 : 1;
   // Every wave adds one at address 0 and releases its slot once.
   test.expected_gds = test.gds_initial;
   test.expected_gds[0] = waves;
@@ -37115,8 +37120,10 @@ TestCase DsOrderedCountRanksPastElevenBits() {
     test.expected.push_back(wave == 0 ? 0x40000u : 1u);
   }
   test.initial.assign(waves * 2u, 0xdeadbeefu);
-  test.gds_initial.assign(
-      ShaderRecompiler::IR::OrderedAppendReleaseCounter + 1u, 0);
+  test.gds_initial.assign(ShaderRecompiler::IR::OrderedAppendGroupCounts + 2u,
+                          0);
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts] = waves;
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts + 1u] = 1;
   // Every wave adds one at address 0 and releases its slot once.
   test.expected_gds = test.gds_initial;
   test.expected_gds[0] = waves;

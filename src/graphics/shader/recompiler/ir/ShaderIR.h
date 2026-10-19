@@ -553,7 +553,10 @@ struct ShaderInfo {
 // that released their slot. It lives past the 64 KiB the guest can address and is zeroed
 // before every dispatch.
 inline constexpr uint32_t OrderedAppendReleaseCounter = 0x4001u;
-inline constexpr uint32_t OrderedAppendWaveIdMask     = 0x7ffu;
+// The dispatch's workgroup counts in X and Y, written by the host next to the counter:
+// NumWorkgroups only covers one group when a dispatch is split per workgroup.
+inline constexpr uint32_t OrderedAppendGroupCounts = 0x4002u;
+inline constexpr uint32_t OrderedAppendWaveIdMask  = 0x7ffu;
 
 struct DescriptorSource {
 	struct IndirectDescriptor {

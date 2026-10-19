@@ -1192,14 +1192,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					result.info.uses_ordered_append      = true;
 					result.info.ordered_append_waves     = waves;
 					result.info.ordered_append_wave_size = wave_size;
-					const auto u32   = [](uint32_t value) { return IR::U32(IR::Value(value)); };
-					auto       group = builtin(IR::StageInputKind::WorkgroupId, 2);
-					group            = entry_ir.IAdd(
-					    entry_ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 1)),
-					    builtin(IR::StageInputKind::WorkgroupId, 1));
-					group = entry_ir.IAdd(
-					    entry_ir.IMul(group, builtin(IR::StageInputKind::NumWorkgroups, 0)),
-					    builtin(IR::StageInputKind::WorkgroupId, 0));
+					const auto u32 = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+					const auto group =
+					    IR::U32(entry_ir.Emit(IR::ValueOpcode::OrderedAppendGroupIndex,
+					                          {builtin(IR::StageInputKind::WorkgroupId, 0),
+					                           builtin(IR::StageInputKind::WorkgroupId, 1),
+					                           builtin(IR::StageInputKind::WorkgroupId, 2)}));
 					const auto term = entry_ir.BitwiseAnd(
 					    entry_ir.IAdd(entry_ir.IMul(group, u32(waves)), wave_id),
 					    u32(IR::OrderedAppendWaveIdMask));

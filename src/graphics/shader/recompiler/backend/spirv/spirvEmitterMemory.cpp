@@ -1447,6 +1447,29 @@ uint32_t OrderedAppendCounterAdd(ValueEmitContext& ctx, const IR::Inst& inst, ui
 
 } // namespace
 
+uint32_t EmitOrderedAppendGroupIndex(ValueEmitContext& ctx, const IR::Inst& inst) {
+	// Workgroup index in the whole dispatch, from the group counts the host stores in GDS.
+	auto&          state = ctx.state;
+	IR::MemoryInfo gds;
+	gds.kind            = IR::ResourceKind::Gds;
+	const auto resource = PrepareMemoryResourceAccess(state, gds);
+	const auto count    = [&](uint32_t axis) {
+		const auto index = ConstantU32(state, IR::OrderedAppendGroupCounts + axis);
+		return EmitValueOrZeroIfCondition(
+		    state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+			    const auto value = state.builder.AllocateId();
+			    state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
+			                              EmitMemoryElementPointer(state, resource, index));
+			    return value;
+		    });
+	};
+	const auto row =
+	    EmitAddU32(state, ctx.Arg(inst, 1),
+	               Binary(state, spv::OpIMul, TypeU32(state), ctx.Arg(inst, 2), count(1)));
+	return EmitAddU32(state, ctx.Arg(inst, 0),
+	                  Binary(state, spv::OpIMul, TypeU32(state), row, count(0)));
+}
+
 void EmitOrderedAppendRelease(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, 0), [&]() {
 		OrderedAppendCounterAdd(ctx, inst, IR::OrderedAppendReleaseCounter, 1u,

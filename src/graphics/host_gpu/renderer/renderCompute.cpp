@@ -243,10 +243,25 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
-void RenderExecutor::ResetOrderedAppendCounters() {
-	// Every dispatch starts its ordered-append wave numbering from zero.
-	m_context.GetBufferCache().FillBuffer(
-	    ShaderRecompiler::IR::OrderedAppendReleaseCounter * sizeof(uint32_t), 8u, 0u, true);
+// Every dispatch starts its ordered-append wave numbering from zero, and ranks its workgroups
+// with the counts of the whole dispatch.
+constexpr uint64_t OrderedAppendCounterOffset =
+    ShaderRecompiler::IR::OrderedAppendReleaseCounter * sizeof(uint32_t);
+constexpr uint64_t OrderedAppendCountsOffset =
+    ShaderRecompiler::IR::OrderedAppendGroupCounts * sizeof(uint32_t);
+
+void RenderExecutor::ResetOrderedAppendCounters(uint32_t groups_x, uint32_t groups_y) {
+	auto& cache = m_context.GetBufferCache();
+	cache.FillBuffer(OrderedAppendCounterOffset, sizeof(uint32_t), 0u, true);
+	cache.FillBuffer(OrderedAppendCountsOffset, sizeof(uint32_t), groups_x, true);
+	cache.FillBuffer(OrderedAppendCountsOffset + sizeof(uint32_t), sizeof(uint32_t), groups_y,
+	                 true);
+}
+
+void RenderExecutor::ResetOrderedAppendCountersIndirect(uint64_t args_addr) {
+	auto& cache = m_context.GetBufferCache();
+	cache.FillBuffer(OrderedAppendCounterOffset, sizeof(uint32_t), 0u, true);
+	cache.CopyBuffer(OrderedAppendCountsOffset, args_addr, 2 * sizeof(uint32_t), true, false);
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -453,7 +468,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (program.info.uses_ordered_append) {
-		ResetOrderedAppendCounters();
+		ResetOrderedAppendCounters(thread_group_x, thread_group_y);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
@@ -521,6 +536,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
+	if (program.info.uses_ordered_append) {
+		ResetOrderedAppendCountersIndirect(args_addr);
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
@@ -546,9 +564,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
-	if (program.info.uses_ordered_append) {
-		ResetOrderedAppendCounters();
-	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

@@ -6,10 +6,12 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
 #include <bitset>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -62,10 +64,20 @@ struct ShaderSource {
 	IR::ResourcePlan call_targets;
 	std::vector<Call> calls;
 	uint32_t unsupported_call_pc = UINT32_MAX;
+	// Calls whose targets the call queries cannot evaluate (a function each lane picks from a
+	// table, or a target written differently on different paths) are expanded from the guest's
+	// call tables when the source is refreshed: `linked` then holds the expanded program, and
+	// `refresh_failed` reports a refresh whose expansion is not possible (with its reason).
+	bool expand_calls = false;
 	uint32_t wave_size = 64;
+	std::shared_ptr<Decoder::ShaderFunctionExpander> expander;
+	bool refresh_failed = false;
+	std::string refresh_failure;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
+
+	[[nodiscard]] bool HasCalls() const { return !calls.empty() || expand_calls; }
 };
 
 [[nodiscard]] const char* StageName(ShaderType stage);

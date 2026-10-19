@@ -282,6 +282,13 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 	return formats;
 }
 
+// A shader whose call targets are GPU data runs the functions its call tables name: a table that
+// does not expand (not mapped, a target that is not a leaf function) leaves nothing to run.
+[[noreturn]] void ExitCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
+	EXIT("shader 0x%016" PRIx64 ": its call tables do not expand: %s\n", hash,
+	     source.refresh_failure.c_str());
+}
+
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
@@ -600,6 +607,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
+			if (cached.call_source->refresh_failed) {
+				ExitCallExpansionFailure(params.hash, *cached.call_source);
+			}
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor);
@@ -621,7 +631,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
 		                                    ShaderRecompiler::StageName(options.stage), params.hash));
 		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
-		if (source.unsupported_call_pc != UINT32_MAX) {
+		if (source.unsupported_call_pc != UINT32_MAX && !source.expand_calls) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
 			                 params.hash, source.unsupported_call_pc);
@@ -632,8 +642,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
 	ShaderRecompiler::TranslateResult translated;
 	if (current != nullptr) {
-		if (!current->calls.empty()) {
-			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+		if (current->HasCalls()) {
+			if (entry == m_program_cache.end()) {
+				ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				if (current->refresh_failed) ExitCallExpansionFailure(params.hash, *current);
+			}
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 			translated.program.source_reads = current->reads;
 		} else {
@@ -643,7 +656,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		translated = ShaderRecompiler::TranslateProgram(params.code, options);
 	}
 	if (entry == m_program_cache.end()) {
-		auto retained = !source.calls.empty()
+		auto retained = source.HasCalls()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 		                    : nullptr;
 		entry = m_program_cache.emplace(m_lookup_key, Program {

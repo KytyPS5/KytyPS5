@@ -109,6 +109,12 @@ public:
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	// Writes a label (or with no bytes, raises only the interrupt) once the host GPU completed
+	// the work recorded before it (pendingLabels.h).
+	void WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t bytes, bool interrupt,
+	                           uint32_t interrupt_context_id);
+	// A 32-bit value as WAIT_REG_MEM and COND_EXEC see it: with the labels not written yet.
+	[[nodiscard]] uint32_t ReadLabel(const uint32_t* address);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);

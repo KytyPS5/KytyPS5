@@ -3094,6 +3094,11 @@ public:
 
       constexpr uint64_t release_tick = 1;
       auto &gpu_scheduler = context.GetCommandScheduler();
+      // An end-of-pipe label reaches guest memory once the host GPU completed the
+      // work before it (pendingLabels.h); the command processor sees it at once.
+      const auto seen = [&](const uint64_t &label) {
+        return gpu.Labels()->Read(&label);
+      };
       auto processor = std::make_unique<CommandProcessor>(context, 0);
       gpu.SendCommandSync([&] {
         processor->BufferInit();
@@ -3137,7 +3142,8 @@ public:
               processor->Process(cb_db_execution, cb_db_release);
           const bool cb_db_release_did_not_submit =
               cb_db_result == Pm4ProcessResult::Complete &&
-              cb_db_release_label == 0 &&
+              seen(cb_db_release_label) == 0 &&
+              cb_db_release_label == UINT64_MAX &&
               gpu_scheduler.CurrentTick() == cb_db_tick;
 
           for (const auto gcr : {0u, 1u << 9u}) {
@@ -3149,8 +3155,9 @@ public:
                 processor->Process(timestamp_execution, timestamp);
             Require("GpuCommandLane", "timestamp write",
                     timestamp_result == Pm4ProcessResult::Complete &&
-                        cb_db_release_label >= before &&
-                        cb_db_release_label <= Sync::ReadReferenceClock() &&
+                        seen(cb_db_release_label) >= before &&
+                        seen(cb_db_release_label) <= Sync::ReadReferenceClock() &&
+                        cb_db_release_label == UINT64_MAX &&
                         gpu_scheduler.CurrentTick() == cb_db_tick,
                     "timestamp write failed, returned an invalid time, or "
                     "submitted extra GPU work");
@@ -3184,6 +3191,15 @@ public:
               "failed to release the blocked GPU timeline");
       no_gpu_wait.join();
       gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+      gpu.SendCommandSync([&] {
+        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+      });
+      // The GPU thread writes completed labels before it takes the next command.
+      gpu.SendCommandSync([] {});
+      Require("GpuCommandLane", "label after native completion",
+              cb_db_release_label != UINT64_MAX &&
+                  cb_db_release_label == seen(cb_db_release_label),
+              "a label did not reach guest memory once the host GPU completed it");
       m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
       Require("GpuCommandLane", "CPU-only unmap with pending host retirement",
               parser_did_not_wait_gpu && cpu_unmap_did_not_submit &&
@@ -3196,6 +3212,7 @@ public:
               "submission behavior");
 
       alignas(uint64_t) uint64_t release_label = 0;
+      alignas(uint64_t) std::array<uint64_t, 4> release_labels{};
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
       bool release_mem_submission_counts = false;
       gpu.SendCommandSync([&] {
@@ -3205,13 +3222,14 @@ public:
         processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
                                      &release_label, UINT64_MAX, 2);
         Require("GpuCommandLane", "EOP reference clock with interrupt",
-                release_label >= clock_before &&
-                    release_label <= Sync::ReadReferenceClock(),
+                seen(release_label) >= clock_before &&
+                    seen(release_label) <= Sync::ReadReferenceClock(),
                 "clock write with writeback and interrupt lost its data");
 
-        for (const auto interrupt : {0u, 3u, 1u, 2u}) {
-          release_label = 0;
-          auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
+        for (size_t i = 0; i < 4; i++) {
+          const auto interrupt = std::array{0u, 3u, 1u, 2u}[i];
+          auto &label = release_labels[i];
+          auto immediate = make_release_mem(1, interrupt, &label, 0x11223344u);
           Pm4Execution immediate_execution;
           const auto immediate_tick = gpu_scheduler.CurrentTick();
           const auto immediate_result =
@@ -3220,7 +3238,7 @@ public:
                   immediate_result == Pm4ProcessResult::Complete &&
                       gpu_scheduler.CurrentTick() ==
                           immediate_tick + (interrupt == 1 || interrupt == 2) &&
-                      release_label == (interrupt == 1 ? 0 : 0x11223344u),
+                      seen(label) == (interrupt == 1 ? 0 : 0x11223344u),
                   "label-only release submitted work or interrupt release lost its boundary");
         }
 
@@ -3258,9 +3276,11 @@ public:
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
+      gpu.SendCommandSync([] {});
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
-                  static_cast<uint32_t>(release_label) == 0x11223344u &&
+                  static_cast<uint32_t>(release_labels[3]) == 0x11223344u &&
+                  release_labels[2] == 0 &&
                   static_cast<uint32_t>(gds_label) == 0,
               "RELEASE_MEM lost its required split/readback or retained a "
               "redundant GPU wait");

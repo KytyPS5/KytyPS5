@@ -47,6 +47,7 @@ names=(
 	ngs2_sampler
 	pad_haptics
 	pad_input
+	pending_labels
 	perf_counters
 	pipeline_use
 	player_seats

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/pendingLabels.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -39,6 +40,11 @@ public:
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
+	// End-of-pipe labels the host GPU has not completed (pendingLabels.h). Completion
+	// callbacks keep them alive past the guest GPU.
+	[[nodiscard]] const std::shared_ptr<PendingLabels>& GetLabels() const noexcept {
+		return m_labels;
+	}
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
@@ -88,7 +94,8 @@ private:
 	RangeSet                  m_mapped_ranges;
 	std::vector<GuestRange>   m_bda_guest_writes; // scratch for PrepareBda
 	uint64_t                  m_last_heat_cool_ms = 0;
-	std::unique_ptr<GuestGpu> m_gpu;
+	std::shared_ptr<PendingLabels> m_labels = std::make_shared<PendingLabels>();
+	std::unique_ptr<GuestGpu>      m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;

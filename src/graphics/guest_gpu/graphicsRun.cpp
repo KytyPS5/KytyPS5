@@ -61,11 +61,17 @@ static bool GraphicsRunDebugDumpEnabled() {
 
 GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
-      m_frame_pacer(std::make_shared<FramePacer>(Config::GetGpuFramesInFlight())) {
+      m_frame_pacer(std::make_shared<FramePacer>(Config::GetGpuFramesInFlight())),
+      m_labels(renderer.GetLabels()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
+	m_labels->SetWake([this] {
+		Common::LockGuard lock(m_queue_mutex);
+		m_labels_ready.store(true, std::memory_order_release);
+		m_work_available.Signal();
+	});
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -85,6 +91,8 @@ void GuestGpu::Shutdown() {
 		m_work_available.SignalAll();
 	}
 	m_frame_pacer->Stop();
+	// Completions after this write nothing: the guest is shutting down.
+	m_labels->SetWake(nullptr);
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
@@ -116,8 +124,29 @@ void GuestGpu::SubmitRecordedBeforeWaiting() {
 	}
 }
 
+void GuestGpu::WriteCompletedLabels() {
+	EXIT_IF(!IsGpuThread());
+	m_labels_ready.store(false, std::memory_order_relaxed);
+	m_completed_labels.clear();
+	m_labels->TakeCompleted(m_completed_labels);
+	auto& buffer_cache = m_renderer.GetBufferCache();
+	for (const auto& label: m_completed_labels) {
+		if (label.bytes != 0) {
+			std::memcpy(reinterpret_cast<void*>(label.address), &label.value, label.bytes);
+			buffer_cache.RecordGpuThreadWrite(label.address, label.bytes);
+			m_labels->Retire(label);
+		}
+		if (label.interrupt) {
+			m_renderer.TriggerInterrupt(label.interrupt_event, label.interrupt_context);
+		}
+	}
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	if (m_labels_ready.load(std::memory_order_acquire)) {
+		WriteCompletedLabels();
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -358,7 +387,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(m_renderer.GetLabels()->Read(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -499,6 +528,9 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 
 	for (;;) {
+		if (gpu->m_labels_ready.load(std::memory_order_acquire)) {
+			gpu->WriteCompletedLabels();
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -511,11 +543,16 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->SubmitRecordedBeforeWaiting();
 				gpu->m_queue_mutex.Lock();
 			}
-			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping &&
+			       !gpu->m_labels_ready.load(std::memory_order_relaxed)) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				KYTY_TRACE_COLUMN(GpuIdle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+			}
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Woken to write completed labels.
+				continue;
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -1188,11 +1225,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		WriteGuest(dst, &data, sizeof(data));
-
-		if (with_interrupt) {
-			TriggerEopEventAtEndOfPipe(interrupt_context_id);
-		}
+		WriteLabelAtEndOfPipe(dst, data, sizeof(data), with_interrupt, interrupt_context_id);
 	};
 
 	switch (event_write_source) {
@@ -1232,11 +1265,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					WriteGuest(dst, &value, sizeof(value));
-
-					if (with_interrupt) {
-						TriggerEopEventAtEndOfPipe(interrupt_context_id);
-					}
+					WriteLabelAtEndOfPipe(dst, value, sizeof(value), with_interrupt,
+					                      interrupt_context_id);
 				};
 
 				switch (cache_action) {
@@ -1339,11 +1369,37 @@ void CommandProcessor::EmitGlobalBarrier() {
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+	WriteLabelAtEndOfPipe(nullptr, 0, 0, true, interrupt_context_id);
+}
+
+void CommandProcessor::WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t bytes,
+                                             bool interrupt, uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-	    });
+	if (!GuestGpu::IsGpuThread()) {
+		// Without the GPU thread nothing writes the label later (a processor of a test).
+		if (bytes != 0) {
+			WriteGuest(dst, &value, bytes);
+		}
+		if (interrupt) {
+			GetScheduler().DeferPriorityOperation(
+			    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    });
+		}
+		return;
+	}
+	const auto& labels = m_renderer.GetLabels();
+	const auto  serial = labels->Add({.address           = reinterpret_cast<uint64_t>(dst),
+	                                  .value             = value,
+	                                  .bytes             = bytes,
+	                                  .interrupt         = interrupt,
+	                                  .interrupt_event   = m_interrupt_event_id,
+	                                  .interrupt_context = interrupt_context_id});
+	GetScheduler().DeferPriorityOperation([labels, serial] { labels->Complete(serial); });
+}
+
+uint32_t CommandProcessor::ReadLabel(const uint32_t* address) {
+	return m_renderer.GetLabels()->Read(address);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

@@ -7,6 +7,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/framePacer.h"
+#include "graphics/guest_gpu/pendingLabels.h"
 
 #include <array>
 #include <atomic>
@@ -47,6 +48,9 @@ public:
 	// Counts a flip the GPU thread records; the host GPU's completion of it calls
 	// FrameCompleted on the returned pacer.
 	[[nodiscard]] std::shared_ptr<FramePacer> RecordFrame();
+	// End-of-pipe labels the host GPU has not completed (pendingLabels.h).
+	[[nodiscard]] const std::shared_ptr<PendingLabels>& Labels() const { return m_labels; }
+
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
@@ -79,6 +83,8 @@ private:
 	void              Enqueue(Submission submission);
 	void              SubmitRecordedBeforeWaiting();
 	void              ProcessCommands();
+	// GPU thread. Writes the labels the host GPU completed, with their interrupts.
+	void              WriteCompletedLabels();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
@@ -100,6 +106,11 @@ private:
 	// Frames recorded ahead of the host GPU. Completion callbacks can outlive GuestGpu during
 	// renderer shutdown.
 	std::shared_ptr<FramePacer> m_frame_pacer;
+	// The renderer's (RenderContext::GetLabels).
+	std::shared_ptr<PendingLabels> m_labels;
+	// Completed labels wait for the GPU thread (set under m_queue_mutex, read without it too).
+	std::atomic_bool                m_labels_ready {false};
+	std::vector<PendingLabels::Label> m_completed_labels;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

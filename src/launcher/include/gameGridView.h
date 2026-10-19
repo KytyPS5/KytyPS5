@@ -164,6 +164,13 @@ protected:
 		painter.restore();
 	}
 
+	bool viewportEvent(QEvent* event) override {
+		if (event->type() == QEvent::ToolTip) {
+			return true;
+		}
+		return QListView::viewportEvent(event);
+	}
+
 	void mouseMoveEvent(QMouseEvent* event) override {
 		const int hover = !m_title.isEmpty() ? (PlayRect().contains(event->pos())   ? 1
 		                                        : InfoRect().contains(event->pos()) ? 2

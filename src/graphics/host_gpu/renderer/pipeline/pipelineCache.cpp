@@ -794,8 +794,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+	const uint32_t user_clip_planes = context.GetEmulatedUserClipPlaneMask();
+	if (user_clip_planes != 0) {
+		// Emulated in the vertex shader; mesh and tessellation pipelines do not emit it yet.
+		EXIT_NOT_IMPLEMENTED(mesh_active || tess_active);
+		vertex_info[0].user_clip_plane_mask = user_clip_planes;
+	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, object_primitive_id);
+	    mesh_active, object_primitive_id, std::popcount(user_clip_planes));
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);

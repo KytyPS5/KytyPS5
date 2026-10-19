@@ -291,8 +291,11 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
+// Plane coefficients are stored as written; whether a plane is used is decided at draw time from
+// PA_CL_CLIP_CNTL.UCP_ENA, which may be written after them.
+static void HwCtxSetUserClipPlane(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	cp.GetCtx().SetUserClipPlaneCoefficient(cmd_offset - Pm4::PA_CL_UCP_0_X,
+	                                        std::bit_cast<float>(value));
 }
 
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
@@ -2899,7 +2902,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			HwCtxSetUserClipPlane(cp, cmd_offset, value);
 		};
 	}
 

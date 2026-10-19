@@ -823,6 +823,24 @@ public:
 	[[nodiscard]] const BlendColor& GetBlendColor() const { return m_blend_color; }
 	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
+	// PA_CL_UCP_0_X .. PA_CL_UCP_5_W, four coefficients per plane.
+	void SetUserClipPlaneCoefficient(uint32_t index, float value) {
+		if (index < 24u) {
+			m_user_clip_planes[index] = value;
+		}
+	}
+	[[nodiscard]] const float* GetUserClipPlane(uint32_t plane) const {
+		return &m_user_clip_planes[plane * 4u];
+	}
+	// Planes the vertex shader must emulate: enabled in PA_CL_CLIP_CNTL.UCP_ENA but not backed by
+	// a shader-exported clip distance (PA_CL_VS_OUT_CNTL.CLIP_DIST_ENA). CLIP_DISABLE turns off
+	// clipping altogether, user planes included.
+	[[nodiscard]] uint32_t GetEmulatedUserClipPlaneMask() const {
+		if (m_clip_control.clip_disable) {
+			return 0;
+		}
+		return m_clip_control.user_clip_planes & ~(m_sh_regs.m_paClVsOutCntl & 0xffu) & 0x3fu;
+	}
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
@@ -921,6 +939,7 @@ private:
 	uint32_t        m_render_target_mask = 0;
 	ScreenViewport  m_screen_viewport;
 	ClipControl     m_clip_control;
+	float           m_user_clip_planes[24] = {};
 	ColorControl    m_color_control;
 	ScanModeControl m_scan_mode_control;
 

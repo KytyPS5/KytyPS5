@@ -1193,10 +1193,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
-	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, state.ps_input_info.object_primitive_id);
+	const uint32_t user_clip_planes = mesh_active ? 0u : state.vertex_info[0].user_clip_plane_mask;
+	const auto     draw_dwords      = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+	    mesh_active, state.ps_input_info.object_primitive_id, std::popcount(user_clip_planes));
 	if (draw_dwords != 0) {
-		std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> draw_data {};
+		std::array<uint32_t, ShaderRecompiler::IR::PushData::DwordCount> draw_data {};
 		const auto draw_stages = vk::ShaderStageFlagBits::eFragment |
 		                         (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT
 		                                      : vk::ShaderStageFlagBits::eVertex);
@@ -1209,6 +1210,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    static_cast<uint32_t>(index_source.address >> 32u)};
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
+			uint32_t dword = ShaderRecompiler::IR::PushData::UserClipPlaneDword;
+			for (uint32_t plane = 0; plane < 6u; plane++) {
+				if ((user_clip_planes & (1u << plane)) == 0) {
+					continue;
+				}
+				const float* equation = buffer.GetRegisters().GetUserClipPlane(plane);
+				for (uint32_t c = 0; c < 4u; c++) {
+					draw_data[dword++] = std::bit_cast<uint32_t>(equation[c]);
+				}
+			}
 		}
 		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());

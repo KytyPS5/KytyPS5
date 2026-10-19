@@ -604,6 +604,37 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, exp.index),
 			                          value);
 		} else if (exp.kind == IR::ExportTargetKind::Position) {
+			if (state.user_clip_plane_first_distance != UINT32_MAX) {
+				// distance = dot(plane, clip-space position); the hardware keeps the side where
+				// it is non-negative, which matches Vulkan ClipDistance.
+				const auto mask  = state.input_info.vertex->user_clip_plane_mask;
+				uint32_t   slot  = 0;
+				for (uint32_t plane = 0; plane < 6u; plane++) {
+					if ((mask & (1u << plane)) == 0) {
+						continue;
+					}
+					uint32_t coefficients[4] {};
+					for (uint32_t c = 0; c < 4u; c++) {
+						const auto raw = EmitPushDataLoad(
+						    state, ConstantU32(state, IR::PushData::UserClipPlaneDword + slot * 4u + c));
+						coefficients[c] = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpBitcast, TypeF32(state), coefficients[c], raw);
+					}
+					const auto equation = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4),
+					                          equation, coefficients[0], coefficients[1],
+					                          coefficients[2], coefficients[3]);
+					const auto distance = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpDot, TypeF32(state), distance, equation, value);
+					const auto distance_pointer = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
+					    distance_pointer, state.clip_distance_variable,
+					    ConstantU32(state, state.user_clip_plane_first_distance + slot));
+					state.builder.AddFunction(spv::OpStore, distance_pointer, distance);
+					slot++;
+				}
+			}
 			if (state.invalid_position_clip_distance != UINT32_MAX) {
 				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
 				const auto equal = state.builder.AllocateId();

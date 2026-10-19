@@ -370,13 +370,43 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 	     c.force_viewport_index_from_vs_enable ? "true" : "false");
 }
 
-static void ClipCheck(const HW::ClipControl& c) {
+static void ClipCheck(const HW::ClipControl& c, uint32_t vs_out_cntl) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
-	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
-	                     c.force_viewport_index_from_vs_enable);
+	//
+	// UCP_ENA bit n also enables clip distance n exported by the vertex shader
+	// (PA_CL_VS_OUT_CNTL.CLIP_DIST_ENA_n), which is emitted as Vulkan ClipDistance. Register-only
+	// planes (PA_CL_UCP_*) are emulated by the vertex shader from push data, see
+	// Context::GetEmulatedUserClipPlaneMask.
+	const uint32_t exported_clip = vs_out_cntl & 0xffu;
+	// When planes are enabled, every exported distance must be enabled too, since Vulkan clips
+	// against all of them.
+	const bool ucp_partial = c.user_clip_planes != 0 && (exported_clip & ~c.user_clip_planes & 0x3fu) != 0;
+	// Cull-only planes and Y negation only apply to enabled planes. PS_UCP_MODE only selects how
+	// expanded point/line sprites are clipped, which the host handles itself.
+	const bool ucp_modifiers =
+	    c.user_clip_planes != 0 && (c.user_clip_plane_negate_y || c.user_clip_plane_cull_only);
+	// VTX_KILL_OR and VTE_VPORT_PROVOKE_DISABLE only matter when the vertex shader exports the
+	// kill flag (USE_VTX_KILL_FLAG) or viewport index (USE_VTX_VIEWPORT_INDX).
+	const bool vertex_kill    = c.vertex_kill_any && (vs_out_cntl & (1u << 20u)) != 0;
+	const bool viewport_index =
+	    c.force_viewport_index_from_vs_enable && (vs_out_cntl & (1u << 19u)) != 0;
+	if (ucp_partial || ucp_modifiers || vertex_kill || viewport_index) {
+		EXIT("unsupported clip state: user_clip_planes=0x%02x exported_clip_distances=0x%02x "
+		     "pa_cl_vs_out_cntl=0x%08x negate_y=%d cull_only=%d vertex_kill_any=%d "
+		     "force_viewport_index_from_vs=%d\n",
+		     c.user_clip_planes, exported_clip, vs_out_cntl, c.user_clip_plane_negate_y ? 1 : 0,
+		     c.user_clip_plane_cull_only ? 1 : 0, c.vertex_kill_any ? 1 : 0,
+		     c.force_viewport_index_from_vs_enable ? 1 : 0);
+	}
+	// DIS_CLIP_ERR_DETECT only changes how primitives with NaN/Inf clip results are treated,
+	// which Vulkan leaves to the implementation.
+	if (c.cull_on_clipping_error_disable) {
+		static std::atomic<bool> warned {false};
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			LOGF("warning: PA_CL_CLIP_CNTL.DIS_CLIP_ERR_DETECT is not emulated\n");
+		}
+	}
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {
@@ -852,7 +882,7 @@ void hw_check(const CommandBuffer& buffer) {
 	log_phase("vp");
 	VpCheck(vp, smc);
 	log_phase("clip");
-	ClipCheck(c);
+	ClipCheck(c, hw.GetShaderRegisters().m_paClVsOutCntl);
 	log_phase("mode");
 	McCheck(mc);
 	log_phase("blend");

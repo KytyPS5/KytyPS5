@@ -243,8 +243,11 @@ void DefineDescriptors(EmitterState& state) {
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
+	const bool user_clip_planes = state.program.stage == ShaderType::Vertex &&
+	                              state.input_info.vertex != nullptr &&
+	                              state.input_info.vertex->user_clip_plane_mask != 0;
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0) {
+	    state.object_primitive_id_variable != 0 || user_clip_planes) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -604,10 +607,26 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	const bool writes_position =
 	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	    });
+	const uint32_t user_clip_planes =
+	    state.program.stage == ShaderType::Vertex && state.input_info.vertex != nullptr
+	        ? std::popcount(state.input_info.vertex->user_clip_plane_mask)
+	        : 0u;
+	if (user_clip_planes != 0 && writes_position) {
+		// Register-only user clip planes become extra ClipDistance outputs computed from the
+		// exported position. They take priority over the clipping-error guard below.
+		EXIT_NOT_IMPLEMENTED(clip_distance_count + cull_distance_count + user_clip_planes > 8u);
+		state.user_clip_plane_first_distance = clip_distance_count;
+		for (uint32_t i = 0; i < user_clip_planes; i++) {
+			state.outputs.push_back({{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0,
+			                          "gl_ClipDistance"}});
+		}
+	}
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    writes_position) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,

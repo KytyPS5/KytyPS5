@@ -356,8 +356,16 @@ struct PushData {
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
-	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id) {
-		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
+	// Non-mesh draws: dword 0 is the object id, followed by four floats per emulated user clip
+	// plane starting at UserClipPlaneDword.
+	static constexpr uint32_t UserClipPlaneDword = 1;
+	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
+	                                                           uint32_t user_clip_planes = 0) {
+		if (mesh) {
+			return MeshDrawDwordCount;
+		}
+		return user_clip_planes != 0 ? UserClipPlaneDword + user_clip_planes * 4u
+		                             : static_cast<uint32_t>(object_id);
 	}
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {

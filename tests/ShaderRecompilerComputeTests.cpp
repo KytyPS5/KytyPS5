@@ -12188,8 +12188,10 @@ public:
                           vk::Format::eR16G16B16A16Unorm,
                   "the aliased clear did not reuse its existing UNORM allocation");
         }
+        // Goat's proven fill stays CPU-owned; multisampled targets are decided on the CPU.
         Require(name, "metadata decided without readback",
-                !m_conditional_rendering_supported ||
+                !m_conditional_rendering_supported || fill_case.goat ||
+                    fill_case.samples_log2 != 0 ||
                     context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
                 "binding a target read its GPU-written metadata back to the CPU");
         Require(name, "color clear metadata discovery",
@@ -12288,8 +12290,10 @@ public:
                 "a nonuniform metadata allocation cleared the whole target");
         fill_metadata(metadata_words);
         if (fill_case.goat) {
-          Require(name, "repeated Goat fill stays CPU-owned",
-                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+          // Conditional rendering decided the partial fill on the GPU, so nothing was read back.
+          Require(name, "repeated Goat fill avoids readback",
+                  resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) ==
+                      m_conditional_rendering_supported,
                   "re-clearing expanded metadata required another GPU readback");
         }
         bind();

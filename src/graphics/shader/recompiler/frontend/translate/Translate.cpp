@@ -87,7 +87,10 @@ Decoder::Operand Translator::ScalarDestinationOperand(const Decoder::Operand& op
 	}
 	code += offset;
 	Decoder::Operand result {};
-	if (code < 106u) {
+	// Trap temporaries already decode past the SGPR file; plain SGPRs keep the
+	// historical VCC crossover so s105+1 still addresses VCC_LO.
+	const bool trap = operand.kind == Decoder::OperandKind::Sgpr && operand.reg >= 106u;
+	if (code < 106u || (trap && code < IR::NumScalarRegs)) {
 		result.kind = Decoder::OperandKind::Sgpr;
 		result.reg  = code;
 	} else {
@@ -167,6 +170,9 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 IR::U32 Translator::ReadScalarCode(uint32_t code) {
 	if (code < 106u) {
 		return ir.GetScalarReg(static_cast<IR::ScalarReg>(code));
+	}
+	if (code >= 112u && code <= 123u) {
+		return ir.GetScalarReg(static_cast<IR::ScalarReg>(IR::NumSgprs + (code - 112u)));
 	}
 	switch (code) {
 		case 106u: return ir.GetVccLo();

@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/frontend/decode/MemoryOps.h"
 #include "graphics/shader/recompiler/frontend/decode/ScalarAluOps.h"
 #include "graphics/shader/recompiler/frontend/decode/VectorAluOps.h"
+#include "graphics/shader/recompiler/ir/Reg.h"
 
 #include <algorithm>
 #include <bit>
@@ -219,12 +220,22 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 	}
 }
 
+// Trap temporaries behave as extra scalar registers past the SGPR file.
+static void DecodeTrapReg(uint32_t code, Operand& operand) {
+	operand.kind = OperandKind::Sgpr;
+	operand.reg  = IR::NumSgprs + (code - 112u);
+}
+
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return;
+	}
+	if (code >= 112u && code <= 123u) {
+		DecodeTrapReg(code, operand);
 		return;
 	}
 	if (code >= 128u && code <= 192u) {
@@ -278,6 +289,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return;
+	}
+	if (code >= 112u && code <= 123u) {
+		DecodeTrapReg(code, operand);
 		return;
 	}
 
@@ -447,7 +462,10 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::FloatInlineConstant:
 			text = fmt::format("{:f}", std::bit_cast<float>(operand.value));
 			break;
-		case OperandKind::Sgpr: text = fmt::format("s{}", operand.reg); break;
+		case OperandKind::Sgpr:
+			text = operand.reg < IR::NumSgprs ? fmt::format("s{}", operand.reg)
+			                                    : fmt::format("ttmp{}", operand.reg - IR::NumSgprs);
+			break;
 		case OperandKind::Vgpr: text = fmt::format("v{}", operand.reg); break;
 		case OperandKind::VccLo: text = "vcc_lo"; break;
 		case OperandKind::VccHi: text = "vcc_hi"; break;

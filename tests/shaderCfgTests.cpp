@@ -2341,6 +2341,27 @@ void TestNewShaderRecompilerScalarVectorAlu() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerTrapTemporaries() {
+  // Atelier Yumia uses trap temporaries (TTMP3 is scalar operand code 0x73) as
+  // scratch scalar registers. They decode into the slots past the SGPR file.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),          // s0 = 1
+      EncodeSop2(0x00, 115, 0, 129),  // s_add_u32 ttmp3, s0, 1
+      EncodeSop2(0x00, 2, 115, 1),    // s_add_u32 s2, ttmp3, s1
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("s_add_u32 ttmp3, s0, 1") != std::string::npos),
+        "new decoder did not decode TTMP destination");
+  Check((result.decoded_dump.find("s_add_u32 s2, ttmp3, s1") != std::string::npos),
+        "new decoder did not decode TTMP source");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   // Lane-read instructions have scalar results, but their VOP3A destination is
   // encoded in VDST [7:0], not the VOP3B SDST field [14:8].
@@ -16824,6 +16845,7 @@ int main() {
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
+  TestNewShaderRecompilerTrapTemporaries();
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 
   return 0;

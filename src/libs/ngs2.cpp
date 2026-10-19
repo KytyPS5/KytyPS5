@@ -1445,7 +1445,8 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 					                           i};
 					if (fx.cleanup(&context) != OK) {
 						// Teardown must not fail; the rack is being destroyed anyway.
-						LOGF("warning: NGS2 user-FX cleanup failed for module %zu\n", m);
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 user-FX cleanup failed for module %zu\n", m));
 					}
 				}
 			}

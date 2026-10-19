@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -18,13 +19,13 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -81,7 +82,8 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	// Driver cache entries already distinguish shader code and pipeline state across builds.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
@@ -273,6 +275,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		bool                                       skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -299,6 +302,9 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
+		                                         Common::DebugCounters::Counter::ShaderCompileNs,
+		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
@@ -355,6 +361,7 @@ struct PipelineCache::ProgramCache {
 		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
+			if (cached.skip_dispatch) return {};
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
@@ -414,10 +421,18 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
+			                 params.hash, source.unsupported_call_pc);
+			programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan{}, nullptr)
+			    .first->second.skip_dispatch = true;
+			return {};
+		}
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
-			if (current->call) {
+			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;
@@ -428,7 +443,7 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 		if (entry == programs.end()) {
-			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -516,17 +531,6 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
-
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -559,7 +563,7 @@ void PipelineCache::InitializeDriverCache() {
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
 				    path);
 			}
 		} else {
@@ -586,8 +590,8 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
+		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
@@ -627,8 +631,8 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
+		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
 	payload.resize(size);
@@ -660,7 +664,8 @@ void PipelineCache::Save() {
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 	m_driver_cache_dirty = false;
 }
@@ -1004,8 +1009,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1035,7 +1045,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

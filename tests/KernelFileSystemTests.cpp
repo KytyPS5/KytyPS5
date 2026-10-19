@@ -6,15 +6,18 @@
 #include "common/file.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/additionalContent.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -83,6 +86,148 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "KernelFileSystemTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+template <typename Predicate>
+void WaitForMutexTest(Predicate ready) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!ready()) {
+    Check(std::chrono::steady_clock::now() < deadline, "mutex waiter made progress");
+    std::this_thread::yield();
+  }
+}
+
+struct MutexWaiter {
+  Libs::LibKernel::PthreadMutex *mutex;
+  Libs::LibKernel::KernelUseconds timeout = 0;
+  bool cancel = false;
+  Libs::LibKernel::Pthread thread = nullptr;
+  std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
+  std::atomic<unsigned> parked{0}, resume{0};
+  std::atomic<bool> acquired{false}, release{false}, finished{false};
+  int result = 0;
+};
+
+thread_local MutexWaiter *current_mutex_waiter = nullptr;
+
+void KYTY_SYSV_ABI ParkMutexWaiter(int, void *) {
+  auto &waiter = *current_mutex_waiter;
+  const auto ticket = waiter.parked.fetch_add(1) + 1;
+  WaitForMutexTest([&] { return waiter.resume.load() >= ticket; });
+}
+
+void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
+  using namespace Libs::LibKernel;
+  auto &waiter = *static_cast<MutexWaiter *>(arg);
+  current_mutex_waiter = &waiter;
+  waiter.result = waiter.timeout == 0 ? PthreadMutexLock(waiter.mutex)
+                                      : PthreadMutexTimedlock(waiter.mutex, waiter.timeout);
+  if (waiter.result == OK) {
+    waiter.acquired = true;
+    WaitForMutexTest([&] { return waiter.release.load(); });
+    Check(PthreadMutexUnlock(waiter.mutex) == OK, "waiter unlocks owned mutex");
+  }
+  waiter.finished = true;
+  if (waiter.cancel) {
+    PthreadTestcancel();
+    Check(false, "deferred mutex waiter cancellation remains pending");
+  }
+  return nullptr;
+}
+
+void QueueMutexWaiter(MutexWaiter &waiter) {
+  using namespace Libs::LibKernel;
+  PthreadAttr attr = nullptr;
+  Check(PthreadAttrInit(&attr) == OK &&
+            PthreadAttrSetstack(&attr, waiter.stack.data(), waiter.stack.size()) == OK &&
+            PthreadCreate(&waiter.thread, &attr, RunMutexWaiter, &waiter, "MutexTest") == OK &&
+            PthreadAttrDestroy(&attr) == OK,
+        "create guest mutex waiter");
+  // Pending guest signals are dispatched inside the contended lock, after enqueueing.
+  // Holding that callback proves queue order without letting the waiter acquire.
+  PthreadQueuePendingSignal(waiter.thread, 30);
+  WaitForMutexTest([&] { return waiter.parked.load() == 1; });
+}
+
+void TestMutexHandoff() {
+  using namespace Libs::LibKernel;
+  Common::Singleton<Loader::RuntimeLinker>::Instance();
+  Initialize();
+  PthreadInitSelfForMainThread();
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
+  Check(install_symbol != nullptr && remove_symbol != nullptr, "mutex signal exports resolve");
+  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
+  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
+  Check(install(30, reinterpret_cast<void *>(ParkMutexWaiter)) == OK, "install mutex test signal");
+
+  PthreadMutexattr attr = nullptr;
+  Check(PthreadMutexattrInit(&attr) == OK && PthreadMutexattrSettype(&attr, 2) == OK,
+        "create recursive mutex attributes");
+  for (unsigned timed = 0; timed < 3; ++timed) {
+    PthreadMutex mutex = nullptr;
+    Check(PthreadMutexInit(&mutex, &attr, "MutexHandoff") == OK &&
+              PthreadMutexLock(&mutex) == OK && PthreadMutexLock(&mutex) == OK,
+          "lock recursive mutex twice");
+    std::array<MutexWaiter, 3> waiters{{{&mutex}, {&mutex}, {&mutex}}};
+    waiters[timed].timeout = 5000;
+    for (auto &waiter : waiters) {
+      QueueMutexWaiter(waiter);
+    }
+    waiters[timed].resume = 1;
+    Check(PthreadJoin(waiters[timed].thread, nullptr) == OK &&
+              waiters[timed].result == KERNEL_ERROR_ETIMEDOUT,
+          "timed waiter unlinks from queue head, middle and tail");
+    Check(PthreadMutexUnlock(&mutex) == OK && PthreadMutexTrylock(&mutex) == OK &&
+              PthreadMutexUnlock(&mutex) == OK,
+          "partial recursive unlock retains ownership");
+    Check(PthreadMutexUnlock(&mutex) == OK &&
+              PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY,
+          "unlock reserves ownership before queued waiter runs");
+    for (auto &waiter : waiters) {
+      if (&waiter == &waiters[timed]) {
+        continue;
+      }
+      waiter.resume = 1;
+      WaitForMutexTest([&] { return waiter.acquired.load(); });
+      Check(PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY, "FIFO waiter owns mutex");
+      waiter.release = true;
+      WaitForMutexTest([&] { return waiter.finished.load(); });
+      Check(PthreadJoin(waiter.thread, nullptr) == OK && waiter.result == OK,
+            "FIFO waiter completes");
+    }
+    Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
+              PthreadMutexDestroy(&mutex) == OK,
+          "mutex remains usable after timed waiter removal");
+  }
+  Check(PthreadMutexattrDestroy(&attr) == OK, "destroy recursive mutex attributes");
+
+  PthreadMutex mutex = nullptr;
+  Check(PthreadMutexInit(&mutex, nullptr, "MutexCancel") == OK &&
+            PthreadMutexLock(&mutex) == OK &&
+            PthreadMutexTimedlock(&mutex, 5000) == KERNEL_ERROR_EDEADLK,
+        "nonrecursive self timed lock reports deadlock");
+  MutexWaiter waiter{&mutex};
+  waiter.cancel = true;
+  QueueMutexWaiter(waiter);
+  Check(PthreadCancel(waiter.thread) == OK, "cancel queued mutex waiter");
+  PthreadQueuePendingSignal(waiter.thread, 30);
+  waiter.resume = 1;
+  WaitForMutexTest([&] { return waiter.parked.load() == 2; });
+  Check(PthreadMutexUnlock(&mutex) == OK &&
+            PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY,
+        "canceled waiter retains its queue position");
+  waiter.release = true;
+  waiter.resume = 2;
+  void *result = nullptr;
+  Check(PthreadJoin(waiter.thread, &result) == OK &&
+            result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
+        "mutex lock defers cancellation until explicit cancellation point");
+  Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
+            PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
+        "mutex remains usable after waiter cancellation");
 }
 
 class TempDirectory {
@@ -235,6 +380,9 @@ void TestSysmoduleReferences() {
   const auto unload = resolve("eR2bZFAAU0Q");
   const auto is_loaded = resolve("fMP5NHUOaMk");
   constexpr int unloaded = static_cast<int>(0x805a1001u);
+  Check(load(0x115) == Libs::LibKernel::KERNEL_ERROR_ENOENT && is_loaded(0x115) == unloaded &&
+            unload(0x115) == unloaded,
+        "missing packaged NpCppWebApi fails without recording a loaded module");
   Check(load(0x113) == OK && is_loaded(0xb4) == unloaded,
         "loading entitlement access does not mark AppContent loaded");
   Check(unload(0x113) == OK, "release independent module reference");
@@ -255,6 +403,9 @@ void TestSysmoduleReferences() {
       reinterpret_cast<int (KYTY_SYSV_ABI *)(uint16_t, int, int, int, int*)>(
           internal_symbol->vaddr);
   int result = -1;
+  Check(internal_load(0x115, 0, 0, 0, &result) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            result == Libs::LibKernel::KERNEL_ERROR_ENOENT && is_loaded(0x115) == unloaded,
+        "internal module loading propagates missing native module failure");
   Check(internal_load(0xb4, 0, 0, 0, &result) == OK && result == OK &&
             is_loaded(0xb4) == OK && unload(0xb4) == OK && is_loaded(0xb4) == unloaded,
         "internal and public module operations share load state");
@@ -407,7 +558,9 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, nullptr, &point) == static_cast<int>(0x80d90002u) &&
             list(0, nullptr, 0, nullptr) == static_cast<int>(0x817d0002u),
         "null add-on parameters return parameter errors");
-  Check(mount(0, &info[3].label, &point) == OK, "mount owned add-on");
+  Check(mount(0, &info[3].label, &point) == OK &&
+            !std::string_view(point.data).ends_with('/'),
+        "mount owned add-on without trailing slash");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
   const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
   std::array<char, 11> payload {};
@@ -416,8 +569,9 @@ void TestAddContent(const std::filesystem::path& root) {
             FileSystem::KernelClose(fd) == OK,
         "guest reads files from the selected title's add-on");
   MountPoint repeated {};
-  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
-        "duplicate mount returns BUSY");
+  Check(mount(0, &info[3].label, &repeated) == OK &&
+            std::strcmp(repeated.data, point.data) == 0,
+        "duplicate mount returns the same mount point");
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
             unmount(&point) == static_cast<int>(0x80d90004u),
         "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
@@ -472,6 +626,27 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestFsync() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"juWbTNM+8hw", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr, "POSIX fsync export resolves");
+  const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
+  Check(fsync(std::numeric_limits<int>::min()) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "invalid fsync descriptor reports POSIX EBADF");
+
+  constexpr char Path[] = "/savedata0/fsync.dat";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "save", 4) == 4 && fsync(fd) == OK &&
+            FileSystem::KernelLseek(fd, 0, 1) == 4,
+        "fsync flushes a writable file without changing its offset");
+  Check(FileSystem::KernelClose(fd) == OK && fsync(fd) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "closed fsync descriptor reports POSIX EBADF");
 }
 
 void TestSaveTruncate() {
@@ -964,6 +1139,9 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             std::equal(bytes.begin(), bytes.begin() + 9, payload.end() - 9) &&
             FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 0,
         "archive reads stop at the member boundary");
+  Check(FileSystem::KernelFsync(fd) == OK &&
+            FileSystem::KernelLseek(fd, 0, 1) == payload.size(),
+        "fsync succeeds on an immutable archive member without changing its offset");
   Check(FileSystem::KernelWrite(fd, bytes.data(), 1) ==
             Libs::LibKernel::KERNEL_ERROR_EBADF &&
             FileSystem::KernelPwrite(fd, bytes.data(), 1, 0) ==
@@ -1896,6 +2074,11 @@ void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
+  Libs::InitLibKernel_1(&symbols);
+  const auto *shutdown_symbol = symbols.Find(
+      {"TUuiYS2kE8s", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(shutdown_symbol != nullptr, "POSIX shutdown export resolves");
+  const auto shutdown = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int)>(shutdown_symbol->vaddr);
   const auto *connect_symbol = symbols.Find(
       {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
@@ -2136,6 +2319,76 @@ void CheckSocketWakeup() {
   CheckSocketReceiveBuffer(reader, writer);
   CheckSocketReceiveConcurrency();
 #endif
+  const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
+  const auto ready_to_read = [](int fd) {
+    std::array<uint64_t, 16> readable {};
+    readable[fd / 64] = uint64_t {1} << (fd % 64);
+    const std::array<int64_t, 2> timeout {2, 0};
+    return Net::Select(fd + 1, readable.data(), nullptr, nullptr, timeout.data()) == 1;
+  };
+  Check(shutdown(-1, 1) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF &&
+            shutdown(shutdown_writer, 3) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "shutdown rejects invalid descriptors and directions");
+  Check(Net::Send(shutdown_writer, "x", 1, 0) == 1 && shutdown(shutdown_writer, 1) == 0 &&
+            ready_to_read(shutdown_reader) &&
+            Net::Recv(shutdown_reader, received.data(), 1, 0) == 1 && received[0] == 'x' &&
+            ready_to_read(shutdown_reader) &&
+            Net::Recv(shutdown_reader, received.data(), 1, 0) == 0 &&
+            Net::Send(shutdown_reader, "y", 1, 0) == 1 &&
+            ready_to_read(shutdown_writer) &&
+            Net::Recv(shutdown_writer, received.data(), 1, 0) == 1 && received[0] == 'y',
+        "write shutdown drains queued bytes, signals EOF, and preserves reverse traffic");
+  Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
+        "close half-shutdown sockets");
+  const int encrypted = Net::Socket(2, 6, 0);
+  int crypto = -1;
+  uint32_t crypto_size = sizeof(crypto);
+  Check(encrypted >= 0 &&
+            Net::Getsockopt(encrypted, 0xffff, 0x20000, &crypto, &crypto_size) == 0 &&
+            crypto == 0,
+        "UDPP2P encryption defaults to disabled");
+  for (const int setting : {7, 0}) {
+    Check(Net::Setsockopt(encrypted, 0xffff, 0x20000, &setting, sizeof(setting)) == 0 &&
+              Net::Getsockopt(encrypted, 0xffff, 0x20000, &crypto, &crypto_size) == 0 &&
+              crypto == (setting != 0),
+          "UDPP2P encryption configuration retains normalized enable and disable values");
+    Check(Net::Send(encrypted, "x", 1, 0) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
+          "UDPP2P configuration never exposes unframed plaintext transport");
+  }
+  std::array<uint8_t, 16> p2p_address {16, 2, 0x0e, 0x4a, 127, 0, 0, 1, 0x1e, 0x61};
+  Check(Net::Bind(encrypted, p2p_address.data(), p2p_address.size()) == 0,
+        "bind UDPP2P physical and virtual ports");
+  char untouched = '!';
+  auto source = p2p_address;
+  uint32_t source_size = source.size();
+  Check(Net::Recvfrom(encrypted, &untouched, 1, 0x80, source.data(), &source_size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "per-call nonblocking UDPP2P receive reports an actually empty queue");
+  Check(Net::Setsockopt(encrypted, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Setsockopt(encrypted, 0xffff, 0x20000, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recvfrom(encrypted, &untouched, 1, 0, source.data(), &source_size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+            untouched == '!' && source == p2p_address && source_size == source.size(),
+        "empty encrypted nonblocking receive preserves all caller outputs");
+  const int raw_sender = Net::Socket(2, 2, 0);
+  Check(raw_sender >= 0 &&
+            Net::Sendto(raw_sender, "pending", 7, 0, p2p_address.data(), p2p_address.size()) == 7,
+        "queue a datagram requiring unsupported UDPP2P processing");
+  const auto pending_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (Net::Recv(encrypted, &untouched, 1, 0) == -1 &&
+         *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+         std::chrono::steady_clock::now() < pending_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Check(*Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP &&
+            Net::Recv(encrypted, &untouched, 1, 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP && untouched == '!',
+        "queued packets remain queued and unsupported instead of masquerading as empty");
+  Check(Net::SocketClose(encrypted) == 0 && Net::SocketClose(raw_sender) == 0,
+        "close UDPP2P readiness fixtures");
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
@@ -2152,7 +2405,7 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -2160,6 +2413,13 @@ int main(int, char**) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  TestMutexHandoff();
+  if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: mutex cases passed\n");
+    return 0;
+  }
 
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
@@ -2187,6 +2447,7 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestFsync();
   TestSaveTruncate();
   TestSaveWritev();
   TestAioBatches();

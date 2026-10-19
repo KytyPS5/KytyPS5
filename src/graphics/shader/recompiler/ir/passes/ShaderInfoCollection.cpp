@@ -340,6 +340,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
+				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -508,6 +509,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
+		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=

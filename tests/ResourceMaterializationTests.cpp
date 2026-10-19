@@ -874,7 +874,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
-void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask) {
+void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool counted_loop = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
   Program program;
@@ -898,54 +898,87 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask) {
     block.AddBranch(&target);
     if (other) block.AddBranch(other);
   };
-  const auto lane = emit(entry, ValueOpcode::GetBuiltin,
-      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
-  const auto active = emit(entry, ValueOpcode::INotEqual32, {lane, Value(0u)});
-  const auto initial_mask = independent_mask
-      ? emit(entry, ValueOpcode::IEqual32, {lane, Value(0u)}) : active;
-  const auto initial = emit(entry, ValueOpcode::SelectU32,
-      {initial_mask, Value(UINT32_MAX), Value(0u)});
+  Value lane, active, initial;
+  if (!counted_loop) {
+    lane = emit(entry, ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    active = emit(entry, ValueOpcode::INotEqual32, {lane, Value(0u)});
+    const auto initial_mask = independent_mask
+        ? emit(entry, ValueOpcode::IEqual32, {lane, Value(0u)}) : active;
+    initial = emit(entry, ValueOpcode::SelectU32,
+        {initial_mask, Value(UINT32_MAX), Value(0u)});
+  }
   program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
   const auto address = emit(entry, ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
   const auto count = emit(entry, ValueOpcode::LoadAddressU32,
       {address, Value(0u), Value(0u), Value(true)});
   count.Instruction()->SetFlags(MemoryFlags{.index = 0});
-  const auto rejected = emit(entry, ValueOpcode::ULessThanEqual32, {count, lane});
-  const auto accepted = emit(entry, ValueOpcode::LogicalNot, {rejected});
-  branch(entry, loop, emit(entry, ValueOpcode::LogicalAnd, {active, accepted}), &merge);
+  if (counted_loop) {
+    branch(entry, loop);
+  } else {
+    const auto rejected = emit(entry, ValueOpcode::ULessThanEqual32, {count, lane});
+    const auto accepted = emit(entry, ValueOpcode::LogicalNot, {rejected});
+    branch(entry, loop, emit(entry, ValueOpcode::LogicalAnd, {active, accepted}), &merge);
+  }
 
   // A nonempty traversal contains a varying loop-carried value. Its cycle must
   // remain unknown; only the proven empty traversal can select the bypass arm.
   auto &carried = loop.AppendNewInst(ValueOpcode::Phi);
   carried.SetFlags(Type::U32);
   const auto next = emit(body, ValueOpcode::IAdd32, {Value(&carried), Value(1u)});
-  carried.AddPhiOperand(&entry, lane);
+  carried.AddPhiOperand(&entry, counted_loop ? Value(0u) : lane);
   carried.AddPhiOperand(&body, next);
-  branch(loop, body, emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)}), &merge);
+  const auto condition = counted_loop
+      ? emit(loop, ValueOpcode::ULessThan32, {Value(&carried), count})
+      : emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)});
+  branch(loop, counted_loop ? use : body, condition, &merge);
   loop.terminator.loop_header = true;
   loop.terminator.continue_block = &body;
   loop.terminator.merge_block = &merge;
   branch(body, loop);
-  auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
-  selected.SetFlags(Type::U32);
-  selected.AddPhiOperand(&entry, initial);
-  selected.AddPhiOperand(&loop, Value(&carried));
-  const auto valid = emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(UINT32_MAX)});
-  branch(merge, use, emit(merge, ValueOpcode::LogicalAnd, {active, valid}), &exit);
-  branch(use, exit);
+  if (counted_loop) {
+    branch(merge, exit);
+    branch(use, body);
+  } else {
+    auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
+    selected.SetFlags(Type::U32);
+    selected.AddPhiOperand(&entry, initial);
+    selected.AddPhiOperand(&loop, Value(&carried));
+    const auto valid = emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(UINT32_MAX)});
+    branch(merge, use, emit(merge, ValueOpcode::LogicalAnd, {active, valid}), &exit);
+    branch(use, exit);
+  }
   DescriptorSource source;
-  source.dwords = {Value(0x8000u), Value(1u << 16u), Value(16u), Value(3u << 28u)};
+  const auto descriptor_address = emit(use, ValueOpcode::GetAddressResource,
+      {Value(0x2000u), Value(0u)});
+  for (uint32_t i = 0; i < 4; ++i) {
+    const auto index = static_cast<uint32_t>(program.memory_info.size());
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+    source.dwords[i] = emit(use, ValueOpcode::LoadAddressU32,
+        {descriptor_address, Value(i * 4u), Value(0u), Value(true)});
+    source.dwords[i].Instruction()->SetFlags(MemoryFlags{.index = index});
+  }
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .read = true});
+  const auto buffer_index = static_cast<uint32_t>(program.memory_info.size());
   program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
   const auto buffer = emit(use, ValueOpcode::GetBufferResource,
       {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
   emit(use, ValueOpcode::LoadBufferU32, {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
-      .Instruction()->SetFlags(MemoryFlags{.index = 1});
+      .Instruction()->SetFlags(MemoryFlags{.index = buffer_index});
   auto plan = ExtractResourcePlan(program);
-  struct Reads { uint32_t count = 0; bool clean = true; } reads;
+  struct Reads { uint32_t count = 0; bool clean = true; uint32_t descriptors = 0; } reads;
   const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        constexpr std::array<uint32_t, 4> descriptor{0x8000u, 1u << 16u, 16u,
+                                                   (3u << 28u) | 0x4dfacu};
+        if (address < 0x2000u || address >= 0x2010u || address % 4u || words.size() != 1)
+          return false;
+        ++static_cast<Reads *>(data)->descriptors;
+        words[0] = descriptor[(address - 0x2000u) / 4u];
+        return true;
+      },
       .userdata = &reads,
       .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
         const auto &reads = *static_cast<Reads *>(data);
@@ -957,9 +990,11 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask) {
   ResourceSpecialization specialization;
   for (const auto state : {Reads{0u, true}, Reads{4u, true}, Reads{0u, false}, Reads{0u, true}}) {
     reads = state;
-    uint32_t condition = 99;
-    Check(!SrtWalker(plan, runtime).Evaluate(plan.control_flow[3].condition, condition),
-          "direct merge evaluation used missing or previous runtime reachability");
+    if (!counted_loop) {
+      uint32_t condition = 99;
+      Check(!SrtWalker(plan, runtime).Evaluate(plan.control_flow[3].condition, condition),
+            "direct merge evaluation used missing or previous runtime reachability");
+    }
     Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "partial traversal proof rejected a valid resource snapshot");
     const bool inactive = !independent_mask && reads.clean && reads.count == 0u;
@@ -967,6 +1002,8 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask) {
           "empty traversal kept its descriptor or an uncertain traversal lost it");
     Check(specialization.buffers[0].zero_stride_oob == inactive,
           "inactive traversal did not expose dead vector reads to specialization");
+    Check(reads.descriptors == (inactive ? 0u : 4u),
+          "inactive traversal read its descriptor or an uncertain traversal skipped it");
     if (inactive) {
       Check(!snapshot.specialization_reads.empty(), "empty traversal lost its clean scalar read");
       for (const auto &read : snapshot.specialization_reads)
@@ -1331,6 +1368,7 @@ int main() {
   TestFiniteImageRefreshReusesScalarReads();
   for (const bool independent_mask : {false, true})
     TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask);
+  TestEmptyTraversalSkipsUnmappedDescriptor(false, true);
   TestCyclicControlPredicatesRemainUnknown();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();

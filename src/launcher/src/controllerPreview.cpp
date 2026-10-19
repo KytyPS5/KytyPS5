@@ -20,6 +20,34 @@ constexpr struct {
     {SDL_GAMEPAD_BUTTON_START, "Options"},
 };
 
+// Host-side names; they must match PAD_SOURCES in hostInput.cpp.
+constexpr struct {
+	SDL_GamepadButton button;
+	const char*       name;
+} RAW_BUTTONS[] = {
+    {SDL_GAMEPAD_BUTTON_SOUTH, "South"},
+    {SDL_GAMEPAD_BUTTON_EAST, "East"},
+    {SDL_GAMEPAD_BUTTON_WEST, "West"},
+    {SDL_GAMEPAD_BUTTON_NORTH, "North"},
+    {SDL_GAMEPAD_BUTTON_BACK, "Back"},
+    {SDL_GAMEPAD_BUTTON_GUIDE, "Guide"},
+    {SDL_GAMEPAD_BUTTON_START, "Start"},
+    {SDL_GAMEPAD_BUTTON_LEFT_STICK, "LeftStick"},
+    {SDL_GAMEPAD_BUTTON_RIGHT_STICK, "RightStick"},
+    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "LeftShoulder"},
+    {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "RightShoulder"},
+    {SDL_GAMEPAD_BUTTON_DPAD_UP, "DpadUp"},
+    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, "DpadDown"},
+    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, "DpadLeft"},
+    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "DpadRight"},
+    {SDL_GAMEPAD_BUTTON_MISC1, "Misc1"},
+    {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, "RightPaddle1"},
+    {SDL_GAMEPAD_BUTTON_LEFT_PADDLE1, "LeftPaddle1"},
+    {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, "RightPaddle2"},
+    {SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, "LeftPaddle2"},
+    {SDL_GAMEPAD_BUTTON_TOUCHPAD, "Touchpad"},
+};
+
 double Axis(SDL_Gamepad* gamepad, SDL_GamepadAxis axis) {
 	const int value = SDL_GetGamepadAxis(gamepad, axis);
 	return value / (value < 0 ? 32768.0 : 32767.0);
@@ -100,6 +128,7 @@ void ControllerPreview::UpdateRunning() {
 		SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
 	}
 	m_pressed.clear();
+	m_raw_pressed.clear();
 	m_left_stick  = {};
 	m_right_stick = {};
 	m_device_name.clear();
@@ -131,12 +160,25 @@ void ControllerPreview::Refresh() {
 	}
 
 	QSet<QString> pressed;
+	QSet<QString> raw;
 	QPointF       left;
 	QPointF       right;
 	QString       name;
 	if (!m_gamepads.isEmpty()) {
 		auto* gamepad = m_gamepads.first();
 		name          = QString::fromUtf8(SDL_GetGamepadName(gamepad));
+		for (const auto& binding: RAW_BUTTONS) {
+			if (SDL_GamepadHasButton(gamepad, binding.button) &&
+			    SDL_GetGamepadButton(gamepad, binding.button)) {
+				raw.insert(QString::fromLatin1(binding.name));
+			}
+		}
+		if (Axis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 0.5) {
+			raw.insert(QStringLiteral("LeftTrigger"));
+		}
+		if (Axis(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 0.5) {
+			raw.insert(QStringLiteral("RightTrigger"));
+		}
 		for (const auto& binding: BUTTONS) {
 			if (SDL_GetGamepadButton(gamepad, binding.button)) {
 				pressed.insert(QString::fromLatin1(binding.control));
@@ -180,9 +222,10 @@ void ControllerPreview::Refresh() {
 			pressed.insert(QStringLiteral("TouchPadRight"));
 		}
 	}
-	if (pressed != m_pressed || left != m_left_stick || right != m_right_stick ||
-	    name != m_device_name) {
+	if (pressed != m_pressed || raw != m_raw_pressed || left != m_left_stick ||
+	    right != m_right_stick || name != m_device_name) {
 		m_pressed     = pressed;
+		m_raw_pressed = raw;
 		m_left_stick  = left;
 		m_right_stick = right;
 		m_device_name = name;

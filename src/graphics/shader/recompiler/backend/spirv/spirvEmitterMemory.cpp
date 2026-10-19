@@ -1075,6 +1075,63 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                       const MemoryResourceAccess& resource, uint32_t components) {
+	auto&      state  = ctx.state;
+	const auto scalar = [&] {
+		std::array<uint32_t, 4> values {};
+		for (uint32_t component = 0; component < components; component++) {
+			values[component] =
+			    LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
+		}
+		return ConstructU32Composite(state, components, values);
+	};
+	if (!mem.IsCoherentBufferPairLoad(inst.GetOpcode())) return scalar();
+
+	const auto first  = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto second = ByteAddress(ctx, inst, RebaseRawComponent(mem, 1), resource.byte_offset);
+	const auto wide =
+	    PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3],
+	                                       resource.non_uniform ? resource.descriptor_index : 0u);
+	const auto index =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, ConstantU32(state, 3));
+	auto atomic =
+	    Binary(state, spv::OpIEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 7)),
+	           ConstantU32(state, 0));
+	atomic = AndCondition(state, atomic,
+	                      Binary(state, spv::OpIEqual, TypeBool(state), second,
+	                             EmitAddU32(state, first, ConstantU32(state, 4))));
+	// The 64-bit alias requires the entire pair; partial and swizzled reads retain DWORD bounds.
+	atomic = AndCondition(state, atomic, EmitMemoryElementInBounds(state, wide, index));
+	const auto atomic_label = state.builder.AllocateId(), scalar_label = state.builder.AllocateId();
+	const auto merge = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, atomic, atomic_label, scalar_label);
+	EmitLabel(state, atomic_label);
+	const auto pointer = EmitStorageBufferElementPointer(
+	    state, wide, index, TypeStorageBufferElementPointer(state, 64));
+	const auto snapshot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU64(state), snapshot, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsAcquireMask |
+	                                                 spv::MemorySemanticsUniformMemoryMask));
+	const std::array<uint32_t, 4> words {
+	    EmitCompositeExtractU64(state, snapshot, IR::Value(0u)),
+	    EmitCompositeExtractU64(state, snapshot, IR::Value(1u))};
+	const auto pair = ConstructU32Composite(state, 2, words);
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, scalar_label);
+	const auto fallback    = scalar();
+	const auto scalar_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, merge);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, TypeU32Composite(state, 2), result, pair, atomic_label,
+	                          fallback, scalar_exit);
+	return result;
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1100,12 +1157,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 				    return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
 			    }
 			    if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
-			    std::array<uint32_t, 4> values {};
-			    for (uint32_t component = 0; component < components; component++) {
-				    values[component] =
-				        LoadWordPrepared(ctx, inst, RebaseRawComponent(selected, component), resource);
-			    }
-			    return ConstructU32Composite(state, components, values);
+			    return LoadRawBuffer(ctx, inst, selected, resource, components);
 		    });
 	    });
 }

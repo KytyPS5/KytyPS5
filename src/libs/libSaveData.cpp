@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -300,15 +301,23 @@ static std::string memory_dir_name(uint32_t slot_id) {
 	return "sce_sdmemory" + (slot_id == 0 ? std::string() : std::to_string(slot_id));
 }
 
+static std::filesystem::path save_user_directory(std::string_view title_id, int32_t user_id) {
+	auto directory = std::filesystem::path(SAVE_DATA_DIR);
+	if (Config::IsGuestUserId(user_id)) {
+		directory /= std::filesystem::path("[users]") / std::to_string(user_id);
+	}
+	return directory / title_id;
+}
+
 static std::filesystem::path save_directory(std::string_view title_id, std::string_view dir_name,
                                             int32_t user_id) {
-	const auto directory = std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name;
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		if (dir_name == memory_dir_name(slot)) {
-			return directory / std::to_string(user_id);
+			return std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name /
+			       std::to_string(user_id);
 		}
 	}
-	return directory;
+	return save_user_directory(title_id, user_id) / dir_name;
 }
 
 static std::filesystem::path memory_directory(int32_t user_id, uint32_t slot_id) {
@@ -590,7 +599,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string title_id = cond->title_id != nullptr ? cond->title_id->data : get_title_id();
-	const auto        root     = std::filesystem::path(SAVE_DATA_DIR) / title_id;
+	const auto        root     = save_user_directory(title_id, cond->user_id);
 	std::vector<std::string> dir_list;
 
 	if (Common::File::IsDirectoryExisting(root)) {

@@ -57,6 +57,7 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -94,6 +95,7 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
+	::printf("  --perf-overlay <true|false>           Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
@@ -378,6 +380,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--keyboard-player") {
+			if (!ParseUint32(value, options.config.keyboard_player) ||
+			    options.config.keyboard_player > static_cast<uint32_t>(Config::MAX_PLAYERS)) {
+				::printf("invalid keyboard player: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -476,6 +484,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--skip-notice-screen") {
 			if (!ParseBool(value, options.config.skip_notice_screen)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--perf-overlay") {
+			if (!ParseBool(value, options.config.perf_overlay_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

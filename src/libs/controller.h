@@ -68,13 +68,18 @@ inline int controller_get_axis(int min, int max, int value) {
 
 void Connect(int id);
 void Disconnect(int id);
+// Moves the keyboard to the next player (shared with player 1, then 1-4) while the game runs.
+void CycleKeyboardPlayer();
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
+void ToggleGyroEmulation(int id);
 void ResetInputState();
 int  GetActiveControllerId();
+// True when the player has a keyboard or gamepad assigned.
+bool IsPlayerConnected(int player);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

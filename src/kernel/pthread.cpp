@@ -343,14 +343,21 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 #endif
 
 struct PthreadMutexPrivate {
+	struct Waiter {
+		Pthread                 thread = nullptr;
+		std::condition_variable cv;
+		Waiter*                 previous = nullptr;
+		Waiter*                 next     = nullptr;
+	};
 	uint8_t                 reserved[256];
 	std::string             name;
 	std::mutex              m;
-	std::condition_variable cv;
 	Pthread                 owner     = nullptr;
 	uint32_t                count     = 0;
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
+	Waiter*                 first_waiter = nullptr;
+	Waiter*                 last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1242,6 +1249,20 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
+                                     PthreadMutexPrivate::Waiter* waiter) {
+	if (waiter->previous != nullptr) {
+		waiter->previous->next = waiter->next;
+	} else {
+		mutex->first_waiter = waiter->next;
+	}
+	if (waiter->next != nullptr) {
+		waiter->next->previous = waiter->previous;
+	} else {
+		mutex->last_waiter = waiter->previous;
+	}
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1258,54 +1279,53 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			mutex->count++;
 			return OK;
 		}
-		if (timeout_us != nullptr) {
-			if (*timeout_us > 0) {
-				mutex->cv.wait_for(lock, std::chrono::microseconds(*timeout_us));
-			}
-			return ETIMEDOUT;
-		}
 		return EDEADLK;
 	}
 
-	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
-	} else if (*timeout_us == 0) {
-		if (mutex->owner != nullptr) {
-			return ETIMEDOUT;
-		}
-	} else {
-		const auto deadline =
-		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
-		while (mutex->owner != nullptr) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				return ETIMEDOUT;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			mutex->cv.wait_for(lock, poll);
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
+	if (mutex->owner == nullptr) {
+		mutex->owner = self;
+		mutex->count = 1;
+		return OK;
+	}
+	if (timeout_us != nullptr && *timeout_us == 0) {
+		return ETIMEDOUT;
 	}
 
-	mutex->owner = self;
-	mutex->count = 1;
-	return OK;
+	// Guest mutex waits are not cancellation points, unlike the host condition wait.
+	int previous_cancel_state = 0;
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state);
+	PthreadMutexPrivate::Waiter waiter;
+	waiter.thread   = self;
+	waiter.previous = mutex->last_waiter;
+	if (mutex->last_waiter != nullptr) {
+		mutex->last_waiter->next = &waiter;
+	} else {
+		mutex->first_waiter = &waiter;
+	}
+	mutex->last_waiter = &waiter;
+	const auto deadline = timeout_us != nullptr
+	                          ? std::chrono::steady_clock::now() +
+	                                std::chrono::microseconds(*timeout_us)
+	                          : std::chrono::steady_clock::time_point::max();
+	int result = OK;
+	while (mutex->owner != self) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			NativeMutexRemoveWaiter(mutex, &waiter);
+			result = ETIMEDOUT;
+			break;
+		}
+		waiter.cv.wait_until(lock, std::min(deadline, now +
+		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		if (mutex->owner != self) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
+	lock.unlock();
+	pthread_setcancelstate(previous_cancel_state, nullptr);
+	return result;
 }
 
 static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
@@ -1358,10 +1378,16 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 		return OK;
 	}
 
-	mutex->owner = nullptr;
-	mutex->count = 0;
-	lock.unlock();
-	mutex->cv.notify_one();
+	if (auto* waiter = mutex->first_waiter) {
+		NativeMutexRemoveWaiter(mutex, waiter);
+		// Transfer ownership in FIFO order before waking the selected waiter.
+		mutex->owner = waiter->thread;
+		mutex->count = 1;
+		waiter->cv.notify_one();
+	} else {
+		mutex->owner = nullptr;
+		mutex->count = 0;
+	}
 
 	return OK;
 }

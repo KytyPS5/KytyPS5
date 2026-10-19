@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -23,6 +24,9 @@ std::vector<Rumble>                rumble;
 std::vector<Rumble>                haptics;
 std::vector<std::array<Uint8, 32>> effects;
 bool                               haptics_handles_rumble = false;
+std::array<Rumble, 6>               pad_rumble {};
+std::vector<int>                    closed_pads;
+std::array<std::array<Uint8, 3>, 6> pad_colors {};
 } // namespace
 
 namespace Fake {
@@ -30,14 +34,15 @@ Uint64 GetTicks() {
 	return now;
 }
 SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 2 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
+	return id >= 1 && id <= 5 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
 	                          : nullptr;
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad*) {
 	return SDL_GAMEPAD_TYPE_PS5;
 }
-bool RumbleGamepad(SDL_Gamepad*, Uint16 large, Uint16 small, Uint32 duration) {
+bool RumbleGamepad(SDL_Gamepad* pad, Uint16 large, Uint16 small, Uint32 duration) {
 	rumble.push_back({large, small, duration});
+	pad_rumble[reinterpret_cast<uintptr_t>(pad)] = rumble.back();
 	return true;
 }
 bool SendGamepadEffect(SDL_Gamepad*, const void* data, int size) {
@@ -47,7 +52,8 @@ bool SendGamepadEffect(SDL_Gamepad*, const void* data, int size) {
 	effects.push_back(effect);
 	return true;
 }
-bool SetGamepadLED(SDL_Gamepad*, Uint8, Uint8, Uint8) {
+bool SetGamepadLED(SDL_Gamepad* pad, Uint8 r, Uint8 g, Uint8 b) {
+	pad_colors[reinterpret_cast<uintptr_t>(pad)] = {r, g, b};
 	return true;
 }
 bool GamepadHasSensor(SDL_Gamepad*, SDL_SensorType) {
@@ -56,7 +62,9 @@ bool GamepadHasSensor(SDL_Gamepad*, SDL_SensorType) {
 bool SetGamepadSensorEnabled(SDL_Gamepad*, SDL_SensorType, bool) {
 	return true;
 }
-void CloseGamepad(SDL_Gamepad*) {}
+void CloseGamepad(SDL_Gamepad* pad) {
+	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
+}
 void Delay(Uint32) {}
 } // namespace Fake
 
@@ -368,6 +376,10 @@ void TestIndependentOutputsAndPadSwitch() {
 	      "speaker volume resent controller effects");
 	Connect(2);
 	Disconnect(1);
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID,
+	      "disconnecting player 1 stole player 2's pad");
+	Disconnect(2);
+	Connect(2);
 	Check(GetActiveControllerId() == 2, "active controller did not change");
 	haptics.clear();
 	effects.clear();
@@ -392,6 +404,126 @@ void TestIndependentOutputsAndPadSwitch() {
 		Check(request.large == 0 && request.small == 0,
 		      "released controller retained a cached vibration");
 	}
+}
+
+void TestPlayerUserIds() {
+	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
+	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
+	          !Config::IsConfiguredUserIdValid(254) && !Config::IsConfiguredUserIdValid(255),
+	      "configured user IDs did not reserve a valid range for guests");
+	Config::ConfigOptions options;
+	options.user_id = Config::MAX_USER_ID;
+	Config::Load(options);
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		Check(Config::GetPlayerFromUserId(Config::GetPlayerUserId(player)) == player,
+		      "player user ID did not round-trip at the upper limit");
+	}
+	Check(Config::GetPlayerUserId(3) == std::numeric_limits<int32_t>::max() &&
+	          Config::GetPlayerFromUserId(-1) == -1,
+	      "guest user ID overflowed or accepted an unknown user");
+	Config::Load(Config::ConfigOptions {});
+}
+
+void TestMultiplayerRouting() {
+	Controller controller;
+	for (int player = 1; player < Config::MAX_PLAYERS; player++) {
+		Check(PadOpen(Config::GetPlayerUserId(player), 0, 0, nullptr) == player + 1,
+		      "a guest could not open its own pad port");
+	}
+	for (int id = 2; id <= 5; id++) {
+		Connect(id);
+	}
+	Connect(2); // Duplicate device reports must not consume another port.
+	const auto read = [](int handle) {
+		PadData data {};
+		Check(PadReadState(handle, &data) == OK, "player pad read failed");
+		return data;
+	};
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	SetButton(2, PAD_BUTTON_CIRCLE, true);
+	SetButton(5, PAD_BUTTON_TRIANGLE, true);
+	Check(read(1).buttons == PAD_BUTTON_CROSS && read(2).buttons == PAD_BUTTON_CIRCLE &&
+	          read(3).buttons == 0 && read(4).buttons == 0,
+	      "physical pads did not route independently or overflow reached a player");
+
+	SetRumble(100, 50);
+	CycleKeyboardPlayer(); // Dedicated player 1; physical pad 1 waits.
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID &&
+	          read(2).buttons == PAD_BUTTON_CIRCLE && pad_rumble[1].large == 0 &&
+	          pad_rumble[1].small == 0,
+	      "keyboard reassignment changed an unaffected player or left pad output "
+	      "running");
+	for (int mode = 2; mode <= Config::MAX_PLAYERS; mode++) {
+		CycleKeyboardPlayer();
+	}
+	CycleKeyboardPlayer(); // Shared player 1; all original pads must return.
+	ResetInputState();
+	for (int id = 1; id <= 5; id++) {
+		SetButton(id, 1u << id, true);
+	}
+	for (int handle = 1; handle <= Config::MAX_PLAYERS; handle++) {
+		Check(read(handle).buttons == (1u << handle),
+		      "cycling keyboard players lost or duplicated a connected pad");
+	}
+
+	// Moving the keyboard clears its held input from the old player.
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, true);
+	CycleKeyboardPlayer();
+	CycleKeyboardPlayer();
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, true);
+	CycleKeyboardPlayer(); // Keyboard now moves from player 2 to player 3.
+	Check((read(2).buttons & PAD_BUTTON_TRIANGLE) == 0,
+	      "moving the keyboard retained a held button on its old player");
+	CycleKeyboardPlayer();
+	CycleKeyboardPlayer();
+	Disconnect(2);
+	SetButton(5, PAD_BUTTON_SQUARE, true);
+	Check(read(2).buttons == PAD_BUTTON_SQUARE && GetActiveControllerId() == 1,
+	      "waiting pad did not fill a free slot or an unaffected pad moved");
+	Disconnect(99);
+	Check(PadCheckHandle(std::numeric_limits<int>::min()) == PAD_ERROR_INVALID_HANDLE &&
+	          PadClose(std::numeric_limits<int>::max()) == PAD_ERROR_INVALID_HANDLE,
+	      "an extreme handle aliased a player port");
+	closed_pads.clear();
+	EmergencyShutdown();
+	std::sort(closed_pads.begin(), closed_pads.end());
+	Check(closed_pads == std::vector<int> {1, 3, 4, 5},
+	      "shutdown did not close each registered host pad exactly once");
+}
+
+void TestDedicatedKeyboardOutputs() {
+	Config::ConfigOptions options;
+	options.keyboard_player  = 1;
+	options.controller_color = Config::ControllerColor {30, 40, 50};
+	Config::Load(options);
+	Initialize();
+	PadInit();
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		Check(PadOpen(Config::GetPlayerUserId(player), 0, 0, nullptr) == player + 1,
+		      "dedicated keyboard port did not open");
+	}
+	Connect(1);
+	Connect(2);
+	const PadVibrationParam request {100, 50};
+	Check(PadSetVibration(3, &request) == OK, "player three vibration failed");
+	SetButton(2, PAD_BUTTON_CROSS, true);
+	CycleKeyboardPlayer(); // Pad 1 moves from player 2 to player 1.
+	PadData data {};
+	Check(GetActiveControllerId() == 1 && pad_colors[1] == *options.controller_color,
+	      "moving a pad to an earlier slot cleared its configured lightbar");
+	Check(PadReadState(3, &data) == OK && data.buttons == PAD_BUTTON_CROSS &&
+	          pad_rumble[2].large == 100 * 257 && pad_rumble[2].small == 50 * 257,
+	      "keyboard reassignment reset an unaffected player's input or output");
+	haptics_handles_rumble = true;
+	SetRumble(200, 100);
+	for (int mode = 0; mode < 4; mode++) {
+		CycleKeyboardPlayer();
+	}
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID && haptics.back().large == 0 &&
+	          haptics.back().small == 0 && haptics.back().duration == 0,
+	      "moving player one's pad retained its DualSense vibration request");
+	Shutdown();
+	Config::Load(Config::ConfigOptions {});
 }
 
 void TestTriggerEffectState() {
@@ -553,6 +685,7 @@ void TestTriggerEffectState() {
 
 int main() {
 	Config::Initialize();
+	TestPlayerUserIds();
 	TestPadPortOwnership();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
@@ -561,6 +694,8 @@ int main() {
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
 	TestTriggerEffectState();
+	TestMultiplayerRouting();
+	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();
 	return 0;
 }

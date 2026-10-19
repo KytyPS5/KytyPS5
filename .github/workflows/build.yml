@@ -113,7 +113,7 @@ jobs:
         shell: cmd
         run: |
           cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
@@ -121,7 +121,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -202,7 +202,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
@@ -212,7 +212,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -388,7 +388,7 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
@@ -397,7 +397,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -407,12 +407,12 @@ jobs:
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/linux/install/launcher
+          file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
           test -x _Build/linux/install/kyty_updater
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
-          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
           while IFS= read -r -d '' binary; do
             while read -r dependency; do
               test -e "_Build/linux/install/lib/$dependency"
@@ -421,8 +421,8 @@ jobs:
                 sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
             )
           done < <(
-            find _Build/linux/install/launcher _Build/linux/install/plugins \
-              -type f \( -name launcher -o -name '*.so' \) -print0
+            find _Build/linux/install/kyty_launcher _Build/linux/install/plugins \
+              -type f \( -name kyty_launcher -o -name '*.so' \) -print0
           )
           _Build/linux/install/kyty_emulator --help > /dev/null
 
@@ -497,7 +497,7 @@ jobs:
           linux_dir="artifacts/KytyPS5-Linux-x86_64"
           test -d "$linux_dir"
           chmod a+x \
-            "$linux_dir/launcher" \
+            "$linux_dir/kyty_launcher" \
             "$linux_dir/kyty_emulator" \
             "$linux_dir/kyty_updater"
           tar -C "$linux_dir" -czf \

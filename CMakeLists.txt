@@ -350,7 +350,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxhash
+	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
@@ -526,6 +526,10 @@ add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
 
+add_executable(host_input_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputTests.cpp")
+target_link_libraries(host_input_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(host_input_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
@@ -644,6 +648,7 @@ if(BUILD_TESTING)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
+	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -723,6 +728,7 @@ if(BUILD_TESTING)
 		ngs2_sampler_tests
 		pad_haptics_tests
 		controller_settings_tests
+		host_input_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests
@@ -759,6 +765,14 @@ add_custom_target(kyty_trophy_sound
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
+
+add_custom_target(kyty_touch_cursors
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/cursors"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_touch_cursors)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

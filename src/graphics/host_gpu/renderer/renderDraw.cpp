@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -507,14 +508,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
-		    !cache.ClearMeta(metadata.range.address)) {
-			EXIT("failed to acquire HTile metadata for a depth clear\n");
-		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		depth.load_clear_aspects = {};
+		if (depth.depth_clear_enable || meta_clear)
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+		// Apply pending clears to compressed stencil as well as depth.
+		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -536,7 +538,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("depth attachment feedback loop is not supported by the host\n");
+			}
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
@@ -564,9 +569,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		attachment.depth_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eStencil);
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -1057,7 +1064,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     state.ps_input_info.ps_sample_mask_export_enable);
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
-	if (depth.depth_load_clear_enable) {
+	if (depth.load_clear_aspects) {
 		m_context.GetCommandScheduler().BeginRendering(rendering);
 	}
 	auto& cache = m_context.GetTextureCache();
@@ -1227,6 +1234,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

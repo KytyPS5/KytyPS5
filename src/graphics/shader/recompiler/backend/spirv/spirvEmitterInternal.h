@@ -420,6 +420,7 @@ void EnsureLdsStorage(EmitterState& state);
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
+	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;

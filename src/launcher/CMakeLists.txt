@@ -1,5 +1,5 @@
 
-find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
@@ -21,7 +21,8 @@ add_executable(launcher WIN32
 )
 
 
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
+	LibAtrac9 kyty_git_version common)
 if(LINUX)
 	find_package(Qt6 COMPONENTS DBus REQUIRED)
 	target_link_libraries(launcher Qt6::DBus)
@@ -76,7 +77,7 @@ if(WIN32)
 	)
 endif()
 
-set(launcher_name "launcher")
+set(launcher_name "kyty_launcher")
 if(APPLE)
 	set(launcher_name "KytyPS5")
 endif()
@@ -101,10 +102,20 @@ install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
 
+if(NOT APPLE)
+	# Older releases require the previous executable name when validating updates.
+	install(CODE "
+		file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
+			TYPE PROGRAM RENAME \"launcher${CMAKE_EXECUTABLE_SUFFIX}\"
+			FILES \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}${CMAKE_EXECUTABLE_SUFFIX}\")
+	")
+endif()
+
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
+	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
 	if(NOT KYTY_MACDEPLOYQT)

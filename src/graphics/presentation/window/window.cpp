@@ -1,6 +1,4 @@
-#include "graphics/presentation/window.h"
-
-#include <SDL3/SDL.h>
+﻿#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -8,14 +6,15 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -24,13 +23,14 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -54,25 +54,6 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
-static uint32_t ControllerButtonToPadButton(int button) {
-	switch (button) {
-		case SDL_GAMEPAD_BUTTON_SOUTH: return Controller::PAD_BUTTON_CROSS;
-		case SDL_GAMEPAD_BUTTON_EAST: return Controller::PAD_BUTTON_CIRCLE;
-		case SDL_GAMEPAD_BUTTON_WEST: return Controller::PAD_BUTTON_SQUARE;
-		case SDL_GAMEPAD_BUTTON_NORTH: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_GAMEPAD_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
-		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return Controller::PAD_BUTTON_L3;
-		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return Controller::PAD_BUTTON_R3;
-		case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return Controller::PAD_BUTTON_L1;
-		case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return Controller::PAD_BUTTON_R1;
-		case SDL_GAMEPAD_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
-		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
-		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
-		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
-		default: return 0;
-	}
-}
 
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
@@ -268,6 +249,15 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		}
 
 		HostInputMouseButton(mouse_button, mb.down);
+		if (!mb.touch && mb.left) {
+			HostInputMouseTouchPad(mb.down, static_cast<float>(mb.x), static_cast<float>(mb.y));
+		}
+	} else if (mb.motion && !mb.touch) {
+		if (mb.left) {
+			HostInputMouseTouchPad(true, static_cast<float>(mb.x), static_cast<float>(mb.y));
+		} else {
+			HostInputMouseMotion(static_cast<float>(mb.x), static_cast<float>(mb.y));
+		}
 	}
 }
 
@@ -316,6 +306,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 
 	if (f.removed) {
+		HostInputDisconnectGamepad(f.id);
 		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
 			Controller::Disconnect(f.id);
 			SDL_CloseGamepad(pad);
@@ -323,30 +314,22 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 
 	if (f.down || f.up) {
-		const auto button = ControllerButtonToPadButton(f.button);
-		if (button != 0) {
-			Controller::SetButton(f.id, button, f.down);
-		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
-			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
-			// blocks games that require it. Use their Back/Select button as a centered click.
-			auto* pad = SDL_GetGamepadFromID(f.id);
-			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
-				if (f.down) {
-					Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
-				}
-				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
-				if (f.up) {
-					Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
-				}
-			}
-		}
+		HostInputPadButton(f.id, f.button, f.down);
 	}
 
 	if (f.axis) {
-		const auto axis = ControllerAxisFromSdl(f.axis_id);
-		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
+		if (f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
+		    f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+			HostInputPadTrigger(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+		} else if (const auto axis = ControllerAxisFromSdl(f.axis_id);
+		           axis != Controller::Axis::AxisMax) {
+			const int value = ControllerAxisValueFromSdl(f.axis_id, f.axis_value);
+			if ((f.axis_id == SDL_GAMEPAD_AXIS_LEFTX || f.axis_id == SDL_GAMEPAD_AXIS_LEFTY) &&
+			    HostInputGamepadAxis(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFTX, value)) {
+				return;
+			}
+			Controller::SetAxis(f.id, axis, value);
 		}
 	}
 }
@@ -431,6 +414,7 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 		case SDL_EVENT_WINDOW_MOUSE_LEAVE:
 			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
+			HostInputSetTouchPadMode(false);
 			break;
 		case SDL_EVENT_WINDOW_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
@@ -475,12 +459,37 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
-	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
-	    event->key.key == SDLK_F7) {
-		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
-			HostInputToggleMouseToJoystick();
+	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
+		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
+		switch (event->key.key) {
+			case SDLK_F7:
+				if (pressed) {
+					HostInputToggleMouseToJoystick();
+				}
+				return;
+			case SDLK_F8:
+				if (pressed) {
+					Controller::CycleKeyboardPlayer();
+				}
+				return;
+#if defined(__APPLE__)
+			case SDLK_P:
+				if ((event->key.mod & SDL_KMOD_GUI) == 0) {
+					break;
+				}
+				[[fallthrough]];
+#endif
+			case SDLK_F2:
+				if (pressed) {
+					if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {
+						TogglePerformanceOverlayDetails();
+					} else {
+						TogglePerformanceOverlay();
+					}
+				}
+				return;
+			default: break;
 		}
-		return;
 	}
 	if (ProcessSystemOverlayInput(*event)) {
 		return;

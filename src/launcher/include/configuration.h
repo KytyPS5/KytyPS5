@@ -48,11 +48,14 @@ struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
+	int     keyboard_player     = 0;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
+		s->setValue("controller_keyboard_player", keyboard_player);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -65,6 +68,8 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
+		                         Config::MAX_PLAYERS);
 	}
 };
 
@@ -125,6 +130,7 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
+	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	int                    vblank_frequency            = 60;
@@ -163,6 +169,7 @@ public:
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
+		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		vblank_frequency            = other.vblank_frequency;

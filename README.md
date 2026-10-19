@@ -275,11 +275,11 @@ From the repository root, follow the launcher configure, build and install steps
 [Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
 Fedora's packaged Qt 6 automatically.
 
-Run `./_Build/linux/install/launcher` on regular Fedora or inside the container. To launch a
+Run `./_Build/linux/install/kyty_launcher` on regular Fedora or inside the container. To launch a
 container build from the host, leave the container with `exit`, then run from the repository root:
 
 ```bash
-distrobox enter kyty-build -- ./_Build/linux/install/launcher
+distrobox enter kyty-build -- ./_Build/linux/install/kyty_launcher
 ```
 
 Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
@@ -345,7 +345,7 @@ Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
 Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
+`kyty_launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
 compiler per platform, so on Linux configure from the command line as shown above.
 
 Before using it:
@@ -365,11 +365,11 @@ Update your graphics driver before reporting rendering problems.
 To use the graphical launcher:
 
 ```powershell
-.\_Build\windows\install\launcher.exe
+.\_Build\windows\install\kyty_launcher.exe
 ```
 
 ```bash
-./_Build/linux/install/launcher
+./_Build/linux/install/kyty_launcher
 ```
 
 ```bash

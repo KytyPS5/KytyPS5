@@ -891,6 +891,7 @@ struct P2pEndpoint {
 	uint16_t virtual_port   = 0;
 	int      nonblocking    = 0;
 	int      broadcast      = 0;
+	int      use_crypto     = 0;
 	int      send_buffer    = 9216;
 	int      receive_buffer = 40 * 1024;
 };
@@ -1095,6 +1096,7 @@ static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
 		case 0x1001: return &endpoint.send_buffer;
 		case 0x1002: return &endpoint.receive_buffer;
 		case 0x1200: return &endpoint.nonblocking;
+		case 0x20000: return &endpoint.use_crypto;
 		default: return nullptr;
 	}
 }
@@ -2096,19 +2098,15 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 		return -1;
 	}
 
-#if defined(_WIN32)
-	if (::shutdown(socket, how) == SOCKET_ERROR) {
+	if (::shutdown(socket, how) != 0) {
 		return SetHostSocketError();
 	}
+#if defined(_WIN32)
 	if (how == SD_RECEIVE || how == SD_BOTH) {
 		transport->receive_shutdown.store(true, std::memory_order_relaxed);
 	}
-
-	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
 #endif
+	return 0;
 }
 
 int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
@@ -2463,15 +2461,30 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		return -1;
 	}
 
-	NativeSocket                    socket = INVALID_NATIVE_SOCKET;
-	std::shared_ptr<SocketTransport> transport;
-	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
+	SocketSlot   state;
+	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
 	}
 
 	const int host_flags = ConvertMessageFlags(flags);
 	if (host_flags < 0) {
 		return -1;
+	}
+	if (state.p2p) {
+		if (!state.p2p->bound || (!state.p2p->nonblocking && (flags & 0x80) == 0)) {
+			return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+		}
+		char pending;
+		if (::recv(socket, &pending, sizeof(pending), MSG_PEEK) < 0) {
+			SetHostSocketError();
+			// Winsock reports a peeked datagram's truncation as EMSGSIZE.
+			if (*Posix::GetErrorAddr() != Posix::POSIX_EMSGSIZE) {
+				return -1;
+			}
+		}
+		// Pending UDPP2P packets still require framing and optional decryption.
+		return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
 	}
 
 	const auto host_len = static_cast<SocketIoLength>(
@@ -2480,12 +2493,12 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
 #if defined(_WIN32)
-	if (transport->type == SOCK_STREAM) {
+	if (state.transport->type == SOCK_STREAM) {
 		if (addr != nullptr &&
 		    ::getpeername(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) != 0) {
 			return SetHostSocketError();
 		}
-		result = ReceiveStream(*transport, static_cast<char*>(buf), host_len, host_flags,
+		result = ReceiveStream(*state.transport, static_cast<char*>(buf), host_len, host_flags,
 		                       (flags & 0x80) != 0);
 		if (result < 0) {
 			return result;
@@ -2493,7 +2506,7 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	} else
 #endif
 	{
-		transport.reset();
+		state.transport.reset();
 		if (addr == nullptr) {
 			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
 		} else {

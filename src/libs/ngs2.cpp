@@ -510,6 +510,7 @@ struct Ngs2VoiceInternal {
 		uint32_t           input  = 0;
 		float              volume = 1.0f;
 		int32_t            matrix = -1;
+		bool               sidechain_warned = false;
 	};
 	struct Block {
 		const uint8_t*    data;
@@ -665,7 +666,10 @@ struct Ngs2VoiceInternal {
 				info.num_skip_samples = 0;
 				info.num_samples      = 0;
 			}
-			EXIT_NOT_IMPLEMENTED(info.num_repeats != 0 && rack->type != Ngs2RackType::Sampler);
+			// Repeats are handled by the shared block path (Ngs2FinishBlock), which serves both
+			// the standard and custom sampler racks.
+			EXIT_NOT_IMPLEMENTED(info.num_repeats != 0 && rack->type != Ngs2RackType::Sampler &&
+			                     rack->type != Ngs2RackType::CustomSampler);
 			EXIT_NOT_IMPLEMENTED(decoder == nullptr &&
 			                     (uint64_t(info.num_skip_samples) + info.num_samples) *
 			                             channels * sizeof(int16_t) >
@@ -1770,7 +1774,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 			}
 		}
 		for (auto* source: voices) {
-			for (const auto& port: source->ports) {
+			for (auto& port: source->ports) {
 				if (port.dest != &voice || port.volume == 0.0f) {
 					continue;
 				}
@@ -1778,7 +1782,22 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				if (!source->has_samples) {
 					continue;
 				}
-				EXIT_NOT_IMPLEMENTED(port.input != 0);
+				if (port.input != 0) {
+					// Custom racks expose extra inputs as extra buffers (num_buffers > 1), e.g. a
+					// side-chain compressor's key input. That signal only drives the rack's modules,
+					// which are not emulated, and is never audible, so do not mix it into the output.
+					const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
+					EXIT_NOT_IMPLEMENTED(!Ngs2RackIsCustom(voice.rack->type) ||
+					                     port.input >= custom.num_buffers);
+					if (!port.sidechain_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 side-chain input %u of a custom rack is not emulated, "
+						    "dropping it\n",
+						    port.input));
+						port.sidechain_warned = true;
+					}
+					continue;
+				}
 				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
 				const size_t output_channels =
 				    matrix == nullptr
@@ -2439,7 +2458,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						break;
 					}
 					case 4: {
-						EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler);
+						// Ends the current loop; both sampler rack types share the block queue.
 						for (auto& block: voice->blocks) {
 							if (block.info.num_repeats != 0) {
 								block.info.num_repeats = 0;

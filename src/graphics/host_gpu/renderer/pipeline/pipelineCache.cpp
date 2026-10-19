@@ -41,7 +41,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+// Fatal errors skip the exit-time save, so checkpoint often enough that a crash early in a run
+// still keeps the pipelines compiled so far.
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -314,6 +316,14 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		// Always logged: comparing spirv_hash for the same guest_hash across runs shows whether
+		// the recompiler output is deterministic, which the driver pipeline caches depend on.
+		LOGF("ShaderSpirv: stage=%s guest_hash=0x%016" PRIx64 " spirv_hash=0x%016" PRIx64
+		     " words=%" PRIu64 " push_start=%u\n",
+		     stage_name, options.shader_hash,
+		     static_cast<uint64_t>(XXH3_64bits(result.spirv.data(),
+		                                       result.spirv.size() * sizeof(uint32_t))),
+		     static_cast<uint64_t>(result.spirv.size()), push_data_start_dword);
 
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);

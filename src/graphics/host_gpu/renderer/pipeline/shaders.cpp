@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <span>
 #include <vector>
@@ -573,8 +574,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
+	const auto graphics_compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	if (const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+	        std::chrono::steady_clock::now() - graphics_compile_start);
+	    elapsed.count() >= 100) {
+		LOGF("PipelineCompile: graphics VS=%" PRIu64 " PS=%" PRIu64 " elapsed_ms=%lld\n",
+		     vertex_program.id, ps_active ? pixel_program.id : 0,
+		     static_cast<long long>(elapsed.count()));
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -647,8 +656,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto compute_compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	LOGF("PipelineCompile: compute guest_hash=0x%016" PRIx64 " elapsed_ms=%lld\n",
+	     input_info.stage.program->shader_hash,
+	     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                std::chrono::steady_clock::now() - compute_compile_start)
+	                                .count()));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

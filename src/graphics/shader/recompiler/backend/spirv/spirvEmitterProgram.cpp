@@ -57,6 +57,10 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
+	// Creation order of spills[0]. Anything that allocates IDs per spill must follow this
+	// instead of iterating the pointer-keyed map, whose order differs between runs and would
+	// make the SPIR-V (and so every driver pipeline cache lookup) nondeterministic.
+	std::vector<const IR::Inst*> spill_order;
 	uint32_t                                      header_label       = 0;
 	uint32_t                                      select_label       = 0;
 	uint32_t                                      after_switch_label = 0;
@@ -633,6 +637,7 @@ void EmitProgram(EmitterState& state) {
 					break;
 				}
 				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
+				dispatch.spill_order.push_back(&inst);
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -648,6 +653,7 @@ void EmitProgram(EmitterState& state) {
 			}
 			if (!dispatch.spills[0].contains(definition)) {
 				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
+				dispatch.spill_order.push_back(definition);
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -670,7 +676,7 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
+			for (const auto* inst: dispatch.spill_order) {
 				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
 			}
 			high.dispatcher_spills = &dispatch.spills[1];

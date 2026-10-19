@@ -188,7 +188,7 @@ void Run(const RunOptions& options) {
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, title_id);
+	Loader::AddContentLoad(options.addcont_dir, title_id, options.app0_dir);
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 

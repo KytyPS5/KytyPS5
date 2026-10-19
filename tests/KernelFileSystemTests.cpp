@@ -599,6 +599,64 @@ void TestAddContent(const std::filesystem::path& root) {
               get(0, &info[i].label, &single) == OK,
           "GTA V entitlement lookup works without detected add-ons");
   }
+  const auto app0 = root / "local-entitlement-game";
+  const auto section = [](const std::string& title, const std::string& label,
+                          const std::string& status = "NO_EXTRA_DATA") {
+    return "[PSAL]\r\ncontent_id=UP0001-" + title + "_00-" + label +
+           "\r\ndownload_status=" + status + "\r\n";
+  };
+  const auto local_label = label(70);
+  const auto valid = section("PPSA11111", local_label);
+  write(app0 / "dlc_emu.ini",
+        "; local entitlement fixture\n" + valid + valid +
+        section("PPSA22222", label(71)) +
+        section("PPSA11111", label(72), "INSTALLED") +
+        section("PPSA11111", "SHORT") +
+        section("PPSA11111", label(73)) + "service_label=1\n" +
+        section("PPSA11111", label(74)) + "download_status=NO_EXTRA_DATA\n" +
+        section("PPSA11111", label(75)) + "enabled=false\n" +
+        "[PSAC]\ncontent_id=UP0001-PPSA11111_00-" + label(76) +
+        "\ndownload_status=NO_EXTRA_DATA\n");
+  Loader::AddContentLoad({}, "PPSA11111", app0);
+  Check(Loader::LocalEntitlementsGetAll().size() == 1 &&
+            Loader::AddContentGetAll().empty(),
+        "local PSAL parser deduplicates and rejects foreign, malformed and unsupported entries");
+  Label local_query {};
+  std::memcpy(local_query.data, local_label.c_str(), 17);
+  Check(get(0, &local_query, &single) == OK && single.package_type == 3 &&
+            single.download_status == 0 &&
+            std::strcmp(single.label.data, local_query.data) == 0,
+        "configured license-only entitlement reports PSAL and NO_EXTRA_DATA without debugger");
+  std::array<Info, 5> local_info {};
+  local_info[4].package_type = 99;
+  Check(list(0, local_info.data(), 4, &count) == OK && count == 4 &&
+            std::memcmp(&local_info[3], &single, sizeof(single)) == 0 &&
+            local_info[4].package_type == 99,
+        "local entitlement list matches individual lookup and respects capacity");
+  Check(get(1, &local_query, &single) == static_cast<int>(0x817d0007u) &&
+            list(1, nullptr, 0, &count) == OK && count == 3,
+        "local entitlement does not leak to another service label");
+  Check(mount(0, &local_query, &point) == static_cast<int>(0x80d90005u),
+        "license-only entitlement does not expose a mount directory");
+  Check(get(0, &missing, &single) == static_cast<int>(0x817d0007u),
+        "local config does not grant an unlisted entitlement");
+  Loader::AddContentLoad({}, "PPSA22222", app0);
+  Check(get(0, &local_query, &single) == static_cast<int>(0x817d0007u),
+        "changing titles clears previously loaded local entitlements");
+  Loader::AddContentLoad({}, "PPSA11111", app0 / "missing");
+  Check(Loader::LocalEntitlementsGetAll().empty() &&
+            get(0, &local_query, &single) == static_cast<int>(0x817d0007u),
+        "missing config restores NO_ENTITLEMENT");
+  write(app0 / "dlc_emu.ini", valid + std::string(65536, ' '));
+  Loader::AddContentLoad({}, "PPSA11111", app0);
+  Check(Loader::LocalEntitlementsGetAll().empty(), "oversized local config is rejected");
+  write(app0 / "dlc_emu.ini", section("PPSA11111", label(0)));
+  Loader::AddContentLoad(folder, "PPSA11111", app0);
+  Check(Loader::LocalEntitlementsGetAll().empty() &&
+            list(0, nullptr, 0, &count) == OK && count == 68,
+        "installed add-on wins over duplicate local license entry");
+  Loader::AddContentLoad({}, "");
+
 }
 
 void TestSaveOpenVisibility() {

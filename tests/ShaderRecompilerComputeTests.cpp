@@ -1394,6 +1394,7 @@ struct GraphicsCase {
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
   u32 width = 1;
+  u32 height = 1;
   std::vector<u32> object_ids;
 };
 
@@ -18855,7 +18856,7 @@ public:
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, test.width, 1, vk::Format::eR32G32B32A32Sfloat,
+        CreateImageMips(test.name, test.width, test.height, vk::Format::eR32G32B32A32Sfloat,
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -18863,7 +18864,7 @@ public:
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
-          test.name, test.width, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
+          test.name, test.width, test.height, target.format, vk::ImageUsageFlagBits::eColorAttachment,
           {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
@@ -18871,7 +18872,7 @@ public:
     Image primitive_target;
     if (object_id) {
       primitive_target = CreateImageMips(
-          test.name, test.width, 1, vk::Format::eR32Uint,
+          test.name, test.width, test.height, vk::Format::eR32Uint,
           vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
           vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -18958,12 +18959,12 @@ public:
     viewport.x = 0.0f;
     viewport.y = 0.0f;
     viewport.width = static_cast<float>(test.width);
-    viewport.height = 1.0f;
+    viewport.height = static_cast<float>(test.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vk::Rect2D scissor{};
     scissor.extent.width = test.width;
-    scissor.extent.height = 1;
+    scissor.extent.height = test.height;
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
     viewport_state.viewportCount = 1;
@@ -19043,7 +19044,7 @@ public:
     }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
-    rendering.renderArea.extent = {test.width, 1};
+    rendering.renderArea.extent = {test.width, test.height};
     rendering.layerCount = test.layers;
     rendering.colorAttachmentCount = color_blend.attachmentCount;
     rendering.pColorAttachments = colors.data();
@@ -42464,6 +42465,47 @@ GraphicsCase GraphicsFrontFaceBits(bool reversed, bool all_bits) {
   return test;
 }
 
+GraphicsCase GraphicsWave64WholeWaveCount(u32 height, bool lanes_0_32) {
+  static const char *const names[2][2] = {
+      {"GraphicsWave64WholeWaveCount8x4Lanes31And63", "GraphicsWave64WholeWaveCount8x4Lanes0And32"},
+      {"GraphicsWave64WholeWaveCount8x8Lanes31And63", "GraphicsWave64WholeWaveCount8x8Lanes0And32"}};
+  GraphicsCase test;
+  test.name = names[height == 8u][lanes_0_32];
+  test.width = 8;
+  test.height = height;
+  auto &code = test.fragment_code;
+  code = {EncodeVop1(0x01, 13, InlineU32(1)),
+          EncodeSop1(0x10, 9, 126),
+          EncodeSop1(0x04, 24, 126),
+          EncodeSop1(0x28, 106, 126)};
+  AppendVop3(&code, 0x101, 13, InlineU32(0), Vgpr(13), 24);
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(0x25, 13, 250, 13));
+    code.push_back(EncodeVop2Dpp(13, (lanes_0_32 ? 0x160u : 0x110u) + shift));
+  }
+  code.insert(code.end(), {0xd778100cu, 0x0305830du,
+                          EncodeVop2(0x25, 13, Vgpr(13), 12),
+                          EncodeSop1(0x04, 126, 106)});
+  AppendVop3(&code, 0x360, 6, Vgpr(13), InlineU32(lanes_0_32 ? 0u : 31u));
+  AppendVop3(&code, 0x360, 7, Vgpr(13), InlineU32(lanes_0_32 ? 32u : 63u));
+  code.insert(code.end(), {EncodeSop2(0x00, 8, 6, 7),
+                          EncodeSopc(0x06, 8, 9),
+                          EncodeSop2(0x0a, 10, 242, 128),
+                          EncodeSop2(0x03, 11, 8, 9),
+                          EncodeVop1(0x01, 0, 10), EncodeVop1(0x05, 1, 11),
+                          EncodeVop1(0x01, 2, InlineU32(0)), EncodeVop1(0x01, 3, 242),
+                          EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3)});
+  AppendEnd(&code);
+  for (u32 i = 0; i < 8u * height; i++) {
+    test.expected_pixel.insert(test.expected_pixel.end(),
+                               {0x3f800000u, 0u, 0u, 0x3f800000u});
+  }
+  test.opcodes = {ShaderOpcode::S_BCNT1_I32_B64, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_PERMLANEX16_B32, ShaderOpcode::V_READLANE_B32,
+                  ShaderOpcode::S_ADD_U32};
+  return test;
+}
+
 void CheckPixelFrontFaceModes() {
   constexpr const char *name = "PixelFrontFaceModes";
   static const std::array<u32, 1> code = {EncodeSopp(0x01)};
@@ -43375,8 +43417,92 @@ std::vector<TestCase> MakeCases() {
   return cases;
 }
 
+enum class WaveReduceOp { UMin, UMax, SMin, SMax, And, Or, Xor };
+
+GraphicsCase GraphicsWave64WholeWaveReduce(WaveReduceOp op, u32 height, bool butterfly) {
+  static const char *const op_names[] = {"UMin", "UMax", "SMin", "SMax", "And", "Or", "Xor"};
+  struct Encoding {
+    u32 vop2;
+    u32 sop2;
+    u32 identity;
+  };
+  static const Encoding encodings[] = {
+      {0x13, 0x07, 0xffffffffu}, {0x14, 0x09, 0u},          {0x11, 0x06, 0x7fffffffu},
+      {0x12, 0x08, 0x80000000u}, {0x1b, 0x0e, 0xffffffffu}, {0x1c, 0x10, 0u},
+      {0x1d, 0x12, 0u}};
+  const auto &enc = encodings[static_cast<u32>(op)];
+  static std::set<std::string> names;
+  GraphicsCase test;
+  test.name = names.insert(std::string("GraphicsWave64WholeWaveReduce") + op_names[static_cast<u32>(op)] +
+                           (height == 8u ? "8x8" : "8x4") + (butterfly ? "Butterfly" : "Scan"))
+                  .first->c_str();
+  test.width = 8;
+  test.height = height;
+  auto &code = test.fragment_code;
+  AppendVop3(&code, 0x365, 4, 193u, InlineU32(0));
+  AppendVop3(&code, 0x366, 4, 193u, Vgpr(4));
+  switch (op) {
+    case WaveReduceOp::UMin:
+    case WaveReduceOp::UMax: code.push_back(EncodeVop1(0x01, 13, Vgpr(4))); break;
+    case WaveReduceOp::SMin:
+    case WaveReduceOp::SMax: code.push_back(EncodeVop2(0x27, 13, InlineU32(32), 4)); break;
+    default:
+      code.push_back(EncodeVop2(0x1b, 5, InlineU32(31), 4));
+      code.push_back(EncodeVop1(0x01, 6, InlineU32(1)));
+      code.push_back(EncodeVop2(0x1a, 13, Vgpr(5), 6));
+      if (op == WaveReduceOp::And) code.push_back(EncodeVop1(0x37, 13, Vgpr(13)));
+      break;
+  }
+  code.insert(code.end(), {EncodeSop1(0x04, 24, 126),
+                           EncodeSop1(0x28, 106, 126),
+                           EncodeSop1(0x03, 30, 255), enc.identity});
+  AppendVop3(&code, 0x101, 13, 30, Vgpr(13), 24);
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(enc.vop2, 13, 250, 13));
+    code.push_back(EncodeVop2Dpp(13, (butterfly ? 0x160u : 0x110u) + shift));
+  }
+  code.insert(code.end(), {0xd778100cu, 0x0305830du,
+                           EncodeVop2(enc.vop2, 13, Vgpr(13), 12),
+                           EncodeSop1(0x04, 126, 106)});
+  AppendVop3(&code, 0x360, 6, Vgpr(13), InlineU32(butterfly ? 0u : 31u));
+  AppendVop3(&code, 0x360, 7, Vgpr(13), InlineU32(butterfly ? 32u : 63u));
+  code.push_back(EncodeSop2(enc.sop2, 8, 6, 7));
+  switch (op) {
+    case WaveReduceOp::UMin: code.push_back(EncodeSop1(0x14, 9, 24)); break;
+    case WaveReduceOp::SMin:
+      code.push_back(EncodeSop1(0x14, 9, 24));
+      code.push_back(EncodeSop2(0x01, 9, 9, InlineU32(32)));
+      break;
+    case WaveReduceOp::UMax:
+      code.push_back(EncodeSop1(0x16, 9, 24));
+      code.push_back(EncodeSop2(0x01, 9, InlineU32(63), 9));
+      break;
+    case WaveReduceOp::SMax:
+      code.push_back(EncodeSop1(0x16, 9, 24));
+      code.push_back(EncodeSop2(0x01, 9, InlineU32(31), 9));
+      break;
+    case WaveReduceOp::Xor: code.push_back(EncodeSop2(0x12, 9, 24, 25)); break;
+    default:
+      code.push_back(EncodeSop2(0x10, 9, 24, 25));
+      if (op == WaveReduceOp::And) code.push_back(EncodeSop1(0x07, 9, 9));
+      break;
+  }
+  code.insert(code.end(), {EncodeSopc(0x06, 8, 9),
+                           EncodeSop2(0x0a, 10, 242, 128),
+                           EncodeSop2(0x03, 11, 8, 9),
+                           EncodeVop1(0x01, 0, 10), EncodeVop1(0x05, 1, 11),
+                           EncodeVop1(0x01, 2, InlineU32(0)), EncodeVop1(0x01, 3, 242),
+                           EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3)});
+  AppendEnd(&code);
+  for (u32 i = 0; i < 8u * height; i++) {
+    test.expected_pixel.insert(test.expected_pixel.end(), {0x3f800000u, 0u, 0u, 0x3f800000u});
+  }
+  test.opcodes = {ShaderOpcode::V_PERMLANEX16_B32, ShaderOpcode::V_READLANE_B32};
+  return test;
+}
+
 std::vector<GraphicsCase> MakeGraphicsCases() {
-  return {
+  std::vector<GraphicsCase> cases{
       GraphicsSparseWaveMinimum(),
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
@@ -43407,7 +43533,21 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
       GraphicsObjectPrimitiveId(false),
       GraphicsObjectPrimitiveId(true),
+      GraphicsWave64WholeWaveCount(8, false),
+      GraphicsWave64WholeWaveCount(8, true),
+      GraphicsWave64WholeWaveCount(4, false),
+      GraphicsWave64WholeWaveCount(4, true),
   };
+  for (const auto op : {WaveReduceOp::UMin, WaveReduceOp::UMax, WaveReduceOp::SMin,
+                        WaveReduceOp::SMax, WaveReduceOp::And, WaveReduceOp::Or,
+                        WaveReduceOp::Xor}) {
+    for (const u32 height : {8u, 4u}) {
+      for (const bool butterfly : {false, true}) {
+        cases.push_back(GraphicsWave64WholeWaveReduce(op, height, butterfly));
+      }
+    }
+  }
+  return cases;
 }
 
 void CheckComputeLdsLimit(VulkanHarness &vulkan) {

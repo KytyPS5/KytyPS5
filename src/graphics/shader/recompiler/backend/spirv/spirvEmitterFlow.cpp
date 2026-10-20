@@ -802,15 +802,34 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
-uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto& state = ctx.state;
+uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&   state = ctx.state;
+	spv::Op op {};
+	uint32_t (*combine)(EmitterState&, uint32_t, uint32_t) = nullptr;
+	switch (inst.Flags<IR::ValueOpcode>()) {
+		case IR::ValueOpcode::IAdd32: op = spv::OpGroupNonUniformIAdd, combine = EmitIAdd32; break;
+		case IR::ValueOpcode::UMin32: op = spv::OpGroupNonUniformUMin, combine = EmitUMin32; break;
+		case IR::ValueOpcode::UMax32: op = spv::OpGroupNonUniformUMax, combine = EmitUMax32; break;
+		case IR::ValueOpcode::SMin32: op = spv::OpGroupNonUniformSMin, combine = EmitSMin32; break;
+		case IR::ValueOpcode::SMax32: op = spv::OpGroupNonUniformSMax, combine = EmitSMax32; break;
+		case IR::ValueOpcode::BitwiseAnd32:
+			op = spv::OpGroupNonUniformBitwiseAnd, combine = EmitBitwiseAnd32;
+			break;
+		case IR::ValueOpcode::BitwiseOr32:
+			op = spv::OpGroupNonUniformBitwiseOr, combine = EmitBitwiseOr32;
+			break;
+		case IR::ValueOpcode::BitwiseXor32:
+			op = spv::OpGroupNonUniformBitwiseXor, combine = EmitBitwiseXor32;
+			break;
+		default: ctx.Fail(inst, "has an unsupported subgroup reduction");
+	}
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
-		value = EmitUMin32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+		value = combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
+	state.builder.AddFunction(op, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
+	                          spv::GroupOperationReduce, value);
 	return result;
 }
 

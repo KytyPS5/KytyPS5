@@ -43785,10 +43785,13 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                                   .domain = 1,
                                   .partitioning = 2,
                                   .output_topology = 2};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          AnalyzeTessellationPrograms(local, control, tess) && tess.ls_stride == ls_stride &&
+              tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
+  // The CP0-only patch stores at 0x7fc0, 0x7fd0, 0x7fe0 and 0x7ff0 are the HS's per-patch outputs.
+  Require(name, "patch range", tess.patch_base == 0x7fc0 && tess.patch_size == 0x34,
+          "the HS's constant-address patch stores must give the per-patch output range");
 
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
                               ShaderType::TessellationEvaluation};

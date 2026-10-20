@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 
 #include "common/assert.h"
 #include "common/profiler.h"
@@ -36,6 +37,7 @@ vk::Fence MasterSemaphore::FenceOps::Create() const {
 
 bool MasterSemaphore::FenceOps::IsSignaled(vk::Fence fence) const {
 	const auto status = graphics->device.getFenceStatus(fence);
+	if (status == vk::Result::eErrorDeviceLost) GpuBreadcrumbs::Report();
 	EXIT_NOT_IMPLEMENTED(status != vk::Result::eSuccess && status != vk::Result::eNotReady);
 	return status == vk::Result::eSuccess;
 }
@@ -50,6 +52,7 @@ void MasterSemaphore::FenceOps::Wait(vk::Fence fence) const {
 	// driver misses costs one period, not a stall.
 	constexpr uint64_t PeriodNs = 1'000'000;
 	const auto         result   = graphics->device.waitForFences(1, &fence, VK_TRUE, PeriodNs);
+	if (result == vk::Result::eErrorDeviceLost) GpuBreadcrumbs::Report();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess && result != vk::Result::eTimeout);
 }
 
@@ -78,6 +81,7 @@ void MasterSemaphore::WaitRetired(uint64_t tick) {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	if (result == vk::Result::eErrorDeviceLost) GpuBreadcrumbs::Report();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -116,6 +120,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result == vk::Result::eErrorDeviceLost) GpuBreadcrumbs::Report();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

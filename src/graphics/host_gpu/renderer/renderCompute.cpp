@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -191,6 +192,23 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	}
 	return true;
 }
+
+
+namespace {
+
+// The compute command a breadcrumb names: its shader, size and buffers.
+std::string DescribeDispatch(const char* kind, uint64_t submit_id, const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                             const ShaderRecompiler::IR::ResourceSnapshot& resources, uint32_t x, uint32_t y, uint32_t z) {
+	auto text = fmt::format("{} cs={:016x} submit={} groups={}x{}x{} buffers:", kind, program.shader_hash, submit_id, x, y, z);
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		text += fmt::format(" {}{:x}+{:x}", program.info.buffers[i].written ? "W" : "r", r.Base48(),
+		                    uint64_t {r.NumRecords()} * std::max(1u, static_cast<uint32_t>(r.Stride())));
+	}
+	return text + fmt::format(" images={} dma={}", program.info.images.size(), program.info.uses_dma ? 1 : 0);
+}
+
+} // namespace
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
@@ -434,7 +452,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	InsertDebugLabel(vk_buffer, "Dispatch {}x{}x{} submit={}", thread_group_x, thread_group_y,
 	                 thread_group_z, submit_id);
 	if (CommandScheduler::GpuProfileEnabled()) m_context.GetCommandScheduler().GpuProfileBegin();
+	const auto crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+	                       ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+	                                               DescribeDispatch("dispatch", submit_id, program, resources,
+	                                                                thread_group_x, thread_group_y, thread_group_z))
+	                       : 0u;
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (crumb != 0) GpuBreadcrumbs::End(vk_buffer, crumb);
 	if (CommandScheduler::GpuProfileEnabled()) {
 		m_context.GetCommandScheduler().GpuProfileEnd((compute_program.id << 32u) | 0xffffffffu);
 	}
@@ -460,8 +484,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	PerfCounters::Add(PerfCounters::Counter::Dispatches);
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -473,8 +496,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
+	// The thread counts are known on the GPU only, and so is the extent of the shader's last
+	// groups: its shader data goes in a buffer that the conversion writes.
+	const bool use_thread_dimensions = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info,
+	    use_thread_dimensions ? ShaderRecompiler::IR::PushData::NoStart : 0u);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -492,9 +520,44 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	const auto vk_buffer = buffer.Handle();
+	vk::Buffer indirect_buffer = args_buffer->Handle();
+	uint64_t   indirect_offset = args_offset;
+	if (use_thread_dimensions) {
+		const auto& layout = program.bindings;
+		EXIT_IF(layout.UsesPushData() ||
+		        (layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart &&
+		         bindings.shader_data_buffer.buffer == nullptr));
+		auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		const auto align  = m_context.GetGraphics().StorageMinAlignment();
+		const std::array<uint32_t, 3> zero {};
+		const ThreadDimensionDispatch::Target groups {
+		    stream.Handle(), stream.Copy(zero.data(), sizeof(zero), align), sizeof(zero)};
+		// A shader that leaves the extent unread still gets a place to write it.
+		const bool has_extent = layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart;
+		const ThreadDimensionDispatch::Target extent =
+		    has_extent ? ThreadDimensionDispatch::Target {bindings.shader_data_buffer.buffer,
+		                                                  bindings.shader_data_buffer.offset,
+		                                                  bindings.shader_data_buffer.range}
+		               : groups;
+		if (m_thread_dimensions == nullptr) {
+			m_thread_dimensions = std::make_unique<ThreadDimensionDispatch>(m_context.GetGraphics());
+		}
+		const auto helper_crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+		                              ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+		                                                      fmt::format("thread-dimension args={:x}", args_addr),
+		                                                      args_addr, indirect_buffer, indirect_offset)
+		                              : 0u;
+		m_thread_dimensions->Record(vk_buffer, indirect_buffer, indirect_offset,
+		                            {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+		                             cs_regs.cs_regs.num_thread_z},
+		                            groups, extent, has_extent ? layout.dispatch_thread_dword : 0u);
+		if (helper_crumb != 0) GpuBreadcrumbs::End(vk_buffer, helper_crumb);
+		indirect_buffer = groups.buffer;
+		indirect_offset = groups.offset;
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -515,7 +578,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	InsertDebugLabel(vk_buffer, "DispatchIndirect submit={}", submit_id);
 	if (CommandScheduler::GpuProfileEnabled()) m_context.GetCommandScheduler().GpuProfileBegin();
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	const auto crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+	                       ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+	                                               DescribeDispatch("dispatch-indirect", submit_id, program,
+	                                                                *input_info.stage.resources, 0, 0, 0) +
+	                                                   fmt::format(" args={:x}", args_addr),
+	                                               args_addr, indirect_buffer, indirect_offset)
+	                       : 0u;
+	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+	if (crumb != 0) GpuBreadcrumbs::End(vk_buffer, crumb);
 	if (CommandScheduler::GpuProfileEnabled()) {
 		m_context.GetCommandScheduler().GpuProfileEnd((compute_program.id << 32u) | 0xffffffffu);
 	}

@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -1476,7 +1477,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute);
 		vk_buffer.pushConstants(pipeline.mesh_compute_layout, vk::ShaderStageFlagBits::eCompute, 0,
 		                        sizeof(mesh_draw_data), mesh_draw_data.data());
+		const auto mesh_crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+		    ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+		                            fmt::format("mesh-capture vs={:016x} submit={} groups={}x{}", state.vertex_info[0].stage.program->shader_hash,
+		                                        submit_id, mesh_groups, draw.instance_count))
+		    : 0u;
 		vk_buffer.dispatch(mesh_groups, draw.instance_count, 1);
+		if (mesh_crumb != 0) GpuBreadcrumbs::End(vk_buffer, mesh_crumb);
 		vk::MemoryBarrier2 barrier {};
 		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 		barrier.srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite;
@@ -1536,6 +1543,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const bool profile = CommandScheduler::GpuProfileEnabled();
 	if (profile) m_context.GetCommandScheduler().GpuProfileBegin();
+	const auto crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+	    ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+	                            fmt::format("{} vs={:016x} ps={:016x} submit={} indices={} instances={} indirect={:x}", draw.Name(),
+	                                        state.vertex_info[0].stage.program->shader_hash,
+	                                        state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0ull, submit_id,
+	                                        draw.index_count, draw.instance_count, emit.indirect_args_address),
+	                            emit.indirect_args_address)
+	    : 0u;
 	if (mesh_emulated) {
 		vk_buffer.draw(mesh_vertex_count, 1, 0, 0);
 	} else if (mesh_active) {
@@ -1543,6 +1558,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, indirect_args);
 	}
+	if (crumb != 0) GpuBreadcrumbs::End(vk_buffer, crumb);
 	if (profile) {
 		m_context.GetCommandScheduler().GpuProfileEnd((state.programs.vertex[0].id << 32u) |
 		                                              (state.programs.pixel.id & 0xffffffffu));

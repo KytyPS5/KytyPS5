@@ -154,9 +154,12 @@ public:
 	                    std::span<const ShaderColorTarget, 8> color_targets,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info);
+	// `push_data_cursor` NoStart keeps the program's shader data out of push constants, in a
+	// buffer that commands on the GPU can write before the dispatch reads it.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                uint32_t                     push_data_cursor = 0);
 
 	// A pipeline that is not known yet is built on a worker thread. Null when it is still being
 	// built and the draw is left out for now; see PlanPipelineUse for which draws wait instead.

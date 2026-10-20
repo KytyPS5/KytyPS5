@@ -33,6 +33,8 @@ struct GraphicContext {
 	// VK_EXT_external_memory_dma_buf and VK_KHR_external_memory_fd: guest memory can be imported
 	// (guestMemoryImport.h).
 	bool                               dma_buf_import_enabled                = false;
+	// VK_AMD_buffer_marker, for the breadcrumbs of KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h).
+	bool                               buffer_marker_enabled                 = false;
 	bool                               sample_rate_shading_enabled           = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// What the device enabled, not only what it supports, and the known defects of its driver.

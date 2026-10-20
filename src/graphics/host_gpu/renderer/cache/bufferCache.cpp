@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -270,6 +271,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	GpuBreadcrumbs::Watch("GDS", reinterpret_cast<const uint32_t*>(m_gds_buffer.Mapped().data()),
+	                      static_cast<uint32_t>(std::min<uint64_t>(m_gds_buffer.Size(), 4096u) / 4u));
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =

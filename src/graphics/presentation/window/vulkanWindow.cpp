@@ -23,6 +23,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <cstdlib>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
@@ -1072,6 +1073,11 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back("VK_KHR_portability_subset");
 		}
 
+		if (std::getenv("KYTY_GPU_BREADCRUMBS") != nullptr &&
+		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			graphic_ctx.buffer_marker_enabled = true;
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;

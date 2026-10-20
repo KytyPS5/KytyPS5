@@ -89,6 +89,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <regex>
 #include <semaphore>
 #include <set>
 #include <span>
@@ -43858,6 +43859,37 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   Require(name, "predicated patch addresses",
           hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
           "CP0 patch stores must use the address assigned on their active predicate");
+  // Every ring access in these programs sits at a fixed offset inside its record, so the
+  // attribute and component must be static (RADV drops patch outputs after dynamic ones).
+  for (const auto *stage : {&ls, &hs, &ds}) {
+    Require(name, "static record offsets", stage->assembly.find("OpUMod") == std::string::npos,
+            "ring accesses at stride * control point + constant must use static attributes");
+  }
+  // The same HS reads through stride * control point + inline -16 + (offset + 16): the
+  // negative term must keep their record offsets when the stride does not divide 2^32.
+  auto negative = control;
+  const auto read = std::ranges::find(negative, EncodeDs0(0x37, (3u << 8u) | 1u));
+  *read = EncodeDs0(0x37, (7u << 8u) | 5u);
+  *(read + 1) = EncodeDs1Ex(10, 0, 0, 40);
+  negative.insert(read, EncodeVop2(0x25, 40, 208u, input_address));
+  auto negative_tess = tess;
+  AnalyzeTessellationPrograms(local, negative, negative_tess);
+  const auto negative_hs =
+      CompileTessellationStage(name, negative, ShaderType::TessellationControl, negative_tess);
+  const auto record_offsets = [](const std::string &assembly) {
+    std::set<std::string> offsets;
+    const std::regex attribute("OpShiftRightLogical %uint (%uint_\\d+) %uint_4\n");
+    for (std::sregex_iterator it(assembly.begin(), assembly.end(), attribute), end; it != end;
+         ++it) {
+      offsets.insert((*it)[1]);
+    }
+    return offsets;
+  };
+  Require(name, "negative inline record offsets",
+          negative_tess.ls_stride == ls_stride &&
+              record_offsets(negative_hs.assembly) == record_offsets(hs.assembly) &&
+              negative_hs.assembly.find("OpUMod") == std::string::npos,
+          "a negative inline constant in a ring address must keep its record offset");
   Require(name, "native local inputs",
           ls.assembly.find("VertexIndex") != std::string::npos &&
               ls.assembly.find("InstanceIndex") != std::string::npos,

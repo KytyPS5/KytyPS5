@@ -76,7 +76,7 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
-	void ProcessDownloadImages();
+	bool ProcessDownloadImages();
 	void RunGarbageCollector();
 
 private:

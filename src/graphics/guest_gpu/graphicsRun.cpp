@@ -1078,6 +1078,16 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
+		if (QueueReadbacksBeforeLabel()) {
+			// The guest may read GPU-written images as soon as it sees this label, so publish the
+			// label only after the queued image downloads have reached guest memory.
+			GetScheduler().DeferPriorityOperation([dst, data] { std::memcpy(dst, &data, sizeof(data)); });
+			if (with_interrupt) {
+				TriggerEopEventAtEndOfPipe(interrupt_context_id);
+			}
+			GetScheduler().Flush();
+			return;
+		}
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1121,6 +1131,16 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
+					if (event_write_source != 0x04 && QueueReadbacksBeforeLabel()) {
+						// See write32: publish the label after pending image readbacks land.
+						GetScheduler().DeferPriorityOperation(
+						    [dst, data = static_cast<uint64_t>(value)] { std::memcpy(dst, &data, sizeof(data)); });
+						if (with_interrupt) {
+							TriggerEopEventAtEndOfPipe(interrupt_context_id);
+						}
+						GetScheduler().Flush();
+						return;
+					}
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1236,6 +1256,11 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+}
+
+bool CommandProcessor::QueueReadbacksBeforeLabel() {
+	Common::LockGuard lock(m_renderer.GetMutex());
+	return m_renderer.GetTextureCache().ProcessDownloadImages();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

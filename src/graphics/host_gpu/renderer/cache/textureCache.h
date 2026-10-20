@@ -76,6 +76,8 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	/// Records GPU-to-guest copies for all enrolled images and clears the enrollment set.
+	/// @return true if at least one copy was queued (its guest write lands as a priority op).
 	bool ProcessDownloadImages();
 	void RunGarbageCollector();
 
@@ -125,6 +127,9 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	/// Enrolls a GPU-written image for readback if it is tiny (1 layer, 1 level, <= 64 texels).
+	/// @return true if the image qualified (whether or not it was already enrolled).
+	bool                      EnrollTinyReadback(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);

@@ -400,25 +400,34 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
-void TextureCache::TrackImageDownload(ImageId id, Image& image) {
+bool TextureCache::EnrollTinyReadback(ImageId id, Image& image) {
 	// Tiny GPU-written images (a handful of texels) are always read back, tiled or not: games
 	// read them on the CPU after waiting for the GPU (e.g. UE4 reads the sky-light irradiance
 	// SH from a 9x1 render target, and 1x1 targets for exposure/statistics). They are cheap.
+	// Stencil associations (depth_id set) are not downloadable on their own; skip them.
 	constexpr uint64_t kMaxTinyReadbackTexels = 64;
 	const auto&        ext  = image.info.extent;
-	const bool         tiny = image.info.resources.layers == 1 && image.info.resources.levels == 1 &&
+	const bool         tiny = !image.depth_id && image.info.resources.layers == 1 &&
+	                  image.info.resources.levels == 1 &&
 	                  uint64_t {ext.width} * ext.height * ext.depth <= kMaxTinyReadbackTexels;
-	if (tiny && image.IsGpuModified()) {
-		static std::unordered_set<uint64_t> s_logged;
-		if (s_logged.size() < 64 && s_logged.insert(image.info.data.address).second) {
-			LOGF("\tReadback tiny image: addr=0x%012llx size=%llu %ux%ux%u layers=%u levels=%u fmt=%d bpb=%u\n",
-			    static_cast<unsigned long long>(image.info.data.address),
-			    static_cast<unsigned long long>(image.info.data.size), image.info.extent.width,
-			    image.info.extent.height, image.info.extent.depth, image.info.resources.layers,
-			    image.info.resources.levels, static_cast<int>(image.info.guest_format),
-			    image.info.bytes_per_block);
-		}
-		m_download_images.insert(id);
+	if (!tiny || !image.IsGpuModified()) {
+		return false;
+	}
+	static std::unordered_set<uint64_t> s_logged;
+	if (s_logged.size() < 64 && s_logged.insert(image.info.data.address).second) {
+		LOGF("\tReadback tiny image: addr=0x%012llx size=%llu %ux%ux%u layers=%u levels=%u fmt=%d bpb=%u\n",
+		    static_cast<unsigned long long>(image.info.data.address),
+		    static_cast<unsigned long long>(image.info.data.size), image.info.extent.width,
+		    image.info.extent.height, image.info.extent.depth, image.info.resources.layers,
+		    image.info.resources.levels, static_cast<int>(image.info.guest_format),
+		    image.info.bytes_per_block);
+	}
+	m_download_images.insert(id);
+	return true;
+}
+
+void TextureCache::TrackImageDownload(ImageId id, Image& image) {
+	if (EnrollTinyReadback(id, image)) {
 		return;
 	}
 	if (m_readback_linear_images && !image.info.IsTiled()) {
@@ -1440,6 +1449,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
+	(void)EnrollTinyReadback(id, image);
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}
@@ -1454,6 +1464,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
+	(void)EnrollTinyReadback(id, image);
 	if (image.info.HasStencil()) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		TrackImage(stencil_id);
@@ -1609,6 +1620,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		command.Handle().beginRendering(&rendering);
 		command.Handle().endRendering();
 		CommitGpuWrite(image);
+		(void)EnrollTinyReadback(id, image);
 		return;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
@@ -1627,6 +1639,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
+	(void)EnrollTinyReadback(id, image);
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {

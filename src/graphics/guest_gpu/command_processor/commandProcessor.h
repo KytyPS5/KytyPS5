@@ -105,6 +105,8 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
+	/// Queues pending GPU-to-guest image readbacks before an EOP label/interrupt.
+	/// @return true if readbacks were queued and the signal must be deferred behind them.
 	bool QueueReadbacksBeforeLabel();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,

@@ -1064,7 +1064,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x03: with_interrupt = false; break;
 		case 0x01:
 			if (!IsAsyncComputeQueue()) {
+				// An interrupt-only EOP is a completion signal too: land pending readbacks first.
+				const bool queued = QueueReadbacksBeforeLabel();
 				TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				if (queued) {
+					GetScheduler().Flush();
+				}
 				return;
 			}
 			with_interrupt = true;
@@ -1100,7 +1105,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					const bool queued = QueueReadbacksBeforeLabel();
 					SynchronizeGpu();
+					if (queued) {
+						// SynchronizeGpu() waits for the GPU; also wait for the readback copies.
+						GetScheduler().DrainPriorityOperations();
+					}
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					if (with_interrupt) {
@@ -1131,7 +1141,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					if (event_write_source != 0x04 && QueueReadbacksBeforeLabel()) {
+					if (QueueReadbacksBeforeLabel()) {
 						// See write32: publish the label after pending image readbacks land.
 						GetScheduler().DeferPriorityOperation(
 						    [dst, data = static_cast<uint64_t>(value)] { std::memcpy(dst, &data, sizeof(data)); });
@@ -1258,6 +1268,9 @@ void CommandProcessor::EmitGlobalBarrier() {
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }
 
+// Queues pending image readbacks (see TextureCache::ProcessDownloadImages) ahead of a GPU
+// completion signal. Returns true if any were queued; the caller must then publish the signal
+// through a priority deferred operation so the guest observes it only after the data landed.
 bool CommandProcessor::QueueReadbacksBeforeLabel() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 	return m_renderer.GetTextureCache().ProcessDownloadImages();

@@ -1018,9 +1018,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
+					// Scalar loads go through the scalar cache, which a dispatch's own vector stores
+					// do not update: the values read when the shader was specialized are the ones the
+					// hardware would read too. Only a later draw or dispatch sees the new values.
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						static std::atomic<uint32_t> warned {0};
+						if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+							LOGF("scalar read %" PRIx64 "+%" PRIx64 " overlaps buffer write %" PRIx64
+							     "+%" PRIx64 "\n",
+							     address, size, written.address, written.size);
+						}
 					}
 				}
 			}

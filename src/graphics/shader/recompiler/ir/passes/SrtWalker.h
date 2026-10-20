@@ -244,8 +244,10 @@ private:
 
 	enum class StepKind : uint8_t { UserData, ShaderBase, Pure, ExtractHalf, AddCarryHalf, RawRead };
 
+	// What a run needs of the value, copied: the plan's Inst objects are cold during a draw.
 	struct Step {
-		const Inst*             inst      = nullptr;
+		uint64_t                flags     = 0;
+		ValueOpcode             op        = ValueOpcode::Identity;
 		StepKind                kind      = StepKind::Pure;
 		uint8_t                 arg_count = 0;
 		// The user data index, or the half of an extract.

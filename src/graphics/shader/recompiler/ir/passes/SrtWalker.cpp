@@ -1106,6 +1106,7 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 	context.active_mask = m_active_mask;
 	context.read_policy = m_read_policy;
 	context.generation += 4;
+	context.unknowns.clear();
 	return context;
 }
 
@@ -1180,6 +1181,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
 		memo.generation = m_context.generation | 2u;
+		m_context.unknowns.push_back(index);
 		return false;
 	}
 	memo.value      = out;
@@ -1195,8 +1197,10 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 void SrtWalker::ResetUnknowns() {
 	for (auto& context: m_program.evaluation_contexts) {
 		if (context.session != m_session) continue;
-		for (auto& entry: context.values)
-			if (entry.generation == (context.generation | 2u)) entry.generation = 0;
+		for (const auto index: context.unknowns)
+			if (context.values[index].generation == (context.generation | 2u))
+				context.values[index].generation = 0;
+		context.unknowns.clear();
 	}
 }
 
@@ -1433,6 +1437,7 @@ bool SrtWalker::EvaluateRef(uint32_t ref, uint64_t& result) {
 	auto&      memo      = m_context.values[ref];
 	if (!evaluated) {
 		memo.generation = m_context.generation | 2u;
+		m_context.unknowns.push_back(ref);
 		return false;
 	}
 	memo.value      = out;
@@ -1788,7 +1793,13 @@ private:
 
 	bool Step(SrtTape::StepKind kind, const Inst& inst, std::span<const Value> args,
 	          uint32_t operand, uint32_t& slot) {
-		SrtTape::Step step {.inst = &inst, .kind = kind, .operand = operand};
+		// A raw read keeps its memory index in `flags` (SrtReadFlags::index).
+		SrtTape::Step step {.flags   = kind == SrtTape::StepKind::RawRead
+		                                   ? inst.Flags<SrtReadFlags>().index
+		                                   : inst.Flags<uint64_t>(),
+		                    .op      = inst.GetOpcode(),
+		                    .kind    = kind,
+		                    .operand = operand};
 		for (const auto arg: args) {
 			if (!Slot(arg, step.args[step.arg_count])) return false;
 			step.arg_count++;
@@ -1906,7 +1917,7 @@ void SrtTape::Run(const ResourcePlan& program, const SrtRuntime& runtime) const 
 		uint64_t out = 0;
 		// As the walker: a pure operation that its first argument decides needs no other.
 		if (step.kind == StepKind::Pure && step.arg_count != 0u && m_ok[step.args[0]] != 0u &&
-		    DecidedByFirst(*step.inst, args[0], out)) {
+		    DecidedByFirst(step.op, args[0], out)) {
 			m_values[step.out] = out;
 			m_ok[step.out]     = 1u;
 			continue;
@@ -1919,17 +1930,17 @@ void SrtTape::Run(const ResourcePlan& program, const SrtRuntime& runtime) const 
 					break;
 				case StepKind::ShaderBase: out = runtime.shader_base; break;
 				case StepKind::Pure:
-					ok = ApplyPure(*step.inst, {args[0], args[1], args[2], args[3]}, out);
+					ok = ApplyPure(step.op, step.flags, {args[0], args[1], args[2], args[3]}, out);
 					break;
 				case StepKind::ExtractHalf: out = ExtractHalf(args[0], step.operand); break;
 				case StepKind::AddCarryHalf:
 					out = AddCarryHalf(args[0], args[1], step.operand);
 					break;
 				case StepKind::RawRead: {
-					const auto& mem = program.memory_info[step.inst->Flags<SrtReadFlags>().index];
+					const auto& mem = program.memory_info[step.flags];
 					uint64_t    address = 0;
 					bool        zero    = false;
-					ok = RawReadAddress(step.inst->GetOpcode(), mem, args[0], args[1], args[2],
+					ok = RawReadAddress(step.op, mem, args[0], args[1], args[2],
 					                    args[3], args[4], address, zero) &&
 					     (zero || ReadRawWord(runtime, false, address, out));
 					break;

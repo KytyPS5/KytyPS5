@@ -10693,6 +10693,8 @@ void TestCapturedBufferAtomicsX2() {
        "BufferAtomicIAdd64", "OpAtomicIAdd", ValueOpcode::BufferAtomicIAdd64},
       {{0xe1680018u, 0x80000000u}, 0u, 241u, "BUFFER_ATOMIC_OR_X2",
        "BufferAtomicOr64", "OpAtomicOr", ValueOpcode::BufferAtomicOr64},
+      {{0xe1582000u, 0x8003092au}, 9u, 237u, "BUFFER_ATOMIC_UMIN_X2",
+       "BufferAtomicUMin64", "OpAtomicUMin", ValueOpcode::BufferAtomicUMin64},
       {{0xe1402000u, 0x80000913u}, 9u, 229u, "BUFFER_ATOMIC_SWAP_X2",
        "BufferAtomicSwap64", "OpAtomicExchange", ValueOpcode::BufferAtomicSwap64},
   };

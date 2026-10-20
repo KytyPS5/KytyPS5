@@ -1034,6 +1034,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMIN:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin32);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin64);
 		case Decoder::Opcode::BUFFER_ATOMIC_SMAX:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMax32);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMAX:

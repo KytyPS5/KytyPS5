@@ -1692,7 +1692,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			    evaluate_condition()) {
 				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 			} else {
-				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+				// One or two successors: an insert costs a library copy per block.
+				for (const auto successor: block.successors) pending.push_back(successor);
 			}
 		}
 		if (reachable == visited) break;

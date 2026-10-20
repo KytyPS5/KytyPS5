@@ -143,7 +143,7 @@ ThreadState* CurrentThread() {
 	}
 	auto* state     = new ThreadState;
 	state->first_ns = NowNs();
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	state->tid = static_cast<int>(gettid());
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -535,7 +535,9 @@ void Initialize() {
 	std::signal(SIGFPE, FatalSignal);
 #endif
 	state->writer = std::thread([state] {
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__APPLE__)
+		pthread_setname_np("TraceWriter");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		pthread_setname_np(pthread_self(), "TraceWriter");
 #endif
 		WriterLoop(*state);

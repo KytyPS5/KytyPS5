@@ -912,6 +912,10 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+bool DescribeNearestGpuMapping(uint64_t fault_vaddr, uint64_t* begin, uint64_t* end) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->DescribeNearestMapping(fault_vaddr, begin, end);
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

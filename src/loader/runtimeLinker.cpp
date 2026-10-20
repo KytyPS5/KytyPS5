@@ -707,6 +707,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			uint64_t nearest_begin = 0;
+			uint64_t nearest_end   = 0;
+			if (Libs::LibKernel::Memory::DescribeNearestGpuMapping(info->access_violation_vaddr,
+			                                                     &nearest_begin, &nearest_end)) {
+				std::printf("nearest guest mapping: [0x%016" PRIx64 " .. 0x%016" PRIx64 ")\n",
+				            nearest_begin, nearest_end);
+			} else {
+				std::printf("nearest guest mapping: (none known)\n");
+			}
+		}
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

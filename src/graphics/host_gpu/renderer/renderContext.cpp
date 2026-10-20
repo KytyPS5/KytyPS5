@@ -87,6 +87,12 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::DescribeNearestMapping(uint64_t vaddr, uint64_t* begin,
+                                            uint64_t* end) const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.Nearest(vaddr, begin, end);
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);

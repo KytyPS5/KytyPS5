@@ -91,6 +91,44 @@ public:
 		}
 	}
 
+	// Finds the mapped range containing address, or the closest one by gap distance.
+	// Used to describe unhandled guest faults; never aborts.
+	[[nodiscard]] bool Nearest(uint64_t address, uint64_t* begin, uint64_t* end) const {
+		if (m_ranges.empty() || begin == nullptr || end == nullptr) {
+			return false;
+		}
+		auto it = m_ranges.upper_bound(address);
+		if (it != m_ranges.begin()) {
+			const auto prev = std::prev(it);
+			if (prev->first <= address && address < prev->second) {
+				*begin = prev->first;
+				*end   = prev->second;
+				return true;
+			}
+		}
+		const bool has_prev = it != m_ranges.begin();
+		const bool has_next = it != m_ranges.end();
+		if (has_prev && has_next) {
+			const auto prev = std::prev(it);
+			// Both gaps are strictly positive here (containment handled above).
+			if (address - prev->second <= it->first - address) {
+				*begin = prev->first;
+				*end   = prev->second;
+			} else {
+				*begin = it->first;
+				*end   = it->second;
+			}
+		} else if (has_prev) {
+			const auto prev = std::prev(it);
+			*begin          = prev->first;
+			*end            = prev->second;
+		} else {
+			*begin = it->first;
+			*end   = it->second;
+		}
+		return true;
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:

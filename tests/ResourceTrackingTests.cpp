@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -131,7 +132,8 @@ struct Fixture {
                  Value(0u), Value(0u), Value(0u)});
   }
 
-  void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input = {}) {
+  ReadLaneStats PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input = {},
+                             uint32_t read_lane_wave = 0) {
     for (size_t index = 0; index < program.blocks.size(); ++index) {
       const auto condition = program.blocks[index]->condition;
       if (!condition.IsEmpty())
@@ -153,7 +155,16 @@ struct Fixture {
         Emit(ValueOpcode::ReferenceU32, {value}, 0, target);
       }
     }
+    ReadLaneStats stats;
+    if (read_lane_wave != 0u) {
+      // Same order as the recompiler: read-lane elimination and cleanup precede tracking.
+      stats = EliminateReadLane(program, read_lane_wave);
+      ConstantPropagationPass(program.blocks, read_lane_wave);
+      RemoveIdentities(program);
+      EliminateDeadCode(program.blocks);
+    }
     TrackResources(program, {}, {}, input);
+    return stats;
   }
 };
 
@@ -1018,7 +1029,8 @@ void TestIndexedPointerImageTable() {
   enum class Case { Valid, ReverseSigned, MissingParent, WrongParent, MissingChild,
                     InclusiveChild, MismatchedPair, DifferentLaneMask, ExtraUse,
                     UnboundedChoice, MissingOuterWitness, WrongOuterWitness, CyclicChoice,
-                    ExcessiveDomain, Counted, MissingCount, DifferentCount, MaskedCount, UnprovenMask };
+                    ExcessiveDomain, UniformRow, Counted, MissingCount, DifferentCount, MaskedCount,
+                    UnprovenMask };
   const auto make = [](Case variant = Case::Valid) {
     auto fixture = std::make_unique<Fixture>();
     std::array<Value, 4> table_words;
@@ -1046,6 +1058,8 @@ void TestIndexedPointerImageTable() {
           {valid, fixture->Emit(ValueOpcode::SelectU32,
                {choice, Value(0u), variant == Case::UnboundedChoice ? lane : Value(1u)}),
            Value(UINT32_MAX)});
+      if (variant == Case::UniformRow)
+        row = fixture->Emit(ValueOpcode::BitwiseAnd32, {fixture->UserData(6), Value(1u)});
     }
     auto* entry = fixture->block;
     auto* left = fixture->AddBlock();
@@ -1079,7 +1093,7 @@ void TestIndexedPointerImageTable() {
     auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
     phi.AddPhiOperand(left, row);
     phi.AddPhiOperand(right, counted ? Value(UINT32_MAX) : row);
-    row = Value(&phi);
+    if (variant != Case::UniformRow) row = Value(&phi);
     if (variant == Case::CyclicChoice) {
       merge->AddBranch(merge);
       merge->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
@@ -1259,6 +1273,17 @@ void TestIndexedPointerImageTable() {
         "explicit null pointer bypassed the strict child reader");
   auto reversed = make(Case::ReverseSigned);
   reversed->PlanAndTrack();
+  for (const uint32_t wave_size : {32u, 64u}) {
+    // Only the uniform row's first-lane read is removed; the GPU pointer pair keeps its reads.
+    auto uniform = make(Case::UniformRow);
+    Check(uniform->PlanAndTrack({}, wave_size).rewritten_reads == 1u,
+          "read-lane elimination kept a uniform row read or removed a GPU pointer read");
+    const auto uniform_plan = ExtractResourcePlan(uniform->program);
+    const auto& uniform_source = *uniform_plan.descriptor_sources[uniform_plan.info.images[0].source].indirect_descriptor;
+    Check(uniform_source.table_maximum == 1u && uniform_source.pointer_table &&
+              uniform_source.pointer_table->indexed && uniform_source.pointer_table->count == 3u,
+          "nested table lost its uniform row after read-lane elimination");
+  }
   for (const auto variant : {Case::MissingParent, Case::WrongParent, Case::MissingChild,
           Case::InclusiveChild, Case::MismatchedPair, Case::DifferentLaneMask,
           Case::ExtraUse, Case::UnboundedChoice, Case::MissingOuterWitness, Case::WrongOuterWitness,
@@ -4168,11 +4193,12 @@ void TestCountedRowImageSelector() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant { Valid, Signed, StepTwo, SkippedIteration, WrongRow, CountStride,
                        KeyStride, CountImmediate, KeyImmediate, DifferentBackedgeBound,
-                       Masked, EmptyCountMask, VaryingRow,
+                       Masked, UserDataRow, UnselectedRow, EmptyCountMask, VaryingRow,
                        EmptyMask, UnprovenMask, WrongMask, AnyBound, MaskedStepTwo, Spilled,
                        MergedInitial, MissingBound, PreviousIteration,
                        InvariantMask, PossiblyEmptyMask };
-  const auto make_plan = [](Variant variant = Variant::Valid, uint32_t capacity = 16u) {
+  const auto make_plan = [](Variant variant = Variant::Valid, uint32_t capacity = 16u,
+                            uint32_t wave_size = 0u) {
     Fixture fixture;
     const bool masked = variant >= Variant::Masked;
     const bool cyclic_mask = variant >= Variant::InvariantMask;
@@ -4205,16 +4231,20 @@ void TestCountedRowImageSelector() {
     if (masked) {
       const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
           {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
-      row = fixture.Emit(ValueOpcode::ReadConstBuffer,
-          {keys, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {row, Value(2u)})},
-          fixture.AddMemory(scalar, 0x04));
-      row = fixture.Emit(ValueOpcode::IMul32,
-          {row, fixture.Emit(ValueOpcode::ConvertU32F32,
-              {fixture.Emit(ValueOpcode::BitCastF32U32, {fixture.UserData(12u)})})});
-      Check(ValidateWaveUniformValue(fixture.program, row) &&
-                !ValidateRuntimeValue(fixture.program, row),
-            "wave-uniform workgroup data escaped the host evaluation boundary");
-      if (variant == Variant::VaryingRow)
+      if (variant == Variant::UserDataRow || variant == Variant::UnselectedRow) {
+        row = fixture.UserData(12u);
+      } else {
+        row = fixture.Emit(ValueOpcode::ReadConstBuffer,
+            {keys, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {row, Value(2u)})},
+            fixture.AddMemory(scalar, 0x04));
+        row = fixture.Emit(ValueOpcode::IMul32,
+            {row, fixture.Emit(ValueOpcode::ConvertU32F32,
+                {fixture.Emit(ValueOpcode::BitCastF32U32, {fixture.UserData(12u)})})});
+        Check(ValidateWaveUniformValue(fixture.program, row) &&
+                  !ValidateRuntimeValue(fixture.program, row),
+              "wave-uniform workgroup data escaped the host evaluation boundary");
+      }
+      if (variant == Variant::VaryingRow || variant == Variant::UnselectedRow)
         row = fixture.Emit(ValueOpcode::IAdd32, {row, local});
       if (cyclic_mask) {
         branch(entry, preheader);
@@ -4275,7 +4305,7 @@ void TestCountedRowImageSelector() {
                    fixture.AddMemory(spill, 0x08));
     }
     auto count_row = row;
-    if (masked) count_row = fixture.Emit(ValueOpcode::ReadFirstLane,
+    if (masked && variant != Variant::UnselectedRow) count_row = fixture.Emit(ValueOpcode::ReadFirstLane,
         {row, variant == Variant::Spilled ? active : Value(variant != Variant::EmptyCountMask)});
     if (variant == Variant::WrongRow)
       count_row = fixture.Emit(ValueOpcode::IAdd32, {row, Value(1u)});
@@ -4362,11 +4392,14 @@ void TestCountedRowImageSelector() {
     compute.threads_num[0] = 64u;
     compute.threads_num[1] = compute.threads_num[2] = 1u;
     compute.lds_size_dwords = 2048u;
-    fixture.PlanAndTrack({.compute = &compute});
+    Check(fixture.PlanAndTrack({.compute = &compute}, wave_size).rewritten_reads ==
+              (wave_size != 0u && variant == Variant::UserDataRow ? 1u : 0u),
+          "read-lane elimination changed which counted-row first-lane reads are uniform");
     const auto &source = fixture.program.descriptor_sources[fixture.program.info.images[0].source];
     Check(source.indirect_descriptor.has_value(), "counted-row image lost its indirect source");
     const auto &selector = source.indirect_descriptor->selector;
     const bool valid = variant == Variant::Valid || variant == Variant::Masked || variant == Variant::Spilled ||
+                       variant == Variant::UserDataRow ||
                        variant == Variant::EmptyCountMask || variant == Variant::MergedInitial ||
                        variant == Variant::StepTwo || variant == Variant::MaskedStepTwo ||
                        variant == Variant::SkippedIteration || variant == Variant::InvariantMask || stable_index;
@@ -4386,6 +4419,9 @@ void TestCountedRowImageSelector() {
   auto plan = make_plan(Variant::MergedInitial);
   make_plan();
   make_plan(Variant::Masked);
+  make_plan(Variant::Masked, 16u, 64u);
+  // A uniform count row loses its first-lane read; the selected element keeps its own.
+  for (const uint32_t wave_size : {0u, 32u, 64u}) make_plan(Variant::UserDataRow, 16u, wave_size);
   make_plan(Variant::Spilled);
   make_plan(Variant::EmptyCountMask);
   make_plan(Variant::DifferentBackedgeBound);
@@ -4394,6 +4430,7 @@ void TestCountedRowImageSelector() {
   for (const auto variant : {Variant::Signed, Variant::StepTwo, Variant::SkippedIteration,
                              Variant::WrongRow, Variant::CountStride, Variant::KeyStride,
                              Variant::CountImmediate, Variant::KeyImmediate, Variant::VaryingRow,
+                             Variant::UnselectedRow,
                              Variant::EmptyMask, Variant::UnprovenMask, Variant::WrongMask,
                              Variant::AnyBound, Variant::MaskedStepTwo,
                              Variant::MissingBound, Variant::PreviousIteration})
@@ -4474,6 +4511,23 @@ void TestCountedRowImageSelector() {
   check({1u, 2u, 3u});
   Check(captured(KeyBase, 8u) && captured(KeyBase + 128u, 4u),
         "active row keys escaped writable-overlap capture");
+  // Removing the uniform row's first-lane read must not change the discovered candidates.
+  std::array<uint32_t, 13> row_data{};
+  std::copy(user_data.begin(), user_data.end(), row_data.begin());
+  row_data[12] = 2u;
+  const SrtRuntime row_runtime{.user_data = row_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  std::array<ResourceSnapshot, 2> row_snapshots;
+  for (const uint32_t pass : {0u, 1u}) {
+    ResourceSpecialization row_specialization;
+    Check(MaterializeResources(make_plan(Variant::UserDataRow, 16u, pass * 64u), row_runtime,
+                               row_snapshots[pass], row_specialization) &&
+              !row_snapshots[pass].images.empty(),
+          "uniform count row failed discovery");
+  }
+  Check(row_snapshots[0].images == row_snapshots[1].images &&
+            row_snapshots[0].flattened_srt == row_snapshots[1].flattened_srt,
+        "uniform count row selected different keys after read-lane elimination");
   at(KeyBase) = 0x80000001u;
   check({1u, 3u, 0x80000001u});
   at(KeyBase) = 0x1890cedeu; // 396*key +184 wraps to material byte32.

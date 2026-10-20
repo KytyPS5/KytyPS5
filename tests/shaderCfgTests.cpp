@@ -1832,6 +1832,37 @@ void TestNewShaderRecompilerSMovB32() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestUniformReadFirstLanePipeline() {
+  // Translation removes a first-lane read of SGPR data before resource tracking;
+  // a buffer-loaded value keeps it through SPIR-V emission.
+  for (const bool uniform : {true, false}) {
+    std::vector<uint32_t> shader;
+    if (uniform)
+      shader = {EncodeVop1(0x01, 5, 4)}; // v_mov_b32 v5, s4
+    else
+      shader = {EncodeMubuf0(0x0c), EncodeMubuf1(5, 0, 1)}; // buffer_load_dword v5, v1
+    shader.insert(shader.end(), {
+        EncodeVop1(0x02, 24, 5 + 256), // v_readfirstlane_b32 s24, v5
+        EncodeVop1(0x01, 0, 24),       // v_mov_b32 v0, s24
+        EncodeMubuf0(0x1c, 0, false),
+        EncodeMubuf1(0, 12, 0),        // buffer_store_dword v0
+        0xbf810000u,                   // s_endpgm
+    });
+    for (const uint32_t wave_size : {32u, 64u}) {
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      options.wave_size = wave_size;
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      uint32_t reads = 0;
+      for (const auto *block : result.program.blocks)
+        for (const auto &inst : *block)
+          reads += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadFirstLane;
+      Check(reads == (uniform ? 0u : 1u),
+            "translated program kept a uniform first-lane read or removed a loaded one");
+    }
+  }
+}
+
 void TestShaderStageBarriers() {
   const uint32_t shader[] = {
       EncodeSopp(0x0a, 0),    // s_barrier
@@ -16651,6 +16682,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestUniformReadFirstLanePipeline();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
   TestNggVertexEntryState();

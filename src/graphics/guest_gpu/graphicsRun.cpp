@@ -1073,14 +1073,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		if (QueueReadbacksBeforeLabel()) {
-			// The guest may read GPU-written images as soon as it sees this label, so publish the
-			// label only after the queued image downloads have reached guest memory.
-			GetScheduler().DeferPriorityOperation([dst, data] { std::memcpy(dst, &data, sizeof(data)); });
-			if (with_interrupt) {
-				TriggerEopEventAtEndOfPipe(interrupt_context_id);
-			}
-			GetScheduler().Flush();
+		if (PublishLabelAfterReadbacks(dst, data, sizeof(data), with_interrupt,
+		                               interrupt_context_id)) {
 			return;
 		}
 		std::memcpy(dst, &data, sizeof(data));
@@ -1131,14 +1125,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					if (QueueReadbacksBeforeLabel()) {
-						// See write32: publish the label after pending image readbacks land.
-						GetScheduler().DeferPriorityOperation(
-						    [dst, data = static_cast<uint64_t>(value)] { std::memcpy(dst, &data, sizeof(data)); });
-						if (with_interrupt) {
-							TriggerEopEventAtEndOfPipe(interrupt_context_id);
-						}
-						GetScheduler().Flush();
+					if (PublishLabelAfterReadbacks(dst, static_cast<uint64_t>(value), sizeof(value),
+					                               with_interrupt, interrupt_context_id)) {
 						return;
 					}
 					std::memcpy(dst, &value, sizeof(value));
@@ -1248,6 +1236,29 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 bool CommandProcessor::QueueReadbacksBeforeLabel() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 	return m_renderer.GetTextureCache().ProcessDownloadImages();
+}
+
+bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uint32_t size,
+                                                  bool with_interrupt,
+                                                  uint32_t interrupt_context_id) {
+	EXIT_IF(size != sizeof(uint32_t) && size != sizeof(uint64_t));
+	const bool queued = QueueReadbacksBeforeLabel();
+	// Priority operations run in FIFO order, so a label queued behind an earlier deferred label
+	// can never become visible before that label's readbacks have landed.
+	if (!queued && m_labels_behind_readbacks->load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);
+	GetScheduler().DeferPriorityOperation(
+	    [dst, value, size, pending = m_labels_behind_readbacks] {
+		    std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
+		    pending->fetch_sub(1, std::memory_order_acq_rel);
+	    });
+	if (with_interrupt) {
+		TriggerEopEventAtEndOfPipe(interrupt_context_id);
+	}
+	GetScheduler().Flush();
+	return true;
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

@@ -160,6 +160,7 @@ void VisitInput(Info& info, F& field) {
 		field(info.scratch_size_dwords);
 		field(info.lds_size_dwords);
 		field(info.pa_cl_vs_out_cntl);
+		field(info.user_clip_planes);
 		Each(info.clip_space.scale, field);
 		Each(info.clip_space.offset, field);
 		Each(info.clip_space.half_extent, field);
@@ -176,6 +177,8 @@ void VisitInput(Info& info, F& field) {
 		field(info.tess.output_control_points);
 		field(info.tess.ls_stride);
 		field(info.tess.hs_stride);
+		field(info.tess.patch_base);
+		field(info.tess.patch_size);
 		field(info.tess.domain);
 		field(info.tess.partitioning);
 		field(info.tess.output_topology);

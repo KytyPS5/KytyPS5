@@ -43697,9 +43697,13 @@ void CheckShaderCacheRecordPadding() {
             "a pixel input field of the program key was lost in its record");
   }
   {
-    // The GS LDS size a vertex program is keyed on survives the record.
+    // Every vertex field of the program key survives the record.
     ShaderVertexInputInfo vertex{};
     vertex.lds_size_dwords = 512;
+    vertex.user_clip_planes = 0x21;
+    vertex.tess.input_control_points = 3;
+    vertex.tess.patch_base = 96;
+    vertex.tess.patch_size = 48;
     ShaderVertexInputInfo decoded{};
     const auto key = [](const ShaderVertexInputInfo &info) {
       std::vector<u32> words;

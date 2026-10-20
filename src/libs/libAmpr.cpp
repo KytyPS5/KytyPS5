@@ -215,6 +215,17 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			info.file_size = Common::File::Size(real_path);
 		} else {
 			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+			// Folder-format dumps can retain APR marker suffixes on backing files.
+			// Keep exact paths authoritative and resolve candidates through the mount table.
+			for (const auto* suffix: {".sndr", ".emf"}) {
+				auto candidate = LibKernel::FileSystem::GetRealFilename(path + suffix);
+				if (Common::File::IsFileExisting(candidate)) {
+					info.host_path = std::move(candidate);
+					info.file_size = Common::File::Size(info.host_path);
+					info.result    = OK;
+					break;
+				}
+			}
 		}
 
 		bool log_missing = false;

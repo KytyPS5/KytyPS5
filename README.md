@@ -341,6 +341,17 @@ ctest --test-dir _Build/windows --output-on-failure
 
 Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 
+Run the APR path-resolution and command-queue cases without initializing Vulkan:
+
+```bash
+cmake --build _Build/macos --target kernel_file_system_tests
+./_Build/macos/kernel_file_system_tests --apr-only
+```
+
+APR lookups prefer the exact guest path, then try backing files with `.sndr` and `.emf`
+suffixes, in that order. This supports marked files in folder-format dumps without
+renaming them. Ordinary filesystem lookups and directory listings are unchanged.
+
 ### Visual Studio Code
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake

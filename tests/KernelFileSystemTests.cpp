@@ -1729,6 +1729,46 @@ void CheckAprPaths(const std::filesystem::path &root) {
           "APR re-resolution preserves each file's ID, host path and cached size");
   }
 
+  const auto create_marker_file = [&](const char *name, const char *data) {
+    Check(fixture.Create(root / name), "create marked APR fixture");
+    fixture.Write(data, static_cast<uint32_t>(std::strlen(data)));
+    fixture.Close();
+  };
+  create_marker_file("content.pak.sndr", "APR");
+  create_marker_file("content.pak.emf", "wrong container");
+  create_marker_file("engine.ucas.emf", "engine");
+  create_marker_file("exact.pak", "exact");
+  create_marker_file("exact.pak.sndr", "wrong");
+  Check(std::filesystem::create_directory(root / "directory.pak.sndr"),
+        "create directory with an APR marker suffix");
+  const char *marked_paths[] = {"content.pak", "engine.ucas", "exact.pak",
+                                "directory.pak", "absent.ucas"};
+  std::array<uint32_t, 5> marked_ids{};
+  std::array<uint64_t, 5> marked_sizes{};
+  std::array<int, 5> marked_results{};
+  Check(resolve_each("/app0/", marked_paths, 5, marked_ids.data(),
+                     marked_sizes.data(), marked_results.data()) == 3 &&
+            marked_results[0] == OK && marked_sizes[0] == 3 &&
+            marked_results[1] == OK && marked_sizes[1] == 6 &&
+            marked_results[2] == OK && marked_sizes[2] == 5 &&
+            marked_results[3] == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            marked_results[4] == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "APR resolves marker files in order, prefers exact paths, and rejects "
+        "directories");
+  FileSystem::FileStat marked_stat{};
+  uint64_t marked_size = 0;
+  Check(reinterpret_cast<Stat>(stat_symbol->vaddr)(marked_ids[1],
+                                                   &marked_stat) == OK &&
+            reinterpret_cast<Size>(size_symbol->vaddr)(marked_ids[1],
+                                                       &marked_size) == OK &&
+            marked_stat.st_size == 6 && marked_size == 6,
+        "APR marker IDs retain the backing path for stat and size");
+  uint32_t repeated_id = 0;
+  Check(resolve("/app0/", marked_paths, 1, &repeated_id, &marked_size,
+                &error_index) == OK &&
+            repeated_id == marked_ids[0] && marked_size == 3,
+        "APR caches the resolved marker ID and size");
+
   // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
   std::string longest = "/app0/";
   for (int i = 0; i < 3; ++i) {
@@ -1752,7 +1792,7 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
-  CheckAmprOrdering(symbols, collision_ids[0]);
+  CheckAmprOrdering(symbols, marked_ids[0]);
   FileSystem::Umount("/app0");
 }
 
@@ -2413,6 +2453,16 @@ int main(int argc, char** argv) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  if (argc == 2 && std::string_view(argv[1]) == "--apr-only") {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    CheckAprPaths(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: APR cases passed\n");
+    return 0;
+  }
 
   TestMutexHandoff();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {

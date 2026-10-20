@@ -11287,6 +11287,76 @@ void TestGraphicsComputeGetreg() {
 #endif
 }
 
+void TestCallThroughTableLinksEveryFunction() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0040000ull;
+  // A waterfall over a table of 16-byte entries {function, data}: each pass reads the entry of
+  // the first lane's index and calls its function.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 255), static_cast<uint32_t>(base),
+      EncodeSMovB32(1, 255), static_cast<uint32_t>(base >> 32u) | (16u << 16u), // stride 16
+      EncodeSMovB32(2, 130),                                                   // 2 records
+      EncodeSMovB32(3, 255), 0x00005204u,
+      0x7e100500u,                 // v_readfirstlane_b32 s8, v0
+      EncodeSop2(0x1e, 8, 8, 132), // s_lshl_b32 s8, s8, 4
+      0xf4280400u, 0x10000000u,    // s_buffer_load_dwordx4 s[16:19], s[0:3], s8
+      0xbf8cc07fu,                 // s_waitcnt lgkmcnt(0)
+      EncodeSMovB32(14, 16), EncodeSMovB32(15, 17),
+      EncodeSop1(0x21, 14, 14),    // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x05, 0xfff7u),   // s_cbranch_scc1 to the read
+      EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 64> words{};
+  } memory;
+  // Entries at base: functions at base + 0x40 and base + 0x60.
+  memory.words[0] = static_cast<uint32_t>(base + 0x40);
+  memory.words[1] = static_cast<uint32_t>(base >> 32u);
+  memory.words[4] = static_cast<uint32_t>(base + 0x60);
+  memory.words[5] = static_cast<uint32_t>(base >> 32u);
+  memory.words[16] = EncodeSMovB32(20, 129); // s_mov_b32 s20, 1
+  memory.words[17] = EncodeSop1(0x20, 0, 14); // s_setpc_b64 s[14:15]
+  memory.words[24] = EncodeSMovB32(20, 130);
+  memory.words[25] = EncodeSop1(0x20, 0, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const uint64_t end = base + m.words.size() * 4u;
+    if (address < base || address > end || out.size_bytes() > end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.call && source.call->table && source.call->table->stride == 16u &&
+            source.call->table->dword == 0u,
+        "a call through a table of functions was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  uint32_t moves = 0, compares = 0, calls = 0;
+  for (const auto& inst: linked.instructions) {
+    moves += inst.opcode == Decoder::Opcode::S_MOV_B32 && inst.dst.reg == 20u ? 1u : 0u;
+    compares += inst.opcode == Decoder::Opcode::S_CMP_EQ_U32 ? 1u : 0u;
+    calls += inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ? 1u : 0u;
+  }
+  Check(moves == 2u && compares == 4u && calls == 3u &&
+            linked.instructions[source.call->instruction].opcode == Decoder::Opcode::S_BRANCH,
+        "the table's functions or the chain that calls them were not linked");
+  Check(source.reads.size() >= 3u && source.reads[source.reads.size() - 3u] == std::pair<uint64_t, uint64_t>{base, 32} &&
+            source.reads[source.reads.size() - 2u] == std::pair<uint64_t, uint64_t>{base + 0x40, 8} &&
+            source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x60, 8},
+        "the table and its functions were not observed");
+  const auto revision = source.revision;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision, "an unchanged table linked its functions again");
+  memory.words[2] = 0x1234u; // An entry's data is not part of the program.
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision, "new data in an entry linked its functions again");
+  memory.words[24] = EncodeSMovB32(20, 131);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == revision + 1u, "a changed function was not linked again");
+  (void)TranslateProgram(source.linked->decoded, options);
+}
+
 void TestCallInLoopIsSkipped() {
   using namespace ShaderRecompiler;
   // A waterfall loop calls through s[14:15]; the target changes per iteration, so it is not linked.
@@ -16808,6 +16878,7 @@ int main() {
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestCallInLoopIsSkipped();
+  TestCallThroughTableLinksEveryFunction();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

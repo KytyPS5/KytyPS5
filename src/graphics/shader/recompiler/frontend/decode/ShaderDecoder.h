@@ -847,6 +847,8 @@ struct Instruction {
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
 	uint32_t       branch_target                                = 0;
+	// The address a linked call returns to, when its own PC is not the call's in the guest code.
+	uint32_t       return_pc                                    = UINT32_MAX;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;

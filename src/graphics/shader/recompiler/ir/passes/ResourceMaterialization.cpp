@@ -1243,8 +1243,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
 		}
 	}
-	if (capture_indirect_reads || !plan.source_reads.empty())
-		plan.resource_tracking_complete &= !program.has_address_writes;
+	// Address writes are not tracked, so values captured from memory the shader may write are not
+	// known to stay. Linked calls read guest code and function tables, which shaders do not write.
+	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
 	plan.srt_tape = SrtTape::Build(plan);
 	CompileSrtWalker(plan);
 	// A plan with a tape never walks its values (MaterializeResources).
@@ -1300,6 +1301,7 @@ bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& run
 	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
+	snapshot.source_reads = program.source_reads.size();
 	SrtReadCapture capture {runtime, reads};
 	const auto     observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	// A plan with a tape runs it in place of the walkers. Its plan has no indirect descriptor,

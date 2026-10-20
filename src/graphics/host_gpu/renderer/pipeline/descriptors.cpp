@@ -995,7 +995,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
+		// Guest code and function tables of linked calls are not memory a shader writes.
+		const bool captures = reads.size() > reader->runtime->resources->source_reads;
 		for (const auto* writer: prepared_bindings) {
+			if (!captures) break;
 			if (writer->runtime->program->has_address_writes) {
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}

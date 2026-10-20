@@ -269,10 +269,14 @@ struct PipelineCache::ProgramCache {
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
 		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {}
 
+		// What the linked calls add to the program: a table call is named by the table and the
+		// functions it links, which may sit inside the program's code.
 		std::span<const uint32_t> FunctionCode() const {
-			return call_source
-			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
-			    : std::span<const uint32_t>{};
+			if (!call_source) return {};
+			const auto& linked = *call_source->linked;
+			return call_source->call->table
+			           ? std::span<const uint32_t>(linked.observed_function)
+			           : std::span<const uint32_t>(linked.code).subspan(call_source->code.size());
 		}
 
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {

@@ -1687,27 +1687,55 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
-	EXIT_IF(before >= program.instructions.size());
+std::optional<uint32_t> TryFindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                                                uint32_t before, uint32_t code) {
+	if (before >= program.instructions.size()) return std::nullopt;
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
-	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
-			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
-			if (MayWriteScalarRegister(inst, code)) return i;
+	if (found == graph.blocks.end()) return std::nullopt;
+	// Every path back from the use must reach the same definition, or the entry (UINT32_MAX) on
+	// all of them. A path that comes back to a block already searched adds nothing new. A call
+	// writes only its return address: the callee keeps the caller's other registers.
+	constexpr uint32_t kNone    = UINT32_MAX - 1u;
+	uint32_t           reaching = kNone;
+	std::vector<bool>  searched(graph.blocks.size(), false);
+	std::vector<std::pair<const BasicBlock*, uint32_t>> pending {{&*found, before}};
+	while (!pending.empty()) {
+		const auto [block, end] = pending.back();
+		pending.pop_back();
+		uint32_t definition = kNone;
+		for (uint32_t i = end; i > block->inst_begin;) {
+			if (MayWriteScalarRegister(program.instructions[--i], code)) {
+				definition = i;
+				break;
+			}
 		}
-		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
-		EXIT_IF(block == nullptr);
-		before = block->inst_end;
+		if (definition == kNone && block->id == graph.entry_block) definition = UINT32_MAX;
+		if (definition != kNone) {
+			if (reaching != kNone && reaching != definition) return std::nullopt;
+			reaching = definition;
+			continue;
+		}
+		if (block->predecessors.empty()) return std::nullopt;
+		for (const auto id: block->predecessors) {
+			const auto* predecessor = graph.FindBlock(id);
+			if (predecessor == nullptr) return std::nullopt;
+			const auto index = static_cast<size_t>(predecessor - graph.blocks.data());
+			if (searched[index]) continue;
+			searched[index] = true;
+			pending.emplace_back(predecessor, predecessor->inst_end);
+		}
 	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+	if (reaching == kNone) return std::nullopt;
+	return reaching;
+}
+
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                              uint32_t before, uint32_t code) {
+	const auto definition = TryFindScalarDefinition(program, graph, before, code);
+	if (!definition.has_value()) EXIT("scalar shader call source has more than one reaching definition");
+	return *definition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

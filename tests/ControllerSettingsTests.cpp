@@ -93,8 +93,9 @@ void Delay(Uint32) {}
 namespace Libs::Controller {
 // No virtual headset in these tests (padVr.cpp is not linked here).
 int PadVrPortHand(int) { return -1; }
-int PadVrPort(int, int, int, bool) { return -1; }
-int PadVrClose(int) { return -1; }
+int PadVrPort(int, int, int, bool) { return PAD_ERROR_INVALID_ARG; }
+int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
+int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
 } // namespace Libs::Controller
 
 namespace Libs::Controller::DualSenseHaptics {

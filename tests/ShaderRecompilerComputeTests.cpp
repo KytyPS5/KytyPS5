@@ -2001,6 +2001,12 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
+  // Host float min/max is used on AMD devices with float controls 2, as in Kyty.
+  [[nodiscard]] bool SupportsNativeFloatMinMax() const {
+    vk::PhysicalDeviceProperties properties;
+    m_physical_device.getProperties(&properties);
+    return properties.vendorID == 0x1002u && m_float_controls2;
+  }
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
@@ -20380,6 +20386,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_float_controls2 = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20699,6 +20706,19 @@ private:
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
     device_info.pNext = &robustness2;
+    // Optional: host float min/max needs float controls 2.
+    for (const auto &extension :
+         m_physical_device.enumerateDeviceExtensionProperties().value) {
+      if (std::strcmp(extension.extensionName,
+                      VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME) == 0)
+        m_float_controls2 = true;
+    }
+    vk::PhysicalDeviceShaderFloatControls2FeaturesKHR float_controls2{};
+    float_controls2.shaderFloatControls2 = true;
+    if (m_float_controls2) {
+      float_controls2.pNext = &robustness2;
+      device_info.pNext = &float_controls2;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -20718,6 +20738,8 @@ private:
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (m_float_controls2)
+      device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -27861,6 +27883,66 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            0x40000000u, 0x40000000u, 0x40000000u},
           {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32,
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+// MIN/MAX/MIN3/MAX3 on runtime inputs, so no compiler can fold them. The expected bits follow
+// the emulated rules: a NaN operand yields the other operand and signed zeros are ordered.
+// Denormal operands are left out; their expected results are not pinned down here.
+TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
+  using O = ShaderOpcode;
+  const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+  const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
+  const auto value = [](u32 v) { return std::bit_cast<float>(v); };
+  const auto min2 = [&](u32 a, u32 b) {
+    if (nan(a)) return b;
+    if (nan(b)) return a;
+    if (zero(a) && zero(b)) return a | b;
+    return value(a) < value(b) ? a : b;
+  };
+  const auto max2 = [&](u32 a, u32 b) {
+    if (nan(a)) return b;
+    if (nan(b)) return a;
+    if (zero(a) && zero(b)) return a & b;
+    return value(a) >= value(b) ? a : b;
+  };
+  constexpr u32 cases[][3] = {
+      {0x40000000u, 0x40400000u, 0x3f800000u}, {0x7fc00000u, 0x40000000u, 0xbf800000u},
+      {0x40000000u, 0x7fc00000u, 0x3f800000u}, {0x7fa00001u, 0x40000000u, 0x40400000u},
+      {0x40000000u, 0x7fa00001u, 0xc0000000u}, {0x80000000u, 0x00000000u, 0x80000000u},
+      {0x00000000u, 0x80000000u, 0x00000000u}, {0x80000000u, 0x80000000u, 0x00000000u},
+      {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
+      {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u}};
+  TestCase test;
+  test.name = "VectorMinMaxF32RuntimeEdges";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : cases)
+    test.initial.insert(test.initial.end(), values, values + 3);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    const auto [a, b, c] = cases[index];
+    code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+    AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x154, 13, Vgpr(0), Vgpr(1), Vgpr(2));
+    for (u32 result = 0; result < 4; ++result)
+      AppendStoreVgpr(&code, 10 + result, static_cast<u32>(test.expected.size() + result));
+    test.expected.insert(test.expected.end(),
+                         {min2(a, b), max2(a, b), min2(min2(a, b), c), max2(max2(a, b), c)});
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_MIN_F32,         O::V_MAX_F32,
+                  O::V_MIN3_F32, O::V_MAX3_F32,        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
@@ -42983,6 +43065,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(32));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -48938,6 +49022,29 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
     RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
+    // Host min/max must keep the emulated results on AMD GPUs.
+    VulkanHarness vulkan;
+    for (bool native : {false, true}) {
+      if (native && !vulkan.SupportsNativeFloatMinMax()) {
+        std::printf("Host float min/max skipped: needs an AMD GPU with float controls 2\n");
+        break;
+      }
+      ShaderRecompiler::Spirv::SetNativeFloatMinMax(native);
+      auto edges = VectorMinMaxF32NanAndSignedZeroEdges();
+      if (native)
+        edges.required_spirv.push_back("FloatControls2");
+      RunCase(&vulkan, edges);
+      for (u32 wave : {32u, 64u}) {
+        auto test = VectorMinMaxF32RuntimeEdges(wave);
+        if (native)
+          test.required_spirv.push_back("FloatControls2");
+        RunCase(&vulkan, test);
+      }
+    }
+    ShaderRecompiler::Spirv::SetNativeFloatMinMax(false);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {

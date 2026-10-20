@@ -318,6 +318,31 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	RecordGuestWrite(vaddr, size);
 }
 
+void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	std::vector<BufferId> stale;
+	const auto            end = vaddr + size;
+	auto                  it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.IsGuestBacked() && buffer.CpuAddress() + buffer.Size() > vaddr) {
+			stale.push_back(it->second);
+		}
+	}
+	// As a demotion (DemoteGuestBackedBuffers): the GPU's writes are in guest memory already.
+	for (const auto id: stale) {
+		const auto& buffer  = m_slot_buffers[id];
+		const auto  address = buffer.CpuAddress();
+		const auto  bytes   = buffer.Size();
+		(void)ForgetGuestBackedWrites(address, bytes);
+		m_memory_tracker.UnmarkRegionAsGpuModified(address, bytes);
+		m_memory_tracker.UntrackMemory(address, bytes);
+		DeleteBuffer(id);
+	}
+}
+
 void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-replacement range\n");

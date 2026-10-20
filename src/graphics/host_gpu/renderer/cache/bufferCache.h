@@ -59,6 +59,10 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// The guest unmapped [vaddr, vaddr + size), after InvalidateMemory and with the GPU idle. A
+	// buffer that is guest memory itself holds the pages mapped when it was made; the address can
+	// get other pages, so such buffers there are dropped, and the next use makes them again.
+	void UnmapMemory(uint64_t vaddr, uint64_t size);
 	// Gives the whole range new bytes, on the GPU thread. Unlike InvalidateMemory followed by a
 	// write, the bytes the GPU wrote there are not fetched first.
 	void ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size);

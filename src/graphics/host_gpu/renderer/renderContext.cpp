@@ -130,6 +130,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);

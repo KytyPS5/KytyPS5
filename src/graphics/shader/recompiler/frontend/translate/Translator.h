@@ -158,7 +158,7 @@ private:
 	void FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse);
 	void FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
-	                  bool mix);
+	                  bool mix, IR::FPCompareFlags flags = {});
 	void V_FREXP_MANT_F32(const Decoder::Instruction& inst);
 	void V_DOT2C_F32_F16(const Decoder::Instruction& inst);
 	void V_CUBEID_F32(const Decoder::Instruction& inst);

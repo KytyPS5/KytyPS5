@@ -129,7 +129,7 @@ void Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode o
 }
 
 void Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
-                              bool accumulator, bool mix) {
+                              bool accumulator, bool mix, IR::FPCompareFlags flags) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
@@ -137,7 +137,7 @@ void Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode 
 		args[index]        = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
 		                                                  : ReadOperand(operand, type);
 	}
-	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
+	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}, flags));
 }
 
 void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {

@@ -188,7 +188,8 @@ uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
-uint32_t EmitFPMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitFPMedTri32(EmitterState& state, const IR::Inst& inst, uint32_t arg0, uint32_t arg1,
+                        uint32_t arg2);
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0);

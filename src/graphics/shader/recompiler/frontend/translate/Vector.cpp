@@ -609,7 +609,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_FMA_F64: return FloatTernary(inst, IR::ValueOpcode::FPFma64, false, false);
 		case O::V_MIN3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMinTri32, false, false);
 		case O::V_MAX3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMaxTri32, false, false);
-		case O::V_MED3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMedTri32, false, false);
+		case O::V_MED3_F32:
+			return FloatTernary(inst, IR::ValueOpcode::FPMedTri32, false, false,
+			                    {.flush_input_denorms = flush_f32_inputs});
 		case O::V_DOT2C_F32_F16: return V_DOT2C_F32_F16(inst);
 		case O::V_CUBEID_F32: return V_CUBEID_F32(inst);
 		case O::V_CUBESC_F32: return V_CUBESC_F32(inst);

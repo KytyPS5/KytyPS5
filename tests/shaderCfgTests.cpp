@@ -2428,6 +2428,37 @@ void TestNewShaderRecompilerTrapTemporaries() {
   Check((wide_result.ir_dump.find("MoveU64 s2, s106") != std::string::npos),
         "64-bit TTMP source did not lower through scalar slot s106");
   CheckSpirvBinaryValidates(wide_result.spirv);
+
+  // Interleaved VCC traffic between the TTMP0 write and read. TTMP0 shares its
+  // scalar index with the VCC_LO hardware code (106), so the scalar tracking
+  // must keep the slot write/read distinct from the VCC write/read.
+  const uint32_t vcc_collision[] = {
+      EncodeSMovB32(0, 129),       // s0 = 1
+      EncodeSMovB32(1, 130),       // s1 = 2
+      EncodeSop2(0x00, 108, 0, 1), // s_add_u32 ttmp0, s0, s1 (slot s106)
+      EncodeSop2(0x00, 106, 0, 1), // s_add_u32 vcc_lo, s0, s1 (VCC path)
+      EncodeSop2(0x00, 2, 108, 1), // s_add_u32 s2, ttmp0, s1 (slot s106)
+      EncodeSop2(0x00, 3, 106, 1), // s_add_u32 s3, vcc_lo, s1 (VCC read)
+      EncodeSop2(0x00, 4, 2, 3),   // s_add_u32 s4, s2, s3 (keeps both live)
+      0xbf810000u,
+  };
+
+  auto vcc_result = RecompileForTest(vcc_collision, options);
+  Check((vcc_result.decoded_dump.find("s_add_u32 ttmp0, s0, s1") != std::string::npos),
+        "new decoder did not decode interleaved TTMP0 destination");
+  Check((vcc_result.decoded_dump.find("s_add_u32 vcc_lo, s0, s1") != std::string::npos),
+        "new decoder did not decode interleaved VCC_LO destination");
+  Check((vcc_result.ir_dump.find("ScalarAddCarryU32 s106, s0, s1") != std::string::npos),
+        "interleaved TTMP0 destination did not lower through scalar slot s106");
+  Check((vcc_result.ir_dump.find("ScalarAddCarryU32 vcc_lo, s0, s1") != std::string::npos),
+        "interleaved VCC_LO write did not lower through vcc_lo");
+  Check((vcc_result.ir_dump.find("ScalarAddCarryU32 s2, s106, s1") != std::string::npos),
+        "interleaved TTMP0 source did not lower through scalar slot s106");
+  Check((vcc_result.ir_dump.find("ScalarAddCarryU32 s3, vcc_lo, s1") != std::string::npos),
+        "interleaved VCC_LO source did not lower through vcc_lo");
+  Check((vcc_result.ir_dump.find("ScalarAddCarryU32 s4, s2, s3") != std::string::npos),
+        "chained scalar add did not keep the interleaved values live");
+  CheckSpirvBinaryValidates(vcc_result.spirv);
 }
 
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {

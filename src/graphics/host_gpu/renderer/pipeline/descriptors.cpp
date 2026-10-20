@@ -115,6 +115,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
+		// A buffer of no records: loads read zero and stores are dropped. The offset puts every
+		// index past the end of the shared null buffer, so no dispatch sees another's writes.
+		buffer_offset = 16;
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();

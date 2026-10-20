@@ -513,17 +513,23 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 		const auto destination_depth = backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(backing.extent.depth >> level, 1u)
 		                                   : backing.layers;
-		const auto slices            = std::min(source_depth, destination_depth);		const auto block_rows = (copy_height + source_block - 1) / source_block;
+		const auto slices = std::min(source_depth, destination_depth);
+		// Download full source block rows so the source extent stays a multiple of
+		// the block size for compressed formats; only the upload is clamped below.
+		// block_rows covers ceil(copy_height/block) chunks, so y stays below
+		// copy_height and every upload writes at least one row.
+		const auto block_rows = (copy_height + source_block - 1) / source_block;
 		const auto row_size =
 		    static_cast<uint64_t>((width + source_block - 1) / source_block) * source_bytes;
 		const auto rows_per_copy = CopyRows(row_size, block_rows, buffer.Size());
 		EXIT_IF(slices == 0 || rows_per_copy == 0);
 		for (uint32_t slice = 0; slice < slices; slice++) {
 			for (uint32_t block_row = 0; block_row < block_rows; block_row += rows_per_copy) {
-				const auto copy_rows = std::min(rows_per_copy, block_rows - block_row);
-			const auto y             = block_row * source_block;
-			const auto chunk_height  = std::min(copy_rows * source_block, copy_height - y);
-			const auto copy_size     = row_size * copy_rows;
+				const auto copy_rows    = std::min(rows_per_copy, block_rows - block_row);
+			const auto y                = block_row * source_block;
+			const auto chunk_height     = std::min(copy_rows * source_block, height - y);
+			const auto upload_height    = std::min(chunk_height, copy_height - y);
+			const auto copy_size        = row_size * copy_rows;
 				vk::BufferImageCopy source_copy {};
 				source_copy.imageSubresource = {
 				    source_aspect, level,
@@ -533,12 +539,16 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 			                                         ? static_cast<int32_t>(slice)
 			                                         : 0};
 				source_copy.imageExtent           = {width, chunk_height, 1};
-				auto destination_copy             = source_copy;
+				auto destination_copy = source_copy;
 				// The staging buffer holds full source rows, so describe that stride
 				// explicitly once the uploaded extent is narrower than the download.
-				destination_copy.bufferRowLength   = width;
-				destination_copy.bufferImageHeight = chunk_height;
-				destination_copy.imageExtent       = {copy_width, chunk_height, 1};
+				// Stride fields stay block multiples for compressed formats; the
+				// rounding is exact because the download packs tight block rows.
+				destination_copy.bufferRowLength =
+				    ((width + source_block - 1) / source_block) * source_block;
+				destination_copy.bufferImageHeight =
+				    ((chunk_height + source_block - 1) / source_block) * source_block;
+				destination_copy.imageExtent = {copy_width, upload_height, 1};
 				destination_copy.imageSubresource = {
 				    destination_aspect, level,
 				    backing.image_type == vk::ImageType::e3D ? 0u : slice, 1};

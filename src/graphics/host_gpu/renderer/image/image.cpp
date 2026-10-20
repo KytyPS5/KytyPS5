@@ -502,34 +502,43 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	for (uint32_t level = 0; level < levels; level++) {
 		const auto width             = std::max(source.backing.extent.width >> level, 1u);
 		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		// The destination may be smaller than the source (e.g. Jusant's 60x33x26
+		// image copied into a 54x33x26 one). Clamp the copied region like CopyImage
+		// does, or copyBufferToImage writes out of bounds.
+		const auto copy_width  = std::min(width, std::max(backing.extent.width >> level, 1u));
+		const auto copy_height = std::min(height, std::max(backing.extent.height >> level, 1u));
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;
 		const auto destination_depth = backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(backing.extent.depth >> level, 1u)
 		                                   : backing.layers;
-		const auto slices            = std::min(source_depth, destination_depth);
-		const auto block_rows        = (height + source_block - 1) / source_block;
+		const auto slices            = std::min(source_depth, destination_depth);		const auto block_rows = (copy_height + source_block - 1) / source_block;
 		const auto row_size =
 		    static_cast<uint64_t>((width + source_block - 1) / source_block) * source_bytes;
 		const auto rows_per_copy = CopyRows(row_size, block_rows, buffer.Size());
 		EXIT_IF(slices == 0 || rows_per_copy == 0);
 		for (uint32_t slice = 0; slice < slices; slice++) {
 			for (uint32_t block_row = 0; block_row < block_rows; block_row += rows_per_copy) {
-				const auto          copy_rows   = std::min(rows_per_copy, block_rows - block_row);
-				const auto          y           = block_row * source_block;
-				const auto          copy_height = std::min(copy_rows * source_block, height - y);
-				const auto          copy_size   = row_size * copy_rows;
+				const auto copy_rows = std::min(rows_per_copy, block_rows - block_row);
+			const auto y             = block_row * source_block;
+			const auto chunk_height  = std::min(copy_rows * source_block, copy_height - y);
+			const auto copy_size     = row_size * copy_rows;
 				vk::BufferImageCopy source_copy {};
 				source_copy.imageSubresource = {
 				    source_aspect, level,
 				    source.backing.image_type == vk::ImageType::e3D ? 0u : slice, 1};
 				source_copy.imageOffset           = {0, static_cast<int32_t>(y),
-				                                     source.backing.image_type == vk::ImageType::e3D
-				                                         ? static_cast<int32_t>(slice)
-				                                         : 0};
-				source_copy.imageExtent           = {width, copy_height, 1};
+			                                     source.backing.image_type == vk::ImageType::e3D
+			                                         ? static_cast<int32_t>(slice)
+			                                         : 0};
+				source_copy.imageExtent           = {width, chunk_height, 1};
 				auto destination_copy             = source_copy;
+				// The staging buffer holds full source rows, so describe that stride
+				// explicitly once the uploaded extent is narrower than the download.
+				destination_copy.bufferRowLength   = width;
+				destination_copy.bufferImageHeight = chunk_height;
+				destination_copy.imageExtent       = {copy_width, chunk_height, 1};
 				destination_copy.imageSubresource = {
 				    destination_aspect, level,
 				    backing.image_type == vk::ImageType::e3D ? 0u : slice, 1};

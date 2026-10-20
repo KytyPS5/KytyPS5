@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -26,7 +27,7 @@ struct TessellationAddress {
 
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
                                    uint32_t control_points, uint32_t input_stride,
-                                   uint32_t* patch_end = nullptr) {
+                                   uint32_t* patch_begin = nullptr, uint32_t* patch_end = nullptr) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
@@ -34,6 +35,17 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	registers[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
+	// Scalar registers (and VCC) holding known constants, e.g. a stride loaded with s_movk_i32
+	// and then used as a VALU operand. Keys are SGPR numbers, VCC_LO/VCC_HI use 0x10000/0x10001.
+	std::map<uint32_t, uint32_t> scalars;
+	const auto scalar_key = [](const Operand& operand, uint32_t& key) {
+		switch (operand.kind) {
+			case OperandKind::Sgpr: key = operand.reg; return true;
+			case OperandKind::VccLo: key = 0x10000u; return true;
+			case OperandKind::VccHi: key = 0x10001u; return true;
+			default: return false;
+		}
+	};
 	const auto read     = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
@@ -44,6 +56,10 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			value = constant(operand.value);
 		} else if (operand.kind == OperandKind::Vgpr) {
 			value = registers.at(operand.reg);
+		} else if (uint32_t key = 0; scalar_key(operand, key)) {
+			if (const auto found = scalars.find(key); found != scalars.end()) {
+				value = constant(found->second);
+			}
 		}
 		// The native packed HS ID's low byte is the patch ordinal. The logical
 		// interface addresses one patch, as in the frontend's v1 initialization.
@@ -142,20 +158,32 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			}
 		}
 	};
+	const auto merge_scalars = [](std::map<uint32_t, uint32_t>& into,
+	                              const std::map<uint32_t, uint32_t>& from) {
+		std::erase_if(into, [&](const auto& entry) {
+			const auto found = from.find(entry.first);
+			return found == from.end() || found->second != entry.second;
+		});
+	};
 	std::unordered_map<uint32_t, Registers> joins;
+	std::unordered_map<uint32_t, std::map<uint32_t, uint32_t>> scalar_joins;
 	// Fixed-address HS stores; those past the per-control-point area are per-patch outputs.
 	std::vector<std::pair<uint32_t, uint32_t>> constant_stores;
 	bool                                    reachable = true;
 	uint32_t stride = 0;
 	for (const auto& inst: program.instructions) {
 		if (const auto join = joins.find(inst.pc); join != joins.end()) {
+			const auto scalar_join = scalar_joins.find(inst.pc);
 			if (reachable) {
 				merge(registers, join->second);
+				merge_scalars(scalars, scalar_join->second);
 			} else {
 				registers = join->second;
+				scalars   = scalar_join->second;
 			}
 			reachable = true;
 			joins.erase(join);
+			scalar_joins.erase(scalar_join);
 		}
 		if (IsDirectBranch(inst.opcode)) {
 			if (inst.branch_target <= inst.pc) {
@@ -167,8 +195,10 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			if (reachable) {
 				if (const auto found = joins.find(inst.branch_target); found != joins.end()) {
 					merge(found->second, registers);
+					merge_scalars(scalar_joins.at(inst.branch_target), scalars);
 				} else {
 					joins.emplace(inst.branch_target, registers);
+					scalar_joins.emplace(inst.branch_target, scalars);
 				}
 			}
 			if (inst.opcode == Opcode::S_BRANCH) {
@@ -180,7 +210,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			continue;
 		}
 		const bool local_store =
-		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
+		    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
 		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
@@ -188,7 +220,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
+		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
+		               inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
 		if ((local && local_store) || control_store || control_read) {
 			const auto address = read(inst.src0);
 			if (address.kind != Kind::Affine) {
@@ -209,6 +243,21 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
 				                     (expected != 0u && expected != address.coefficient));
 				if (!control_read) stride = address.coefficient;
+			}
+		}
+		// Any scalar write forgets the destination (64-bit writes and loads cover several
+		// registers); only constant moves record a value.
+		for (const auto* written: {&inst.dst, &inst.dst2}) {
+			if (uint32_t key = 0; scalar_key(*written, key)) {
+				const uint32_t count = std::max(std::max(inst.data_dwords, 1u), 2u);
+				for (uint32_t index = 0; index < count; index++) scalars.erase(key + index);
+			}
+		}
+		if (uint32_t key = 0; (inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOVK_I32) &&
+		                      scalar_key(inst.dst, key)) {
+			if (const auto value = read(inst.src0);
+			    value.kind == Kind::Affine && value.coefficient == 0u) {
+				scalars[key] = value.constant;
 			}
 		}
 		// Store vdata is a source, despite occupying the decoder's dst field.
@@ -268,13 +317,23 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		}
 		registers.at(inst.dst.reg) = value;
 	}
-	EXIT_NOT_IMPLEMENTED(stride == 0u);
+	if (stride == 0u) {
+		dump_program();
+		EXIT("%s tessellation analysis found no per-control-point stride\n", local ? "LS" : "HS");
+	}
 	if (patch_end != nullptr) {
+		// Per-patch outputs follow the control points of every patch in the threadgroup, so
+		// their base is the lowest fixed store address past one patch's control points.
 		*patch_end = 0;
-		const uint64_t patch_begin = uint64_t {stride} * control_points;
+		uint32_t   lowest        = UINT32_MAX;
+		const uint64_t control_area = uint64_t {stride} * control_points;
 		for (const auto& [begin, end]: constant_stores) {
-			if (begin >= patch_begin) *patch_end = std::max(*patch_end, end);
+			if (begin >= control_area) {
+				*patch_end = std::max(*patch_end, end);
+				lowest     = std::min(lowest, begin);
+			}
 		}
+		if (patch_begin != nullptr) *patch_begin = *patch_end == 0u ? 0u : lowest;
 	}
 	return stride;
 }
@@ -321,11 +380,11 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	Decoder::DecodeProgram(control, control_program);
 	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u);
 	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
-	                                           info.ls_stride, &info.patch_end);
+	                                           info.ls_stride, &info.patch_begin, &info.patch_end);
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "
-	     "patch_end=%u\n",
+	     "patch=[%u, %u)\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
-	     info.patch_end);
+	     info.patch_begin, info.patch_end);
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {

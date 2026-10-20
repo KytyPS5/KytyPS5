@@ -96,9 +96,8 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			type = array(TypeF32(state), 4u);
 		} else if (patch) {
 			if (tess.patch_end != 0u) {
-				// Shared layout from the HS analysis, so the HS outputs and DS inputs match:
-				// the per-patch area starts right after the per-control-point data.
-				const uint32_t base = tess.hs_stride * tess.output_control_points;
+				// Shared layout from the HS analysis, so the HS outputs and DS inputs match.
+				const uint32_t base = tess.patch_begin;
 				EXIT_NOT_IMPLEMENTED(patch_begin < base ||
 				                     (kind == Attribute::PatchInput && patch_end > tess.patch_end));
 				state.tess_patch_base = base;

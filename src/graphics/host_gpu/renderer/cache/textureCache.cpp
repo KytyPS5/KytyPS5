@@ -1135,6 +1135,76 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
+	// Consecutive slices with the same clear are cleared and published together: a layered
+	// target cleared by one fill otherwise costs a clear pass and a memory write per layer.
+	struct Batch {
+		uint32_t       first = 0;
+		uint32_t       count = 0;
+		vk::ClearValue clear {};
+	};
+	std::optional<Batch> batch;
+	const auto flush = [&] {
+		if (!batch) return;
+		const auto address = range.address + slice_size * (first + batch->first);
+		const auto bytes   = slice_size * batch->count;
+		auto       clear   = batch->clear;
+		{
+			std::scoped_lock lock {m_lock};
+			const auto& image = m_slot_images[id];
+			const bool depth = image.info.IsDepth();
+			if (depth) {
+				const auto value = clear.color.float32[0];
+				clear.depthStencil = {value, 0u};
+			}
+			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
+			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+			            view.base_level, view.level_count,
+			            image_first + batch->first, batch->count}, clear);
+		}
+		batch.reset();
+		// Publish the conversion's expanded keys without treating them as guest writes
+		// to overlapping image data. Invalidate the buffer before updating its backing.
+		if (desc.type != BindingType::VideoOut) {
+			// A write by anyone else since the record was checked voids it. Read the generation
+			// before this thread's own write, so that write cannot hide another one.
+			const bool unchanged = known && m_buffer_cache.WriteWatches().Generation(
+			                                    known->watch) == known->generation;
+			const std::vector<uint8_t> expanded(bytes, uint8_t {0xff});
+			m_buffer_cache.ReplaceMemory(address, expanded.data(), expanded.size());
+			if (known) {
+				// The slices are CPU memory now and hold 0xff, which decodes to "no clear". A later
+				// guest write to CPU memory does not reach the watch, so the record no longer
+				// speaks for these slices: they are noted as consumed, and a consumed slice is
+				// decided from its bytes, which need no read-back. The writes above are this
+				// thread's own, so the record adopts their generation.
+				bool kept = false;
+				{
+					std::scoped_lock lock {m_lock};
+					const auto       fill = m_color_metadata_fills.find(range.address);
+					if (fill != m_color_metadata_fills.end()) {
+						if (unchanged &&
+						    m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+							fill->second.consumed.emplace_back(address - range.address, bytes);
+							fill->second.generation =
+							    m_buffer_cache.WriteWatches().Generation(fill->second.watch);
+							known = fill->second;
+							kept  = true;
+						} else {
+							DropColorMetadataFill(fill);
+						}
+					}
+				}
+				if (!kept) {
+					// The record is void: the remaining slices are decided from the real bytes.
+					known.reset();
+					if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+						m_buffer_cache.ReadMemory(range.address, range.size, false);
+					}
+					read_back = true;
+				}
+			}
+		}
+	};
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1156,70 +1226,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			code = known_code;
 		}
 		vk::ClearValue clear {};
-		if (!DecodeColorClear(desc, code, clear.color)) {
+		if (!DecodeColorClear(desc, code, clear.color) ||
+		    (!from_record && !SliceHoldsOnly(address, slice_size, code))) {
+			flush();
 			continue;
 		}
-		if (!from_record) {
-			if (!SliceHoldsOnly(address, slice_size, code)) {
-				continue;
-			}
+		if (batch && batch->first + batch->count == slice &&
+		    std::memcmp(&batch->clear.color, &clear.color, sizeof(clear.color)) == 0) {
+			batch->count++;
+			continue;
 		}
-		{
-			std::scoped_lock lock {m_lock};
-			const auto& image = m_slot_images[id];
-			const bool depth = image.info.IsDepth();
-			if (depth) {
-				const auto value = clear.color.float32[0];
-				clear.depthStencil = {value, 0u};
-			}
-			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
-			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
-			            view.base_level, view.level_count,
-			            image_first + slice, 1}, clear);
-		}
-		// Publish the conversion's expanded keys without treating them as guest writes
-		// to overlapping image data. Invalidate the buffer before updating its backing.
-		if (desc.type != BindingType::VideoOut) {
-			// A write by anyone else since the record was checked voids it. Read the generation
-			// before this thread's own write, so that write cannot hide another one.
-			const bool unchanged = known && m_buffer_cache.WriteWatches().Generation(
-			                                    known->watch) == known->generation;
-			const std::vector<uint8_t> bytes(slice_size, uint8_t {0xff});
-			m_buffer_cache.ReplaceMemory(address, bytes.data(), bytes.size());
-			if (known) {
-				// The slice is CPU memory now and holds 0xff, which decodes to "no clear". A later
-				// guest write to CPU memory does not reach the watch, so the record no longer
-				// speaks for this slice: it is noted as consumed, and a consumed slice is decided
-				// from its bytes, which need no read-back. The writes above are this thread's
-				// own, so the record adopts their generation.
-				bool kept = false;
-				{
-					std::scoped_lock lock {m_lock};
-					const auto       fill = m_color_metadata_fills.find(range.address);
-					if (fill != m_color_metadata_fills.end()) {
-						if (unchanged &&
-						    m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-							fill->second.consumed.emplace_back(address - range.address, slice_size);
-							fill->second.generation =
-							    m_buffer_cache.WriteWatches().Generation(fill->second.watch);
-							known = fill->second;
-							kept  = true;
-						} else {
-							DropColorMetadataFill(fill);
-						}
-					}
-				}
-				if (!kept) {
-					// The record is void: the remaining slices are decided from the real bytes.
-					known.reset();
-					if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-						m_buffer_cache.ReadMemory(range.address, range.size, false);
-					}
-					read_back = true;
-				}
-			}
-		}
+		flush();
+		batch = Batch {.first = slice, .count = 1, .clear = clear};
 	}
+	flush();
 }
 
 void TextureCache::RefreshImage(ImageId id) {

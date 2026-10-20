@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/perVertexVsStoreRuntime.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -543,8 +544,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	vk::PhysicalDeviceFloatControlsProperties float_controls {};
 	float_controls.pNext = &properties11;
+	vk::PhysicalDeviceDriverProperties driver_properties {};
+	driver_properties.pNext = &float_controls;
 	vk::PhysicalDeviceProperties2 properties2 {};
-	properties2.pNext = &float_controls;
+	properties2.pNext = &driver_properties;
 
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
@@ -568,6 +571,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+#if defined(__APPLE__)
+	constexpr bool fragment_shader_barycentric_enabled = false; // never requested on macOS
+#else
+	constexpr bool fragment_shader_barycentric_enabled = true; // a device requirement elsewhere
+#endif
+	(void)ResolvePvVsStoreEnabled(fragment_shader_barycentric_enabled,
+	                              driver_properties.driverID == vk::DriverId::eMoltenvk);
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -1105,6 +1115,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		ShutdownPvVsStore(graphic_ctx.device);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

@@ -118,6 +118,9 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+		// VS-store variants (perVertexVsStore.h): set 1 = cap + index buffers and 32 more push
+		// bytes in VS|FS; the vertex input stays native.
+		vk::DescriptorSetLayout pv_store_layout = nullptr;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};

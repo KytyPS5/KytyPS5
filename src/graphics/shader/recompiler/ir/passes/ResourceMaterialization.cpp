@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
@@ -1246,11 +1247,48 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	plan.srt_tape = SrtTape::Build(plan);
 	CompileSrtWalker(plan);
+	plan.srt_nodes = SrtNodes::Build(plan);
 	return plan;
 }
 
+namespace {
+
+bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+
+bool SameSnapshot(const ResourceSnapshot& a, const ResourceSnapshot& b) {
+	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
+	       a.specialization_reads == b.specialization_reads && a.uniform_fill == b.uniform_fill;
+}
+
+} // namespace
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (!SrtNodes::Verify() || program.srt_nodes == nullptr || !SrtNodes::Enabled()) {
+		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	}
+	auto       reference_snapshot       = snapshot;
+	auto       reference_specialization = specialization;
+	const bool result = MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	SrtNodes::SetThreadDisabled(true);
+	const bool reference = MaterializeResourcesOnce(program, runtime, reference_snapshot,
+	                                                reference_specialization);
+	SrtNodes::SetThreadDisabled(false);
+	if (result != reference ||
+	    (result && (!SameSnapshot(snapshot, reference_snapshot) ||
+	                specialization != reference_specialization))) {
+		EXIT("SrtNodes: shader 0x%016" PRIx64 " materializes differently over nodes (result %d/%d)\n",
+		     program.shader_hash, result ? 1 : 0, reference ? 1 : 0);
+	}
+	return result;
+}
+
+namespace {
+
+bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
@@ -1435,6 +1473,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
+
+} // namespace
 
 bool ResourceSpecializationFits(const ShaderInfo&             info,
                                 const ResourceSpecialization& specialization) {

@@ -129,6 +129,8 @@ public:
 		}
 		return evaluation_index;
 	}
+	// UINT32_MAX until EvaluationIndex numbers the value.
+	[[nodiscard]] uint32_t AssignedEvaluationIndex() const { return evaluation_index; }
 	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
 	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
 	void SetDefinition(uint32_t half, uint32_t definition) const {

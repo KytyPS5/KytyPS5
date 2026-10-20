@@ -606,6 +606,7 @@ struct UniformFillPlan {
 };
 
 class SrtTape;
+class SrtNodes;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -650,6 +651,8 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	// Null when MaterializeResources must walk the values (SrtWalker.h).
 	std::shared_ptr<const SrtTape>      srt_tape;
+	// Null when the walker walks the values themselves (SrtWalker.h).
+	std::shared_ptr<const SrtNodes>     srt_nodes;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;

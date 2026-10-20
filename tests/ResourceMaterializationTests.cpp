@@ -1272,13 +1272,15 @@ void TestTapeZeroLowerBound() {
 
 // A plan whose walk depends on runtime values, or that needs the strict reader, keeps the walker.
 // Each case changes the plain program in one way; the plan is made as the renderer makes it.
-void TestRuntimeChoicesKeepTheWalker() {
+struct RuntimeChoiceCase {
+  const char *name;
+  void (*change)(Libs::Graphics::ShaderRecompiler::IR::Program &program);
+};
+
+// Programs whose walk depends on runtime values: the tape refuses them and the walker walks them.
+std::vector<RuntimeChoiceCase> RuntimeChoiceCases() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  struct Case {
-    const char *name;
-    void (*change)(Program &program);
-  };
-  const Case cases[] = {
+  return {
       {"a select", [](Program &program) {
          auto &block = *program.blocks[0];
          program.srt_reads[1].value = Value(&block.AppendNewInst(
@@ -1334,6 +1336,11 @@ void TestRuntimeChoicesKeepTheWalker() {
              Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
        }},
   };
+}
+
+void TestRuntimeChoicesKeepTheWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto cases = RuntimeChoiceCases();
   Check(ExtractResourcePlan(TapeProgram()).srt_tape != nullptr, "the plain program got no tape");
   for (const auto &test : cases) {
     auto program = TapeProgram();
@@ -1343,6 +1350,77 @@ void TestRuntimeChoicesKeepTheWalker() {
       Check(false, "a plan whose walk depends on runtime values got a tape");
     }
   }
+}
+
+// The walker gives the same over SrtNodes as over the plan's values, for plans with every kind of
+// runtime choice, from inputs that take both sides of each choice.
+void TestNodesMatchWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto cases = RuntimeChoiceCases();
+  cases.insert(cases.begin(), {"a plain program", [](Program &) {}});
+  std::array<uint32_t, 8> memory{0x11u, 4u, 0x33u, 0x44u, 0u, 1u, 2u, 3u};
+  const auto base = reinterpret_cast<uint64_t>(memory.data());
+  struct Reads {
+    const std::array<uint32_t, 8> *memory = nullptr;
+    std::vector<uint64_t> addresses;
+  };
+  // Reads outside the array fail, as a read of unmapped memory does.
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &reads = *static_cast<Reads *>(data);
+    const auto start = reinterpret_cast<uint64_t>(reads.memory->data());
+    if (address < start || address + words.size_bytes() > start + sizeof(*reads.memory)) {
+      return false;
+    }
+    reads.addresses.push_back(address);
+    std::memcpy(words.data(), reinterpret_cast<const void *>(address), words.size_bytes());
+    return true;
+  };
+  bool previous = SrtNodes::Verify();
+  SrtNodes::SetVerify(false);
+  for (const auto &test : cases) {
+    auto program = TapeProgram();
+    test.change(program);
+    auto plan = ExtractResourcePlan(program);
+    plan.srt_tape = nullptr;
+    if (plan.srt_nodes == nullptr) {
+      std::fprintf(stderr, "ResourceMaterializationTests: case: %s\n", test.name);
+      Check(false, "a plan the walker walks got no nodes");
+    }
+    for (const uint32_t first : {0x11u, 4u}) {
+      memory[0] = first;
+      for (const uint32_t carry_in : {0u, 1u}) {
+        const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(base),
+                                                static_cast<uint32_t>(base >> 32u), 5u, carry_in};
+        std::array<ResourceSnapshot, 2> snapshots;
+        std::array<ResourceSpecialization, 2> specializations;
+        std::array<Reads, 2> reads{Reads{&memory}, Reads{&memory}};
+        std::array<bool, 2> results{};
+        for (const int nodes : {0, 1}) {
+          SrtNodes::SetEnabled(nodes != 0);
+          results[nodes] = MaterializeResources(plan,
+              {.user_data = user_data, .read_memory = read, .userdata = &reads[nodes],
+               .read_specialization_memory = read},
+              snapshots[nodes], specializations[nodes]);
+        }
+        SrtNodes::SetEnabled(true);
+        const bool same = results[0] == results[1] && reads[0].addresses == reads[1].addresses &&
+            (!results[0] ||
+             (snapshots[0].flattened_srt == snapshots[1].flattened_srt &&
+              snapshots[0].buffers == snapshots[1].buffers &&
+              snapshots[0].images == snapshots[1].images &&
+              snapshots[0].samplers == snapshots[1].samplers &&
+              snapshots[0].specialization_reads == snapshots[1].specialization_reads &&
+              snapshots[0].uniform_fill == snapshots[1].uniform_fill &&
+              specializations[0] == specializations[1]));
+        if (!same) {
+          std::fprintf(stderr, "ResourceMaterializationTests: case: %s, first %u, carry %u\n",
+                       test.name, first, carry_in);
+          Check(false, "the walker over nodes differs from the walker over values");
+        }
+      }
+    }
+  }
+  SrtNodes::SetVerify(previous);
 }
 
 // Every operation on scalar values that the walker evaluates, the tape builds too, with the same
@@ -1549,6 +1627,7 @@ void TestSpecializationFitsTheShader() {
 }
 
 int main() {
+  TestNodesMatchWalker();
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();

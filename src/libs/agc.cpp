@@ -1620,7 +1620,9 @@ uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
 }
 
 void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
-	*result = is_trinity_mode();
+	// What the game is told (--ps5-pro); Kyty's own packet encodings stay in base mode
+	// (is_trinity_mode).
+	*result = Config::Ps5ProEnabled() ? 1 : 0;
 }
 
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);

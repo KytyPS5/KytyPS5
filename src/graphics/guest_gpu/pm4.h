@@ -91,6 +91,7 @@ constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
 constexpr uint32_t R_DMA_DATA       = 0x19;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
+constexpr uint32_t R_PSSR           = 0x1B; // PS5 Pro upscaling request (pssr.h)
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 

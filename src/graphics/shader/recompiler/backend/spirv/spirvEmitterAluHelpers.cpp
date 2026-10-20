@@ -29,75 +29,105 @@ F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
 	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match) {
-	const auto selected =
-	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, mask, 1u << bit), 0);
-	return EmitLogicalAndBool(state, selected, class_match);
-}
-
 static uint32_t EmitClassMaskBits(EmitterState& state, uint32_t bits, uint32_t mask, bool half) {
-	const uint32_t sign_mask     = half ? 0x8000u : 0x80000000u;
-	const uint32_t exponent_mask = half ? 0x7c00u : 0x7f800000u;
-	const uint32_t mantissa_mask = half ? 0x03ffu : 0x007fffffu;
-	const uint32_t quiet_mask    = half ? 0x0200u : 0x00400000u;
-	const auto     sign_bits     = EmitAndConstant(state, bits, sign_mask);
-	const auto     abs_bits      = EmitAndConstant(state, bits, sign_mask - 1u);
-	const auto     exponent_bits = EmitAndConstant(state, abs_bits, exponent_mask);
-	const auto     mantissa_bits = EmitAndConstant(state, abs_bits, mantissa_mask);
-	const auto     quiet_bits    = EmitAndConstant(state, mantissa_bits, quiet_mask);
-
-	const auto sign             = EmitCompareU32Constant(state, spv::OpINotEqual, sign_bits, 0);
-	const auto positive         = EmitLogicalNotBool(state, sign);
-	const auto exponent_zero    = EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0);
-	const auto exponent_nonzero = EmitLogicalNotBool(state, exponent_zero);
-	const auto exponent_inf =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, exponent_mask);
-	const auto finite_exponent  = EmitLogicalNotBool(state, exponent_inf);
-	const auto mantissa_zero    = EmitCompareU32Constant(state, spv::OpIEqual, mantissa_bits, 0);
-	const auto mantissa_nonzero = EmitLogicalNotBool(state, mantissa_zero);
-	const auto quiet            = EmitCompareU32Constant(state, spv::OpINotEqual, quiet_bits, 0);
-
-	const auto nan_common = EmitLogicalAndBool(state, exponent_inf, mantissa_nonzero);
-	const auto snan       = EmitLogicalAndBool(state, nan_common, EmitLogicalNotBool(state, quiet));
-	const auto qnan       = EmitLogicalAndBool(state, nan_common, quiet);
-	const auto inf        = EmitLogicalAndBool(state, exponent_inf, mantissa_zero);
-	const auto normal     = EmitLogicalAndBool(state, exponent_nonzero, finite_exponent);
-	const auto denorm     = EmitLogicalAndBool(state, exponent_zero, mantissa_nonzero);
-	const auto zero       = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
-
-	uint32_t match = EmitClassMaskBitMatch(state, mask, 0, snan);
-	match          = EmitLogicalOrBool(state, match, EmitClassMaskBitMatch(state, mask, 1, qnan));
-	match          = EmitLogicalOrBool(
-	    state, match, EmitClassMaskBitMatch(state, mask, 2, EmitLogicalAndBool(state, inf, sign)));
-	match = EmitLogicalOrBool(
-	    state, match,
-	    EmitClassMaskBitMatch(state, mask, 3, EmitLogicalAndBool(state, normal, sign)));
-	match = EmitLogicalOrBool(
-	    state, match,
-	    EmitClassMaskBitMatch(state, mask, 4, EmitLogicalAndBool(state, denorm, sign)));
-	match = EmitLogicalOrBool(
-	    state, match, EmitClassMaskBitMatch(state, mask, 5, EmitLogicalAndBool(state, zero, sign)));
-	match = EmitLogicalOrBool(
-	    state, match,
-	    EmitClassMaskBitMatch(state, mask, 6, EmitLogicalAndBool(state, zero, positive)));
-	match = EmitLogicalOrBool(
-	    state, match,
-	    EmitClassMaskBitMatch(state, mask, 7, EmitLogicalAndBool(state, denorm, positive)));
-	match = EmitLogicalOrBool(
-	    state, match,
-	    EmitClassMaskBitMatch(state, mask, 8, EmitLogicalAndBool(state, normal, positive)));
-	return EmitLogicalOrBool(
-	    state, match,
-	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
+	const uint32_t top       = half ? 0x7fffu : 0x7fffffffu;
+	const uint32_t inf       = half ? 0x7c00u : 0x7f800000u;
+	const uint32_t quiet     = half ? 0x7e00u : 0x7fc00000u;
+	const uint32_t normal    = half ? 0x0400u : 0x00800000u;
+	const auto     magnitude = EmitAndConstant(state, bits, top);
+	const auto     step      = [&](spv::Op opcode, uint32_t limit) {
+		return Select(state, TypeU32(state),
+		              EmitCompareU32Constant(state, opcode, magnitude, limit),
+		              ConstantU32(state, 1), ConstantU32(state, 0));
+	};
+	const auto kind = EmitAddU32(
+	    state, EmitAddU32(state, step(spv::OpINotEqual, 0), step(spv::OpUGreaterThanEqual, normal)),
+	    step(spv::OpUGreaterThanEqual, inf));
+	const auto negative =
+	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, bits, top + 1u), 0);
+	const auto finite =
+	    Select(state, TypeU32(state), negative,
+	           Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 5), kind),
+	           EmitAddU32(state, kind, ConstantU32(state, 6)));
+	const auto nan = EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, inf);
+	const auto index =
+	    Select(state, TypeU32(state), nan, step(spv::OpUGreaterThanEqual, quiet), finite);
+	const auto selected = EmitAndConstant(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), mask, index), 1);
+	return EmitCompareU32Constant(state, spv::OpINotEqual, selected, 0);
 }
 
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
-	return EmitClassMaskBits(state, EmitBitcastF32ToU32(state, value), mask, false);
+static uint32_t EmitConstantClassMask(EmitterState& state, uint32_t bits, uint32_t mask,
+                                      bool half) {
+	const uint32_t inf    = half ? 0x7c00u : 0x7f800000u;
+	const uint32_t quiet  = half ? 0x7e00u : 0x7fc00000u;
+	const uint32_t top    = half ? 0x7fffu : 0x7fffffffu;
+	const uint32_t normal = half ? 0x0400u : 0x00800000u;
+
+	const std::array<std::array<uint32_t, 2>, 6> ranges {{{0, 0},
+	                                                      {1, normal - 1},
+	                                                      {normal, inf - 1},
+	                                                      {inf, inf},
+	                                                      {inf + 1, quiet - 1},
+	                                                      {quiet, top}}};
+	static constexpr std::array<uint32_t, 6> negative {5, 4, 3, 2, 0, 1};
+	static constexpr std::array<uint32_t, 6> positive {6, 7, 8, 9, 0, 1};
+
+	const auto magnitude = EmitAndConstant(state, bits, top);
+	const auto selected  = [&](const std::array<uint32_t, 6>& classes) {
+		uint32_t match = 0;
+		for (size_t first = 0; first < ranges.size(); first++) {
+			if ((mask >> classes[first] & 1u) == 0) continue;
+			auto last = first;
+			while (last + 1 < ranges.size() && (mask >> classes[last + 1] & 1u) != 0)
+				last++;
+			const auto lo   = ranges[first][0];
+			const auto hi   = ranges[last][1];
+			uint32_t   test = ConstantBool(state, true);
+			if (lo == hi) {
+				test = EmitCompareU32Constant(state, spv::OpIEqual, magnitude, lo);
+			} else if (lo != 0 && hi != top) {
+				test = EmitLogicalAndBool(
+				    state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, magnitude, lo),
+				    EmitCompareU32Constant(state, spv::OpULessThanEqual, magnitude, hi));
+			} else if (lo != 0) {
+				test = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, magnitude, lo);
+			} else if (hi != top) {
+				test = EmitCompareU32Constant(state, spv::OpULessThanEqual, magnitude, hi);
+			}
+			match = match == 0 ? test : EmitLogicalOrBool(state, match, test);
+			first = last;
+		}
+		return match == 0 ? ConstantBool(state, false) : match;
+	};
+	const auto same_for_both_signs = [&] {
+		for (size_t i = 0; i < ranges.size(); i++) {
+			if ((mask >> negative[i] & 1u) != (mask >> positive[i] & 1u)) return false;
+		}
+		return true;
+	}();
+	if (same_for_both_signs) {
+		return selected(positive);
+	}
+	const auto sign =
+	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, bits, top + 1u), 0);
+	return Select(state, TypeBool(state), sign, selected(negative), selected(positive));
 }
 
-uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
-	return EmitClassMaskBits(state, bits, mask, true);
+static uint32_t EmitClassMask(ValueEmitContext& ctx, uint32_t bits, IR::Value mask, bool half) {
+	mask = mask.Resolve();
+	if (mask.IsImmediate()) {
+		return EmitConstantClassMask(ctx.state, bits, mask.U32() & 0x3ffu, half);
+	}
+	return EmitClassMaskBits(ctx.state, bits, ctx.Def(mask), half);
+}
+
+uint32_t EmitClassMaskF32(ValueEmitContext& ctx, uint32_t value, IR::Value mask) {
+	return EmitClassMask(ctx, EmitBitcastF32ToU32(ctx.state, value), mask, false);
+}
+
+uint32_t EmitClassMaskF16(ValueEmitContext& ctx, uint32_t bits, IR::Value mask) {
+	return EmitClassMask(ctx, bits, mask, true);
 }
 
 static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs,

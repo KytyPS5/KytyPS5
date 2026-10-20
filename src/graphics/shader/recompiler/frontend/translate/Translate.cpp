@@ -1170,9 +1170,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					    builtin(IR::StageInputKind::WorkgroupId, index));
 				}
 			}
+			const auto wave_size = cs->wave_size != 0u ? cs->wave_size : 64u;
+			const auto waves     = std::min((total_threads + wave_size - 1u) / wave_size, 0x3fu);
+			// DS_ORDERED_COUNT is served in wave order whether or not TG_SIZE is loaded.
+			const bool ordered_append =
+			    std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+				    return inst.opcode == Decoder::Opcode::DS_ORDERED_COUNT;
+			    });
+			if (ordered_append) {
+				result.info.uses_ordered_append      = true;
+				result.info.ordered_append_waves     = waves;
+				result.info.ordered_append_wave_size = wave_size;
+			}
 			if (cs->tg_size_en) {
-				const auto wave_size     = cs->wave_size != 0u ? cs->wave_size : 64u;
-				const auto waves = std::min((total_threads + wave_size - 1u) / wave_size, 0x3fu);
 				const auto local_index = builtin(IR::StageInputKind::LocalInvocationIndex);
 				const auto wave_id     = IR::U32(
 				    entry_ir.Emit(IR::ValueOpcode::UDiv32, {local_index, IR::Value(wave_size)}));
@@ -1182,16 +1192,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                    IR::U32(IR::Value(0x80000000u)), IR::U32(IR::Value(0u)));
 				auto tg_size = entry_ir.BitwiseOr(
 				    entry_ir.BitwiseOr(wave_bits, IR::U32(IR::Value(waves))), first_bit);
-				const bool ordered_append =
-				    std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
-					    return inst.opcode == Decoder::Opcode::DS_ORDERED_COUNT;
-				    });
 				if (ordered_append) {
 					// Ordered append term [16:6]: the wave's position in dispatch order, which the
 					// hardware dispatcher assigns and DS_ORDERED_COUNT serves in sequence.
-					result.info.uses_ordered_append      = true;
-					result.info.ordered_append_waves     = waves;
-					result.info.ordered_append_wave_size = wave_size;
 					const auto u32 = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 					const auto group =
 					    IR::U32(entry_ir.Emit(IR::ValueOpcode::OrderedAppendGroupIndex,

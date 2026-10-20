@@ -433,7 +433,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	InsertDebugLabel(vk_buffer, "Dispatch {}x{}x{} submit={}", thread_group_x, thread_group_y,
 	                 thread_group_z, submit_id);
+	if (CommandScheduler::GpuProfileEnabled()) m_context.GetCommandScheduler().GpuProfileBegin();
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (CommandScheduler::GpuProfileEnabled()) {
+		m_context.GetCommandScheduler().GpuProfileEnd((compute_program.id << 32u) | 0xffffffffu);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -510,7 +514,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	InsertDebugLabel(vk_buffer, "DispatchIndirect submit={}", submit_id);
+	if (CommandScheduler::GpuProfileEnabled()) m_context.GetCommandScheduler().GpuProfileBegin();
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (CommandScheduler::GpuProfileEnabled()) {
+		m_context.GetCommandScheduler().GpuProfileEnd((compute_program.id << 32u) | 0xffffffffu);
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	m_context.GetCommandScheduler().NoteWork();

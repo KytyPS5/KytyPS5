@@ -1534,12 +1534,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	const bool profile = CommandScheduler::GpuProfileEnabled();
+	if (profile) m_context.GetCommandScheduler().GpuProfileBegin();
 	if (mesh_emulated) {
 		vk_buffer.draw(mesh_vertex_count, 1, 0, 0);
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, indirect_args);
+	}
+	if (profile) {
+		m_context.GetCommandScheduler().GpuProfileEnd((state.programs.vertex[0].id << 32u) |
+		                                              (state.programs.pixel.id & 0xffffffffu));
 	}
 
 	if (!draw.IsIndexed()) {

@@ -13,6 +13,8 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_map>
+#include <array>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -48,6 +50,13 @@ public:
 	// The open submission writes buffer memory that the CPU will read (see readbackPlan.h). The
 	// submission then ends with the barrier that makes those writes visible to the CPU.
 	void NoteWriteTheCpuReads() noexcept { m_cpu_reads_writes = true; }
+	// KYTY_GPU_PROFILE: the host GPU's time of each draw and dispatch, added up by `key` (its
+	// programs) and printed now and then. Begin and End go around one draw or dispatch.
+	[[nodiscard]] static bool GpuProfileEnabled();
+	void                      GpuProfileBegin();
+	void                      GpuProfileEnd(uint64_t key);
+	// The guest shader hash of a program id, for the profile's report.
+	static void NoteProgramHash(uint64_t program_id, uint64_t guest_hash);
 	// Waits until the host GPU has finished a submission that was made before. Any thread. False
 	// when the device no longer answers (the emulator is shutting down).
 	[[nodiscard]] bool WaitSubmitted(uint64_t tick) noexcept { return m_master.TryWait(tick); }
@@ -145,6 +154,21 @@ private:
 	vk::QueryPool                                m_gpu_timer_pool = nullptr;
 	uint32_t                                     m_gpu_timer_slot = 0;
 	std::deque<std::pair<uint64_t, uint32_t>>    m_gpu_timer_pending;
+	static constexpr uint32_t                    ProfileBlocks      = 64;
+	static constexpr uint32_t                    ProfileBlockQueries = 2048;
+	struct ProfileBlock {
+		uint64_t                                    tick = 0;
+		uint32_t                                    used = 0;
+		std::vector<uint64_t>                       keys;
+	};
+	vk::QueryPool                                m_profile_pool = nullptr;
+	std::array<ProfileBlock, ProfileBlocks>      m_profile_blocks {};
+	uint32_t                                     m_profile_block = 0;
+	std::deque<uint32_t>                         m_profile_pending;
+	std::unordered_map<uint64_t, std::pair<double, uint64_t>> m_profile_totals;
+	uint64_t                                     m_profile_buffers = 0;
+	void                                         StartGpuProfile();
+	void                                         CollectGpuProfile(uint64_t tick);
 	// Priority callbacks that finished while the scheduler shut down. They may own resources, so
 	// Shutdown destroys them once the queue is idle.
 	std::vector<Common::UniqueFunction<void>> m_retired_while_draining;

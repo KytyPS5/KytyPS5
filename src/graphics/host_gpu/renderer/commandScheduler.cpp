@@ -508,7 +508,115 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	StartGpuTimer();
+	StartGpuProfile();
 	return m_command;
+}
+
+namespace {
+std::mutex                                  g_profile_names_mutex;
+std::unordered_map<uint64_t, uint64_t>      g_profile_names;
+} // namespace
+
+bool CommandScheduler::GpuProfileEnabled() {
+	static const bool enabled = std::getenv("KYTY_GPU_PROFILE") != nullptr;
+	return enabled;
+}
+
+void CommandScheduler::NoteProgramHash(uint64_t program_id, uint64_t guest_hash) {
+	if (!GpuProfileEnabled()) return;
+	std::lock_guard lock(g_profile_names_mutex);
+	g_profile_names[program_id] = guest_hash;
+}
+
+void CommandScheduler::StartGpuProfile() {
+	if (!GpuProfileEnabled()) return;
+	if (m_profile_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = ProfileBlocks * ProfileBlockQueries;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_profile_pool),
+		                     "create the GPU profile query pool");
+	}
+	// A block still in flight is skipped this time: the profile loses those spans.
+	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if (block.tick != 0 && !m_master.IsFree(block.tick)) {
+		block.used = ProfileBlockQueries; // full: nothing is recorded into it
+		return;
+	}
+	block.tick = 0;
+	block.used = 0;
+	block.keys.clear();
+	m_command.Handle().resetQueryPool(m_profile_pool,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries,
+	                                  ProfileBlockQueries);
+}
+
+void CommandScheduler::GpuProfileBegin() {
+	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if (block.used + 2 > ProfileBlockQueries) return;
+	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
+	                                      block.used);
+	block.used++;
+}
+
+void CommandScheduler::GpuProfileEnd(uint64_t key) {
+	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if ((block.used & 1u) == 0u || block.used + 1 > ProfileBlockQueries) return;
+	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
+	                                      block.used);
+	block.used++;
+	block.keys.push_back(key);
+}
+
+void CommandScheduler::CollectGpuProfile(uint64_t tick) {
+	if (!GpuProfileEnabled() || m_profile_pool == nullptr) return;
+	auto& current = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if (current.used != ProfileBlockQueries || !current.keys.empty()) {
+		current.tick = tick;
+		m_profile_pending.push_back(m_profile_block % ProfileBlocks);
+	}
+	m_profile_block++;
+	const auto period = static_cast<double>(m_graphics.physical_device_properties.limits.timestampPeriod);
+	while (!m_profile_pending.empty() && m_master.IsFree(m_profile_blocks[m_profile_pending.front()].tick)) {
+		const auto index = m_profile_pending.front();
+		m_profile_pending.pop_front();
+		auto& block = m_profile_blocks[index];
+		const auto count = static_cast<uint32_t>(block.keys.size()) * 2u;
+		if (count != 0) {
+			std::vector<uint64_t> stamps(count);
+			if (m_graphics.device.getQueryPoolResults(m_profile_pool, index * ProfileBlockQueries, count,
+			                                          count * sizeof(uint64_t), stamps.data(),
+			                                          sizeof(uint64_t), vk::QueryResultFlagBits::e64) ==
+			    vk::Result::eSuccess) {
+				for (size_t i = 0; i < block.keys.size(); i++) {
+					if (stamps[2 * i + 1] < stamps[2 * i]) continue;
+					auto& total = m_profile_totals[block.keys[i]];
+					total.first += static_cast<double>(stamps[2 * i + 1] - stamps[2 * i]) * period;
+					total.second++;
+				}
+			}
+		}
+		block.tick = 0;
+		if (++m_profile_buffers % 3000 == 0) {
+			std::vector<std::pair<double, uint64_t>> top;
+			double sum = 0;
+			for (const auto& [key, total]: m_profile_totals) { top.emplace_back(total.first, key); sum += total.first; }
+			std::sort(top.rbegin(), top.rend());
+			std::lock_guard lock(g_profile_names_mutex);
+			const auto name = [](uint64_t id) { const auto it = g_profile_names.find(id); return it == g_profile_names.end() ? id : it->second; };
+			std::printf("GPUPROF total %.1f ms over %zu keys\n", sum / 1e6, top.size());
+			for (size_t i = 0; i < std::min<size_t>(top.size(), 25); i++) {
+				const auto key = top[i].second;
+				const auto& total = m_profile_totals[key];
+				std::printf("GPUPROF %5.1f%% %8.1f ms %7llu calls %6.1f us/call  a %016llx b %016llx\n", 100.0 * total.first / sum,
+				            total.first / 1e6, (unsigned long long)total.second, total.first / 1e3 / static_cast<double>(total.second),
+				            (unsigned long long)name(key >> 32u), (unsigned long long)name(key & 0xffffffffu));
+			}
+			m_profile_totals.clear();
+		}
+	}
 }
 
 void CommandScheduler::StartGpuTimer() {
@@ -617,6 +725,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	StopGpuTimer(tick);
+	CollectGpuProfile(tick);
 
 	m_command.m_buffer = nullptr;
 	{

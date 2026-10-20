@@ -482,6 +482,7 @@ struct PipelineCache::ProgramCache {
 				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
 			}
 			if (permutation != nullptr) {
+				CommandScheduler::NoteProgramHash(permutation->handle.id, params.hash);
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;

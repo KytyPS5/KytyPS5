@@ -163,9 +163,11 @@ public:
 
 	// PS5-style carousel: a single row of square tiles; only the selected one is enlarged and
 	// outlined. The slider value is the size of the selected tile.
+	// Cells are as wide as the largest tile, so they always cover the drawn (packed) tiles and
+	// Qt never culls a visible one.
 	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
 		const int big = option.decorationSize.width() * 3 / 4;
-		return QSize(option.decorationSize.width() / 2 + GameGridView::TileGap, big + 12);
+		return QSize(big + GameGridView::TileGap, big + 12);
 	}
 
 	void paint(QPainter* painter, const QStyleOptionViewItem& option,

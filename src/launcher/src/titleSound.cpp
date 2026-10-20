@@ -59,12 +59,17 @@ TitleSound::Sound TitleSound::Decode(const QByteArray& data, const QPromise<Soun
 TitleSound::TitleSound(QObject* parent): QObject(parent) {
 	m_decode_pool.setMaxThreadCount(1);
 	connect(&m_decode, &QFutureWatcher<Sound>::finished, this, [this] {
-		if (m_decode.isCanceled() || m_decode.future().resultCount() == 0) {
+		if (m_decode.isCanceled()) {
+			return;
+		}
+		if (m_decode.future().resultCount() == 0) {
+			FadeOthers({});
 			return;
 		}
 		auto sound = std::make_shared<Sound>(m_decode.future().takeResult());
 		if (sound->pcm.empty() || sound->channels <= 0 || sound->rate <= 0) {
 			qWarning() << "Cannot decode title sound:" << m_base;
+			FadeOthers({});
 			return;
 		}
 		if (m_cache.size() >= 3) {
@@ -84,14 +89,41 @@ TitleSound::~TitleSound() {
 	Clear();
 }
 
+// Queues the looping track in small chunks, so only about a second of audio is copied into the
+// stream at a time instead of the whole (possibly very long) decoded track.
+void TitleSound::Feed(Voice& v) {
+	const auto&  pcm      = v.sound->pcm;
+	const size_t frame    = static_cast<size_t>(v.sound->channels);
+	const size_t chunk    = std::max<size_t>(static_cast<size_t>(v.sound->rate) / 2, 1) * frame;
+	const int    target_b = static_cast<int>(chunk * 2 * sizeof(float));
+	while (SDL_GetAudioStreamQueued(v.stream) < target_b) {
+		if (v.pos >= pcm.size()) {
+			v.pos = 0;
+		}
+		const size_t n = std::min(chunk, pcm.size() - v.pos);
+		if (!SDL_PutAudioStreamData(v.stream, pcm.data() + v.pos, static_cast<int>(n * sizeof(float)))) {
+			return;
+		}
+		v.pos += n;
+	}
+}
+
+void TitleSound::FadeOthers(const QString& keep) {
+	for (auto& v : m_voices) {
+		v.target = !keep.isEmpty() && v.base == keep ? 1.0f : 0.0f;
+	}
+}
+
 void TitleSound::AddVoice(const QString& base, std::shared_ptr<const Sound> sound) {
 	if (!EnsureAudio()) {
+		FadeOthers({});
 		return;
 	}
 	const SDL_AudioSpec spec {SDL_AUDIO_F32, sound->channels, sound->rate};
 	auto* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
 	if (stream == nullptr) {
 		qWarning() << "Cannot play title sound:" << SDL_GetError();
+		FadeOthers({});
 		return;
 	}
 	SDL_SetAudioStreamGain(stream, 0.0f);
@@ -100,14 +132,16 @@ void TitleSound::AddVoice(const QString& base, std::shared_ptr<const Sound> soun
 		const std::vector<float> silence(static_cast<size_t>(sound->rate * sound->channels) / 4, 0.0f);
 		SDL_PutAudioStreamData(stream, silence.data(), static_cast<int>(silence.size() * sizeof(float)));
 	}
-	if (!SDL_PutAudioStreamData(stream, sound->pcm.data(),
-	                            static_cast<int>(sound->pcm.size() * sizeof(float))) ||
-	    !SDL_ResumeAudioStreamDevice(stream)) {
+	Voice voice {base, std::move(sound), stream, 0.0f, 1.0f, 0};
+	Feed(voice);
+	if (!SDL_ResumeAudioStreamDevice(stream)) {
 		qWarning() << "Cannot play title sound:" << SDL_GetError();
 		SDL_DestroyAudioStream(stream);
+		FadeOthers({});
 		return;
 	}
-	m_voices.push_back({base, std::move(sound), stream, 0.0f, 1.0f});
+	FadeOthers(base);
+	m_voices.push_back(std::move(voice));
 	m_timer.start();
 }
 
@@ -123,10 +157,7 @@ void TitleSound::Tick() {
 		}
 		// Squared ramp: smoother start/end than a linear one.
 		SDL_SetAudioStreamGain(v.stream, v.gain * v.gain);
-		const auto bytes = static_cast<int>(v.sound->pcm.size() * sizeof(float));
-		if (SDL_GetAudioStreamQueued(v.stream) < bytes / 2) {
-			SDL_PutAudioStreamData(v.stream, v.sound->pcm.data(), bytes);
-		}
+		Feed(v);
 	}
 	std::erase_if(m_voices, [](const Voice& v) {
 		if (v.target <= 0.0f && v.gain <= 0.0f) {
@@ -166,11 +197,13 @@ void TitleSound::SetTitle(const QString& base) {
 	}
 	m_decode.cancel();
 	m_base = base;
-	for (auto& v : m_voices) {
-		v.target = v.base == base ? 1.0f : 0.0f;
+	const bool have_voice =
+	    std::any_of(m_voices.begin(), m_voices.end(), [&](const Voice& v) { return v.base == base; });
+	// Old voices keep playing until the replacement is ready, unless there is nothing to play.
+	if (base.isEmpty() || have_voice || m_cache.contains(base)) {
+		FadeOthers(base);
 	}
-	if (base.isEmpty() ||
-	    std::any_of(m_voices.begin(), m_voices.end(), [&](const Voice& v) { return v.base == base; })) {
+	if (base.isEmpty() || have_voice) {
 		return;
 	}
 	if (const auto cached = m_cache.value(base)) {

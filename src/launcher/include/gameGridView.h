@@ -349,11 +349,15 @@ protected:
 		constexpr int gap    = 12;
 		constexpr int height = 84;
 		const int     count  = static_cast<int>(m_recent.size());
-		const int     width  = qBound(200, (r.width() - 2 * Margin - (count - 1) * gap) / count, 280);
-		const int     y      = top + 34;
+		// Cards wrap onto more rows when the viewport is too narrow to fit them all.
+		const int avail = r.width() - 2 * Margin;
+		const int cols  = qBound(1, (avail + gap) / (200 + gap), count);
+		const int width = qBound(120, (avail - (cols - 1) * gap) / cols, 280);
+		const int y0    = top + 34;
 		for (int i = 0; i < count; ++i) {
 			const auto& t = m_recent[i];
-			const QRect card(Margin + i * (width + gap), y, width, height);
+			const int   y = y0 + (i / cols) * (height + gap);
+			const QRect card(Margin + (i % cols) * (width + gap), y, width, height);
 			painter.setPen(Qt::NoPen);
 			painter.setBrush(QColor(0, 0, 0, 150));
 			painter.drawRoundedRect(card, 14, 14);
@@ -541,6 +545,7 @@ protected:
 		if (selectionModel() != nullptr && !selectionModel()->selectedIndexes().isEmpty()) {
 			busy = true;
 		}
+		UpdateScrollRange();
 		viewport()->update();
 		if (!busy) {
 			m_timer.stop();
@@ -553,9 +558,60 @@ protected:
 		PlayIntro();
 	}
 
+	// The drawn tiles are packed with animated sizes, so the scroll range and the scrolling to
+	// an item follow TileRect instead of Qt's fixed cell layout.
+	int ContentWidth() const {
+		int       width = Margin;
+		const int rows  = model() != nullptr ? model()->rowCount() : 0;
+		for (int row = 0; row < rows; ++row) {
+			if (!isRowHidden(row)) {
+				width += TileRect(row).width() + TileGap;
+			}
+		}
+		if (m_show_all) {
+			width += iconSize().width() / 2 + TileGap;
+		}
+		return width - TileGap + Margin;
+	}
+
+	void UpdateScrollRange() {
+		auto* bar = horizontalScrollBar();
+		const int max = qMax(0, ContentWidth() - viewport()->width());
+		if (bar->maximum() != max || bar->minimum() != 0) {
+			bar->setRange(0, max);
+		}
+		bar->setPageStep(viewport()->width());
+	}
+
+	void updateGeometries() override {
+		QListView::updateGeometries();
+		UpdateScrollRange();
+	}
+
+public:
+	void scrollTo(const QModelIndex& index, ScrollHint hint = EnsureVisible) override {
+		if (!index.isValid() || index.model() != model() || isRowHidden(index.row())) {
+			return;
+		}
+		UpdateScrollRange();
+		const auto rect = TileRect(index.row());
+		auto*      bar  = horizontalScrollBar();
+		int        value = bar->value();
+		if (hint == PositionAtCenter) {
+			value += rect.center().x() - viewport()->width() / 2;
+		} else if (rect.left() < Margin) {
+			value += rect.left() - Margin;
+		} else if (rect.right() > viewport()->width() - Margin) {
+			value += rect.right() - (viewport()->width() - Margin);
+		}
+		bar->setValue(qBound(bar->minimum(), value, bar->maximum()));
+	}
+
+protected:
 	void resizeEvent(QResizeEvent* event) override {
 		QListView::resizeEvent(event);
 		UpdateScaledBackground();
+		UpdateScrollRange();
 	}
 
 	void PaintBattery(QPainter& p, const QRect& r) {

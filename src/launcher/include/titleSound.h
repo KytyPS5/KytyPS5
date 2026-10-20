@@ -39,10 +39,13 @@ private:
 		SDL_AudioStream*              stream = nullptr;
 		float                         gain   = 0.0f;
 		float                         target = 1.0f;
+		size_t                        pos    = 0;
 	};
 
 	static Sound Decode(const QByteArray& data, const QPromise<Sound>& promise);
+	static void  Feed(Voice& v);
 	void         AddVoice(const QString& base, std::shared_ptr<const Sound> sound);
+	void         FadeOthers(const QString& keep);
 	void         Tick();
 	void         Clear();
 

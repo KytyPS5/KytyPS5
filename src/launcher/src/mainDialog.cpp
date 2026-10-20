@@ -388,8 +388,14 @@ static bool CreateBashScript(const QString& interpreter, const QStringList& args
 			s << " " << BashQuote(arg);
 		}
 		s << "\n";
+		// Keep the terminal open only after a failure, so the launcher is restored as soon as the
+		// emulator exits normally.
+		s << "rc=$?\n";
+		s << "if [ $rc -ne 0 ]; then\n";
 		s << "echo Press any key...\n";
 		s << "read -n1\n";
+		s << "fi\n";
+		s << "exit $rc\n";
 
 		file.close();
 
@@ -512,11 +518,13 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	}
 #elif defined(_WIN32)
 	{
-		// Use nativeArguments so Qt does not re-quote the /K command string.
+		// Use nativeArguments so Qt does not re-quote the command string. /C closes the console
+		// when the emulator exits (so the launcher is restored); it is kept open on failure.
 		process->setProgram(CMD_EXE);
 		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K \"") +
-		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
+		process->setNativeArguments(QStringLiteral("/C \"") +
+		                            BuildWinCmdKCommand(interpreter, args) +
+		                            QStringLiteral(" || pause\""));
 	}
 #else
 	process->setProgram(interpreter);

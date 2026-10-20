@@ -21,4 +21,13 @@ struct ReadLaneStats {
 // Returns the number of operations replaced.
 [[nodiscard]] uint32_t LowerLaneOpsToSingleLane(Program& program);
 
+// A wave-wide reduction that the guest compiler builds from lane operations (WaveActiveMin and
+// the like): DPP row shifts, V_PERMLANEX16 and V_READLANE of the lanes that end up holding the
+// result. On the hardware every lane of the wave exists, also those a fragment wave has no pixel
+// for, and they hold partial results. The host has no invocation for such a lane, so the lane by
+// lane form reads nothing there. A value that combines every lane of one operand, whose lanes
+// outside EXEC hold the operation's identity, becomes one subgroup reduction of that operand.
+// Returns the number of reductions found.
+[[nodiscard]] uint32_t RecognizeWaveReductions(Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

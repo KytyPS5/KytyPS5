@@ -26790,6 +26790,57 @@ TestCase VectorPermlanex16() {
   return test;
 }
 
+// WaveActiveMin as the guest compiler builds it: every lane on, lanes outside the old EXEC set
+// to the identity, DPP row shifts, V_PERMLANEX16 and V_READLANE of lanes 31 and 63. The shader
+// compiles it to one subgroup reduction (lanes a fragment wave lacks hold partial results).
+TestCase WaveMinThroughDppAndReadlane() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 9, 0);                               // v9 = lane
+  code.push_back(EncodeVop1(0x01, 9, Vgpr(0)));
+  code.push_back(EncodeVop2(0x26, 0, 255u, 0));             // v0 = 200 - lane
+  code.push_back(200u);
+  code.push_back(EncodeSop1(0x03, 126, 255u));              // EXEC = lanes 10..49
+  code.push_back(0xfffffc00u);
+  code.push_back(EncodeSop1(0x03, 127, 255u));
+  code.push_back(0x0003ffffu);
+  // The idiom, as EA SPORTS FC 25 has it.
+  code.insert(code.end(), {0xbeea287eu,                     // s_orn2_saveexec_b64 vcc, exec
+                           0x020400c1u,                     // v_cndmask_b32 v2, -1, v0, vcc
+                           0x260404fau, 0xff011102u,        // v_min_u32_dpp v2, v2, v2 row_shr:1
+                           0x260404fau, 0xff011202u,        // row_shr:2
+                           0x260404fau, 0xff011402u,        // row_shr:4
+                           0x260404fau, 0xff011802u,        // row_shr:8
+                           0xd7781001u, 0x03058302u,        // v_permlanex16_b32 v1, v2, -1, -1
+                           0x26040302u,                     // v_min_u32 v2, v2, v1
+                           0xbefe046au,                     // s_mov_b64 exec, vcc
+                           0xd7600004u, 0x00013f02u,        // v_readlane_b32 s4, v2, 31
+                           0xd7600005u, 0x00017f02u,        // v_readlane_b32 s5, v2, 63
+                           0x839c0504u});                   // s_min_u32 s28, s4, s5
+  code.push_back(EncodeSop1(0x04, 126, 0xc1u));             // EXEC = all lanes
+  code.push_back(EncodeVop1(0x01, 3, 28));                  // v3 = s28
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 9, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "WaveMinThroughDppAndReadlane";
+  test.code = std::move(code);
+  test.expected = std::vector<u32>(64, 200u - 49u);
+  test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U32, O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64,
+                  O::V_CNDMASK_B32, O::V_MIN_U32, O::V_PERMLANEX16_B32, O::S_MOV_B64,
+                  O::V_READLANE_B32, O::S_MIN_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformUMin"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorPermlane16FetchInactiveZero() {
   using O = ShaderOpcode;
 
@@ -40370,6 +40421,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
+  AddCase(WaveMinThroughDppAndReadlane);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));

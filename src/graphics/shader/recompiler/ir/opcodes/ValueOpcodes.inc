@@ -230,6 +230,8 @@ VALUE_OPCODE(LaneId, U32)
 VALUE_OPCODE(Ballot, U32x4, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)
 VALUE_OPCODE(ReadLane, U32, U32, U32)
+// Flags: the reducing operation's opcode.
+VALUE_OPCODE(WaveReduceU32, U32, U32)
 VALUE_OPCODE(WriteLane, U32, U32, U32, U32)
 VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1)
 VALUE_OPCODE(PermuteU32, U32, U32, U32, U1)

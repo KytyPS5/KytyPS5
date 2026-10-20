@@ -825,6 +825,43 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
+uint32_t EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (state.single_lane) return ctx.Arg(inst, 0);
+	const auto op = static_cast<IR::ValueOpcode>(inst.Flags<uint64_t>());
+	spv::Op group = spv::OpGroupNonUniformIAdd;
+	uint32_t combine = 0; // A GLSL.std.450 instruction, or 0 for a core one.
+	spv::Op  core    = spv::OpIAdd;
+	switch (op) {
+		case IR::ValueOpcode::UMin32: group = spv::OpGroupNonUniformUMin; combine = GLSLstd450UMin; break;
+		case IR::ValueOpcode::UMax32: group = spv::OpGroupNonUniformUMax; combine = GLSLstd450UMax; break;
+		case IR::ValueOpcode::SMin32: group = spv::OpGroupNonUniformSMin; combine = GLSLstd450SMin; break;
+		case IR::ValueOpcode::SMax32: group = spv::OpGroupNonUniformSMax; combine = GLSLstd450SMax; break;
+		case IR::ValueOpcode::IAdd32: group = spv::OpGroupNonUniformIAdd; core = spv::OpIAdd; break;
+		case IR::ValueOpcode::BitwiseAnd32: group = spv::OpGroupNonUniformBitwiseAnd; core = spv::OpBitwiseAnd; break;
+		case IR::ValueOpcode::BitwiseOr32: group = spv::OpGroupNonUniformBitwiseOr; core = spv::OpBitwiseOr; break;
+		case IR::ValueOpcode::BitwiseXor32: group = spv::OpGroupNonUniformBitwiseXor; core = spv::OpBitwiseXor; break;
+		default: EXIT("wave reduction with an unknown operation");
+	}
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		// This invocation holds two lanes of the wave: combine them first.
+		const auto both = state.builder.AllocateId();
+		if (combine != 0) {
+			state.builder.AddFunction(spv::OpExtInst, TypeU32(state), both, GlslStd450(state), combine,
+			                          ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+		} else {
+			state.builder.AddFunction(core, TypeU32(state), both, ctx.HalfArg(inst, 0, 0),
+			                          ctx.HalfArg(inst, 0, 1));
+		}
+		value = both;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(group, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
+	                          spv::GroupOperationReduce, value);
+	return result;
+}
+
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();

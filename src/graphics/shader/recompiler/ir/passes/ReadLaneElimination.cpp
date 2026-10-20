@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <cinttypes>
 #include <cstdio>
 #include <mutex>
@@ -404,6 +406,270 @@ uint32_t LowerLaneOpsToSingleLane(Program& program) {
 		}
 	}
 	return replaced;
+}
+
+namespace {
+
+// For each lane, the lanes of the reduced operand that its value combines. Lanes whose value is
+// not such a combination (a DPP read the hardware answers with zero) are "poisoned".
+struct LaneSets {
+	Value                    operand;
+	ValueOpcode              op = ValueOpcode::Void;
+	std::array<uint64_t, 64> lanes {};
+	uint64_t                 poisoned = 0;
+	bool                     uniform  = false;
+};
+
+bool Idempotent(ValueOpcode op) {
+	return op == ValueOpcode::UMin32 || op == ValueOpcode::UMax32 || op == ValueOpcode::SMin32 ||
+	       op == ValueOpcode::SMax32 || op == ValueOpcode::BitwiseAnd32 || op == ValueOpcode::BitwiseOr32;
+}
+
+std::optional<uint32_t> Identity(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::UMin32:
+		case ValueOpcode::BitwiseAnd32: return 0xffffffffu;
+		case ValueOpcode::UMax32:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32: return 0u;
+		case ValueOpcode::SMin32: return 0x7fffffffu;
+		case ValueOpcode::SMax32: return 0x80000000u;
+		default: return std::nullopt;
+	}
+}
+
+// EXEC with every lane on, as S_ORN2_SAVEEXEC leaves it.
+bool AllLanes(Value exec) {
+	exec = exec.Resolve();
+	if (exec.IsImmediate()) return exec.GetType() == Type::U1 && exec.U1();
+	const auto* inst = exec.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LogicalOr) return false;
+	const auto is_not_of = [](Value value, Value of) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalNot &&
+		       inst->Arg(0).Resolve() == of.Resolve();
+	};
+	return is_not_of(inst->Arg(0), inst->Arg(1)) || is_not_of(inst->Arg(1), inst->Arg(0));
+}
+
+// A register write under every lane: the written value.
+Value StripFullWrite(Value value) {
+	for (;;) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 || !AllLanes(inst->Arg(0)))
+			return value;
+		value = inst->Arg(1);
+	}
+}
+
+// The lane a DPP source reads for each lane, as the SPIR-V emitter maps it (EmitDppTargetLane);
+// UINT32_MAX for a lane with no source.
+std::optional<std::array<uint32_t, 64>> DppSources(const DppMoveFlags& flags) {
+	std::array<uint32_t, 64> source {};
+	const auto control = flags.control;
+	for (uint32_t lane = 0; lane < 64u; ++lane) {
+		const uint32_t row = lane & ~15u, in_row = lane & 15u;
+		if (flags.dpp8) return std::nullopt;
+		if (control <= 0xffu) {
+			source[lane] = (lane & ~3u) | ((control >> ((lane & 3u) * 2u)) & 3u);
+		} else if (control >= 0x101u && control <= 0x10fu) {
+			const auto from = in_row + (control & 0xfu);
+			source[lane]    = from < 16u ? row | from : UINT32_MAX;
+		} else if (control >= 0x111u && control <= 0x11fu) {
+			const auto shift = control & 0xfu;
+			source[lane]     = in_row >= shift ? row | (in_row - shift) : UINT32_MAX;
+		} else if (control >= 0x121u && control <= 0x12fu) {
+			source[lane] = row | ((in_row + 16u - (control & 0xfu)) & 15u);
+		} else if (control == 0x140u) {
+			source[lane] = row | (15u - in_row);
+		} else if (control == 0x141u) {
+			source[lane] = row | (in_row & 8u) | (7u - (in_row & 7u));
+		} else if (control >= 0x150u && control <= 0x15fu) {
+			source[lane] = row | (control & 0xfu);
+		} else if (control >= 0x160u && control <= 0x16fu) {
+			source[lane] = lane ^ (control & 0xfu);
+		} else {
+			return std::nullopt;
+		}
+	}
+	return source;
+}
+
+class ReductionFinder {
+public:
+	explicit ReductionFinder(uint32_t wave_size): wave_size(wave_size) {}
+
+	std::optional<LaneSets> Analyze(Value value, uint32_t depth = 0) {
+		value = StripFullWrite(value);
+		auto* inst = value.TryInstruction();
+		if (inst != nullptr) {
+			if (const auto found = memo.find(inst); found != memo.end()) return found->second;
+		}
+		auto result = depth > 64u ? std::nullopt : Compute(value, inst, depth);
+		if (inst != nullptr) memo.emplace(inst, result);
+		return result;
+	}
+
+private:
+	LaneSets Leaf(Value value) const {
+		LaneSets sets {.operand = value};
+		for (uint32_t lane = 0; lane < wave_size; ++lane) sets.lanes[lane] = uint64_t {1} << lane;
+		return sets;
+	}
+
+	static bool Merge(LaneSets& into, const LaneSets& other, ValueOpcode op) {
+		if (into.operand != other.operand) return false;
+		if (into.op != ValueOpcode::Void && into.op != op) return false;
+		if (other.op != ValueOpcode::Void && other.op != op) return false;
+		into.op = op;
+		for (uint32_t lane = 0; lane < 64u; ++lane) {
+			if (!Idempotent(op) && (into.lanes[lane] & other.lanes[lane]) != 0u) return false;
+			into.lanes[lane] |= other.lanes[lane];
+		}
+		into.poisoned |= other.poisoned;
+		into.uniform = into.uniform && other.uniform;
+		return true;
+	}
+
+	std::optional<LaneSets> Combine(Value lhs, Value rhs, ValueOpcode op, uint32_t depth) {
+		auto left  = Analyze(lhs, depth + 1u);
+		auto right = Analyze(rhs, depth + 1u);
+		// One side may be the operand itself.
+		if (left && !right) right = Leaf(StripFullWrite(rhs));
+		if (right && !left) left = Leaf(StripFullWrite(lhs));
+		if (!left || !right) return std::nullopt;
+		if (!Merge(*left, *right, op)) return std::nullopt;
+		return left;
+	}
+
+	std::optional<LaneSets> Compute(Value value, Inst* inst, uint32_t depth) {
+		if (inst == nullptr) return std::nullopt;
+		switch (const auto op = inst->GetOpcode()) {
+			case ValueOpcode::ReadLane: {
+				const auto lane = inst->Arg(1).Resolve();
+				if (!lane.IsImmediate() || lane.GetType() != Type::U32) return std::nullopt;
+				auto sets = Analyze(inst->Arg(0), depth + 1u);
+				if (!sets || sets->op == ValueOpcode::Void) return std::nullopt;
+				const auto index = lane.U32() % wave_size;
+				if ((sets->poisoned >> index) & 1u) return std::nullopt;
+				const auto mask = sets->lanes[index];
+				sets->lanes.fill(0);
+				for (uint32_t i = 0; i < wave_size; ++i) sets->lanes[i] = mask;
+				sets->poisoned = 0;
+				sets->uniform  = true;
+				return sets;
+			}
+			case ValueOpcode::DppUpdateU32: {
+				if (!AllLanes(inst->Arg(2))) return std::nullopt;
+				const auto flags   = inst->Flags<DppMoveFlags>();
+				const auto sources = DppSources(flags);
+				if (!sources) return std::nullopt;
+				const auto old_sets = Analyze(inst->Arg(1), depth + 1u);
+				auto       old      = old_sets ? *old_sets : Leaf(StripFullWrite(inst->Arg(1)));
+				auto       written  = Analyze(inst->Arg(0), depth + 1u);
+				if (!written || written->operand != old.operand) return std::nullopt;
+				LaneSets result = old;
+				result.op       = written->op;
+				for (uint32_t lane = 0; lane < wave_size; ++lane) {
+					const bool masks = ((flags.row_mask >> (lane / 16u)) & 1u) != 0u &&
+					                   ((flags.bank_mask >> ((lane / 4u) & 3u)) & 1u) != 0u;
+					const bool valid = (*sources)[lane] < wave_size;
+					if (!masks || (!flags.bound_control && !valid)) continue;
+					result.lanes[lane] = written->lanes[lane];
+					result.poisoned    = (result.poisoned & ~(uint64_t {1} << lane)) |
+					                  (written->poisoned & (uint64_t {1} << lane));
+				}
+				return result;
+			}
+			case ValueOpcode::DppMoveU32: {
+				// The value a DPP source reads, before the instruction combines it: lanes with no
+				// source read zero, which is no lane set.
+				if (!AllLanes(inst->Arg(1))) return std::nullopt;
+				const auto sources = DppSources(inst->Flags<DppMoveFlags>());
+				if (!sources) return std::nullopt;
+				auto source = Analyze(inst->Arg(0), depth + 1u);
+				if (!source) source = Leaf(StripFullWrite(inst->Arg(0)));
+				LaneSets result = *source;
+				for (uint32_t lane = 0; lane < wave_size; ++lane) {
+					const auto from = (*sources)[lane];
+					if (from >= wave_size) {
+						result.lanes[lane] = 0;
+						result.poisoned |= uint64_t {1} << lane;
+					} else {
+						result.lanes[lane] = source->lanes[from];
+						result.poisoned    = (result.poisoned & ~(uint64_t {1} << lane)) |
+						                  (((source->poisoned >> from) & 1u) << lane);
+					}
+				}
+				return result;
+			}
+			case ValueOpcode::Permlane16U32: {
+				if (!AllLanes(inst->Arg(3))) return std::nullopt;
+				const auto low = inst->Arg(1).Resolve(), high = inst->Arg(2).Resolve();
+				if (!low.IsImmediate() || !high.IsImmediate()) return std::nullopt;
+				const bool x16 = inst->Flags<PermlaneFlags>().x16;
+				auto source = Analyze(inst->Arg(0), depth + 1u);
+				if (!source) source = Leaf(StripFullWrite(inst->Arg(0)));
+				LaneSets result = *source;
+				for (uint32_t lane = 0; lane < wave_size; ++lane) {
+					const uint32_t in_row = lane & 15u;
+					const uint32_t select = ((in_row < 8u ? low.U32() : high.U32()) >> ((in_row & 7u) * 4u)) & 15u;
+					const uint32_t from   = ((lane & ~15u) ^ (x16 ? 16u : 0u)) | select;
+					if (from >= wave_size) return std::nullopt;
+					result.lanes[lane] = source->lanes[from];
+					result.poisoned    = (result.poisoned & ~(uint64_t {1} << lane)) |
+					                  (((source->poisoned >> from) & 1u) << lane);
+				}
+				return result;
+			}
+			default:
+				if (Identity(op).has_value()) return Combine(inst->Arg(0), inst->Arg(1), op, depth);
+				(void)value;
+				return std::nullopt;
+		}
+	}
+
+	uint32_t wave_size;
+	std::unordered_map<const Inst*, std::optional<LaneSets>> memo;
+};
+
+// The operand's lanes outside EXEC hold the identity: a select of it by a lane condition.
+bool HoldsIdentityOutsideExec(Value operand, uint32_t identity) {
+	const auto* inst = StripFullWrite(operand).TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32) return false;
+	const auto is_identity = [identity](Value value) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == identity;
+	};
+	return is_identity(inst->Arg(1)) || is_identity(inst->Arg(2));
+}
+
+} // namespace
+
+uint32_t RecognizeWaveReductions(Program& program) {
+	const auto wave_size = program.wave_size;
+	if (wave_size != 32u && wave_size != 64u) return 0;
+	const uint64_t full = wave_size == 64u ? ~uint64_t {0} : 0xffffffffu;
+	ReductionFinder finder(wave_size);
+	uint32_t found = 0;
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
+			const auto op = inst.GetOpcode();
+			if (op != ValueOpcode::ReadLane && !Identity(op).has_value()) continue;
+			if (inst.Uses().empty()) continue;
+			const auto sets = finder.Analyze(Value(&inst));
+			if (!sets || !sets->uniform || sets->lanes[0] != full) continue;
+			if (!HoldsIdentityOutsideExec(sets->operand, *Identity(sets->op))) continue;
+			const auto reduced = block->PrependNewInst(it, ValueOpcode::WaveReduceU32, {sets->operand},
+			                                           static_cast<uint64_t>(sets->op));
+			inst.ReplaceUsesWith(Value(&*reduced));
+			found++;
+		}
+	}
+	return found;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

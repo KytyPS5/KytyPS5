@@ -86,7 +86,7 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		return MissingCapability {"derivatives in a compute shader", "computeDerivativeGroupQuads"};
 	}
 	const bool subgroups = requirements.subgroup_ballot || requirements.subgroup_barrier ||
-	                       requirements.subgroup_shuffle ||
+	                       requirements.subgroup_shuffle || requirements.subgroup_arithmetic ||
 	                       requirements.subgroup_local_invocation_id;
 	// A wave barrier has no single-lane form.
 	const bool single_lane =
@@ -107,6 +107,7 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		                                                                                : 0u) |
 		    (requirements.subgroup_ballot ? 0x8u : 0u) |
 		    (requirements.subgroup_shuffle ? 0x10u : 0u) |
+		    (requirements.subgroup_arithmetic ? 0x4u : 0u) |
 		    // arithmetic 0x4, for a lane index from a scan
 		    (requirements.subgroup_local_invocation_id && LaneIndexFromScan(program.stage, host)
 		         ? 0x4u

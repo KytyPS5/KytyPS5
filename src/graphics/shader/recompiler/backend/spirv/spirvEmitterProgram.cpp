@@ -298,7 +298,8 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
+	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
+	                     inst.GetOpcode() == IR::ValueOpcode::WaveReduceU32)) {
 		// Both operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;

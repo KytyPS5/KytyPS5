@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <deque>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Xbyak {
@@ -139,6 +141,40 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+
+	// Raw stores and atomics with constant byte offsets may use a varying index.
+	std::vector<std::pair<uint32_t, uint32_t>> indexed_write_patterns;
+	bool                                       unknown_write_pattern = false;
+
+	[[nodiscard]] bool WritesOverlap(uint64_t address, uint64_t size, uint64_t read_address,
+	                                 uint64_t read_size) const {
+		if (!written || size == 0 || read_size == 0) return false;
+		if (read_address >= address ? read_address - address >= size
+		                            : address - read_address >= read_size)
+			return false;
+		const uint32_t stride = packed_stride & 0x3fffu;
+		if (!unknown_write_pattern && !indexed_write_patterns.empty() && !formatted &&
+		    indirect_root == NoIndirectBuffer &&
+		    (packed_stride & ((1u << 20u) | (1u << 14u))) == 0u && (address & 3u) == 0u &&
+		    stride >= 4u && std::has_single_bit(stride)) {
+			const auto offset = read_address >= address ? read_address - address : 0u;
+			const auto length = std::min(size - offset, read_address >= address
+			                                                ? read_size
+			                                                : read_size - (address - read_address));
+			// Power-of-two strides divide 2^32. Wrapped index multiplication therefore
+			// preserves each store's byte residue, including raw DWORD rounding.
+			for (const auto& [byte_offset, width]: indexed_write_patterns) {
+				if (width == 0u || width > stride) return true;
+				const auto residue  = byte_offset & (stride - 1u);
+				const auto position = uint32_t(offset & (stride - 1u));
+				if (((position - residue) & (stride - 1u)) < width ||
+				    ((residue - position) & (stride - 1u)) < length)
+					return true;
+			}
+			return false;
+		}
+		return true;
+	}
 
 	bool operator==(const BufferResource& other) const = default;
 };

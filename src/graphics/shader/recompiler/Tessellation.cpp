@@ -14,6 +14,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -114,27 +115,9 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		           ? value
 		           : Address {};
 	};
-	// A forward branch joins its target with the fallthrough path. Definitions that
-	// differ between the paths are unknown there.
-	std::unordered_map<uint32_t, Registers> joins;
-	const auto merge = [](Registers& into, const Registers& from) {
-		for (uint32_t index = 0; index < into.size(); index++) {
-			if (into[index] != from[index]) into[index] = {};
-		}
-	};
-
 	uint32_t stride = 0, patch_begin = UINT32_MAX, patch_end = 0;
-	for (const auto& inst: program.instructions) {
-		if (const auto join = joins.find(inst.pc); join != joins.end()) {
-			merge(registers, join->second);
-			joins.erase(join);
-		}
-		if (IsDirectBranch(inst.opcode)) {
-			EXIT_NOT_IMPLEMENTED(inst.branch_target <= inst.pc);
-			if (const auto [join, inserted] = joins.try_emplace(inst.branch_target, registers);
-			    !inserted)
-				merge(join->second, registers);
-		}
+	// Ring accesses are checked only once the block entry states are final.
+	const auto step = [&](const Instruction& inst, bool check) {
 		const bool local_store  = IsDsWriteOpcode(inst.opcode);
 		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
@@ -143,7 +126,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 		const bool control_read = !local && IsLocalRead(inst.opcode);
-		if ((local && local_store) || control_store || control_read) {
+		if (check && ((local && local_store) || control_store || control_read)) {
 			const auto address = read(inst.src0);
 			// A read may index another control point; only its record offset must be fixed.
 			const bool indexed_read = control_read && address.kind == Kind::Scaled &&
@@ -171,7 +154,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			}
 		}
 		// Store vdata is a source, despite occupying the decoder's dst field.
-		if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
+		if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) return;
 		const auto lhs   = read(inst.src0);
 		const auto rhs   = read(inst.src1);
 		const auto third = read(inst.src2);
@@ -221,8 +204,65 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			registers[inst.dst.reg + index] = {};
 		}
 		registers.at(inst.dst.reg) = value;
+	};
+
+	// Forward dataflow over the blocks, loops included: a register whose incoming values differ
+	// is unknown.
+	const auto& insts    = program.instructions;
+	const auto  index_of = [&](uint32_t pc) {
+		const auto it = std::ranges::lower_bound(insts, pc, {}, &Instruction::pc);
+		EXIT_NOT_IMPLEMENTED(it == insts.end() || it->pc != pc);
+		return static_cast<size_t>(it - insts.begin());
+	};
+	std::vector<bool> leader(insts.size(), false);
+	leader.at(0) = true;
+	for (size_t index = 0; index < insts.size(); index++) {
+		if (!IsDirectBranch(insts[index].opcode)) continue;
+		leader[index_of(insts[index].branch_target)] = true;
+		if (index + 1u < insts.size()) leader[index + 1u] = true;
 	}
-	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
+	std::unordered_map<size_t, Registers> entry {{0u, registers}};
+	std::vector<size_t>                   work {0u};
+	const auto                            flow = [&](size_t target) {
+		const auto [it, inserted] = entry.try_emplace(target, registers);
+		bool changed              = inserted;
+		for (size_t reg = 0; !inserted && reg < registers.size(); reg++) {
+			if (it->second[reg] != registers[reg] && it->second[reg].kind != Kind::Unknown) {
+				it->second[reg] = {};
+				changed         = true;
+			}
+		}
+		if (changed) work.push_back(target);
+	};
+	const auto run = [&](size_t begin, bool check) {
+		registers = entry.at(begin);
+		for (size_t index = begin; index < insts.size(); index++) {
+			if (index != begin && leader[index]) {
+				if (!check) flow(index);
+				return;
+			}
+			const auto& inst = insts[index];
+			step(inst, check);
+			if (inst.opcode == Opcode::S_ENDPGM) return;
+			if (IsDirectBranch(inst.opcode)) {
+				if (!check) {
+					flow(index_of(inst.branch_target));
+					if (IsConditionalBranch(inst.opcode) && index + 1u < insts.size())
+						flow(index + 1u);
+				}
+				return;
+			}
+		}
+	};
+	while (!work.empty()) {
+		const auto begin = work.back();
+		work.pop_back();
+		run(begin, false);
+	}
+	for (size_t index = 0; index < insts.size(); index++) {
+		if (entry.contains(index)) run(index, true);
+	}
+	EXIT_NOT_IMPLEMENTED(stride == 0u);
 	(local ? info.ls_stride : info.hs_stride) = stride;
 	if (patch_end != 0u) {
 		EXIT_NOT_IMPLEMENTED(patch_begin < stride * control_points);

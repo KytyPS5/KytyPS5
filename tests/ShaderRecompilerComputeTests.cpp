@@ -44340,7 +44340,54 @@ void CheckTessellationStoreOutsideRecord() {
 }
 #endif
 
+// LS and HS loops before their ring stores: values carried by a loop are unknown, the others
+// keep their address.
+void CheckTessellationLoop() {
+  using namespace ShaderRecompiler;
+  constexpr const char *name = "TessellationLoop";
+  constexpr u32 ls_stride = 132;
+  constexpr u32 hs_stride = 112;
+  const auto make_local = [&](u32 address_source) {
+    return std::vector<u32>{EncodeVop1(0x01, 4, InlineU32(0)),
+                            EncodeVop2(0x25, 4, InlineU32(1), 4),
+                            EncodeSopp(0x04, 0xfffeu), // s_cbranch_scc0 back to the add
+                            EncodeVop2(0x0b, 2, 255u, address_source),
+                            ls_stride,
+                            EncodeDs0(0x0d),
+                            EncodeDs1(0, 4, 2),
+                            EncodeSop1(0x20, 0, 6),
+                            0xffffffffu};
+  };
+  std::vector<u32> control;
+  constexpr u32 control_point = 34;
+  AppendVop3(&control, 0x148, control_point, Vgpr(1), InlineU32(8), InlineU32(5));
+  control.push_back(EncodeVop2(0x0b, 35, 255u, control_point));
+  control.push_back(hs_stride);
+  control.push_back(EncodeVop2(0x25, 6, InlineU32(1), 6));
+  control.push_back(EncodeSopp(0x04, 0xfffeu));
+  control.push_back(EncodeMubuf0(0x1c, 4));
+  control.push_back(EncodeMubuf1(10, 2, 35, 2));
+  AppendEnd(&control);
+  const ShaderTessellationInputInfo layout{.input_control_points = 3,
+                                           .output_control_points = 3,
+                                           .domain = 1,
+                                           .partitioning = 0,
+                                           .output_topology = 2};
+  auto tess = layout;
+  AnalyzeTessellationPrograms(make_local(3), control, tess);
+  Require(name, "strides across loops", tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          "addresses computed outside a loop must keep their stride after it");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal("TessellationLoopCarriedAddress", [&] {
+    auto info = layout;
+    AnalyzeTessellationPrograms(make_local(4), control, info);
+  });
+#endif
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckTessellationPrograms() {
+  CheckTessellationLoop();
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
   CheckTessellationPatchConstants();

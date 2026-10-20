@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1029,7 +1030,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto args_address = m_draw_indirect_args_base_addr + data_offset;
 		const auto args_size =
 		    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-		if (m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size)) {
+		// Memory outside the tracked guest range (a test's host buffer) is never GPU-written.
+		if (GuestRange {args_address, args_size}.Valid() &&
+		    m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size)) {
 			const bool drawn =
 			    indexed ? DrawIndex({.index_count = m_index_buffer_size,
 			                         .index_addr  = reinterpret_cast<const void*>(m_index_base_addr),

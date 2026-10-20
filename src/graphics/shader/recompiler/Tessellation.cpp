@@ -133,6 +133,13 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
 					                     (stride != 0u && stride != address.coefficient));
 					stride = address.coefficient;
+					// The lowering writes a per-control-point store to the invocation's own output.
+					const auto end =
+					    uint64_t {address.constant} + inst.offset + 4u * inst.data_dwords;
+					if (control_store && end > stride) {
+						EXIT("HS store at pc 0x%08x leaves its %u-byte control point record\n",
+						     inst.pc, stride);
+					}
 				} else if (control_store) {
 					// Control-point-independent HS outputs are patch constants.
 					const auto begin = address.constant + inst.offset;

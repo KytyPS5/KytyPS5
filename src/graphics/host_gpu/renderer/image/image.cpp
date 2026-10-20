@@ -760,10 +760,20 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+	const auto supported = [&] {
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         create.usage, create.flags,
+		                                         &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	// A host can refuse 2D views of the slices of a block-compressed volume, and then views of
+	// its blocks as texels: the image goes without them, and so do views that need them.
+	for (const auto optional: {vk::ImageCreateFlagBits::e2DArrayCompatible,
+	                           vk::ImageCreateFlagBits::eBlockTexelViewCompatible}) {
+		if (supported() || !(create.flags & optional)) continue;
+		create.flags &= ~vk::ImageCreateFlags {optional};
+	}
+	if (!supported()) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),

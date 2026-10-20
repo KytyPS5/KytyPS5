@@ -711,6 +711,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, m_master.AcquireFence(tick));
+		m_master.FenceSubmitted(tick);
 		PerfCounters::Add(PerfCounters::Counter::Submissions);
 		if (result == vk::Result::eSuccess) {
 			graphics.queue_commits.NoteSubmit(m_queue_timeline, tick);

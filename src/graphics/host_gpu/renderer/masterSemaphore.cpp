@@ -61,6 +61,10 @@ vk::Fence MasterSemaphore::AcquireFence(uint64_t tick) {
 	return m_fences.Acquire(tick);
 }
 
+void MasterSemaphore::FenceSubmitted(uint64_t tick) {
+	m_fences.Submitted(tick);
+}
+
 bool MasterSemaphore::IsRetired(uint64_t tick) {
 	return m_fences.IsRetired(tick);
 }

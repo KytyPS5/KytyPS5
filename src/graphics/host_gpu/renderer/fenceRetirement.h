@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 #include <span>
+#include <thread>
 #include <vector>
 
 // Tracks one fence per submission of a queue and tells when a submission has retired: when its
@@ -14,7 +15,9 @@
 // `Ops` supplies the fence calls: Create(), IsSignaled(fence), Reset(span of fences), Wait(fence)
 // and Destroy(fence). Wait may return before the fence is signalled; the state is checked again.
 // Resetting needs exclusive access to a fence, so a fence is reset only while no thread waits on
-// one. Acquire is called by the submitting thread; IsRetired and WaitRetired by any thread.
+// one. Acquire and Submitted are called by the submitting thread, around the submission: the
+// submission writes the fence, so no thread queries or waits on it before Submitted. IsRetired
+// and WaitRetired are called by any thread.
 
 namespace Libs::Graphics {
 
@@ -24,6 +27,9 @@ public:
 	explicit FenceRetirement(Ops ops): m_ops(std::move(ops)) {}
 	~FenceRetirement() {
 		for (const auto& pending: m_pending) {
+			m_ops.Destroy(pending.fence);
+		}
+		for (const auto& pending: m_submitting) {
 			m_ops.Destroy(pending.fence);
 		}
 		for (const auto fence: m_retired) {
@@ -51,8 +57,17 @@ public:
 		} else {
 			fence = m_ops.Create();
 		}
-		m_pending.push_back({tick, fence});
+		m_submitting.push_back({tick, fence});
 		return fence;
+	}
+
+	// The submission with this tick has taken its fence: other threads may now wait on it.
+	void Submitted(uint64_t tick) {
+		std::scoped_lock lock {m_mutex};
+		while (!m_submitting.empty() && m_submitting.front().tick <= tick) {
+			m_pending.push_back(m_submitting.front());
+			m_submitting.pop_front();
+		}
 	}
 
 	[[nodiscard]] bool IsRetired(uint64_t tick) {
@@ -79,11 +94,17 @@ public:
 			{
 				std::scoped_lock lock {m_mutex};
 				if (m_pending.empty()) {
-					// Another thread retired the last fence after our check; check again.
-					continue;
+					// Another thread retired the last fence after our check, or the submission
+					// has not taken its fence yet; check again.
+					oldest = Fence {};
+				} else {
+					oldest = m_pending.front().fence;
+					m_waiters++;
 				}
-				oldest = m_pending.front().fence;
-				m_waiters++;
+			}
+			if (oldest == Fence {}) {
+				std::this_thread::yield();
+				continue;
 			}
 			// Another thread may retire this fence meanwhile. It then stays signalled: no fence
 			// is reset while a thread waits.
@@ -101,7 +122,8 @@ private:
 
 	Ops                   m_ops;
 	std::mutex            m_mutex;
-	std::deque<Pending>   m_pending; // oldest first; one queue completes in order
+	std::deque<Pending>   m_pending;    // oldest first; one queue completes in order
+	std::deque<Pending>   m_submitting; // acquired, not yet taken by their submission
 	std::vector<Fence>    m_retired; // signalled, not yet reset
 	std::vector<Fence>    m_free;
 	uint32_t              m_waiters = 0;

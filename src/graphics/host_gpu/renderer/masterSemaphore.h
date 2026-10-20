@@ -38,6 +38,8 @@ public:
 	//
 	// Every submission passes the fence AcquireFence returns for its tick.
 	[[nodiscard]] vk::Fence AcquireFence(uint64_t tick);
+	// After the submission that took the fence of this tick returns.
+	void FenceSubmitted(uint64_t tick);
 	[[nodiscard]] bool      IsRetired(uint64_t tick);
 	void                    WaitRetired(uint64_t tick);
 

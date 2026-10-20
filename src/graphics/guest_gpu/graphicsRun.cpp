@@ -1243,8 +1243,10 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 	EXIT_IF(size != sizeof(uint32_t) && size != sizeof(uint64_t));
 	const bool queued = QueueReadbacksBeforeLabel();
 	// Priority operations run in FIFO order, so a label queued behind an earlier deferred label
-	// can never become visible before that label's readbacks have landed.
-	if (!queued && m_labels_behind_readbacks->load(std::memory_order_acquire) == 0) {
+	// or an earlier readback (e.g. one queued at a suspend point) can never become visible
+	// before that data has landed.
+	if (!queued && m_labels_behind_readbacks->load(std::memory_order_acquire) == 0 &&
+	    !m_renderer.GetTextureCache().HasReadbacksInFlight()) {
 		return false;
 	}
 	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);

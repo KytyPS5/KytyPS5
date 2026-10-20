@@ -2045,18 +2045,23 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-void TextureCache::ProcessDownloadImages() {
+bool TextureCache::ProcessDownloadImages() {
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
-		return;
+		return false;
 	}
 	std::scoped_lock lock {m_lock};
+	if (m_download_images.empty()) {
+		return false;
+	}
+	bool queued = false;
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);
 		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+			queued |= DownloadImageMemory(id);
 		}
 	}
 	m_download_images.clear();
+	return queued;
 }
 
 } // namespace Libs::Graphics

@@ -303,10 +303,12 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
-	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
-#if defined(__APPLE__)
-	m_ui->checkBox_amd_cpu->setVisible(false);
-#endif
+	// Tri-state: checked = on, unchecked = off, partially checked = auto (default).
+	m_ui->checkBox_amd_cpu->setTristate(true);
+	Qt::CheckState amd_cpu_state = Qt::PartiallyChecked;
+	if (info.amd_cpu_mode == Common::AmdCpuMode::On) amd_cpu_state = Qt::Checked;
+	if (info.amd_cpu_mode == Common::AmdCpuMode::Off) amd_cpu_state = Qt::Unchecked;
+	m_ui->checkBox_amd_cpu->setCheckState(amd_cpu_state);
 #if defined(_WIN32)
 	m_ui->checkBox_red_zone_protection->setChecked(info.red_zone_protection_enabled);
 #else
@@ -491,7 +493,13 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
-	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.amd_cpu_mode              = Common::AmdCpuMode::Auto;
+	if (ui.checkBox_amd_cpu->checkState() == Qt::Checked) {
+		info.amd_cpu_mode = Common::AmdCpuMode::On;
+	}
+	if (ui.checkBox_amd_cpu->checkState() == Qt::Unchecked) {
+		info.amd_cpu_mode = Common::AmdCpuMode::Off;
+	}
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif

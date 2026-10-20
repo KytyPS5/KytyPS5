@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 
 namespace Config {
@@ -109,8 +110,12 @@ bool VrEnabled() {
 	return g_config->vr_enabled;
 }
 
-bool AmdCpuEnabled() {
-	return g_config->amd_cpu_enabled;
+Common::AmdCpuMode GetAmdCpuMode() {
+	return Common::ResolveAmdCpuMode(g_config->amd_cpu_mode, std::getenv("KYTY_AMD_CPU"));
+}
+
+uint32_t GetAmdPatchKinds() {
+	return Common::ResolveAmdPatchKinds(std::getenv("KYTY_AMD_PATCH"), GetAmdCpuMode());
 }
 
 uint32_t GetVblankFrequency() {

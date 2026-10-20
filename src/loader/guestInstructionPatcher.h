@@ -4,6 +4,7 @@
 #ifndef KYTY_LOADER_GUEST_INSTRUCTION_PATCHER_H_
 #define KYTY_LOADER_GUEST_INSTRUCTION_PATCHER_H_
 
+#include "common/amdCpuMode.h"
 #include "common/common.h"
 
 #include <span>
@@ -60,7 +61,8 @@ void UnregisterGuestInstructionPatchModule(void* module_ptr);
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
     bool protect_memory, bool emulate_amd,
-    GuestInstructionHostFeatures host_features = GetGuestInstructionHostFeatures());
+    GuestInstructionHostFeatures host_features = GetGuestInstructionHostFeatures(),
+    uint32_t                     amd_kinds     = Common::AmdPatchAll);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);

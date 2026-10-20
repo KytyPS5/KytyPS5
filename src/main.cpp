@@ -68,7 +68,12 @@ static void PrintUsage() {
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --amd-cpu                            Always apply AMD CPU instruction patches.\n");
+	::printf("  --no-amd-cpu                         Never apply AMD CPU instruction patches.\n");
+	::printf("                                       Default (auto, or KYTY_AMD_CPU=auto|0|1): "
+	         "apply them only when the host\n");
+	::printf("                                       CPU lacks SSE4a, RDPID or CLWB (e.g. under "
+	         "Rosetta).\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -243,7 +248,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 
 		if (arg == "--amd-cpu") {
-			options.config.amd_cpu_enabled = true;
+			options.config.amd_cpu_mode = Common::AmdCpuMode::On;
+			continue;
+		}
+
+		if (arg == "--no-amd-cpu") {
+			options.config.amd_cpu_mode = Common::AmdCpuMode::Off;
 			continue;
 		}
 

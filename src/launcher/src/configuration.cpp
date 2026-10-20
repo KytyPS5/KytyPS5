@@ -33,7 +33,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(printf_output_file);
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
-	KYTY_CFG_SET(amd_cpu_enabled);
+	values.insert(QStringLiteral("amd_cpu_mode"),
+	              QString::fromLatin1(Common::AmdCpuModeName(amd_cpu_mode)));
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -85,7 +86,17 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(printf_output_file);
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
-	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
+	// Settings saved before the mode existed hold a bool: true -> on, false -> auto (the old
+	// default, never a choice).
+	{
+		const QString                   mode_text = s.value("amd_cpu_mode").toString();
+		const std::string               mode_utf8 = mode_text.toStdString();
+		std::optional<std::string_view> mode;
+		if (s.contains("amd_cpu_mode")) mode = mode_utf8;
+		std::optional<bool> legacy;
+		if (s.contains("amd_cpu_enabled")) legacy = s.value("amd_cpu_enabled").toBool();
+		amd_cpu_mode = Common::AmdCpuModeFromStored(mode, legacy);
+	}
 #if defined(_WIN32)
 	red_zone_protection_enabled =
 	    s.value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
@@ -122,18 +133,32 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	};
 	auto values = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		if (!values.contains(it.key())) {
+		// Exports written before amd_cpu_mode existed carry the old bool.
+		const bool legacy_key = it.key() == QStringLiteral("amd_cpu_enabled");
+		if (!legacy_key && !values.contains(it.key())) {
 			return fail(tr("Unknown game setting: %1").arg(it.key()));
 		}
 		if (!it.value().isString()) {
 			return fail(tr("Game setting %1 must be a string.").arg(it.key()));
 		}
+		if (legacy_key && !Common::ParseLegacyAmdCpuEnabled(it.value().toString().toStdString())) {
+			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
+		}
 		values.insert(it.key(), it.value().toString());
+	}
+	// Without a mode in the import the legacy bool decides (true -> on, false -> auto), not the
+	// current mode that GameSettings() put in as the default.
+	if (settings.contains(QStringLiteral("amd_cpu_enabled")) &&
+	    !settings.contains(QStringLiteral("amd_cpu_mode"))) {
+		values.remove(QStringLiteral("amd_cpu_mode"));
 	}
 
 	ReadGameSettingsValues(values);
 	const auto canonical = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+		if (it.key() == QStringLiteral("amd_cpu_enabled")) {
+			continue; // not exported any more, so there is nothing to compare it with
+		}
 		if (canonical.value(it.key()) != values.value(it.key())) {
 			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
 		}

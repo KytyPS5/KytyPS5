@@ -7273,6 +7273,37 @@ public:
                   nullptr,
               "D16 uint sampling did not create an integer sampled view");
 
+      // FC 25 samples the first layer of a four-layer D16 depth target as 16-bit integers.
+      constexpr uint64_t array_raw_d16_offset = raw_d16_offset + 0x2000;
+      auto array_raw_d16 = MakeLinearDesc(
+          base + array_raw_d16_offset, sizeof(uint16_t) * 2 * 4,
+          vk::Format::eD16Unorm, Prospero::BufferFormat::k16UNorm,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 4, sizeof(uint16_t), 1);
+      array_raw_d16.type = BindingType::DepthTarget;
+      array_raw_d16.view_info.format = vk::Format::eD16Unorm;
+      array_raw_d16.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      array_raw_d16.view_info.layer_count = 4;
+      array_raw_d16.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto array_raw_d16_image = texture_cache.FindImage(array_raw_d16);
+      (void)texture_cache.FindDepthTarget(array_raw_d16_image, array_raw_d16);
+
+      auto array_layer_d16_uint = MakeLinearDesc(
+          base + array_raw_d16_offset, sizeof(uint16_t) * 2, vk::Format::eR16Uint,
+          Prospero::BufferFormat::k16UInt, Prospero::ImageType::kColor2D,
+          {2, 1, 1}, 1, sizeof(uint16_t), 1);
+      array_layer_d16_uint.view_info.format = vk::Format::eR16Uint;
+      const auto array_layer_d16_uint_image = texture_cache.FindImage(array_layer_d16_uint);
+      const auto &array_layer_owner = texture_cache.GetImage(array_layer_d16_uint_image);
+      Require(name, "raw D16 uint layer of a depth array",
+              array_layer_d16_uint_image != array_raw_d16_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache, array_raw_d16_image) &&
+                  array_layer_owner.backing.format == vk::Format::eR16Uint &&
+                  array_layer_owner.info.resources.layers == 4 &&
+                  texture_cache.FindTexture(array_layer_d16_uint_image,
+                                            array_layer_d16_uint) != nullptr,
+              "a 16-bit integer view of one depth array layer did not get an integer "
+              "copy of the whole array");
+
       constexpr uint64_t layered_raw_d16_offset = raw_d16_offset + 0x1000;
       constexpr std::array<uint16_t, 12> layered_raw_d16_values{
           0x0102u, 0x0304u, 0x1112u, 0x1314u, 0x2122u, 0x2324u,

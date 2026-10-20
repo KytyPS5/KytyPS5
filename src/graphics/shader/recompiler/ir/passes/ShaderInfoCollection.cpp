@@ -284,6 +284,7 @@ struct InputUsage {
 	}
 };
 
+/// Collect resource and subgroup feature requirements from the shader IR.
 void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs,
            const Inst& inst) {
 	auto& info = program.info;
@@ -516,7 +517,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
-		case ValueOpcode::SubgroupUMinU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupUMinU32:
+		case ValueOpcode::SubgroupUMaxU32:
+		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {

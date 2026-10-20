@@ -30,6 +30,7 @@ namespace {
 	}
 }
 
+/// Choose supported creation flags, falling back for sampled compressed volumes.
 [[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
                                                    const ImageInfo& info) {
 	vk::ImageCreateFlags flags {};
@@ -42,6 +43,24 @@ namespace {
 	}
 	if (info.IsVolume()) {
 		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+	}
+	if (info.IsBlock() && info.IsVolume()) {
+		const auto sampled_usage = vk::ImageUsageFlagBits::eTransferSrc |
+		                           vk::ImageUsageFlagBits::eTransferDst |
+		                           vk::ImageUsageFlagBits::eSampled;
+		// Some drivers reject extended usage for compressed volumes even when
+		// ordinary sampled views are supported. Keep block-view compatibility;
+		// storage support is queried separately using the resulting flags.
+		if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+		                                      vk::ImageTiling::eOptimal, sampled_usage, flags,
+		                                      nullptr) != vk::Result::eSuccess) {
+			const auto sampled_flags = flags & ~vk::ImageCreateFlagBits::eExtendedUsage;
+			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+			                                      vk::ImageTiling::eOptimal, sampled_usage,
+			                                      sampled_flags, nullptr) == vk::Result::eSuccess) {
+				flags = sampled_flags;
+			}
+		}
 	}
 	return flags;
 }

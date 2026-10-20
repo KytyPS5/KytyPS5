@@ -91,7 +91,33 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+/// Zero BDA mappings and fault bits once, before recording their first GPU use.
+void BufferCache::EnsureBdaStorageInitialized() {
+	if (m_bda_storage_initialized) return;
+	// Device-local allocations may contain recycled data. Zero is the missing-page
+	// sentinel; stale addresses must never be interpreted as live mappings.
+	// Do this on first GPU use, since construction has no recording command buffer.
+	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	auto* faults = m_fault_manager.GetFaultBuffer();
+	faults->Fill(0, faults->Size(), 0);
+	m_bda_storage_initialized = true;
+}
+
+/// Return the page table after scheduling its required initial clear.
+Buffer* BufferCache::GetBdaPageTableBuffer() noexcept {
+	EnsureBdaStorageInitialized();
+	return &m_bda_pagetable_buffer;
+}
+
+/// Return the fault bitset after scheduling its required initial clear.
+Buffer* BufferCache::GetFaultBuffer() noexcept {
+	EnsureBdaStorageInitialized();
+	return m_fault_manager.GetFaultBuffer();
+}
+
+/// Initialize BDA storage before publishing a new guest-to-device mapping.
 void BufferCache::Register(BufferId id) {
+	EnsureBdaStorageInitialized();
 	ChangeRegister<true>(id);
 }
 
@@ -686,11 +712,15 @@ void BufferCache::RunGarbageCollector() {
 	}
 }
 
+/// Initialize the fault bitset before scheduling fault collection.
 void BufferCache::ProcessFaultBuffer() {
+	EnsureBdaStorageInitialized();
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+/// Upload pending guest writes only after the BDA storage has been initialized.
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	EnsureBdaStorageInitialized();
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = m_memory_tracker.TakeBdaSync();
 	pending.ForEach([&](uint64_t begin, uint64_t end) {

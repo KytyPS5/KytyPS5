@@ -423,6 +423,7 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	return true;
 }
 
+/// Recover a dword jump table, allowing its omitted load to reuse the selector register.
 bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_index,
                                 SetpcTargetInfo& info) {
 	if (setpc_index < 3u || setpc_index >= program.instructions.size()) {
@@ -471,7 +472,9 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 		return false;
 	}
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	// The table load is omitted during translation, preserving its input selector
+	// even when the guest load overwrites that same register with the table entry.
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}

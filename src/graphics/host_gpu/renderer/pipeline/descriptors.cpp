@@ -474,6 +474,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+/// Decode a guest texture descriptor and normalize its selected mip view before lookup.
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -590,6 +591,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 	} else {
 		desc.info.UpdateSize();
+	}
+	if (!desc.info.NormalizeMipView(view_base, view_levels)) {
+		EXIT("unsupported guest mip view: base=%u count=%u extent=%ux%ux%u\n",
+		     view_base, view_levels, width, height, volume ? depth : 1u);
 	}
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||

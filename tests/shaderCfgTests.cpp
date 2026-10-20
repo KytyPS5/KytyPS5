@@ -1297,6 +1297,54 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+/// Check that extra guest mip views preserve original offsets, array strides and tail layout.
+void TestOversizedGuestMipViews() {
+  for (uint32_t layers : {1u, 2u}) {
+    ImageInfo physical{};
+    physical.data.address = 0x12f4f48000;
+    physical.pixel_format = vk::Format::eR32G32B32A32Uint;
+    physical.guest_format = Prospero::BufferFormat::k32_32_32_32UInt;
+    physical.extent = {64, 64, 1};
+    physical.resources = {9, layers};
+    physical.tile_mode = Prospero::TileMode::kStandard4KB;
+    physical.UpdateSize();
+    for (uint32_t selected : {0u, 6u, 7u, 8u}) {
+      auto view = physical;
+      auto base = selected;
+      Check(view.NormalizeMipView(base, 1), "extra guest mip could not be represented");
+      const auto first = selected < 7 ? 0u : selected;
+      Check(base == selected - first && view.guest_base_mip == first &&
+                view.guest_mip_levels == 9 &&
+                view.resources.levels == (first == 0 ? 7u : 1u),
+            "guest mip view was incorrectly rebased");
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        Check(view.data.address == physical.data.address &&
+                  view.data.size == physical.data.size &&
+                  view.tiled_slice_stride == physical.tiled_slice_stride,
+              "rebased guest mip changed allocation or array stride");
+        for (uint32_t level = 0; level < view.resources.levels; ++level) {
+          Check(view.mip_layout[level] == physical.mip_layout[first + level] &&
+                    view.MipExtent(level) == physical.MipExtent(first + level) &&
+                    (level >= view.first_tail_level) ==
+                        (first + level >= physical.first_tail_level),
+                "rebased mip lost original offsets, extent or tail coordinates");
+        }
+        for (const auto& copy : view.BufferCopies()) {
+          Check(copy.imageSubresource.mipLevel < view.resources.levels &&
+                    copy.bufferOffset < view.LinearSize(),
+                "rebased upload references an invalid mip or staging offset");
+        }
+        view.UpdateSize();
+      }
+    }
+    auto invalid = physical;
+    uint32_t base = 7;
+    Check(!invalid.NormalizeMipView(base, 2) && base == 7 &&
+              invalid.resources.levels == 9 && invalid.guest_mip_levels == 0,
+          "unrepresentable multi-mip view was silently truncated");
+  }
+}
+
 void TestRebasedTextureMipViews() {
   constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
   constexpr auto tile = Prospero::TileMode::kStandard4KB;
@@ -11801,7 +11849,9 @@ void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
         "unreachable S_SETPC metadata suppressed a reachable scalar load component");
 }
 
-void TestNewShaderRecompilerSetpcDwordJumpTable() {
+/// Compile dword jump tables with separate or reused selector and load-result registers.
+void TestNewShaderRecompilerSetpcDwordJumpTable(bool reuse_selector) {
+  const uint32_t offset_reg = reuse_selector ? 106u : 6u;
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),             // skip one unreachable block
       EncodeSMovB32(100, 129),         // unreachable
@@ -11811,10 +11861,10 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
       EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
       0x00000034u,
       EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
-      EncodeSmem0(0x00, 6, 2),
-      (106u << 25u) | 4u,          // s_load_dword s6, s[4:5], vcc_lo offset:4
+      EncodeSmem0(0x00, offset_reg, 2),
+      (106u << 25u) | 4u,          // load into s6 or overwrite the selector vcc_lo
       EncodeSopp(0x0c, 0),         // s_waitcnt 0
-      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
+      EncodeSop2(0x01, 4, 4, offset_reg), // subtract the loaded table entry
       EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
       EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
       EncodeSMovB32(1, 129),       // case 0
@@ -16631,6 +16681,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
+/// Run shader decoding, control-flow, image-layout and SPIR-V construction regressions.
 int main() {
   using namespace Libs::Graphics;
 
@@ -16641,6 +16692,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestOversizedGuestMipViews();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
@@ -16768,7 +16820,8 @@ int main() {
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTable(false);
+  TestNewShaderRecompilerSetpcDwordJumpTable(true);
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();

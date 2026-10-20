@@ -674,7 +674,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
-	// PPSA04264
+	// PPSA04264. EA SPORTS FC 25 (PPSA20049) reads a depth target with HTILE so: the copy keeps
+	// the depth values, and the depth target gets its metadata back when it is bound again.
 	const bool raw_d16_texture =
 	    binding == BindingType::Texture && cached.info.IsDepth() &&
 	    cached.info.guest_format == Prospero::BufferFormat::k16UNorm &&
@@ -684,7 +685,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
+	    (cached.info.metadata.kind == ImageMetadataKind::None ||
+	     cached.info.metadata.kind == ImageMetadataKind::Htile);
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.

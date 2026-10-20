@@ -367,8 +367,14 @@ list(APPEND check_headers
 	${KYTY_SOURCE_DIR}
 )
 
+# Optional extra arguments <replaced source> <replacement> build a mutation test with one emulator source swapped.
 function(add_kyty_full_emulator_test target source)
-	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+	set(emulator_sources ${kyty_emulator_src})
+	if(ARGC EQUAL 4)
+		list(REMOVE_ITEM emulator_sources "${ARGV2}")
+		list(APPEND emulator_sources "${ARGV3}")
+	endif()
+	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${emulator_sources})
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
@@ -394,6 +400,8 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+include("${KYTY_TESTS_DIR}/PerVertexVsStoreMutants.cmake")
+include("${KYTY_TESTS_DIR}/PerVertexVsStoreGpu.cmake")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -627,6 +635,26 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	# The mutants abort (Check -> abort), which ctest counts as a crash even with WILL_FAIL: require the failure message.
+	if(NOT WIN32)
+		add_test(NAME shader_cfg_pv_vsstore_mutant_first_third
+		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_first_third_tests> 2>&1 | grep -q 'first/third swapped'")
+		add_test(NAME shader_cfg_pv_vsstore_mutant_stride_dword
+		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_stride_dword_tests> 2>&1 | grep -q 'not read from push dword 7'")
+		add_test(NAME shader_cfg_pv_vsstore_mutant_capability_geometry
+		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_capability_geometry_tests> 2>&1 | grep -q 'PS needs the Geometry capability'")
+		add_test(NAME shader_cfg_pv_vsstore_mutant_location31_exit
+		         COMMAND sh -c "$<TARGET_FILE:shader_cfg_pv_vsstore_mutant_location31_exit_tests> 2>&1 | grep -q 'spirvEmitterPvStore.cpp'")
+	endif()
+	add_test(NAME per_vertex_vsstore COMMAND $<TARGET_FILE:per_vertex_vsstore_tests>)
+	foreach(mutant IN LISTS KYTY_PV_HEADER_MUTANTS)
+		add_test(NAME per_vertex_vsstore_mutant_${mutant} COMMAND $<TARGET_FILE:per_vertex_vsstore_mutant_${mutant}_tests>)
+		set_tests_properties(per_vertex_vsstore_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
+	endforeach()
+	foreach(mutant IN ITEMS no_clamp no_tail_check)
+		add_test(NAME per_vertex_vsstore_test_mutant_${mutant} COMMAND $<TARGET_FILE:per_vertex_vsstore_test_mutant_${mutant}_tests>)
+		set_tests_properties(per_vertex_vsstore_test_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
+	endforeach()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -705,6 +733,13 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		shader_cfg_pv_vsstore_mutant_first_third_tests
+		shader_cfg_pv_vsstore_mutant_stride_dword_tests
+		shader_cfg_pv_vsstore_mutant_capability_geometry_tests
+		shader_cfg_pv_vsstore_mutant_location31_exit_tests
+		per_vertex_vsstore_tests
+		per_vertex_vsstore_test_mutant_no_clamp_tests
+		per_vertex_vsstore_test_mutant_no_tail_check_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
@@ -735,6 +770,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	foreach(mutant IN LISTS KYTY_PV_HEADER_MUTANTS)
+		add_dependencies(kyty_tests per_vertex_vsstore_mutant_${mutant}_tests)
+	endforeach()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

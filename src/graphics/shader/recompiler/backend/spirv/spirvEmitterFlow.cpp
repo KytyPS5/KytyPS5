@@ -163,13 +163,18 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	const auto* input = InputBindingForParameter(state, attr);
-	if (input == nullptr || input->variable_id == 0) {
+	const bool  pv_store_input = state.pv_store != nullptr && input != nullptr &&
+	                             input->per_vertex && state.program.stage == ShaderType::Pixel;
+	if (input == nullptr || (input->variable_id == 0 && !pv_store_input)) {
 		return ConstantU32(state, 0);
 	}
 	if (state.program.stage == ShaderType::Vertex || state.program.stage == ShaderType::Local) {
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
 	}
 	const auto load_per_vertex = [&](uint32_t vertex) {
+		if (pv_store_input) {
+			return EmitPvLoadCorner(state, PixelParameterLocation(state, attr), vertex, chan & 3u);
+		}
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		state.builder.AddFunction(
@@ -231,6 +236,9 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 		return EmitAttribute(ctx.state, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {
+		if (state.pv_store != nullptr) {
+			return EmitPvLoadCorner(state, PixelParameterLocation(state, attr), vertex, chan & 3u);
+		}
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		state.builder.AddFunction(
@@ -636,6 +644,15 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+			if (state.pv_store != nullptr && exp.kind == IR::ExportTargetKind::Parameter) {
+				const auto output =
+				    std::ranges::find_if(state.outputs, [&](const OutputBinding& binding) {
+					    return binding.kind == IR::StageOutputKind::Parameter &&
+					           binding.index == exp.index;
+				    });
+				if (output != state.outputs.end())
+					EmitPvStoreParameter(state, output->location, value);
+			}
 		}
 	});
 }

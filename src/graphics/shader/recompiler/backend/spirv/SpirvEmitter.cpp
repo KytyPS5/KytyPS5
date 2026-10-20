@@ -205,7 +205,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, bool maintenance8_enabled,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info, const PvStoreInfo* pv_store) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -221,6 +221,14 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, maintenance8_enabled);
+	state.pv_store = pv_store;
+	if (pv_store != nullptr) {
+		const bool vertex = pv_store->role == PvStoreInfo::Role::Vertex;
+		if (program.stage != (vertex ? ShaderType::Vertex : ShaderType::Pixel) ||
+		    (vertex ? input_info.vertex == nullptr : input_info.pixel == nullptr)) {
+			Fail(program, "invalid PerVertex VS-store stage or record layout");
+		}
+	}
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",

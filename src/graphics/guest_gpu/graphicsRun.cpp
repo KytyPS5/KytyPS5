@@ -1099,12 +1099,11 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
-					const bool queued = QueueReadbacksBeforeLabel();
+					(void)QueueReadbacksBeforeLabel();
 					SynchronizeGpu();
-					if (queued) {
-						// SynchronizeGpu() waits for the GPU; also wait for the readback copies.
-						GetScheduler().DrainPriorityOperations();
-					}
+					// SynchronizeGpu() waits for the GPU but not for priority callbacks: wait for
+					// readback copies and deferred labels queued by this or earlier EOPs.
+					GetScheduler().DrainPriorityOperations();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					if (with_interrupt) {

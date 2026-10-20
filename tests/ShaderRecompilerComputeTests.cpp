@@ -43684,6 +43684,7 @@ void CheckShaderCacheRecordPadding() {
     pixel.object_primitive_id = true;
     pixel.target_packed_unorm_mask = 0x5;
     pixel.target_round_mode = 0x4;
+    pixel.lds_size_dwords = 256;
     ShaderPixelInputInfo decoded{};
     const auto key = [](const ShaderPixelInputInfo &info) {
       std::vector<u32> words;
@@ -43694,6 +43695,21 @@ void CheckShaderCacheRecordPadding() {
             DecodeShaderCacheInput(EncodeShaderCacheInput(pixel), decoded) &&
                 key(decoded) == key(pixel),
             "a pixel input field of the program key was lost in its record");
+  }
+  {
+    // The GS LDS size a vertex program is keyed on survives the record.
+    ShaderVertexInputInfo vertex{};
+    vertex.lds_size_dwords = 512;
+    ShaderVertexInputInfo decoded{};
+    const auto key = [](const ShaderVertexInputInfo &info) {
+      std::vector<u32> words;
+      BuildStageStaticKey(info, words);
+      return words;
+    };
+    Require(name, "vertex key",
+            DecodeShaderCacheInput(EncodeShaderCacheInput(vertex), decoded) &&
+                key(decoded) == key(vertex),
+            "a vertex input field of the program key was lost in its record");
   }
   ShaderComputeInputInfo decoded{};
   auto encoded = recipes[0]->input;

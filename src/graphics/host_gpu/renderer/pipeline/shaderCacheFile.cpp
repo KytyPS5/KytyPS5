@@ -158,6 +158,7 @@ void VisitInput(Info& info, F& field) {
 		field(info.buffers_num);
 		field(info.wave_size);
 		field(info.scratch_size_dwords);
+		field(info.lds_size_dwords);
 		field(info.pa_cl_vs_out_cntl);
 		Each(info.clip_space.scale, field);
 		Each(info.clip_space.offset, field);
@@ -197,6 +198,7 @@ void VisitInput(Info& info, F& field) {
 		field(info.target_packed_unorm_mask);
 		field(info.target_round_mode);
 		field(info.scratch_size_dwords);
+		field(info.lds_size_dwords);
 		field(info.ps_pos_x);
 		field(info.ps_pos_y);
 		field(info.ps_pos_z);

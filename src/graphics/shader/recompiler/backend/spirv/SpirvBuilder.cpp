@@ -160,6 +160,14 @@ void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_
 	AppendInstruction(m_entry_points, spv::OpEntryPoint, operands);
 }
 
+uint32_t Builder::AddString(const char* text) {
+	const auto id = AllocateId();
+	std::vector<uint32_t> operands = {id};
+	AppendString(operands, text);
+	AppendInstruction(m_debug, spv::OpString, operands);
+	return id;
+}
+
 void Builder::AddName(uint32_t target, const char* name) {
 	std::vector<uint32_t> operands = {target};
 	AppendString(operands, name);

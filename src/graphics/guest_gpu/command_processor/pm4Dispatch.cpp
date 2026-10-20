@@ -231,7 +231,6 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_WAIT_FLIP_DONE] = CpOpWaitFlipDone;
 	g_cp_op_custom_func[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
 	g_cp_op_custom_func[Pm4::R_POP_MARKER]     = CpOpPopMarker;
-	g_cp_op_custom_func[Pm4::R_ACQUIRE_MEM]    = CpOpAcquireMem;
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;

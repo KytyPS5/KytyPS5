@@ -17,7 +17,6 @@ enum class Vop2SdwaProfile {
 	IntegerFullDestination,
 	IntegerPartialDestination,
 	ReverseRightShift,
-	ReverseLogicalLeft,
 	Bitwise,
 	Count,
 };
@@ -48,7 +47,7 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x17u, Opcode::V_ASHR_I32},
     {0x18u, Opcode::V_ASHRREV_I32, Vop2SdwaProfile::ReverseRightShift},
     {0x19u, Opcode::V_LSHL_B32},
-    {0x1au, Opcode::V_LSHLREV_B32, Vop2SdwaProfile::ReverseLogicalLeft},
+    {0x1au, Opcode::V_LSHLREV_B32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x1bu, Opcode::V_AND_B32, Vop2SdwaProfile::Bitwise},
     {0x1cu, Opcode::V_OR_B32, Vop2SdwaProfile::Bitwise},
     {0x1du, Opcode::V_XOR_B32, Vop2SdwaProfile::Bitwise},
@@ -1040,7 +1039,6 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, true},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     // Bitwise: WriteRawU32 inserts a byte or word destination like any other partial write.
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},

@@ -85,6 +85,7 @@ private:
 	QString                       m_settings_file;
 	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
+	QString                       m_addons_dir;
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;

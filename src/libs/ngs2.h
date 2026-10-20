@@ -40,6 +40,8 @@ int KYTY_SYSV_ABI Ngs2SystemCreate(const Ngs2SystemOption*      option,
 /// Retrieves information about a system.
 int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* info,
                                     size_t info_size);
+int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle);
+int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle);
 /// Sets the number of samples processed in each render grain.
 int KYTY_SYSV_ABI Ngs2SystemSetGrainSamples(uintptr_t system_handle, uint32_t num_samples);
 /// Reports the context-buffer size and alignment required by a rack option.

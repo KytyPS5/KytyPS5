@@ -185,6 +185,7 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
     {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
     {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
+    {0x4cu, Opcode::IMAGE_GATHER4_C_L, ImageSampleFlagCompare | ImageSampleFlagLod},
     {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero},
     {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
@@ -194,6 +195,9 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
+    {0xc8u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare | ImageSampleFlagAdjust},
+    {0xd8u, Opcode::IMAGE_GATHER4_C_O,
+     ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust},
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
@@ -350,6 +354,9 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;
+	}
+	if ((sample != nullptr || gather != nullptr) && (word0 & (1u << 12u)) != 0u) {
+		inst.image_sample_flags |= ImageSampleFlagUnnormalized;
 	}
 	inst.image_dimension  = dimension;
 	inst.image_r128       = r128;

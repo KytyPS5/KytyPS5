@@ -21,11 +21,11 @@ constexpr qint64 MAX_METADATA_SIZE = 2 * 1024 * 1024;
 
 QString LauncherRelativePath() {
 #if defined(_WIN32)
-	return QStringLiteral("launcher.exe");
+	return QStringLiteral("kyty_launcher.exe");
 #elif defined(__APPLE__)
 	return QStringLiteral("KytyPS5.app/Contents/MacOS/KytyPS5");
 #else
-	return QStringLiteral("launcher");
+	return QStringLiteral("kyty_launcher");
 #endif
 }
 

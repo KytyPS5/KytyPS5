@@ -164,9 +164,23 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	switch (inst.opcode) {
 		case Opcode::S_SWAPPC_B64:
 			inst.branch_target = UINT32_MAX;
-			inst.data_dwords = 2;
+			[[fallthrough]];
+		case Opcode::S_MOV_B64:
+		case Opcode::S_CMOV_B64:
+		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B64:
+		case Opcode::S_BREV_B64:
+		case Opcode::S_BITSET0_B64:
+		case Opcode::S_BITSET1_B64:
+		case Opcode::S_AND_SAVEEXEC_B64:
+		case Opcode::S_ORN2_SAVEEXEC_B64:
+		case Opcode::S_QUADMASK_B64:
+		case Opcode::S_ANDN1_SAVEEXEC_B64:
+		case Opcode::S_BITREPLICATE_B64_B32:
+			inst.data_dwords = 2u;
 			break;
 		case Opcode::S_GETPC_B64:
+			inst.data_dwords = 2u;
 			inst.src_count = 0;
 			DecodeScalarDestination(sdst, pc, inst.dst);
 			return;
@@ -206,6 +220,8 @@ void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
+	if (opcode == 0x0bu || (opcode >= 0x0fu && opcode <= 0x25u && (opcode & 1u)) || opcode == 0x29u)
+		inst.data_dwords = 2u;
 }
 
 void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,

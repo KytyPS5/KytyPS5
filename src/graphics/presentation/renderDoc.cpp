@@ -162,7 +162,8 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {
-		LOGF("RenderDoc: captured guest flip %u/2\n", ++g_captured_flips);
+		++g_captured_flips;
+		LOGF("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
 		if (g_captured_flips < 2) {
 			return;
 		}

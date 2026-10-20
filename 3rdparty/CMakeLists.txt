@@ -25,6 +25,23 @@ FetchContent_MakeAvailable(opus)
 set(BUILD_TESTING "${kyty_build_testing_saved}")
 install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
 
+# Headsets are driven through OpenXR. Only the static loader is built; the runtime that serves it
+# (for example SteamVR, Monado or Virtual Desktop) comes from the user's system.
+set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(openxr
+	GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
+	GIT_TAG f2448a8797c85814aa892efc1ab8707900fbcc78 # release-1.1.63
+	GIT_SHALLOW FALSE)
+FetchContent_MakeAvailable(openxr)
+# Keep the loader's headers and library out of the installed package.
+set_property(DIRECTORY "${openxr_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+# The loader uses exceptions internally.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(openxr_loader PRIVATE -fexceptions)
+endif()
+install(FILES "${openxr_SOURCE_DIR}/LICENSE" DESTINATION "licenses/openxr")
+
 # The guest instruction patcher needs a decoder/encoder and a small
 # trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)

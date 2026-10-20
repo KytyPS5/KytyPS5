@@ -47,26 +47,17 @@ void ValidateOptions(const Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::TessellationControl:
 		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh:
-			if (input_info.vertex == nullptr) {
-				return Fail("vertex shader has no input metadata");
-			}
 			if (input_info.vertex->resources_num < 0 ||
 			    input_info.vertex->resources_num > ShaderVertexInputInfo::RES_MAX) {
 				return Fail("vertex resource count is out of range");
 			}
 			return;
 		case ShaderType::Pixel:
-			if (input_info.pixel == nullptr) {
-				return Fail("pixel shader has no input metadata");
-			}
 			if (input_info.pixel->input_num > std::size(input_info.pixel->interpolator_settings)) {
 				return Fail("pixel input count is out of range");
 			}
 			return;
 		case ShaderType::Compute:
-			if (input_info.compute == nullptr) {
-				return Fail("compute shader has no input metadata");
-			}
 			if (input_info.compute->thread_ids_num < 0 || input_info.compute->thread_ids_num > 3) {
 				return Fail("compute thread ID count is out of range");
 			}
@@ -191,7 +182,7 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 
 void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
                    ShaderInfo& info, const Inst& inst) {
-	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	const bool alpha_remap = program.stage == ShaderType::Pixel &&
 	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
 	const auto& export_info = program.export_info[inst.Flags<ExportFlags>().index];
 	if (export_info.kind == ExportTargetKind::MrtZ) {
@@ -308,15 +299,15 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.uses_lds |= kind == ResourceKind::Lds;
 				info.uses_gds |= kind == ResourceKind::Gds;
 			} else if (kind == ResourceKind::Buffer || kind == ResourceKind::ScalarBuffer) {
-				if (memory.resource >= info.buffers.size() || memory.resource >= ShaderInfo::MaxBuffers) {
+				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
-				info.live_buffers |= uint64_t{1} << memory.resource;
+				info.buffers[memory.resource].live = true;
 				for (const auto child: info.buffers[memory.resource].indirect_resources) {
 					if (child >= info.buffers.size()) {
 						return Fail("indirect buffer operation has invalid resource metadata");
 					}
-					info.live_buffers |= uint64_t{1} << child;
+					info.buffers[child].live = true;
 				}
 			}
 		}
@@ -340,12 +331,20 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
+				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
-				const auto bits = StorageBufferElementBits(program, memory);
-				info.buffer_u8 |= bits == 8u;
-				info.buffer_u16 |= bits == 16u;
+				const auto collect_element = [&](uint32_t resource) {
+					auto selected = memory;
+					selected.resource = resource;
+					const auto bits = StorageBufferElementBits(program, selected);
+					info.buffer_u8 |= bits == 8u;
+					info.buffer_u16 |= bits == 16u;
+				};
+				collect_element(memory.resource);
+				for (const auto child: info.buffers[memory.resource].indirect_resources)
+					collect_element(child);
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 					if (program.stage != ShaderType::Compute) {
 						return Fail("buffer ADD_TID is only valid for compute shaders");
@@ -501,12 +500,14 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
+		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
 		case ValueOpcode::ConditionRef:
-			info.subgroup_ballot |=
+			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
+		case ValueOpcode::SubgroupUMinU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -558,16 +559,14 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	ValidateOptions(program, input_info);
 	auto& info = program.info;
-	if (info.buffers.size() > ShaderInfo::MaxBuffers) {
-		return Fail("buffer resource limit exceeded");
-	}
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
-	info.live_buffers = 0;
+	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
-	info.bvh = info.subgroup_ballot = info.subgroup_barrier = info.subgroup_shuffle =
+	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	    info.subgroup_shuffle = info.subgroup_arithmetic =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
@@ -593,6 +592,15 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel:
 			CollectPixelInputs(input_info.pixel, info, inputs.per_vertex, inputs.components);
+			if (input_info.pixel->object_primitive_id) {
+				if (std::ranges::any_of(info.outputs, [](const StageOutput& output) {
+					    return output.kind == StageOutputKind::Mrt && output.location == 7u;
+				    })) {
+					return Fail("explicit MRT7 export overlaps automatic object/primitive ID");
+				}
+				AddBuiltinInput(info, StageInputKind::PrimitiveId);
+				AddOutput(info, StageOutputKind::ObjectPrimitiveId, 0, 7, "out_object_primitive_id");
+			}
 			break;
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, info); break;
 		default: return Fail("unsupported shader stage for info collection");

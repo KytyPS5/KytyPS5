@@ -72,7 +72,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
+	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
+	if (approximate_eqaa) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
+		}
+	}
+	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments && !approximate_eqaa)) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
@@ -220,8 +229,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
 	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
-	                            rt.cmask.addr != 0 && samples == 1 &&
-	                            !rt.info.fmask_compression_enable &&
+	                            rt.cmask.addr != 0 &&
 	                            !rt.attrib3.write_vrs_rate_hint_to_cmask;
 	if (has_dcc || has_cmask) {
 		TileSizeAlign metadata_size {};
@@ -233,10 +241,11 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		} else {
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
 		}
-		// DCC owns the clear when both planes are enabled; single-sample CMASK stays expanded.
+		// DCC owns the clear when both planes are enabled.
 		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
 		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
-		desc.info.metadata.clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.clear_word =
+		    rt.clear_word0.word0 | (uint64_t {rt.clear_word1.word1} << 32u);
 		desc.info.metadata.clear_register_valid = true;
 	}
 	desc.view_info.format = target_format.format;

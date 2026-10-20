@@ -28,6 +28,46 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+template <typename Regions, typename Region, typename Gap>
+static void ForEachSparseRange(const Regions& regions, uint64_t vaddr, uint64_t size,
+                               Region&& region, Gap&& gap) {
+	const auto end     = vaddr + size;
+	auto       mapping = regions.lower_bound(vaddr);
+	if (mapping != regions.begin()) {
+		auto previous = std::prev(mapping);
+		if (previous->second.vaddr + previous->second.size > vaddr) {
+			mapping = previous;
+		}
+	}
+
+	auto cursor = vaddr;
+	for (; mapping != regions.end() && mapping->second.vaddr < end; ++mapping) {
+		const auto& entry = mapping->second;
+		const auto  start = std::max(vaddr, entry.vaddr);
+		const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
+		if (cursor < start) {
+			gap(cursor, start - cursor);
+		}
+		region(entry, start, bytes);
+		cursor = start + bytes;
+	}
+	if (cursor < end) {
+		gap(cursor, end - cursor);
+	}
+}
+
+template <typename Regions, typename Source, typename Gap>
+static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, uint64_t size,
+                            Source&& source, Gap&& gap) {
+	auto* destination = static_cast<uint8_t*>(data);
+	ForEachSparseRange(
+	    regions, vaddr, size,
+	    [&](const auto& entry, uint64_t start, uint64_t bytes) {
+		    std::memcpy(destination + (start - vaddr), source(entry, start), bytes);
+	    },
+	    [&](uint64_t start, uint64_t bytes) { gap(start, destination + (start - vaddr), bytes); });
+}
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -171,36 +211,16 @@ public:
 			return false;
 		}
 
+		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
-		const auto      end   = vaddr + size;
-		auto            first = m_maps.upper_bound(vaddr);
-		if (first == m_maps.begin()) {
-			return false;
-		}
-		--first;
-		auto current = vaddr;
-		for (auto mapping = first; current < end; ++mapping) {
-			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
-			    current >= mapping->second.vaddr + mapping->second.size) {
-				return false;
-			}
-			const auto& entry = mapping->second;
-			const auto  bytes = std::min(end, entry.vaddr + entry.size) - current;
-			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
-				return false;
-			}
-			current += bytes;
-		}
-
-		const auto* source = static_cast<const uint8_t*>(data);
-		current = vaddr;
-		for (auto mapping = first; current < end; ++mapping) {
-			const auto& entry  = mapping->second;
-			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
-			const auto  offset = entry.backing_offset + current - entry.vaddr;
-			std::memcpy(m_backing_base + offset, source + (current - vaddr), bytes);
-			current += bytes;
-		}
+		const auto*     source = static_cast<const uint8_t*>(data);
+		ForEachSparseRange(
+		    m_maps, vaddr, size,
+		    [&](const auto& entry, uint64_t start, uint64_t bytes) {
+			    std::memcpy(m_backing_base + (entry.backing_offset + start - entry.vaddr),
+			                source + (start - vaddr), bytes);
+		    },
+		    [](uint64_t, uint64_t) {});
 		return true;
 	}
 
@@ -247,7 +267,8 @@ public:
 		return true;
 	}
 
-	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+	template <typename Gap>
+	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -258,31 +279,11 @@ public:
 			g_test_backing_read(vaddr, size);
 		}
 #endif
-		const auto end     = vaddr + size;
-		auto       mapping = m_maps.lower_bound(vaddr);
-		if (mapping != m_maps.begin()) {
-			auto previous = std::prev(mapping);
-			if (previous->second.vaddr + previous->second.size > vaddr) {
-				mapping = previous;
-			}
-		}
-
-		auto* destination = static_cast<uint8_t*>(data);
-		auto  cursor      = vaddr;
-		for (; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
-			const auto& entry  = mapping->second;
-			const auto  start  = std::max(vaddr, entry.vaddr);
-			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
-			const auto  offset = entry.backing_offset + start - entry.vaddr;
-			if (cursor < start) {
-				std::memset(destination + (cursor - vaddr), 0, start - cursor);
-			}
-			std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
-			cursor = start + bytes;
-		}
-		if (cursor < end) {
-			std::memset(destination + (cursor - vaddr), 0, end - cursor);
-		}
+		CopySparseRange(m_maps, vaddr, data, size,
+		                [this](const auto& entry, uint64_t start) {
+			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
+		                },
+		                gap);
 		return true;
 	}
 
@@ -765,30 +766,48 @@ public:
 		});
 	}
 
+	// Writes the backed bytes of a range that holds no private mappings.
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-		return m_backing->TryWriteBacking(vaddr, data, size);
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) &&
+		       m_backing->TryWriteBacking(vaddr, data, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
-	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
-		if (!Owns(vaddr, size)) {
+	template <bool copy_private>
+	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
-		auto            mapping = m_mapped.upper_bound(vaddr);
-		if (mapping != m_mapped.begin()) {
-			--mapping;
-		}
-		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
-			const auto& region = mapping->second;
-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+		if constexpr (!copy_private) {
+			if (OverlapsPrivateUnlocked(vaddr, size)) {
 				return false;
 			}
 		}
-		return m_backing->TryReadSparseBacking(vaddr, data, size);
+		return m_backing->TryReadSparseBacking(
+		    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
+			    const auto zero = [](uint64_t, uint8_t* output, uint64_t length) {
+				    std::memset(output, 0, length);
+			    };
+			    if constexpr (copy_private) {
+				    // Backing gaps can contain private mappings or reservations only.
+				    CopySparseRange(m_mapped, start, destination, bytes,
+				                    [](const auto& region, uint64_t address) {
+					                    EXIT_IF(region.type != MappingType::Private);
+					                    return reinterpret_cast<const void*>(address);
+				                    },
+				                    zero);
+			    } else {
+				    zero(start, destination, bytes);
+			    }
+		    });
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
@@ -1080,6 +1099,20 @@ private:
 			current = std::min(end, it->second.vaddr + it->second.size);
 		}
 		return true;
+	}
+
+	[[nodiscard]] bool OverlapsPrivateUnlocked(uint64_t vaddr, uint64_t size) const {
+		auto mapping = m_mapped.upper_bound(vaddr);
+		if (mapping != m_mapped.begin()) {
+			--mapping;
+		}
+		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
+			const auto& region = mapping->second;
+			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {

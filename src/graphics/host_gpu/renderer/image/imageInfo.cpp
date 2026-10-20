@@ -21,6 +21,53 @@ bool IsDepthPlane(const ImageInfo& info) {
 	        info.tile_mode == Prospero::TileMode::kLinear);
 }
 
+GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
+	const auto& block = info.tiling.block;
+	if (info.tile_mode != Prospero::TileMode::kStandard4KB ||
+	    block.family != TileBlockFamily::Standard4KB || info.IsVolume() || info.samples != 1 ||
+	    info.HasMetadata() || level >= info.resources.levels || level >= info.mip_layout.size() ||
+	    info.tiling.texel_width == 0 || info.tiling.texel_height == 0) {
+		return {};
+	}
+	const auto extent = info.MipExtent(level);
+	const auto width  = (extent.width + info.tiling.texel_width - 1u) / info.tiling.texel_width;
+	const auto height = (extent.height + info.tiling.texel_height - 1u) / info.tiling.texel_height;
+	const auto& mip   = info.mip_layout[level];
+	uint32_t last = 0, origin = 0;
+	if (!std::has_single_bit(width) || !std::has_single_bit(height) ||
+	    width > block.block_width || height > block.block_height ||
+	    mip.tail_x > block.block_width - width || mip.tail_y > block.block_height - height ||
+	    mip.tail_x % width != 0 || mip.tail_y % height != 0 ||
+	    !TileGetBlockOffset(block, width - 1u, height - 1u, 0, last) ||
+	    !TileGetBlockOffset(block, mip.tail_x, mip.tail_y, 0, origin)) {
+		return {};
+	}
+	// Standard4KB interleaves monotonically ordered X/Y bits, so the last
+	// corner bounds every active texel. Tiling preserves any holes in this span.
+	const uint64_t size = uint64_t {last} + block.bytes_per_element;
+	if ((origin & (std::bit_ceil(size) - 1u)) != 0 || size > block.block_size - origin ||
+	    mip.offset > UINT64_MAX - origin) {
+		return {};
+	}
+	return {mip.offset + origin, size};
+}
+
+uint32_t CompactMipSize(const ImageInfo& info) {
+	if (info.resources.levels != 1 || info.resources.layers != 1) {
+		return 0;
+	}
+	const auto range = TiledMipRange(info, 0);
+	if (range.size == 0 || range.size % 4 != 0 || range.address != 0) {
+		return 0;
+	}
+	const auto alignment = std::max<uint64_t>(256, std::bit_ceil(range.size));
+	const auto in_block  = info.data.address & (info.tiling.block.block_size - 1u);
+	return (info.data.address & (alignment - 1u)) == 0 &&
+	               range.size <= info.tiling.block.block_size - in_block
+	           ? static_cast<uint32_t>(range.size)
+	           : 0;
+}
+
 } // namespace
 
 vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
@@ -34,6 +81,7 @@ void ImageInfo::UpdateSize() {
 	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
 	        resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
 	        !std::has_single_bit(samples));
+	const bool auto_size = data.size == 0;
 	TileTextureElementLayout element {};
 	EXIT_NOT_IMPLEMENTED(!TileGetTextureElementLayout(guest_format, element));
 	if (bytes_per_block == 0) {
@@ -164,7 +212,84 @@ void ImageInfo::UpdateSize() {
 			linear_offset     = Add(mip.linear_offset, Multiply(mip.linear_size, active.depth));
 			mip_pitch         = std::max(mip_pitch >> 1u, 1u);
 		}
+		const auto compact_size = CompactMipSize(*this);
+		if (compact_size != 0 && (auto_size || data.size == compact_size)) {
+			data.size = mip_layout[0].size = compact_size;
+		}
 	}
+}
+
+uint32_t ImageInfo::DataAlignment() const {
+	if (!IsTiled()) {
+		return 256;
+	}
+	const auto compact_size = CompactMipSize(*this);
+	if (compact_size != 0 && data.size == compact_size && mip_layout[0].size == compact_size) {
+		return std::max(256u, std::bit_ceil(compact_size));
+	}
+	return tiling.block.block_size;
+}
+
+int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
+	if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
+	    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
+	    container.resources.layers == 0 || mip < 0 ||
+	    static_cast<uint32_t>(mip) >= container.resources.levels ||
+	    container.resources.levels > container.mip_layout.size() ||
+	    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
+	    data.End() > container.data.End()) {
+		return -1;
+	}
+	if (HasStencil() != container.HasStencil() ||
+	    (HasStencil() && (stencil.address < container.stencil.address ||
+	                      stencil.End() > container.stencil.End()))) {
+		return -1;
+	}
+
+	const auto  level  = static_cast<uint32_t>(mip);
+	const auto& layout = container.mip_layout[level];
+	if (extent.width != std::max(container.extent.width >> level, 1u) ||
+	    extent.height != std::max(container.extent.height >> level, 1u) ||
+	    extent.depth != container.extent.depth || mip_layout[0].pitch != layout.pitch ||
+	    mip_layout[0].height != layout.height || layout.size == 0 ||
+	    layout.size % container.resources.layers != 0 ||
+	    container.data.size % container.resources.layers != 0 ||
+	    data.size % resources.layers != 0) {
+		return -1;
+	}
+
+	// PS5 block slices contain the entire reversed mip chain. A rebased tail
+	// descriptor covers its addressed span within the shared tail block.
+	const auto slice_stride = container.data.size / container.resources.layers;
+	const auto child_stride = data.size / resources.layers;
+	auto mip_offset = layout.offset;
+	auto mip_size   = layout.size / container.resources.layers;
+	const auto compact_size = CompactMipSize(*this);
+	if (compact_size != 0 && child_stride == compact_size && mip_layout[0].size == compact_size) {
+		const auto range = TiledMipRange(container, level);
+		if (range.size != compact_size) {
+			return -1;
+		}
+		mip_offset = range.address;
+		mip_size   = range.size;
+	} else if (mip_layout[0].tail_x != layout.tail_x || mip_layout[0].tail_y != layout.tail_y) {
+		return -1;
+	}
+	if (child_stride != mip_size || mip_offset >= slice_stride ||
+	    child_stride > slice_stride - mip_offset ||
+	    (resources.layers > 1 && child_stride != slice_stride)) {
+		return -1;
+	}
+	const auto address_delta = data.address - container.data.address;
+	if (address_delta < mip_offset || (address_delta - mip_offset) % slice_stride != 0) {
+		return -1;
+	}
+	const auto layer = (address_delta - mip_offset) / slice_stride;
+	if (layer > INT32_MAX || layer >= container.resources.layers ||
+	    resources.layers > container.resources.layers - layer) {
+		return -1;
+	}
+	return static_cast<int32_t>(layer);
 }
 
 uint64_t ImageInfo::LinearSize(uint32_t levels) const {

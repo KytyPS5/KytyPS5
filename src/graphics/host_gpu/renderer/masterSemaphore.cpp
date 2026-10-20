@@ -53,7 +53,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		// eErrorDeviceLost means submitted GPU work faulted or hung; enable Vulkan validation
+		// (and GPU-assisted validation) in the launcher to find the offending draw/dispatch.
+		EXIT("GPU wait for tick %" PRIu64 " failed: %s\n", tick, vk::to_string(result).c_str());
+	}
 	Refresh();
 }
 

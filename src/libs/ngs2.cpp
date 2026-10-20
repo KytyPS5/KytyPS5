@@ -1886,7 +1886,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	const auto grain = ngs->option.num_grain_samples;
 	for (auto* voice: voices) {
 		Ngs2RenderVoice(*voice, voices, grain);
-		if (voice->rack->type != Ngs2RackType::Mastering || !voice->has_samples) {
+		const bool mastering = voice->rack->type == Ngs2RackType::Mastering ||
+		                       voice->rack->type == Ngs2RackType::CustomMastering;
+		if (!mastering || !voice->has_samples) {
 			continue;
 		}
 		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
@@ -2502,9 +2504,33 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				voice->channels = channels[0];
 				break;
 			}
-			case 0x4003:
+			case 0x4003: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomMastering);
+				// Custom mastering voices mirror the standard mastering setup/output controls:
+				// 0 = setup {num_input_channels, flags}, 1 = output {output_id, reserved}.
+				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
+				switch (param->id & 0xffffu) {
+					case 0:
+						EXIT_NOT_IMPLEMENTED(param->size < sizeof(Ngs2VoiceParamHeader) + 8u);
+						EXIT_NOT_IMPLEMENTED(values[0] == 0 ||
+						                     values[0] > voice->rack->option.common.max_voice_channels);
+						voice->channels = values[0];
+						LOGF("\t custom mastering setup: channels=%u flags=0x%08" PRIx32 "\n",
+						     values[0], values[1]);
+						break;
+					case 1:
+						EXIT_NOT_IMPLEMENTED(param->size < sizeof(Ngs2VoiceParamHeader) + 4u);
+						voice->output_id = values[0];
+						LOGF("\t custom mastering output: output_id=%u\n", values[0]);
+						break;
+					default:
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom mastering control 0x%08" PRIx32 " is ignored\n",
+						    param->id));
+						break;
+				}
 				break;
+			}
 			default: EXIT("unknown rack_id: 0x%" PRIx32 "\n", rack_id);
 		}
 

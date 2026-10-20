@@ -90,6 +90,13 @@ void Delay(Uint32) {}
 #undef SDL_CloseGamepad
 #undef SDL_Delay
 
+namespace Libs::Controller {
+// No virtual headset in these tests (padVr.cpp is not linked here).
+int PadVrPortHand(int) { return -1; }
+int PadVrPort(int, int, int, bool) { return -1; }
+int PadVrClose(int) { return -1; }
+} // namespace Libs::Controller
+
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
 	haptics.push_back({large_motor, small_motor, duration_ms});

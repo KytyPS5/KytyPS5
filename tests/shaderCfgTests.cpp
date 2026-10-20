@@ -2370,6 +2370,64 @@ void TestNewShaderRecompilerTrapTemporaries() {
   Check((result.ir_dump.find("ScalarAddCarryU32 s3, s2, s1") != std::string::npos),
         "chained scalar add did not keep the TTMP-fed value live");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // Range boundaries and the VCC collision guard: TTMP0 (code 108) lands on
+  // scalar slot s106, which shares its index with the VCC_LO code (106), so the
+  // scalar tracking paths must use hardware codes to keep them distinct.
+  // TTMP15 (code 123) closes the RDNA2 range at slot s121.
+  const uint32_t bounds[] = {
+      EncodeSMovB32(0, 129),          // s0 = 1
+      EncodeSMovB32(1, 130),          // s1 = 2
+      EncodeSop2(0x00, 108, 0, 1),    // s_add_u32 ttmp0, s0, s1
+      EncodeSop2(0x00, 2, 108, 1),    // s_add_u32 s2, ttmp0, s1
+      EncodeSop2(0x00, 123, 0, 1),    // s_add_u32 ttmp15, s0, s1
+      EncodeSop2(0x00, 3, 123, 1),    // s_add_u32 s3, ttmp15, s1
+      EncodeSop2(0x00, 4, 2, 3),      // s_add_u32 s4, s2, s3 (keeps both live)
+      0xbf810000u,
+  };
+
+  auto bounds_result = RecompileForTest(bounds, options);
+  Check((bounds_result.decoded_dump.find("s_add_u32 ttmp0, s0, s1") != std::string::npos),
+        "new decoder did not decode TTMP0 destination");
+  Check((bounds_result.decoded_dump.find("s_add_u32 s2, ttmp0, s1") != std::string::npos),
+        "new decoder did not decode TTMP0 source");
+  Check((bounds_result.decoded_dump.find("s_add_u32 ttmp15, s0, s1") != std::string::npos),
+        "new decoder did not decode TTMP15 destination");
+  Check((bounds_result.decoded_dump.find("s_add_u32 s3, ttmp15, s1") != std::string::npos),
+        "new decoder did not decode TTMP15 source");
+  Check((bounds_result.ir_dump.find("ScalarAddCarryU32 s106, s0, s1") != std::string::npos),
+        "TTMP0 destination did not lower through scalar slot s106");
+  Check((bounds_result.ir_dump.find("ScalarAddCarryU32 s2, s106, s1") != std::string::npos),
+        "TTMP0 source did not lower through scalar slot s106");
+  Check((bounds_result.ir_dump.find("ScalarAddCarryU32 s121, s0, s1") != std::string::npos),
+        "TTMP15 destination did not lower through scalar slot s121");
+  Check((bounds_result.ir_dump.find("ScalarAddCarryU32 s3, s121, s1") != std::string::npos),
+        "TTMP15 source did not lower through scalar slot s121");
+  Check((bounds_result.ir_dump.find("ScalarAddCarryU32 s4, s2, s3") != std::string::npos),
+        "chained scalar add did not keep both TTMP-fed values live");
+  CheckSpirvBinaryValidates(bounds_result.spirv);
+
+  // 64-bit pair through TTMP0_1 (slots s106/s107).
+  const uint32_t wide[] = {
+      EncodeSMovB32(0, 129),    // s0 = 1
+      EncodeSMovB32(1, 129),    // s1 = 1
+      EncodeSop1(0x04, 108, 0), // s_mov_b64 ttmp0, s0
+      EncodeSop1(0x04, 2, 108), // s_mov_b64 s2, ttmp0
+      EncodeSop2(0x00, 4, 2, 1), // s_add_u32 s4, s2, s1 (keeps low half live)
+      EncodeSop2(0x00, 5, 3, 1), // s_add_u32 s5, s3, s1 (keeps high half live)
+      0xbf810000u,
+  };
+
+  auto wide_result = RecompileForTest(wide, options);
+  Check((wide_result.decoded_dump.find("s_mov_b64 ttmp0, s0") != std::string::npos),
+        "new decoder did not decode 64-bit TTMP destination");
+  Check((wide_result.decoded_dump.find("s_mov_b64 s2, ttmp0") != std::string::npos),
+        "new decoder did not decode 64-bit TTMP source");
+  Check((wide_result.ir_dump.find("MoveU64 s106, s0") != std::string::npos),
+        "64-bit TTMP destination did not lower through scalar slot s106");
+  Check((wide_result.ir_dump.find("MoveU64 s2, s106") != std::string::npos),
+        "64-bit TTMP source did not lower through scalar slot s106");
+  CheckSpirvBinaryValidates(wide_result.spirv);
 }
 
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {

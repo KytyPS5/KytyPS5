@@ -1602,7 +1602,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	result = {};
 	result.dword_count = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
-		if (m_nodes != nullptr) {
+		// A root added after the nodes were built (a test edits a plan) is walked by value.
+		if (m_nodes != nullptr && source < m_nodes->m_descriptor_refs.size()) {
 			uint64_t wide = 0;
 			if (!EvaluateRef(m_nodes->m_descriptor_refs[source][index], wide)) return false;
 			result.dwords[index] = static_cast<uint32_t>(wide);
@@ -1627,7 +1628,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
-		if (m_nodes != nullptr && (m_clean_evaluator == nullptr || m_clean_evaluator->m_nodes != nullptr)) {
+		if (m_nodes != nullptr && slot < m_nodes->m_read_refs.size() &&
+		    (m_clean_evaluator == nullptr || m_clean_evaluator->m_nodes != nullptr)) {
 			const bool clean = m_nodes->m_read_clean[slot] != 0u;
 			if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 				return false;
@@ -1677,7 +1679,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			uint32_t condition = 0;
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 			const auto evaluate_condition = [&] {
-				if (m_nodes == nullptr || predicate.m_nodes == nullptr)
+				if (m_nodes == nullptr || predicate.m_nodes == nullptr ||
+				    index >= m_nodes->m_condition_refs.size())
 					return predicate.Evaluate(block.condition, condition);
 				uint64_t wide = 0;
 				if (!predicate.EvaluateRef(m_nodes->m_condition_refs[index], wide)) return false;

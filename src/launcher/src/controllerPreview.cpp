@@ -174,6 +174,7 @@ void ControllerPreview::Refresh() {
 				case SDL_GAMEPAD_BUTTON_DPAD_UP: emit NavigationInput(2); break;
 				case SDL_GAMEPAD_BUTTON_DPAD_DOWN: emit NavigationInput(3); break;
 				case SDL_GAMEPAD_BUTTON_SOUTH: emit NavigationInput(4); break;
+				case SDL_GAMEPAD_BUTTON_EAST: emit NavigationInput(5); break;
 				default: break;
 			}
 		} else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&

@@ -380,6 +380,9 @@ void ConfigurationEditDialog::InitGameDirectories() {
 		}
 	});
 
+	m_show_activity_check = new QCheckBox(tr("Show latest activity in the grid view"), m_game_dirs_group);
+	group_layout->addWidget(m_show_activity_check);
+
 	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
 	m_game_dirs_group->setVisible(false);
 
@@ -412,6 +415,14 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
+}
+
+void ConfigurationEditDialog::SetShowLatestActivity(bool show) {
+	m_show_activity_check->setChecked(show);
+}
+
+bool ConfigurationEditDialog::GetShowLatestActivity() const {
+	return m_show_activity_check->isChecked();
 }
 
 QString ConfigurationEditDialog::GetAddonsDirectory() const {

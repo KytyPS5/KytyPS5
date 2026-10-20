@@ -79,6 +79,45 @@ public:
 		viewport()->update();
 	}
 
+	void SetShowRecent(bool show) {
+		m_show_recent = show;
+		viewport()->update();
+	}
+
+	void SetShowAllVisible(bool visible) {
+		if (m_show_all != visible) {
+			m_show_all = visible;
+			if (!visible && m_focus == 4) {
+				m_focus = 0;
+			}
+			viewport()->update();
+		}
+	}
+
+	void SetShowAllHandler(std::function<void()> handler) {
+		m_show_all_handler = std::move(handler);
+	}
+
+	// The "Show all" tile, drawn after the last visible game.
+	QRect ShowAllRect() const {
+		const int last = LastVisibleRow();
+		if (last < 0) {
+			return QRect(Margin, 10, iconSize().width() / 2, iconSize().width() / 2);
+		}
+		const auto r = TileRect(last);
+		const int  s = iconSize().width() / 2;
+		return QRect(r.right() + 1 + TileGap, 10, s, s);
+	}
+
+	int LastVisibleRow() const {
+		for (int row = (model() != nullptr ? model()->rowCount() : 0) - 1; row >= 0; --row) {
+			if (!isRowHidden(row)) {
+				return row;
+			}
+		}
+		return -1;
+	}
+
 	// 0 = small tile, 1 = selected tile; animated.
 	qreal TileScale(int row) const {
 		return row >= 0 && row < m_scales.size() ? m_scales[row] : 0.0;
@@ -109,7 +148,30 @@ public:
 
 	// Controller navigation: 0 left, 1 right, 2 up, 3 down, 4 accept. Down moves focus from the
 	// tiles to the Play / info / menu buttons; accept presses the focused button.
+	// Global position just under the "more" button, where its menu is opened.
+	QPoint MenuAnchor() const {
+		return viewport()->mapToGlobal(MoreRect().bottomLeft() + QPoint(0, 6));
+	}
+
 	void GamepadNav(int action) {
+		// An open popup menu takes the controller input as keys.
+		if (auto* popup = QApplication::activePopupWidget(); popup != nullptr) {
+			const Qt::Key k = action == 0   ? Qt::Key_Left
+			                  : action == 1 ? Qt::Key_Right
+			                  : action == 2 ? Qt::Key_Up
+			                  : action == 3 ? Qt::Key_Down
+			                  : action == 4 ? Qt::Key_Return
+			                                : Qt::Key_Escape;
+			QKeyEvent press(QEvent::KeyPress, k, Qt::NoModifier);
+			QKeyEvent release(QEvent::KeyRelease, k, Qt::NoModifier);
+			QApplication::sendEvent(popup, &press);
+			QApplication::sendEvent(popup, &release);
+			return;
+		}
+		GamepadNavGrid(action);
+	}
+
+	void GamepadNavGrid(int action) {
 		if (m_title.isEmpty()) {
 			m_focus = 0;
 		}
@@ -121,16 +183,31 @@ public:
 		};
 		switch (action) {
 			case 0:
-				if (m_focus == 0) key(Qt::Key_Left); else m_focus = qMax(1, m_focus - 1);
+				if (m_focus == 4) m_focus = 0;
+				else if (m_focus == 0) key(Qt::Key_Left);
+				else m_focus = qMax(1, m_focus - 1);
 				break;
 			case 1:
-				if (m_focus == 0) key(Qt::Key_Right); else m_focus = qMin(3, m_focus + 1);
+				if (m_focus == 0) {
+					if (m_show_all && currentIndex().isValid() &&
+					    currentIndex().row() == LastVisibleRow()) {
+						m_focus = 4;
+					} else {
+						key(Qt::Key_Right);
+					}
+				} else if (m_focus != 4) {
+					m_focus = qMin(3, m_focus + 1);
+				}
 				break;
 			case 2: m_focus = 0; break;
 			case 3:
 				if (m_focus == 0 && !m_title.isEmpty()) m_focus = 1;
 				break;
 			case 4: {
+				if (m_focus == 4) {
+					if (m_show_all_handler) m_show_all_handler();
+					break;
+				}
 				const auto& handler = m_focus == 1 ? m_play_handler
 				                      : m_focus == 2 ? m_info_handler
 				                      : m_focus == 3 ? m_menu_handler
@@ -254,7 +331,7 @@ protected:
 	}
 
 	void PaintRecent(QPainter& painter, const QRect& r) {
-		if (m_recent.empty()) {
+		if (m_recent.empty() || !m_show_recent) {
 			return;
 		}
 		const int top = ButtonsTop() + 40 + 28;
@@ -366,6 +443,12 @@ protected:
 	}
 
 	void mousePressEvent(QMouseEvent* event) override {
+		if (event->button() == Qt::LeftButton && m_show_all && ShowAllRect().contains(event->pos())) {
+			if (m_show_all_handler) {
+				m_show_all_handler();
+			}
+			return;
+		}
 		if (event->button() == Qt::LeftButton && !m_title.isEmpty()) {
 			const auto& handler = PlayRect().contains(event->pos())   ? m_play_handler
 			                      : InfoRect().contains(event->pos()) ? m_info_handler
@@ -593,6 +676,57 @@ protected:
 		}
 
 		QListView::paintEvent(event);
+		if (m_show_all) {
+			PaintShowAll();
+		}
+	}
+
+	void keyPressEvent(QKeyEvent* event) override {
+		const int k = event->key();
+		if (m_focus == 4) {
+			if (k == Qt::Key_Left || k == Qt::Key_Up) {
+				m_focus = 0;
+			} else if ((k == Qt::Key_Return || k == Qt::Key_Enter || k == Qt::Key_Space) &&
+			           m_show_all_handler) {
+				m_show_all_handler();
+			}
+			viewport()->update();
+			return;
+		}
+		if (k == Qt::Key_Right && m_show_all && currentIndex().isValid() &&
+		    currentIndex().row() == LastVisibleRow()) {
+			m_focus = 4;
+			viewport()->update();
+			return;
+		}
+		QListView::keyPressEvent(event);
+	}
+
+	void PaintShowAll() {
+		const auto      rect = ShowAllRect();
+		QPainter        p(viewport());
+		p.setRenderHint(QPainter::Antialiasing);
+		p.setPen(Qt::NoPen);
+		p.setBrush(QColor(255, 255, 255, m_focus == 4 ? 70 : 38));
+		p.drawRoundedRect(rect, 14, 14);
+		const QPoint c = rect.center() - QPoint(0, 12);
+		const int    d = qMax(10, rect.width() / 7);
+		p.setBrush(Qt::white);
+		for (int dx = -1; dx <= 1; dx += 2) {
+			for (int dy = -1; dy <= 1; dy += 2) {
+				p.drawRoundedRect(QRect(c.x() + dx * d * 7 / 10 - d / 2,
+				                        c.y() + dy * d * 7 / 10 - d / 2, d, d),
+				                  3, 3);
+			}
+		}
+		p.setPen(Qt::white);
+		p.drawText(QRect(rect.left(), rect.bottom() - 40, rect.width(), 30), Qt::AlignCenter,
+		           tr("Show all"));
+		if (m_focus == 4) {
+			p.setBrush(Qt::NoBrush);
+			p.setPen(QPen(QColor(120, 190, 255), 3));
+			p.drawRoundedRect(rect.adjusted(-3, -3, 3, 3), 16, 16);
+		}
 	}
 
 private:
@@ -612,6 +746,9 @@ private:
 	std::function<void()> m_menu_handler;
 	int                   m_hover = 0;
 	int                   m_focus = 0;
+	bool                  m_show_all = false;
+	bool                  m_show_recent = true;
+	std::function<void()> m_show_all_handler;
 	bool                  m_keep_deselected = false;
 	QString               m_path;
 	QPixmap               m_source;

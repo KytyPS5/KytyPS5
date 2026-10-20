@@ -442,6 +442,26 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// The render area must fit every attachment. The texture cache can hand back an image smaller
+// than the guest description (GT7: a 495x512 depth target for a 512-wide pass), and rendering
+// past it writes outside the image: a GPU page fault and a lost device on NVIDIA.
+static void ClampToBacking(RenderState& state, const vk::Extent3D& backing, uint32_t level,
+                           const char* kind) {
+	const uint32_t width  = std::max(backing.width >> level, 1u);
+	const uint32_t height = std::max(backing.height >> level, 1u);
+	if (state.width <= width && state.height <= height) {
+		return;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("Render: %s attachment %ux%u (level %u) is smaller than the render area "
+		            "%ux%u; clamping\n",
+		            kind, width, height, level, state.width, state.height);
+	}
+	state.width  = std::min(state.width, width);
+	state.height = std::min(state.height, height);
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -477,6 +497,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
+		ClampToBacking(state, image.backing.extent, view.base_level, "color");
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
@@ -543,6 +564,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              buffer.Handle());
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		ClampToBacking(state, image.backing.extent, view.base_level, "depth");
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;

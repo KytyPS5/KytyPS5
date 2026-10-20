@@ -15,6 +15,7 @@
 #include <bitset>
 #include <map>
 #include <type_traits>
+#include <atomic>
 #include <unordered_set>
 #include <vector>
 
@@ -76,7 +77,14 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
-	void ProcessDownloadImages();
+	/// Records GPU-to-guest copies for enrolled images. Entries that fail transiently stay
+	/// enrolled; entries that can never be downloaded are dropped.
+	/// @return true if at least one copy was queued (its guest write lands as a priority op).
+	bool ProcessDownloadImages();
+	/// @return true while a queued readback has not yet been written to guest memory.
+	[[nodiscard]] bool HasReadbacksInFlight() const noexcept {
+		return m_readbacks_in_flight.load(std::memory_order_acquire) != 0;
+	}
 	void RunGarbageCollector();
 
 private:
@@ -186,6 +194,8 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	// Readbacks recorded by DownloadImageMemory() whose guest write has not run yet.
+	std::atomic<uint32_t> m_readbacks_in_flight {0};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

@@ -1857,9 +1857,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_readbacks_in_flight.fetch_add(1, std::memory_order_acq_rel);
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_readbacks_in_flight.fetch_sub(1, std::memory_order_acq_rel);
 	});
 	return true;
 }
@@ -2032,17 +2034,31 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-void TextureCache::ProcessDownloadImages() {
+bool TextureCache::ProcessDownloadImages() {
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
-		return;
+		return false;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: m_download_images) {
-		if (m_slot_images[id].IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+	if (m_download_images.empty()) {
+		return false;
+	}
+	bool queued = false;
+	for (auto it = m_download_images.begin(); it != m_download_images.end();) {
+		const auto id    = *it;
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || !owner->IsGpuModified() ||
+		    owner->depth_id || !CanDownload(*owner)) {
+			// Gone, already current, or never downloadable: nothing to retry.
+			it = m_download_images.erase(it);
+		} else if (DownloadImageMemory(id)) {
+			queued = true;
+			it     = m_download_images.erase(it);
+		} else {
+			// Transient failure (e.g. not safe to download yet): retry at the next signal.
+			++it;
 		}
 	}
-	m_download_images.clear();
+	return queued;
 }
 
 } // namespace Libs::Graphics

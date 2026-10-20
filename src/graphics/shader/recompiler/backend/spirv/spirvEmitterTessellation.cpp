@@ -56,10 +56,12 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
+		// Vulkan only lets an HS invocation write its own control point; reads may index any.
+		const bool own_output = kind == Attribute::ControlOutput &&
+		                        inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute;
 		const auto vertex =
-		    kind == Attribute::ControlOutput
-		        ? EmitLaneId(state)
-		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		    own_output ? EmitLaneId(state)
+		               : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
 		                          component);
 	}
@@ -126,7 +128,8 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning != 2u ||
+	// Guest integer partitioning rounds factors up, as Vulkan's equal spacing; pow2 has no match.
+	EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning == 1u ||
 	                     tess.output_topology != 2u);
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
@@ -134,7 +137,10 @@ void DefineTessellationExecutionModes(EmitterState& state) {
 		                               tess.output_control_points);
 	} else {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSpacingFractionalOdd);
+		state.builder.AddExecutionMode(
+		    state.main_func, tess.partitioning == 0u   ? spv::ExecutionModeSpacingEqual
+		                     : tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd
+		                                               : spv::ExecutionModeSpacingFractionalEven);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
 	}
 }

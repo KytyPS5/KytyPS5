@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <numeric>
 #include <unordered_map>
 #include <utility>
 
@@ -17,13 +19,22 @@ namespace Libs::Graphics::ShaderRecompiler {
 namespace {
 
 struct TessellationAddress {
-	enum class Kind { Unknown, Affine, PackedControlPoint };
+	// Affine: coefficient * ordinal + constant. Scaled: coefficient * n + constant for an
+	// unknown integer n.
+	enum class Kind { Unknown, Affine, PackedControlPoint, Scaled };
 	Kind     kind        = Kind::Unknown;
 	uint32_t coefficient = 0;
 	uint32_t constant    = 0;
 
 	bool operator==(const TessellationAddress&) const = default;
 };
+
+bool IsLocalRead(Decoder::Opcode opcode) {
+	using Decoder::Opcode;
+	return opcode == Opcode::DS_READ_B32 || opcode == Opcode::DS_READ_B64 ||
+	       opcode == Opcode::DS_READ_B96 || opcode == Opcode::DS_READ_B128 ||
+	       opcode == Opcode::DS_READ2_B32 || opcode == Opcode::DS_READ2_B64;
+}
 
 // Reflects the LS output stride, or the HS output stride and patch constant range.
 void ReflectTessellationLayout(const Decoder::Program& program, bool local,
@@ -37,8 +48,11 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 	Registers  registers {};
 	registers[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
-	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
-	const auto read     = [&](const Operand& operand) -> Address {
+	const auto constant    = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
+	const auto is_constant = [](Address value) {
+		return value.kind == Kind::Affine && value.coefficient == 0u;
+	};
+	const auto read = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
 			return {};
@@ -54,31 +68,46 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
-	const auto affine = [](uint64_t coefficient, uint64_t offset) {
+	const auto affine = [](Kind kind, uint64_t coefficient, uint64_t offset) {
 		return coefficient <= UINT32_MAX && offset <= UINT32_MAX
-		           ? Address {Kind::Affine, static_cast<uint32_t>(coefficient),
+		           ? Address {kind, static_cast<uint32_t>(coefficient),
 		                      static_cast<uint32_t>(offset)}
 		           : Address {};
 	};
 	const auto add = [&](Address lhs, Address rhs) {
-		return lhs.kind == Kind::Affine && rhs.kind == Kind::Affine
-		           ? affine(uint64_t {lhs.coefficient} + rhs.coefficient,
-		                    uint64_t {lhs.constant} + rhs.constant)
-		           : Address {};
+		if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine)
+			return affine(Kind::Affine, uint64_t {lhs.coefficient} + rhs.coefficient,
+			              uint64_t {lhs.constant} + rhs.constant);
+		// Ordinal multiples of a Scaled coefficient stay multiples of it.
+		const auto scaled = [](Address value) {
+			return value.kind == Kind::Affine || value.kind == Kind::Scaled;
+		};
+		if (!scaled(lhs) || !scaled(rhs)) return Address {};
+		const auto coefficient = std::gcd(lhs.coefficient, rhs.coefficient);
+		return affine(Kind::Scaled, coefficient, uint64_t {lhs.constant} + rhs.constant);
 	};
-	const auto multiply = [&](Address lhs, Address rhs) {
-		if ((lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant == 0u) ||
-		    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0u))
-			return constant(0u);
-		if (lhs.kind != Kind::Affine || rhs.kind != Kind::Affine) return Address {};
-		if (rhs.coefficient != 0u) std::swap(lhs, rhs);
-		return rhs.coefficient == 0u ? affine(uint64_t {lhs.coefficient} * rhs.constant,
-		                                      uint64_t {lhs.constant} * rhs.constant)
-		                             : Address {};
+	const auto multiply = [&](Address lhs, Address rhs, bool u24) {
+		const auto zero = [](Address value) {
+			return value.kind == Kind::Affine && value.coefficient == 0u && value.constant == 0u;
+		};
+		if (zero(lhs) || zero(rhs)) return constant(0u);
+		if (!is_constant(rhs)) std::swap(lhs, rhs);
+		if (!is_constant(rhs)) return Address {};
+		if (lhs.kind == Kind::Affine)
+			return affine(Kind::Affine, uint64_t {lhs.coefficient} * rhs.constant,
+			              uint64_t {lhs.constant} * rhs.constant);
+		if (lhs.kind == Kind::PackedControlPoint) return Address {};
+		// A product by a power of two keeps that factor when it wraps; a 24-bit operand times at
+		// most 256 cannot wrap.
+		const bool power = std::has_single_bit(rhs.constant);
+		if (lhs.kind == Kind::Scaled && power && std::has_single_bit(lhs.coefficient))
+			return affine(Kind::Scaled, uint64_t {lhs.coefficient} * rhs.constant,
+			              uint64_t {lhs.constant} * rhs.constant);
+		return power || (u24 && rhs.constant <= 0x100u) ? Address {Kind::Scaled, rhs.constant, 0u}
+		                                                : Address {};
 	};
 	const auto low24 = [&](Address value) {
-		if (value.kind == Kind::Affine && value.coefficient == 0u)
-			return constant(value.constant & 0xffffffu);
+		if (is_constant(value)) return constant(value.constant & 0xffffffu);
 		return value.kind == Kind::Affine &&
 		               uint64_t {value.coefficient} * (control_points - 1u) + value.constant <=
 		                   0xffffffu
@@ -113,15 +142,17 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
-		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
+		const bool control_read = !local && IsLocalRead(inst.opcode);
 		if ((local && local_store) || control_store || control_read) {
 			const auto address = read(inst.src0);
-			if (address.kind != Kind::Affine) {
+			// A read may index another control point; only its record offset must be fixed.
+			const bool indexed_read = control_read && address.kind == Kind::Scaled &&
+			                          address.coefficient % info.ls_stride == 0u;
+			if (address.kind != Kind::Affine && !indexed_read) {
 				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
 				     inst.pc);
 			}
-			if (address.coefficient != 0u) {
+			if (address.kind == Kind::Affine && address.coefficient != 0u) {
 				const auto expected = control_read ? info.ls_stride : stride;
 				EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
 				                     (expected != 0u && expected != address.coefficient));
@@ -140,10 +171,10 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		const auto third = read(inst.src2);
 		Address    value;
 		switch (inst.opcode) {
+			case Opcode::V_MOV_B32: value = lhs; break;
 			case Opcode::V_BFE_U32:
-				if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
-				    rhs.coefficient == 0u && third.kind == Kind::Affine &&
-				    third.coefficient == 0u) {
+				if (lhs.kind == Kind::PackedControlPoint && is_constant(rhs) &&
+				    is_constant(third)) {
 					if (rhs.constant == 8u && third.constant == 5u) value = {Kind::Affine, 1u, 0u};
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
@@ -154,21 +185,25 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					value = constant(0u);
 				break;
 			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
-			case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
-			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
-			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
+			case Opcode::V_ADD3_U32: value = add(add(lhs, rhs), third); break;
+			case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs, false); break;
+			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs), true); break;
+			case Opcode::V_MAD_U32_U24:
+				value = add(multiply(low24(lhs), low24(rhs), true), third);
+				break;
 			case Opcode::V_LSHL_ADD_U32:
-				if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
-					value = add(multiply(lhs, constant(1u << rhs.constant)), third);
+				if (is_constant(rhs) && rhs.constant < 32u)
+					value = add(multiply(lhs, constant(1u << rhs.constant), false), third);
 				break;
 			case Opcode::V_LSHLREV_B32:
-				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
-					value = multiply(rhs, constant(1u << lhs.constant));
+				if (is_constant(lhs) && lhs.constant < 32u)
+					value = multiply(rhs, constant(1u << lhs.constant), false);
 				break;
 			case Opcode::V_SUB_NC_U32:
 				if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
 				    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-					value = affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
+					value = affine(Kind::Affine, lhs.coefficient - rhs.coefficient,
+					               lhs.constant - rhs.constant);
 				break;
 			default: break;
 		}
@@ -221,9 +256,17 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 	}
 	// Pure address arithmetic that stays behind EXEC selects; mul24 lowers to IMul32 of BFEs.
 	const auto opcode = source->GetOpcode();
-	if (opcode != ValueOpcode::IAdd32 && opcode != ValueOpcode::ISub32 &&
-	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract)
-		return value;
+	switch (opcode) {
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitFieldUExtract: break;
+		default: return value;
+	}
 	std::array<Value, 3> args;
 	bool                 changed = false;
 	for (size_t index = 0; index < source->NumArgs(); index++) {
@@ -318,19 +361,22 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					kind = TessellationAttribute::Factor;
 					factors += components;
 				} else {
-					kind = write ? TessellationAttribute::ControlOutput
-					             : TessellationAttribute::EvaluationInput;
-					EXIT_NOT_IMPLEMENTED(write
-					                         ? options.stage != ShaderType::TessellationControl
-					                         : options.stage != ShaderType::TessellationEvaluation);
+					// The HS reads back its own outputs, written by any control point before a
+					// barrier.
+					const bool control = options.stage == ShaderType::TessellationControl;
+					kind               = control ? TessellationAttribute::ControlOutput
+					                             : TessellationAttribute::EvaluationInput;
+					EXIT_NOT_IMPLEMENTED(
+					    write ? !control
+					          : !control && options.stage != ShaderType::TessellationEvaluation);
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
 						const auto begin = address.U32() + memory.offset;
 						EXIT_NOT_IMPLEMENTED(begin < tess.patch_base ||
 						                     begin + 4u * components >
 						                         tess.patch_base + tess.patch_size);
-						kind = write ? TessellationAttribute::PatchOutput
-						             : TessellationAttribute::PatchInput;
+						kind = control ? TessellationAttribute::PatchOutput
+						               : TessellationAttribute::PatchInput;
 						patches += components;
 					}
 				}

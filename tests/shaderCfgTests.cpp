@@ -11287,6 +11287,23 @@ void TestGraphicsComputeGetreg() {
 #endif
 }
 
+void TestCallInLoopIsSkipped() {
+  using namespace ShaderRecompiler;
+  // A waterfall loop calls through s[14:15]; the target changes per iteration, so it is not linked.
+  const uint32_t shader[] = {
+      EncodeSMovB32(14, 255), 0x12345678u,
+      EncodeSMovB32(15, 128),
+      EncodeSop1(0x21, 14, 14),   // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSopp(0x05, 0xfffbu),  // s_cbranch_scc1 back to the first move
+      EncodeSopp(0x01)};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto source = PrepareShaderSource(shader, options);
+  Check(!source.call && !source.decoded.has_swap_pc &&
+            source.decoded.instructions[2].opcode == Decoder::Opcode::S_GETPC_B64,
+        "a call inside a loop was not skipped");
+  (void)TranslateProgram(source.decoded, options);
+}
+
 void TestMemoryFedScalarLeafCall() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -16790,6 +16807,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestCallInLoopIsSkipped();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

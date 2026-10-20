@@ -579,6 +579,44 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
 }
 
+// A call inside a loop takes its target from data that changes per iteration: a waterfall over a
+// table of functions, as ray tracing calls its any-hit and intersection shaders. No single target
+// can be linked, so the call is skipped: it still writes its return address, as S_GETPC_B64 does,
+// and the loop sees the callee's results as the registers held before it.
+bool SkipCallsInLoops(Decoder::Program& program, uint64_t shader_hash) {
+	const auto graph = CFG::BuildGraph(program);
+	bool       skipped_all = true;
+	for (uint32_t i = 0; i < program.instructions.size(); ++i) {
+		auto& inst = program.instructions[i];
+		if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+		const auto home = std::ranges::find_if(graph.blocks, [i](const auto& block) {
+			return block.inst_begin <= i && i < block.inst_end;
+		});
+		EXIT_IF(home == graph.blocks.end());
+		std::vector<bool>     seen(graph.blocks.size(), false);
+		std::vector<uint32_t> pending(home->successors.begin(), home->successors.end());
+		bool                  in_loop = false;
+		while (!pending.empty() && !in_loop) {
+			const auto* block = graph.FindBlock(pending.back());
+			pending.pop_back();
+			EXIT_IF(block == nullptr);
+			const auto index = static_cast<size_t>(block - graph.blocks.data());
+			if (seen[index]) continue;
+			seen[index] = true;
+			in_loop     = block->id == home->id;
+			pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+		}
+		if (!in_loop) {
+			skipped_all = false;
+			continue;
+		}
+		LOGF("Shader %016" PRIx64 ": the call at pc 0x%08x is in a loop; it is skipped\n", shader_hash,
+		     inst.pc);
+		inst.opcode = Decoder::Opcode::S_GETPC_B64;
+	}
+	return skipped_all;
+}
+
 } // namespace
 
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
@@ -593,6 +631,9 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
+	}
+	if (source.decoded.has_swap_pc && SkipCallsInLoops(source.decoded, options.shader_hash)) {
+		source.decoded.has_swap_pc = false;
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTarget(source, options);

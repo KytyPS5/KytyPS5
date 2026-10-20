@@ -128,6 +128,14 @@ bool ReadAheadStrict(void* userdata, uint64_t address, std::span<uint32_t> value
 }
 
 bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t size) {
+	// A table pointer below guest memory (0x40000) is null: the speculative walk follows both sides
+	// of a branch it cannot decide and reads through it on the side the shader never takes.
+	// Reading zero there is what the speculative walk means, as in upstream's x86 walker, and the
+	// bytes are zero for every thread, so they need neither the backing nor a validation entry.
+	if (address < 0x40000u && size != 0u) {
+		std::memset(data, 0, size);
+		return true;
+	}
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 

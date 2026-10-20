@@ -2361,8 +2361,10 @@ void TestNewShaderRecompilerTrapTemporaries() {
         "new decoder did not decode TTMP destination");
   Check((result.decoded_dump.find("s_add_u32 s2, ttmp3, s1") != std::string::npos),
         "new decoder did not decode TTMP source");
-  // TTMP3 (code 111) decodes to scalar slot 109. The translated adds must read
-  // that slot, so a wrong-register translation cannot pass these checks.
+  // TTMP3 (code 111) decodes to scalar slot 109. The translated adds must write
+  // and read that slot, so a wrong-register translation cannot pass these checks.
+  Check((result.ir_dump.find("ScalarAddCarryU32 s109, s0, 0x00000001") != std::string::npos),
+        "TTMP destination did not lower through scalar slot s109");
   Check((result.ir_dump.find("ScalarAddCarryU32 s2, s109, s1") != std::string::npos),
         "TTMP source did not lower through scalar slot s109");
   Check((result.ir_dump.find("ScalarAddCarryU32 s3, s2, s1") != std::string::npos),

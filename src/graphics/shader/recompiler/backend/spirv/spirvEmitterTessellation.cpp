@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -14,6 +15,49 @@ bool IsTessellationInput(IR::TessellationAttribute kind) {
 bool IsTessellationPatch(IR::TessellationAttribute kind) {
 	using Attribute = IR::TessellationAttribute;
 	return kind == Attribute::PatchOutput || kind == Attribute::PatchInput;
+}
+
+// The offset of a ring address inside its control point record when it is the same for every
+// lane that passes the access predicate: control point terms are multiples of the stride. Only
+// the final ring address is known not to wrap, so immediates count as signed integers.
+std::optional<uint32_t> RecordOffset(const IR::Value& value, uint32_t stride,
+                                     const IR::Value& predicate) {
+	const auto resolved = value.Resolve();
+	if (resolved.IsImmediate()) {
+		const auto residue = int64_t {static_cast<int32_t>(resolved.U32())} % stride;
+		return static_cast<uint32_t>(residue < 0 ? residue + stride : residue);
+	}
+	const auto* inst = resolved.TryInstruction();
+	if (inst == nullptr) return std::nullopt;
+	const auto operand = [&](size_t index) {
+		return RecordOffset(inst->Arg(index), stride, predicate);
+	};
+	switch (inst->GetOpcode()) {
+		case IR::ValueOpcode::IAdd32: {
+			const auto left = operand(0), right = operand(1);
+			if (!left || !right) return std::nullopt;
+			return (*left + *right) % stride;
+		}
+		case IR::ValueOpcode::IMul32: {
+			const auto left = operand(0), right = operand(1);
+			if ((left && *left == 0) || (right && *right == 0)) return 0u;
+			if (!left || !right) return std::nullopt;
+			return static_cast<uint32_t>(uint64_t {*left} * *right % stride);
+		}
+		case IR::ValueOpcode::ShiftLeftLogical32: {
+			const auto shift = inst->Arg(1).Resolve();
+			if (!shift.IsImmediate() || shift.U32() >= 32u) return std::nullopt;
+			if ((uint64_t {1} << shift.U32()) % stride == 0u) return 0u;
+			const auto left = operand(0);
+			if (!left) return std::nullopt;
+			return static_cast<uint32_t>((uint64_t {*left} << shift.U32()) % stride);
+		}
+		case IR::ValueOpcode::SelectU32:
+			// Lanes that pass the predicate see the selected operand.
+			if (inst->Arg(0).Resolve() == predicate.Resolve()) return operand(1);
+			return std::nullopt;
+		default: return std::nullopt;
+	}
 }
 
 uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -43,8 +87,14 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
 	const auto stride = local ? tess.ls_stride : tess.hs_stride;
+	// A constant record offset keeps the attribute and component static, as the guest code
+	// addresses them; only the control point index varies.
+	const auto record =
+	    patch ? std::nullopt : RecordOffset(inst.Arg(1), stride, inst.Arg(inst.NumArgs() - 1u));
 	const auto offset =
-	    patch ? address : EmitBinaryU32(state, spv::OpUMod, address, ConstantU32(state, stride));
+	    patch    ? address
+	    : record ? ConstantU32(state, *record)
+	             : EmitBinaryU32(state, spv::OpUMod, address, ConstantU32(state, stride));
 	const auto attribute =
 	    EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 4));
 	const auto component =

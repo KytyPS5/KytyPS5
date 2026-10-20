@@ -1611,6 +1611,82 @@ void CheckRectListShaders() {
   const auto position_only = BuildRectListShaders(vertex, nullptr);
   ValidateSpirv(name, position_only.control);
   ValidateSpirv(name, position_only.evaluation);
+
+  // A vertex shader that exports a position also gets the appended clip plane:
+  // with one clip distance of its own it writes two, and both tessellation
+  // stages must declare and pass them on.
+  ShaderRecompiler::IR::CompiledShaderInfo clip_program{
+      .stage = ShaderType::Vertex, .param_export_mask = 1u};
+  clip_program.info.outputs.push_back(
+      {ShaderRecompiler::IR::StageOutputKind::Position, 0, 0, "position"});
+  clip_program.info.outputs.push_back(
+      {ShaderRecompiler::IR::StageOutputKind::ClipDistance, 0, 0, "clip_0"});
+  ShaderVertexInputInfo clip_vertex = vertex;
+  clip_vertex.stage.program = &clip_program;
+  const auto clipped = BuildRectListShaders(clip_vertex, nullptr);
+  ValidateSpirv(name, clipped.control);
+  ValidateSpirv(name, clipped.evaluation);
+  Require(name, "clip distance disassembly",
+          tools.Disassemble(clipped.control, &control_text) &&
+              tools.Disassemble(clipped.evaluation, &evaluation_text),
+          "failed to disassemble rectangle-list shaders with clip distances");
+  Require(
+      name, "clip distances passed on",
+      CountText(control_text, "BuiltIn ClipDistance") == 1 &&
+          CountText(evaluation_text, "BuiltIn ClipDistance") == 1 &&
+          control_text.find("OpTypeStruct %v4float %_arr_float_uint_2") !=
+              std::string::npos &&
+          evaluation_text.find("OpTypeStruct %v4float %_arr_float_uint_2") !=
+              std::string::npos,
+      "both stages must carry the vertex shader's two clip distances in their "
+      "per-vertex block");
+  Require(name, "clip distance capability",
+          control_text.find("OpCapability ClipDistance") != std::string::npos &&
+              evaluation_text.find("OpCapability ClipDistance") !=
+                  std::string::npos,
+          "stages that declare BuiltIn ClipDistance need the ClipDistance "
+          "capability");
+
+  // Built-ins only take part in interface matching inside the built-in block,
+  // and the control shader input block must match the vertex shader output
+  // block: a recompiled vertex shader that exports a position keeps its
+  // appended clip plane in gl_PerVertex, with the same members as the rect
+  // list stages.
+  std::vector<u32> vertex_code;
+  AppendSMovLiteral(&vertex_code, 8, std::bit_cast<u32>(1.0f));
+  vertex_code.push_back(0x7e000208u); // v_mov_b32 v0, s8
+  vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+  vertex_code.push_back(EncodeExp1(0, 0, 0, 0));
+  AppendEnd(&vertex_code);
+  ShaderVertexInputInfo compiled_vertex_info{};
+  ShaderRecompiler::CompileOptions vertex_options;
+  vertex_options.stage = ShaderType::Vertex;
+  vertex_options.input_info.vertex = &compiled_vertex_info;
+  auto vertex_result = ShaderRecompiler::CompileProgram(
+      ShaderRecompiler::TranslateProgram(vertex_code, vertex_options),
+      vertex_options, {});
+  ValidateSpirv(name, vertex_result.spirv);
+  auto compiled_program = std::move(vertex_result.program).TakeCompiledInfo();
+  ShaderVertexInputInfo compiled_vertex = vertex;
+  compiled_vertex.stage.program = &compiled_program;
+  const auto compiled = BuildRectListShaders(compiled_vertex, nullptr);
+  ValidateSpirv(name, compiled.control);
+  ValidateSpirv(name, compiled.evaluation);
+  std::string vertex_text;
+  Require(name, "vertex block disassembly",
+          tools.Disassemble(vertex_result.spirv, &vertex_text) &&
+              tools.Disassemble(compiled.control, &control_text),
+          "failed to disassemble the vertex and control shaders");
+  const std::string block = "OpTypeStruct %v4float %_arr_float_uint_1";
+  Require(name, "matching built-in blocks",
+          vertex_text.find(block) != std::string::npos &&
+              CountText(vertex_text, "BuiltIn ClipDistance") == 1 &&
+              vertex_text.find("OpMemberDecorate %gl_PerVertex 1 BuiltIn "
+                               "ClipDistance") != std::string::npos &&
+              control_text.find(block) != std::string::npos,
+          "the vertex shader must write its clip distances in gl_PerVertex, "
+          "the block the control shader reads");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
@@ -49240,6 +49316,10 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
     RunGraphicsCase(&vulkan, GraphicsPerspectiveSample(false));
     RunGraphicsCase(&vulkan, GraphicsPerspectiveSample(true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rect-list-only") == 0) {
+    CheckRectListShaders();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {

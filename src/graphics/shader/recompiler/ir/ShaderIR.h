@@ -512,6 +512,8 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// The shader has packed FP16 arithmetic (PackedFPAdd16 and its kind).
+	bool                            packed_float16                = false;
 	// The shader moves an append or consume counter.
 	bool                            append_consume                = false;
 	// The shader reads the barycentrics as values.

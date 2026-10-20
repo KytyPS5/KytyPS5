@@ -211,6 +211,8 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	    static_cast<vk::SubgroupFeatureFlags::MaskType>(properties11.subgroupSupportedOperations);
 	facts.float64_preserves_special_values =
 	    properties12.shaderSignedZeroInfNanPreserveFloat64 == VK_TRUE;
+	facts.float16_preserves_special_values =
+	    properties12.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE;
 
 	const auto& core                         = features2.features;
 	facts.depth_clamp                        = core.depthClamp == VK_TRUE;
@@ -238,6 +240,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 
 	facts.storage_buffer_16bit_access  = features11.storageBuffer16BitAccess == VK_TRUE;
 	facts.sampler_mirror_clamp_to_edge = features12.samplerMirrorClampToEdge == VK_TRUE;
+	facts.shader_float16               = features12.shaderFloat16 == VK_TRUE;
 	facts.timeline_semaphore           = features12.timelineSemaphore == VK_TRUE;
 	facts.shader_output_layer          = features12.shaderOutputLayer == VK_TRUE;
 	facts.shader_output_viewport_index = features12.shaderOutputViewportIndex == VK_TRUE;
@@ -549,6 +552,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderBufferInt64Atomics = caps.buffer_int64_atomics ? VK_TRUE : VK_FALSE;
 	features12.shaderSharedInt64Atomics = caps.shared_int64_atomics ? VK_TRUE : VK_FALSE;
+	features12.shaderFloat16            = caps.float16 ? VK_TRUE : VK_FALSE;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -587,6 +591,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	caps.provoking_vertex_last    = caps.provoking_vertex_last && provoking_extension;
 	caps.attachment_feedback_loop = caps.attachment_feedback_loop && feedback_extensions;
 	caps.maintenance8             = caps.maintenance8 && maintenance8_extension;
+	LOGF("Vulkan native FP16: %s\n", graphics.host.capabilities.float16 ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.host.capabilities.attachment_feedback_loop ? "true" : "false");
 	if (caps.mesh_shader) {

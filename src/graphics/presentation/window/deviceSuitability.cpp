@@ -92,6 +92,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.image_int64_atomics =
 	    with_extension(facts.shader_image_int64_atomics, kImageAtomic64Extension);
 	caps.float64 = facts.shader_float64 && facts.float64_preserves_special_values;
+	caps.float16 = facts.shader_float16 && facts.float16_preserves_special_values;
 	caps.fragment_barycentric =
 	    with_extension(facts.fragment_shader_barycentric, kBarycentricExtension);
 	caps.depth_bounds       = facts.depth_bounds;

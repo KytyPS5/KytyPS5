@@ -20281,6 +20281,10 @@ private:
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
             "no Vulkan graphics+compute device the emulator accepts:" + rejections);
     m_host = {decision.capabilities, decision.faults};
+    // KYTY_TEST_NO_FLOAT16: the cases run as on a host without native FP16.
+    if (std::getenv("KYTY_TEST_NO_FLOAT16") != nullptr) {
+      m_host.capabilities.float16 = false;
+    }
     const auto &caps = m_host.capabilities;
     for (const auto &line : decision.unavailable) {
       std::printf("[host]    %s\n", line.c_str());
@@ -20314,6 +20318,7 @@ private:
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderBufferInt64Atomics = caps.buffer_int64_atomics;
     device_features12.shaderSharedInt64Atomics = caps.shared_int64_atomics;
+    device_features12.shaderFloat16 = caps.float16;
     link(device_features12);
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.dynamicRendering = true;
@@ -25960,6 +25965,53 @@ TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
           {},
           {0x4f004d00u, 0x4e004d00u, 0x50804d00u},
           {O::V_MOV_B32, O::V_PK_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+// Packed FP16 rounds each lane to nearest even and keeps subnormals, signed zeros, infinities
+// and quiet NaNs (expected values from exact rational arithmetic). The FMA lanes are exact: RADV
+// computes a packed FP16 FMA as an F32 FMA rounded again (an F32 FMA and the guest's single
+// rounding differ by an ulp for 0x41ed * 0x3a9f + 0x8331), as the per-lane path does.
+TestCase Vop3pPackedF16EdgesRoundOnce() {
+  using O = ShaderOpcode;
+  const auto vop3p = [](u32 opcode, u32 dst, u32 src0, u32 src1, u32 src2) {
+    // OP_SEL_HI set for every source: the high lane reads the high halves.
+    return std::array<u32, 2>{0xcc004000u | (opcode << 16u) | dst,
+                              (256u + src0) | ((256u + src1) << 9u) | ((256u + src2) << 18u) |
+                                  (3u << 27u)};
+  };
+  constexpr u32 Fma = 0x0e, Add = 0x0f, Mul = 0x10;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x03ff0001u);  // subnormals
+  AppendVMovLiteral(&code, 1, 0x00010001u);
+  AppendVMovLiteral(&code, 2, 0x00010400u);  // a normal and a subnormal times 0.5
+  AppendVMovLiteral(&code, 3, 0x38003800u);
+  AppendVMovLiteral(&code, 4, 0x3c013c00u);  // halfway cases: ties to even
+  AppendVMovLiteral(&code, 5, 0x10001000u);
+  AppendVMovLiteral(&code, 6, 0xfbff7bffu);  // overflow to +-infinity
+  AppendVMovLiteral(&code, 7, 0x40004000u);
+  AppendVMovLiteral(&code, 8, 0x80008000u);  // -0 + -0
+  AppendVMovLiteral(&code, 9, 0x7e007e00u);  // quiet NaN + 1
+  AppendVMovLiteral(&code, 11, 0x3c003c00u);
+  AppendVMovLiteral(&code, 12, 0x3c004000u); // FMA: 2*3+1 and 1*subnormal+subnormal
+  AppendVMovLiteral(&code, 13, 0x00014200u);
+  AppendVMovLiteral(&code, 14, 0x00013c00u);
+  for (const auto &words : {vop3p(Add, 20, 0, 1, 0), vop3p(Mul, 21, 2, 3, 0),
+                            vop3p(Add, 22, 4, 5, 0), vop3p(Mul, 23, 6, 7, 0),
+                            vop3p(Add, 24, 8, 8, 0), vop3p(Add, 25, 9, 11, 0),
+                            vop3p(Fma, 26, 12, 13, 14)}) {
+    code.insert(code.end(), words.begin(), words.end());
+  }
+  for (u32 i = 0; i < 7; i++) {
+    AppendStoreVgpr(&code, 20 + i, i);
+  }
+  AppendEnd(&code);
+  return {"Vop3pPackedF16EdgesRoundOnce",
+          code,
+          {},
+          {0x04000002u, 0x00000200u, 0x3c023c00u, 0xfc007c00u, 0x80008000u, 0x7e007e00u,
+           0x00024700u},
+          {O::V_MOV_B32, O::V_PK_ADD_F16, O::V_PK_MUL_F16, O::V_PK_FMA_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop3pIntegerNegationCapturedAndSelectedHalves() {
@@ -40294,6 +40346,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadU64U32UnsignedCarryOut);
   AddCase(VectorLaneAndPackedOps);
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
+  AddCase(Vop3pPackedF16EdgesRoundOnce);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
   AddCase(Vop3pIntegerNegationCapturedAndSelectedHalves);
@@ -46591,6 +46644,22 @@ int RunSelectedCases(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
     return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--cases") == 0) {
+    // The compute cases whose name contains the text.
+    VulkanHarness vulkan;
+    uint32_t run = 0;
+    for (const auto &test : MakeCases()) {
+      if (std::string_view(test.name).find(argv[2]) != std::string_view::npos) {
+        RunCase(&vulkan, test);
+        run++;
+      }
+    }
+    std::printf("ShaderRecompilerComputeTests: %u cases matching \"%s\" run, %zu wrong "
+                "(native FP16: %s)\n",
+                run, argv[2], g_wrong_results.size(),
+                vulkan.RuntimeRenderer().GetGraphics().host.capabilities.float16 ? "yes" : "no");
+    return g_wrong_results.empty() ? 0 : 1;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {
     VulkanHarness vulkan;

@@ -669,6 +669,7 @@ struct PipelineCache::ProgramCache {
 		    c.shared_int64_atomics,
 		    c.image_int64_atomics,
 		    c.float64,
+		    c.float16,
 		    c.fragment_barycentric,
 		    c.depth_bounds,
 		    c.depth_clamp,

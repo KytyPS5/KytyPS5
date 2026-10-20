@@ -21,6 +21,8 @@ struct HostCapabilities {
 	bool shared_int64_atomics = false;
 	bool image_int64_atomics  = false;
 	bool float64              = false;
+	// Native FP16 arithmetic that keeps signed zeros, infinities and NaNs (shaderFloat16).
+	bool float16              = false;
 	bool fragment_barycentric = false;
 	bool depth_bounds         = false;
 	bool depth_clamp          = false;
@@ -70,6 +72,7 @@ struct HostCapabilities {
 		all.shared_int64_atomics      = true;
 		all.image_int64_atomics       = true;
 		all.float64                   = true;
+		all.float16                   = true;
 		all.fragment_barycentric      = true;
 		all.depth_bounds              = true;
 		all.depth_clamp               = true;

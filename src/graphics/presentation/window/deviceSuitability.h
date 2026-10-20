@@ -46,6 +46,7 @@ struct DeviceFacts {
 	bool tessellation_shader                       = false;
 	bool shader_int64                              = false;
 	bool shader_float64                            = false;
+	bool shader_float16                            = false;
 	bool draw_indirect_first_instance              = false;
 
 	// Vulkan 1.1 features.
@@ -65,6 +66,7 @@ struct DeviceFacts {
 	// The device keeps signed zero, infinity and NaN in 64-bit float operations
 	// (VkPhysicalDeviceVulkan12Properties::shaderSignedZeroInfNanPreserveFloat64).
 	bool float64_preserves_special_values = false;
+	bool float16_preserves_special_values = false;
 
 	// Vulkan 1.3 features.
 	bool robust_image_access = false;

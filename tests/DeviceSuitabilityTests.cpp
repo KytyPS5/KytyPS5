@@ -83,6 +83,7 @@ DeviceFacts FullFacts() {
 	f.tessellation_shader                             = true;
 	f.shader_int64                                    = true;
 	f.shader_float64                                  = true;
+	f.shader_float16                                  = true;
 	f.storage_buffer_16bit_access                     = true;
 	f.sampler_mirror_clamp_to_edge                    = true;
 	f.timeline_semaphore                              = true;
@@ -95,6 +96,7 @@ DeviceFacts FullFacts() {
 	f.shader_buffer_int64_atomics                     = true;
 	f.shader_shared_int64_atomics                     = true;
 	f.float64_preserves_special_values                = true;
+	f.float16_preserves_special_values                = true;
 	f.robust_image_access                             = true;
 	f.dynamic_rendering                               = true;
 	f.synchronization2                                = true;
@@ -350,6 +352,15 @@ void TestFloat64NeedsSpecialValues() {
 	      "Float64 that loses signed zero, infinity or NaN must not count");
 }
 
+void TestFloat16NeedsSpecialValues() {
+	auto facts                             = FullFacts();
+	facts.float16_preserves_special_values = false;
+	const auto decision                    = EvaluateDeviceSuitability(facts, kRequiredExtensions);
+	Check(decision.Accepted(), "Float16 is optional");
+	Check(!decision.capabilities.float16,
+	      "Float16 that loses signed zero, infinity or NaN must not count");
+}
+
 void TestEveryMandatoryFeatureRejectsByName() {
 	struct Case {
 		bool DeviceFacts::* field;
@@ -427,6 +438,7 @@ int main() {
 	TestCapabilityNeedsBothFeatureAndExtension();
 	TestSharedInt64AtomicsNeedExplicitWorkgroupLayout();
 	TestFloat64NeedsSpecialValues();
+	TestFloat16NeedsSpecialValues();
 	TestMoltenVkAppleGpuGetsVertexSubgroups();
 	TestVertexSubgroupProbeSamples();
 	TestEveryMandatoryFeatureRejectsByName();

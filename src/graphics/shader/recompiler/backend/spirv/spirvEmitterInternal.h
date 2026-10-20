@@ -114,7 +114,8 @@ struct EmitterState {
 		    input_info.compute != nullptr && input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
-		soft_float64 = program.info.float64 && !host.capabilities.float64;
+		soft_float64   = program.info.float64 && !host.capabilities.float64;
+		native_float16 = program.info.packed_float16 && host.capabilities.float16;
 	}
 
 	Builder                                          builder;
@@ -143,6 +144,9 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          u32_vector_types {};
 	std::array<uint32_t, 3>                          i32_vector_types {};
 	std::array<uint32_t, 3>                          f32_vector_types {};
+	// Packed FP16 runs on two-lane half vectors (TypeF16x2) when the host has native FP16.
+	bool                                             native_float16 = false;
+	uint32_t                                         f16x2_type     = 0;
 	std::array<uint32_t, 6>                          tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
 	uint32_t                                         tess_patch_base     = 0;

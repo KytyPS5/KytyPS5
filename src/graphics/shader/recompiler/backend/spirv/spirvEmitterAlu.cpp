@@ -125,6 +125,89 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	return result;
 }
 
+namespace {
+
+uint32_t TypeF16x2(EmitterState& state) {
+	if (state.f16x2_type == 0) {
+		const auto half  = state.builder.Type(spv::OpTypeFloat, 16);
+		state.f16x2_type = state.builder.Type(spv::OpTypeVector, half, 2);
+	}
+	return state.f16x2_type;
+}
+
+uint32_t BitcastTo(EmitterState& state, uint32_t type, uint32_t value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, type, result, value);
+	return result;
+}
+
+// Lane `high` of a packed pair as F32, as the guest's lane reads give it (ConvertF32F16).
+uint32_t HalfLaneF32(EmitterState& state, uint32_t packed, bool high) {
+	return EmitF16BitsToF32(state, high ? EmitShiftRightLogical32(state, packed,
+	                                                              ConstantU32(state, 16))
+	                                    : packed);
+}
+
+uint32_t PackLanes(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, low, high);
+	return EmitPackHalf2x16(state, pair);
+}
+
+// A packed FP16 operation: native on two-lane half vectors, or (without native FP16) each lane
+// through F32 and back, as the translator did before these operations existed.
+template <typename Native, typename Lane>
+uint32_t PackedF16(EmitterState& state, std::initializer_list<uint32_t> args, Native native,
+                   Lane lane) {
+	if (state.native_float16) {
+		std::array<uint32_t, 3> halves {};
+		size_t                  index = 0;
+		for (const auto arg: args) halves[index++] = BitcastTo(state, TypeF16x2(state), arg);
+		return BitcastTo(state, TypeU32(state), native(halves));
+	}
+	std::array<uint32_t, 2> lanes {};
+	for (const bool high: {false, true}) {
+		std::array<uint32_t, 3> values {};
+		size_t                  index = 0;
+		for (const auto arg: args) values[index++] = HalfLaneF32(state, arg, high);
+		lanes[high ? 1 : 0] = lane(values);
+	}
+	return PackLanes(state, lanes[0], lanes[1]);
+}
+
+uint32_t NativeF16x2(EmitterState& state, spv::Op op, uint32_t a, uint32_t b) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(op, TypeF16x2(state), result, a, b);
+	MarkNoContraction(state, result);
+	return result;
+}
+
+} // namespace
+
+uint32_t EmitPackedFPAdd16(EmitterState& state, uint32_t a, uint32_t b) {
+	return PackedF16(
+	    state, {a, b}, [&](const auto& h) { return NativeF16x2(state, spv::OpFAdd, h[0], h[1]); },
+	    [&](const auto& v) { return EmitFPAdd32(state, v[0], v[1]); });
+}
+
+uint32_t EmitPackedFPMul16(EmitterState& state, uint32_t a, uint32_t b) {
+	return PackedF16(
+	    state, {a, b}, [&](const auto& h) { return NativeF16x2(state, spv::OpFMul, h[0], h[1]); },
+	    [&](const auto& v) { return EmitFPMul32(state, v[0], v[1]); });
+}
+
+uint32_t EmitPackedFPFma16(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	return PackedF16(
+	    state, {a, b, c},
+	    [&](const auto& h) {
+		    const auto result = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
+		                              GLSLstd450Fma, h[0], h[1], h[2]);
+		    return result;
+	    },
+	    [&](const auto& v) { return EmitFPFma32(state, v[0], v[1], v[2]); });
+}
+
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	if (state.host.faults.no_contraction_is_slow) {
 		// The marks below are slow on this host. So the product goes to the sum through the

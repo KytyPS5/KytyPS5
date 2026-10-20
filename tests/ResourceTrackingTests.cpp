@@ -4890,6 +4890,7 @@ void TestSharedAppendSelectorBounds() {
   }
 }
 
+/// Verifies compute-fill recognition and rejects extra stores or incompatible control flow.
 void TestComputeBufferFill() {
   struct Options {
     bool scalar = false;
@@ -5001,6 +5002,8 @@ void TestComputeBufferFill() {
   Run({.clean = true, .branch = true});
 }
 
+/// Checks the captured atomic/header layout against enumerated indexed writes.
+/// Covers wrapped offsets, multiple writers, and conservative unsupported-mode fallbacks.
 void TestIndexedWriteFootprints() {
   // PPSA01342 shader 72c9c6d90df9ab3d reads a loop count at byte zero,
   // while BUFFER_ATOMIC_ADD writes a field at byte 24 of indexed records.
@@ -5060,6 +5063,7 @@ void TestIndexedWriteFootprints() {
   }
 }
 
+/// Verifies that equivalent buffer sources share dense tracked descriptor bindings.
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -8727,8 +8731,10 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
+/// Runs the resource-tracking regressions and reports the failing case on exceptions.
 int main() {
   try {
+    /// Runs one regression and prefixes any exception with its registered test name.
     const auto Run = [](const char *name, auto test) {
       try {
         test();

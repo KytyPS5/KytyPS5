@@ -3743,6 +3743,8 @@ private:
 		}
 	}
 
+	/// Interns a buffer descriptor source and merges this instruction into its metadata.
+	/// @return The dense resource index, or UINT32_MAX if the buffer budget is exhausted.
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -3761,6 +3763,9 @@ private:
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
+	/// Accumulates access flags and supported constant-offset write patterns.
+	/// Any unsupported write marks the whole resource proof as unknown, so later
+	/// overlap checks cannot rely on the remaining supported instructions alone.
 	static void Merge(BufferResource& resource, const MemoryInfo& memory, const Inst& inst,
 	                  uint32_t pc) {
 		const auto op            = inst.GetOpcode();
@@ -3778,6 +3783,7 @@ private:
 			}
 			const auto offset    = inst.Arg(2).Resolve();
 			const auto soffset   = inst.Arg(3).Resolve();
+			/// Accepts only resolved U32 literals suitable for modular byte-offset arithmetic.
 			const auto immediate = [](Value value) {
 				return value.IsImmediate() && value.GetType() == Type::U32;
 			};
@@ -3917,6 +3923,8 @@ private:
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
 	}
 
+	/// Resolves a memory instruction into tracked resources and records binding patches.
+	/// Buffer instructions retain their operands for write-pattern analysis.
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect) {

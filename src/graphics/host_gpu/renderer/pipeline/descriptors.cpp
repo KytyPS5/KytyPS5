@@ -894,6 +894,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+/// Validates captured scalar reads against bound writes and commits native descriptors.
+/// Captured scalar reads may pass an overlapping binding only when its write-pattern proof
+/// establishes disjoint bytes; invalid ranges and unproven overlaps remain fatal.
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,

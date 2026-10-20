@@ -146,6 +146,16 @@ struct BufferResource {
 	std::vector<std::pair<uint32_t, uint32_t>> indexed_write_patterns;
 	bool                                       unknown_write_pattern = false;
 
+	/// Conservatively tests a guest read against writes within this buffer binding.
+	/// The caller validates the guest ranges before using this result as a proof.
+	/// Supported raw writes use byte residues modulo a power-of-two stride; this
+	/// remains valid when 32-bit index arithmetic wraps. Unsupported patterns or
+	/// address modes retain the full-binding overlap result.
+	/// @param address Guest base address of the resolved buffer binding.
+	/// @param size Size in bytes of that binding.
+	/// @param read_address Guest base address of the scalar read.
+	/// @param read_size Size in bytes of the scalar read.
+	/// @return True if any write may overlap the read; false only when disjoint.
 	[[nodiscard]] bool WritesOverlap(uint64_t address, uint64_t size, uint64_t read_address,
 	                                 uint64_t read_size) const {
 		if (!written || size == 0 || read_size == 0) return false;
@@ -176,6 +186,7 @@ struct BufferResource {
 		return true;
 	}
 
+	/// Compares descriptor state, including the accumulated write-pattern proof.
 	bool operator==(const BufferResource& other) const = default;
 };
 

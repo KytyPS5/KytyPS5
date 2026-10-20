@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/Reg.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -75,7 +76,11 @@ bool IsRegister(const Decoder::Operand& operand, Decoder::OperandKind kind, uint
 
 bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
 	switch (operand.kind) {
-		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
+		case Decoder::OperandKind::Sgpr:
+			// Trap temporaries decode into scalar slots past the SGPR file; report the
+			// hardware operand code so VCC_LO/HI (106/107) cannot collide with TTMP0/1.
+			code = operand.reg >= IR::NumSgprs ? operand.reg - IR::NumSgprs + 108u : operand.reg;
+			return true;
 		case Decoder::OperandKind::VccLo: code = 106u; return true;
 		case Decoder::OperandKind::VccHi: code = 107u; return true;
 		case Decoder::OperandKind::M0: code = 124u; return true;

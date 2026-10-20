@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
@@ -110,11 +111,17 @@ bool IsDecodedSgpr(const Decoder::Operand& op) {
 	       op.kind == Decoder::OperandKind::VccHi;
 }
 
+// Scalar tracking uses hardware operand codes so TTMP0/1 cannot collide with
+// VCC_LO/HI. Trap slots past the SGPR file map back to codes 108-123.
+uint32_t ScalarSlotToCode(uint32_t slot) {
+	return slot >= IR::NumSgprs ? slot - IR::NumSgprs + 108u : slot;
+}
+
 uint32_t DecodedSgprReg(const Decoder::Operand& op) {
 	switch (op.kind) {
 		case Decoder::OperandKind::VccLo: return 106u;
 		case Decoder::OperandKind::VccHi: return 107u;
-		default: return op.reg;
+		default: return ScalarSlotToCode(op.reg);
 	}
 }
 
@@ -130,7 +137,7 @@ uint32_t EmbeddedFetchDstSize(const Decoder::Instruction& inst) {
 	return inst.opcode == Decoder::Opcode::V_MAD_U64_U32 ? 2u : DecodedDstSize(inst);
 }
 
-void ClearEmbeddedFetchSgprs(std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
+void ClearEmbeddedFetchSgprs(std::array<EmbeddedFetchSgprInfo, 128>& sgprs,
                              const Decoder::Operand& dst, uint32_t size) {
 	if (!IsDecodedSgpr(dst)) {
 		return;
@@ -141,7 +148,7 @@ void ClearEmbeddedFetchSgprs(std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
 	}
 }
 
-bool TryDecodedOperandConstant(const std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
+bool TryDecodedOperandConstant(const std::array<EmbeddedFetchSgprInfo, 128>& sgprs,
                                const Decoder::Operand& op, uint32_t& value) {
 	switch (op.kind) {
 		case Decoder::OperandKind::LiteralConstant:
@@ -158,7 +165,7 @@ bool TryDecodedOperandConstant(const std::array<EmbeddedFetchSgprInfo, 108>& sgp
 	return false;
 }
 
-bool TryDecodedSmemOffset(const std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
+bool TryDecodedSmemOffset(const std::array<EmbeddedFetchSgprInfo, 128>& sgprs,
                           const Decoder::Instruction& inst, uint32_t& raw_offset) {
 	uint32_t base = 0;
 	if (!TryDecodedOperandConstant(sgprs, inst.src1, base)) {
@@ -224,7 +231,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 	const int attrib_reg = input_info.fetch_attrib_reg + shift_regs;
 	const int buffer_reg = input_info.fetch_buffer_reg + shift_regs;
 
-	std::array<EmbeddedFetchSgprInfo, 108> sgprs {};
+	std::array<EmbeddedFetchSgprInfo, 128> sgprs {}; // Full scalar operand namespace 0-127.
 	std::array<bool, 256>                 vgpr_is_index {};
 	EmbeddedFetchVectorLanes               vector_lanes;
 	const bool                             track_vector_lanes =
@@ -505,7 +512,9 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		if (inst == nullptr) return value;
 		uint32_t code = UINT32_MAX;
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::GetScalarRegister: code = static_cast<uint32_t>(inst->Arg(0).ScalarRegister()); break;
+			case ValueOpcode::GetScalarRegister:
+				code = ScalarSlotToCode(static_cast<uint32_t>(inst->Arg(0).ScalarRegister()));
+				break;
 			case ValueOpcode::GetVccLo: code = 106u; break;
 			case ValueOpcode::GetVccHi: code = 107u; break;
 			default: break;
@@ -541,7 +550,9 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 				Value value;
 				switch (inst.GetOpcode()) {
 					case ValueOpcode::SetScalarRegister:
-						destination = static_cast<uint32_t>(inst.Arg(0).ScalarRegister()); value = inst.Arg(1); break;
+						destination = ScalarSlotToCode(static_cast<uint32_t>(inst.Arg(0).ScalarRegister()));
+						value       = inst.Arg(1);
+						break;
 					case ValueOpcode::SetVccLo: destination = 106u; value = inst.Arg(0); break;
 					case ValueOpcode::SetVccHi: destination = 107u; value = inst.Arg(0); break;
 					default: break;

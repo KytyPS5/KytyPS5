@@ -1381,7 +1381,11 @@ void TestNodesMatchWalker() {
     auto program = TapeProgram();
     test.change(program);
     auto plan = ExtractResourcePlan(program);
-    plan.srt_tape = nullptr;
+    if (plan.srt_tape != nullptr) {
+      // A tape plan gets no nodes; without its tape it is walked, so it gets them here.
+      plan.srt_tape = nullptr;
+      plan.srt_nodes = SrtNodes::Build(plan);
+    }
     if (plan.srt_nodes == nullptr) {
       std::fprintf(stderr, "ResourceMaterializationTests: case: %s\n", test.name);
       Check(false, "a plan the walker walks got no nodes");

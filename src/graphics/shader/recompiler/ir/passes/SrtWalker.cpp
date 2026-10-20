@@ -907,11 +907,8 @@ private:
 	using Kind = SrtNodes::Kind;
 
 	uint32_t Constant(Value value) {
-		for (size_t index = 0; index < m_nodes->m_constant_values.size(); ++index) {
-			const auto& known = m_nodes->m_constant_values[index];
-			if (known.GetType() == value.GetType() && known == value) {
-				return static_cast<uint32_t>(index) | SrtNodes::ConstantBit;
-			}
+		if (const auto found = m_nodes->FindConstant(value); found != SrtNodes::NoRef) {
+			return found;
 		}
 		SrtNodes::Constant constant {};
 		constant.ok = ImmediateBits(value, constant.bits);
@@ -1031,6 +1028,7 @@ private:
 		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
 		if (handle == nullptr || handle->NumArgs() < 2u) return false;
 		if (op == ValueOpcode::LoadBufferU32) {
+			if (inst.NumArgs() < 5u) return false;
 			const auto guard = inst.Arg(4).Resolve();
 			node.arity |= SrtNodes::ReadVector;
 			if (guard.IsImmediate()) node.arity |= SrtNodes::ReadGuardImm;
@@ -1056,6 +1054,15 @@ private:
 	SrtNodes*           m_nodes = nullptr;
 };
 
+uint32_t SrtNodes::FindConstant(Value value) const {
+	for (size_t index = 0; index < m_constant_values.size(); ++index) {
+		if (m_constant_values[index] == value) {
+			return static_cast<uint32_t>(index) | ConstantBit;
+		}
+	}
+	return NoRef;
+}
+
 std::shared_ptr<const SrtNodes> SrtNodes::Build(const ResourcePlan& program) {
 	return SrtNodesBuilder(program).Build();
 }
@@ -1065,18 +1072,21 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
     : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
       m_session(this),
       m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {
-	m_nodes = SrtNodes::Enabled() ? program.srt_nodes.get() : nullptr;
+	// A walker delegates to its clean evaluator by node: both use nodes, or neither does.
+	m_nodes = clean_evaluator != nullptr ? clean_evaluator->m_nodes
+	          : SrtNodes::Enabled()      ? program.srt_nodes.get()
+	                                     : nullptr;
 }
 
 SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
-                     SrtWalker* clean_evaluator)
+                     SrtWalker* clean_evaluator, uint32_t active_ref)
     : m_program(parent.m_program), m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
                     (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {
 	m_nodes      = parent.m_nodes;
-	m_active_ref = RefOf(m_active_mask);
+	m_active_ref = active_ref != SrtNodes::NoRef ? active_ref : RefOf(m_active_mask);
 }
 
 SrtWalker::~SrtWalker() {
@@ -1119,13 +1129,7 @@ uint32_t SrtWalker::RefOf(Value value) const {
 		                                                                         : SrtNodes::NoRef;
 	}
 	if (value.IsEmpty()) return SrtNodes::NoRef;
-	for (size_t index = 0; index < m_nodes->m_constant_values.size(); ++index) {
-		const auto& known = m_nodes->m_constant_values[index];
-		if (known.GetType() == value.GetType() && known == value) {
-			return static_cast<uint32_t>(index) | SrtNodes::ConstantBit;
-		}
-	}
-	return SrtNodes::NoRef;
+	return m_nodes->FindConstant(value);
 }
 
 Value SrtWalker::ValueOf(uint32_t ref) const {
@@ -1487,8 +1491,8 @@ bool SrtWalker::EvaluateNode(uint32_t index, uint64_t& result) {
 				return EvaluateRef(node.args[0], result);
 			}
 			const auto mask = ValueOf(node.args[1]);
-			SrtWalker  clean_active(*this, mask, true);
-			SrtWalker  active(*this, mask, false, &clean_active);
+			SrtWalker  clean_active(*this, mask, true, nullptr, node.args[1]);
+			SrtWalker  active(*this, mask, false, &clean_active, node.args[1]);
 			return active.EvaluateRef(node.args[0], result);
 		}
 		case Kind::ExtractU64:
@@ -1527,7 +1531,7 @@ bool SrtWalker::EvaluateNode(uint32_t index, uint64_t& result) {
 			}
 			if (!left) {
 				SrtWalker active(m_clean_evaluator != nullptr ? *m_clean_evaluator : *this,
-				                 ValueOf(node.args[0]));
+				                 ValueOf(node.args[0]), false, nullptr, node.args[0]);
 				if (active.EvaluateRef(node.args[1], b) && b == 0u) {
 					result = 0u;
 					return true;

@@ -1143,8 +1143,25 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		vk::ClearValue clear {};
 	};
 	std::optional<Batch> batch;
-	const auto flush = [&] {
-		if (!batch) return;
+	// False when the record went stale before the batch was cleared: the batch was decided from it,
+	// so its slices are decided again from the real bytes.
+	const auto flush = [&]() -> bool {
+		if (!batch) return true;
+		if (known && m_buffer_cache.WriteWatches().Generation(known->watch) != known->generation) {
+			{
+				std::scoped_lock lock {m_lock};
+				const auto       fill = m_color_metadata_fills.find(range.address);
+				if (fill != m_color_metadata_fills.end()) {
+					DropColorMetadataFill(fill);
+				}
+			}
+			known.reset();
+			if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+				m_buffer_cache.ReadMemory(range.address, range.size, false);
+			}
+			read_back = true;
+			return false;
+		}
 		const auto address = range.address + slice_size * (first + batch->first);
 		const auto bytes   = slice_size * batch->count;
 		auto       clear   = batch->clear;
@@ -1204,8 +1221,19 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				}
 			}
 		}
+		return true;
 	};
-	for (uint32_t slice = 0; slice < count; slice++) {
+	// A batch decided from a record that went stale is decided again from its first slice; the
+	// record is dropped then, so the second time the bytes decide.
+	uint32_t slice = 0;
+	for (;;) {
+		if (slice == count) {
+			const auto restart = batch ? batch->first : count;
+			if (flush()) break;
+			batch.reset();
+			slice = restart;
+			continue;
+		}
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		// A slice this renderer consumed is CPU memory: its bytes are at hand and decide it.
@@ -1226,20 +1254,25 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			code = known_code;
 		}
 		vk::ClearValue clear {};
-		if (!DecodeColorClear(desc, code, clear.color) ||
-		    (!from_record && !SliceHoldsOnly(address, slice_size, code))) {
-			flush();
-			continue;
-		}
-		if (batch && batch->first + batch->count == slice &&
+		const bool clears = DecodeColorClear(desc, code, clear.color) &&
+		                    (from_record || SliceHoldsOnly(address, slice_size, code));
+		if (clears && batch && batch->first + batch->count == slice &&
 		    std::memcmp(&batch->clear.color, &clear.color, sizeof(clear.color)) == 0) {
 			batch->count++;
+			slice++;
 			continue;
 		}
-		flush();
-		batch = Batch {.first = slice, .count = 1, .clear = clear};
+		const auto restart = batch ? batch->first : slice;
+		if (!flush()) {
+			batch.reset();
+			slice = restart;
+			continue;
+		}
+		if (clears) {
+			batch = Batch {.first = slice, .count = 1, .clear = clear};
+		}
+		slice++;
 	}
-	flush();
 }
 
 void TextureCache::RefreshImage(ImageId id) {

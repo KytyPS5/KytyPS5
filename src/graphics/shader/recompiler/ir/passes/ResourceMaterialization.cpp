@@ -1247,7 +1247,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	plan.srt_tape = SrtTape::Build(plan);
 	CompileSrtWalker(plan);
-	plan.srt_nodes = SrtNodes::Build(plan);
+	// A plan with a tape never walks its values (MaterializeResources).
+	if (plan.srt_tape == nullptr) plan.srt_nodes = SrtNodes::Build(plan);
 	return plan;
 }
 
@@ -1266,6 +1267,8 @@ bool SameSnapshot(const ResourceSnapshot& a, const ResourceSnapshot& b) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// The check walks twice, so the runtime's readers see every read twice. Tape plans have no
+	// nodes and are not checked here (TestTapeMatchesWalker covers the tape).
 	if (!SrtNodes::Verify() || program.srt_nodes == nullptr || !SrtNodes::Enabled()) {
 		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
 	}

@@ -129,7 +129,6 @@ private:
 	// What SrtWalker::EvaluateInst does for the value.
 	enum class Kind : uint8_t {
 		Fail,            // never evaluates
-		Exit,            // the walker stops the emulator (a malformed value)
 		Pure,            // args[0..arity) through ApplyPure
 		UserData,        // aux: user data index
 		ShaderBase,
@@ -167,6 +166,9 @@ private:
 		bool     ok   = false;
 	};
 
+	// The constant equal to `value`, or NoRef.
+	[[nodiscard]] uint32_t FindConstant(Value value) const;
+
 	std::vector<Node>        m_nodes;
 	std::vector<uint32_t>    m_extra;
 	std::vector<Constant>    m_constants;
@@ -194,8 +196,9 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	// `active_ref`: the mask's node reference, when the caller has it (SrtNodes::NoRef: found).
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
-	          SrtWalker* clean_evaluator = nullptr);
+	          SrtWalker* clean_evaluator = nullptr, uint32_t active_ref = UINT32_MAX);
 	ResourcePlan::EvaluationContext& AcquireContext();
 	void ResetUnknowns();
 	bool EvaluateWide(Value value, uint64_t& result);

@@ -466,8 +466,21 @@ jobs:
       contents: write
     env:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      HAS_RELEASE_APP: ${{ vars.RELEASE_APP_ID != '' }}
 
     steps:
+      # The Actions token may not tag a commit whose workflows differ from the default
+      # branch, so when a release app is set up the release is made with its token
+      - name: Get release app token
+        id: app_token
+        if: env.HAS_RELEASE_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Download Windows build
         if: needs.windows.result == 'success'
         uses: actions/download-artifact@v4
@@ -524,9 +537,7 @@ jobs:
       - name: Create release
         shell: bash
         env:
-          # The Actions token may not tag a commit whose workflows differ from the default
-          # branch, so a branch that changes them releases with a token allowed to
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
           RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           assets=()

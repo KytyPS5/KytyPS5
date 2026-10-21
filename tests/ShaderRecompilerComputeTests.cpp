@@ -7276,10 +7276,8 @@ public:
         written_chain.info.UpdateSize();
         const auto written_chain_image = texture_cache.FindImage(written_chain);
         (void)texture_cache.FindTexture(written_chain_image, written_chain);
-        vk::ClearColorValue written_clear {};
-        for (auto& channel: written_clear.uint32) {
-          channel = written_value;
-        }
+        vk::ClearValue written_clear{};
+        std::fill_n(written_clear.color.uint32.data(), 4, written_value);
         TextureCacheTestAccess::ClearImage(
             texture_cache, scheduler.Current(), written_chain_image,
             vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1},
@@ -7298,7 +7296,8 @@ public:
         Require(name, "idle GPU-written chain replaced by a one-level texture",
                 written_one_level_image != written_chain_image &&
                     !TextureCacheTestAccess::Contains(texture_cache, written_chain_image) &&
-                    texture_cache.FindImageFromRange(base + written_offset, chain_row) ==
+                    texture_cache.FindImageFromRange(base + written_offset, chain_row,
+                                                     false) ==
                         written_one_level_image &&
                     ReadCachedTexel(name, context, written_one_level_image, {},
                                     {chain_width, 1, 1}) ==

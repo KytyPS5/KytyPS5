@@ -96,7 +96,17 @@ bool UpdateChecker::IsSupported() {
 
 void UpdateChecker::ShowPreviousResult(QWidget* parent) {
 	const auto directory = InstallDirectory();
-	QFile      result(QDir(directory).filePath(QStringLiteral(".kyty-update-result")));
+	if (!directory.isEmpty()) {
+		// The helper cannot delete its own executable on Windows, so its workspace is
+		// removed by the next launcher start.
+		const QDir install(directory);
+		for (const auto& name:
+		     install.entryList({QStringLiteral(".kyty-update-??????")},
+		                       QDir::Dirs | QDir::Hidden | QDir::NoSymLinks | QDir::NoDotAndDotDot)) {
+			QDir(install.filePath(name)).removeRecursively();
+		}
+	}
+	QFile result(QDir(directory).filePath(QStringLiteral(".kyty-update-result")));
 	if (directory.isEmpty() || !result.open(QIODevice::ReadOnly)) {
 		return;
 	}

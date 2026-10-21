@@ -469,26 +469,37 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});
 	if (decoded == m_decoded_textures.end()) {
-		if (m_decoded_textures.size() >= MaxDecodedTextures) {
-			m_decoded_textures.clear();
-		}
 		auto texture = DecodeTexture(resource, value);
 		decoded = m_decoded_textures.emplace(TextureDecodeKey {value, resource}, std::move(texture))
 		              .first;
 	}
-	// The texture cache can change the description, and a later decode can drop the table.
-	auto  desc          = decoded->second.desc;
-	auto& texture_cache = m_context.GetTextureCache();
-	if (decoded->second.null_descriptor) {
+	const auto& texture       = decoded->second;
+	auto&       texture_cache = m_context.GetTextureCache();
+	if (texture.null_descriptor) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
-	const auto pixel_format = decoded->second.pixel_format;
-	const auto view_format  = decoded->second.view_format;
+	// The image this texture found before, while the registered images are the same; it was
+	// checked for the binding then.
+	const auto& range = texture.desc.info.data;
+	if (texture.bound_image &&
+	    texture_cache.RangeUnchangedSince(range.address, range.size, texture.image_since)) {
+		texture_cache.ReuseImage(texture.found_image, texture.desc);
+		return {.image_id  = texture.bound_image,
+		        .texture   = &texture,
+		        .view_info = texture.desc.view_info,
+		        .type      = texture.desc.type};
+	}
+	const auto pixel_format = texture.pixel_format;
+	const auto view_format  = texture.view_format;
 	const bool storage      = resource.written;
 	const auto descriptor   = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const auto swizzle      = descriptor.DstSelXYZW();
 
-	auto       id                  = texture_cache.FindImage(desc, decoded->second.shader_conversion);
+	// The texture cache can move the view's base level or layer.
+	auto       desc                = texture.desc;
+	bool       plain               = false;
+	const auto found               = texture_cache.FindImage(desc, texture.shader_conversion, &plain);
+	auto       id                  = found;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -505,7 +516,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format, swizzle);
 	}
-	return {.image_id = id, .desc = std::move(desc)};
+	if (plain) {
+		texture.found_image   = found;
+		texture.bound_image   = id;
+		texture.image_since   = texture_cache.m_image_change_count;
+	}
+	return {.image_id = id, .texture = &texture, .view_info = desc.view_info, .type = desc.type};
 }
 
 DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
@@ -731,7 +747,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		BindImage(binding.image_id, binding.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
@@ -753,7 +769,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		if (pair.descriptor_index == UINT32_MAX) continue;
 		EXIT_IF(pair.descriptor_index != prepared.samplers.size());
 		prepared.samplers.push_back(
-		    make_sampler(pair.sampler, prepared.images.at(pair.image).desc.view_info.min_lod));
+		    make_sampler(pair.sampler, prepared.images.at(pair.image).view_info.min_lod));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -882,29 +898,31 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+			          images[i].type == TextureCache::BindingType::Storage);
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			        resource.mip_count != binding.view_info.level_count);
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
-				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
-				desc.view_info.level_count = 1;
+				auto view = binding.view_info;
+				view.base_level += mip;
+				view.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
-				desc.view_info.min_lod = 0;
-				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
+				view.min_lod = 0;
+				binding.mip_views.push_back(texture_cache.FindTexture(
+				    binding.image_id, binding.texture->desc.info, view, binding.type));
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
-			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			binding.image_view = texture_cache.FindTexture(
+			    binding.image_id, binding.texture->desc.info, binding.view_info, binding.type);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
-		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		const bool storage = binding.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 	}
 }
@@ -1066,10 +1084,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				continue;
 			}
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
-			const auto&                 view = binding.desc.view_info;
+			const auto&                 view = binding.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
-			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			const bool storage = binding.type == TextureCache::BindingType::Storage;
 			if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);

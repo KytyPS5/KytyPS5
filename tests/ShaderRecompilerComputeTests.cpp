@@ -100,6 +100,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <deque>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -347,7 +348,7 @@ struct TextureCacheTestAccess {
             address >> TextureCache::ImagePageTable::kPageBits)]
         .push_back(id);
     // As RegisterImage does: region answers kept before the change are stale.
-    cache.m_image_index_version++;
+    cache.NoteImageChange(address, 1);
   }
 
   static bool RemovePageOwner(TextureCache &cache, uint64_t address,
@@ -355,7 +356,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
-    cache.m_image_index_version++;
+    cache.NoteImageChange(address, 1);
     return owners != nullptr && owners->Erase(id);
   }
 
@@ -363,7 +364,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     cache.m_image_query_epoch = epoch;
     // The next query walks the pages, so it uses the epoch.
-    cache.m_image_index_version++;
+    for (auto &query : cache.m_region_queries) query.since = UINT64_MAX;
   }
 
   static uint32_t QueryEpoch(TextureCache &cache) {
@@ -427,6 +428,18 @@ struct TextureCacheTestAccess {
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
 };
+
+// A binding of `desc` made by hand. Its decoded texture lives as long as the test does.
+inline TextureBinding HandBinding(ImageId id, vk::ImageView view,
+                                  const TextureCache::ImageDesc &desc) {
+  static std::deque<DecodedTexture> textures;
+  textures.push_back({.desc = desc});
+  return {.image_id = id,
+          .image_view = view,
+          .texture = &textures.back(),
+          .view_info = desc.view_info,
+          .type = desc.type};
+}
 
 struct RenderExecutorTestAccess {
   static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
@@ -5920,15 +5933,15 @@ public:
       Require(name, "same descriptor and resource",
               first.image_id && again.image_id == first.image_id &&
                   again.image_view == first.image_view &&
-                  first.desc.type == BindingType::Texture && again.desc.type == BindingType::Texture,
+                  first.type == BindingType::Texture && again.type == BindingType::Texture,
               "a remembered decode gave another binding for the same descriptor and resource");
       const auto written = RenderExecutorTestAccess::ResolveTexture(executor, storage, value);
       Require(name, "same descriptor, other resource",
-              written.image_id && written.desc.type == BindingType::Storage,
+              written.image_id && written.type == BindingType::Storage,
               "a storage read of a remembered descriptor got the sampled decode");
       const auto back = RenderExecutorTestAccess::ResolveTexture(executor, sampled, value);
       Require(name, "first resource again",
-              back.desc.type == BindingType::Texture && back.image_id == first.image_id,
+              back.type == BindingType::Texture && back.image_id == first.image_id,
               "the sampled decode was replaced by the storage decode");
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -10831,10 +10844,10 @@ public:
             RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
         Require(name, "target sampled alias",
                 sampled.image_id == color.image_id &&
-                    sampled.desc.info.pitch == target.pitch &&
-                    sampled.desc.info.data.size == target.size &&
-                    sampled.desc.info.mip_layout == color.desc.info.mip_layout &&
-                    texture_cache.FindTexture(sampled.image_id, sampled.desc) != nullptr,
+                    sampled.Desc().info.pitch == target.pitch &&
+                    sampled.Desc().info.data.size == target.size &&
+                    sampled.Desc().info.mip_layout == color.desc.info.mip_layout &&
+                    texture_cache.FindTexture(sampled.image_id, sampled.Desc()) != nullptr,
                 "sampling the target changed its padded layout or created a second image");
         const auto expected = target.float16
                                   ? std::vector<u32>{0x00003c00u, 0x3c003c00u}
@@ -10859,16 +10872,16 @@ public:
             resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
             const auto one_d =
                 RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
-            const auto one_d_view = texture_cache.FindTexture(one_d.image_id, one_d.desc);
+            const auto one_d_view = texture_cache.FindTexture(one_d.image_id, one_d.Desc());
             const auto repeated =
                 RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
             Require(name, "1D sampled backing and reuse",
                     one_d.image_id != color.image_id && one_d_view != nullptr &&
-                        one_d.desc.view_info.type == vk::ImageViewType::e1D &&
+                        one_d.view_info.type == vk::ImageViewType::e1D &&
                         texture_cache.GetImage(one_d.image_id).backing.image_type ==
                             vk::ImageType::e1D &&
                         repeated.image_id == one_d.image_id &&
-                        texture_cache.FindTexture(repeated.image_id, repeated.desc) == one_d_view &&
+                        texture_cache.FindTexture(repeated.image_id, repeated.Desc()) == one_d_view &&
                         ReadCachedTexel(name, context, one_d.image_id) == expected,
                     "the 1D alias reused an incompatible backing or lost the rendered texel");
 
@@ -12361,7 +12374,8 @@ public:
         auto binding = RenderExecutorTestAccess::ResolveTexture(
             context.GetRenderExecutor(), input.stage.program->info.images[0],
             input.stage.resources->images[0]);
-        const auto target = textures.FindImage(binding.desc);
+        auto binding_desc = binding.Desc();
+        const auto target = textures.FindImage(binding_desc);
         TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), target,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
         processor.DispatchDirect(1, 1, test.groups, 0x41u);
@@ -13374,13 +13388,13 @@ public:
       resource.read = true;
       auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
       Require(name, "sampled metadata discovery",
-              binding.desc.info.extent == vk::Extent3D{3840, 2160, 1} &&
-                  binding.desc.info.data.size == color_size &&
-                  binding.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
-                  binding.desc.info.metadata.range.address == dcc_address &&
-                  binding.desc.info.metadata.range.size == metadata_size,
+              binding.Desc().info.extent == vk::Extent3D{3840, 2160, 1} &&
+                  binding.Desc().info.data.size == color_size &&
+                  binding.Desc().info.metadata.kind == ImageMetadataKind::Dcc &&
+                  binding.Desc().info.metadata.range.address == dcc_address &&
+                  binding.Desc().info.metadata.range.size == metadata_size,
               "captured sampled descriptor lost its DCC allocation");
-      Require(name, "sampled view", cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+      Require(name, "sampled view", cache.FindTexture(binding.image_id, binding.Desc()) != nullptr,
               "captured scene did not produce a sampled view");
       if (initial_size != metadata_size) {
         Require(name, "partial metadata coverage",
@@ -13388,8 +13402,9 @@ public:
                     std::vector<u32>{0x5a5a5a5au, 0x5a5a5a5au},
                 "an incomplete metadata fill cleared the whole scene");
         WriteMetadata(context, dcc_address, metadata_size, 0x40404040u);
-        binding.image_id = cache.FindImage(binding.desc);
-        (void)cache.FindTexture(binding.image_id, binding.desc);
+        auto binding_desc = binding.Desc();
+        binding.image_id = cache.FindImage(binding_desc);
+        (void)cache.FindTexture(binding.image_id, binding.Desc());
       }
       Require(name, "opaque black before first sample",
               ReadCachedTexel(name, context, binding.image_id, {3839, 2159, 0}) ==
@@ -13404,8 +13419,9 @@ public:
                               [](uint8_t byte) { return byte == 0xff; }),
               "the sampled clear retained native clear keys after materialization");
       WriteMetadata(context, dcc_address, metadata_size, 0x80808080u);
-      binding.image_id = cache.FindImage(binding.desc);
-      (void)cache.FindTexture(binding.image_id, binding.desc);
+      auto binding_desc = binding.Desc();
+      binding.image_id = cache.FindImage(binding_desc);
+      (void)cache.FindTexture(binding.image_id, binding.Desc());
       Require(name, "later sampled clear",
               ReadCachedTexel(name, context, binding.image_id) ==
                   std::vector<u32>{0x3c003c00u, 0x00003c00u},
@@ -13444,7 +13460,7 @@ public:
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       resource.written = true;
       const auto color = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
-      (void)cache.FindTexture(color.image_id, color.desc);
+      (void)cache.FindTexture(color.image_id, color.Desc());
       vk::ClearValue paint{};
       paint.color.float32 = std::array{0.375f, 0.f, 0.f, 0.f};
       TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
@@ -13454,7 +13470,7 @@ public:
       resource.read = true;
       resource.depth_compare = true;
       auto comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
-      (void)cache.FindTexture(comparison.image_id, comparison.desc);
+      (void)cache.FindTexture(comparison.image_id, comparison.Desc());
       const auto &depth = cache.GetImage(comparison.image_id);
       Require(name, "expanded DCC comparison alias",
               comparison.image_id != color.image_id &&
@@ -13470,7 +13486,7 @@ public:
       for (const u32 code : {0x40404040u, 0x80808080u}) {
         WriteMetadata(context, comparison_dcc, 0x1000, code);
         comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
-        (void)cache.FindTexture(comparison.image_id, comparison.desc);
+        (void)cache.FindTexture(comparison.image_id, comparison.Desc());
         Require(name, "DCC clear on a comparison backing",
                 ReadCachedTexel(name, context, comparison.image_id, {63, 63, 0}) ==
                     std::vector<u32>{code == 0x40404040u ? 0u : 0x3f800000u},
@@ -13602,7 +13618,7 @@ public:
         const auto binding = RenderExecutorTestAccess::ResolveTexture(
             executor, compiled.program.info.images.at(0), value);
         Image sampled;
-        sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+        sampled.view = cache.FindTexture(binding.image_id, binding.Desc());
         sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
         scheduler.Finish();
         auto output = CreateStorageBuffer(name, {}, 16);
@@ -13707,7 +13723,7 @@ public:
       const auto binding = RenderExecutorTestAccess::ResolveTexture(
           executor, compiled.program.info.images.at(0), value);
       Image sampled;
-      sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+      sampled.view = cache.FindTexture(binding.image_id, binding.Desc());
       sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
       scheduler.Finish();
       auto output = CreateStorageBuffer(name, {}, 16);
@@ -13745,11 +13761,11 @@ public:
               "native packed-float write lost the guest 10/11/11 bit layout");
 
       clear({16.f, 8.f, 4.f, 1.f});
-      auto alias_desc = binding.desc;
+      auto alias_desc = binding.Desc();
       alias_desc.info.guest_format = Prospero::BufferFormat::k11_11_10Float;
       alias_desc.view_info.mapping = {};
       Require(name, "same-format transform compatibility",
-              !alias_desc.info.IsCompatible(binding.desc.info),
+              !alias_desc.info.IsCompatible(binding.Desc().info),
               "equal Vulkan formats hid incompatible guest color transforms");
       const auto alias = cache.FindImage(alias_desc);
       (void)cache.FindTexture(alias, alias_desc);
@@ -13943,7 +13959,7 @@ public:
       std::copy_n(descriptor.fields, 8, value.dwords.begin());
       auto binding = RenderExecutorTestAccess::ResolveTexture(
           executor, compiled.program.info.images[0], value);
-      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      const auto view = cache.FindTexture(binding.image_id, binding.Desc());
       auto &image = cache.GetImage(binding.image_id);
       if (swizzle == DstSel(4, 4, 4, 1)) {
         const vk::ComponentMapping mapping{vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eR,
@@ -13965,7 +13981,7 @@ public:
       ordinary_resource.depth_compare = false;
       value.dwords[0] = static_cast<uint32_t>(ordinary_address >> 8u);
       auto ordinary = RenderExecutorTestAccess::ResolveTexture(executor, ordinary_resource, value);
-      (void)cache.FindTexture(ordinary.image_id, ordinary.desc);
+      (void)cache.FindTexture(ordinary.image_id, ordinary.Desc());
       auto &color = cache.GetImage(ordinary.image_id);
       Require(name, "ordinary R16", color.info.pixel_format == vk::Format::eR16Unorm,
               "ordinary R16 sampling unexpectedly acquired a depth format");
@@ -14013,7 +14029,7 @@ public:
 
       auto promoted = RenderExecutorTestAccess::ResolveTexture(
           executor, compiled.program.info.images[0], value);
-      sampled.view = cache.FindTexture(promoted.image_id, promoted.desc);
+      sampled.view = cache.FindTexture(promoted.image_id, promoted.Desc());
       auto &promoted_image = cache.GetImage(promoted.image_id);
       Require(name, "GPU color owner promotion", promoted.image_id != ordinary.image_id &&
                   promoted_image.info.pixel_format == vk::Format::eD16Unorm &&
@@ -14092,7 +14108,7 @@ public:
           executor, compiled.program.info.images[0], compiled.resources.images[0]);
       auto &cache = context.GetTextureCache();
       Image sampled;
-      sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+      sampled.view = cache.FindTexture(binding.image_id, binding.Desc());
       auto &image = cache.GetImage(binding.image_id);
       Require(test.name, "native depth mip backing",
               image.info.pixel_format == vk::Format::eD32Sfloat && image.backing.mip_levels == 2u,
@@ -14205,16 +14221,16 @@ public:
         std::copy_n(descriptor.fields, 8, value.dwords.begin());
         const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
         Image storage;
-        storage.view = cache.FindTexture(binding.image_id, binding.desc);
+        storage.view = cache.FindTexture(binding.image_id, binding.Desc());
         auto &image = cache.GetImage(binding.image_id);
         Require(name, "face view and backing", storage.view != nullptr &&
                     image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
                     image.info.bytes_per_block == 8 &&
                     image.info.resources.layers == face + 1 &&
                     image.backing.layers == face + 1 &&
-                    binding.desc.view_info.type == vk::ImageViewType::e2DArray &&
-                    binding.desc.view_info.base_layer == face &&
-                    binding.desc.view_info.layer_count == 1,
+                    binding.view_info.type == vk::ImageViewType::e2DArray &&
+                    binding.view_info.base_layer == face &&
+                    binding.view_info.layer_count == 1,
                 "cube face did not expand the array or select its own layer");
         image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
                       {}, scheduler.Current().Handle());
@@ -14580,7 +14596,7 @@ public:
           return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
         };
         auto raw_blocks = resolve_block_alias(false);
-        (void)texture_cache.FindTexture(raw_blocks.image_id, raw_blocks.desc);
+        (void)texture_cache.FindTexture(raw_blocks.image_id, raw_blocks.Desc());
         auto &raw_blocks_native = texture_cache.GetImage(raw_blocks.image_id);
         raw_blocks_native.Transit(vk::ImageLayout::eTransferDstOptimal,
                                   vk::AccessFlagBits2::eTransferWrite, {},
@@ -14596,13 +14612,13 @@ public:
         texture_cache.MarkGpuWritten(raw_blocks.image_id);
         auto compressed_blocks = resolve_block_alias(true);
         (void)texture_cache.FindTexture(compressed_blocks.image_id,
-                                        compressed_blocks.desc);
+                                        compressed_blocks.Desc());
         auto raw_blocks_again = resolve_block_alias(false);
         Require(name, "compressed atlas storage reuse",
                 compressed_blocks.image_id != raw_blocks.image_id &&
                     raw_blocks_again.image_id == compressed_blocks.image_id &&
                     texture_cache.FindTexture(raw_blocks_again.image_id,
-                                              raw_blocks_again.desc) != nullptr,
+                                              raw_blocks_again.Desc()) != nullptr,
                 "BC3 sampling replaced the GPU atlas on its next raw-block write");
         Require(name, "compressed atlas download",
                 TextureCacheTestAccess::TryDownload(texture_cache,
@@ -15116,13 +15132,13 @@ public:
       const auto fixed_storage_binding = RenderExecutorTestAccess::ResolveTexture(
           executor, fixed_storage_resource, fixed_storage_descriptor);
       Require(name, "fixed storage preserves physical mip layout",
-              fixed_storage_binding.desc.info.resources.levels == 4 &&
-                  fixed_storage_binding.desc.info.data.size == 0xb80000 &&
-                  fixed_storage_binding.desc.info.mip_layout[1].offset == 0x180000 &&
-                  fixed_storage_binding.desc.view_info.base_level == 1 &&
-                  fixed_storage_binding.desc.view_info.level_count == 1 &&
+              fixed_storage_binding.Desc().info.resources.levels == 4 &&
+                  fixed_storage_binding.Desc().info.data.size == 0xb80000 &&
+                  fixed_storage_binding.Desc().info.mip_layout[1].offset == 0x180000 &&
+                  fixed_storage_binding.view_info.base_level == 1 &&
+                  fixed_storage_binding.view_info.level_count == 1 &&
                   texture_cache.FindTexture(fixed_storage_binding.image_id,
-                                             fixed_storage_binding.desc) != nullptr,
+                                             fixed_storage_binding.Desc()) != nullptr,
               "IMAGE_STORE expanded an inaccessible mip and shifted physical storage");
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
@@ -15172,18 +15188,18 @@ public:
             executor, compiled.program.info.images.at(1), descriptor);
         Require(name, "rebased last mip",
                 query.image_id == store.image_id &&
-                    query.desc.info.data.size == 256 &&
-                    query.desc.info.resources.levels == 1 &&
-                    query.desc.view_info.base_level == 0 &&
-                    query.desc.view_info.level_count == 1 &&
-                    query.desc.view_info.min_lod == 0 &&
-                    store.desc.view_info.base_level == 0,
+                    query.Desc().info.data.size == 256 &&
+                    query.Desc().info.resources.levels == 1 &&
+                    query.view_info.base_level == 0 &&
+                    query.view_info.level_count == 1 &&
+                    query.view_info.min_lod == 0 &&
+                    store.view_info.base_level == 0,
                 "equivalent selected mip changed backing or relative LOD");
         Image sampled;
-        sampled.view = texture_cache.FindTexture(query.image_id, query.desc);
+        sampled.view = texture_cache.FindTexture(query.image_id, query.Desc());
         sampled.layout = vk::ImageLayout::eGeneral;
         Image storage_view;
-        storage_view.view = texture_cache.FindTexture(store.image_id, store.desc);
+        storage_view.view = texture_cache.FindTexture(store.image_id, store.Desc());
         storage_view.layout = vk::ImageLayout::eGeneral;
         texture_cache.GetImage(store.image_id).Transit(
             vk::ImageLayout::eGeneral,
@@ -15254,15 +15270,15 @@ public:
       overwide_mipped_binding.layout = vk::ImageLayout::eGeneral;
       sampled_overwide_binding.layout = vk::ImageLayout::eGeneral;
       Require(name, "dynamic storage mip views",
-              plain_mipped_binding.desc.view_info.base_level == 1 &&
-                  plain_mipped_binding.desc.view_info.level_count == 1 &&
+              plain_mipped_binding.view_info.base_level == 1 &&
+                  plain_mipped_binding.view_info.level_count == 1 &&
                   plain_mipped_binding.mip_views.empty() &&
                   plain_mipped_binding.image_view ==
                       texture_cache.FindTexture(plain_mipped_binding.image_id,
-                                                plain_mipped_binding.desc) &&
-                  mipped_binding.desc.info.resources.levels == 4 &&
-                  mipped_binding.desc.view_info.base_level == 1 &&
-                  mipped_binding.desc.view_info.level_count == 3 &&
+                                                plain_mipped_binding.Desc()) &&
+                  mipped_binding.Desc().info.resources.levels == 4 &&
+                  mipped_binding.view_info.base_level == 1 &&
+                  mipped_binding.view_info.level_count == 3 &&
                   mipped_binding.mip_views.size() == 3 &&
                   mipped_binding.mip_views[0] != nullptr &&
                   mipped_binding.mip_views[1] != nullptr &&
@@ -15282,9 +15298,9 @@ public:
                   overwide_mipped_storage.MaxMip() == 3 &&
                   overwide_mipped_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  overwide_mipped_binding.desc.info.resources.levels == 4 &&
-                  overwide_mipped_binding.desc.view_info.base_level == 1 &&
-                  overwide_mipped_binding.desc.view_info.level_count == 1 &&
+                  overwide_mipped_binding.Desc().info.resources.levels == 4 &&
+                  overwide_mipped_binding.view_info.base_level == 1 &&
+                  overwide_mipped_binding.view_info.level_count == 1 &&
                   overwide_mipped_binding.mip_views.empty() &&
                   overwide_mipped_binding.image_view ==
                       plain_mipped_binding.image_view,
@@ -15292,9 +15308,9 @@ public:
       Require(name, "over-wide sampled mip view",
               sampled_overwide_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  sampled_overwide_binding.desc.info.resources.levels == 5 &&
-                  sampled_overwide_binding.desc.view_info.base_level == 1 &&
-                  sampled_overwide_binding.desc.view_info.level_count == 4 &&
+                  sampled_overwide_binding.Desc().info.resources.levels == 5 &&
+                  sampled_overwide_binding.view_info.base_level == 1 &&
+                  sampled_overwide_binding.view_info.level_count == 4 &&
                   sampled_overwide_binding.mip_views.empty() &&
                   sampled_overwide_binding.image_view != nullptr,
               "sampled view lost addressable mips in the allocated tail");
@@ -15389,7 +15405,7 @@ public:
           const auto binding = RenderExecutorTestAccess::ResolveTexture(
               executor, lod_program.program.info.images[0], lod_descriptor);
           views[index] =
-              texture_cache.FindTexture(binding.image_id, binding.desc);
+              texture_cache.FindTexture(binding.image_id, binding.Desc());
           auto &image = texture_cache.GetImage(binding.image_id);
           image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::AccessFlagBits2::eShaderRead, {},
@@ -15405,7 +15421,7 @@ public:
                   ? sampler
                   : context.GetSamplerCache().GetSampler(
                         lod_sampler, lod_program.program.info.samplers[0].integer_border,
-                        binding.desc.view_info.min_lod);
+                        binding.view_info.min_lod);
           Dispatch(lod_test, lod_program, output, nullptr, &sampled, nullptr,
                    nullptr, case_sampler);
           const auto result = ReadBuffer(lod_test.name, output, 1)[0];
@@ -15437,11 +15453,11 @@ public:
         executor.RebindImages(gather_bindings);
         const auto &gather_binding = gather_bindings.images[0];
         Require(lod_test.name, "dynamic sampled mip views",
-                gather_binding.desc.view_info.min_lod == 256u &&
+                gather_binding.view_info.min_lod == 256u &&
                     gather_binding.mip_views.size() == 4,
                 "dynamic gather lost the guest minimum or accessible mip range");
         for (uint32_t mip = 0; mip < 4; ++mip) {
-          auto single_mip = gather_binding.desc;
+          auto single_mip = gather_binding.Desc();
           single_mip.view_info.base_level = mip;
           single_mip.view_info.level_count = 1;
           single_mip.view_info.min_lod = 0;
@@ -15477,12 +15493,12 @@ public:
           RenderExecutorTestAccess::ResolveTexture(
               executor, srgb_storage_resource, srgb_storage_descriptor);
       const auto srgb_storage_view = texture_cache.FindTexture(
-          srgb_storage_binding.image_id, srgb_storage_binding.desc);
+          srgb_storage_binding.image_id, srgb_storage_binding.Desc());
       Require(name, "sRGB storage view",
               srgb_storage_view != nullptr &&
-                  srgb_storage_binding.desc.info.pixel_format ==
+                  srgb_storage_binding.Desc().info.pixel_format ==
                       vk::Format::eR8G8B8A8Srgb &&
-                  srgb_storage_binding.desc.view_info.format ==
+                  srgb_storage_binding.view_info.format ==
                       vk::Format::eR8G8B8A8Unorm &&
                   texture_cache.GetImage(srgb_storage_binding.image_id)
                           .backing.format == vk::Format::eR8G8B8A8Srgb,
@@ -15528,15 +15544,15 @@ public:
           RenderExecutorTestAccess::ResolveTexture(
               executor, sint_storage_resource, sint_storage_descriptor);
       const auto sint_storage_view = texture_cache.FindTexture(
-          sint_storage_binding.image_id, sint_storage_binding.desc);
+          sint_storage_binding.image_id, sint_storage_binding.Desc());
       Require(name, "PPSA06888 raw R32 SINT storage view",
               sint_storage_view != nullptr &&
-                  sint_storage_binding.desc.info.metadata.range ==
+                  sint_storage_binding.Desc().info.metadata.range ==
                       GuestRange{sint_metadata_address, 0x1000} &&
-                  sint_storage_binding.desc.info.data.size == 0x10000 &&
-                  sint_storage_binding.desc.info.pixel_format ==
+                  sint_storage_binding.Desc().info.data.size == 0x10000 &&
+                  sint_storage_binding.Desc().info.pixel_format ==
                       vk::Format::eR32Sint &&
-                  sint_storage_binding.desc.view_info.format ==
+                  sint_storage_binding.view_info.format ==
                       vk::Format::eR32Uint &&
                   texture_cache.GetImage(sint_storage_binding.image_id)
                           .backing.format == vk::Format::eR32Sint,
@@ -15567,18 +15583,18 @@ public:
           RenderExecutorTestAccess::ResolveTexture(
               executor, narrowed_storage_resource, narrowed_storage_descriptor);
       const auto narrowed_storage_view = texture_cache.FindTexture(
-          narrowed_storage_binding.image_id, narrowed_storage_binding.desc);
+          narrowed_storage_binding.image_id, narrowed_storage_binding.Desc());
       const auto &narrowed_storage_image =
           texture_cache.GetImage(narrowed_storage_binding.image_id);
       Require(name, "narrowed 1D array storage view",
               narrowed_storage_view != nullptr &&
-                  narrowed_storage_binding.desc.info.type ==
+                  narrowed_storage_binding.Desc().info.type ==
                       Prospero::ImageType::kColor1D &&
-                  narrowed_storage_binding.desc.info.resources.layers == 2 &&
-                  narrowed_storage_binding.desc.view_info.type ==
+                  narrowed_storage_binding.Desc().info.resources.layers == 2 &&
+                  narrowed_storage_binding.view_info.type ==
                       vk::ImageViewType::e1D &&
-                  narrowed_storage_binding.desc.view_info.base_layer == 1 &&
-                  narrowed_storage_binding.desc.view_info.layer_count == 1 &&
+                  narrowed_storage_binding.view_info.base_layer == 1 &&
+                  narrowed_storage_binding.view_info.layer_count == 1 &&
                   narrowed_storage_image.backing.image_type ==
                       vk::ImageType::e1D,
               "non-array 1D specialization did not select the descriptor "
@@ -15793,12 +15809,8 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot split_snapshot;
       ShaderStageRuntime split_runtime{&split_program, &split_snapshot};
       split_bindings.runtime = &split_runtime;
-      split_bindings.images.push_back(
-          {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
-           split_storage_desc});
-      split_bindings.images.push_back(
-          {split_id, texture_cache.FindTexture(split_id, split_sampled_desc),
-           split_sampled_desc});
+      split_bindings.images.push_back(HandBinding(split_id, texture_cache.FindTexture(split_id, split_storage_desc), split_storage_desc));
+      split_bindings.images.push_back(HandBinding(split_id, texture_cache.FindTexture(split_id, split_sampled_desc), split_sampled_desc));
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), split_bindings));
       const auto &split_image = texture_cache.GetImage(split_id);
@@ -15845,8 +15857,7 @@ public:
       disjoint_depth.depth_compare_op = vk::CompareOp::eAlways;
       PreparedBindings disjoint_binding{};
       disjoint_binding.runtime = &sampled_runtime;
-      disjoint_binding.images.push_back(
-          {disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc});
+      disjoint_binding.images.push_back(HandBinding(disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc));
       RenderExecutorTestAccess::BindRenderTarget(executor, disjoint_depth_id);
       vk::ImageAspectFlags disjoint_feedback;
       std::array<PreparedBindings *, 1> disjoint_stages{&disjoint_binding};
@@ -15896,10 +15907,8 @@ public:
         ShaderStageRuntime depth_views_runtime{&depth_views_program, &depth_views_snapshot};
         PreparedBindings depth_views_binding{};
         depth_views_binding.runtime = &depth_views_runtime;
-        depth_views_binding.images.push_back(
-            {disjoint_depth_id, overlapping_view, overlapping_sampled_desc});
-        depth_views_binding.images.push_back(
-            {disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc});
+        depth_views_binding.images.push_back(HandBinding(disjoint_depth_id, overlapping_view, overlapping_sampled_desc));
+        depth_views_binding.images.push_back(HandBinding(disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc));
         RenderExecutorTestAccess::BindRenderTarget(executor, disjoint_depth_id);
         std::array<PreparedBindings *, 1> depth_views_stages{&depth_views_binding};
         vk::ImageAspectFlags depth_views_feedback;
@@ -16185,7 +16194,7 @@ public:
       auto sampled_depth_binding = RenderExecutorTestAccess::ResolveTexture(
           executor, sampled_depth_resource, sampled_depth_value);
       const auto sampled_depth_view = texture_cache.FindTexture(
-          sampled_depth_binding.image_id, sampled_depth_binding.desc);
+          sampled_depth_binding.image_id, sampled_depth_binding.Desc());
       const auto &sampled_depth_image =
           texture_cache.GetImage(sampled_depth_binding.image_id);
       const bool normalized_depth_view = std::ranges::any_of(
@@ -16198,15 +16207,15 @@ public:
       Require(
           name, "R32 uint depth-backed view",
           sampled_depth_binding.image_id == depth_only.image_id &&
-              sampled_depth_binding.desc.info.guest_format ==
+              sampled_depth_binding.Desc().info.guest_format ==
                   Prospero::BufferFormat::k32UInt &&
-              sampled_depth_binding.desc.info.pixel_format ==
+              sampled_depth_binding.Desc().info.pixel_format ==
                   vk::Format::eR32Uint &&
-              sampled_depth_binding.desc.view_info.format ==
+              sampled_depth_binding.view_info.format ==
                   vk::Format::eR32Uint &&
-              sampled_depth_binding.desc.view_info.aspect ==
+              sampled_depth_binding.view_info.aspect ==
                   vk::ImageAspectFlagBits::eColor &&
-              sampled_depth_binding.desc.view_info.usage ==
+              sampled_depth_binding.view_info.usage ==
                   vk::ImageUsageFlagBits::eSampled &&
               sampled_depth_image.info.pixel_format == vk::Format::eD32Sfloat &&
               sampled_depth_image.backing.format == vk::Format::eD32Sfloat &&
@@ -16610,11 +16619,11 @@ public:
           executor, copy_sample_program.program.info.images[0],
           copy_sample_value);
       const auto copy_sample_view = texture_cache.FindTexture(
-          copy_sample_binding.image_id, copy_sample_binding.desc);
+          copy_sample_binding.image_id, copy_sample_binding.Desc());
       Require(
           name, "copied depth sampled owner",
           copy_sample_binding.image_id == copy_destination.image_id &&
-              copy_sample_binding.desc.info.pixel_format ==
+              copy_sample_binding.Desc().info.pixel_format ==
                   vk::Format::eR32Sfloat,
           "R32 sampling did not reuse the GPU-written depth-copy destination");
       auto &copy_sample_image = texture_cache.GetImage(copy_destination.image_id);
@@ -16691,7 +16700,7 @@ public:
         const auto stencil_view = shared_image.FindView(stencil_view_info);
         auto& pixel_image = shared_bindings.pixel->images[0];
         pixel_image.image_view = stencil_view;
-        pixel_image.desc.view_info = stencil_view_info;
+        pixel_image.view_info = stencil_view_info;
         std::array<PreparedBindings *, 2> shared_stages{
             &shared_bindings.vertex[0], &*shared_bindings.pixel};
         vk::ImageAspectFlags shared_feedback;
@@ -16751,7 +16760,7 @@ public:
         value.dwords[3] = color ? 0x91b00facu : 0x91800204u;
         const auto binding = RenderExecutorTestAccess::ResolveTexture(
             executor, pooled_resource, value);
-        const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+        const auto view = texture_cache.FindTexture(binding.image_id, binding.Desc());
         if (color && !pooled_color_id) {
           pooled_color_id = binding.image_id;
         }
@@ -16762,7 +16771,7 @@ public:
                     texture_cache.GetImage(binding.image_id).backing.format ==
                         (color ? vk::Format::eA2B10G10R10UnormPack32
                                : vk::Format::eD32SfloatS8Uint) &&
-                    binding.desc.info.tile_mode ==
+                    binding.Desc().info.tile_mode ==
                         (color ? Prospero::TileMode::kRenderTarget
                                : Prospero::TileMode::kDepth),
                 "a changed tile family reused depth or repeated sampling lost its backing");
@@ -16867,13 +16876,13 @@ public:
               !TextureCacheTestAccess::Contains(texture_cache,
                                                 array_target_id) &&
               array_binding.images[0].image_view != nullptr &&
-              array_binding.images[0].desc.info.type ==
+              array_binding.images[0].Desc().info.type ==
                   Prospero::ImageType::kColor2D &&
-              array_binding.images[0].desc.info.resources ==
+              array_binding.images[0].Desc().info.resources ==
                   ImageSubresources{1, 2} &&
-              array_binding.images[0].desc.view_info.type ==
+              array_binding.images[0].view_info.type ==
                   vk::ImageViewType::e2DArray &&
-              array_binding.images[0].desc.view_info.layer_count ==
+              array_binding.images[0].view_info.layer_count ==
                   2 &&
               expanded_array.backing.layers == 2 &&
               expanded_array.IsGpuModified(),
@@ -17039,12 +17048,12 @@ public:
           name, "equal-footprint sample-count identity",
           resolved_colliding_msaa.image_id != expanded_array_id &&
               resolved_colliding_msaa.image_view != nullptr &&
-              resolved_colliding_msaa.desc.info.type ==
+              resolved_colliding_msaa.Desc().info.type ==
                   Prospero::ImageType::kColor2D &&
-              resolved_colliding_msaa.desc.info.resources ==
+              resolved_colliding_msaa.Desc().info.resources ==
                   ImageSubresources{1, 1} &&
-              resolved_colliding_msaa.desc.info.samples == 2 &&
-              resolved_colliding_msaa.desc.info.data.size == 0x20000 &&
+              resolved_colliding_msaa.Desc().info.samples == 2 &&
+              resolved_colliding_msaa.Desc().info.data.size == 0x20000 &&
               texture_cache.GetImage(resolved_colliding_msaa.image_id)
                       .backing.samples == 2 &&
               texture_cache.GetImage(expanded_array_id).backing.samples == 1 &&
@@ -17098,11 +17107,11 @@ public:
           msaa_target_view != nullptr &&
               resolved_msaa.image_id == msaa_target_id &&
               resolved_msaa.image_view != nullptr &&
-              resolved_msaa.desc.info.type == Prospero::ImageType::kColor2D &&
-              resolved_msaa.desc.info.resources == ImageSubresources{1, 1} &&
-              resolved_msaa.desc.info.samples == msaa_samples &&
-              resolved_msaa.desc.info.data.size == 0x40000 &&
-              resolved_msaa.desc.view_info.level_count == 1 &&
+              resolved_msaa.Desc().info.type == Prospero::ImageType::kColor2D &&
+              resolved_msaa.Desc().info.resources == ImageSubresources{1, 1} &&
+              resolved_msaa.Desc().info.samples == msaa_samples &&
+              resolved_msaa.Desc().info.data.size == 0x40000 &&
+              resolved_msaa.view_info.level_count == 1 &&
               texture_cache.GetImage(msaa_target_id).backing.samples ==
                   msaa_samples,
           "MSAA view fields did not resolve to the matching multisample "
@@ -17136,15 +17145,15 @@ public:
       Require(name, "MSAA array backing expansion",
               resolved_msaa_array.image_id != msaa_target_id &&
                   resolved_msaa_array.image_view != nullptr &&
-                  resolved_msaa_array.desc.info.type ==
+                  resolved_msaa_array.Desc().info.type ==
                       Prospero::ImageType::kColor2D &&
-                  resolved_msaa_array.desc.info.resources ==
+                  resolved_msaa_array.Desc().info.resources ==
                       ImageSubresources{1, 2} &&
-                  resolved_msaa_array.desc.info.samples == msaa_samples &&
-                  resolved_msaa_array.desc.info.data.size == 0x80000 &&
-                  resolved_msaa_array.desc.view_info.type ==
+                  resolved_msaa_array.Desc().info.samples == msaa_samples &&
+                  resolved_msaa_array.Desc().info.data.size == 0x80000 &&
+                  resolved_msaa_array.view_info.type ==
                       vk::ImageViewType::e2DArray &&
-                  resolved_msaa_array.desc.view_info.layer_count == 2 &&
+                  resolved_msaa_array.view_info.layer_count == 2 &&
                   texture_cache.GetImage(resolved_msaa_array.image_id)
                           .backing.layers == 2 &&
                   texture_cache.GetImage(resolved_msaa_array.image_id)
@@ -19926,7 +19935,7 @@ public:
         Require(name, "packed target sampled alias", binding.image_id == packed_target.image_id,
                 "sampling the packed target allocated a different image or lost the rendered data");
         Image sampled;
-        sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+        sampled.view = cache.FindTexture(binding.image_id, binding.Desc());
         sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
         scheduler.Finish();
         Dispatch(packed_read, packed_reader, packed_output, nullptr, &sampled,

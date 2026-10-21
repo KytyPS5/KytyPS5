@@ -73,6 +73,8 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// Size of the metadata surface registered at `address`; false if there is none.
+	[[nodiscard]] bool FindMeta(uint64_t address, uint64_t& size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -83,6 +85,7 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		uint64_t          size = 0; // Largest metadata range registered at this address.
 	};
 
 	struct OverlapResult {

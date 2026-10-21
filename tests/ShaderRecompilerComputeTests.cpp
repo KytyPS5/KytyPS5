@@ -297,6 +297,15 @@ struct TextureCacheTestAccess {
     }
   }
 
+  static void MakeIdle(TextureCache &cache, ImageId id) {
+    cache.m_slot_images[id].tick_accessed_last = 0;
+  }
+
+  static void RetireReplacedLayout(TextureCache &cache, ImageId cached, ImageId merged) {
+    std::lock_guard lock(cache.m_lock);
+    cache.RetireReplacedLayout(cached, merged);
+  }
+
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
@@ -7926,6 +7935,105 @@ public:
                         std::vector<u32>(chain_width, chain_low_value),
                 "an equal-size one-level texture reused a cached image with a different mip "
                 "layout");
+
+        // An idle GPU-written chain replaced by a one-level texture is retired, and its
+        // contents reach the new image instead of being dropped or left behind as a stale
+        // copy that range lookups or GC could download over newer data.
+        constexpr uint64_t written_offset = chain_offset + 0x400;
+        constexpr uint32_t written_value = 0x55555555u;
+        auto* written_memory = reinterpret_cast<uint32_t*>(memory + written_offset);
+        std::fill_n(written_memory, 2 * chain_row / sizeof(uint32_t), chain_low_value);
+        auto written_chain = two_level;
+        written_chain.info.data.address = base + written_offset;
+        written_chain.info.UpdateSize();
+        const auto written_chain_image = texture_cache.FindImage(written_chain);
+        (void)texture_cache.FindTexture(written_chain_image, written_chain);
+        vk::ClearColorValue written_clear {};
+        for (auto& channel: written_clear.uint32) {
+          channel = written_value;
+        }
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), written_chain_image,
+            vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1},
+            written_clear);
+        texture_cache.MarkGpuWritten(written_chain_image);
+        while (scheduler.CurrentTick() <= 64) {
+          scheduler.Flush();
+        }
+        TextureCacheTestAccess::MakeIdle(texture_cache, written_chain_image);
+
+        auto written_one_level = one_level;
+        written_one_level.info.data.address = base + written_offset;
+        written_one_level.info.UpdateSize();
+        const auto written_one_level_image = texture_cache.FindImage(written_one_level);
+        (void)texture_cache.FindTexture(written_one_level_image, written_one_level);
+        Require(name, "idle GPU-written chain replaced by a one-level texture",
+                written_one_level_image != written_chain_image &&
+                    !TextureCacheTestAccess::Contains(texture_cache, written_chain_image) &&
+                    texture_cache.FindImageFromRange(base + written_offset, chain_row) ==
+                        written_one_level_image &&
+                    ReadCachedTexel(name, context, written_one_level_image, {},
+                                    {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, written_value),
+                "a retired GPU-written chain was kept or its contents were lost");
+
+        // Retiring older GPU-written chains into a newer GPU-written image at the same address
+        // must leave the newer contents in place. The second retirement finds the newer image
+        // already buffer-modified by the first, so it must not publish its old contents over it.
+        // Two identical chains stand in for two older layouts, which FindImage would never keep
+        // side by side.
+        constexpr uint64_t ordered_offset = chain_offset + 0x800;
+        constexpr uint32_t older_value = 0x66666666u;
+        constexpr uint32_t newer_value = 0x77777777u;
+        auto* ordered_memory = reinterpret_cast<uint32_t*>(memory + ordered_offset);
+        std::fill_n(ordered_memory, 2 * chain_row / sizeof(uint32_t), chain_low_value);
+        auto ordered_chain = two_level;
+        ordered_chain.info.data.address = base + ordered_offset;
+        ordered_chain.info.UpdateSize();
+        auto ordered_one_level = one_level;
+        ordered_one_level.info.data.address = base + ordered_offset;
+        ordered_one_level.info.UpdateSize();
+        // Fills every level of an inserted image on the GPU and records it as GPU-written.
+        const auto insert_written = [&](const ImageInfo &info, uint32_t value) {
+          const auto id = TextureCacheTestAccess::InsertImage(texture_cache, info);
+          vk::ClearValue clear{};
+          std::fill_n(clear.color.uint32.data(), clear.color.uint32.size(), value);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), id,
+              vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0,
+                                         info.resources.levels, 0, 1},
+              clear);
+          texture_cache.MarkGpuWritten(id);
+          return id;
+        };
+        const ImageId older_chains[] = {insert_written(ordered_chain.info, older_value),
+                                        insert_written(ordered_chain.info, older_value)};
+        const auto newer_image = insert_written(ordered_one_level.info, newer_value);
+        for (const auto older_chain : older_chains) {
+          TextureCacheTestAccess::RetireReplacedLayout(texture_cache, older_chain, newer_image);
+        }
+        (void)texture_cache.FindTexture(newer_image, ordered_one_level);
+        Require(name, "retired older chains keep a newer image's contents",
+                !TextureCacheTestAccess::Contains(texture_cache, older_chains[0]) &&
+                    !TextureCacheTestAccess::Contains(texture_cache, older_chains[1]) &&
+                    ReadCachedTexel(name, context, newer_image, {}, {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, newer_value),
+                "an older retired chain was published over a newer GPU-written image");
+
+        // A GPU-written image that can't be downloaded, here a multisampled one, is still
+        // retired rather than left registered beside the image that replaces it.
+        constexpr uint64_t multisampled_offset = chain_offset + 0xc00;
+        constexpr uint32_t multisampled_samples = 2;
+        auto multisampled_info = one_level.info;
+        multisampled_info.data.address = base + multisampled_offset;
+        multisampled_info.samples = multisampled_samples;
+        multisampled_info.tile_mode = Prospero::TileMode::kRenderTarget;
+        multisampled_info.UpdateSize();
+        const auto multisampled_image = insert_written(multisampled_info, older_value);
+        TextureCacheTestAccess::RetireReplacedLayout(texture_cache, multisampled_image, {});
+        Require(name, "undownloadable replaced image",
+                !TextureCacheTestAccess::Contains(texture_cache, multisampled_image),
+                "a replaced image that couldn't be published was left registered");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

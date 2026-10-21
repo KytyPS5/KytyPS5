@@ -791,6 +791,36 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+// Frees a cached image that a request with a different guest layout replaces. Its GPU-written
+// contents are published to the buffer cache first, unless that could overwrite newer data.
+void TextureCache::RetireReplacedLayout(ImageId cached_id, ImageId merged_id) {
+	auto& cached = m_slot_images[cached_id];
+	auto* merged = merged_id ? &m_slot_images[merged_id] : nullptr;
+	if (cached.SafeToDownload()) {
+		// The idle replaced image is usually older than merged, so it publishes first and merged
+		// publishes over it. A buffer-modified merged already has newer bytes waiting in the
+		// buffer, and an undownloadable merged couldn't publish over the old ones.
+		const bool merged_wins_overlap =
+		    merged == nullptr ||
+		    (!merged->IsBufferModified() && (!merged->SafeToDownload() || CanDownload(*merged)));
+		if (merged_wins_overlap && BcAlias::Publish(*this, cached)) {
+			if (merged != nullptr) {
+				if (merged->SafeToDownload()) {
+					(void)BcAlias::Publish(*this, *merged);
+				}
+				merged->MarkBufferModified();
+			}
+		} else {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: dropping GPU contents of replaced image at 0x%016" PRIx64
+			           ", the replacing image has newer pending bytes or can't be downloaded\n",
+			           cached.info.data.address);
+		}
+	}
+	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	FreeImage(cached_id);
+}
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -828,17 +858,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// cached image cannot serve the request.
 		const bool shared_levels_differ =
 		    requested.resources.levels != cached.info.resources.levels &&
-		    requested.resources.layers == cached.info.resources.layers &&
 		    !SharedLevelsMatch(requested, cached.info);
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
 		                 cached.info.mip_layout.begin(), SameMipPlacement)) ||
 		    shared_levels_differ) {
-			// The request becomes a separate image. Retire an idle cached image only when it
-			// mirrors guest memory; GPU-written contents stay until texture GC downloads them.
-			if (safe_to_delete && !cached.IsGpuModified()) {
-				FreeImage(cached_id);
+			// The request becomes a separate image. An idle cached image is retired, so no stale
+			// copy is left for range lookups or texture GC to download later. Its GPU-written
+			// contents are published to the buffer cache first, so the new image uploads them.
+			if (safe_to_delete) {
+				RetireReplacedLayout(cached_id, merged_id);
 			}
 			return {merged_id};
 		}

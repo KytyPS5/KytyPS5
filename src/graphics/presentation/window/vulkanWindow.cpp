@@ -1005,15 +1005,12 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not find suitable device:%s", rejected_devices.c_str());
 	}
 
-	vk::PhysicalDeviceDriverProperties         driver_properties {};
 	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
 	vk::PhysicalDeviceProperties2              physical_device_properties {};
-	push_descriptor_properties.pNext = &driver_properties;
 	physical_device_properties.pNext = &push_descriptor_properties;
 	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
-	graphic_ctx.driver_id                  = driver_properties.driverID;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 

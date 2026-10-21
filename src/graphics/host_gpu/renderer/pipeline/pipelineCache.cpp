@@ -482,10 +482,11 @@ struct PipelineCache::ProgramCache {
 
 	explicit ProgramCache(GraphicContext& graphics)
 	    : graphics(graphics),
-	      // GLSL.std.450 does not order -0 below +0 in NMin/NMax; RADV runs them as v_min/v_max
-	      // with IEEE mode off, which gives the guest's NaN and signed-zero results.
-	      profile {.maintenance8         = graphics.maintenance8_enabled,
-		           .native_float_min_max = graphics.driver_id == vk::DriverId::eMesaRadv} {
+	      // AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	      profile {.maintenance8 = graphics.maintenance8_enabled,
+		           .native_float_min_max =
+		               graphics.physical_device_properties.vendorID == 0x1002u} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {

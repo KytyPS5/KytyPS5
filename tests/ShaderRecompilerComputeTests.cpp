@@ -2005,13 +2005,11 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
-  // Host float min/max is used on RADV, as in Kyty.
+  // Host float min/max is used on AMD GPUs, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
-    vk::PhysicalDeviceDriverProperties driver{};
-    vk::PhysicalDeviceProperties2 properties{};
-    properties.pNext = &driver;
-    m_physical_device.getProperties2(&properties);
-    return driver.driverID == vk::DriverId::eMesaRadv;
+    vk::PhysicalDeviceProperties properties;
+    m_physical_device.getProperties(&properties);
+    return properties.vendorID == 0x1002u;
   }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -49016,7 +49014,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
-    // Host min/max must keep the emulated results on RADV; other drivers only
+    // Host min/max must keep the emulated results on AMD GPUs; other GPUs only
     // compile it.
     static constexpr ShaderProfile native_profile{.maintenance8 = true,
                                                   .native_float_min_max = true};

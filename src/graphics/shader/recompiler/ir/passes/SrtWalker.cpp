@@ -175,9 +175,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::ULessThanEqual32:
 		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -430,6 +432,8 @@ uint32_t PureArity(ValueOpcode op) {
 		case ValueOpcode::ShiftRightArithmetic64:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::ULessThanEqual32:
 		case ValueOpcode::UGreaterThan32:
@@ -442,19 +446,25 @@ uint32_t PureArity(ValueOpcode op) {
 	}
 }
 
-// The result of a pure operation (PureArity) that its first argument decides alone, when the
-// other arguments are not known: a zero lower bound accepts every U32, also a value that varies
-// from lane to lane.
-bool DecidedByFirst(ValueOpcode op, uint64_t first, uint64_t& result) {
-	if (op == ValueOpcode::ULessThanEqual32 && static_cast<uint32_t>(first) == 0u) {
+// The result of a pure operation (PureArity) that one argument decides alone, when the other
+// arguments are not known: a zero lower bound accepts every U32, and no U32 is below zero, also
+// a value that varies from lane to lane or is carried around a loop.
+bool DecidedByArgument(ValueOpcode op, uint32_t index, uint64_t value, uint64_t& result) {
+	if (static_cast<uint32_t>(value) != 0u) return false;
+	if (op == ValueOpcode::ULessThanEqual32 && index == 0u) {
 		result = 1u;
+		return true;
+	}
+	if (op == ValueOpcode::ULessThan32 && index == 1u) {
+		result = 0u;
 		return true;
 	}
 	return false;
 }
 
-bool DecidedByFirst(const Inst& inst, uint64_t first, uint64_t& result) {
-	return DecidedByFirst(inst.GetOpcode(), first, result);
+// An argument after `index` can decide the operation alone (DecidedByArgument).
+bool DecidableAfter(ValueOpcode op, uint32_t index) {
+	return op == ValueOpcode::ULessThan32 && index == 0u;
 }
 
 // The result of a pure operation (PureArity) from its evaluated arguments. `flags`: those of
@@ -598,6 +608,8 @@ bool ApplyPure(ValueOpcode op, uint64_t flags, const std::array<uint64_t, 4>& ar
 		case ValueOpcode::INotEqual32:
 			result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
 			return true;
+		case ValueOpcode::IEqual64: result = a == b; return true;
+		case ValueOpcode::INotEqual64: result = a != b; return true;
 		case ValueOpcode::ULessThan32:
 			result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
 			return true;
@@ -1309,15 +1321,18 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	if (const auto arity = PureArity(inst.GetOpcode()); arity != 0u) {
 		std::array<uint64_t, 4> args {};
+		bool                    known = true;
 		for (uint32_t index = 0; index < arity; ++index) {
 			if (!Arg(inst, index, args[index])) {
-				return false;
+				if (!DecidableAfter(inst.GetOpcode(), index)) return false;
+				known = false;
+				continue;
 			}
-			if (index == 0u && DecidedByFirst(inst, args[0], result)) {
+			if (DecidedByArgument(inst.GetOpcode(), index, args[index], result)) {
 				return true;
 			}
 		}
-		return ApplyPure(inst, args, result);
+		return known && ApplyPure(inst, args, result);
 	}
 	uint64_t a = 0;
 	uint64_t b = 0;
@@ -1459,11 +1474,16 @@ bool SrtWalker::EvaluateNode(uint32_t index, uint64_t& result) {
 		case Kind::Fail: return false;
 		case Kind::Pure: {
 			std::array<uint64_t, 4> args {};
+			bool                    known = true;
 			for (uint32_t arg = 0; arg < node.arity; ++arg) {
-				if (!EvaluateRef(node.args[arg], args[arg])) return false;
-				if (arg == 0u && DecidedByFirst(node.op, args[0], result)) return true;
+				if (!EvaluateRef(node.args[arg], args[arg])) {
+					if (!DecidableAfter(node.op, arg)) return false;
+					known = false;
+					continue;
+				}
+				if (DecidedByArgument(node.op, arg, args[arg], result)) return true;
 			}
-			return ApplyPure(node.op, node.flags, args, result);
+			return known && ApplyPure(node.op, node.flags, args, result);
 		}
 		case Kind::UserData:
 			if (node.aux >= m_runtime.user_data.size()) return false;
@@ -1918,14 +1938,20 @@ void SrtTape::Run(const ResourcePlan& program, const SrtRuntime& runtime) const 
 	for (const auto& step: m_steps) {
 		std::array<uint64_t, 5> args {};
 		bool                    ok = true;
-		for (uint32_t index = 0; index < step.arg_count && ok; ++index) {
-			ok          = m_ok[step.args[index]] != 0u;
+		// Every argument, also after an unknown one: a later one can decide the step alone.
+		for (uint32_t index = 0; index < step.arg_count; ++index) {
+			ok          = ok && m_ok[step.args[index]] != 0u;
 			args[index] = m_values[step.args[index]];
 		}
 		uint64_t out = 0;
-		// As the walker: a pure operation that its first argument decides needs no other.
-		if (step.kind == StepKind::Pure && step.arg_count != 0u && m_ok[step.args[0]] != 0u &&
-		    DecidedByFirst(step.op, args[0], out)) {
+		// As the walker: a pure operation that one argument decides needs no other.
+		bool decided = false;
+		for (uint32_t index = 0; step.kind == StepKind::Pure && index < step.arg_count && !decided;
+		     ++index) {
+			decided = m_ok[step.args[index]] != 0u &&
+			          DecidedByArgument(step.op, index, args[index], out);
+		}
+		if (decided) {
 			m_values[step.out] = out;
 			m_ok[step.out]     = 1u;
 			continue;

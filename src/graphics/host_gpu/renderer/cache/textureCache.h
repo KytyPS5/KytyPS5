@@ -13,9 +13,9 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/writeWatchSet.h"
 
+#include <bitset>
 #include <map>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -92,10 +92,8 @@ public:
 
 private:
 	struct MetaDataInfo {
-		enum class Type : uint8_t { CMask, FMask, HTile };
-
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
+		std::bitset<8192> clear_mask;
 	};
 
 	struct OverlapResult {
@@ -125,7 +123,6 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -186,7 +183,6 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

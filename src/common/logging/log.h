@@ -21,6 +21,10 @@ struct Lifecycle {
 
 enum class Direction { Silent, Console, File };
 
+// Set by LoadExec for the program it starts, which continues the log file of the one it replaces
+// instead of starting it over.
+inline constexpr const char* RelaunchedVariable = "KYTY_RELAUNCHED";
+
 Direction GetDirection();
 bool      IsSilent();
 void      Write(std::string_view text);
@@ -47,20 +51,26 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 
 } // namespace Color
 
+// Out of line, so callers on small guest stacks (fibers) do not reserve the formatting frame.
+template <typename... Args>
+[[gnu::noinline]] void Printf(fmt::text_style style, const char* format, const Args&... args) {
+	Write(style, fmt::sprintf(format, args...));
+}
+
 } // namespace Log
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LOGF(...)                                                                                  \
 	do {                                                                                           \
 		if (!::Log::IsSilent()) {                                                                  \
-			::Log::Write(::fmt::sprintf(__VA_ARGS__));                                             \
+			::Log::Printf({}, __VA_ARGS__);                                                        \
 		}                                                                                          \
 	} while (false)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LOGF_COLOR(style, ...)                                                                     \
 	do {                                                                                           \
 		if (!::Log::IsSilent()) {                                                                  \
-			::Log::Write((style), ::fmt::sprintf(__VA_ARGS__));                                    \
+			::Log::Printf((style), __VA_ARGS__);                                                   \
 		}                                                                                          \
 	} while (false)
 

@@ -187,7 +187,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 	if (decoded.family == Decoder::Family::MUBUF || decoded.family == Decoder::Family::MTBUF) {
 		const bool store_or_atomic =
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_X &&
-		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X) ||
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -941,6 +941,10 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
+		case Decoder::Opcode::BUFFER_GL0_INV:
+		case Decoder::Opcode::BUFFER_GL1_INV:
+			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
+			return;
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
 			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
@@ -974,6 +978,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		}
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
@@ -988,6 +993,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
@@ -998,12 +1004,16 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_DWORDX3:
 		case Decoder::Opcode::BUFFER_STORE_DWORDX4:
 		case Decoder::Opcode::BUFFER_STORE_BYTE:
+		case Decoder::Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_STORE_SHORT:
+		case Decoder::Opcode::BUFFER_STORE_SHORT_D16_HI:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
@@ -1041,6 +1051,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMAX:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMax32);
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
 
 		case Decoder::Opcode::DS_ADD_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd32, false);
@@ -1078,6 +1090,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax32, true);
 		case Decoder::Opcode::DS_MAX_RTN_U64:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax64, true);
+		case Decoder::Opcode::DS_CMPST_RTN_B32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicCmpSwap32, true);
 		case Decoder::Opcode::DS_CMPST_RTN_B64:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicCmpSwap64, true);
 		case Decoder::Opcode::DS_AND_B32:
@@ -1158,6 +1172,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_L:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:

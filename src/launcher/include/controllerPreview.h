@@ -24,6 +24,7 @@ public:
 	void SetSuspended(bool suspended);
 
 	[[nodiscard]] const QSet<QString>& Pressed() const { return m_pressed; }
+	[[nodiscard]] const QSet<QString>& RawPressed() const { return m_raw_pressed; }
 	[[nodiscard]] QPointF              LeftStick() const { return m_left_stick; }
 	[[nodiscard]] QPointF              RightStick() const { return m_right_stick; }
 	[[nodiscard]] const QString&       DeviceName() const { return m_device_name; }
@@ -44,6 +45,7 @@ private:
 	bool                               m_preview_enabled = false;
 	bool                               m_suspended       = false;
 	QSet<QString>                      m_pressed;
+	QSet<QString>                      m_raw_pressed;
 	QPointF                            m_left_stick;
 	QPointF                            m_right_stick;
 	QString                            m_device_name;

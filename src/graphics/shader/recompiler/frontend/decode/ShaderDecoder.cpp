@@ -143,6 +143,7 @@ std::string FormatMimg(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_L:
 		case Opcode::IMAGE_GATHER4_C_LZ:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
@@ -569,6 +570,9 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_BARRIER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_barrier", inst.pc));
+		case Opcode::BUFFER_GL0_INV:
+		case Opcode::BUFFER_GL1_INV:
+			return fmt::format("0x{:08x}: {}", inst.pc, magic_enum::enum_name(inst.opcode));
 		case Opcode::V_NOP:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
 		case Opcode::S_ENDPGM:
@@ -615,6 +619,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_L:
 		case Opcode::IMAGE_GATHER4_C_LZ:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
@@ -635,12 +640,16 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_STORE_FORMAT_X:
 		case Opcode::BUFFER_STORE_FORMAT_XY:
 		case Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_LOAD_UBYTE:
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
 		case Opcode::BUFFER_LOAD_USHORT:
 		case Opcode::BUFFER_LOAD_SHORT_D16:
 		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
@@ -649,7 +658,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_DWORDX3:
 		case Opcode::BUFFER_LOAD_DWORDX4:
 		case Opcode::BUFFER_STORE_BYTE:
+		case Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Opcode::BUFFER_STORE_SHORT:
+		case Opcode::BUFFER_STORE_SHORT_D16_HI:
 		case Opcode::BUFFER_STORE_DWORD:
 		case Opcode::BUFFER_STORE_DWORDX2:
 		case Opcode::BUFFER_STORE_DWORDX3:
@@ -666,6 +677,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
+		case Opcode::BUFFER_ATOMIC_ADD_X2:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
 		case Opcode::BUFFER_ATOMIC_UMIN:
@@ -713,6 +725,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
 		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B32:
 		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:

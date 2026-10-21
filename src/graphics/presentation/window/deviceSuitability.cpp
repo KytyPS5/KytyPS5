@@ -49,6 +49,8 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	        "shaderSampledImageArrayNonUniformIndexing");
 	require(facts.shader_storage_buffer_array_non_uniform_indexing,
 	        "shaderStorageBufferArrayNonUniformIndexing");
+	require(facts.shader_storage_image_array_non_uniform_indexing,
+	        "shaderStorageImageArrayNonUniformIndexing");
 	require(facts.robust_image_access, "robustImageAccess");
 	require(facts.dynamic_rendering, "dynamicRendering");
 	require(facts.synchronization2, "synchronization2");

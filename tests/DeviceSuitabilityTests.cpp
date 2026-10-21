@@ -93,6 +93,7 @@ DeviceFacts FullFacts() {
 	f.storage_buffer_8bit_access                      = true;
 	f.shader_sampled_image_array_non_uniform_indexing = true;
 	f.shader_storage_buffer_array_non_uniform_indexing = true;
+	f.shader_storage_image_array_non_uniform_indexing  = true;
 	f.shader_buffer_int64_atomics                     = true;
 	f.shader_shared_int64_atomics                     = true;
 	f.float64_preserves_special_values                = true;
@@ -376,6 +377,8 @@ void TestEveryMandatoryFeatureRejectsByName() {
 	     "shaderSampledImageArrayNonUniformIndexing"},
 	    {&DeviceFacts::shader_storage_buffer_array_non_uniform_indexing,
 	     "shaderStorageBufferArrayNonUniformIndexing"},
+	    {&DeviceFacts::shader_storage_image_array_non_uniform_indexing,
+	     "shaderStorageImageArrayNonUniformIndexing"},
 	    {&DeviceFacts::depth_clip_control, "depthClipControl"},
 	    {&DeviceFacts::buffer_device_address, "bufferDeviceAddress"},
 	    {&DeviceFacts::tessellation_shader, "tessellationShader"},

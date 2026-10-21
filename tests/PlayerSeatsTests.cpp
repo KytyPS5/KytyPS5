@@ -1,6 +1,8 @@
 // Who plays as which player: the seats of up to four players, and the logins the game sees.
 #include "libs/playerSeats.h"
 
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -9,6 +11,8 @@ namespace {
 using Libs::Controller::PlayerSeats;
 
 constexpr int FIRST_USER = 0x10000;
+constexpr std::array<int32_t, PlayerSeats::MAX_PLAYERS> USERS {FIRST_USER, FIRST_USER + 0x100,
+                                                               FIRST_USER + 0x200, FIRST_USER + 0x300};
 
 void Check(bool condition, const char* text) {
 	if (!condition) {
@@ -24,7 +28,7 @@ void DrainEvents(PlayerSeats& seats) {
 }
 
 void TestPlayerOneIsLoggedInFromTheStart() {
-	PlayerSeats        seats(FIRST_USER);
+	PlayerSeats        seats(USERS);
 	PlayerSeats::Event event;
 	Check(seats.TakeEvent(&event) && event.login && event.player == 0,
 	      "player 1 did not log in first");
@@ -34,13 +38,13 @@ void TestPlayerOneIsLoggedInFromTheStart() {
 }
 
 void TestAPadWithoutASeatPlaysAsNobody() {
-	PlayerSeats seats(FIRST_USER);
+	PlayerSeats seats(USERS);
 	Check(seats.PlayerOf(7) == PlayerSeats::NO_PLAYER, "a pad without a seat plays as a player");
 }
 
 // The first pad that presses a button is player 1, the next is player 2.
 void TestPadsTakeSeatsInTheOrderTheyPress() {
-	PlayerSeats seats(FIRST_USER);
+	PlayerSeats seats(USERS);
 	DrainEvents(seats);
 	PlayerSeats::Event event;
 	Check(seats.Seat(7) == 0 && seats.PlayerOf(7) == 0 && !seats.TakeEvent(&event),
@@ -55,7 +59,7 @@ void TestPadsTakeSeatsInTheOrderTheyPress() {
 }
 
 void TestALeavingPadFreesItsSeat() {
-	PlayerSeats seats(FIRST_USER);
+	PlayerSeats seats(USERS);
 	(void)seats.Seat(7);
 	(void)seats.Seat(8);
 	DrainEvents(seats);
@@ -70,18 +74,18 @@ void TestALeavingPadFreesItsSeat() {
 	Check(seats.Leave(42) == PlayerSeats::NO_PLAYER, "an unknown pad freed a seat");
 }
 
-void TestUsersSkipTheSystemIds() {
-	PlayerSeats seats(0xfd);
-	Check(seats.UserOf(0) == 0xfd && seats.UserOf(1) == 0x100 && seats.UserOf(2) == 0x101,
-	      "a player got a user id the system keeps");
-	Check(seats.PlayerOfUser(0x100) == PlayerSeats::NO_PLAYER,
+void TestPlayersHaveTheirUsers() {
+	PlayerSeats seats(USERS);
+	Check(seats.UserOf(0) == USERS[0] && seats.UserOf(1) == USERS[1] && seats.UserOf(3) == USERS[3],
+	      "a player did not get its user id");
+	Check(seats.PlayerOfUser(USERS[1]) == PlayerSeats::NO_PLAYER,
 	      "a user without a seated pad is logged in");
 }
 
 // A game that never reads the logins does not make the seats grow without end: the oldest are
 // dropped.
 void TestUnreadEventsAreBounded() {
-	PlayerSeats seats(FIRST_USER);
+	PlayerSeats seats(USERS);
 	(void)seats.Seat(6);
 	for (int i = 0; i < 1000; ++i) {
 		(void)seats.Seat(7);
@@ -105,7 +109,7 @@ int main() {
 	TestAPadWithoutASeatPlaysAsNobody();
 	TestPadsTakeSeatsInTheOrderTheyPress();
 	TestALeavingPadFreesItsSeat();
-	TestUsersSkipTheSystemIds();
+	TestPlayersHaveTheirUsers();
 	TestUnreadEventsAreBounded();
 	std::puts("PlayerSeatsTests: passed");
 	return 0;

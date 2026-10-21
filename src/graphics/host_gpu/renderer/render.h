@@ -120,12 +120,6 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
-	// The guest flushed its caches: writes recorded so far must be visible to later reads. Outside
-	// a render pass the barrier is recorded at once. Inside one it is recorded when the pass
-	// ends. That is equivalent: every shader or transfer write the renderer records ends the pass
-	// and is followed by its own barrier, so the only writes still open are to the attachments,
-	// and those cannot be read before the pass ends.
-	void RequestGlobalBarrier() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -158,7 +152,6 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_used        = false;
-	mutable bool        m_global_barrier_pending = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -245,11 +238,11 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
-	void                     UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
-	                                                 const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+	                                                     const CommandBuffer&          buffer);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	std::unique_ptr<ThreadDimensionDispatch> m_thread_dimensions; // created on first use

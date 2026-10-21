@@ -66,6 +66,7 @@ public:
 		AppendInstruction(m_execution_modes, spv::OpExecutionMode, entry_point, mode, operands...);
 	}
 
+	uint32_t AddString(const char* text);
 	void AddName(uint32_t target, const char* name);
 	template <typename... Args>
 	void AddAnnotation(spv::Op opcode, const Args&... operands) {

@@ -107,7 +107,6 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
-	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	// Writes a label (or with no bytes, raises only the interrupt) once the host GPU completed
 	// the work recorded before it (pendingLabels.h).

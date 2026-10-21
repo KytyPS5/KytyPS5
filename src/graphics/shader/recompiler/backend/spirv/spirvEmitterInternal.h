@@ -111,7 +111,7 @@ struct EmitterState {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
 		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
-		    input_info.compute != nullptr && input_info.compute->lds_storage) {
+		    input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
 		soft_float64   = program.info.float64 && !host.capabilities.float64;
@@ -130,6 +130,8 @@ struct EmitterState {
 	// calls a function of softFloat64.h (see DefineSoftFloat64).
 	bool                                             soft_float64    = false;
 	std::array<uint32_t, static_cast<size_t>(SoftFloat64Op::Count)> soft_float64_functions {};
+	// The OpString of the guest disassembly (CompileOptions::emit_debug_info), or 0.
+	uint32_t                                         debug_source    = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -147,17 +149,19 @@ struct EmitterState {
 	// Packed FP16 runs on two-lane half vectors (TypeF16x2) when the host has native FP16.
 	bool                                             native_float16 = false;
 	uint32_t                                         f16x2_type     = 0;
-	std::array<uint32_t, 6>                          tess_variables {};
+	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
-	uint32_t                                         tess_patch_base     = 0;
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::vector<uint32_t>                           memory_byte_offsets;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         indirect_format_function = 0;
+	uint32_t                                         indirect_format_geometry_function = 0;
+	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
 	// Loop iterations this invocation may still run (see LoopBudget in spirvEmitterProgram.cpp).
 	uint32_t                                         loop_budget_variable    = 0;
@@ -192,10 +196,12 @@ struct EmitterState {
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
+	uint32_t                   user_clip_planes                      = 0;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                   object_primitive_id_variable          = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
@@ -231,6 +237,11 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
 	state.builder.AddFunction(spv::OpLabel, label);
+	if (state.debug_source != 0 && state.current_block != nullptr) {
+		// Source lines encode the containing native block's byte offset plus one.
+		state.builder.AddFunction(spv::OpLine, state.debug_source,
+		                          state.current_block->start_pc + 1u, 0u);
+	}
 }
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
@@ -335,7 +346,6 @@ struct ImageSampleLayout {
 };
 
 struct F32Class {
-	uint32_t bits = 0;
 	uint32_t nan  = 0;
 	uint32_t zero = 0;
 };
@@ -395,7 +405,7 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
                           bool sampler_dynamic = false);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
-                           uint32_t texel);
+                           uint32_t texel, uint32_t array_index);
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
@@ -465,12 +475,13 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
-bool UsesSharedIndirectBufferStore(const EmitterState& state, uint32_t resource);
+uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryOffsets(EmitterState& state);
 
@@ -480,6 +491,7 @@ void EnsureLdsStorage(EmitterState& state);
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
+	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
@@ -489,7 +501,8 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
-MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
+                                                 uint32_t array_index = 0u);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
@@ -517,8 +530,15 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
 
+enum class UnormRounding { RoundEven, HalfUp, Truncate };
+
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                       uint32_t component, uint32_t data, uint32_t data_bits);
+                                       uint32_t component, uint32_t data, uint32_t data_bits,
+                                       UnormRounding rounding = UnormRounding::RoundEven);
+
+uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                    uint32_t component, uint32_t data, uint32_t data_bits,
+                                    UnormRounding rounding = UnormRounding::RoundEven);
 
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
 
@@ -540,16 +560,10 @@ inline constexpr auto EmitSelectValueU32 =
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
 
-uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
-
 inline constexpr auto EmitOrU32 = EmitNative<spv::OpBitwiseOr, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t value,
                                 uint32_t constant);
-
-uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value);
-
-uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32);
 
 inline constexpr auto EmitBitcastF32ToU32 = EmitNative<spv::OpBitcast, IR::Type::U32, uint32_t>;
 
@@ -566,8 +580,6 @@ inline constexpr auto EmitLogicalOrBool =
 inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
-
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);
@@ -592,6 +604,8 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineIndirectBufferFormats(ValueEmitContext& ctx);
+void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 // Defines the functions for the 64-bit float operations the shader uses, when soft_float64.
 void DefineSoftFloat64(EmitterState& state);

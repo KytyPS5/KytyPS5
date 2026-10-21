@@ -31,18 +31,6 @@ namespace ImageViewOps {
 	       ImageViewOps::IsFormatDepthCompatible(view_format);
 }
 
-[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
-                                             uint32_t component_count = 4) noexcept {
-	if ((swizzle & ~0xfffu) != 0) {
-		return false;
-	}
-	for (uint32_t channel = 0; channel < 4; channel++) {
-		const auto selector = GetDstSel(swizzle, channel);
-		if (selector > 1 && (selector < 4 || selector >= 4 + component_count)) return false;
-	}
-	return true;
-}
-
 [[noreturn]] inline void UnsupportedColorView(const char* usage, vk::Format image_format,
                                               vk::Format view_format, uint32_t swizzle) noexcept {
 	EXIT("unsupported %s color image view: image_format=%d view_format=%d swizzle=0x%03x\n", usage,

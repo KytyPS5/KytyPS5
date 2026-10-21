@@ -342,7 +342,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
 
 # Linux system libraries.
 if(LINUX)
@@ -356,7 +356,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxhash
+	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
@@ -688,6 +688,10 @@ add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
 
+add_executable(host_input_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputTests.cpp")
+target_link_libraries(host_input_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(host_input_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
@@ -851,12 +855,15 @@ if(BUILD_TESTING)
 	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
 	add_test(NAME overlay_queue COMMAND $<TARGET_FILE:overlay_queue_tests>)
 	add_test(NAME const_ram COMMAND $<TARGET_FILE:const_ram_tests>)
+	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_tessellation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -965,6 +972,7 @@ if(BUILD_TESTING)
 		image_readback_tests
 		overlay_queue_tests
 		const_ram_tests
+		host_input_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests
@@ -1001,6 +1009,14 @@ add_custom_target(kyty_trophy_sound
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
+
+add_custom_target(kyty_touch_cursors
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/cursors"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_touch_cursors)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

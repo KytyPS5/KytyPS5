@@ -78,11 +78,13 @@ public:
 	}
 
 	void QueueUsers(const std::vector<Use>& users) {
-		++generation;
-		affected.clear();
 		for (const auto& use: users) affected.push_back(use.user);
+	}
+
+	void FlushUsers() {
+		++generation;
 		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit consumers once per change, including cyclic Phi edges, through the
+		// stay dynamic. Visit their union once per drain, including cyclic Phi edges, through the
 		// operations such folds look into (see InspectedThrough). Walking every transitive user
 		// made the pass quadratic in large shaders.
 		for (size_t i = 0; i < affected.size(); ++i) {
@@ -94,6 +96,7 @@ public:
 			if (!InspectedThrough(inst->GetOpcode())) continue;
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
+		affected.clear();
 	}
 
 	Block::iterator Prepend(Block& block, Block::iterator before, ValueOpcode opcode,
@@ -638,13 +641,23 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			    ReplaceBinaryIdentity(inst, Type::U32, UINT32_MAX)) return;
 			for (uint32_t arm = 0; arm < 2u; ++arm) {
 				const auto mask = Arg(inst, arm);
+				if (!IsImmediate(mask, Type::U32)) continue;
+				if (mask.U32() == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
 				const auto* shifted = Arg(inst, arm ^ 1u).TryInstruction();
-				if (!IsImmediate(mask, Type::U32) || shifted == nullptr ||
-				    shifted->GetOpcode() != ValueOpcode::ShiftLeftLogical32 || !HasOneUse(*shifted)) continue;
+				if (shifted == nullptr || shifted->GetOpcode() != ValueOpcode::ShiftLeftLogical32) continue;
 				const auto shift = Arg(*shifted, 1);
-				if (!IsImmediate(shift, Type::U32) || shift.U32() >= 32u) continue;
+				if (!IsImmediate(shift, Type::U32)) continue;
+				const auto shifted_mask = mask.U32() >> (shift.U32() & 31u);
+				if (shifted_mask == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
+				if (!HasOneUse(*shifted) || shift.U32() >= 32u) continue;
 				const auto masked = worklist.Prepend(block, instruction, ValueOpcode::BitwiseAnd32,
-				    {Arg(*shifted, 0), Value(mask.U32() >> shift.U32())});
+				    {Arg(*shifted, 0), Value(shifted_mask)});
 				Replace(inst, Value(&*worklist.Prepend(block, instruction, ValueOpcode::ShiftLeftLogical32,
 				    {Value(&*masked), shift})));
 				return;
@@ -997,27 +1010,30 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::vector<Use> users;
 	std::vector<Value> operands;
 	const auto drain = [&] {
-		for (size_t i = 0; i < worklist.pending.size(); ++i) {
-			auto* inst = worklist.pending[i];
-			auto& location = worklist.locations.at(inst);
-			location.queued = false;
-			const auto opcode = inst->GetOpcode();
-			if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
-			const auto where = location.instruction;
-			users.assign(inst->Uses().begin(), inst->Uses().end());
-			operands.clear();
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
-			mask_projection.Fold(*inst, wave_size);
-			FoldInstruction(*inst->Parent(), where, worklist);
-			bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
-			for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
-				changed = operands[arg] != inst->Arg(arg);
-			if (changed) {
-				worklist.QueueUsers(users);
-				worklist.Queue(inst);
+		do {
+			for (size_t i = 0; i < worklist.pending.size(); ++i) {
+				auto* inst = worklist.pending[i];
+				auto& location = worklist.locations.at(inst);
+				location.queued = false;
+				const auto opcode = inst->GetOpcode();
+				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
+				const auto where = location.instruction;
+				users.assign(inst->Uses().begin(), inst->Uses().end());
+				operands.clear();
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
+				mask_projection.Fold(*inst, wave_size);
+				FoldInstruction(*inst->Parent(), where, worklist);
+				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
+				for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
+					changed = operands[arg] != inst->Arg(arg);
+				if (changed) {
+					worklist.QueueUsers(users);
+					worklist.Queue(inst);
+				}
 			}
-		}
-		worklist.pending.clear();
+			worklist.pending.clear();
+			worklist.FlushUsers();
+		} while (!worklist.pending.empty());
 	};
 	drain();
 	// Normalize retained PHI/select values only after every supported field read has
@@ -1043,6 +1059,19 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		}
 		drain();
 	} while (normalized);
+	// Repeated register reads share a bitcast only within the same SSA block.
+	std::unordered_map<const Inst*, Inst*> bitcasts;
+	for (auto* block: blocks) {
+		bitcasts.clear();
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::BitCastF32U32 &&
+			    inst.GetOpcode() != ValueOpcode::BitCastU32F32) continue;
+			const auto* source = Arg(inst, 0).TryInstruction();
+			if (source == nullptr) continue;
+			const auto [entry, inserted] = bitcasts.try_emplace(source, &inst);
+			if (!inserted) Replace(inst, Value(entry->second));
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

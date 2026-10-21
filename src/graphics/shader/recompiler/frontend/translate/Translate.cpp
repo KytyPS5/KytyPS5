@@ -233,13 +233,6 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 		if (type == IR::Type::F64) {
 			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
 				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
-			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-				const auto bits = operand.value == 0x3e22f983u
-				                      ? 0x3fc45f306dc9c882ull
-				                      : std::bit_cast<uint64_t>(static_cast<double>(
-				                            std::bit_cast<float>(operand.value)));
-				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
 			}
 			if (operand.absolute) {
 				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
@@ -319,7 +312,7 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
 			ir.SetScalarReg(reg, value);
-			program.scalar_writes.push_back({current_pc, reg});
+			program.scalar_writes.push_back({current_pc, reg, value});
 			ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 			if (IR::RegIndex(reg) > 0u) {
 				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(IR::RegIndex(reg) - 1u),
@@ -488,6 +481,14 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	if (operand.kind == Decoder::OperandKind::VccLo) {
 		return {ir.GetVccLo(), ir.GetVccHi()};
 	}
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		const auto bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
+		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	}
 	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	IR::U32    high(IR::Value(0u));
 	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr) {
@@ -546,9 +547,11 @@ IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_la
 	auto bits             = ReadRawU32(operand);
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
-		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
-		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
-		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
+		const auto value = operand.value;
+		bits             = IR::U32(IR::Value(value == 0x3e22f983u
+		                                         ? 0x3118u
+		                                         : ((value >> 16u) & 0x8000u) |
+		                                               ((((value >> 23u) & 0xffu) - 112u) << 10u)));
 	}
 	bits = ApplyBitSourceModifiers(raw_operand, bits);
 	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
@@ -685,13 +688,13 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 				                    IR::U1(IR::Value(false)));
 			}
 			ir.SetScalarReg(reg, mask[0]);
-			program.scalar_writes.push_back({current_pc, reg});
+			program.scalar_writes.push_back({current_pc, reg, mask[0]});
 			// A wave32 VALU mask destination must not overwrite the neighboring SGPR.
 			if ((write_64 || program.wave_size == 64u) &&
 			    IR::RegIndex(reg) + 1u < IR::NumScalarRegs) {
 				const auto high = static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u);
 				ir.SetScalarReg(high, mask[1]);
-				program.scalar_writes.push_back({current_pc, high});
+				program.scalar_writes.push_back({current_pc, high, mask[1]});
 				ir.SetThreadBitScalarReg(high, IR::U1(IR::Value(false)));
 				ir.SetScalarMaskTag(high, IR::U1(IR::Value(false)));
 			}
@@ -984,30 +987,6 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	    options.stage != ShaderType::Local) {
 		EXIT("embedded fetch requires a vertex or local shader");
 	}
-	switch (options.stage) {
-		case ShaderType::Vertex:
-		case ShaderType::Local:
-		case ShaderType::TessellationControl:
-		case ShaderType::TessellationEvaluation:
-		case ShaderType::Mesh:
-			if (options.input_info.vertex == nullptr) {
-				EXIT("vertex shader translation has no vertex input metadata");
-			}
-			return;
-		case ShaderType::Pixel:
-			if (options.input_info.pixel == nullptr) {
-				EXIT("pixel shader translation has no pixel input metadata");
-			}
-			return;
-		case ShaderType::Compute:
-			if (options.input_info.compute == nullptr) {
-				EXIT("compute shader translation has no compute input metadata");
-			}
-			return;
-		default:
-			EXIT("shader translation has unsupported stage %u",
-			     static_cast<uint32_t>(options.stage));
-	}
 }
 
 } // namespace
@@ -1041,7 +1020,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		case ShaderType::Compute:
 			result.scratch_dwords = options.input_info.compute->scratch_size_dwords;
 			break;
-		default: break; // ValidateTranslateOptions rejects unsupported stages.
+		default:
+			EXIT("shader translation has unsupported stage %u",
+			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
 	result.cfg_failure_kind    = cfg.failure_kind;

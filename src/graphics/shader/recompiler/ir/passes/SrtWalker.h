@@ -22,6 +22,7 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	uint64_t                  indirect_args_address = 0;
 };
 
 class SrtReadCapture {

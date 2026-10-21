@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -25,16 +26,19 @@ std::vector<Rumble>                rumble;
 std::vector<Rumble>                haptics;
 std::vector<std::array<Uint8, 32>> effects;
 bool                               haptics_handles_rumble = false;
+std::array<Rumble, 6>               pad_rumble {};
+std::vector<int>                    closed_pads;
+std::array<std::array<Uint8, 3>, 6> pad_colors {};
 } // namespace
 
 namespace Fake {
 Uint64 GetTicks() {
 	return now;
 }
-// One more pad than 1 and 2, for a test that needs a third.
+// One more pad than 1 to 5, for a test that needs a sixth.
 SDL_JoystickID extra_pad = 0;
 SDL_Gamepad*   GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 2 || (id != 0 && id == extra_pad)
+	return (id >= 1 && id <= 5) || (id != 0 && id == extra_pad)
 	           ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
 	           : nullptr;
 }
@@ -43,6 +47,7 @@ SDL_GamepadType GetGamepadType(SDL_Gamepad*) {
 }
 bool RumbleGamepad(SDL_Gamepad* pad, Uint16 large, Uint16 small, Uint32 duration) {
 	rumble.push_back({large, small, duration, static_cast<int>(reinterpret_cast<uintptr_t>(pad))});
+	pad_rumble[reinterpret_cast<uintptr_t>(pad) % pad_rumble.size()] = rumble.back();
 	return true;
 }
 bool SendGamepadEffect(SDL_Gamepad*, const void* data, int size) {
@@ -52,7 +57,8 @@ bool SendGamepadEffect(SDL_Gamepad*, const void* data, int size) {
 	effects.push_back(effect);
 	return true;
 }
-bool SetGamepadLED(SDL_Gamepad*, Uint8, Uint8, Uint8) {
+bool SetGamepadLED(SDL_Gamepad* pad, Uint8 r, Uint8 g, Uint8 b) {
+	pad_colors[reinterpret_cast<uintptr_t>(pad)] = {r, g, b};
 	return true;
 }
 bool GamepadHasSensor(SDL_Gamepad*, SDL_SensorType) {
@@ -61,7 +67,9 @@ bool GamepadHasSensor(SDL_Gamepad*, SDL_SensorType) {
 bool SetGamepadSensorEnabled(SDL_Gamepad*, SDL_SensorType, bool) {
 	return true;
 }
-void CloseGamepad(SDL_Gamepad*) {}
+void CloseGamepad(SDL_Gamepad* pad) {
+	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
+}
 void Delay(Uint32) {}
 } // namespace Fake
 
@@ -86,6 +94,14 @@ void Delay(Uint32) {}
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
+
+namespace Libs::Controller {
+// No virtual headset in these tests (padVr.cpp is not linked here).
+int PadVrPortHand(int) { return -1; }
+int PadVrPort(int, int, int, bool) { return PAD_ERROR_INVALID_ARG; }
+int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
+int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
+} // namespace Libs::Controller
 
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
@@ -561,6 +577,129 @@ void TestTheSpecialPortIsAPortOfItsOwn() {
 	      "the special port did not close");
 }
 
+void TestPlayerUserIds() {
+	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
+	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
+	          !Config::IsConfiguredUserIdValid(254) && !Config::IsConfiguredUserIdValid(255),
+	      "configured user IDs did not reserve a valid range for guests");
+	Config::ConfigOptions options;
+	options.user_id = Config::MAX_USER_ID;
+	Config::Load(options);
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		Check(Config::GetPlayerFromUserId(Config::GetPlayerUserId(player)) == player,
+		      "player user ID did not round-trip at the upper limit");
+	}
+	Check(Config::GetPlayerUserId(3) == std::numeric_limits<int32_t>::max() &&
+	          Config::GetPlayerFromUserId(-1) == -1,
+	      "guest user ID overflowed or accepted an unknown user");
+	Config::Load(Config::ConfigOptions {});
+}
+
+// Guests get the user ids of their player (Config::GetPlayerUserId), which keep their saves and
+// trophies apart from player 1's, and open their port with it.
+void TestGuestsHaveTheirPlayersUserIds() {
+	Controller controller;
+	Connect(2);
+	Press(2);
+	std::array<int, 4> users {};
+	GetLoggedInUsers(users.data());
+	Check(users[0] == Config::GetPlayerUserId(0) && users[1] == Config::GetPlayerUserId(1) &&
+	          Config::IsGuestUserId(users[1]) && !Config::IsGuestUserId(users[0]),
+	      "a guest did not get its player's user id");
+	Check(PadOpen(Config::GetPlayerUserId(1), 0, 0, nullptr) == 2 &&
+	          PadOpen(Config::GetPlayerUserId(2), 0, 0, nullptr) == PAD_ERROR_INVALID_ARG,
+	      "a guest could not open its own port, or a player who is not logged in could");
+	Check(PadCheckHandle(std::numeric_limits<int>::min()) == PAD_ERROR_INVALID_HANDLE &&
+	          PadClose(std::numeric_limits<int>::max()) == PAD_ERROR_INVALID_HANDLE,
+	      "an extreme handle aliased a player port");
+}
+
+// The keyboard with a player of its own (keyboard_player, F8): its player is logged in, pads take
+// the other seats, and moving the keyboard moves a pad out of its new seat.
+void TestAKeyboardOfItsOwn() {
+	Config::ConfigOptions options;
+	options.keyboard_player = 2;
+	Config::Load(options);
+	now                    = 1000;
+	haptics_handles_rumble = true;
+	Initialize();
+	bool login      = false;
+	int  event_user = 0;
+	Check(TakePlayerEvent(&login, &event_user) && login && event_user == Config::GetPlayerUserId(0) &&
+	          TakePlayerEvent(&login, &event_user) && login &&
+	          event_user == Config::GetPlayerUserId(1) && !TakePlayerEvent(&login, &event_user),
+	      "the keyboard's player did not log in after player 1");
+	Check(PadInit() == 0 && PadOpen(Config::GetPlayerUserId(0), 0, 0, nullptr) == 1 &&
+	          PadOpen(Config::GetPlayerUserId(1), 0, 0, nullptr) == 2 &&
+	          PadOpen(Config::GetPlayerUserId(2), 0, 0, nullptr) == PAD_ERROR_INVALID_ARG,
+	      "the ports of the logged-in players did not open");
+	const auto read = [](int handle) {
+		PadData data {};
+		Check(PadReadState(handle, &data) == 0, "player pad read failed");
+		return data;
+	};
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_CROSS, true);
+	Check(read(2).buttons == PAD_BUTTON_CROSS && read(1).buttons == 0,
+	      "the keyboard did not play as its own player");
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_CROSS, false);
+	Connect(1);
+	Press(1);
+	Connect(2);
+	Press(2);
+	Check(GetGamepadOfPlayer(0) == 1 && GetGamepadOfPlayer(1) == 0 && GetGamepadOfPlayer(2) == 2,
+	      "a pad took the keyboard's seat");
+	Check(PadOpen(Config::GetPlayerUserId(2), 0, 0, nullptr) == 3, "player 3 did not open");
+
+	// The keyboard moves on to player 3; pad 2 moves out to the free seat of player 2. What the
+	// keyboard held is let go: no player keeps it.
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, true);
+	CycleKeyboardPlayer();
+	Check(GetGamepadOfPlayer(1) == 2 && GetGamepadOfPlayer(2) == 0,
+	      "moving the keyboard did not move the pad out of its seat");
+	SetButton(2, PAD_BUTTON_CIRCLE, true);
+	Check(read(2).buttons == PAD_BUTTON_CIRCLE && read(3).buttons == 0,
+	      "the moved pad did not play as its new player, or a held key moved with the keyboard");
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, false);
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, true);
+	Check(read(3).buttons == PAD_BUTTON_TRIANGLE, "the keyboard did not play as player 3");
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, false);
+
+	// Only player 1 uses the DualSense haptics backend, which drives one pad.
+	rumble.clear();
+	haptics.clear();
+	const PadVibrationParam request {100, 50};
+	Check(PadSetVibration(2, &request) == 0 && haptics.empty() && !rumble.empty() &&
+	          rumble.back().pad == 2 && rumble.back().large == 100 * 257,
+	      "a guest's vibration went to the haptics backend");
+
+	CycleKeyboardPlayer(); // player 4
+	CycleKeyboardPlayer(); // shared with player 1
+	(void)read(1);
+	while (TakePlayerEvent(&login, &event_user)) {
+	}
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_SQUARE, true);
+	Check(read(1).buttons == PAD_BUTTON_SQUARE && !IsPlayerConnected(2) && !IsPlayerConnected(3) &&
+	          IsPlayerConnected(1),
+	      "the shared keyboard did not return to player 1, or its last player stayed logged in");
+	Shutdown();
+	haptics_handles_rumble = false;
+	Config::Load(Config::ConfigOptions {});
+}
+
+// Without a gyroscope, the right stick can tilt the pad instead (gyro emulation).
+void TestGyroEmulation() {
+	Controller controller;
+	ToggleGyroEmulation(1);
+	SetRightStick(1, 255, 128);
+	PadData data {};
+	Check(PadReadState(1, &data) == 0 && data.right_stick_x == 128 && data.orientation_z != 0.0f &&
+	          data.angular_velocity_z == 0.0f,
+	      "the right stick did not tilt the pad");
+	ToggleGyroEmulation(1);
+	Check(PadReadState(1, &data) == 0 && data.right_stick_x == 255 && data.orientation_z == 0.0f,
+	      "turning gyro emulation off did not give the stick back");
+}
+
 void TestTriggerEffectState() {
 	Controller                       controller;
 	PadTriggerEffectStateInformation info {{-1, -1}};
@@ -722,6 +861,7 @@ void TestTriggerEffectState() {
 
 int main() {
 	Config::Initialize();
+	TestPlayerUserIds();
 	TestPadPortOwnership();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
@@ -736,6 +876,9 @@ int main() {
 	TestTheKeyboardIsNeverSeated();
 	TestTheLoginListHasNoGaps();
 	TestTriggerEffectState();
+	TestGuestsHaveTheirPlayersUserIds();
+	TestAKeyboardOfItsOwn();
+	TestGyroEmulation();
 	Config::Shutdown();
 	return 0;
 }

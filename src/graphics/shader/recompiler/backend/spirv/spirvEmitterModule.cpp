@@ -213,9 +213,8 @@ void DefineDescriptors(EmitterState& state) {
 	auto& bindings = state.program.bindings;
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
-	for (uint32_t index = 0; index < info.buffers.size(); ++index) {
-		info.buffers[index].descriptor_index = (info.live_buffers & (uint64_t{1} << index)) != 0
-		                                          ? buffer_count++ : UINT32_MAX;
+	for (auto& buffer: info.buffers) {
+		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -254,7 +253,8 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    UsesDepthBounds(state)) {
+	    UsesDepthBounds(state) || state.object_primitive_id_variable != 0 ||
+	    state.user_clip_planes != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -608,6 +608,11 @@ void DefineInputs(EmitterState& state) {
 		}
 		input.variable_id =
 		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());
+		if (state.program.stage == ShaderType::Pixel && input.kind == IR::StageInputKind::PrimitiveId) {
+			// Fragment PrimitiveId accepts Tessellation, which the device already enables.
+			state.builder.RequireCapability(spv::CapabilityTessellation);
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+		}
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
@@ -673,11 +678,25 @@ void DefineOutputs(EmitterState& state) {
 			cull_distance_count = std::max(cull_distance_count, output.index + 1);
 		}
 	}
+	const bool position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		return output.kind == IR::StageOutputKind::Position;
+	});
+	if (position && state.input_info.vertex->user_clip_planes != 0) {
+		// PipelineCache rejects UCP_ENA with shader clip or cull distances.
+		EXIT_IF(clip_distance_count + cull_distance_count != 0);
+		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
+		for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
+			state.outputs.push_back(
+			    {{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0, "gl_ClipDistance"}});
+		}
+	}
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (VertexClipDistanceCount(state.program.stage, state.program.info) > clip_distance_count) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u && position) {
+		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
 		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
@@ -737,12 +756,24 @@ void DefineOutputs(EmitterState& state) {
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
 				            spv::BuiltInSampleMask);
 				break;
+			case IR::StageOutputKind::ObjectPrimitiveId:
+				binding.variable_id = DefineInterfaceVariable(
+				    state, TypeU32(state), spv::StorageClassOutput, binding.debug_name.c_str());
+				state.object_primitive_id_variable = binding.variable_id;
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+				                            spv::DecorationLocation, binding.location);
+				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const auto output_class =
-				    binding.kind == IR::StageOutputKind::Mrt && state.program.stage == ShaderType::Pixel
-				        ? MrtOutputClass(state, binding.index)
-				        : ShaderColorNumberClass::Float;
+				const bool pixel_mrt = binding.kind == IR::StageOutputKind::Mrt &&
+				                       state.program.stage == ShaderType::Pixel;
+				// A packed UNorm export stores its packed dword as an integer (see the export).
+				const bool packed_unorm =
+				    pixel_mrt && binding.index < 8u &&
+				    (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u;
+				const auto output_class = packed_unorm ? ShaderColorNumberClass::Uint
+				                          : pixel_mrt  ? MrtOutputClass(state, binding.index)
+				                                       : ShaderColorNumberClass::Float;
 				const auto type = output_class == ShaderColorNumberClass::Uint
 				                      ? TypeU32Vector(state, 4)
 				                  : output_class == ShaderColorNumberClass::Sint
@@ -864,13 +895,17 @@ void DefineModule(EmitterState& state) {
 	if (state.single_lane) {
 		// No subgroup operation is written.
 	} else if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
-	           state.program.info.subgroup_ballot || state.program.info.subgroup_shuffle ||
+	           state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
+	           state.program.info.subgroup_shuffle ||
 	           state.program.info.subgroup_arithmetic ||
 	           state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (!state.single_lane && (state.lane_count == 2 || state.program.info.subgroup_ballot)) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	}
+	if (state.program.info.subgroup_vote && !state.single_lane) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	if (state.program.info.subgroup_shuffle && !state.single_lane) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);

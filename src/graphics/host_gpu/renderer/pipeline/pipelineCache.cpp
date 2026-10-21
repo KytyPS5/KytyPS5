@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/fileLock.h"
@@ -9,6 +10,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "common/trace.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -21,7 +23,6 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -69,6 +70,8 @@ consteval size_t FieldCount() {
 } // namespace
 
 namespace {
+
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -277,8 +280,9 @@ struct PipelineCache::ProgramCache {
 		std::span<const uint32_t> FunctionCode() const {
 			if (!call_source) return {};
 			const auto& linked = *call_source->linked;
-			return call_source->call->table
-			           ? std::span<const uint32_t>(linked.observed_function)
+			const bool table = std::ranges::any_of(
+			    call_source->calls, [](const auto& call) { return call.table.has_value(); });
+			return table ? std::span<const uint32_t>(linked.observed_function)
 			           : std::span<const uint32_t>(linked.code).subspan(call_source->code.size());
 		}
 
@@ -319,6 +323,9 @@ struct PipelineCache::ProgramCache {
 		// A deque: a worker that builds a pipeline points to a permutation, and a new one must
 		// not move those that exist.
 		std::deque<Permutation> permutations;
+		// A program that calls a GPU-selected function the translator cannot link: its dispatches
+		// are left out.
+		bool skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -345,6 +352,9 @@ struct PipelineCache::ProgramCache {
 	               ShaderRecompiler::TranslateResult                   translated,
 	               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	               uint32_t                                            push_data_start_dword) {
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
+		                                         Common::DebugCounters::Counter::ShaderCompileNs,
+		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
@@ -435,6 +445,7 @@ struct PipelineCache::ProgramCache {
 		options.dump_label  = NamesOf(stage).label;
 		options.input_info  = stage_input;
 		options.host        = host;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -477,10 +488,12 @@ struct PipelineCache::ProgramCache {
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
+			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
 		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
+			if (cached.skip_dispatch) return {};
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
@@ -504,10 +517,18 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
+			                 params.hash, source.unsupported_call_pc);
+			programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan{}, nullptr)
+			    .first->second.skip_dispatch = true;
+			return {};
+		}
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
-			if (current->call) {
+			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;
@@ -518,7 +539,7 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 		if (entry == programs.end()) {
-			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -751,7 +772,7 @@ struct PipelineCache::ProgramCache {
 		const auto source = ShaderRecompiler::PrepareShaderSource(record.code, options);
 		// A program that calls a guest function chosen at run time is built by the draw that
 		// finds the function (see Get). Lists of older builds can name one.
-		if (source.call) {
+		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			out.stale = true;
 			m_stale_records.fetch_add(1, std::memory_order_relaxed);
 			return true;
@@ -997,7 +1018,8 @@ struct PipelineCache::ProgramCache {
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
-      m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.host)) {
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.host)),
+      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	m_always_wait       = Config::PipelineWaitEnabled();
@@ -1344,16 +1366,6 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
 	if (m_graphics.host.faults.pipeline_cache_serializes_builds) {
 		PipelineCacheLog("Vulkan pipeline cache: one in memory for each worker thread (the driver "
 		                 "builds the pipelines of a cache one at a time; the game's pipeline list "
@@ -1403,7 +1415,7 @@ void PipelineCache::InitializeDriverCache() {
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
 				    path);
 			}
 		} else {
@@ -1430,20 +1442,30 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
+		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
 }
 
-void PipelineCache::Save() {
-	// The cache stays alive: worker threads may still build with it until the destructor stops
-	// them.
-	if (m_driver_cache == nullptr || m_driver_cache_saved || m_driver_cache_path.empty() ||
-	    !m_lists_writable) {
+void PipelineCache::CheckpointDriverCache() {
+	if (!m_driver_cache_dirty.load(std::memory_order_relaxed) ||
+	    std::chrono::steady_clock::now() < m_next_driver_cache_save) {
 		return;
 	}
+	Save();
+}
+
+void PipelineCache::Save() {
+	// The cache stays alive: worker threads may still build with it until the destructor stops
+	// them. Only what they built since the last save is written.
+	std::lock_guard lock(m_driver_cache_save_mutex);
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty() || !m_lists_writable ||
+	    !m_driver_cache_dirty.exchange(false)) {
+		return;
+	}
+	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -1463,8 +1485,8 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
+		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
 	payload.resize(size);
@@ -1486,14 +1508,18 @@ void PipelineCache::Save() {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	std::error_code error;
+	if (written) {
+		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+	}
+	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	m_driver_cache_saved = true;
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 }
 
@@ -1513,6 +1539,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	if (object_primitive_id) {
+		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
+		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
+		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
+		const auto& target = context.GetRenderTarget(7);
+		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
+		                                                       target.info.channel_type)
+		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+	}
 	if (mesh_active) {
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
@@ -1549,6 +1586,29 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, color_targets, pixel_info);
+		pixel_info.object_primitive_id = object_primitive_id;
+		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
+			const auto& rt = context.GetRenderTarget(slot);
+			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
+			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
+			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
+			const auto mapping = pixel_info.target_export_mapping[export_index];
+			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
+			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
+			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			    pixel_info.target_output_mode[export_index] != 9u) {
+				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
+				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
+				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
+			}
+			pixel_info.target_packed_unorm_mask |= 1u << export_index;
+			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
+		}
 		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
 			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
 		} else if (context.GetModeControl().provoking_vtx_last) {
@@ -1594,10 +1654,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			}
 		}
 	}
-	if (context.GetClipControl().clip_disable) {
+	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
+	const auto& clip_control = context.GetClipControl();
+	if (clip_control.clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
+		auto&       clip     = last_stage.clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
 		clip.offset[0]       = viewport.xoffset;
@@ -1607,11 +1669,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+	} else if (clip_control.user_clip_planes != 0) {
+		// CLIP_DISABLE also disables user planes. How they combine with shader clip and cull
+		// distances is unverified; draw push constants only reach VS/mesh and PS, and the
+		// generated RECTLIST stages do not forward clip distances.
+		EXIT_NOT_IMPLEMENTED((last_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 || tess_active ||
+		                     Prospero::IsRectList(user_config.GetPrimType()));
+		if (mesh_active && vertex_info[0].mesh.emulated) {
+			// The planes would take the push dwords of the record buffer's address
+			// (UserClipPlaneDword == MeshEmulationAddressDword): the draw is not clipped.
+			static bool logged = false;
+			if (!std::exchange(logged, true)) {
+				PipelineCacheLog("User clip planes of an emulated mesh draw are ignored");
+			}
+		} else {
+			last_stage.user_clip_planes = clip_control.user_clip_planes;
+		}
 	}
-	uint32_t push_data_cursor = !mesh_active ? 0
-	                            : vertex_info[0].mesh.emulated
-	                                ? ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount
-	                                : ShaderRecompiler::IR::PushData::MeshDrawDwordCount;
+	uint32_t push_data_cursor =
+	    mesh_active && vertex_info[0].mesh.emulated
+	        ? ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount
+	        : ShaderRecompiler::IR::PushData::GraphicsDrawDwords(mesh_active, object_primitive_id,
+	                                                              last_stage.user_clip_planes);
 	GraphicsPrograms  result;
 	if (pixel_active && !m_graphics.host.capabilities.depth_bounds &&
 	    context.GetDepthControl().depth_bounds_enable) {
@@ -1705,6 +1784,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.color_mask[slot] = 1u;
+		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
@@ -1863,6 +1945,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	job.static_params = static_params;
 	RememberPipeline(key, job);
 	QueueBuild(key, std::move(job));
+	CheckpointDriverCache();
 	return WhenReady(*m_graphics_pipelines.find(key)->second, effects, frame);
 }
 
@@ -1881,15 +1964,23 @@ void PipelineCache::BuildPipelines(std::stop_token stop, uint32_t builder) {
 		}
 		KYTY_TRACE_COLUMN(PipelineCompile);
 		const auto begin = std::chrono::steady_clock::now();
-		if (job.compute) {
-			CreatePipelineInternal(m_graphics, job.target->pipeline, *job.compute,
-			                       job.programs.pixel.module, driver_cache);
-		} else {
-			CreatePipelineInternal(m_graphics, job.target->pipeline, job.rendering, job.vertex_input,
-			                       std::span {job.vertex_info.data(), job.vertex_count},
-			                       job.pixel ? &*job.pixel : nullptr, job.programs,
-			                       job.static_params, driver_cache);
+		{
+			Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+			                                         Common::DebugCounters::Counter::PipelineCreateNs,
+			                                         Common::DebugCounters::Peak::PipelineCreateNs);
+			if (job.compute) {
+				CreatePipelineInternal(m_graphics, job.target->pipeline, *job.compute,
+				                       job.programs.pixel.module, driver_cache);
+			} else {
+				CreatePipelineInternal(m_graphics, job.target->pipeline, job.rendering,
+				                       job.vertex_input,
+				                       std::span {job.vertex_info.data(), job.vertex_count},
+				                       job.pixel ? &*job.pixel : nullptr, job.programs,
+				                       job.static_params, driver_cache);
+			}
 		}
+		// The driver cache has something new to write (CheckpointDriverCache).
+		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
 		EXIT_NOT_IMPLEMENTED(job.target->pipeline.pipeline == nullptr);
 		EXIT_NOT_IMPLEMENTED(job.target->pipeline.pipeline_layout == nullptr);
 		const auto took = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1916,7 +2007,7 @@ PipelineCache::Pipeline* PipelineCache::WhenReady(PipelineEntry& entry, const Dr
 		PerfCounters::Add(PerfCounters::Counter::LeftOutDraws);
 		if (m_left_out_draws++ == 0) {
 			PipelineCacheLog("Pipelines: a draw is left out until its pipeline is built "
-			                 "(--pipeline-wait true waits instead)");
+			                 "(--pipeline-wait waits instead)");
 		}
 		return nullptr;
 	};
@@ -2007,6 +2098,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	job.programs.pixel  = compute_program;
 	RememberComputePipeline(job);
 	QueueComputeBuild(compute_program.id, std::move(job));
+	CheckpointDriverCache();
 	return wait(*m_compute_pipelines.find(compute_program.id)->second);
 }
 } // namespace Libs::Graphics

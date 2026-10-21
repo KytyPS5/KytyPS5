@@ -74,12 +74,6 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
-bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
-	return eop_event_type != 0x28u ||
-	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
-	                    GcrGl2Invalidate | GcrGl2Writeback)) != 0;
-}
-
 uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
 	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
 }
@@ -294,14 +288,6 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
-}
-
-static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreObjprimIdControl([[maybe_unused]] uint32_t value) {}
-
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreVtxControl([[maybe_unused]] uint32_t value) {}
@@ -457,23 +443,13 @@ KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDrawPayloadControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreDrawPayloadControl(buffer[i]);
-	}
-
-	return num_values;
+	cp.GetCtx().SetDrawPayloadControl(buffer[0]);
+	return KYTY_PM4_LEN(cmd_id) - 2u;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetObjprimIdControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreObjprimIdControl(buffer[i]);
-	}
-
-	return num_values;
+	cp.GetCtx().SetObjprimIdControl(buffer[0]);
+	return KYTY_PM4_LEN(cmd_id) - 2u;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPrimitiveIdReset) {
@@ -1307,8 +1283,8 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
-	return (cmd_id == 0xc0061050 ? 7 : 6);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
@@ -2295,28 +2271,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		}
 	};
 
-	if (data_sel == 0 || interrupt_selector == 4) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
+	// Cache actions only order GPU work, which the renderer's resource barriers already order.
+	if (data_sel == 0 || interrupt_selector == 4 ||
+	    (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr)) {
 		trigger_interrupt();
 
 		return 7;
-	}
-
-	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
-		trigger_interrupt();
-
-		return 7;
-	}
-
-	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
-		cp.EmitGlobalBarrier();
 	}
 
 	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
@@ -2929,7 +2889,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			cp.GetCtx().SetUserClipPlane(cmd_offset - Pm4::PA_CL_UCP_0_X, value);
 		};
 	}
 
@@ -3122,7 +3082,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetTfParam(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreDrawPayloadControl(value);
+		cp.GetCtx().SetDrawPayloadControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_PRIMITIVEID_RESET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePrimitiveIdReset(value);
@@ -3131,7 +3091,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetShaderZFormat(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_CL_OBJPRIM_ID_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreObjprimIdControl(value);
+		cp.GetCtx().SetObjprimIdControl(value);
 	};
 
 	for (auto cmd_offset = Pm4::PA_SC_CLIPRECT_RULE; cmd_offset < Pm4::PA_SC_CLIPRECT_0_TL + 8u;

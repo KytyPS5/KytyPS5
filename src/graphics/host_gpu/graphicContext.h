@@ -11,6 +11,7 @@
 
 #include <map>
 #include <mutex>
+#include <span>
 #include <tuple>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -38,6 +39,9 @@ struct GraphicContext {
 	// VK_KHR_pipeline_executable_properties, for KYTY_PIPELINE_IR: the driver's statistics and
 	// internal representations of the compute pipelines of one guest shader.
 	bool                               pipeline_executable_info_enabled      = false;
+	// VK_EXT_robustness2's nullDescriptor: a null guest texture is bound as a null descriptor.
+	// Off where the device lacks it (MoltenVK), and the renderer binds a placeholder instead.
+	bool                               null_descriptor_enabled               = false;
 	bool                               sample_rate_shading_enabled           = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// What the device enabled, not only what it supports, and the known defects of its driver.
@@ -124,6 +128,14 @@ struct GraphicContext {
 	}
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+
+	struct HeapUsage {
+		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
+		uint64_t budget       = 0;
+		uint32_t allocations  = 0;
+		bool     device_local = false;
+	};
+	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 

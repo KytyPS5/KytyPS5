@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/perfCounters.h"
 #include "common/profiler.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -499,7 +500,7 @@ void CommandScheduler::CheckActive() const {
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
 	return m_command;
 }
 
@@ -718,6 +719,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			graphics.queue_commits.NoteSubmit(m_queue_timeline, tick);
 		}
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
 		GpuBreadcrumbs::Report();

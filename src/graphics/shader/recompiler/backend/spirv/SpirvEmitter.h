@@ -40,7 +40,8 @@ struct MissingCapability {
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword = 0,
-                                  const HostGpu& host = HostGpu::Full());
+                                  const HostGpu& host = HostGpu::Full(),
+                                  bool emit_debug_info = false);
 
 // The record of a mesh program's outputs on a host without mesh shaders: the program runs as a
 // compute shader (EmitProgram with an emulated mesh program), which stores one record per

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -523,14 +524,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
-		    !cache.ClearMeta(metadata.range.address)) {
-			EXIT("failed to acquire HTile metadata for a depth clear\n");
-		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		depth.load_clear_aspects = {};
+		if (depth.depth_clear_enable || meta_clear)
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+		// Apply pending clears to compressed stencil as well as depth.
+		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -552,7 +554,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		if (feedback_aspects && !m_context.GetGraphics().host.capabilities.attachment_feedback_loop) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("depth attachment feedback loop is not supported by the host\n");
+			}
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
@@ -580,9 +585,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		attachment.depth_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear =
+		    static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eStencil);
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -601,7 +608,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	const auto& sh_regs     = ctx.GetShaderRegisters();
 	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
-	uint32_t    output_mask = 0;
+	uint32_t    output_mask = ctx.HasObjectPrimitiveIdOutput() ? 1u << 7u : 0;
 	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
 		const auto slot = ShaderPixelExportTarget(sh_regs.m_cbShaderMask, index);
 		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
@@ -931,7 +938,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
-			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
+			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
 				mrt_mask |= 1u << output.location;
 			}
 		}
@@ -1115,7 +1123,7 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 	    .target_image       = ImageIdentity(depth.image_id),
 	    .target_layer       = view.base_layer,
 	    .content_generation = image.ContentGeneration(),
-	    .load_clear         = depth.depth_load_clear_enable,
+	    .load_clear         = static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth),
 	    .clear_value        = depth.depth_clear_value,
 	    .cached             = held.buffer != nullptr && held.buffer->Size() >= bytes,
 	    .cached_target_image = held.image,
@@ -1138,7 +1146,7 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 		held.image      = ImageIdentity(depth.image_id);
 		held.layer      = view.base_layer;
 		held.generation = image.ContentGeneration();
-		held.load_clear = depth.depth_load_clear_enable;
+		held.load_clear = static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
 		held.clear      = depth.depth_clear_value;
 	}
 	held.tick          = scheduler.CurrentTick();
@@ -1233,7 +1241,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     state.ps_input_info.ps_sample_mask_export_enable);
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
-	if (depth.depth_load_clear_enable) {
+	if (depth.load_clear_aspects) {
 		m_context.GetCommandScheduler().BeginRendering(rendering);
 	}
 	auto& cache = m_context.GetTextureCache();
@@ -1503,20 +1511,42 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	}
-	if (mesh_emulated) {
-		// Everything the draw needs is bound.
-	} else if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages, 0,
-		                        sizeof(draw_data), draw_data);
-	} else {
+	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
+	}
+	using ShaderRecompiler::IR::PushData;
+	// Pushes name the stages of the layout's one range (pipeline.push_constant_stages).
+	const auto draw_dwords =
+	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
+	if (!mesh_emulated && draw_dwords != 0) {
+		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
+		if (mesh_active) {
+			draw_data = {
+			    draw.index_count,
+			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+			    emit.first_instance, index_source.guest_element_size,
+			    static_cast<uint32_t>(index_source.address),
+			    static_cast<uint32_t>(index_source.address >> 32u)};
+		} else {
+			draw_data[0] = buffer.GetUserConfig().GetObjectId();
+		}
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages, 0,
+		                        draw_dwords * sizeof(uint32_t), draw_data.data());
+	}
+	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
+		// An emulated mesh draw keeps its record address where the planes start
+		// (MeshEmulationAddressDword == UserClipPlaneDword); its program gets no planes.
+		if (mesh_emulated) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("user clip planes are not supported in emulated mesh draws\n");
+			}
+		} else {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages,
+			                        PushData::UserClipPlaneDword * sizeof(uint32_t),
+			                        std::bit_width(planes) * 4u * sizeof(uint32_t),
+			                        buffer.GetRegisters().GetUserClipPlanes().data());
+		}
 	}
 
 	if (state.depth_info.depth_bounds_test_enable &&
@@ -1530,6 +1560,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
+	vk::PipelineStageFlags shader_write_stages = {};
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(*stage.stage.program));
+		}
+	}
+	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (shader_write_stages) {
+		// As for dispatches, buffer writes wait for earlier accesses to the memory.
+		m_context.GetCommandScheduler().EndRendering();
+		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1563,18 +1607,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().GpuProfileEnd((state.programs.vertex[0].id << 32u) |
 		                                              (state.programs.pixel.id & 0xffffffffu));
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	}
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(*stage.stage.program));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
@@ -1582,7 +1619,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (state.depth_info.image_id &&
 	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable ||
-	     state.depth_info.stencil_clear_enable || state.depth_info.depth_load_clear_enable)) {
+	     state.depth_info.stencil_clear_enable || static_cast<bool>(state.depth_info.load_clear_aspects))) {
 		m_context.GetTextureCache().GetImage(state.depth_info.image_id).NoteContentWrite();
 	}
 	// The targets hold this draw's picture now (see TargetHistory).

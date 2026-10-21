@@ -21,6 +21,7 @@
 #include "graphics/shader/triangleVertexValueShader.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -203,12 +204,43 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	DescriptorLayoutShape shape;
+	const auto&              limits = graphics.GetPhysicalDeviceProperties().limits;
+	DescriptorLayoutShape    shape;
+	uint64_t                 samplers = 0;
+	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
 		shape.descriptors += binding.descriptorCount;
-		if (binding.descriptorType == vk::DescriptorType::eStorageBuffer) {
+		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
+		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
+		if (storage) {
 			shape.storage_buffers += binding.descriptorCount;
 		}
+		if (sampler) {
+			samplers += binding.descriptorCount;
+		}
+		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
+			const auto stage = std::countr_zero(stages);
+			if (storage) stage_buffers[stage] += binding.descriptorCount;
+			if (sampler) stage_samplers[stage] += binding.descriptorCount;
+			else
+				stage_resources[stage] += binding.descriptorCount;
+			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
+			    stage_resources[stage] > limits.maxPerStageResources ||
+			    stage_samplers[stage] > limits.maxPerStageDescriptorSamplers) {
+				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
+				     "/%u resources=%" PRIu64 "/%u samplers=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
+				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources,
+				     stage_samplers[stage], limits.maxPerStageDescriptorSamplers);
+			}
+		}
+	}
+	if (shape.storage_buffers > limits.maxDescriptorSetStorageBuffers) {
+		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
+		     static_cast<uint64_t>(shape.storage_buffers), limits.maxDescriptorSetStorageBuffers);
+	}
+	if (samplers > limits.maxDescriptorSetSamplers) {
+		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
+		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors =
 	    ChooseDescriptorDelivery(graphics.host, graphics.max_push_descriptors, shape) ==
@@ -749,6 +781,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::ComputePipelineCreateInfo info {};
+	if (input_info.stage.program->info.uses_gds) {
+		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
+	}
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;

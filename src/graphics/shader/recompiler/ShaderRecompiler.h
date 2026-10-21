@@ -8,6 +8,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <bitset>
 #include <optional>
 #include <span>
 #include <vector>
@@ -21,6 +22,7 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	bool                        emit_debug_info            = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -60,10 +62,14 @@ struct ShaderSource {
 		uint32_t instruction;
 		std::array<IR::Value, 2> target;
 		std::optional<Table> table;
+		std::bitset<128> preserved_registers;
+		uint64_t address = 0;
 	};
 	struct Linked {
+		struct Function { uint32_t offset; uint32_t size; };
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
+		std::vector<Function> functions;
 		std::vector<uint32_t> observed_function;
 		// A table call is named by the targets of its entries and the code of every function it
 		// links (observed_function holds both, in this order); the entries' other words, such as
@@ -74,7 +80,8 @@ struct ShaderSource {
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
-	std::optional<Call> call;
+	std::vector<Call> calls;
+	uint32_t unsupported_call_pc = UINT32_MAX;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

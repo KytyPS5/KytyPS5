@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -196,6 +197,7 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 		const auto& record = g_stubbed_imports[record_id];
 		Trace::Note("unresolved_import", record.name, record.program);
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -658,6 +660,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -672,6 +675,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}

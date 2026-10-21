@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -210,8 +211,12 @@ private:
 	// (DriverFaults::pipeline_cache_serializes_builds).
 	std::vector<vk::PipelineCache> m_builder_caches;
 	std::filesystem::path         m_driver_cache_path;
-	// Save wrote the driver cache: the destructor does not write it again.
-	bool                          m_driver_cache_saved = false;
+	// Save runs on the GPU thread (CheckpointDriverCache) and at exit.
+	std::mutex                    m_driver_cache_save_mutex;
+	// The driver cache is written every few minutes while new pipelines are built
+	// (CheckpointDriverCache, on the GPU thread); a worker that built one sets the flag.
+	std::chrono::steady_clock::time_point m_next_driver_cache_save;
+	std::atomic<bool>                     m_driver_cache_dirty {false};
 	// A pipeline and whether it is built yet: false while a worker thread is still building it,
 	// and the pipeline is read only once it is true.
 	struct PipelineEntry {
@@ -265,6 +270,7 @@ private:
 	std::FILE*                   m_pipeline_list = nullptr;
 
 	void                    InitializeDriverCache();
+	void                    CheckpointDriverCache();
 	void OpenPipelineList(const std::filesystem::path& path, bool writable);
 	void                    QueueListedPipelines();
 	void                    RememberPipeline(const GraphicsPipelineKey& key, const PipelineJob& job);

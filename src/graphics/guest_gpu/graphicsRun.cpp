@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -417,12 +418,13 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	if (write_one_address) {
-		// Each dword goes to the same address: the last one stays.
-		WriteGuest(dst, src + (dw_num - 1u), sizeof(uint32_t));
-	} else {
-		WriteGuest(dst, src, static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
+	// Completion labels can be reused immediately; memcpy may write a destination twice.
+	auto* output = static_cast<volatile uint32_t*>(dst);
+	for (uint32_t i = 0; i < dw_num; i++) {
+		*output = src[i];
+		output += !write_one_address;
 	}
+	NoteGuestWrite(dst, static_cast<uint64_t>(write_one_address ? 1u : dw_num) * sizeof(uint32_t));
 }
 
 void CommandProcessor::WriteGuest(void* dst, const void* src, uint64_t size) {
@@ -732,7 +734,6 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			cp.EmitGlobalBarrier();
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -1059,6 +1060,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	if (draw_count == 0) {
 		return;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
@@ -1363,11 +1365,6 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
-void CommandProcessor::EmitGlobalBarrier() {
-	Common::LockGuard lock(m_renderer.GetMutex());
-	CurrentBuffer().RequestGlobalBarrier();
-}
-
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	WriteLabelAtEndOfPipe(nullptr, 0, 0, true, interrupt_context_id);
 }
@@ -1425,21 +1422,17 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
+	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
+	// barriers already order.
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: EmitGlobalBarrier(); break;
-		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
+		case 0x00000010: break;
+		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
+		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:
 		case 0x00000031:
-			if (!valid_cache_event_index) {
-				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
-				     event_index);
-			}
-			EmitGlobalBarrier();
-			break;
-		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x0000002a:
 		case 0x0000002c:
 		case 0x0000002e:
@@ -1447,7 +1440,6 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
 			break;
 		case 0x0000000d:
 		case 0x0000000e:

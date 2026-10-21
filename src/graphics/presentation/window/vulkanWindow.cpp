@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vertexSubgroupProbe.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -65,6 +66,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+	features.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
@@ -251,6 +253,8 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	    features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
 	facts.shader_storage_buffer_array_non_uniform_indexing =
 	    features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE;
+	facts.shader_storage_image_array_non_uniform_indexing =
+	    features12.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
 	facts.shader_buffer_int64_atomics = features12.shaderBufferInt64Atomics == VK_TRUE;
 	facts.shader_shared_int64_atomics = features12.shaderSharedInt64Atomics == VK_TRUE;
 	facts.robust_image_access         = features13.robustImageAccess == VK_TRUE;
@@ -315,6 +319,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
 			     Config::GetGpuIndex());
 		}
+	} else if (vk::PhysicalDevice headset; Vr::OpenXrPhysicalDevice(instance, headset)) {
+		devices = {headset}; // The headset runtime renders on this GPU.
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;
@@ -577,6 +583,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
 	physical_device.getProperties2(&properties2);
+	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -640,6 +647,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
+	graphics.null_descriptor_enabled = robustness2_ext_enabled && robustness2.nullDescriptor == VK_TRUE;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext =
@@ -896,8 +904,11 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
+	Vr::OpenXrInit();
+
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
+	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1114,6 +1125,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1142,6 +1154,7 @@ void WindowContext::CreateVulkan() {
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
+	Vr::OpenXrStartSession(graphic_ctx);
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {
@@ -1164,6 +1177,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	Vr::OpenXrShutdown();
 	ShutdownSystemOverlayInput();
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);

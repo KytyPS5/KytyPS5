@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/perfCounters.h"
 #include "common/profiler.h"
@@ -189,6 +190,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	PerfCounters::Add(PerfCounters::Counter::ReadbackBytes, total_size);
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
@@ -275,6 +277,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	                      static_cast<uint32_t>(std::min<uint64_t>(m_gds_buffer.Size(), 4096u) / 4u));
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	m_scheduler.BeginCommand();
+	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+		buffer->Fill(0, buffer->Size(), 0);
+	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -823,6 +829,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 	PerfCounters::Add(PerfCounters::Counter::UploadBytes, total_size);
 	PerfCounters::Add(PerfCounters::Counter::UploadCopies, copies.size());
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = MapStaging(total_size);
 	if (mapped != nullptr) {
@@ -1197,6 +1204,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});

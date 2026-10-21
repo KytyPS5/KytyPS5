@@ -15,11 +15,16 @@ namespace Libs::Controller {
 // plays as nobody: a copy of a pad that the host reports twice never presses, and stays out.
 // Player 1 is logged in from the start and stays logged in, also without a pad; the keyboard
 // plays as player 1. Players 2 to 4 log in with their pad's seat and log out when it frees.
+//
+// The keyboard can instead have a seat of its own (SetKeyboard): its player is logged in while it
+// holds the seat, and pads take the other seats.
 class PlayerSeats final {
 public:
 	static constexpr int MAX_PLAYERS = 4;
 	static constexpr int NO_PLAYER   = -1;
 	static constexpr int NO_PAD      = 0; // never a host gamepad id
+	// The keyboard shares player 1 with player 1's pad.
+	static constexpr int KEYBOARD_SHARED = NO_PLAYER;
 	// Logins and logouts the game has not read yet, at most; the oldest go first.
 	static constexpr size_t MAX_EVENTS = 64;
 
@@ -28,16 +33,17 @@ public:
 		int  player = NO_PLAYER;
 	};
 
-	// `first_user`: the user id of player 1. The other players get the ids that follow it, without
-	// the two ids the system keeps for itself.
-	explicit PlayerSeats(int32_t first_user) {
-		int32_t user = first_user;
-		for (auto& id: m_users) {
-			while (user == USER_EVERYONE || user == USER_SYSTEM) {
-				++user;
-			}
-			id = user++;
-		}
+	// A pad that SetKeyboard moved out of the keyboard's new seat: to the lowest free seat, or to
+	// none (NO_PLAYER) until it presses again with a seat free.
+	struct Move {
+		int pad  = NO_PAD;
+		int from = NO_PLAYER;
+		int to   = NO_PLAYER;
+	};
+
+	// `users`: the user ids of players 1 to 4 (Config::GetPlayerUserId), which keep the saves and
+	// trophies of each player apart.
+	explicit PlayerSeats(const std::array<int32_t, MAX_PLAYERS>& users): m_users(users) {
 		Push({.login = true, .player = 0});
 	}
 
@@ -47,17 +53,38 @@ public:
 		if (const int player = PlayerOf(pad); player != NO_PLAYER || pad == NO_PAD) {
 			return player;
 		}
-		for (int player = 0; player < MAX_PLAYERS; ++player) {
-			if (m_pads[player] == NO_PAD) {
-				m_pads[player] = pad;
-				if (player != 0) {
-					Push({.login = true, .player = player});
-				}
-				return player;
+		const int player = FreeSeat();
+		if (player != NO_PLAYER) {
+			const auto before = LoggedIn();
+			m_pads[player]    = pad;
+			PushChanges(before);
+		}
+		return player;
+	}
+
+	// The keyboard takes the seat of `player`, or shares player 1 (KEYBOARD_SHARED). A pad in that
+	// seat moves (Move).
+	Move SetKeyboard(int player) {
+		const auto before = LoggedIn();
+		m_keyboard        = player;
+		Move move;
+		if (player != KEYBOARD_SHARED && m_pads[player] != NO_PAD) {
+			move.pad       = m_pads[player];
+			move.from      = player;
+			m_pads[player] = NO_PAD;
+			move.to        = FreeSeat();
+			if (move.to != NO_PLAYER) {
+				m_pads[move.to] = move.pad;
 			}
 		}
-		return NO_PLAYER;
+		PushChanges(before);
+		return move;
 	}
+
+	// The keyboard's seat, or KEYBOARD_SHARED.
+	[[nodiscard]] int Keyboard() const { return m_keyboard; }
+	// The player the keyboard plays as.
+	[[nodiscard]] int KeyboardPlayer() const { return m_keyboard == KEYBOARD_SHARED ? 0 : m_keyboard; }
 
 	// `pad` disconnected. Returns the player whose seat it freed, or NO_PLAYER when the pad had no
 	// seat. That player logs out, unless it is player 1.
@@ -66,10 +93,9 @@ public:
 		if (player == NO_PLAYER) {
 			return NO_PLAYER;
 		}
-		m_pads[player] = NO_PAD;
-		if (player != 0) {
-			Push({.login = false, .player = player});
-		}
+		const auto before = LoggedIn();
+		m_pads[player]    = NO_PAD;
+		PushChanges(before);
 		return player;
 	}
 
@@ -87,7 +113,8 @@ public:
 	[[nodiscard]] int PadOf(int player) const { return m_pads[player]; }
 
 	[[nodiscard]] bool IsLoggedIn(int player) const {
-		return player == 0 || (player > 0 && player < MAX_PLAYERS && m_pads[player] != NO_PAD);
+		return player == 0 ||
+		       (player > 0 && player < MAX_PLAYERS && (m_pads[player] != NO_PAD || m_keyboard == player));
 	}
 
 	[[nodiscard]] int32_t UserOf(int player) const { return m_users[player]; }
@@ -113,6 +140,31 @@ public:
 	}
 
 private:
+	[[nodiscard]] int FreeSeat() const {
+		for (int player = 0; player < MAX_PLAYERS; ++player) {
+			if (m_pads[player] == NO_PAD && player != m_keyboard) {
+				return player;
+			}
+		}
+		return NO_PLAYER;
+	}
+
+	[[nodiscard]] std::array<bool, MAX_PLAYERS> LoggedIn() const {
+		std::array<bool, MAX_PLAYERS> logged_in {};
+		for (int player = 0; player < MAX_PLAYERS; ++player) {
+			logged_in[player] = IsLoggedIn(player);
+		}
+		return logged_in;
+	}
+
+	void PushChanges(const std::array<bool, MAX_PLAYERS>& before) {
+		for (int player = 0; player < MAX_PLAYERS; ++player) {
+			if (const bool now = IsLoggedIn(player); now != before[player]) {
+				Push({.login = now, .player = player});
+			}
+		}
+	}
+
 	void Push(Event event) {
 		if (m_events.size() == MAX_EVENTS) {
 			m_events.pop_front();
@@ -120,10 +172,8 @@ private:
 		m_events.push_back(event);
 	}
 
-	static constexpr int32_t USER_EVERYONE = 0xfe;
-	static constexpr int32_t USER_SYSTEM   = 0xff;
-
 	std::array<int, MAX_PLAYERS>     m_pads {};
+	int                              m_keyboard = KEYBOARD_SHARED;
 	std::array<int32_t, MAX_PLAYERS> m_users {};
 	std::deque<Event>                m_events;
 };

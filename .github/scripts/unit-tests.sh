@@ -37,6 +37,7 @@ names=(
 	gpu_write_ticks
 	guest_memory_window
 	guest_write_log
+	host_input
 	host_lowering
 	http_uri_parse
 	image_page_table
@@ -105,6 +106,7 @@ local_only=(
 	pm4_context_state
 	shader_recompiler_alignbyte
 	shader_recompiler_compute
+	shader_recompiler_tessellation
 	stream_buffer_ring
 	texture_cache_depth_readback
 	texture_cache_htile_clear

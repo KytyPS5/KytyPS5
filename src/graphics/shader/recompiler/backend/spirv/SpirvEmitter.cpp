@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -86,7 +87,7 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		return MissingCapability {"derivatives in a compute shader", "computeDerivativeGroupQuads"};
 	}
 	const bool subgroups = requirements.subgroup_ballot || requirements.subgroup_barrier ||
-	                       requirements.subgroup_shuffle || requirements.subgroup_arithmetic ||
+	                       requirements.subgroup_vote || requirements.subgroup_shuffle || requirements.subgroup_arithmetic ||
 	                       requirements.subgroup_local_invocation_id;
 	// A wave barrier has no single-lane form.
 	const bool single_lane =
@@ -101,10 +102,11 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		                          "subgroupSupportedStages"};
 	}
 	if (subgroups && !single_lane) {
-		// VkSubgroupFeatureFlagBits: basic 0x1, ballot 0x8, shuffle 0x10.
+		// VkSubgroupFeatureFlagBits: basic 0x1, vote 0x2, ballot 0x8, shuffle 0x10.
 		const uint32_t operations =
 		    (requirements.subgroup_local_invocation_id || requirements.subgroup_barrier ? 0x1u
 		                                                                                : 0u) |
+		    (requirements.subgroup_vote ? 0x2u : 0u) |
 		    (requirements.subgroup_ballot ? 0x8u : 0u) |
 		    (requirements.subgroup_shuffle ? 0x10u : 0u) |
 		    (requirements.subgroup_arithmetic ? 0x4u : 0u) |
@@ -113,7 +115,7 @@ std::optional<MissingCapability> FindMissingCapability(const IR::Program& progra
 		         ? 0x4u
 		         : 0u);
 		if ((caps.subgroup_supported_operations & operations) != operations) {
-			return MissingCapability {"a subgroup operation (lane id, ballot, shuffle or scan)",
+			return MissingCapability {"a subgroup operation (lane id, vote, ballot, shuffle or scan)",
 			                          "subgroupSupportedOperations"};
 		}
 	}
@@ -166,7 +168,7 @@ void ValidateHost(const IR::Program& program, const HostGpu& host) {
 }
 
 void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
-	uint64_t live_buffers = 0;
+	std::vector<bool> live_buffers(program.info.buffers.size());
 	bool uses_lds = false;
 	bool uses_gds = false;
 	const auto uses_mapping = [](const auto& resource) {
@@ -233,12 +235,12 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 						if (memory.resource >= program.info.buffers.size()) {
 							Fail(program, "typed shader contains an invalid buffer resource");
 						}
-						live_buffers |= uint64_t{1} << memory.resource;
+						live_buffers[memory.resource] = true;
 						for (const auto child: program.info.buffers[memory.resource].indirect_resources) {
 							if (child >= program.info.buffers.size()) {
 								Fail(program, "typed shader contains an invalid indirect buffer resource");
 							}
-							live_buffers |= uint64_t{1} << child;
+							live_buffers[child] = true;
 						}
 					}
 				}
@@ -251,6 +253,11 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 					}
 					if (dense >= program.info.buffers.size()) {
 						Fail(program, "typed buffer handle has an invalid dense resource");
+					}
+					break;
+				case IR::ValueOpcode::GetBufferResourceIndex:
+					if (dense >= program.info.buffers.size()) {
+						Fail(program, "typed buffer selector has an invalid dense resource");
 					}
 					break;
 				case IR::ValueOpcode::GetAddressResource:
@@ -292,8 +299,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	std::array<uint32_t, static_cast<size_t>(Kind::Count)> expected {};
 	auto& buffer_count = expected[static_cast<size_t>(Kind::Buffers)];
 	for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
-		const auto slot = (live_buffers & (uint64_t{1} << index)) != 0 ? buffer_count++ : UINT32_MAX;
-		if (program.info.buffers[index].descriptor_index != slot) {
+		const auto slot = live_buffers[index] ? buffer_count++ : UINT32_MAX;
+		if (program.info.buffers[index].live != live_buffers[index] ||
+		    program.info.buffers[index].descriptor_index != slot) {
 			Fail(program, "native buffer descriptor index does not match shader topology");
 		}
 	}
@@ -353,7 +361,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 } // namespace
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword, const HostGpu& host) {
+                                  uint32_t push_data_start_dword, const HostGpu& host,
+                                  bool emit_debug_info) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -366,13 +375,16 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	    !program.shader_info_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	if (program.info.buffers.size() > IR::ShaderInfo::MaxBuffers) {
-		Fail(program, "native shader exceeds the buffer resource limit");
-	}
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, host);
 	state.single_lane = UsesSingleLaneModel(program.stage, host);
+	if (emit_debug_info) {
+		char name[64];
+		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",
+		              program.shader_hash);
+		state.debug_source = state.builder.AddString(name);
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

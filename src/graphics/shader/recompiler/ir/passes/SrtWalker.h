@@ -222,6 +222,8 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
+	// The session's contexts, linked by next_of_session (the session's own walker keeps them).
+	mutable uint32_t                m_session_contexts = UINT32_MAX;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;

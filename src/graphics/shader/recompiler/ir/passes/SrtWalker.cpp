@@ -1103,8 +1103,11 @@ SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
 
 SrtWalker::~SrtWalker() {
 	if (m_session != this) return;
-	for (auto& context: m_program.evaluation_contexts)
-		if (context.session == this) context.session = nullptr;
+	for (auto index = m_session_contexts; index != UINT32_MAX;) {
+		auto& context   = m_program.evaluation_contexts[index];
+		context.session = nullptr;
+		index           = context.next_of_session;
+	}
 }
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
@@ -1117,18 +1120,27 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 }
 
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
-	ResourcePlan::EvaluationContext* unused = nullptr;
-	for (auto& context: m_program.evaluation_contexts) {
-		if (context.session == m_session && context.active_mask == m_active_mask &&
-		    context.read_policy == m_read_policy) return context;
-		if (context.session == nullptr && unused == nullptr) unused = &context;
+	auto& contexts = m_program.evaluation_contexts;
+	const auto key = m_program.evaluation_keys.try_emplace({m_active_mask, m_read_policy}, UINT32_MAX).first;
+	auto unused = UINT32_MAX;
+	for (auto index = key->second; index != UINT32_MAX; index = contexts[index].next_of_key) {
+		if (contexts[index].session == m_session) return contexts[index];
+		if (contexts[index].session == nullptr && unused == UINT32_MAX) unused = index;
 	}
-	auto& context = unused != nullptr ? *unused : m_program.evaluation_contexts.emplace_back();
-	context.session = m_session;
-	context.active_mask = m_active_mask;
-	context.read_policy = m_read_policy;
-	context.generation += 4;
+	if (unused == UINT32_MAX) {
+		unused              = static_cast<uint32_t>(contexts.size());
+		auto& context       = contexts.emplace_back();
+		context.active_mask = m_active_mask;
+		context.read_policy = m_read_policy;
+		context.next_of_key = key->second;
+		key->second         = unused;
+	}
+	auto& context              = contexts[unused];
+	context.session            = m_session;
+	context.generation        += 4;
 	context.unknowns.clear();
+	context.next_of_session    = m_session->m_session_contexts;
+	m_session->m_session_contexts = unused;
 	return context;
 }
 
@@ -1211,8 +1223,9 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 }
 
 void SrtWalker::ResetUnknowns() {
-	for (auto& context: m_program.evaluation_contexts) {
-		if (context.session != m_session) continue;
+	for (auto next = m_session->m_session_contexts; next != UINT32_MAX;) {
+		auto& context = m_program.evaluation_contexts[next];
+		next          = context.next_of_session;
 		for (const auto index: context.unknowns)
 			if (context.values[index].generation == (context.generation | 2u))
 				context.values[index].generation = 0;

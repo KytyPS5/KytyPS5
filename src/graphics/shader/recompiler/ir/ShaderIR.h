@@ -694,6 +694,23 @@ struct ResourcePlan {
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
 		uint8_t            read_policy = 0;
+		// The next context of the same key, and of the same session (SrtWalker::AcquireContext).
+		uint32_t next_of_key     = UINT32_MAX;
+		uint32_t next_of_session = UINT32_MAX;
+	};
+
+	struct EvaluationKey {
+		Value   active_mask;
+		uint8_t read_policy = 0;
+
+		bool operator==(const EvaluationKey& other) const = default;
+	};
+
+	struct EvaluationKeyHash {
+		size_t operator()(const EvaluationKey& key) const {
+			return (reinterpret_cast<uintptr_t>(key.active_mask.TryInstruction()) >> 4u) * 4u +
+			       key.read_policy;
+		}
 	};
 
 	ResourcePlan();
@@ -729,6 +746,8 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
+	// The first context of each key; a key has one context per session that uses it.
+	mutable std::unordered_map<EvaluationKey, uint32_t, EvaluationKeyHash> evaluation_keys;
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;

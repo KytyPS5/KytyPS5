@@ -69,19 +69,55 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
+	if (program.info.has_bitwise_xor) {
+		return false;
+	}
+	// A metadata clear writes constant values into metadata surfaces and nothing else. Metadata
+	// entries outlive the memory they describe when a game frees a depth target and reuses its
+	// HTILE for something else, so the target address alone does not identify a clear. A dispatch
+	// that reads real data, writes other memory, or writes past the surface must run.
+	// PPSA09809: the scene-buffer resize and upload landed on a stale HTILE address after battles
+	// and were dropped, so models vanished.
+	constexpr uint64_t MaxClearConstantsBytes = 4096;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& resource   = program.info.buffers[i];
+		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (!resource.read || descriptor.Base48() == 0) {
+			continue;
+		}
+		if (descriptor.NumRecords() == UINT32_MAX ||
+		    descriptor.GetSize() > MaxClearConstantsBytes) {
+			return false;
 		}
 	}
-	return false;
+	bool any_meta = false;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& resource   = program.info.buffers[i];
+		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (!resource.written || descriptor.Base48() == 0) {
+			continue;
+		}
+		uint64_t meta_size = 0;
+		if (!cache.FindMeta(descriptor.Base48(), meta_size)) {
+			return false;
+		}
+		if (descriptor.NumRecords() != UINT32_MAX && meta_size != 0 &&
+		    descriptor.GetSize() > meta_size) {
+			return false;
+		}
+		any_meta = true;
+	}
+	if (!any_meta) {
+		return false;
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].written) {
+			const auto descriptor =
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			(void)cache.ClearMeta(descriptor.Base48());
+		}
+	}
+	return true;
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,

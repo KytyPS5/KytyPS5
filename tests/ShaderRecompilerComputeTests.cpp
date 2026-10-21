@@ -384,10 +384,12 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
-  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
+                                uint64_t size = 0) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.clear_mask.reset();
+    metadata.size = size;
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -5834,6 +5836,81 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+
+    // A game can free a depth target and reuse its HTILE memory for other data while the
+    // metadata entry remains. Writing that address is then not a clear unless the dispatch
+    // writes only metadata, within the surface, from constants (PPSA09809 scene-buffer copies).
+    const auto AddBuffer = [](uint64_t address, bool read, bool written, uint32_t records,
+                              ShaderRecompiler::IR::CompiledShaderInfo &program,
+                              ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+      program.stage = ShaderType::Compute;
+      ShaderRecompiler::IR::BufferResource resource{};
+      resource.read = read;
+      resource.written = written;
+      resource.formatted = true;
+      program.info.buffers.push_back(resource);
+      ShaderBufferResource descriptor{};
+      descriptor.UpdateAddress48(address);
+      descriptor.fields[1] |= 16u << 16u;
+      descriptor.fields[2] = records;
+      descriptor.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt)
+           << 12u);
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 4;
+      std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
+      snapshot.buffers.push_back(value);
+    };
+    const auto MakeDispatch = [](ShaderRecompiler::IR::CompiledShaderInfo &program,
+                                 ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+      ShaderComputeInputInfo input{};
+      input.stage.program = &program;
+      input.stage.resources = &snapshot;
+      return input;
+    };
+    constexpr uint64_t reused_meta = 0x0000000204210000ull;
+    constexpr uint64_t scene_data = 0x0000000204300000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, reused_meta, 0xa0000);
+
+    ShaderRecompiler::IR::CompiledShaderInfo copy_program{};
+    ShaderRecompiler::IR::ResourceSnapshot copy_snapshot;
+    AddBuffer(scene_data, true, false, 0x2400, copy_program, copy_snapshot);
+    AddBuffer(reused_meta, false, true, 0x9000, copy_program, copy_snapshot);
+    const bool copy_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(copy_program, copy_snapshot), command);
+    Require(name, "data copy into reused HTile memory preserved",
+            !copy_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch copying data into reused HTile memory was replaced by a clear");
+
+    ShaderRecompiler::IR::CompiledShaderInfo past_program{};
+    ShaderRecompiler::IR::ResourceSnapshot past_snapshot;
+    AddBuffer(reused_meta, false, true, 0xb000, past_program, past_snapshot);
+    const bool past_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(past_program, past_snapshot), command);
+    Require(name, "write past the HTile surface preserved",
+            !past_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch writing past the HTile surface was replaced by a clear");
+
+    ShaderRecompiler::IR::CompiledShaderInfo mixed_program{};
+    ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
+    AddBuffer(reused_meta, false, true, 0x100, mixed_program, mixed_snapshot);
+    AddBuffer(scene_data, false, true, 0x100, mixed_program, mixed_snapshot);
+    const bool mixed_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(mixed_program, mixed_snapshot), command);
+    Require(name, "write to HTile and other memory preserved",
+            !mixed_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch also writing non-metadata memory was replaced by a clear");
+
+    ShaderRecompiler::IR::CompiledShaderInfo clear_program{};
+    ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;
+    AddBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);
+    AddBuffer(reused_meta, false, true, 0xa000, clear_program, clear_snapshot);
+    const bool clear_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(clear_program, clear_snapshot), command);
+    Require(name, "constant-driven HTile clear consumed",
+            clear_consumed && texture_cache.IsMetaCleared(reused_meta, 0),
+            "a full HTile clear reading only constants was not consumed");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }

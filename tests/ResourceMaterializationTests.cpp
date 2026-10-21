@@ -1856,6 +1856,15 @@ void TestSpecializationFitsTheShader() {
   specialization.images.resize(1);
   Check(ResourceSpecializationFits(info, specialization),
         "a specialization of the shader's own resources was refused");
+  // A record from before the shader had samplers is refused, as for images.
+  info.samplers.resize(2);
+  Check(!ResourceSpecializationFits(info, specialization),
+        "a specialization with fewer samplers than the shader was accepted");
+  specialization.samplers.resize(2);
+  Check(ResourceSpecializationFits(info, specialization),
+        "a specialization of the shader's own samplers was refused");
+  info.samplers.clear();
+  specialization.samplers.clear();
 
   // An entry past the shader's resources is a copy of one of them.
   specialization.buffers.push_back({.indirect_root = 1});

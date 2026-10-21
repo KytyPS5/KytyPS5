@@ -481,6 +481,19 @@ protected:
 		QListView::mousePressEvent(event);
 	}
 
+	// Press selects by the drawn tile and never reaches QAbstractItemView, so double clicks are
+	// resolved here with the same geometry.
+	void mouseDoubleClickEvent(QMouseEvent* event) override {
+		if (event->button() == Qt::LeftButton) {
+			const auto index = indexAt(event->pos());
+			if (index.isValid()) {
+				emit doubleClicked(index);
+			}
+			return;
+		}
+		QListView::mouseDoubleClickEvent(event);
+	}
+
 	void mouseReleaseEvent(QMouseEvent* event) override {
 		if (event->button() == Qt::LeftButton || !indexAt(event->pos()).isValid()) {
 			return;

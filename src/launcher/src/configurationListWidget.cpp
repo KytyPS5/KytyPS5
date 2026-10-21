@@ -452,8 +452,12 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 		m_ui->grid_size_slider->setVisible(grid);
 		auto* view = grid ? static_cast<QAbstractItemView*>(m_ui->cfgs_grid) : m_ui->cfgs_list;
 		m_ui->game_views->setCurrentWidget(view);
-		if (grid && m_selected_item == nullptr) {
-			SelectFirstVisibleItem();
+		if (grid) {
+			if (m_selected_item == nullptr) {
+				SelectFirstVisibleItem();
+			} else {
+				UpdateGridDetails();
+			}
 		}
 		view->setCurrentIndex(view->currentIndex().siblingAtColumn(GAME_NAME_COLUMN));
 		view->scrollTo(view->currentIndex());
@@ -1441,13 +1445,19 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 }
 
 void ConfigurationListWidget::UpdateGridDetails() {
+	// The grid details load images and parse trophy files, so skip them while the list is shown.
+	if (m_ui->game_views->currentWidget() != m_ui->cfgs_grid) {
+		return;
+	}
 	if (m_selected_item == nullptr) {
 		m_ui->cfgs_grid->SetBackgroundImage({});
 		m_ui->cfgs_grid->SetTrophyInfo({}, {}, {});
 		m_ui->cfgs_grid->SetRecentTrophies({});
 		return;
 	}
-	const auto& info = m_selected_item->GetInfo();
+	// Use the effective configuration so a custom user_id / language is honoured.
+	const auto  config = CreateConfiguration(*m_selected_item);
+	const auto& info   = *config;
 	m_ui->cfgs_grid->SetBackgroundImage(info.basedir);
 	unsigned earned = 0, total = 0, percent = 0;
 	if (TrophyViewerDialog::GetProgress(&info, m_runtime_directory, earned, total, percent)) {

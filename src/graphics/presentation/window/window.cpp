@@ -919,6 +919,11 @@ void WindowContext::Run() {
 					if (key.empty() || SDL_GetKeyFromName(key.c_str()) == SDLK_UNKNOWN) continue;
 					std::printf("Bench: %llu ms, live tap %s\n", static_cast<unsigned long long>(live_now), key.c_str());
 					std::fflush(stdout);
+					if (SDL_GetKeyFromName(key.c_str()) == SDLK_F1) {
+						// As on the keyboard: F1 captures the next frame in RenderDoc.
+						RenderDocRequestCapture();
+						continue;
+					}
 					HostInputKey(SDL_GetKeyFromName(key.c_str()), true);
 					live_releases.emplace_back(live_now + 150, key);
 					live_next_ms = live_now + 400; // one tap at a time, as a player would

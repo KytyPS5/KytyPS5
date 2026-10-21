@@ -31,6 +31,8 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Like SendCommand, but returns false instead of exiting once Shutdown() has begun.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,

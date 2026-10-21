@@ -16241,13 +16241,19 @@ public:
       TextureCacheTestAccess::ClearImage(
           texture_cache, scheduler.Current(), target_subresource_id,
           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
+      // A cleared 2x2 target is tiny, so the clear itself enrolls it for EOP readback; the
+      // prefetch must not change that enrollment.
+      Require(name, "tiny cleared target readback",
+              TextureCacheTestAccess::PendingDownload(texture_cache,
+                                                      target_subresource_id),
+              "clearing a tiny target did not enroll it for readback");
       RenderExecutorTestAccess::BindRenderTarget(executor,
                                                  target_subresource_id);
       Require(name, "target prefetch purity",
               texture_cache.GetImage(target_subresource_id).binding.is_target &&
                   !texture_cache.GetImage(target_subresource_id)
                        .usage.render_target &&
-                  !TextureCacheTestAccess::PendingDownload(
+                  TextureCacheTestAccess::PendingDownload(
                       texture_cache, target_subresource_id),
               "target prefetch performed final target acquisition");
       const auto target_parent_id = texture_cache.FindImage(target_parent);

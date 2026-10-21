@@ -33,6 +33,11 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// Deferred EOP labels hand their writes to the GPU object; let them run before it goes.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.Finish();
+		}
+		m_command_scheduler.DrainPriorityOperations();
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {

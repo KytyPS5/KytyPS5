@@ -1405,8 +1405,7 @@ bool RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The CPU path skips primitive types it cannot draw (patches without tessellation); their
 	// arguments only latch NUM_INSTANCES.
 	const bool drawn = GetDrawTopology(ucfg, topology);
-	if (prim == Prospero::PrimitiveType::kQuadListLegacy || Prospero::IsRectList(prim) ||
-	    (drawn && prim == Prospero::PrimitiveType::kPatch)) {
+	if (prim == Prospero::PrimitiveType::kQuadListLegacy || Prospero::IsRectList(prim)) {
 		return false;
 	}
 	const uint32_t command_bytes = args.indexed ? 5 * sizeof(uint32_t) : 4 * sizeof(uint32_t);
@@ -1487,9 +1486,12 @@ bool RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                      : CommandBufferDebugOp::DrawIndexAuto,
 	                         0, 0, 0};
 	DrawRenderState    state {};
+	// Patches run the LS, HS and TES stages; the arguments count their control points.
+	const bool tessellated = prim == Prospero::PrimitiveType::kPatch;
 	if (!PrepareDrawRenderState(buffer, draw, 0, state) ||
-	    state.vertex_info[0].stage.program->stage != ShaderType::Vertex ||
-	    state.programs.VertexStageCount() != 1) {
+	    state.vertex_info[0].stage.program->stage !=
+	        (tessellated ? ShaderType::Local : ShaderType::Vertex) ||
+	    state.programs.VertexStageCount() != (tessellated ? 3u : 1u)) {
 		ResetBindings();
 		return false;
 	}

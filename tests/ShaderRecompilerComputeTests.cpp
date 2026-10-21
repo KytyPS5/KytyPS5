@@ -18798,8 +18798,7 @@ public:
         registers.SetRenderControl(render_control);
 
         // Primitive types the CPU path skips (patches without tessellation, line loops) draw
-        // nothing; their GPU-written arguments only latch NUM_INSTANCES. Drawn patches stay on
-        // the CPU.
+        // nothing; their GPU-written arguments only latch NUM_INSTANCES.
         for (const auto prim :
              {Prospero::PrimitiveType::kPatch, Prospero::PrimitiveType::kLineLoop}) {
           user_config.SetPrimitiveType(prim);
@@ -18821,13 +18820,127 @@ public:
                   std::ranges::all_of(pixels, [](u32 v) { return v == 0; }),
                   "a draw the CPU path skips wrote the target");
         }
+
+        // Tessellated patches run LS, HS and TES from GPU-written arguments too. The HS reads
+        // another control point's output and stores a patch output, which the TES reads.
+        static const auto tess_local = [] {
+          std::vector<u32> code{EncodeVop2(0x1b, 4, InlineU32(1), 2),
+                                EncodeVop2(0x1b, 5, InlineU32(2), 2),
+                                EncodeVop1(0x06, 4, Vgpr(4)), EncodeVop1(0x06, 5, Vgpr(5))};
+          AppendVop3(&code, 0x141, 4, Vgpr(4), 246u, 243u); // x = 4 * (vertex & 1) - 1
+          AppendVop3(&code, 0x141, 5, Vgpr(5), 244u, 243u); // y = 2 * (vertex & 2) - 1
+          code.insert(code.end(), {EncodeSopp(0x04, 1), EncodeVop1(0x01, 6, InlineU32(0)),
+                                   EncodeVop2(0x1a, 2, InlineU32(4), 3), EncodeDs0(0x4d),
+                                   EncodeDs1Ex(0, 0, 4, 2), EncodeSop1(0x20, 0, 6), 0xffffffffu});
+          return code;
+        }();
+        static const auto tess_control = [] {
+          std::vector<u32> code;
+          AppendVop3(&code, 0x148, 34, Vgpr(1), InlineU32(8), InlineU32(5));
+          AppendVop3(&code, 0x148, 32, Vgpr(1), InlineU32(0), InlineU32(8));
+          code.insert(code.end(), {EncodeSop1(0x04, 20, 126), EncodeVopc(0xd4, InlineU32(3), 34),
+                                   EncodeSopp(0x08, 4)});
+          AppendVop3(&code, 0x346, 29, Vgpr(34), InlineU32(4), Vgpr(32));
+          code.insert(code.end(),
+                      {EncodeDs0(0x76), EncodeDs1Ex(10, 0, 0, 29), EncodeSop1(0x04, 126, 20),
+                       EncodeVop2(0x0b, 35, InlineU32(16), 34), EncodeMubuf0(0x1d),
+                       EncodeMubuf1(10, 2, 35, 2), EncodeSopp(0x0a),
+                       EncodeVopc(0xd4, InlineU32(1), 34), EncodeSopp(0x08, 16),
+                       EncodeMubuf0(0x0c, 16), EncodeMubuf1(14, 2, 32, 2),
+                       EncodeVop2(0x25, 8, InlineU32(1), 32), EncodeVop2(0x0b, 8, 255u, 8), 0x50,
+                       EncodeVop2(0x26, 8, 255u, 8), 0x8000, EncodeMubuf0(0x1c),
+                       EncodeMubuf1(14, 2, 8, 2), EncodeVop2(0x1a, 6, InlineU32(4), 32)});
+          for (u32 factor = 0; factor < 4; factor++) {
+            code.push_back(EncodeVop1(0x01, factor, 242u));
+          }
+          code.insert(code.end(), {EncodeMubuf0(0x1e), EncodeMubuf1(0, 2, 6, 4)});
+          AppendEnd(&code);
+          return code;
+        }();
+        static const auto tess_evaluation = [] {
+          std::vector<u32> code;
+          AppendVop3(&code, 0x169, 24, 255u, Vgpr(7));
+          code.push_back(48);
+          for (u32 point = 0; point < 3; point++) {
+            code.insert(code.end(),
+                        {EncodeMubuf0(0x0d, 16 * point), EncodeMubuf1(10 + 2 * point, 2, 24, 4)});
+          }
+          code.insert(code.end(),
+                      {EncodeVop2(0x04, 16, 242u, 5), EncodeVop2(0x04, 16, Vgpr(16), 6),
+                       EncodeVop2(0x08, 17, Vgpr(5), 10), EncodeVop2(0x1f, 17, Vgpr(6), 12),
+                       EncodeVop2(0x1f, 17, Vgpr(16), 14), EncodeVop2(0x08, 18, Vgpr(5), 11),
+                       EncodeVop2(0x1f, 18, Vgpr(6), 13), EncodeVop2(0x1f, 18, Vgpr(16), 15),
+                       EncodeVop2(0x25, 7, InlineU32(1), 7), EncodeVop2(0x0b, 7, 255u, 7), 0x50,
+                       EncodeVop2(0x26, 7, 255u, 7), 0x8000, EncodeMubuf0(0x0c),
+                       EncodeMubuf1(19, 2, 7, 4), EncodeVop1(0x01, 20, InlineU32(0)),
+                       EncodeVop1(0x01, 21, 242u), EncodeExp0(0x0c, 0xf, false),
+                       EncodeExp1(17, 18, 20, 21), EncodeExp0(0x20, 0xf),
+                       EncodeExp1(19, 19, 19, 21)});
+          AppendEnd(&code);
+          return code;
+        }();
+        static const auto tess_pixel = [] {
+          std::vector<u32> code{EncodeVintrp(0x02, 0, 0, 0, 2), EncodeVop1(0x01, 1, 242u),
+                                EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 1)};
+          AppendEnd(&code);
+          return code;
+        }();
+        const auto map_stage = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type) {
+          const auto address = reinterpret_cast<uint64_t>(code.data());
+          ShaderMapUserData(address,
+              {.type = type, .user_data = &native_user_data,
+               .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+          return address;
+        };
+        shaders.SetLsShaderBase(map_stage(tess_local, Prospero::ShaderBinaryType::kHsFront));
+        shaders.SetHsShaderBase(map_stage(tess_control, Prospero::ShaderBinaryType::kHsBack));
+        shaders.SetEsShaderBase(map_stage(tess_evaluation, Prospero::ShaderBinaryType::kGs));
+        shaders.SetPsShaderBase(map_stage(tess_pixel, Prospero::ShaderBinaryType::kPs));
+        const auto hs_user_data = reinterpret_cast<uint64_t>(&native_user_data);
+        shaders.SetHsUserDataAddress(0, static_cast<u32>(hs_user_data));
+        shaders.SetHsUserDataAddress(1, static_cast<u32>(hs_user_data >> 32u));
+        shaders.SetHsShaderResource2({});
+        shaders.SetGsShaderResource2({});
+        const auto saved_stages = registers.GetShaderStages();
+        registers.SetShaderStages(0x4);
+        registers.SetLsHsConfig((3u << 8u) | (3u << 14u) | 1u);
+        registers.SetTfParam(1u | (2u << 5u)); // triangles, integer partitioning, clockwise
+        registers.SetPsInControl(0x8001);
+        registers.SetPsInputSettings(0, 0x400);
         user_config.SetPrimitiveType(Prospero::PrimitiveType::kPatch);
         Config::Load({.tessellation_enabled = true});
-        Require("GpuIndirectDraw", "tessellated patch stays on the CPU",
-                !RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
-                    {.arguments = arguments_base + 0x3c0, .max_count = 1, .stride = 16}, 1u),
-                "a tessellated draw took the GPU path");
+        for (const bool indexed : {false, true}) {
+          clear_color();
+          const auto arguments_address = arguments_base + 0x3c0;
+          write_gpu(arguments_address, std::array{3u, 1u, 0u, 0u, 0u});
+          Require("GpuIndirectDraw", "tessellated GPU path",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                      {.arguments = arguments_address,
+                       .max_count = 1,
+                       .stride = indexed ? 20u : 16u,
+                       .indexed = indexed,
+                       .index_base = index_address,
+                       .index_type_and_size = 1,
+                       .index_buffer_size = 3},
+                      1u),
+                  "a tessellated draw read its GPU-written arguments back");
+          Require("GpuIndirectDraw", "tessellated without readback",
+                  buffers.IsRegionGpuModified(arguments_address, 20),
+                  "a tessellated draw read its GPU-written arguments back to the CPU");
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id, {},
+                                              {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            Require("GpuIndirectDraw", indexed ? "tessellated indexed" : "tessellated auto",
+                    pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x40400000u),
+                    "the tessellated patch lost coverage or did not carry control point 1's x");
+          }
+        }
         Config::Load({});
+        registers.SetShaderStages(saved_stages);
+        registers.SetPsInControl(0x8000);
+        registers.SetPsInputSettings(0, 0);
+        shaders.SetPsShaderBase(pixel_address);
+        shaders.SetGsShaderResource2({.user_sgpr = 2});
         user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
 
         // Rewritten fetches keep the base vertex and first instance; the commands follow the

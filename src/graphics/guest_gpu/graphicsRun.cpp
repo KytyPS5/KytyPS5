@@ -98,6 +98,22 @@ void GuestGpu::Wake() {
 	m_work_available.Signal();
 }
 
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) {
+		return false;
+	}
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -1094,6 +1110,11 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					// SynchronizeGpu() waits for the GPU but not for priority callbacks: wait for
 					// readback copies and deferred labels queued by this or earlier EOPs.
 					GetScheduler().DrainPriorityOperations();
+					// Deferred labels are written by GPU-thread commands (see
+					// PublishLabelAfterReadbacks); run them so they land before this label.
+					if (g_gpu_state != nullptr) {
+						g_gpu_state->ProcessCommands();
+					}
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					if (with_interrupt) {
@@ -1250,14 +1271,28 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 		return false;
 	}
 	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);
-	GetScheduler().DeferPriorityOperation(
-	    [dst, value, size, pending = m_labels_behind_readbacks] {
-		    std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
-		    pending->fetch_sub(1, std::memory_order_acq_rel);
-	    });
-	if (with_interrupt) {
-		TriggerEopEventAtEndOfPipe(interrupt_context_id);
-	}
+	// The priority callback only hands the write to the GPU thread. The label's page can be
+	// tracked by the buffer cache (the GPU writes other bytes of it); a CPU write there faults
+	// into a buffer readback, which cannot run from a deferred operation. GPU-thread commands
+	// run in FIFO order between PM4 packets, so labels stay ordered, and the interrupt is raised
+	// by the same command after the label is visible.
+	GetScheduler().DeferPriorityOperation([&gpu = m_renderer.GetGpu(), &renderer = m_renderer,
+	                                       event_id = m_interrupt_event_id, dst, value, size,
+	                                       with_interrupt, interrupt_context_id,
+	                                       pending = m_labels_behind_readbacks] {
+		const bool sent = gpu.TrySendCommand([&renderer, event_id, dst, value, size,
+		                                      with_interrupt, interrupt_context_id, pending] {
+			std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
+			pending->fetch_sub(1, std::memory_order_acq_rel);
+			if (with_interrupt) {
+				renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			}
+		});
+		if (!sent) {
+			// The GPU is shutting down; nothing waits on the label any more.
+			pending->fetch_sub(1, std::memory_order_acq_rel);
+		}
+	});
 	GetScheduler().Flush();
 	return true;
 }

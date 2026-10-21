@@ -62,6 +62,7 @@ DeviceFacts FullFacts() {
 	f.block_texel_view                                = true;
 	f.subgroup_supported_stages                       = ~0u;
 	f.subgroup_supported_operations                   = ~0u;
+	f.max_per_stage_samplers                          = ~0u;
 	f.depth_clamp                                     = true;
 	f.draw_indirect_first_instance                    = true;
 	f.depth_bias_clamp                                = true;
@@ -159,6 +160,7 @@ void TestMoltenVkLikeDeviceIsAccepted() {
 	Check(c.push_descriptors, "push descriptors must be on: the device has the extension");
 	Check(c.subgroup_supported_stages == (0x20u | 0x10u), "subgroup stages must be passed on");
 	Check(c.subgroup_supported_operations == ~0u, "subgroup operations must be passed on");
+	Check(c.max_stage_samplers == ~0u, "the per-stage sampler limit must be passed on");
 	Check(Contains(decision.unavailable, "image view minLod"),
 	      "an unavailable minLod must be reported");
 	Check(Contains(decision.unavailable, "shaderCullDistance"),

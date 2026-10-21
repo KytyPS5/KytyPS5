@@ -233,9 +233,12 @@ void DefineDescriptors(EmitterState& state) {
 	// A host that cannot put a minimum LOD on a texture view applies it through the sampler.
 	// Textures read through one guest sampler may have different minimums, so each pair gets
 	// its own entry, after the plain ones, which serve a read whose texture is not known here.
+	// The entries stay within the samplers a stage can bind (16 on Metal): a pair past that
+	// reads its guest sampler's plain entry and loses only the texture's minimum LOD.
 	for (auto& pair: info.sampled_pairs) {
-		pair.descriptor_index =
-		    state.host.capabilities.image_view_min_lod ? UINT32_MAX : sampler_count++;
+		const bool own_entry = !state.host.capabilities.image_view_min_lod &&
+		                       sampler_count < state.host.capabilities.max_stage_samplers;
+		pair.descriptor_index = own_entry ? sampler_count++ : UINT32_MAX;
 	}
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =

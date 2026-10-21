@@ -5663,6 +5663,19 @@ void TestSamplerEntryPerTexture() {
             !SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%samplers %uint_0"),
         "the texture is not read through its own sampler entry");
   CheckSpirvBinaryValidates(split.spirv);
+
+  // A stage that can bind no more samplers keeps the guest sampler's entry alone (Metal binds
+  // 16 samplers a stage).
+  options.host.capabilities.max_stage_samplers = 1;
+  const auto bounded = RecompileForTest(shader, options);
+  Check(bounded.program.info.sampled_pairs.size() == 1 &&
+            bounded.program.info.sampled_pairs[0].descriptor_index == UINT32_MAX &&
+            bounded.program.bindings.descriptor_counts[kSamplers] == 1,
+        "a texture got its own sampler entry past the samplers a stage can bind");
+  Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(bounded.spirv), "OpAccessChain",
+                                       "%samplers %uint_0"),
+        "past the stage's samplers, the texture is not read through the guest sampler's entry");
+  CheckSpirvBinaryValidates(bounded.spirv);
 }
 
 void TestImageAddressOperands() {

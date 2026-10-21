@@ -22,6 +22,8 @@ struct DeviceFacts {
 	uint32_t subgroup_supported_stages = 0;
 	// VkPhysicalDeviceVulkan11Properties::subgroupSupportedOperations.
 	uint32_t subgroup_supported_operations = 0;
+	// VkPhysicalDeviceLimits::maxPerStageDescriptorSamplers.
+	uint32_t max_per_stage_samplers = 16;
 
 	// Core 1.0 features.
 	bool depth_clamp                               = false;

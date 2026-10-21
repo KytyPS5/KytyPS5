@@ -36,6 +36,12 @@ public:
 		viewport()->setMouseTracking(true);
 		m_timer.setInterval(16);
 		connect(&m_timer, &QTimer::timeout, this, [this]() { Tick(); });
+		m_rescale.setSingleShot(true);
+		m_rescale.setInterval(150);
+		connect(&m_rescale, &QTimer::timeout, this, [this]() {
+			UpdateScaledBackground(true);
+			viewport()->update();
+		});
 	}
 
 	void SetBackgroundImage(const QString& key) {
@@ -50,8 +56,12 @@ public:
 		if (!key.isEmpty()) {
 			m_source.loadFromData(GameContent::ReadFile(key, QStringLiteral("sce_sys/pic0.png"),
 			                                            GameContent::MaxImageSize));
+			// Rescaling a 4K image on every resize step is what makes small windows sluggish.
+			if (m_source.width() > 1920) {
+				m_source = m_source.scaledToWidth(1920, Qt::SmoothTransformation);
+			}
 		}
-		m_logo        = GameLogo::Load(key);
+		m_logo         = GameLogo::Load(key);
 		m_logo_scaled = QPixmap();
 		UpdateScaledBackground();
 		if (m_fade < 1.0) {
@@ -143,6 +153,7 @@ public:
 	}
 
 	void PlayIntro() {
+		m_scroll = TargetScroll();
 		m_intro = true;
 		m_intro_clock.start();
 		StartAnimation();
@@ -248,9 +259,15 @@ public:
 		return qRound(side / 2.0 + side / 4.0 * (t * t * (3.0 - 2.0 * t)));
 	}
 
+	// Left edge of the selected tile. The room on its left leaves the previous tile partly visible,
+	// hinting that more games are on that side.
+	int TileAnchor() const {
+		return TileGap + iconSize().width() * 3 / 10;
+	}
+
 	QRect TileRect(int row) const {
 		const auto size = [&](int r) { return TileSize(r); };
-		int x = Margin - horizontalScrollBar()->value();
+		int x = TileAnchor() - qRound(m_scroll);
 		for (int r = 0; r < row; ++r) {
 			if (!isRowHidden(r)) {
 				x += size(r) + TileGap;
@@ -283,16 +300,23 @@ protected:
 		return iconSize().height() * 3 / 4 + 20 + 36;
 	}
 
+	// Enough room for the tile, the buttons and a two-line title below them.
+public:
+	QSize MinimumGridSize() const {
+		return QSize(640, ButtonsTop() + 40 + 190);
+	}
+
+protected:
 	QRect PlayRect() const {
-		return QRect(Margin, ButtonsTop(), 200, 40);
+		return QRect(TileAnchor(), ButtonsTop(), 200, 40);
 	}
 
 	QRect InfoRect() const {
-		return QRect(Margin + 212, ButtonsTop(), 40, 40);
+		return QRect(TileAnchor() + 212, ButtonsTop(), 40, 40);
 	}
 
 	QRect MoreRect() const {
-		return QRect(Margin + 264, ButtonsTop(), 40, 40);
+		return QRect(TileAnchor() + 264, ButtonsTop(), 40, 40);
 	}
 
 	void PaintButtons(QPainter& painter) {
@@ -348,21 +372,21 @@ protected:
 		heading.setBold(true);
 		painter.setFont(heading);
 		painter.setPen(Qt::white);
-		painter.drawText(QRect(Margin, top, 400, 26), Qt::AlignLeft | Qt::AlignVCenter,
+		painter.drawText(QRect(TileAnchor(), top, 400, 26), Qt::AlignLeft | Qt::AlignVCenter,
 		                 tr("Latest activity"));
 
 		constexpr int gap    = 12;
 		constexpr int height = 84;
 		const int     count  = static_cast<int>(m_recent.size());
 		// Cards wrap onto more rows when the viewport is too narrow to fit them all.
-		const int avail = r.width() - 2 * Margin;
+		const int avail = r.width() - TileAnchor() - Margin;
 		const int cols  = qBound(1, (avail + gap) / (200 + gap), count);
 		const int width = qBound(120, (avail - (cols - 1) * gap) / cols, 280);
 		const int y0    = top + 34;
 		for (int i = 0; i < count; ++i) {
 			const auto& t = m_recent[i];
 			const int   y = y0 + (i / cols) * (height + gap);
-			const QRect card(Margin + (i % cols) * (width + gap), y, width, height);
+			const QRect card(TileAnchor() + (i % cols) * (width + gap), y, width, height);
 			painter.setPen(Qt::NoPen);
 			painter.setBrush(QColor(0, 0, 0, 150));
 			painter.drawRoundedRect(card, 14, 14);
@@ -529,7 +553,11 @@ protected:
 	}
 
 	void Tick() {
-		const qreal dt   = qMin<qreal>(m_clock.restart(), 50) / 160.0;
+		if (window()->isMinimized()) {
+			m_clock.restart();
+			return;
+		}
+		const qreal dt    = qMin<qreal>(m_clock.restart(), 50) / 160.0;
 		bool        busy = false;
 		const int   rows = model() != nullptr ? model()->rowCount() : 0;
 		if (m_scales.size() != rows) {
@@ -564,8 +592,14 @@ protected:
 		    !selectionModel()->selectedIndexes().isEmpty()) {
 			busy = true;
 		}
+		const qreal scroll_target = TargetScroll();
+		if (qAbs(scroll_target - m_scroll) > 0.5) {
+			m_scroll += (scroll_target - m_scroll) * qMin<qreal>(1.0, dt * 2.5);
+			busy = true;
+		} else {
+			m_scroll = scroll_target;
+		}
 		if (isVisible()) {
-			UpdateScrollRange();
 			viewport()->update();
 		}
 		if (!busy) {
@@ -584,60 +618,58 @@ protected:
 		PlayIntro();
 	}
 
-	// The drawn tiles are packed with animated sizes, so the scroll range and the scrolling to
-	// an item follow TileRect instead of Qt's fixed cell layout.
-	int ContentWidth() const {
-		int       width = Margin;
-		const int rows  = model() != nullptr ? model()->rowCount() : 0;
-		for (int row = 0; row < rows; ++row) {
-			if (!isRowHidden(row)) {
-				width += TileSize(row) + TileGap;
+	// The tiles are drawn by TileRect, not by Qt's cell layout. The carousel keeps the selected
+	// tile at a fixed position and slides everything else past it, so there is nothing to scroll.
+	int SelectedRow() const {
+		if (selectionModel() != nullptr) {
+			const auto selected = selectionModel()->selectedIndexes();
+			if (!selected.isEmpty()) {
+				return selected.first().row();
 			}
 		}
-		if (m_show_all) {
-			width += iconSize().width() / 2 + TileGap;
-		}
-		return width - TileGap + Margin;
+		return -1;
 	}
 
-	void UpdateScrollRange() {
-		auto* bar = horizontalScrollBar();
-		const int max = qMax(0, ContentWidth() - viewport()->width());
-		if (bar->maximum() != max || bar->minimum() != 0) {
-			bar->setRange(0, max);
+	// Distance from the first tile to the one that should sit at the fixed position.
+	qreal TargetScroll() const {
+		const int selected = SelectedRow();
+		if (selected < 0) {
+			return 0.0;
 		}
-		bar->setPageStep(viewport()->width());
+		const int small = iconSize().width() / 2;
+		qreal     x     = 0.0;
+		for (int row = 0; row < selected; ++row) {
+			if (!isRowHidden(row)) {
+				x += small + TileGap;
+			}
+		}
+		// Focusing "Show all" slides it into the fixed position.
+		if (m_focus == 4) {
+			x += iconSize().width() * 3 / 4 + TileGap;
+		}
+		return x;
 	}
 
 	void updateGeometries() override {
 		QListView::updateGeometries();
-		UpdateScrollRange();
+		horizontalScrollBar()->setRange(0, 0);
+	}
+
+	void scrollContentsBy(int, int) override {
+		viewport()->update();
 	}
 
 public:
-	void scrollTo(const QModelIndex& index, ScrollHint hint = EnsureVisible) override {
-		if (!index.isValid() || index.model() != model() || isRowHidden(index.row())) {
-			return;
-		}
-		UpdateScrollRange();
-		const auto rect = TileRect(index.row());
-		auto*      bar  = horizontalScrollBar();
-		int        value = bar->value();
-		if (hint == PositionAtCenter) {
-			value += rect.center().x() - viewport()->width() / 2;
-		} else if (rect.left() < Margin) {
-			value += rect.left() - Margin;
-		} else if (rect.right() > viewport()->width() - Margin) {
-			value += rect.right() - (viewport()->width() - Margin);
-		}
-		bar->setValue(qBound(bar->minimum(), value, bar->maximum()));
+	void scrollTo(const QModelIndex&, ScrollHint = EnsureVisible) override {
+		StartAnimation();
 	}
 
 protected:
 	void resizeEvent(QResizeEvent* event) override {
 		QListView::resizeEvent(event);
-		UpdateScaledBackground();
-		UpdateScrollRange();
+		// Scale cheaply while the window is being dragged and smoothly once it settles.
+		UpdateScaledBackground(false);
+		m_rescale.start();
 	}
 
 	void PaintBattery(QPainter& p, const QRect& r) {
@@ -719,7 +751,26 @@ protected:
 		p.restore();
 	}
 
-	void paintEvent(QPaintEvent* event) override {
+	void PaintTiles() {
+		QPainter    painter(viewport());
+		const int   rows = model() != nullptr ? model()->rowCount() : 0;
+		const auto  area = viewport()->rect();
+		for (int row = 0; row < rows; ++row) {
+			if (isRowHidden(row)) {
+				continue;
+			}
+			const auto rect = TileRect(row);
+			if (!rect.adjusted(-TileGap, 0, TileGap, 40).intersects(area)) {
+				continue;
+			}
+			QStyleOptionViewItem option;
+			initViewItemOption(&option);
+			option.rect = rect;
+			itemDelegate()->paint(&painter, option, model()->index(row, 0));
+		}
+	}
+
+	void paintEvent(QPaintEvent*) override {
 		{
 			QPainter   painter(viewport());
 			const auto r = viewport()->rect();
@@ -770,7 +821,7 @@ protected:
 			}
 		}
 
-		QListView::paintEvent(event);
+		PaintTiles();
 		if (m_show_all) {
 			PaintShowAll();
 		}
@@ -825,13 +876,13 @@ protected:
 	}
 
 private:
-	void UpdateScaledBackground() {
+	void UpdateScaledBackground(bool smooth = true) {
 		m_scaled = QPixmap();
 		if (m_source.isNull() || viewport()->size().isEmpty()) {
 			return;
 		}
 		m_scaled     = m_source.scaled(viewport()->size(), Qt::KeepAspectRatioByExpanding,
-		                               Qt::SmoothTransformation);
+		                               smooth ? Qt::SmoothTransformation : Qt::FastTransformation);
 		m_scaled_pos = QPoint((viewport()->width() - m_scaled.width()) / 2,
 		                      (viewport()->height() - m_scaled.height()) / 2);
 	}
@@ -848,6 +899,7 @@ private:
 	QString               m_path;
 	QImage                m_logo;
 	QPixmap               m_logo_scaled;
+	QTimer                m_rescale;
 	QPixmap               m_source;
 	QPixmap               m_scaled;
 	QPoint                m_scaled_pos;
@@ -859,6 +911,7 @@ private:
 	QPoint                m_prev_pos;
 	qreal                 m_fade = 1.0;
 	QVector<qreal>        m_scales;
+	qreal                 m_scroll = 0.0;
 	QTimer                m_timer;
 	QElapsedTimer         m_clock;
 	QElapsedTimer         m_intro_clock;

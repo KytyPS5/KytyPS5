@@ -32,6 +32,7 @@ public:
 	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
 	void SetControllerPreview(ControllerPreview* preview) { m_controller_preview = preview; }
 	void SetControllerBattery(int percent, bool charging);
+	void ApplyGridMinimum();
 	// Controller navigation of the grid view; ignored unless the grid is shown in the active window.
 	void GamepadNavigate(int action);
 

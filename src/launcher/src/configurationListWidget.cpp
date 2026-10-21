@@ -332,6 +332,8 @@ static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_grid->setWrapping(false);
 	ui->cfgs_grid->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
 	ui->cfgs_grid->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	// The carousel scrolls itself; an as-needed bar flips on and off while the window resizes.
+	ui->cfgs_grid->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 	ui->cfgs_grid->setMouseTracking(true);
 	ui->cfgs_grid->setSpacing(0);
 	ui->cfgs_grid->setUniformItemSizes(true);
@@ -450,6 +452,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        });
 	connect(m_ui->grid_view_button, &QToolButton::toggled, this, [this](bool grid) {
 		m_ui->grid_size_slider->setVisible(grid);
+		// The carousel lays out tiles, buttons and a trophy box; keep it from being crushed.
+		ApplyGridMinimum();
 		auto* view = grid ? static_cast<QAbstractItemView*>(m_ui->cfgs_grid) : m_ui->cfgs_list;
 		m_ui->game_views->setCurrentWidget(view);
 		if (grid) {
@@ -479,6 +483,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->grid_size_slider->setVisible(m_ui->grid_view_button->isChecked());
 	const auto resize_grid = [this](int width) {
 		m_ui->cfgs_grid->setIconSize(QSize(width, width));
+		ApplyGridMinimum();
 	};
 	resize_grid(m_ui->grid_size_slider->value());
 	m_ui->cfgs_grid->SetPlayHandler([this] {
@@ -514,6 +519,24 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 ConfigurationListWidget::~ConfigurationListWidget() {
 	qDeleteAll(m_custom_infos);
 	delete m_ui;
+}
+
+void ConfigurationListWidget::ApplyGridMinimum() {
+	// Deferred because the form applies its own minimum size after this widget is constructed, and
+	// the dialog's explicit minimum size stops its layout from raising it by itself.
+	QMetaObject::invokeMethod(this, [this]() {
+		constexpr int ToolbarHeight = 80;
+		const QSize   list_min(400, 300);
+		const bool    grid = m_ui->grid_view_button->isChecked();
+		setMinimumSize(grid ? list_min.expandedTo(m_ui->cfgs_grid->MinimumGridSize() +
+		                                          QSize(0, ToolbarHeight))
+		                    : list_min);
+		auto* top = window();
+		if (top != nullptr && top->layout() != nullptr) {
+			top->layout()->invalidate();
+			top->setMinimumSize(top->layout()->totalMinimumSize());
+		}
+	}, Qt::QueuedConnection);
 }
 
 void ConfigurationListWidget::SetControllerBattery(int percent, bool charging) {

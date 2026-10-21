@@ -561,25 +561,31 @@ void CheckSpirvBudget(const char *name, const std::vector<uint32_t> &binary,
           budget.storage_write_without_format_capabilities &&
       actual.image_texel_pointers <= budget.image_texel_pointers;
   if (!within) {
-    std::fprintf(
-        stderr,
-        "SPIR-V budget %s exceeded\n"
-        "  actual: words=%zu insts=%u images=%u vars=%u loads=%u stores=%u "
-        "lengths=%u phis=%u labels=%u loops=%u selections=%u branches=%u "
-        "cond=%u switches=%u ballots=%u quad=%u\n"
-        "  budget: words=%zu insts=%u images=%u vars=%u loads=%u stores=%u "
-        "lengths=%u phis=%u labels=%u loops=%u selections=%u branches=%u "
-        "cond=%u switches=%u ballots=%u quad=%u\n",
-        name, actual.words, actual.instructions, actual.type_images,
-        actual.variables, actual.loads, actual.stores, actual.array_lengths,
-        actual.phis, actual.labels, actual.loop_merges, actual.selection_merges,
-        actual.branches, actual.conditional_branches, actual.switches,
-        actual.ballots, actual.quad_broadcasts, budget.words,
-        budget.instructions, budget.type_images, budget.variables, budget.loads,
-        budget.stores, budget.array_lengths, budget.phis, budget.labels,
-        budget.loop_merges, budget.selection_merges, budget.branches,
-        budget.conditional_branches, budget.switches, budget.ballots,
-        budget.quad_broadcasts);
+    // Every field the check compares, so the one over its budget shows.
+    const auto print = [](const char *label, const SpirvMetrics &m) {
+      std::fprintf(
+          stderr,
+          "  %s: words=%zu insts=%u ext_imports=%u images=%u samplers=%u "
+          "sampled_images=%u runtime_arrays=%u image_pointers=%u vars=%u "
+          "function_vars=%u workgroup_vars=%u loads=%u stores=%u lengths=%u "
+          "phis=%u labels=%u loops=%u selections=%u branches=%u cond=%u "
+          "switches=%u ballots=%u quad=%u sampled_1d=%u image_1d=%u "
+          "image_query=%u read_without_format=%u write_without_format=%u "
+          "texel_pointers=%u\n",
+          label, m.words, m.instructions, m.ext_inst_imports, m.type_images,
+          m.type_samplers, m.type_sampled_images, m.runtime_arrays,
+          m.image_pointers, m.variables, m.function_variables,
+          m.workgroup_variables, m.loads, m.stores, m.array_lengths, m.phis,
+          m.labels, m.loop_merges, m.selection_merges, m.branches,
+          m.conditional_branches, m.switches, m.ballots, m.quad_broadcasts,
+          m.sampled_1d_capabilities, m.image_1d_capabilities,
+          m.image_query_capabilities,
+          m.storage_read_without_format_capabilities,
+          m.storage_write_without_format_capabilities, m.image_texel_pointers);
+    };
+    std::fprintf(stderr, "SPIR-V budget %s exceeded\n", name);
+    print("actual", actual);
+    print("budget", budget);
     std::abort();
   }
 }
@@ -7730,9 +7736,18 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
   options.user_data = user_data;
   result = RecompileForTest(shader, options);
+  // With FP16 the conversion rounds to nearest even (OpFConvert); PackHalf2x16 may round toward
+  // zero (RADV), so it is used only on a host without FP16.
+  const auto half_source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(half_source, "OpFConvert", "%v2half") &&
+            half_source.find("PackHalf2x16") == std::string::npos,
+        "formatted half-float store did not convert F32 to F16 with OpFConvert");
+  CheckSpirvBinaryValidates(result.spirv);
+  options.host.capabilities.float16 = false;
+  result = RecompileForTest(shader, options);
   Check((DisassembleSpirvBinary(result.spirv).find("PackHalf2x16") !=
          std::string::npos),
-        "formatted half-float store did not convert F32 to F16");
+        "formatted half-float store without FP16 did not convert F32 to F16");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -10969,12 +10984,15 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
         "buffer load guard regression did not decode MUBUF load");
   CheckSpirvBinaryValidates(result.spirv);
 
+  // A binding's exact end, from its length, is computed once in the entry block; the length
+  // reads no buffer data. The element is reached only through the EXEC guard and then the
+  // bounds branch.
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
   const auto array_length =
       source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
+  const auto bounds_branch = source.find("OpBranchConditional", exec_branch + 1);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
         "buffer load SPIR-V lacks EXEC guard branch");
@@ -10984,8 +11002,8 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
         "buffer load SPIR-V lacks storage buffer bounds branch");
   Check(element_access != std::string::npos,
         "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
-        "buffer load bounds check was emitted outside EXEC guard");
+  Check(array_length < bounds_branch && exec_branch < bounds_branch,
+        "buffer load bounds branch does not follow the EXEC guard and the binding's length");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
 }
@@ -17542,19 +17560,21 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeMubuf1(0, 0, 1), // buffer_store_dwordx4 v[0:3]
       EncodeSopp(0x01),
   };
-  // The store's binding computes its exact end (Bindings::MemoryPadDword).
+  // Both bindings end at their exact byte (Bindings::MemoryPadDword), computed once in the
+  // entry block; the end is a UMin of GLSL.std.450.
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 862,
-                                    .instructions = 211,
+                                   {.words = 810,
+                                    .instructions = 194,
+                                    .ext_inst_imports = 1,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    .loads = 6,
                                     .stores = 4,
-                                    .array_lengths = 2,
+                                    .array_lengths = 1,
                                     .phis = 5,
-                                    .labels = 34,
+                                    .labels = 23,
                                     .selection_merges = 10,
-                                    .branches = 23,
+                                    .branches = 12,
                                     .conditional_branches = 10});
   Check((wide_result.decoded_dump.find("BUFFER_LOAD_DWORDX4") != std::string::npos),
         "wide buffer size fixture no longer decodes its x4 load");

@@ -809,16 +809,27 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
+		// The mip count matters too: guest mip chains run backwards, so a texture with fewer
+		// levels keeps its base level at a different offset than one with a longer chain at the
+		// same address. If any level both layouts have is placed differently, the cached image
+		// cannot serve the request.
+		const auto same_mip = [](const ImageMipInfo& left, const ImageMipInfo& right) {
+			return left.offset == right.offset && left.size == right.size &&
+			       left.pitch == right.pitch && left.height == right.height &&
+			       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
+			       left.surface_z == right.surface_z;
+		};
+		const auto shared_levels =
+		    std::min(requested.resources.levels, cached.info.resources.levels);
+		const bool shared_levels_differ =
+		    requested.resources.layers == cached.info.resources.layers &&
+		    !std::equal(requested.mip_layout.begin(), requested.mip_layout.begin() + shared_levels,
+		                cached.info.mip_layout.begin(), same_mip);
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
-		                 cached.info.mip_layout.begin(),
-		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
-			                 return left.offset == right.offset && left.size == right.size &&
-			                        left.pitch == right.pitch && left.height == right.height &&
-			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-			                        left.surface_z == right.surface_z;
-		                 }))) {
+		                 cached.info.mip_layout.begin(), same_mip)) ||
+		    shared_levels_differ) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}

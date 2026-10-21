@@ -998,7 +998,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
+	// Binding orders nothing: a dispatch's bindings leave its compute chain open.
+	auto   vk_buffer        = buffer.StateHandle();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1103,7 +1104,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-			vk_buffer.pipelineBarrier(
+			buffer.Handle().pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
 			        vk::PipelineStageFlagBits::eComputeShader,
@@ -1119,7 +1120,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage) {
 					buffer.EndRendering();
 					m_context.GetNullTextures().Reset(
-					    *ShaderRecompiler::IR::DescriptorBindingForImage(resource), vk_buffer);
+					    *ShaderRecompiler::IR::DescriptorBindingForImage(resource), buffer.Handle());
 				}
 				continue;
 			}

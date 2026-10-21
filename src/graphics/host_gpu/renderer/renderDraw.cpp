@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/frontWorker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/capturedVertexLayout.h"
@@ -463,6 +464,7 @@ struct DrawRenderState {
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
+	PipelineCache::StageResources*  resources = nullptr; // where the lookups put the resources
 };
 
 struct DrawCallInfo {
@@ -891,11 +893,11 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
-	auto& ctx    = buffer.GetRegisters();
-	auto& sh_ctx = buffer.GetShaders();
-
+// From the registers alone, not the command buffer: the front worker runs it on a copy of them.
+static void RefreshShaders(const HW::Context& ctx, const HW::Shader& sh_ctx,
+                           const HW::UserConfig& user_config, PipelineCache& pipeline_cache,
+                           const DrawCallInfo& draw, uint32_t color_output_mask,
+                           DrawRenderState& state) {
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
@@ -916,26 +918,42 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			                                                           : ShaderColorNumberClass::Float;
 		}
 	}
-	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
-	if (draw.IsIndexed()) {
+	if (draw.IsIndexed() && !InFrontJob()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
-	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    color_targets, state.ps_active, state.vertex_info, state.ps_input_info);
+	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, user_config,
+	    color_targets, state.ps_active, state.vertex_info, state.ps_input_info, state.resources);
+}
+
+// What decides the lookups beside the programs' registers: the color outputs, the pixel stage.
+static uint32_t PrepareDrawShaderState(const HW::Context& ctx, const HW::Shader& sh_ctx,
+                                       DrawRenderState& state) {
+	const auto& shader_regs       = ctx.GetShaderRegisters();
+	const auto  color_output_mask = DrawColorOutputMask(ctx);
+	state.ps_active = sh_ctx.GetPs().ps_regs.data_addr != 0 &&
+	                  (color_output_mask != 0 ||
+	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	return color_output_mask;
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
-	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
-	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
-	                  (color_output_mask != 0 ||
-	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
-	uint32_t mrt_mask = 0;
+	const auto color_output_mask =
+	    PrepareDrawShaderState(buffer.GetRegisters(), buffer.GetShaders(), state);
+	state.resources = &m_draw_resources;
+	RefreshShaders(buffer.GetRegisters(), buffer.GetShaders(), buffer.GetUserConfig(),
+	               buffer.GetContext().GetPipelineCache(), draw, color_output_mask, state);
+	return PrepareDrawTargets(buffer, draw, render_target_slice_offset, state);
+}
+
+bool RenderExecutor::PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                        uint32_t render_target_slice_offset,
+                                        DrawRenderState& state) {
+	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	uint32_t   mrt_mask          = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
@@ -1645,6 +1663,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
+// KYTY_FRONT_WORKER=0: program lookups stay on the GPU thread.
+bool RenderExecutor::FrontWorkerEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FRONT_WORKER");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Neither a metadata/decompression mode, a resolve, nor a depth or stencil copy: nothing the
+// draw does is recorded before its program lookups (ConsumeMetadataColorOperation,
+// DepthStencilCopy, ResolveColorTargets act only in these modes).
+static bool OrdinaryDrawMode(const HW::Context& ctx) {
+	const auto& override = ctx.GetDepthRenderOverride();
+	return ctx.GetColorControl().mode == static_cast<uint8_t>(CbColorMode::Normal) &&
+	       !override.force_z_dirty && !override.force_stencil_dirty;
+}
+
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
@@ -1662,6 +1698,15 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	Common::LockGuard lock(m_context.GetMutex());
 	const bool        host_args = args.indirect_args_address != 0;
 	EXIT_IF(host_args && args.offset_source != DrawOffsetSource::IndirectArgs);
+	// An ordinary draw records nothing before its program lookups, so they can run on the front
+	// worker while the draw before it is recorded. Any other draw records in order.
+	const bool pipelined = FrontWorkerEnabled() && !host_args &&
+	                       static_cast<Prospero::IndexType>(args.index_type_and_size) !=
+	                           Prospero::IndexType::kIndex8 &&
+	                       OrdinaryDrawMode(buffer.GetRegisters());
+	if (!pipelined) {
+		FlushPendingWork();
+	}
 	if (host_args &&
 	    (!HostReadsIndirectArgs(buffer) || args.index_count == 0 ||
 	     static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex8)) {
@@ -1741,16 +1786,42 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        host_args ? 1u : args.instance_count, args.first_instance};
-	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
-		ResetBindings();
+	if (pipelined) {
+		PipelineDrawIndex(submit_id, buffer, args, draw, topology, index_source, primitive_restart);
 		return true;
 	}
-	if (host_args && !HostReadsIndirectArgs(state)) {
-		ResetBindings();
-		return false;
+	DrawRenderState state {};
+	const auto color_output_mask =
+	    PrepareDrawShaderState(buffer.GetRegisters(), buffer.GetShaders(), state);
+	state.resources = &m_draw_resources;
+	RefreshShaders(buffer.GetRegisters(), buffer.GetShaders(), buffer.GetUserConfig(),
+	               m_context.GetPipelineCache(), draw, color_output_mask, state);
+	if (host_args) {
+		if (!PrepareDrawTargets(buffer, draw, args.render_target_slice_offset, state)) {
+			ResetBindings();
+			return true;
+		}
+		if (!HostReadsIndirectArgs(state)) {
+			ResetBindings();
+			return false;
+		}
 	}
+	FinishDrawIndex(submit_id, buffer, args, draw, topology, index_source, primitive_restart,
+	                state, !host_args);
+	return true;
+}
 
+void RenderExecutor::FinishDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+                                     const DrawIndexArgs& args, const DrawCallInfo& draw,
+                                     vk::PrimitiveTopology        topology,
+                                     const DrawIndexBufferSource& index_source,
+                                     bool primitive_restart, DrawRenderState& state,
+                                     bool prepare_targets) {
+	if (prepare_targets && !PrepareDrawTargets(buffer, draw, args.render_target_slice_offset, state)) {
+		ResetBindings();
+		return;
+	}
+	auto& ucfg = buffer.GetUserConfig();
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 
@@ -1770,7 +1841,208 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
-	return true;
+}
+
+// ---- Draws and dispatches whose program lookups run on the front worker (frontWorker.h).
+
+// A draw or dispatch waiting to be recorded: what DrawIndex or DispatchDirect knew of it, with a
+// copy of its registers.
+struct PendingWork {
+	bool                          dispatch  = false;
+	uint64_t                      submit_id = 0;
+	HW::Context                   registers;
+	HW::UserConfig                user_config;
+	HW::Shader                    shaders;
+	// A draw.
+	DrawIndexArgs                 args {};
+	DrawCallInfo                  draw {};
+	vk::PrimitiveTopology         topology = vk::PrimitiveTopology::ePointList;
+	DrawIndexBufferSource         index_source {};
+	bool                          primitive_restart = false;
+	uint32_t                      color_output_mask = 0;
+	DrawRenderState               state;
+	PipelineCache::StageResources resources;
+	// A dispatch: its groups, its input before the lookups and after them.
+	std::array<uint32_t, 3>                dispatch_groups {};
+	uint32_t                               dispatch_mode = 0;
+	ShaderComputeInputInfo                 dispatch_input;
+	ShaderComputeInputInfo                 compute_info;
+	ShaderProgram                          compute_program;
+	ShaderRecompiler::IR::ResourceSnapshot compute_resources;
+	// BufferCache::GpuModifiedVersion when the lookups were queued: a GPU write recorded since
+	// may be in what they read.
+	uint64_t gpu_modified_version = 0;
+	uint64_t ticket               = 0;
+};
+
+// KYTY_FRONT_DEPTH: how many draws or dispatches wait to be recorded while the front worker runs
+// the lookups of the ones after them. One lets a long lookup stall the GPU thread; more smooth
+// the lookups' lengths out (FC25: 39 FPS with 1, 42-43 with 3 or 4).
+static uint32_t FrontDepth() {
+	static const uint32_t depth = [] {
+		const char* value = std::getenv("KYTY_FRONT_DEPTH");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 3ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 1ul, FrontWorker::Capacity - 2));
+	}();
+	return depth;
+}
+
+struct FrontPipeline {
+	FrontWorker worker;
+	// The work queued and not recorded yet, from `first` to `next`: a ring.
+	std::array<PendingWork, FrontWorker::Capacity> work;
+	uint64_t                                       first = 0;
+	uint64_t                                       next  = 0;
+	// Settling or recording the oldest work: the worker may run the GPU thread's commands
+	// (FrontWorker::Wait), which must not record the work after it first.
+	bool busy = false;
+};
+
+void FrontPipelineDeleter::operator()(FrontPipeline* pipeline) const {
+	delete pipeline;
+}
+
+static void RunLookups(PendingWork& work, PipelineCache& pipeline_cache) {
+	if (work.dispatch) {
+		work.compute_info    = work.dispatch_input;
+		work.compute_program = pipeline_cache.GetComputeProgram(
+		    work.shaders.GetCs(), work.registers.GetShaderRegisters(), work.compute_info, 0,
+		    &work.compute_resources);
+		return;
+	}
+	RefreshShaders(work.registers, work.shaders, work.user_config, pipeline_cache, work.draw,
+	               work.color_output_mask, work.state);
+}
+
+PendingWork& RenderExecutor::NextPendingWork(CommandBuffer& buffer, uint64_t submit_id) {
+	if (!m_front_pipeline) {
+		m_front_pipeline.reset(new FrontPipeline);
+	}
+	auto& pipeline = *m_front_pipeline;
+	EXIT_IF(pipeline.busy || pipeline.next - pipeline.first >= pipeline.work.size());
+	auto& next = pipeline.work[pipeline.next % pipeline.work.size()];
+	next.submit_id   = submit_id;
+	next.registers   = buffer.GetRegisters();
+	next.user_config = buffer.GetUserConfig();
+	next.shaders     = buffer.GetShaders();
+	return next;
+}
+
+void RenderExecutor::QueuePendingWork(CommandBuffer& buffer, PendingWork& next) {
+	auto& pipeline       = *m_front_pipeline;
+	auto& pipeline_cache = m_context.GetPipelineCache();
+	// The GPU thread changes the program cache only while the worker is idle: what the workers
+	// built waits for then, and a lookup that needs it meanwhile is redone here.
+	if (pipeline.worker.Idle()) {
+		pipeline_cache.PrepareFrontLookups();
+	}
+	next.gpu_modified_version = m_context.GetBufferCache().GpuModifiedVersion();
+	next.ticket = pipeline.worker.Start([&next, &pipeline_cache] { RunLookups(next, pipeline_cache); });
+	pipeline.next++;
+	while (pipeline.next - pipeline.first > FrontDepth()) {
+		RecordOldestPendingWork(buffer);
+	}
+}
+
+void RenderExecutor::RecordOldestPendingWork(CommandBuffer& buffer) {
+	auto& pipeline = *m_front_pipeline;
+	auto& oldest   = pipeline.work[pipeline.first % pipeline.work.size()];
+	pipeline.busy  = true;
+	SettlePendingLookups(oldest);
+	RecordPendingWork(oldest, buffer);
+	pipeline.first++;
+	pipeline.busy = false;
+}
+
+void RenderExecutor::PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+                                       const DrawIndexArgs& args, const DrawCallInfo& draw,
+                                       vk::PrimitiveTopology        topology,
+                                       const DrawIndexBufferSource& index_source,
+                                       bool                         primitive_restart) {
+	auto& next             = NextPendingWork(buffer, submit_id);
+	next.dispatch          = false;
+	next.args              = args;
+	next.draw              = draw;
+	next.topology          = topology;
+	next.index_source      = index_source;
+	next.primitive_restart = primitive_restart;
+	next.state             = {};
+	next.state.resources   = &next.resources;
+	next.color_output_mask = PrepareDrawShaderState(next.registers, next.shaders, next.state);
+	QueuePendingWork(buffer, next);
+}
+
+void RenderExecutor::PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+                                            const std::array<uint32_t, 3>& groups, uint32_t mode,
+                                            const ShaderComputeInputInfo& input_info) {
+	auto& next           = NextPendingWork(buffer, submit_id);
+	next.dispatch        = true;
+	next.dispatch_groups = groups;
+	next.dispatch_mode   = mode;
+	next.dispatch_input  = input_info;
+	QueuePendingWork(buffer, next);
+}
+
+void RenderExecutor::SettlePendingLookups(PendingWork& pending) {
+	auto&      pipeline = *m_front_pipeline;
+	const auto service  = [this] { m_context.GetGpu().ServiceCommands(); };
+	const bool aborted  = pipeline.worker.Wait(pending.ticket, service);
+	if (!aborted) {
+		// What the GPU wrote since the lookups were queued, where they read.
+		auto& buffer_cache = m_context.GetBufferCache();
+		if (buffer_cache.GpuModifiedVersion() == pending.gpu_modified_version ||
+		    std::ranges::none_of(pipeline.worker.Reads(pending.ticket), [&](const FrontRead& read) {
+			    return buffer_cache.HasGpuDirtyBytes(read.vaddr, read.size);
+		    })) {
+			return;
+		}
+	}
+	// What the worker read has changed, or it stopped: the lookups again, here, once the worker
+	// is idle (they may change the program cache).
+	pipeline.worker.WaitIdle(service);
+	if (!pending.dispatch) {
+		pending.state             = {};
+		pending.state.resources   = &pending.resources;
+		pending.color_output_mask =
+		    PrepareDrawShaderState(pending.registers, pending.shaders, pending.state);
+	}
+	RunLookups(pending, m_context.GetPipelineCache());
+}
+
+void RenderExecutor::RecordPendingWork(PendingWork& pending, CommandBuffer& buffer) {
+	auto& registers   = buffer.GetRegisters();
+	auto& user_config = buffer.GetUserConfig();
+	auto& shaders     = buffer.GetShaders();
+	buffer.Bind(pending.registers, pending.user_config, pending.shaders);
+	if (pending.dispatch) {
+		const auto& groups = pending.dispatch_groups;
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect),
+		                    pending.submit_id, groups[0], groups[1], groups[2],
+		                    pending.dispatch_mode, pending.shaders.GetCs().cs_regs.data_addr);
+		if (pending.compute_program) {
+			FinishDispatchDirect(pending.submit_id, buffer, groups, pending.dispatch_mode,
+			                     pending.compute_info, pending.compute_program);
+		}
+	} else {
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex),
+		                    pending.submit_id, pending.args.index_count, 0, 1,
+		                    pending.args.instance_count,
+		                    reinterpret_cast<uint64_t>(pending.args.index_addr));
+		FinishDrawIndex(pending.submit_id, buffer, pending.args, pending.draw, pending.topology,
+		                pending.index_source, pending.primitive_restart, pending.state, true);
+	}
+	buffer.Bind(registers, user_config, shaders);
+}
+
+void RenderExecutor::FlushPendingWork() {
+	if (!m_front_pipeline || m_front_pipeline->busy ||
+	    m_front_pipeline->first == m_front_pipeline->next) {
+		return;
+	}
+	Common::LockGuard lock(m_context.GetMutex());
+	while (m_front_pipeline->first != m_front_pipeline->next) {
+		RecordOldestPendingWork(m_context.GetCommandScheduler().Current());
+	}
 }
 
 bool RenderExecutor::HostReadsIndirectArgs(const CommandBuffer& buffer) {

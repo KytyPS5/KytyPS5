@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -25,14 +26,28 @@ bool CommandBuffer::IsInvalid() const {
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
+	EndComputeChain();
+	return StateHandle();
+}
+
+vk::CommandBuffer CommandBuffer::StateHandle() const {
 	EXIT_IF(IsInvalid());
 	m_used = true;
 	return m_buffer;
 }
 
+void CommandBuffer::EndComputeChain() const {
+	if (!m_compute_chain) {
+		return;
+	}
+	m_compute_chain = false;
+	ShaderAccessBarrier(StateHandle(), vk::PipelineStageFlagBits::eComputeShader);
+}
+
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	m_compute_chain = false;
+	auto buffer     = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;

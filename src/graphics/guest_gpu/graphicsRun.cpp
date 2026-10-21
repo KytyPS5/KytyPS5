@@ -151,6 +151,10 @@ void GuestGpu::ProcessCommands() {
 	if (m_labels_ready.load(std::memory_order_acquire)) {
 		WriteCompletedLabels();
 	}
+	if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		// A command may unmap or read back memory the pending work uses: it is recorded first.
+		m_renderer.GetRenderExecutor().FlushPendingWork();
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -769,6 +773,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	// A suspended or finished stream records nothing more: its last work is recorded now.
+	m_renderer.GetRenderExecutor().FlushPendingWork();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -783,6 +789,65 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
+}
+
+// Packets that leave a draw or dispatch pending (RenderExecutor::FlushPendingWork): they set
+// registers or the state the next draw reads, and record nothing; a draw or dispatch packet
+// decides itself.
+static bool KeepsWorkPending(const uint32_t* packet) {
+	const auto header = packet[0];
+	switch ((header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_WRITE_CONST_RAM:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return true;
+		case Pm4::IT_NOP: {
+			// Padding and the user data markers; other markers flip or write memory.
+			if (KYTY_PM4_R(header) != Pm4::R_ZERO) return false;
+			const auto word = packet[1];
+			return (word & 0xffff0000u) != 0x68750000u || word == 0x68750004u ||
+			       word == 0x6875000du;
+		}
+		default: return false;
+	}
+}
+
+// Packets that only set state or dispatch: the GPU runs the dispatches around them together.
+// Any other packet may synchronize them (partial flushes, cache actions, waits, memory writes).
+static bool LeavesComputeChainOpen(uint32_t packet_header) {
+	switch ((packet_header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_CONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_QUEUE_REG:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_CONTEXT_CONTROL:
+		case Pm4::IT_CLEAR_STATE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_DISPATCH_DIRECT: return true;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+		}
+		default: return false;
+	}
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
@@ -863,8 +928,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (!KeepsWorkPending(packet)) {
+			m_renderer.GetRenderExecutor().FlushPendingWork();
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (!LeavesComputeChainOpen(packet_header)) {
+			GetScheduler().EndComputeChain();
+		}
 		// Whatever the packet prepared buffers for has been recorded by now.
 		m_renderer.GetBufferCache().SettleGpuWrites();
 		GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Packet);

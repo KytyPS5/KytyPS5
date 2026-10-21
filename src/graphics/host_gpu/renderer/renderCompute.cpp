@@ -324,9 +324,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const std::array<uint32_t, 3> groups {thread_group_x, thread_group_y, thread_group_z};
+	if (FrontWorkerEnabled()) {
+		PipelineDispatchDirect(submit_id, buffer, groups, mode, input_info);
+		return;
+	}
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, sh_regs, input_info, 0, &m_dispatch_resources);
 	if (!compute_program) return;
+	FinishDispatchDirect(submit_id, buffer, groups, mode, input_info, compute_program);
+}
+
+void RenderExecutor::FinishDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+                                          std::array<uint32_t, 3> groups, uint32_t mode,
+                                          ShaderComputeInputInfo& input_info,
+                                          const ShaderProgram&    compute_program) {
+	auto& sh_ctx         = buffer.GetShaders();
+	const auto& cs_regs  = sh_ctx.GetCs();
+	auto thread_group_x  = groups[0];
+	auto thread_group_y  = groups[1];
+	auto thread_group_z  = groups[2];
+	const bool use_thread_dimensions = input_info.dispatch_thread_dimensions;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -384,7 +402,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
+	// The dispatch joins the chain of the dispatches before it when nothing was recorded or
+	// synchronized since (see CommandBuffer::ContinueComputeChain). Emulated LDS and GDS are one
+	// buffer that dispatches cannot share at the same time.
+	if (bindings.shared_memory.buffer != nullptr || program.info.uses_gds) {
+		buffer.EndComputeChain();
+	}
+	const bool chained   = buffer.InComputeChain();
+	auto       vk_buffer = buffer.StateHandle();
+	if (!chained) {
+		m_compute_chain_ordered = false;
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -397,10 +425,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
+	if (has_storage_writes && !m_compute_chain_ordered) {
+		// Writes wait for everything recorded before the chain; once per chain, since its
+		// dispatches run together anyway.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		m_compute_chain_ordered = true;
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -499,8 +528,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetCommandScheduler().GpuProfileEnd((compute_program.id << 32u) | 0xffffffffu);
 	}
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// Whatever is recorded next waits for the dispatch, unless it is a dispatch of the chain.
+	buffer.ContinueComputeChain();
 	ResetBindings();
 
 	// A uniform fill of a colour metadata block is the guest's fast clear. Record the code so the
@@ -549,7 +578,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info,
-	    use_thread_dimensions ? ShaderRecompiler::IR::PushData::NoStart : 0u);
+	    use_thread_dimensions ? ShaderRecompiler::IR::PushData::NoStart : 0u, &m_dispatch_resources);
 	if (!compute_program) return;
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);

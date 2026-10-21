@@ -36,6 +36,12 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+struct FrontPipeline;
+struct PendingWork;
+// Defined with FrontPipeline (renderDraw.cpp).
+struct FrontPipelineDeleter {
+	void operator()(FrontPipeline* pipeline) const;
+};
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -121,20 +127,32 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// Ends an open compute chain first: whatever is recorded waits for the chain's dispatches.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// For commands that only set state (binds, push constants): an open compute chain stays
+	// open.
+	[[nodiscard]] vk::CommandBuffer StateHandle() const;
+	// Dispatches recorded one after another, with no guest synchronization between them, run
+	// together as on the guest GPU. The barrier after a dispatch is left open until anything
+	// else is recorded (Handle) or the guest synchronizes (EndComputeChain).
+	void ContinueComputeChain() const noexcept { m_compute_chain = true; }
+	[[nodiscard]] bool InComputeChain() const noexcept { return m_compute_chain; }
+	void EndComputeChain() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
-
-private:
-	explicit CommandBuffer(CommandScheduler& scheduler);
+	// The registers commands are recorded with. A draw recorded after later packets changed them
+	// binds a copy of its own for its recording (RenderExecutor::DrawIndex).
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
 	}
+
+private:
+	explicit CommandBuffer(CommandScheduler& scheduler);
 
 	void Begin();
 	void End() const;
@@ -152,6 +170,7 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_used        = false;
+	mutable bool        m_compute_chain = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -170,6 +189,11 @@ public:
 	// A frame of the game ends: what the next frame draws into is told apart from what it does
 	// not (see PlanPipelineUse).
 	void NoteFlip();
+	// Records the draw or dispatch DrawIndex or DispatchDirect left pending (its program lookups
+	// run on the front worker while the work before it is recorded). Before anything else is
+	// recorded or guest memory written: the command processor calls it for every packet but
+	// register writes, draws and dispatches.
+	void FlushPendingWork();
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
@@ -210,6 +234,40 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
+	// The part of PrepareDrawRenderState after the program lookups.
+	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                      uint32_t render_target_slice_offset,
+	                                      DrawRenderState& state);
+	// DrawIndex from its prepared state on: targets, bindings, the recording.
+	void FinishDrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	                     const DrawCallInfo& draw, vk::PrimitiveTopology topology,
+	                     const DrawIndexBufferSource& index_source, bool primitive_restart,
+	                     DrawRenderState& state, bool prepare_targets);
+	// KYTY_FRONT_WORKER=0 keeps the program lookups on the GPU thread.
+	[[nodiscard]] static bool FrontWorkerEnabled();
+	// DrawIndex of an ordinary draw with a front worker: see FlushPendingWork.
+	void PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	                       const DrawCallInfo& draw, vk::PrimitiveTopology topology,
+	                       const DrawIndexBufferSource& index_source, bool primitive_restart);
+	// DispatchDirect with a front worker, from its input before the program lookup.
+	void PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+	                            const std::array<uint32_t, 3>& groups, uint32_t mode,
+	                            const ShaderComputeInputInfo& input_info);
+	// DispatchDirect after its program lookup.
+	void FinishDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+	                          std::array<uint32_t, 3> groups, uint32_t mode,
+	                          ShaderComputeInputInfo& input_info,
+	                          const ShaderProgram& compute_program);
+	// The free slot for the next pending work, with a copy of the buffer's registers.
+	PendingWork& NextPendingWork(CommandBuffer& buffer, uint64_t submit_id);
+	// Queues the lookups of `next` on the front worker, and records the oldest pending work
+	// while more than FrontDepth wait.
+	void QueuePendingWork(CommandBuffer& buffer, PendingWork& next);
+	// Settles and records the oldest pending work.
+	void RecordOldestPendingWork(CommandBuffer& buffer);
+	// The front worker's job for the pending work is done and still holds, or redone here.
+	void SettlePendingLookups(PendingWork& pending);
+	void RecordPendingWork(PendingWork& pending, CommandBuffer& buffer);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
@@ -249,9 +307,16 @@ private:
 	std::unique_ptr<ThreadDimensionDispatch> m_thread_dimensions; // created on first use
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	// Created on the first pipelined draw or dispatch (see FrontWorkerEnabled).
+	std::unique_ptr<FrontPipeline, FrontPipelineDeleter> m_front_pipeline;
+	// The resources the program lookups of the current draw and dispatch materialized.
+	PipelineCache::StageResources          m_draw_resources;
+	ShaderRecompiler::IR::ResourceSnapshot m_dispatch_resources;
 	// The last color target each slot resolved (colorRenderTarget.cpp).
 	struct ColorTargetMemos;
 	std::unique_ptr<ColorTargetMemos>    m_color_target_memos;
+	// The open compute chain has waited for the work recorded before it (see DispatchDirect).
+	bool                                 m_compute_chain_ordered = false;
 	std::vector<ImageId>                  m_bound_images;
 	// The frame in which each render target was last drawn into. A target is an image slot with
 	// its generation (so a slot given to a new image does not inherit the frame of the old one)

@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/frontWorker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -879,10 +880,19 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread()) {
-			return false;
-		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			// The front worker reads what the GPU did not write; a read-back is the GPU thread's.
+			if (!Graphics::InFrontJob()) {
+				return false;
+			}
+			if (buffers.HasGpuDirtyBytesShared(vaddr, size)) {
+				Graphics::AbortFrontJob();
+				return false;
+			}
+			Graphics::NoteFrontRead(vaddr, size);
+			return TryReadBacking(vaddr, data, size);
+		}
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}

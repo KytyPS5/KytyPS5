@@ -1313,6 +1313,9 @@ struct BdaMapping {
   u32 backing_offset = 0;
 };
 
+using ShaderProfile = ShaderRecompiler::Spirv::Profile;
+constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1340,6 +1343,7 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1672,7 +1676,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
-  options.maintenance8_enabled = true;
+  options.profile = test.profile;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
@@ -1745,7 +1749,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, options.maintenance8_enabled);
+        result.program, options.input_info, 0u, *options.profile);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -1862,7 +1866,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
-  options.maintenance8_enabled = true;
+  options.profile = &Maintenance8Profile;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -10807,7 +10811,7 @@ public:
               ShaderRecompiler::CompileOptions options;
               options.wave_size = wave_size;
               options.dump_ir = false;
-              options.maintenance8_enabled = true;
+              options.profile = &Maintenance8Profile;
               input.host_subgroup_size = SubgroupSize();
               options.input_info.compute = &input;
               options.user_data = user_data;
@@ -38212,7 +38216,8 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
           "dynamic offsets expanded samples or lost signed six-bit components");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (wave_size == 32u) {
-    Require(test.name, "default feature gate", !ShaderRecompiler::CompileOptions{}.maintenance8_enabled,
+    Require(test.name, "default feature gate",
+            !ShaderRecompiler::CompileOptions{}.profile->maintenance8,
             "maintenance8 must reflect the enabled device feature");
     ExpectFatal("DynamicSampleOffsetsRequireMaintenance8", [&] {
       ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &test.compute_info});
@@ -49013,20 +49018,21 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
     // Host min/max must keep the emulated results on RADV; other drivers only
     // compile it.
+    static constexpr ShaderProfile native_profile{.maintenance8 = true,
+                                                  .native_float_min_max = true};
     VulkanHarness vulkan;
     const bool supported = vulkan.SupportsNativeFloatMinMax();
     for (bool native : {false, true}) {
-      ShaderRecompiler::Spirv::SetNativeFloatMinMax(native);
       for (auto test :
            {VectorMinMaxF32NanAndSignedZeroEdges(),
             VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
         auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
         spirv = {" NMin ", " NMax "};
+        test.profile = native ? &native_profile : &Maintenance8Profile;
         test.compile_only = native && !supported;
         RunCase(&vulkan, test);
       }
     }
-    ShaderRecompiler::Spirv::SetNativeFloatMinMax(false);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {

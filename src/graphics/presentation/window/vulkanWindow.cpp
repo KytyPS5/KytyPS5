@@ -17,7 +17,6 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -1014,12 +1013,9 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
+	graphic_ctx.driver_id                  = driver_properties.driverID;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
-	// GLSL.std.450 does not order -0 below +0 in NMin/NMax; RADV runs them as v_min/v_max with
-	// IEEE mode off, which gives the guest's NaN and signed-zero results.
-	Libs::Graphics::ShaderRecompiler::Spirv::SetNativeFloatMinMax(driver_properties.driverID ==
-	                                                              vk::DriverId::eMesaRadv);
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
 

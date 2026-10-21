@@ -1,17 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
-namespace Libs::Graphics::ShaderRecompiler::Spirv {
-
-namespace {
-bool g_native_float_min_max = false;
-} // namespace
-
-void SetNativeFloatMinMax(bool enabled) {
-	g_native_float_min_max = enabled;
-}
-
-} // namespace Libs::Graphics::ShaderRecompiler::Spirv
-
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -125,7 +113,7 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (g_native_float_min_max) {
+	if (state.profile.native_float_min_max) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);

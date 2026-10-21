@@ -707,14 +707,18 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 	context.active_mask = m_active_mask;
 	context.read_policy = m_read_policy;
 	context.generation += 4;
+	context.unknowns.clear();
 	return context;
 }
 
+// Each context lists its unknowns, so a reset does not depend on the size of the plan.
 void SrtWalker::ResetUnknowns() {
 	for (auto& context: m_program.evaluation_contexts) {
 		if (context.session != m_session) continue;
-		for (auto& entry: context.values)
-			if (entry.generation == (context.generation | 2u)) entry.generation = 0;
+		for (const auto index: context.unknowns)
+			if (context.values[index].generation == (context.generation | 2u))
+				context.values[index].generation = 0;
+		context.unknowns.clear();
 	}
 }
 
@@ -768,6 +772,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
 		memo.generation = m_context.generation | 2u;
+		m_context.unknowns.push_back(index);
 		return false;
 	}
 	memo.value      = out;

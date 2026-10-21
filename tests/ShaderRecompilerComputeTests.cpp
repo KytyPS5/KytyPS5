@@ -2001,13 +2001,13 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
-  // Host float min/max is used on RADV with float controls 2, as in Kyty.
+  // Host float min/max is used on RADV, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
     vk::PhysicalDeviceDriverProperties driver{};
     vk::PhysicalDeviceProperties2 properties{};
     properties.pNext = &driver;
     m_physical_device.getProperties2(&properties);
-    return driver.driverID == vk::DriverId::eMesaRadv && m_float_controls2;
+    return driver.driverID == vk::DriverId::eMesaRadv;
   }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -20388,7 +20388,6 @@ public:
 
 private:
   bool m_rasterization_supported = true;
-  bool m_float_controls2 = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20708,19 +20707,6 @@ private:
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
     device_info.pNext = &robustness2;
-    // Optional: host float min/max needs float controls 2.
-    for (const auto &extension :
-         m_physical_device.enumerateDeviceExtensionProperties().value) {
-      if (std::strcmp(extension.extensionName,
-                      VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME) == 0)
-        m_float_controls2 = true;
-    }
-    vk::PhysicalDeviceShaderFloatControls2FeaturesKHR float_controls2{};
-    float_controls2.shaderFloatControls2 = true;
-    if (m_float_controls2) {
-      float_controls2.pNext = &robustness2;
-      device_info.pNext = &float_controls2;
-    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -20740,8 +20726,6 @@ private:
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    if (m_float_controls2)
-      device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -49037,7 +49021,7 @@ int main(int argc, char **argv) {
            {VectorMinMaxF32NanAndSignedZeroEdges(),
             VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
         auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
-        spirv = {" NMin ", " NMax ", "FloatControls2"};
+        spirv = {" NMin ", " NMax "};
         test.compile_only = native && !supported;
         RunCase(&vulkan, test);
       }

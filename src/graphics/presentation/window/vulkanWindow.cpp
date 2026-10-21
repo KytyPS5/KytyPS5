@@ -494,13 +494,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
-	const bool float_controls2_extension =
-	    HasExtension(device_extensions, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
-	vk::PhysicalDeviceShaderFloatControls2FeaturesKHR float_controls2 {};
-	if (float_controls2_extension) {
-		float_controls2.pNext     = supported_features2.pNext;
-		supported_features2.pNext = &float_controls2;
-	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -581,8 +574,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
-	graphics.float_controls2_enabled =
-	    float_controls2_extension && float_controls2.shaderFloatControls2;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -680,10 +671,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
-	}
-	if (graphics.float_controls2_enabled) {
-		float_controls2.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext     = &float_controls2;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1034,7 +1021,6 @@ void WindowContext::CreateVulkan() {
 	// IEEE mode off, which gives the guest's NaN and signed-zero results.
 	Libs::Graphics::ShaderRecompiler::Spirv::SetNativeFloatMinMax(
 	    driver_properties.driverID == vk::DriverId::eMesaRadv &&
-	    graphic_ctx.float_controls2_enabled &&
 	    std::getenv("KYTY_EMULATED_FLOAT_MIN_MAX") == nullptr);
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
@@ -1073,10 +1059,6 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
-		}
-		// Lets shaders keep NaN and signed-zero results of host float min/max.
-		if (HasExtension(available_extensions, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

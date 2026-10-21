@@ -128,15 +128,9 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	if (g_native_float_min_max.load(std::memory_order_relaxed)) {
-		// Without fast-math flags, float controls 2 makes NMin/NMax keep NaN, infinity and
-		// signed-zero results; SignedZeroInfNanPreserve does not cover extended instructions.
-		state.builder.RequireExtension("SPV_KHR_float_controls2");
-		state.builder.RequireCapability(spv::CapabilityFloatControls2);
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
-		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationFPFastMathMode,
-		                            spv::FPFastMathModeMaskNone);
 		return result;
 	}
 	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),

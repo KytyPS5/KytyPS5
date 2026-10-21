@@ -1193,13 +1193,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
-	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, state.ps_input_info.object_primitive_id);
+	using ShaderRecompiler::IR::PushData;
+	const auto draw_stages =
+	    vk::ShaderStageFlagBits::eFragment |
+	    (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex);
+	const auto draw_dwords =
+	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
 	if (draw_dwords != 0) {
-		std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> draw_data {};
-		const auto draw_stages = vk::ShaderStageFlagBits::eFragment |
-		                         (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT
-		                                      : vk::ShaderStageFlagBits::eVertex);
+		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
 		if (mesh_active) {
 			draw_data = {
 			    draw.index_count,
@@ -1213,6 +1214,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
+	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
+		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages,
+		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
+		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
+		                        buffer.GetRegisters().GetUserClipPlanes().data());
+	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
@@ -1220,6 +1227,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
+	vk::PipelineStageFlags shader_write_stages = {};
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+		}
+	}
+	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (shader_write_stages) {
+		// As for dispatches, buffer writes wait for earlier accesses to the memory.
+		m_context.GetCommandScheduler().EndRendering();
+		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1239,15 +1260,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	}
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();

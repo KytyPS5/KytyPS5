@@ -80,7 +80,7 @@ struct EmitterState {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
 		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
-		    input_info.compute != nullptr && input_info.compute->lds_storage) {
+		    input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
 	}
@@ -104,9 +104,8 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          u32_vector_types {};
 	std::array<uint32_t, 3>                          i32_vector_types {};
 	std::array<uint32_t, 3>                          f32_vector_types {};
-	std::array<uint32_t, 6>                          tess_variables {};
+	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
-	uint32_t                                         tess_patch_base     = 0;
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
@@ -148,6 +147,7 @@ struct EmitterState {
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
+	uint32_t                   user_clip_planes                      = 0;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
@@ -285,7 +285,6 @@ struct ImageSampleLayout {
 };
 
 struct F32Class {
-	uint32_t bits = 0;
 	uint32_t nan  = 0;
 	uint32_t zero = 0;
 };
@@ -509,8 +508,6 @@ inline constexpr auto EmitLogicalOrBool =
 inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
-
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);

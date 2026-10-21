@@ -362,8 +362,7 @@ class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
 	        ShaderStageInputInfo input)
-	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
-	      m_workgroup(program.stage == ShaderType::Compute ? input.compute : nullptr),
+	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg), m_input(input),
 	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
@@ -1560,12 +1559,17 @@ private:
 
 	const Inst* IndexedMaterialRead(const Inst* read, Value active,
 	                               DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+		if (read == nullptr) return nullptr;
 		uint32_t lane = 0;
-		if (read != nullptr && read->GetOpcode() == ValueOpcode::CompositeExtractU32x2) {
-			if (!ImmediateU32(read->Arg(1), lane) || lane >= 2u) return nullptr;
+		const auto op = read->GetOpcode();
+		if (op == ValueOpcode::CompositeExtractU32x2 || op == ValueOpcode::CompositeExtractU32x3) {
+			const bool x3 = op == ValueOpcode::CompositeExtractU32x3;
+			if (!ImmediateU32(read->Arg(1), lane) || lane >= (x3 ? 3u : 2u)) return nullptr;
 			read = read->Arg(0).Resolve().TryInstruction();
-			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x2) return nullptr;
-		} else if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) {
+			if (read == nullptr ||
+			    read->GetOpcode() != (x3 ? ValueOpcode::LoadBufferU32x3 : ValueOpcode::LoadBufferU32x2))
+				return nullptr;
+		} else if (op != ValueOpcode::LoadBufferU32) {
 			return nullptr;
 		}
 		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
@@ -1587,8 +1591,9 @@ private:
 		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
 		if (indexed) {
 			read = IndexedMaterialRead(read, active, selector);
-			// This optional domain is checked against the dispatch's writable buffers.
-			// Other stages and unbounded/image writes need the original heap domain.
+			// Bounded heaps fall back when the material aliases a written buffer; pointer
+			// tables rely on the renderer's specialization-read alias check. Other stages
+			// and unbounded/image writes keep the original domain.
 			if (read == nullptr || m_program.stage != ShaderType::Compute ||
 			    std::ranges::any_of(m_program.blocks, [](const Block* block) {
 				    return std::ranges::any_of(*block, [](const Inst& inst) {
@@ -1853,7 +1858,7 @@ private:
 			    if (inst->GetOpcode() == ValueOpcode::GetBuiltin &&
 			        inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)) &&
 			        ImmediateU32(inst->Arg(1), axis) && axis < 3u &&
-			        m_workgroup->threads_num[axis] <= (uint64_t {1} << bits)) return axis + 1u;
+			        m_input.compute->threads_num[axis] <= (uint64_t {1} << bits)) return axis + 1u;
 			    if (!allow_induction || inst->GetOpcode() != ValueOpcode::Phi ||
 			        (!induction.IsEmpty() && induction != at)) return {};
 			    induction = at;
@@ -1864,20 +1869,20 @@ private:
 	bool LinearLocalIndex(const std::array<uint64_t, 5>& index) const {
 		uint64_t stride = 1u;
 		for (uint32_t axis = 0; axis < 3u; ++axis) {
-			if (m_workgroup->threads_num[axis] != 1u && index[axis + 1u] != stride) return false;
-			stride *= m_workgroup->threads_num[axis];
+			if (m_input.compute->threads_num[axis] != 1u && index[axis + 1u] != stride) return false;
+			stride *= m_input.compute->threads_num[axis];
 		}
 		return index[0] == 0u;
 	}
 
 	void ForwardPrivateLds() {
-		if (m_workgroup == nullptr) return;
+		if (m_program.stage != ShaderType::Compute) return;
 		uint64_t bytes = 4u;
-		for (const auto size: m_workgroup->threads_num) {
+		for (const auto size: m_input.compute->threads_num) {
 			if (size == 0u || size > 1024u) return;
 			bytes *= size;
 		}
-		if (bytes > uint64_t {m_workgroup->lds_size_dwords} * 4u) return;
+		if (bytes > uint64_t {m_input.compute->lds_size_dwords} * 4u) return;
 		struct Access { Inst* inst; uint32_t offset; };
 		std::vector<Access> reads, writes;
 		Value address;
@@ -1893,7 +1898,7 @@ private:
 				if ((op != ValueOpcode::LoadSharedU32 && op != ValueOpcode::WriteSharedU32) ||
 				    memory.data_bits != 32u || memory.secondary_offset != 0u ||
 				    (memory.offset & 3u) != 0u ||
-				    uint64_t {memory.offset} + bytes > uint64_t {m_workgroup->lds_size_dwords} * 4u)
+				    uint64_t {memory.offset} + bytes > uint64_t {m_input.compute->lds_size_dwords} * 4u)
 					return;
 				if (address.IsEmpty()) address = inst.Arg(0).Resolve();
 				else if (!EquivalentValue(m_program, address, inst.Arg(0))) return;
@@ -2039,16 +2044,16 @@ private:
 	Value SharedLoadBound(Value value, Value active) {
 		const auto* read = ActiveValue(value, active).TryInstruction();
 		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadSharedU32 ||
-		    m_workgroup == nullptr || m_program.stage != ShaderType::Compute ||
+		    m_program.stage != ShaderType::Compute ||
 		    read->Arg(1).Resolve() != Value(true)) return {};
 		uint64_t group_size = 1u;
-		for (const auto dimension: m_workgroup->threads_num) {
-			if (dimension == 0u || dimension > m_workgroup->wave_size) return {};
+		for (const auto dimension: m_input.compute->threads_num) {
+			if (dimension == 0u || dimension > m_input.compute->wave_size) return {};
 			group_size *= dimension;
 		}
 		// Indexed LDS operations within one native wave execute in order. Multiwave
 		// append lists require a separate workgroup synchronization proof.
-		if (group_size != m_workgroup->wave_size || group_size != m_program.wave_size ||
+		if (group_size != m_input.compute->wave_size || group_size != m_program.wave_size ||
 		    (group_size != 32u && group_size != 64u)) return {};
 		const auto memory = [&](const Inst& inst) -> const MemoryInfo* {
 			const auto index = inst.Flags<MemoryFlags>().index;
@@ -2101,7 +2106,7 @@ private:
 					if (op != ValueOpcode::SharedAtomicIAdd32 ||
 					    ActiveValue(inst.Arg(1), guard) != Value(1u) ||
 					    !constant_address(inst, address) ||
-					    uint64_t {address} + 4u > uint64_t {m_workgroup->lds_size_dwords} * 4u ||
+					    uint64_t {address} + 4u > uint64_t {m_input.compute->lds_size_dwords} * 4u ||
 					    address >= 0x10000u ||
 					    std::ranges::any_of(appends, [&](const Append& at) { return at.counter == address; })) return {};
 					appends.push_back({.atomic = &inst, .counter = address});
@@ -3063,6 +3068,7 @@ private:
 			}
 			if (indirect.key_count.IsEmpty() &&
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, false) &&
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, true) &&
 			    !MatchReversedImageRange(key, indirect)) {
 				const auto maximum = SelectorMaximum(key);
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
@@ -3800,6 +3806,13 @@ private:
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
+		if (write) {
+			// Formatted stores write the whole format; otherwise zero index, VGPR and SGPR offsets
+			// leave only the immediate offset.
+			const bool fixed = !memory.formatted && inst.Arg(1).Resolve() == Value(0u) &&
+			                   inst.Arg(2).Resolve() == Value(0u) && inst.Arg(3).Resolve() == Value(0u);
+			resource.write_extent = std::max(resource.write_extent, fixed ? ByteExtent(memory) : UINT32_MAX);
+		}
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
@@ -4091,7 +4104,7 @@ private:
 	Program&                                   m_program;
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
-	const ShaderWorkgroupInputInfo*            m_workgroup;
+	ShaderStageInputInfo                       m_input;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
@@ -4124,8 +4137,8 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 		// Dispatch thread dimensions, valid in both wave sizes.
 		Pattern {.code_words = 38, .hash = 0xacbda1a1ccdd4198ull, .wave_size_mask = 32 | 64, .bounded = false},
 	};
-	if (program.stage != ShaderType::Compute || input.compute == nullptr ||
-	    decoded.instructions.empty() || program.user_data_base != 0 || program.user_data_count < 10 ||
+	if (program.stage != ShaderType::Compute || decoded.instructions.empty() ||
+	    program.user_data_base != 0 || program.user_data_count < 10 ||
 	    program.info.buffers.size() != 1 || !program.info.images.empty()) return {};
 	const auto& cs = *input.compute;
 	const bool matching_inputs = cs.workgroup_register == 10 && cs.thread_ids_num == 1 &&

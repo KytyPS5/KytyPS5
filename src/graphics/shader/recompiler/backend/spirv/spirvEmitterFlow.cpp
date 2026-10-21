@@ -53,8 +53,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
 		// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects uint masks or float +/-1.
-		const bool all_bits =
-		    state.input_info.pixel != nullptr && state.input_info.pixel->ps_front_face_all_bits;
+		const bool all_bits = state.input_info.pixel->ps_front_face_all_bits;
 		const auto front = ConstantU32(state, all_bits ? 0xffffffffu : 0x3f800000u);
 		const auto back  = ConstantU32(state, all_bits ? 0u : 0xbf800000u);
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value, front, back);
@@ -350,6 +349,38 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 	return vector;
 }
 
+uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
+	if (state.program.stage == ShaderType::Mesh) {
+		return MeshOutputPointer(state, kind, index);
+	}
+	const auto variable = kind == IR::StageOutputKind::ClipDistance ? state.clip_distance_variable
+	                                                                : state.cull_distance_variable;
+	const auto pointer  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)), pointer,
+	                          variable, ConstantU32(state, index));
+	return pointer;
+}
+
+// The clipper keeps the half space where dot(plane, position) >= 0 for each UCP_ENA plane.
+void EmitUserClipDistances(EmitterState& state, uint32_t position) {
+	uint32_t index = 0;
+	for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
+		const auto dword = IR::PushData::UserClipPlaneDword + 4u * std::countr_zero(mask);
+		uint32_t   components[4] {};
+		for (uint32_t i = 0; i < 4; i++) {
+			components[i] = Unary(state, spv::OpBitcast, TypeF32(state),
+			                      EmitPushDataLoad(state, ConstantU32(state, dword + i)));
+		}
+		const auto plane = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), plane,
+		                          components[0], components[1], components[2], components[3]);
+		state.builder.AddFunction(
+		    spv::OpStore, DistancePointer(state, IR::StageOutputKind::ClipDistance, index++),
+		    Binary(state, spv::OpDot, TypeF32(state), plane, position));
+	}
+}
+
 void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp) {
 	auto& state = ctx.state;
 	for (uint32_t component = 0; component < 4; component++) {
@@ -390,23 +421,13 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			state.builder.AddFunction(spv::OpStore, state.point_size_variable, f32);
 			continue;
 		}
-		auto StoreDistance = [&](IR::StageOutputKind kind, uint32_t variable, uint32_t index) {
-			if (index == UINT32_MAX) {
-				return;
+		auto StoreDistance = [&](IR::StageOutputKind kind, uint32_t index) {
+			if (index != UINT32_MAX) {
+				state.builder.AddFunction(spv::OpStore, DistancePointer(state, kind, index), f32);
 			}
-			uint32_t pointer;
-			if (state.program.stage == ShaderType::Mesh) {
-				pointer = MeshOutputPointer(state, kind, index);
-			} else {
-				pointer = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpAccessChain,
-				                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
-				                          pointer, variable, ConstantU32(state, index));
-			}
-			state.builder.AddFunction(spv::OpStore, pointer, f32);
 		};
-		StoreDistance(IR::StageOutputKind::ClipDistance, state.clip_distance_variable, output.clip_distance);
-		StoreDistance(IR::StageOutputKind::CullDistance, state.cull_distance_variable, output.cull_distance);
+		StoreDistance(IR::StageOutputKind::ClipDistance, output.clip_distance);
+		StoreDistance(IR::StageOutputKind::CullDistance, output.cull_distance);
 	}
 }
 
@@ -597,6 +618,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    state.input_info.vertex->clip_space.enabled) {
 			value = ConvertPositionToClipSpace(state, value);
 		}
+		if (exp.kind == IR::ExportTargetKind::Position && state.user_clip_planes != 0) {
+			EmitUserClipDistances(state, value);
+		}
 		if (state.program.stage == ShaderType::Mesh) {
 			const auto kind = exp.kind == IR::ExportTargetKind::Position
 			                      ? IR::StageOutputKind::Position
@@ -609,7 +633,6 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto equal = state.builder.AllocateId();
 				const auto invalid = state.builder.AllocateId();
 				const auto distance = state.builder.AllocateId();
-				const auto distance_pointer = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal,
 				                          value, zero);
 				state.builder.AddFunction(spv::OpAll, TypeBool(state), invalid, equal);
@@ -618,11 +641,10 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				state.builder.AddFunction(spv::OpSelect, TypeF32(state), distance, invalid,
 				                          ConstantF32Value(state, -1.0f),
 				                          ConstantF32Value(state, 0.0f));
-				state.builder.AddFunction(
-				    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
-				    distance_pointer, state.clip_distance_variable,
-				    ConstantU32(state, state.invalid_position_clip_distance));
-				state.builder.AddFunction(spv::OpStore, distance_pointer, distance);
+				state.builder.AddFunction(spv::OpStore,
+				                          DistancePointer(state, IR::StageOutputKind::ClipDistance,
+				                                          state.invalid_position_clip_distance),
+				                          distance);
 				static std::atomic_bool logged = false;
 				if (!logged.exchange(true, std::memory_order_relaxed)) {
 					Log::WriteToConsoleAndLog(

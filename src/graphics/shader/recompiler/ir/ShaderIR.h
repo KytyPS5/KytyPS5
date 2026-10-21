@@ -127,6 +127,7 @@ struct BufferResource {
 	uint32_t               descriptor_index   = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
+	uint32_t               write_extent       = 0; // UINT32_MAX once a write is runtime-addressed or formatted
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
@@ -267,8 +268,11 @@ enum class TessellationAttribute {
 	ControlOutput,
 	EvaluationInput,
 	PatchOutput,
+	PatchInput,
 	Factor
 };
+constexpr uint32_t NumTessellationAttributes =
+    static_cast<uint32_t>(TessellationAttribute::Factor) + 1u;
 
 enum class StageInputKind {
 	VertexIndex,
@@ -403,7 +407,14 @@ struct PushData {
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
-	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id) {
+	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
+	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
+
+	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
+	                                                           uint32_t user_clip_planes = 0) {
+		if (user_clip_planes != 0) {
+			return UserClipPlaneDword + 4u * std::bit_width(user_clip_planes);
+		}
 		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
 	}
 

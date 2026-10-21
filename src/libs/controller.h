@@ -18,6 +18,12 @@ struct Lifecycle {
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
 
+constexpr int PAD_ERROR_INVALID_ARG     = -2137915391; /* 0x80920001 */
+constexpr int PAD_ERROR_INVALID_HANDLE  = -2137915389; /* 0x80920003 */
+constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
+constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
+constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
+
 constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
 constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
 constexpr uint32_t PAD_BUTTON_OPTIONS   = 0x00000008;
@@ -86,7 +92,32 @@ enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity }
 void  CycleSetting(Setting setting);
 float GetSettingScale(Setting setting);
 
-int PadCheckHandle(int handle);
+int  PadCheckHandle(int handle);
+bool PadInitialized();
+
+// Virtual headset only (padVr.cpp): the Sense controller ports of the initial user. Their handles
+// stay outside the per-player range and otherwise act on the first player.
+constexpr int PAD_HANDLE_VR_LEFT = 0x10; // The right controller follows it.
+
+// 0 for the left and 1 for the right Sense controller handle, -1 for any other handle.
+constexpr int PadVrHand(int handle) {
+	return handle == PAD_HANDLE_VR_LEFT || handle == PAD_HANDLE_VR_LEFT + 1
+	           ? handle - PAD_HANDLE_VR_LEFT
+			   : -1;
+}
+
+// Hand of a Sense controller port type, -1 for other types or without the virtual headset.
+int PadVrPortHand(int type);
+// scePadOpen (open) or scePadGetHandle for a Sense controller port.
+int PadVrPort(int user_id, int hand, int index, bool open);
+int PadVrCheckHandle(int handle);
+int PadVrClose(int handle);
+
+struct PadVrControllerData;
+
+int KYTY_SYSV_ABI PadVrControllerReadState(int handle, PadVrControllerData* data);
+int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_handle,
+                                                   const PadTriggerEffectParam* param);
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);

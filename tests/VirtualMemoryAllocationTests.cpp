@@ -1596,20 +1596,23 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	ExpectUnmapped(test, base + SceKernelPageSize);
 
 	constexpr uint64_t transaction_sentinel = 0x5452414e53414354ull; // "TRANSACT"
-	constexpr uint64_t rejected_write       = 0x4e4f504152544941ull; // "NOPARTIA"
+	constexpr uint64_t sparse_write         = 0x4e4f504152544941ull; // "NOPARTIA"
+	constexpr uint64_t backed_prefix_mask   = 0xffffffffull;
 	const auto         crossing_address     = base + SceKernelPageSize - sizeof(uint32_t);
 	std::memcpy(reinterpret_cast<void*>(alias_base + SceKernelPageSize - sizeof(uint32_t)),
 	            &transaction_sentinel, sizeof(transaction_sentinel));
 	Check(test,
-	      !Libs::LibKernel::Memory::TryWriteBacking(crossing_address, &rejected_write,
-	                                                sizeof(rejected_write)),
-	      "TryWriteBacking should reject a range crossing an unmapped span");
-	uint64_t backing_after_rejected_write = 0;
-	std::memcpy(&backing_after_rejected_write,
+	      Libs::LibKernel::Memory::TryWriteBacking(crossing_address, &sparse_write,
+	                                               sizeof(sparse_write)),
+	      "TryWriteBacking should write a range crossing an unmapped span");
+	uint64_t backing_after_sparse_write = 0;
+	std::memcpy(&backing_after_sparse_write,
 	            reinterpret_cast<const void*>(alias_base + SceKernelPageSize - sizeof(uint32_t)),
-	            sizeof(backing_after_rejected_write));
-	Check(test, backing_after_rejected_write == transaction_sentinel,
-	      "failed backing writes must not modify a validated prefix");
+	            sizeof(backing_after_sparse_write));
+	Check(test,
+	      backing_after_sparse_write == ((sparse_write & backed_prefix_mask) |
+	                                     (transaction_sentinel & ~backed_prefix_mask)),
+	      "sparse backing writes must fill the backed prefix and skip the unmapped span");
 	uint64_t rejected_read = transaction_sentinel;
 	Check(test,
 	      !Libs::LibKernel::Memory::TryReadBacking(crossing_address, &rejected_read,

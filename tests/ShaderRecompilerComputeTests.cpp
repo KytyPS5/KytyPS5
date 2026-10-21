@@ -84,6 +84,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -2184,9 +2185,9 @@ public:
   }
 
   /// Exercises the scalar-read guard through the renderer's descriptor commit.
-  /// Header reads must succeed; reads of an indexed atomic field must terminate.
-  void CheckScalarBufferWriteBindings(bool overlapping) {
-    constexpr const char *name = "ScalarBufferWriteBindings";
+  /// Disjoint reads must succeed for fixed and indexed writes; overlaps must terminate.
+  void CheckScalarBufferWriteBindings(bool overlapping, bool fixed = false) {
+    const char *name = fixed ? "FixedBufferWriteBindings" : "ScalarBufferWriteBindings";
     constexpr uint64_t guest_base = 0x1000;
     constexpr uint64_t bytes = 0x840;
     EnsureRuntimeContext();
@@ -2205,13 +2206,18 @@ public:
     resource.atomic = true;
     resource.descriptor_index = 0;
     resource.packed_stride = 64;
-    resource.indexed_write_patterns.emplace_back(24, 4);
+    // A fixed atomic subtraction is unsupported by the indexed proof, so its
+    // disjoint read must be accepted by upstream's write_extent check alone.
+    resource.write_extent = fixed ? 4u : UINT32_MAX;
+    resource.unknown_write_pattern = fixed;
+    if (!fixed) resource.indexed_write_patterns.emplace_back(24, 4);
     program.info.buffers.push_back(resource);
     program.bindings.descriptor_counts[0] = 1;
     program.bindings.descriptor_mask = 1;
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
     snapshot.specialization_reads.emplace_back(
-        guest_base + (overlapping ? 24 : 0), sizeof(uint32_t));
+        guest_base + (fixed ? (overlapping ? 0 : 64) : (overlapping ? 24 : 0)),
+        sizeof(uint32_t));
     ShaderStageRuntime runtime{&program, &snapshot};
     auto host = CreateHostBuffer(name, bytes,
                                 vk::BufferUsageFlagBits::eStorageBuffer, {});
@@ -27962,8 +27968,8 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 17,593/36,607 words; keep classification growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 17600u : 36620u;
+  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
   return test;
 }
 
@@ -43741,6 +43747,58 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
+struct TessellationStage {
+  // Immediate byte addresses of the lowered accesses, per attribute kind.
+  std::map<ShaderRecompiler::IR::TessellationAttribute, std::set<u32>> addresses;
+  std::string assembly;
+};
+
+TessellationStage CompileTessellationStage(const char *name, const std::vector<u32> &code,
+                                           ShaderType stage,
+                                           const ShaderTessellationInputInfo &tess) {
+  using namespace ShaderRecompiler;
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = stage;
+  vertex.tess = tess;
+  CompileOptions options;
+  options.stage = stage;
+  options.input_info.vertex = &vertex;
+  auto translated = TranslateProgram(code, options);
+  TessellationStage result;
+  for (const auto *block : translated.program.blocks) {
+    for (const auto &inst : *block) {
+      if ((inst.GetOpcode() == IR::ValueOpcode::GetTessellationAttribute ||
+           inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute) &&
+          inst.Arg(1).IsImmediate()) {
+        result.addresses[static_cast<IR::TessellationAttribute>(inst.Arg(0).U32())].insert(
+            inst.Arg(1).U32());
+      }
+    }
+  }
+  auto compiled = CompileProgram(std::move(translated), options, {});
+  ValidateSpirv(name, compiled.spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  Require(name, "disassembly", tools.Disassemble(compiled.spirv, &result.assembly),
+          "failed to disassemble tessellation shader");
+  return result;
+}
+
+// Whether a Patch uvec4[vectors] variable of a storage class sits at a Location.
+bool HasPatchInterface(const std::string &assembly, const std::string &storage, u32 vectors,
+                       u32 location) {
+  const auto variable = " = OpVariable %_ptr_" + storage + "__arr_v4uint_uint_" +
+                        std::to_string(vectors) + " " + storage + "\n";
+  const auto end = assembly.find(variable);
+  if (end == std::string::npos) {
+    return false;
+  }
+  const auto begin = assembly.rfind('%', end);
+  const auto id = assembly.substr(begin, end - begin);
+  return assembly.find("OpDecorate " + id + " Patch\n") != std::string::npos &&
+         assembly.find("OpDecorate " + id + " Location " + std::to_string(location) + "\n") !=
+             std::string::npos;
+}
+
 void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   using namespace ShaderRecompiler;
   const bool multiplied_stride = hs_stride == 112;
@@ -43749,8 +43807,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   const u32 relative_patch = multiplied_stride ? 28 : 32;
   const u32 output_address = multiplied_stride ? 31 : 35;
   const u32 input_address = multiplied_stride ? 25 : 29;
-  std::array<std::vector<u32>, 3> code;
-  auto &local = code[0];
+  std::vector<u32> local, control, evaluation;
   // The fused LS addresses one control point using its v3 ordinal.
   local.push_back(EncodeVop2(0x0b, local_address, 255u, 3));
   local.push_back(ls_stride);
@@ -43759,7 +43816,6 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   local.push_back(EncodeSop1(0x20, 0, 6));
   local.push_back(0xffffffffu); // Shader footer is not executable after LS handoff.
 
-  auto &control = code[1];
   AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
   AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
   control.push_back(EncodeSopp(0x0a));
@@ -43818,7 +43874,6 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   }
   AppendEnd(&control);
 
-  auto &evaluation = code[2];
   AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
   evaluation.push_back(3 * hs_stride);
   evaluation.push_back(EncodeMubuf0(0x0d, 28));
@@ -43839,91 +43894,221 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
           tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
-  constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
-                              ShaderType::TessellationEvaluation};
-  for (u32 stage = 0; stage < stages.size(); stage++) {
-    ShaderVertexInputInfo vertex;
-    vertex.logical_stage = stages[stage];
-    vertex.tess = tess;
-    CompileOptions options;
-    options.stage = stages[stage];
-    options.input_info.vertex = &vertex;
-    auto translated = TranslateProgram(code[stage], options);
-    std::set<u32> local_offsets, evaluation_offsets, factor_offsets, patch_offsets;
-    for (const auto *block : translated.program.blocks) {
-      for (const auto &inst : *block) {
-        if (inst.GetOpcode() != IR::ValueOpcode::GetTessellationAttribute &&
-            inst.GetOpcode() != IR::ValueOpcode::SetTessellationAttribute) {
-          continue;
-        }
-        if (!inst.Arg(1).IsImmediate()) {
-          continue;
-        }
-        switch (static_cast<IR::TessellationAttribute>(inst.Arg(0).U32())) {
-        case IR::TessellationAttribute::LocalOutput:
-          local_offsets.insert(inst.Arg(1).U32());
-          break;
-        case IR::TessellationAttribute::EvaluationInput:
-          evaluation_offsets.insert(inst.Arg(1).U32());
-          break;
-        case IR::TessellationAttribute::Factor:
-          factor_offsets.insert(inst.Arg(1).U32());
-          break;
-        case IR::TessellationAttribute::PatchOutput:
-          patch_offsets.insert(inst.Arg(1).U32());
-          break;
-        default:
-          break;
-        }
-      }
-    }
-    Require(name, "separate DS offsets", stage != 0 || local_offsets == std::set<u32>{4, 12},
-            "DS_WRITE2 must preserve both independently encoded offsets");
-    Require(name, "offchip component addressing",
-            stage != 2 ||
-                evaluation_offsets == std::set<u32>{28, 2 * hs_stride + 28},
-            "TES control point and component offsets must survive lowering");
-    Require(name, "triangle factor layout",
-            stage != 1 || factor_offsets == std::set<u32>{0, 4, 8, 12},
-            "the four packed guest factors must retain their order");
-    Require(name, "predicated patch addresses",
-            stage != 1 || patch_offsets == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
-            "CP0 patch stores must use the address assigned on their active predicate");
-    auto result = CompileProgram(std::move(translated), options, {});
-    ValidateSpirv(name, result.spirv);
-    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
-    std::string assembly;
-    Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
-            "failed to disassemble tessellation shader");
-    Require(name, "native local inputs",
-            stage != 0 || (assembly.find("VertexIndex") != std::string::npos &&
-                           assembly.find("InstanceIndex") != std::string::npos),
-            "LS v2/v5 must read native vertex/instance indices");
-    Require(name, "control point lane",
-            stage != 1 || (assembly.find("InvocationId") != std::string::npos &&
-                           assembly.find("SubgroupLocalInvocationId") == std::string::npos),
-            "HS lane masks must use control point invocation IDs");
-    Require(name, "control point barrier",
-            stage != 1 || (assembly.find("OpMemoryModel Logical GLSL450") != std::string::npos &&
-                           assembly.find("OpControlBarrier %uint_2 %uint_4 %uint_0") != std::string::npos),
-            "HS barriers must match GLSL450 control point synchronization semantics");
-    Require(name, "factor builtins",
-            stage != 1 || (assembly.find("TessLevelOuter") != std::string::npos &&
-                           assembly.find("TessLevelInner") != std::string::npos),
-            "triangle factors require outer[4] and inner[2] Vulkan builtins");
-    Require(name, "native domain and winding",
-            stage != 2 || (assembly.find("TessCoord") != std::string::npos &&
-                           assembly.find("Triangles") != std::string::npos &&
-                           assembly.find("SpacingFractionalOdd") != std::string::npos &&
-                           assembly.find("VertexOrderCw") != std::string::npos),
-            "TES must preserve guest triangle domain, partitioning, and winding");
-  }
+  Require(name, "patch constant range", tess.patch_base == 0x7fc0u && tess.patch_size == 52u,
+          "CP0 patch stores must reflect the HS patch constant range");
+
+  using Attribute = IR::TessellationAttribute;
+  auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
+  auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
+  auto ds = CompileTessellationStage(name, evaluation, ShaderType::TessellationEvaluation, tess);
+  Require(name, "separate DS offsets", ls.addresses[Attribute::LocalOutput] == std::set<u32>{4, 12},
+          "DS_WRITE2 must preserve both independently encoded offsets");
+  Require(name, "offchip component addressing",
+          ds.addresses[Attribute::EvaluationInput] == std::set<u32>{28, 2 * hs_stride + 28},
+          "TES control point and component offsets must survive lowering");
+  Require(name, "triangle factor layout",
+          hs.addresses[Attribute::Factor] == std::set<u32>{0, 4, 8, 12},
+          "the four packed guest factors must retain their order");
+  Require(name, "predicated patch addresses",
+          hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
+          "CP0 patch stores must use the address assigned on their active predicate");
+  Require(name, "native local inputs",
+          ls.assembly.find("VertexIndex") != std::string::npos &&
+              ls.assembly.find("InstanceIndex") != std::string::npos,
+          "LS v2/v5 must read native vertex/instance indices");
+  Require(name, "control point lane",
+          hs.assembly.find("InvocationId") != std::string::npos &&
+              hs.assembly.find("SubgroupLocalInvocationId") == std::string::npos,
+          "HS lane masks must use control point invocation IDs");
+  Require(name, "control point barrier",
+          hs.assembly.find("OpMemoryModel Logical GLSL450") != std::string::npos &&
+              hs.assembly.find("OpControlBarrier %uint_2 %uint_4 %uint_0") != std::string::npos,
+          "HS barriers must match GLSL450 control point synchronization semantics");
+  Require(name, "factor builtins",
+          hs.assembly.find("TessLevelOuter") != std::string::npos &&
+              hs.assembly.find("TessLevelInner") != std::string::npos,
+          "triangle factors require outer[4] and inner[2] Vulkan builtins");
+  Require(name, "native domain and winding",
+          ds.assembly.find("TessCoord") != std::string::npos &&
+              ds.assembly.find("Triangles") != std::string::npos &&
+              ds.assembly.find("SpacingFractionalOdd") != std::string::npos &&
+              ds.assembly.find("VertexOrderCw") != std::string::npos,
+          "TES must preserve guest triangle domain, partitioning, and winding");
   std::printf("[host]    %-32s ok\n", name);
+}
+
+// PPSA25468: CP0 writes patch constants below the 32 KiB offchip ring end
+// through mul24 addresses that reuse data VGPRs under nested EXEC masks, and
+// the TES reads them back. As in God of War Ragnarok, the HS reads its next LS
+// record, loops on a v_cmpx header and CP0 reads back another CP's outputs.
+void CheckTessellationPatchConstants() {
+  using namespace ShaderRecompiler;
+  using Attribute = IR::TessellationAttribute;
+  constexpr const char *name = "TessellationPatchConstants";
+  constexpr u32 ls_stride = 48, hs_stride = 80, patch_stride = 0xf0;
+  std::vector<u32> local;
+  // One 128-bit DS store writes the LS record.
+  local.push_back(EncodeVop2(0x0b, 20, 255u, 3)); // v_mul_u32_u24 v20, ls_stride, v3
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0xdf, 16)); // ds_write_b128 v20, v[2:5] offset:16
+  local.push_back(EncodeDs1(0, 2, 20));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+
+  const auto make_control = [&](bool divergent, bool carried) {
+    std::vector<u32> control;
+    AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
+    AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
+    control.push_back(EncodeVopc(0xd1, 249u, 3));
+    control.push_back(EncodeVopcSdwa(0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 0, 0, 1));
+    const auto skip_control = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    AppendVop3(&control, 0x148, 16, Vgpr(1), InlineU32(8), InlineU32(5));
+    control.push_back(EncodeVop2(0x1b, 50, 255u, 1)); // v_and_b32 v50, 0xff, v1
+    control.push_back(0xffu);
+    control.push_back(EncodeVop2(0x0b, 0, 255u, 16)); // v_mul_u32_u24 v0, hs_stride, v16
+    control.push_back(hs_stride);
+    control.push_back(EncodeVopc(0xc4, InlineU32(2), 16));    // v_cmp_gt_u32 vcc, 2, v16
+    control.push_back(EncodeVop2(0x25, 1, InlineU32(1), 16)); // v_add_nc_u32 v1, 1, v16
+    control.push_back(EncodeVop2(0x01, 1, InlineU32(0), 1));  // v_cndmask_b32 v1, 0, v1, vcc
+    AppendVop3(&control, 0x169, 1, Vgpr(1), 255u); // v_mul_lo_u32 v1, v1, ls_stride
+    control.push_back(ls_stride);
+    AppendVop3(&control, 0x143, 17, 255u, Vgpr(50), Vgpr(0));
+    control.push_back(3 * hs_stride);
+    AppendVop3(&control, 0x143, 14, 255u, Vgpr(50), Vgpr(1));
+    control.push_back(3 * ls_stride);
+    // ds_read2_b32 v[10:11], v14 offset0:4 offset1:5
+    control.push_back(EncodeDs0(0x37, (5u << 8u) | 4u));
+    control.push_back(EncodeDs1(10, 0, 14));
+    control.push_back(EncodeMubuf0(0x1d, 16));
+    control.push_back(EncodeMubuf1(10, 2, 17, 2));
+    // v17 stays affine at the forward branch's join unless the paths diverge.
+    control.push_back(EncodeVopc(0x01, InlineU32(0), 10)); // v_cmp_lt_f32 vcc, 0, v10
+    const auto skip_scale = control.size();
+    control.push_back(0u);                                 // s_cbranch_vccz
+    control.push_back(EncodeVop1(0x01, 12, 242u));         // v_mov_b32 v12, 1.0
+    if (divergent) {
+      control.push_back(EncodeVop2(0x25, 17, InlineU32(4), 17)); // v_add_nc_u32 v17, 4, v17
+    }
+    control[skip_scale] = EncodeSopp(0x06, control.size() - skip_scale - 1u);
+    control.push_back(EncodeSop1(0x04, 6, 126));       // s_mov_b64 s[6:7], exec
+    control.push_back(EncodeSMovB32(5, InlineU32(0))); // s_mov_b32 s5, 0
+    const auto loop = control.size();
+    control.push_back(EncodeVopc(0xd1, 5, 16)); // v_cmpx_lt_u32 s5, v16
+    const auto exit_loop = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeMubuf0(0x1c, 24));
+    control.push_back(EncodeMubuf1(12, 2, 17, 2));
+    // Only the back edge shows a loop-carried v17 at the store above.
+    if (carried) {
+      control.push_back(EncodeVop2(0x25, 17, InlineU32(4), 17)); // v_add_nc_u32 v17, 4, v17
+    }
+    control.push_back(EncodeVop2(0x25, 13, InlineU32(1), 13)); // v_add_nc_u32 v13, 1, v13
+    control.push_back(EncodeSop2(0x00, 5, 5, InlineU32(1)));   // s_add_u32 s5, s5, 1
+    control.push_back(EncodeSopp(0x02, loop - control.size() - 1u)); // s_branch
+    control[exit_loop] = EncodeSopp(0x08, control.size() - exit_loop - 1u);
+    control.push_back(EncodeSop1(0x04, 126, 6)); // s_mov_b64 exec, s[6:7]
+    control.push_back(EncodeSopp(0x0a));         // s_barrier
+    // CP0 reuses data VGPR v10 for the ring address 0x8000 - (patch + 1) * 0xf0.
+    control.push_back(EncodeVopc(0xd4, InlineU32(1), 16)); // v_cmpx_gt_u32 1, v16
+    const auto skip_patch = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeVop2(0x0b, 11, 255u, 50)); // v_mul_u32_u24 v11, 3 * hs_stride, v50
+    control.push_back(3 * hs_stride);
+    // buffer_load_dwordx2 v[11:12], v11, s[8:11], s2 offen offset:hs_stride + 16 (CP1)
+    control.push_back(EncodeMubuf0(0x0d, hs_stride + 16));
+    control.push_back(EncodeMubuf1(11, 2, 11, 2));
+    control.push_back(EncodeVop2(0x25, 10, InlineU32(1), 50)); // v_add_nc_u32 v10, 1, v50
+    control.push_back(EncodeVop2(0x0b, 10, 255u, 10));         // v_mul_u32_u24 v10, 0xf0, v10
+    control.push_back(patch_stride);
+    control.push_back(EncodeVop2(0x26, 10, 255u, 10)); // v_sub_nc_u32 v10, 0x8000, v10
+    control.push_back(0x8000u);
+    control.push_back(EncodeVopc(0x01, InlineU32(0), 11)); // v_cmp_lt_f32 vcc, 0, v11
+    control.push_back(EncodeSop1(0x24, 0, 106));           // s_and_saveexec_b64 s[0:1], vcc
+    const auto skip_nested = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeMubuf0(0x1c, 0)); // buffer_store_dword v11, v10, s[8:11], s2 offen
+    control.push_back(EncodeMubuf1(11, 2, 10, 2));
+    control[skip_nested] = EncodeSopp(0x08, control.size() - skip_nested - 1u);
+    control.push_back(EncodeSop1(0x04, 126, 0)); // s_mov_b64 exec, s[0:1]
+    // buffer_store_dwordx3 v[11:13], v10, s[8:11], s2 offen offset:16
+    control.push_back(EncodeMubuf0(0x1f, 16));
+    control.push_back(EncodeMubuf1(11, 2, 10, 2));
+    control[skip_control] = EncodeSopp(0x08, control.size() - skip_control - 1u);
+    control[skip_patch] = EncodeSopp(0x08, control.size() - skip_patch - 1u);
+    AppendEnd(&control);
+    return control;
+  };
+  const auto control = make_control(false, false);
+
+  std::vector<u32> evaluation;
+  AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
+  evaluation.push_back(3 * hs_stride);
+  evaluation.push_back(EncodeVop2(0x25, 2, InlineU32(1), 7));
+  evaluation.push_back(EncodeVop2(0x0b, 2, 255u, 2));
+  evaluation.push_back(patch_stride);
+  evaluation.push_back(EncodeVop2(0x26, 2, 255u, 2));
+  evaluation.push_back(0x8000u);
+  evaluation.push_back(EncodeMubuf0(0x0d, hs_stride + 16)); // CP1 dwords 4-5
+  evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
+  evaluation.push_back(EncodeMubuf0(0x0d, 16)); // patch constant dwords 4-5
+  evaluation.push_back(EncodeMubuf1(12, 2, 2, 4));
+  evaluation.push_back(EncodeVop2(0x03, 10, Vgpr(12), 10)); // v_add_f32 v10, v12, v10
+  evaluation.push_back(EncodeVop2(0x03, 11, Vgpr(13), 11));
+  evaluation.push_back(EncodeExp0(0x0c, 0xf));
+  evaluation.push_back(EncodeExp1(5, 6, 10, 11));
+  AppendEnd(&evaluation);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 3,
+                                  .output_control_points = 3,
+                                  .domain = 1,
+                                  .partitioning = 0,
+                                  .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require(name, "reflected interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
+              tess.patch_base == 0x7f10u && tess.patch_size == 28u,
+          "b128 LS records, selected LS reads, joined and looping HS paths and CP0 patch "
+          "stores must reflect the layout");
+
+  auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
+  auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
+  auto ds = CompileTessellationStage(name, evaluation, ShaderType::TessellationEvaluation, tess);
+  Require(name, "128-bit LS record",
+          ls.addresses[Attribute::LocalOutput] == std::set<u32>{16, 20, 24, 28},
+          "DS_WRITE_B128 must lower to four consecutive LS outputs");
+  Require(name, "predicated patch outputs",
+          hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7f10, 0x7f20, 0x7f24, 0x7f28},
+          "CP0 mul24 addresses under nested EXEC masks must reach patch constants");
+  Require(name, "control point read-back",
+          hs.addresses[Attribute::ControlOutput] == std::set<u32>{hs_stride + 16, hs_stride + 20} &&
+              hs.assembly.find("OpUDiv %uint %uint_96 %uint_80") != std::string::npos,
+          "CP0 must read CP1's outputs by address instead of its own invocation's");
+  Require(name, "patch inputs",
+          ds.addresses[Attribute::PatchInput] == std::set<u32>{0x7f20, 0x7f24} &&
+              ds.addresses[Attribute::EvaluationInput] ==
+                  std::set<u32>{hs_stride + 16, hs_stride + 20},
+          "TES patch constant reads must not alias control point inputs");
+  Require(name, "matching patch interface",
+          HasPatchInterface(hs.assembly, "Output", 2, 5) &&
+              HasPatchInterface(ds.assembly, "Input", 2, 5),
+          "HS and TES patch variables must share their Location and type");
+  Require(name, "integer partitioning", ds.assembly.find("SpacingEqual") != std::string::npos,
+          "integer partitioning must map to equal spacing");
+  std::printf("[host]    %-32s ok\n", name);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  for (const bool carried : {false, true}) {
+    ExpectFatal(carried ? "TessellationLoopCarriedAddress" : "TessellationDivergentJoin", [&] {
+      ShaderTessellationInputInfo info{.input_control_points = 3, .output_control_points = 3};
+      AnalyzeTessellationPrograms(local, make_control(!carried, carried), info);
+    });
+  }
+#endif
 }
 
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationPatchConstants();
 }
 
 void CheckEmbeddedFetchVertexOffset() {
@@ -44130,45 +44315,48 @@ void CheckEmbeddedFetchVertexOffset() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
-/// Checks both successful header binding and fatal rejection of an atomic-field read.
+/// Checks disjoint reads and fatal rejection of overlaps for fixed and indexed writes.
 void CheckScalarBufferWriteBindingsContract(VulkanHarness &vulkan,
                                           const char *executable) {
   vulkan.CheckScalarBufferWriteBindings(false);
+  vulkan.CheckScalarBufferWriteBindings(false, true);
+  for (const char *selector : {"--scalar-buffer-overlap-death", "--scalar-fixed-overlap-death"}) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  constexpr const char *name = "ScalarBufferWriteBindings";
-  char path[MAX_PATH]{};
-  Require(name, "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
-          "GetModuleFileName failed");
-  std::string command = std::string("\"") + path + "\" --scalar-buffer-overlap-death";
-  std::vector<char> mutable_command(command.begin(), command.end());
-  mutable_command.push_back('\0');
-  STARTUPINFOA startup{sizeof(startup)};
-  PROCESS_INFORMATION process{};
-  Require(name, "host",
-          CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
-                         FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                         &process) != 0,
-          "CreateProcess failed");
-  const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
-  if (wait != WAIT_OBJECT_0) {
-    TerminateProcess(process.hProcess, 0x7f);
-    WaitForSingleObject(process.hProcess, 10000);
-  }
-  DWORD exit_code = 0;
-  const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  Require(name, "fatal overlap guard",
-          wait == WAIT_OBJECT_0 && exited && exit_code == 321,
-          "overlapping scalar read did not retain the fatal guard");
+    constexpr const char *name = "ScalarBufferWriteBindings";
+    char path[MAX_PATH]{};
+    Require(name, "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+            "GetModuleFileName failed");
+    std::string command = std::string("\"") + path + "\" " + selector;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    Require(name, "host",
+            CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                           FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                           &process) != 0,
+            "CreateProcess failed");
+    const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+    if (wait != WAIT_OBJECT_0) {
+      TerminateProcess(process.hProcess, 0x7f);
+      WaitForSingleObject(process.hProcess, 10000);
+    }
+    DWORD exit_code = 0;
+    const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    Require(name, "fatal overlap guard",
+            wait == WAIT_OBJECT_0 && exited && exit_code == 321,
+            "overlapping scalar read did not retain the fatal guard");
 #else
-  ExpectFatal("ScalarBufferWriteBindings", [executable] {
-    // Re-exec rather than using Vulkan driver state inherited across fork.
-    ::execlp(executable, executable, "--scalar-buffer-overlap-death",
-             static_cast<char *>(nullptr));
-    std::_Exit(0x7f);
-  });
+    ExpectFatal("ScalarBufferWriteBindings", [executable, selector] {
+      // Re-exec rather than using Vulkan driver state inherited across fork.
+      ::execlp(executable, executable, selector,
+               static_cast<char *>(nullptr));
+      std::_Exit(0x7f);
+    });
 #endif
+  }
 }
 
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
@@ -48846,6 +49034,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scalar-buffer-overlap-death") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckScalarBufferWriteBindings(true);
+    return 0x7f;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-fixed-overlap-death") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarBufferWriteBindings(true, true);
     return 0x7f;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-buffer-overlap-only") == 0) {

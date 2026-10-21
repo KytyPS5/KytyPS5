@@ -209,20 +209,20 @@ int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 }
 
 Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
-    const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
+    const Decoder::Program& decoded, const ShaderVertexInputInfo& input_info,
     uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
-	const uint32_t    vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
-	const uint32_t    instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
+	const uint32_t    vertex_index_reg   = input_info.logical_stage == ShaderType::Local ? 2u : 5u;
+	const uint32_t    instance_index_reg = input_info.logical_stage == ShaderType::Local ? 5u : 8u;
 	Frontend::EmbeddedFetchPlan data;
-	data.loads.reserve(input_info->resources_num);
+	data.loads.reserve(input_info.resources_num);
 	int32_t vertex_offset_candidate   = -1;
 	int32_t instance_offset_candidate = -1;
 	bool    vertex_offset_conflict    = false;
 	bool    instance_offset_conflict  = false;
 
 	const int shift_regs = 8;
-	const int attrib_reg = input_info->fetch_attrib_reg + shift_regs;
-	const int buffer_reg = input_info->fetch_buffer_reg + shift_regs;
+	const int attrib_reg = input_info.fetch_attrib_reg + shift_regs;
+	const int buffer_reg = input_info.fetch_buffer_reg + shift_regs;
 
 	std::array<EmbeddedFetchSgprInfo, 108> sgprs {};
 	std::array<bool, 256>                 vgpr_is_index {};
@@ -488,7 +488,6 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
 		source.calls.push_back({.instruction = i});
 	}
-	EXIT_IF(options.input_info.compute == nullptr);
 	const auto graph = CFG::BuildGraph(source.decoded);
 	Program query;
 	query.stage = options.stage;
@@ -809,9 +808,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	const auto& cfg = *selected_cfg;
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
-	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
+	    options.input_info.vertex->fetch_embedded) {
 		embedded_fetch = DetectEmbeddedVertexFetch(
-		    decoded, options.input_info.vertex, options.user_data_base,
+		    decoded, *options.input_info.vertex, options.user_data_base,
 		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
 			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),

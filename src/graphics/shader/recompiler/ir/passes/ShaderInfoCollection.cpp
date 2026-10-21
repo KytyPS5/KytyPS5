@@ -47,26 +47,17 @@ void ValidateOptions(const Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::TessellationControl:
 		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh:
-			if (input_info.vertex == nullptr) {
-				return Fail("vertex shader has no input metadata");
-			}
 			if (input_info.vertex->resources_num < 0 ||
 			    input_info.vertex->resources_num > ShaderVertexInputInfo::RES_MAX) {
 				return Fail("vertex resource count is out of range");
 			}
 			return;
 		case ShaderType::Pixel:
-			if (input_info.pixel == nullptr) {
-				return Fail("pixel shader has no input metadata");
-			}
 			if (input_info.pixel->input_num > std::size(input_info.pixel->interpolator_settings)) {
 				return Fail("pixel input count is out of range");
 			}
 			return;
 		case ShaderType::Compute:
-			if (input_info.compute == nullptr) {
-				return Fail("compute shader has no input metadata");
-			}
 			if (input_info.compute->thread_ids_num < 0 || input_info.compute->thread_ids_num > 3) {
 				return Fail("compute thread ID count is out of range");
 			}
@@ -191,7 +182,7 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 
 void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
                    ShaderInfo& info, const Inst& inst) {
-	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	const bool alpha_remap = program.stage == ShaderType::Pixel &&
 	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
 	const auto& export_info = program.export_info[inst.Flags<ExportFlags>().index];
 	if (export_info.kind == ExportTargetKind::MrtZ) {

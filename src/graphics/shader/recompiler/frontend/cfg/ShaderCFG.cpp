@@ -470,8 +470,10 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 2u, &entry_count)) {
 		return false;
 	}
+	// Code-table loads are not translated, so a selector that is also the load destination
+	// keeps its scaled index at the branch.
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}

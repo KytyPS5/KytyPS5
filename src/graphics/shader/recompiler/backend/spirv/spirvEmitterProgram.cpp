@@ -233,14 +233,17 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
-	                     inst.GetOpcode() == IR::ValueOpcode::SubgroupUMinU32)) {
-		// These operations combine both emulated halves into one whole-wave result.
+	using Op = IR::ValueOpcode;
+	const auto op = inst.GetOpcode();
+	if (ctx.half != 0 &&
+	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
+	     op == Op::ReadConstBuffer ||
+	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
+		// Whole-wave results and SMEM loads (SGPR operands, no EXEC) are identical in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
-	switch (inst.GetOpcode()) {
+	switch (op) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
@@ -623,6 +626,12 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
+		// Allocate both halves in program order so the SPIR-V is identical across runs.
+		const auto add_spill = [&](const IR::Inst* inst) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				dispatch.spills[half].emplace(inst, state.builder.AllocateId());
+			}
+		};
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
@@ -632,7 +641,7 @@ void EmitProgram(EmitterState& state) {
 					ctx.Fail(inst, "cannot be stored by the dispatcher");
 					break;
 				}
-				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
+				add_spill(&inst);
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -647,7 +656,7 @@ void EmitProgram(EmitterState& state) {
 				return;
 			}
 			if (!dispatch.spills[0].contains(definition)) {
-				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
+				add_spill(definition);
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -669,12 +678,7 @@ void EmitProgram(EmitterState& state) {
 		dispatch.continue_label     = state.builder.AllocateId();
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
-		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
-				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
-			}
-			high.dispatcher_spills = &dispatch.spills[1];
-		}
+		high.dispatcher_spills      = &dispatch.spills[1];
 	}
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);

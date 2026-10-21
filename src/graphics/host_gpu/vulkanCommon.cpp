@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstdlib>
+#include <string>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -132,6 +134,24 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
 	return module;
+}
+
+void PrepareVulkanDriverEnvironment() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// A guest vertex wave runs as one host subgroup (Translate: each vertex subgroup is one NGG
+	// wave). RADV runs vertex shaders in 64-lane waves unless RADV_PERFTEST has gewave32, and
+	// Vulkan cannot ask for a vertex subgroup size (RADV's requiredSubgroupSizeStages has no
+	// vertex stage). In a 64-lane wave a wave32 guest's vertices 32-63 took lanes 32-63 of one
+	// 32-lane wave, so their lane counts and ranks were wrong. A wave64 guest in 32-lane waves is
+	// a vertex group smaller than the wave, which its lane operations handle. Other drivers
+	// ignore the variable.
+	const char* perftest = std::getenv("RADV_PERFTEST");
+	std::string value    = perftest != nullptr ? perftest : "";
+	if (value.find("gewave32") == std::string::npos) {
+		value += value.empty() ? "gewave32" : ",gewave32";
+		setenv("RADV_PERFTEST", value.c_str(), 1);
+	}
+#endif
 }
 
 } // namespace Libs::Graphics

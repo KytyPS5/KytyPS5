@@ -385,7 +385,23 @@ uint32_t EmitFPTrunc64(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitFPFract64(EmitterState& state, uint32_t arg0) {
-	return GlslOrSoft<GLSLstd450Fract>(state, SoftFloat64Op::Fract, arg0);
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::Fract, {arg0});
+	}
+	// x - floor(x), as the guest computes it: a tiny negative x gives 1.0 and a NaN or infinity a
+	// quiet NaN. RADV's Fract keeps the result below 1.0, and it folds x - Floor(x) back into its
+	// Fract, so the floor is made from Trunc here. RADV also returned a signaling NaN unchanged, so
+	// a NaN gives the quiet NaN explicitly.
+	const auto f64       = TypeF64(state);
+	const auto truncated = EmitFPTrunc64(state, arg0);
+	const auto floor     = Select(
+        state, f64, Binary(state, spv::OpFOrdLessThan, TypeBool(state), arg0, truncated),
+        Binary(state, spv::OpFSub, f64, truncated,
+               state.builder.Constant(spv::OpConstant, f64, 0u, 0x3ff00000u)),
+        truncated);
+	const auto fraction = Binary(state, spv::OpFSub, f64, arg0, floor);
+	return Select(state, f64, Unary(state, spv::OpIsNan, TypeBool(state), arg0),
+	              state.builder.Constant(spv::OpConstant, f64, 0u, 0x7ff80000u), fraction);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

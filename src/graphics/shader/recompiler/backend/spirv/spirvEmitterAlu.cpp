@@ -441,8 +441,28 @@ uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
 	if (state.soft_float64) {
 		return EmitSoftFloat64(state, SoftFloat64Op::Recip, {arg0});
 	}
-	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
-	return EmitNative<spv::OpFDiv, IR::Type::F64>(state, one, arg0);
+	// V_RCP_F64 takes denormal inputs and gives denormal results, but a driver's division may not
+	// for a divisor outside [2^-1022, 2^1022] (RADV gave 0 for 1/2^1023 and an approximation for
+	// 1/2^-1023). The divisor is scaled into that range by a power of two, and the result back.
+	const auto f64      = TypeF64(state);
+	const auto constant = [&](uint32_t high) {
+		return state.builder.Constant(spv::OpConstant, f64, 0u, high);
+	};
+	const auto words = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0);
+	const auto high  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, words, 1u);
+	const auto exponent = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+	    state, high, ConstantU32(state, 20), ConstantU32(state, 11));
+	const auto large = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), exponent,
+	                          ConstantU32(state, 0x7fdu));
+	const auto tiny  = Binary(state, spv::OpULessThanEqual, TypeBool(state), exponent,
+	                          ConstantU32(state, 2u));
+	const auto scale = Select(state, f64, large, constant(0x3bf00000u), // 2^-64
+	                          Select(state, f64, tiny, constant(0x43f00000u), // 2^64
+	                                 constant(0x3ff00000u)));
+	const auto quotient = EmitNative<spv::OpFDiv, IR::Type::F64>(
+	    state, constant(0x3ff00000u), EmitNative<spv::OpFMul, IR::Type::F64>(state, arg0, scale));
+	return EmitNative<spv::OpFMul, IR::Type::F64>(state, quotient, scale);
 }
 
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {

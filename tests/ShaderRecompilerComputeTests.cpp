@@ -346,6 +346,8 @@ struct TextureCacheTestAccess {
         .m_image_page_table[static_cast<size_t>(
             address >> TextureCache::ImagePageTable::kPageBits)]
         .push_back(id);
+    // As RegisterImage does: region answers kept before the change are stale.
+    cache.m_image_index_version++;
   }
 
   static bool RemovePageOwner(TextureCache &cache, uint64_t address,
@@ -353,12 +355,15 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
+    cache.m_image_index_version++;
     return owners != nullptr && owners->Erase(id);
   }
 
   static void SetQueryEpoch(TextureCache &cache, uint32_t epoch) {
     std::lock_guard lock(cache.m_lock);
     cache.m_image_query_epoch = epoch;
+    // The next query walks the pages, so it uses the epoch.
+    cache.m_image_index_version++;
   }
 
   static uint32_t QueryEpoch(TextureCache &cache) {
@@ -5769,7 +5774,13 @@ public:
     constexpr uint64_t piece = 0x8000;
     constexpr uint32_t pieces = 6; // 192 KiB through a 64 KiB staging ring
     EnsureRuntimeContext();
+    // Buffers are copies through the staging ring here, also on a host that imports guest
+    // memory (guestMemoryImport.h).
+    auto copy_config = HarnessConfig();
+    copy_config.gpu_guest_memory_import = false;
+    Config::Load(copy_config);
     RenderContext context(m_runtime_context);
+    Config::Load(HarnessConfig());
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -11402,8 +11413,10 @@ public:
     return result;
   }
 
-  void CheckNullTextureDescriptors() {
-    constexpr const char *name = "NullTextureDescriptors";
+  // With `placeholders`, the device's null descriptor is left unused, as on a device without
+  // one (MoltenVK), and null textures are bound as NullTextures' zero-filled placeholders.
+  void CheckNullTextureDescriptors(bool placeholders = false) {
+    const char *name = placeholders ? "NullTexturePlaceholders" : "NullTextureDescriptors";
     constexpr uintptr_t base = 0x0000000204900000ull;
     constexpr uint64_t size = 0x10000;
     std::vector<u32> reader{
@@ -11433,6 +11446,8 @@ public:
            .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
 
     EnsureRuntimeContext();
+    const bool null_descriptor = m_runtime_context.null_descriptor_enabled;
+    if (placeholders) m_runtime_context.null_descriptor_enabled = false;
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
         0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
@@ -11502,6 +11517,7 @@ public:
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
+    m_runtime_context.null_descriptor_enabled = null_descriptor;
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
             "null texture output release failed");
     std::printf("[gpu]     %-32s ok\n", name);
@@ -18162,6 +18178,13 @@ public:
                                                  &pipeline),
                 "vkCreateGraphicsPipelines");
     } else {
+      // As the renderer does (CreatePipelineInternal): the guest wave size where the device can.
+      vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{};
+      const auto wave_size = compiled.program.wave_size;
+      if (wave_size >= m_min_subgroup_size && wave_size <= m_max_subgroup_size) {
+        subgroup_size.requiredSubgroupSize = wave_size;
+        stage.pNext = &subgroup_size;
+      }
       vk::ComputePipelineCreateInfo pipeline_info{};
       pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
       pipeline_info.stage = stage;
@@ -18288,6 +18311,12 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        // The bytes the range's last dword pads, packed as the renderer does (RebindBuffers):
+        // a store ends at the range's exact byte.
+        const auto pad_dword = layout.MemoryPadDword() + index / 16u;
+        if (pad_dword < shader_data.size())
+          shader_data[pad_dword] |= static_cast<u32>((4u - info.range % 4u) % 4u)
+                                    << ((index % 16u) * 2u);
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -21470,6 +21499,9 @@ private:
   HostGpu m_host;
   bool m_dma_buf_import = false;
   bool m_null_descriptor = false;
+  // The compute subgroup sizes a pipeline can require (0: it cannot).
+  u32 m_min_subgroup_size = 0;
+  u32 m_max_subgroup_size = 0;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -21505,6 +21537,8 @@ private:
     m_runtime_context.host = m_host;
     m_runtime_context.dma_buf_import_enabled = m_dma_buf_import;
     m_runtime_context.null_descriptor_enabled = m_null_descriptor;
+    m_runtime_context.min_subgroup_size = m_min_subgroup_size;
+    m_runtime_context.max_subgroup_size = m_max_subgroup_size;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -21538,6 +21572,8 @@ private:
   }
 
   void Init() {
+    // As the emulator does before its instance (main.cpp).
+    PrepareVulkanDriverEnvironment();
     static vk::detail::DynamicLoader loader;
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
@@ -21674,7 +21710,17 @@ private:
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    // As the renderer does: a compute pipeline runs in subgroups of the guest wave size.
+    device_features13.subgroupSizeControl = caps.compute_subgroup_size_control;
     link(device_features13);
+    if (caps.compute_subgroup_size_control) {
+      vk::PhysicalDeviceSubgroupSizeControlProperties size_control{};
+      vk::PhysicalDeviceProperties2 properties{};
+      properties.pNext = &size_control;
+      m_physical_device.getProperties2(&properties);
+      m_min_subgroup_size = size_control.minSubgroupSize;
+      m_max_subgroup_size = size_control.maxSubgroupSize;
+    }
     std::vector<const char *> device_extensions{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
     if (portability_subset) {
       device_extensions.push_back("VK_KHR_portability_subset");
@@ -26597,14 +26643,15 @@ TestCase Vop3Med3I16Captured() {
 TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
+  // The second operands come from user data, so the minimum is not folded away.
   std::vector<u32> code;
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 7);
+  code.push_back(EncodeVop1(0x01, 12, 4));
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 0);
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 64);
+  code.push_back(EncodeVop1(0x01, 12, 5));
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 1);
@@ -26613,6 +26660,10 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   TestCase test;
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
+  test.has_user_data = true;
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[4] = 7;
+  test.user_data[5] = 64;
   test.expected = {0xa1b20007u, 0xa1b2001fu};
   test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -28052,8 +28103,8 @@ TestCase VectorFractF16CapturedAndEdges() {
                   O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  // The fraction is taken in F32 and rounded to F16 by a conversion (EmitPackHalf2x16).
+  test.required_spirv = {" Fract ", "OpFConvert", " UnpackHalf2x16 "};
   return test;
 }
 
@@ -28095,7 +28146,7 @@ TestCase VectorFractF16Modifiers() {
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {{"V_FRACT_F16", 10}};
   test.ir_counts = {{" = FPFract32 ", 10}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", "OpFConvert"};
   return test;
 }
 
@@ -28133,8 +28184,9 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  // The cos runs in F32; only the result is converted to F16.
+  test.required_spirv = {" Fract ", " Cos ", "OpFConvert"};
+  test.forbidden_spirv = {"OpExtInst %half"};
   return test;
 }
 
@@ -28179,8 +28231,9 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  // The sin runs in F32; only the result is converted to F16.
+  test.required_spirv = {" Fract ", " Sin ", "OpFConvert"};
+  test.forbidden_spirv = {"OpExtInst %half"};
   return test;
 }
 
@@ -30065,7 +30118,7 @@ TestCase VectorFractF64CapturedAndEdges() {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F64,
                   O::V_AND_B32, O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F64 v4, v4", cases.size() + 1}};
-  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Fract"};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", " Trunc ", "OpFSub"};
   test.soft_float64 = {"soft_f64_fract"};
   return test;
 }
@@ -30268,7 +30321,7 @@ TestCase VectorFractF64CapturedChainRuntimeExec() {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
-  test.required_spirv = {"OpCapability Float64", "OpFDiv", "Fma", "Fract"};
+  test.required_spirv = {"OpCapability Float64", "OpFDiv", "Fma", " Trunc "};
   test.soft_float64 = {"soft_f64_from_s32", "soft_f64_from_f32", "soft_f64_fma", "soft_f64_fract", "soft_f64_to_f32"};
   test.forbidden_spirv = {"RoundingModeRTE"};
   test.ir_counts = {{"FPRecip32", 1}, {"ConvertF64S32", 1}, {"ConvertF64F32", 3},
@@ -34224,7 +34277,8 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
       8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
-  test.required_spirv = {"PackHalf2x16"};
+  // F16 rounds to nearest: a conversion, not PackHalf2x16 (EmitPackHalf2x16).
+  test.required_spirv = {"OpFConvert"};
   return test;
 }
 
@@ -38668,7 +38722,7 @@ template <bool d16, bool sparse> TestCase ImageLoadPackedUnorm() {
                       : std::vector<u32>{0x3f800000u, green, 0u, 0u};
   test.expected.resize(words);
   test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract", "OpConvertUToF"};
-  if constexpr (d16) test.required_spirv.emplace_back("PackHalf2x16");
+  if constexpr (d16) test.required_spirv.emplace_back("OpFConvert");
   test.forbidden_spirv = {"OpTypeSampler", "OpImageGather"};
   return test;
 }
@@ -39398,7 +39452,7 @@ TestCase ImageD16GatherPacksHalfPairs() {
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.required_spirv = {"OpImageGather", "PackHalf2x16"};
+  test.required_spirv = {"OpImageGather", "OpFConvert"};
   return test;
 }
 
@@ -40834,8 +40888,12 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                                    {Value(&overflow), Value(0x40000000u), Value(&lane)});
   auto &data = block->AppendNewInst(ValueOpcode::IAdd32,
                                   {Value(&lane), Value(0x1000u)});
-  auto &exec = block->AppendNewInst(ValueOpcode::INotEqual32,
-                                  {Value(&lane), Value(4u)});
+  // EXEC leaves out two lanes. With one lane out, Mesa 26.2's ACO clears that lane's bit in EXEC
+  // itself instead of in the branch condition (an s_bitset0 retargeted to EXEC after register
+  // allocation), so the null-child layouts stored from every other lane.
+  auto &not4 = block->AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(4u)});
+  auto &not5 = block->AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(5u)});
+  auto &exec = block->AppendNewInst(ValueOpcode::LogicalAnd, {Value(&not4), Value(&not5)});
   auto &store = block->AppendNewInst(ValueOpcode::StoreBufferU32,
                       {Value(&handle), Value(0u), Value(&offset), Value(0u),
                        Value(&data), Value(&exec)});
@@ -40946,7 +41004,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                                          14u, swapped ? 0u : 1u};
       test.expected = test.initial;
       for (u32 lane = 0; lane < 16u; ++lane) {
-        if (lane == 4u || lane == 6u) continue;
+        if (lane == 4u || lane == 5u || lane == 6u) continue;
         if (layout == Layout::IndexedSingle) {
           test.expected[test.storage_buffer_offsets[0] / 4u + lane] = 0x1000u + lane;
           continue;
@@ -51407,6 +51465,7 @@ int RunSelectedCases(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     vulkan.CheckNullTextureDescriptors();
+    vulkan.CheckNullTextureDescriptors(true);
     CheckCountedRowImageSelector(vulkan);
     CheckPointerImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
@@ -51601,6 +51660,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
+  vulkan.CheckNullTextureDescriptors(true);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckTextureDecodeMemo();

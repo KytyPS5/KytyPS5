@@ -61,6 +61,9 @@ struct HostCapabilities {
 	// The subgroup operations those stages have: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedOperations, as VkSubgroupFeatureFlagBits values.
 	uint32_t subgroup_supported_operations = 0;
+	// Samplers one shader stage can bind: VkPhysicalDeviceLimits::maxPerStageDescriptorSamplers.
+	// 16 is the least a device may report, and what MoltenVK reports (Metal's limit).
+	uint32_t max_stage_samplers = 16;
 
 	// A host with every capability. For tests and offline compilation only: the renderer always
 	// passes what its device enabled.
@@ -90,6 +93,7 @@ struct HostCapabilities {
 		all.draw_indirect_first_instance  = true;
 		all.subgroup_supported_stages     = ~0u;
 		all.subgroup_supported_operations = ~0u;
+		all.max_stage_samplers            = ~0u;
 		return all;
 	}
 

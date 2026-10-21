@@ -25,12 +25,8 @@ namespace Libs::Controller {
 
 LIB_NAME("Pad", "Pad");
 
-constexpr int PAD_ERROR_INVALID_ARG     = -2137915391; /* 0x80920001 */
-constexpr int PAD_ERROR_INVALID_HANDLE  = -2137915389; /* 0x80920003 */
-constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
-constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
-constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
-constexpr int PAD_HANDLE                = 1;
+constexpr int PAD_HANDLE = 1;
+static_assert(PAD_HANDLE + Config::MAX_PLAYERS <= PAD_HANDLE_VR_LEFT);
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
@@ -215,9 +211,11 @@ static GameController* PlayerForDevice(int id) {
 }
 
 static GameController* PlayerForHandle(int handle) {
-	return handle >= PAD_HANDLE && handle < PAD_HANDLE + Config::MAX_PLAYERS
-	           ? g_players[handle - PAD_HANDLE].get()
-	           : nullptr;
+	if (handle >= PAD_HANDLE && handle < PAD_HANDLE + Config::MAX_PLAYERS) {
+		return g_players[handle - PAD_HANDLE].get();
+	}
+	// The Sense controller ports belong to the initial user.
+	return PadVrHand(handle) >= 0 ? g_players[0].get() : nullptr;
 }
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
@@ -1204,8 +1202,16 @@ int PadCheckHandle(int handle) {
 	if (g_players[0] == nullptr) {
 		return PAD_ERROR_NOT_INITIALIZED;
 	}
+	if (PadVrHand(handle) >= 0) {
+		return PadVrCheckHandle(handle);
+	}
 	auto* player = PlayerForHandle(handle);
 	return player != nullptr ? player->CheckPortHandle(handle) : PAD_ERROR_INVALID_HANDLE;
+}
+
+// Handle 0 is never valid, so this only reports whether scePadInit has run.
+bool PadInitialized() {
+	return g_players[0] != nullptr && g_players[0]->CheckPortHandle(0) != PAD_ERROR_NOT_INITIALIZED;
 }
 
 int KYTY_SYSV_ABI PadInit() {
@@ -1225,6 +1231,9 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
+	if (const int hand = PadVrPortHand(type); hand >= 0) {
+		return PadVrPort(user_id, hand, index, true);
+	}
 	const int player = Config::GetPlayerFromUserId(user_id);
 	return player >= 0 ? g_players[player]->OpenPort(user_id, type, index) : PAD_ERROR_INVALID_ARG;
 }
@@ -1237,6 +1246,9 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 	     "\t index   = %d\n",
 	     user_id, type, index);
 
+	if (const int hand = PadVrPortHand(type); hand >= 0) {
+		return PadVrPort(user_id, hand, index, false);
+	}
 	const int player = Config::GetPlayerFromUserId(user_id);
 	return player >= 0 ? g_players[player]->GetPortHandle(user_id, type, index)
 	                   : PAD_ERROR_NO_HANDLE;
@@ -1245,6 +1257,9 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 int KYTY_SYSV_ABI PadClose(int handle) {
 	PRINT_NAME();
 	LOGF("\t handle = %d\n", handle);
+	if (PadVrHand(handle) >= 0) {
+		return PadVrClose(handle);
+	}
 	auto* player = PlayerForHandle(handle);
 	if (player == nullptr) {
 		return PAD_ERROR_INVALID_HANDLE;

@@ -244,8 +244,10 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 }
 
-static QString BoolArg(bool value) {
-	return value ? QStringLiteral("true") : QStringLiteral("false");
+static void AddFlag(QStringList& args, bool enabled, const char* name) {
+	if (enabled) {
+		args << name;
+	}
 }
 
 static QStringList CreateEmulatorArgs(const Configuration& info) {
@@ -273,54 +275,37 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
-	if (info.fullscreen_enabled) {
-		args << "--fullscreen";
-	}
-	if (info.hdr_enabled) {
-		args << "--hdr";
-	}
-	if (info.hide_cursor_enabled) {
-		args << "--hide-cursor";
-	}
-	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
-	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
-	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
+	AddFlag(args, info.hdr_enabled, "--hdr");
+	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
+	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
+	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
+	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
-	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
-	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
-	args << "--network-connected" << BoolArg(info.network_connected);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
+	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
+	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
+	AddFlag(args, info.network_connected, "--network-connected");
+	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
-	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
-	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
+	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
+	AddFlag(args, info.shader_validation_enabled, "--shader-validation");
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
-	args << "--command-buffer-dump" << BoolArg(info.command_buffer_dump_enabled);
+	AddFlag(args, info.command_buffer_dump_enabled, "--command-buffer-dump");
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
-	if (info.profiler_enabled) {
-		args << "--profile";
-	}
-	args << "--spirv-debug-printf" << "false";
-	if (info.amd_cpu_enabled) {
-		args << "--amd-cpu";
-	}
+	AddFlag(args, info.profiler_enabled, "--profile");
+	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 #if defined(_WIN32)
-	if (info.red_zone_protection_enabled) {
-		args << "--redzone";
-	}
+	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
 	}
-	if (info.renderdoc_enabled) {
-		args << "--rd";
-	}
+	AddFlag(args, info.renderdoc_enabled, "--rd");
 
 	QString game = info.basedir;
 	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {

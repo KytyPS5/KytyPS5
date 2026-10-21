@@ -14,6 +14,7 @@
 namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
+using Libs::Graphics::ShaderComputeInputInfo;
 using Libs::Graphics::ShaderType;
 
 void Check(bool condition, const char *message) {
@@ -37,6 +38,7 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
 
 struct Fixture {
   Program program;
+  ShaderComputeInputInfo compute{};
 
   explicit Fixture(uint32_t block_count = 1) {
     program.stage = ShaderType::Compute;
@@ -73,7 +75,7 @@ struct Fixture {
     return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() { TrackResources(program, {}, {}); }
+  void Plan() { TrackResources(program, {}, {}, {.compute = &compute}); }
 };
 
 struct TestMemory {
@@ -158,7 +160,7 @@ void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
   RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u), raw_memory);
-  CheckFatal([&] { TrackResources(raw.program, {}, {}); },
+  CheckFatal([&] { raw.Plan(); },
              "incompatible scalar memory metadata",
              "raw scalar load accepted descriptor-buffer metadata");
 
@@ -169,7 +171,7 @@ void TestScalarMemoryDomainMismatchFails() {
                   {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
   buffer.EmitMemory(ValueOpcode::ReadConstBuffer, {resource, Value(0u)},
                     buffer_memory);
-  CheckFatal([&] { TrackResources(buffer.program, {}, {}); },
+  CheckFatal([&] { buffer.Plan(); },
              "incompatible scalar memory metadata",
              "descriptor scalar load accepted raw-address metadata");
 }

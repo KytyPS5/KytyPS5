@@ -195,6 +195,9 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
+    {0xc8u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare | ImageSampleFlagAdjust},
+    {0xd8u, Opcode::IMAGE_GATHER4_C_O,
+     ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust},
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {

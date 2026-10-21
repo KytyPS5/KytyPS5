@@ -9,6 +9,7 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
@@ -71,35 +72,30 @@ static void PrintUsage() {
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
-	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
-	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
-	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
+	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
+	::printf("  --network-connected                  Use the host local network.\n");
+	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
-	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
+	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
-	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
+	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
-	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
+	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
-	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
-	::printf(
-	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
-	::printf(
-	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
-	::printf(
-	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
+	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
+	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
+	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
-	::printf("  --perf-overlay <true|false>           Show the performance panel (F2 or Cmd+P).\n");
+	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
-	::printf(
-	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
-	    "                                      Default: false.\n");
+	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -115,22 +111,6 @@ static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
 	index++;
 	out = argv[index];
 	return true;
-}
-
-static bool ParseBool(const std::string& value, bool& out) {
-	if (Common::EqualNoCase(value, "true") || value == "1" || Common::EqualNoCase(value, "yes") ||
-	    Common::EqualNoCase(value, "on")) {
-		out = true;
-		return true;
-	}
-
-	if (Common::EqualNoCase(value, "false") || value == "0" || Common::EqualNoCase(value, "no") ||
-	    Common::EqualNoCase(value, "off")) {
-		out = false;
-		return true;
-	}
-
-	return false;
 }
 
 template <typename E>
@@ -200,6 +180,42 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 	return true;
 }
 
+using Config::ConfigOptions;
+
+struct Flag {
+	std::string_view name;
+	bool ConfigOptions::* field;
+	bool                  value = true;
+};
+
+static constexpr Flag FLAGS[] = {
+    {"--rd", &ConfigOptions::renderdoc_enabled},
+    {"--fullscreen", &ConfigOptions::fullscreen_enabled},
+    {"--hdr", &ConfigOptions::hdr_enabled},
+    {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
+    {"--no-splash", &ConfigOptions::splash_enabled, false},
+    {"--vr", &ConfigOptions::vr_enabled},
+    {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
+    {"--network-connected", &ConfigOptions::network_connected},
+    {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
+    {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
+    {"--shader-validation", &ConfigOptions::shader_validation_enabled},
+    {"--tessellation", &ConfigOptions::tessellation_enabled},
+    {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
+    {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
+    {"--profile", &ConfigOptions::profiler_enabled},
+    {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
+    {"--readback-linear-images", &ConfigOptions::readback_linear_images},
+    {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
+    {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
+    {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
+    {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
+    {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    {"--redzone", &ConfigOptions::red_zone_protection_enabled},
+#endif
+};
+
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
 
@@ -212,62 +228,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
-		if (arg == "--rd") {
-			options.config.renderdoc_enabled = true;
+		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
+			options.config.*flag->field = flag->value;
 			continue;
 		}
-
-		if (arg == "--fullscreen") {
-			options.config.fullscreen_enabled = true;
-			continue;
-		}
-
-		if (arg == "--hdr") {
-			options.config.hdr_enabled = true;
-			continue;
-		}
-
-		if (arg == "--hide-cursor") {
-			options.config.hide_cursor_enabled = true;
-			continue;
-		}
-
-		if (arg == "--no-splash") {
-			options.config.splash_enabled = false;
-			continue;
-		}
-
-		if (arg == "--vr") {
-			options.config.vr_enabled = true;
-			continue;
-		}
-
-		if (arg == "--amd-cpu") {
-			options.config.amd_cpu_enabled = true;
-			continue;
-		}
-
-		if (arg == "--playgo-hack") {
-			options.config.playgo_hack_enabled = true;
-			continue;
-		}
-
-		if (arg == "--tessellation") {
-			options.config.tessellation_enabled = true;
-			continue;
-		}
-
-		if (arg == "--profile") {
-			options.config.profiler_enabled = true;
-			continue;
-		}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (arg == "--redzone") {
-			options.config.red_zone_protection_enabled = true;
-			continue;
-		}
-#endif
 
 		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
@@ -411,26 +375,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
-		} else if (arg == "--network-connected") {
-			if (!ParseBool(value, options.config.network_connected)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--vulkan-validation") {
-			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--gpu-assisted-validation") {
-			if (!ParseBool(value, options.config.gpu_assisted_validation_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--shader-validation") {
-			if (!ParseBool(value, options.config.shader_validation_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
 		} else if (arg == "--shader-optimization-type") {
 			if (!ParseEnum(value, options.config.shader_optimization_type)) {
 				::printf("invalid shader optimization type: %s\n", value.c_str());
@@ -443,18 +387,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-log-folder") {
 			options.config.shader_log_folder = Common::PathFromUtf8(value);
-		} else if (arg == "--command-buffer-dump") {
-			if (!ParseBool(value, options.config.command_buffer_dump_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
-		} else if (arg == "--graphics-debug-dump") {
-			if (!ParseBool(value, options.config.graphics_debug_dump_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
 		} else if (arg == "--printf-direction") {
 			if (!ParseEnum(value, options.config.printf_direction)) {
 				::printf("invalid printf direction: %s\n", value.c_str());
@@ -462,36 +396,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
-		} else if (arg == "--spirv-debug-printf") {
-			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--readback-linear-images") {
-			if (!ParseBool(value, options.config.readback_linear_images)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--sync-raw-image-buffers") {
-			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--trophy-notifications") {
-			if (!ParseBool(value, options.config.trophy_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--skip-notice-screen") {
-			if (!ParseBool(value, options.config.skip_notice_screen)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--perf-overlay") {
-			if (!ParseBool(value, options.config.perf_overlay_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

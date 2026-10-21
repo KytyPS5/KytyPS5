@@ -47,6 +47,7 @@ struct Fixture {
 		} else {
 			rack.option.custom_sampler.max_waveform_blocks = capacity;
 			rack.option.custom_sampler.custom_rack_option.state_size = sizeof(Ngs2CustomSamplerVoiceState);
+			rack.option.custom_sampler.custom_rack_option.num_buffers = 1;
 		}
 	}
 
@@ -703,6 +704,53 @@ void TestSubmixerSetupAndRouting() {
 	}
 }
 
+uint32_t g_side_chain_flags = 0;
+
+void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
+	Check(context->num_channels == 1 && context->grain_samples == 1 &&
+	          context->user_data[0] == 7,
+	      "user FX context did not describe the custom voice");
+	g_side_chain_flags = context->flags;
+	context->channels[0][0] *= context->channels[1][0];
+}
+
+void TestCustomSideChainUserFx() {
+	Fixture          main(48000), side(48000);
+	Ngs2RackInternal custom_rack {};
+	auto&            custom = custom_rack.option.custom_submixer.custom_rack_option;
+	custom_rack.ngs         = &main.system;
+	custom_rack.type        = Ngs2RackType::CustomSubmixer;
+	custom.num_buffers      = 2;
+	custom.num_modules      = 1;
+	custom.module[0]        = {nullptr, 0x19, 0, 1, 0};
+	Ngs2VoiceInternal voice;
+	voice.rack = &custom_rack;
+	voice.ports.resize(1);
+	voice.modules.resize(1);
+	struct {
+		Ngs2VoiceParamHeader header {24, 0, 0x40020000};
+		uint32_t             inputs = 1, outputs = 1, flags = 0, reserved = 0;
+	} setup;
+	struct {
+		Ngs2VoiceParamHeader header;
+		void                 KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*);
+		uintptr_t            user_data[3];
+	} fx {{40, 0, 0x40001900}, MultiplyBySideChain, {7, 0, 0}};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK &&
+	          Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &fx.header) == OK,
+	      "custom submixer user FX setup failed");
+	voice.state = Ngs2VoicePlayState::Playing;
+	main.voice.ports.push_back({&voice, 0, 1.0f, -1});
+	side.voice.ports.push_back({&voice, 1, 1.0f, -1});
+	const int16_t main_pcm = 8192, side_pcm = 16384;
+	main.Queue(&main_pcm, 1, 0);
+	side.Queue(&side_pcm, 1, 0);
+	Ngs2RenderVoice(voice, {&main.voice, &side.voice, &voice}, 1);
+	Check(voice.has_samples && voice.samples[0] == 0.125f && voice.samples[1] == 0.5f &&
+	          g_side_chain_flags == 1,
+	      "user FX did not receive the side-chain buffer after the source channels");
+}
+
 void TestPcm16RenderOutput() {
 	Ngs2Internal system;
 	system.option                   = Ngs2DefaultSystemOption();
@@ -1145,9 +1193,9 @@ void KYTY_SYSV_ABI RecordLoopCallback(const Ngs2VoiceCallbackInfo* info) {
 	}
 }
 
-void TestLoopCallbacksAndExit() {
+void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	const int16_t pcm[] = {8192, 16384, 24576};
-	Fixture       f(48000);
+	Fixture       f(48000, 1, type);
 	LoopCallbacks log;
 	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
 	f.voice.callback_data  = reinterpret_cast<uintptr_t>(&log);
@@ -1158,7 +1206,7 @@ void TestLoopCallbacksAndExit() {
 	      "loop and completion callbacks lost the completed repeat count");
 	Check(f.voice.blocks.empty(), "finite loop did not complete");
 
-	Fixture active(48000);
+	Fixture active(48000, 1, type);
 	log.events.clear();
 	log.pause                   = true;
 	active.voice.callback       = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
@@ -1170,7 +1218,8 @@ void TestLoopCallbacksAndExit() {
 	Check(log.events.size() == 1 && active.voice.decoded_samples == 2 &&
 	          active.voice.blocks.front().cursor == 0 && active.voice.samples[2] == 0,
 	      "loop callback pause consumed another iteration");
-	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0, 0x10000004};
+	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0,
+	                                type == Ngs2RackType::Sampler ? 0x10000004u : 0x40010004u};
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&active.voice), &exit_loop);
 	active.voice.SetEvent(32);
 	active.Render(5);
@@ -1178,7 +1227,7 @@ void TestLoopCallbacksAndExit() {
 	          active.voice.blocks.empty() && log.events.size() == 1,
 	      "exiting infinite loop lost its final iteration or ignored callback flags");
 
-	Fixture pending(48000);
+	Fixture pending(48000, 1, type);
 	pending.Queue(pcm, 1, 1);
 	pending.Queue(pcm + 1, 1, 1, UINT32_MAX);
 	pending.Queue(pcm + 2, 1, 0);
@@ -1608,13 +1657,15 @@ int main() {
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
+	TestCustomSideChainUserFx();
 	TestWaveformBlockGeometry();
 	TestAtrac9ResampleAfterStarvation();
 	TestAtrac9ResampleAcrossFrames();
 	TestResamplingPhaseAfterStarvation();
 	TestSamplerReuseResetsRouting();
 	TestDeferredSamplerSetup();
-	TestLoopCallbacksAndExit();
+	TestLoopCallbacksAndExit(Ngs2RackType::Sampler);
+	TestLoopCallbacksAndExit(Ngs2RackType::CustomSampler);
 	TestAtrac9Looping();
 	TestAtrac9WaveformJoining();
 	TestWaveformReadAddress();

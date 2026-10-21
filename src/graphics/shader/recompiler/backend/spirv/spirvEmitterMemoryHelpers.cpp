@@ -157,9 +157,25 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 }
 
+// Stages without a workgroup emulate LDS with one private array per invocation. A GPU keeps
+// hundreds of thousands of invocations in flight, so this size multiplies into driver local memory:
+// a fixed 8192 dwords (32 KB) asked for gigabytes and killed the device (a write fault in the
+// first heavy pixel shader that touched LDS). A pixel shader can only address the LDS that
+// EXTRA_LDS_SIZE reserves, a vertex shader the LDS_SIZE of its GS stage; hardware reads zero and
+// drops writes beyond it, as the bounds checks do.
+constexpr uint32_t FUNCTION_LDS_DWORDS = 1024u;
+
 uint32_t LdsDwordCount(const EmitterState& state) {
-	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	if (const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
+		return workgroup->lds_size_dwords;
+	}
+	if (state.program.stage == ShaderType::Pixel) {
+		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
+	}
+	if (state.program.stage == ShaderType::Vertex) {
+		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
+	}
+	return FUNCTION_LDS_DWORDS;
 }
 
 void EnsureLdsStorage(EmitterState& state) {

@@ -780,10 +780,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			}
 		}
 	}
-	if (context.GetClipControl().clip_disable) {
+	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
+	const auto& clip_control = context.GetClipControl();
+	if (clip_control.clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
+		auto&       clip     = last_stage.clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
 		clip.offset[0]       = viewport.xoffset;
@@ -793,9 +795,16 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+	} else if (clip_control.user_clip_planes != 0) {
+		// CLIP_DISABLE also disables user planes. How they combine with shader clip and cull
+		// distances is unverified; draw push constants only reach VS/mesh and PS, and the
+		// generated RECTLIST stages do not forward clip distances.
+		EXIT_NOT_IMPLEMENTED((last_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 || tess_active ||
+		                     Prospero::IsRectList(user_config.GetPrimType()));
+		last_stage.user_clip_planes = clip_control.user_clip_planes;
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, object_primitive_id);
+	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);

@@ -52,6 +52,7 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
 struct Fixture {
   Program program;
   Block *block = nullptr;
+  ShaderComputeInputInfo compute_info{};
 
   explicit Fixture(ShaderType stage = ShaderType::Compute) {
     program.stage = stage;
@@ -131,7 +132,9 @@ struct Fixture {
                  Value(0u), Value(0u), Value(0u)});
   }
 
-  void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input = {}) {
+  void PlanAndTrack() { PlanAndTrack({.compute = &compute_info}); }
+
+  void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input) {
     for (size_t index = 0; index < program.blocks.size(); ++index) {
       const auto condition = program.blocks[index]->condition;
       if (!condition.IsEmpty())
@@ -3416,6 +3419,104 @@ void TestIndexedMaterialImageKeys() {
               snapshot.images.size() == 6u,
           "native zero/OOB indexed load read its unavailable payload");
   }
+}
+
+void TestPointerTableIndexedMaterialKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // A waterfall scalarizes one lane's indexed x3 key; matching lanes sample the
+  // descriptor at the user-data pointer plus key * 32.
+  Fixture f;
+  auto *entry = f.block, *body = f.AddBlock(), *done = f.AddBlock();
+  entry->AddBranch(body);
+  entry->AddBranch(done);
+  body->AddBranch(done);
+  const auto lane = f.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto active = f.Emit(ValueOpcode::INotEqual32, {lane, Value(UINT32_MAX)});
+  const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+  MemoryInfo request;
+  request.kind = ResourceKind::Buffer;
+  request.idxen = true;
+  const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x3,
+      {material, lane, Value(0u), Value(0u), active}, f.AddMemory(request, 0x28));
+  const auto selected = f.Emit(ValueOpcode::SelectU32,
+      {active, f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)}), Value(0u)});
+  const auto key = f.Emit(ValueOpcode::ReadLane, {selected, f.UserData(6)});
+  const auto guard = f.Emit(ValueOpcode::LogicalAnd,
+      {active, f.Emit(ValueOpcode::IEqual32, {key, selected})});
+  entry->condition = f.Emit(ValueOpcode::ConditionRef, {guard}, CFG::BranchCondition::ExecNonZero);
+  entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                       .true_block = body, .false_block = done};
+  body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+  done->terminator.kind = CFG::TerminatorKind::Return;
+  f.block = body;
+  const auto table = f.Address(f.UserData(4), f.UserData(5));
+  const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = word * 4u;
+    words[word] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                         f.AddMemory(scalar, 0x60));
+  }
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  f.Emit(ValueOpcode::ImageSampleRaw,
+      {f.Image(words, 0x6c), f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
+       f.ImageAddress(), guard},
+      f.AddMemory(sample, 0x6c));
+  f.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(f.program);
+  Check(plan.info.images.size() == 1u, "pointer-table waterfall image was not tracked");
+  const auto &indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.selector && indirect.selector->stride == 0u && indirect.selector->offset == 8u &&
+            !indirect.selector->global && !indirect.table_scalar && indirect.table_stride == 32u &&
+            plan.descriptor_sources[indirect.table_source].dword_count == 2u,
+        "pointer-table waterfall lost its indexed x3 material selector");
+
+  constexpr uint32_t base = 0x1000u, heap = 0x2000u, records = 6u;
+  struct Memory {
+    std::vector<uint32_t> words = std::vector<uint32_t>((heap - base + 16u * 32u) / 4u);
+    uint32_t descriptors = 0;
+  } memory;
+  const auto put = [&](uint32_t key) {
+    auto *texture = memory.words.data() + (heap - base + key * 32u) / 4u;
+    texture[0] = 0x100u + key;
+    texture[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k16UNorm) << 20u;
+    texture[3] = (9u << 28u) | Libs::Graphics::DstSel(4, 5, 6, 7);
+  };
+  for (const uint32_t key : {0u, 5u, 9u}) put(key);
+  for (uint32_t row = 0; row < records; ++row)
+    memory.words[(row * 12u + 8u) / 4u] = row % 2u == 0u ? 9u : 5u;
+  const std::array<uint32_t, 7> user_data{base, 12u << 16u, records, 0x5204u, heap, 0u, 0u};
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &m = *static_cast<Memory *>(data);
+    if (address < base || address - base + words.size_bytes() > m.words.size() * 4u) return false;
+    if (address >= heap) {
+      const auto key = (address - heap) / 32u;
+      if (words.size() != 8u || (key != 0u && key != 5u && key != 9u)) return false;
+      ++m.descriptors;
+    }
+    std::copy_n(m.words.begin() + (address - base) / 4u, words.size(), words.begin());
+    return true;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = read};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
+            snapshot.images.size() == 3u,
+        "pointer-table selector did not read exactly the zero and material-key descriptors");
+  Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 8u, 64u}) !=
+            snapshot.specialization_reads.end(),
+        "pointer-table selector rows escaped writable-alias tracking");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.images[0].dwords[0] == 0x100u && specialization.images[0].indirect_search_iterations == 2u &&
+            snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 5u &&
+            snapshot.flattened_srt[mapping + 5u] == 9u,
+        "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
 }
 
 void TestImageDescriptorFields() {
@@ -8698,6 +8799,7 @@ int main() {
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
+    Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);

@@ -987,30 +987,6 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	    options.stage != ShaderType::Local) {
 		EXIT("embedded fetch requires a vertex or local shader");
 	}
-	switch (options.stage) {
-		case ShaderType::Vertex:
-		case ShaderType::Local:
-		case ShaderType::TessellationControl:
-		case ShaderType::TessellationEvaluation:
-		case ShaderType::Mesh:
-			if (options.input_info.vertex == nullptr) {
-				EXIT("vertex shader translation has no vertex input metadata");
-			}
-			return;
-		case ShaderType::Pixel:
-			if (options.input_info.pixel == nullptr) {
-				EXIT("pixel shader translation has no pixel input metadata");
-			}
-			return;
-		case ShaderType::Compute:
-			if (options.input_info.compute == nullptr) {
-				EXIT("compute shader translation has no compute input metadata");
-			}
-			return;
-		default:
-			EXIT("shader translation has unsupported stage %u",
-			     static_cast<uint32_t>(options.stage));
-	}
 }
 
 } // namespace
@@ -1044,7 +1020,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		case ShaderType::Compute:
 			result.scratch_dwords = options.input_info.compute->scratch_size_dwords;
 			break;
-		default: break; // ValidateTranslateOptions rejects unsupported stages.
+		default:
+			EXIT("shader translation has unsupported stage %u",
+			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
 	result.cfg_failure_kind    = cfg.failure_kind;

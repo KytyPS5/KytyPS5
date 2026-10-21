@@ -244,7 +244,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0) {
+	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -600,14 +600,24 @@ void DefineOutputs(EmitterState& state) {
 			cull_distance_count = std::max(cull_distance_count, output.index + 1);
 		}
 	}
+	const bool position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		return output.kind == IR::StageOutputKind::Position;
+	});
+	if (position && state.input_info.vertex->user_clip_planes != 0) {
+		// PipelineCache rejects UCP_ENA with shader clip or cull distances.
+		EXIT_IF(clip_distance_count + cull_distance_count != 0);
+		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
+		for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
+			state.outputs.push_back(
+			    {{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0, "gl_ClipDistance"}});
+		}
+	}
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u && position) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,

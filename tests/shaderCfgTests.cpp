@@ -6214,6 +6214,10 @@ void TestNewShaderRecompilerImageGatherVariants() {
       EncodeMimg1(76, 0, 1, 20), // image_gather4_c_o
       EncodeMimg0(0x5f, 0x1),
       EncodeMimg1(80, 0, 1, 24), // image_gather4_c_lz_o
+      EncodeMimg0(0xc8, 0x1),
+      EncodeMimg1(84, 0, 1, 28), // image_gather4_c_a
+      EncodeMimg0(0xd8, 0x1),
+      EncodeMimg1(88, 0, 1, 32), // image_gather4_c_o_a
       0xbf810000u,
   };
 
@@ -6249,6 +6253,10 @@ void TestNewShaderRecompilerImageGatherVariants() {
   Check((result.decoded_dump.find("sample_flags=compare|offset|level_zero addr_components=4") != std::string::npos),
         "IMAGE_GATHER4_C_LZ_O did not expose compare+offset+level-zero sample "
         "metadata");
+  Check((result.decoded_dump.find("sample_flags=compare|adjust addr_components=3") != std::string::npos),
+        "PS5 IMAGE_GATHER4_C_A did not expose compare+adjust sample metadata");
+  Check((result.decoded_dump.find("sample_flags=compare|offset|adjust addr_components=4") != std::string::npos),
+        "PS5 IMAGE_GATHER4_C_O_A did not expose compare+offset+adjust sample metadata");
   Check((result.ir_dump.find("ImageGather4 v60") != std::string::npos),
         "IMAGE_GATHER4_LZ did not lower to shared IR ImageGather4");
   Check((result.ir_dump.find("ImageGather4 v64") != std::string::npos),
@@ -6261,6 +6269,10 @@ void TestNewShaderRecompilerImageGatherVariants() {
         "IMAGE_GATHER4_C_O did not lower to shared IR ImageGather4");
   Check((result.ir_dump.find("ImageGather4 v80") != std::string::npos),
         "IMAGE_GATHER4_C_LZ_O did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v84") != std::string::npos),
+        "IMAGE_GATHER4_C_A did not lower to shared IR ImageGather4");
+  Check((result.ir_dump.find("ImageGather4 v88") != std::string::npos),
+        "IMAGE_GATHER4_C_O_A did not lower to shared IR ImageGather4");
   Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
         "IMAGE_GATHER4 did not preserve four-component result metadata");
   Check((result.ir_dump.find("image_flags=0x30") != std::string::npos),
@@ -6273,6 +6285,10 @@ void TestNewShaderRecompilerImageGatherVariants() {
         "IMAGE_GATHER4_C_O flags did not survive into IR memory metadata");
   Check((result.ir_dump.find("image_flags=0x38") != std::string::npos),
         "IMAGE_GATHER4_C_LZ_O flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x408") != std::string::npos),
+        "IMAGE_GATHER4_C_A flags did not survive into IR memory metadata");
+  Check((result.ir_dump.find("image_flags=0x418") != std::string::npos),
+        "IMAGE_GATHER4_C_O_A flags did not survive into IR memory metadata");
   Check(SpirvContainsCapability(result.spirv, 25),
         "SPIR-V binary does not request ImageGatherExtended");
   Check(SpirvContainsOpcode(result.spirv, 96),
@@ -11740,7 +11756,7 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   Check((*jump)->terminator.cases.size() == 2,
         "S_SETPC_B64 jump table did not retain selector mapping");
   Check(
-      (result.ir_dump.find("SLoadDword") == std::string::npos),
+      (result.ir_dump.find("LoadAddressU32") == std::string::npos),
       "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "dispatcher SPIR-V lacks OpSwitch");
@@ -11801,7 +11817,9 @@ void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
         "unreachable S_SETPC metadata suppressed a reachable scalar load component");
 }
 
-void TestNewShaderRecompilerSetpcDwordJumpTable() {
+// offset_sgpr 106 aliases the vcc_lo selector, like PPSA34015's
+// s_load_dword s17, s[22:23], s17.
+void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),             // skip one unreachable block
       EncodeSMovB32(100, 129),         // unreachable
@@ -11811,20 +11829,20 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
       EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
       0x00000034u,
       EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
-      EncodeSmem0(0x00, 6, 2),
-      (106u << 25u) | 4u,          // s_load_dword s6, s[4:5], vcc_lo offset:4
-      EncodeSopp(0x0c, 0),         // s_waitcnt 0
-      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
-      EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
-      EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
-      EncodeSMovB32(1, 129),       // case 0
+      EncodeSmem0(0x00, offset_sgpr, 2),
+      (106u << 25u) | 4u,  // s_load_dword offset, s[4:5], vcc_lo offset:4
+      EncodeSopp(0x0c, 0), // s_waitcnt 0
+      EncodeSop2(0x01, 4, 4, offset_sgpr), // s_sub_u32 s4, s4, offset
+      EncodeSop2(0x05, 5, 5, 128),         // s_subb_u32 s5, s5, 0
+      EncodeSop1(0x20, 0, 4),              // s_setpc_b64 s[4:5]
+      EncodeSMovB32(1, 129),               // case 0
       EncodeSopp(0x02, 1),
       EncodeSMovB32(2, 129), // case 1
       EncodeSopp(0x01, 0),
       0u,
       0x00000010u,
       0x00000008u,
-      0x00000010u, // table at pc 0x44, targets relative backward from pc 0x40
+      0x00000010u, // table at pc 0x4c, targets relative backward from pc 0x48
   };
 
   auto options = MakeCompileOptions(ShaderType::Compute);
@@ -11850,7 +11868,7 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
                 result.program.blocks,
                 [](const auto *block) { return block->start_pc == 0x04u; }),
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
-  Check((result.ir_dump.find("SLoadDword") == std::string::npos),
+  Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
@@ -14343,7 +14361,7 @@ void BuildTypedPlan(const uint32_t *code, uint32_t words,
     ShaderRecompiler::IR::RemoveIdentities(ir);
     ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   }
-  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg);
+  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg, options.input_info);
   ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
 }
 
@@ -16182,10 +16200,6 @@ void TestCompilerStageInputOwnership() {
   CheckSpirvBinaryValidates(compiled.spirv);
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  options.stage = ShaderType::Vertex;
-  options.input_info.vertex = nullptr;
-  ExpectFatal([&] { (void)TranslateProgram(shader, options); },
-              "missing stage metadata bypassed translation validation");
   const uint32_t auxiliary_position[] = {
       EncodeExp0(0x0d, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)};
   for (const auto stage : {ShaderType::Pixel, ShaderType::Compute}) {
@@ -16768,7 +16782,8 @@ int main() {
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTable(6);
+  TestNewShaderRecompilerSetpcDwordJumpTable(106);
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();

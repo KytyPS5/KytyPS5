@@ -166,6 +166,8 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 	inst.formatted   = info->formatted;
 }
 
+} // namespace
+
 bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::DS_WRITE_B8:
@@ -183,6 +185,8 @@ bool IsDsWriteOpcode(Opcode opcode) {
 		default: return false;
 	}
 }
+
+namespace {
 
 bool IsDsAtomicOpcode(Opcode opcode) {
 	switch (opcode) {

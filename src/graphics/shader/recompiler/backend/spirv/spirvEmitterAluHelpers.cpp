@@ -17,16 +17,9 @@ uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t va
 }
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
-	F32Class cls;
-	cls.bits            = bits;
-	const auto abs_bits = EmitAndConstant(state, cls.bits, 0x7fffffffu);
-	cls.nan  = EmitCompareU32Constant(state, spv::OpUGreaterThan, abs_bits, 0x7f800000u);
-	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
-	return cls;
-}
-
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
-	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
+	const auto abs_bits = EmitAndConstant(state, bits, 0x7fffffffu);
+	return {EmitCompareU32Constant(state, spv::OpUGreaterThan, abs_bits, 0x7f800000u),
+	        EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0)};
 }
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
@@ -100,51 +93,53 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 	return EmitClassMaskBits(state, bits, mask, true);
 }
 
-static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs,
-                             const F32Class& lhs_class, const F32Class& rhs_class,
-                             bool max_value) {
-	const auto numeric_cond = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-	                          TypeBool(state), numeric_cond, lhs, rhs);
-	const auto ordered_bits =
-	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
-
-	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
-	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
-	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
-	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
-
-	const auto rhs_nan_bits =
-	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
-	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
-	return EmitBitcastU32ToF32(state, result_bits);
+static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, uint32_t lhs_bits,
+                              uint32_t rhs_bits, bool max_value) {
+	// RDNA2 V_MIN/V_MAX_F32 return the other source for a NaN source (S1 when both are NaN)
+	// and order -0 below +0. An unordered compare keeps S0 for a NaN S1 and, unlike NMin/NMax,
+	// always returns the exact bits of one source.
+	const auto either    = EmitOrU32(state, lhs_bits, rhs_bits);
+	const auto both_zero = EmitCompareU32Constant(state, spv::OpIEqual,
+	                                              EmitAndConstant(state, either, 0x7fffffffu), 0);
+	const auto zero =
+	    EmitBitcastU32ToF32(state, max_value ? EmitAndU32(state, lhs_bits, rhs_bits) : either);
+	const auto keep_lhs =
+	    Binary(state, max_value ? spv::OpFUnordGreaterThanEqual : spv::OpFUnordLessThan,
+		       TypeBool(state), lhs, rhs);
+	const auto ordered = Select(state, TypeF32(state), keep_lhs, lhs, rhs);
+	const auto numeric = Select(state, TypeF32(state), both_zero, zero, ordered);
+	return Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs), rhs,
+	              numeric);
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto lhs_class = EmitClassifyF32(state, lhs);
-	const auto rhs_class = EmitClassifyF32(state, rhs);
-	return EmitMinMaxF32(state, lhs, rhs, lhs_class, rhs_class, max_value);
+	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
+	                     EmitBitcastF32ToU32(state, rhs), max_value);
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	const auto a_class = EmitClassifyF32(state, a);
-	const auto b_class = EmitClassifyF32(state, b);
-	const auto c_class = EmitClassifyF32(state, c);
-	const auto min_ab = EmitMinMaxF32(state, a, b, a_class, b_class, false);
-	const auto min_ab_class = EmitClassifyF32(state, min_ab);
-	const auto min3 = EmitMinMaxF32(state, min_ab, c, min_ab_class, c_class, false);
-	const auto max_ab = EmitMinMaxF32(state, a, b, a_class, b_class, true);
-	const auto max_ab_class = EmitClassifyF32(state, max_ab);
-	const auto max3 = EmitMinMaxF32(state, max_ab, c, max_ab_class, c_class, true);
-	const auto max_bc = EmitMinMaxF32(state, b, c, b_class, c_class, true);
-	const auto max_ac = EmitMinMaxF32(state, a, c, a_class, c_class, true);
-	// RDNA2 compares numerically against MAX3, including ties between signed zeros.
+	const auto a_bits = EmitBitcastF32ToU32(state, a);
+	const auto b_bits = EmitBitcastF32ToU32(state, b);
+	const auto c_bits = EmitBitcastF32ToU32(state, c);
+	const auto min_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, false);
+	const auto min3 =
+	    EmitMinMaxF32(state, min_ab, c, EmitBitcastF32ToU32(state, min_ab), c_bits, false);
+	const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
+	const auto max3 =
+	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, true);
+	// RDNA2 compares numerically against MAX3, including ties between signed zeros, then takes
+	// V_MAX_F32 of the other two sources in their original order.
 	const auto a_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, a);
 	const auto b_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, b);
-	const auto median = Select(state, TypeF32(state), a_is_max, max_bc,
-	                           Select(state, TypeF32(state), b_is_max, max_ac, max_ab));
-	const auto nan_ab = EmitLogicalOrBool(state, a_class.nan, b_class.nan);
-	const auto any_nan = EmitLogicalOrBool(state, nan_ab, c_class.nan);
+	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
+	const auto y =
+	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
+	const auto median = EmitMinMaxF32Value(state, x, y, true);
+	const auto is_nan = [&](uint32_t value) {
+		return Unary(state, spv::OpIsNan, TypeBool(state), value);
+	};
+	const auto any_nan =
+	    EmitLogicalOrBool(state, EmitLogicalOrBool(state, is_nan(a), is_nan(b)), is_nan(c));
 	return Select(state, TypeF32(state), any_nan, min3, median);
 }
 

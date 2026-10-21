@@ -71,12 +71,6 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
-bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
-	return eop_event_type != 0x28u ||
-	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
-	                    GcrGl2Invalidate | GcrGl2Writeback)) != 0;
-}
-
 uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
 	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
 }
@@ -290,10 +284,6 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
                                       [[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
-}
 
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
 
@@ -2263,28 +2253,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		}
 	};
 
-	if (data_sel == 0 || interrupt_selector == 4) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
+	// Cache actions only order GPU work, which the renderer's resource barriers already order.
+	if (data_sel == 0 || interrupt_selector == 4 ||
+	    (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr)) {
 		trigger_interrupt();
 
 		return 7;
-	}
-
-	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
-		trigger_interrupt();
-
-		return 7;
-	}
-
-	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
-		cp.EmitGlobalBarrier();
 	}
 
 	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
@@ -2899,7 +2873,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			cp.GetCtx().SetUserClipPlane(cmd_offset - Pm4::PA_CL_UCP_0_X, value);
 		};
 	}
 

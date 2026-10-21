@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <array>
+
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
@@ -824,6 +826,11 @@ public:
 	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
+	// PA_CL_UCP_0_X..PA_CL_UCP_5_W as raw float bits, four per plane.
+	[[nodiscard]] const std::array<uint32_t, 24>& GetUserClipPlanes() const {
+		return m_user_clip_planes;
+	}
+	void SetUserClipPlane(uint32_t index, uint32_t value) { m_user_clip_planes[index] = value; }
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
 	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
@@ -923,6 +930,8 @@ private:
 	ClipControl     m_clip_control;
 	ColorControl    m_color_control;
 	ScanModeControl m_scan_mode_control;
+
+	std::array<uint32_t, 24> m_user_clip_planes {};
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;

@@ -143,7 +143,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
-bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
+// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state.
+static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
@@ -154,17 +155,25 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
-	const bool         common          = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
-	                                     (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	                                     descriptor.fields[3] == field3_expected;
-	if (r128) {
-		return common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
-		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
+	if ((descriptor.fields[1] & field1_reserved_mask) != 0 ||
+	    (descriptor.fields[2] & field2_reserved_mask) != 0 || descriptor.fields[3] != field3_expected) {
+		return false;
 	}
-	const bool full = common && descriptor.fields[4] == field4_expected &&
-	                  descriptor.fields[5] == field5_expected;
-	if (!full ||
-	    (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()))) {
+	if (r128) {
+		return descriptor.fields[4] == 0 && descriptor.fields[5] == 0 && descriptor.fields[6] == 0 &&
+		       descriptor.fields[7] == 0;
+	}
+	return descriptor.fields[4] == field4_expected && descriptor.fields[5] == field5_expected;
+}
+
+bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
+	if (!IsCanonicalTextureEncoding(descriptor, r128)) {
+		return false;
+	}
+	if (r128) {
+		return true;
+	}
+	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
 	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
@@ -281,36 +290,12 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	       !descriptor.MsaaDepth();
 }
 
-static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageResource& resource,
-                                              const ShaderTextureResource& descriptor) {
-	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
-	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
-	constexpr uint32_t field5_expected      = 0x00700000u;
-	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
-	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
-	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
-	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
-	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
-	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
-	const uint32_t     expected_field4 =
-	    descriptor.Depth() | (static_cast<uint32_t>(descriptor.BaseArray5()) << 16u);
-	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
-	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	                    descriptor.fields[3] == expected_field3;
-	if (resource.r128) {
-		return common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
-		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
-	}
-	return common && descriptor.fields[4] == expected_field4 &&
-	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
-}
-
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
 	const auto format        = descriptor.Format();
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
-	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
+	const bool encoding_ok   = IsCanonicalTextureEncoding(descriptor, resource.r128);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = uint_resource &&
 	    ShaderRecompiler::IR::RawSignedStorageFormat(resource, format) != Prospero::BufferFormat::kInvalid;
@@ -956,8 +941,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
+					// ADD_TID and swizzle move fixed-offset writes past write_extent.
+					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
+					const auto written_size =
+					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
+					if (written_size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written_size)) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

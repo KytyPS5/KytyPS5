@@ -98,11 +98,13 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			continue;
 		}
 		uint64_t meta_size = 0;
-		if (!cache.FindMeta(descriptor.Base48(), meta_size)) {
+		if (!cache.FindMeta(descriptor.Base48(), meta_size) || meta_size == 0) {
 			return false;
 		}
-		if (descriptor.NumRecords() != UINT32_MAX && meta_size != 0 &&
-		    descriptor.GetSize() > meta_size) {
+		// An unbounded descriptor (NumRecords = 0xffffffff) is how clear shaders commonly address
+		// a whole surface; its extent is the shader's, not the descriptor's. Such a dispatch is
+		// still held to writing only metadata from constants above.
+		if (descriptor.NumRecords() != UINT32_MAX && descriptor.GetSize() > meta_size) {
 			return false;
 		}
 		any_meta = true;

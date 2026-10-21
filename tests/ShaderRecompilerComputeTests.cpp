@@ -5745,9 +5745,10 @@ public:
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     auto &texture_cache = context.GetTextureCache();
-    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
-    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
-    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
+    constexpr uint64_t meta_size = 0x100;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta, meta_size);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta, meta_size);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta, meta_size);
 
     // An empty dispatch must not inspect even an unreadable shader address.
     shaders.SetCsShader({.data_addr = 1});
@@ -5901,6 +5902,17 @@ public:
     Require(name, "write to HTile and other memory preserved",
             !mixed_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
             "a dispatch also writing non-metadata memory was replaced by a clear");
+
+    constexpr uint64_t unsized_meta = 0x0000000204280000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, unsized_meta);
+    ShaderRecompiler::IR::CompiledShaderInfo unsized_program{};
+    ShaderRecompiler::IR::ResourceSnapshot unsized_snapshot;
+    AddBuffer(unsized_meta, false, true, 0x10, unsized_program, unsized_snapshot);
+    const bool unsized_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(unsized_program, unsized_snapshot), command);
+    Require(name, "write to metadata of unknown size preserved",
+            !unsized_consumed && !texture_cache.IsMetaCleared(unsized_meta, 0),
+            "a write to metadata of unknown size was replaced by a clear");
 
     ShaderRecompiler::IR::CompiledShaderInfo clear_program{};
     ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;

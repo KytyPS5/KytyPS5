@@ -7939,6 +7939,8 @@ public:
         // An idle GPU-written chain replaced by a one-level texture is retired, and its
         // contents reach the new image instead of being dropped or left behind as a stale
         // copy that range lookups or GC could download over newer data.
+        // The chain's level 1 at offset 0 is 32 texels wide, so only the first half of the
+        // one-level texture's row holds GPU-written data; the rest is guest padding.
         constexpr uint64_t written_offset = chain_offset + 0x400;
         constexpr uint32_t written_value = 0x55555555u;
         auto* written_memory = reinterpret_cast<uint32_t*>(memory + written_offset);
@@ -7972,8 +7974,8 @@ public:
                                                      false) ==
                         written_one_level_image &&
                     ReadCachedTexel(name, context, written_one_level_image, {},
-                                    {chain_width, 1, 1}) ==
-                        std::vector<u32>(chain_width, written_value),
+                                    {chain_width / 2, 1, 1}) ==
+                        std::vector<u32>(chain_width / 2, written_value),
                 "a retired GPU-written chain was kept or its contents were lost");
 
         // Retiring older GPU-written chains into a newer GPU-written image at the same address

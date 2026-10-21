@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/MaskedSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -1255,6 +1256,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	// Read-lane elimination matches EXEC selects, so the masked ones go only after it.
+	(void)IR::EliminateMaskedSelects(ir.blocks);
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
 	if (decoded.has_swap_pc) {

@@ -576,6 +576,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
+	desc.info.tile_swizzle = descriptor.TileSwizzle();
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}

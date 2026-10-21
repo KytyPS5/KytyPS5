@@ -198,6 +198,13 @@ enum class TileMode : uint32_t {
 	kRenderTarget = 0x1b,
 };
 
+[[nodiscard]] inline constexpr uint32_t TileSwizzle(uint64_t address, TileMode mode) {
+	// XOR modes encode the pipe/bank swizzle in base address bits [15:8].
+	return mode == TileMode::kDepth || mode == TileMode::kRenderTarget
+	           ? static_cast<uint32_t>(address) & 0xff00u
+	           : 0u;
+}
+
 enum class StencilOp : uint32_t {
 	kKeep        = 0x00,
 	kZero        = 0x01,

@@ -32,7 +32,8 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+[[nodiscard]] bool Resolve(TextureCache& cache, ImageId cached, ImageId merged, bool retire = true,
+                           bool allow_discard = false);
 } // namespace BcAlias
 
 class TextureCache {
@@ -194,7 +195,7 @@ private:
 	friend class ImageHeap;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
-	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
+	friend bool BcAlias::Resolve(TextureCache&, ImageId, ImageId, bool, bool);
 };
 
 } // namespace Libs::Graphics

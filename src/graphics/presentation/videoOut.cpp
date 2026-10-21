@@ -585,6 +585,8 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.bytes_per_block = pixel_format.bytes_per_element;
 	info.samples         = 1;
 	info.tile_mode       = tile_mode;
+	// Display surfaces use zero pipe/bank XOR; registration requires 64 KB alignment.
+	info.tile_swizzle    = 0;
 	info.bgra16          = pixel_format.bgra16;
 	info.UpdateSize();
 	if (info.data.size == 0 || info.tiling.block.block_size != 65536 ||

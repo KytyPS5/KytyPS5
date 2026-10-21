@@ -28,6 +28,7 @@ struct Mip {
 layout(set = 0, binding = 2, std140) uniform TilingInfo {
 	uint num_texels;
 	uint color_transform;
+	uint tile_swizzle;
 	Mip mips[16];
 } info;
 
@@ -78,7 +79,7 @@ void main() {
 
 	uint block_index = block.y * params.blocks_per_row + block.x;
 	uint tiled = block.z * params.tiled_slice_bytes + block_index * BLOCK_BYTES +
-	             block_offset(swizzle);
+	             (block_offset(swizzle) ^ info.tile_swizzle);
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
 	if (TILE == 0) {

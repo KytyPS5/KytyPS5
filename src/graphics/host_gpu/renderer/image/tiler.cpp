@@ -103,6 +103,8 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	    block.bytes_per_element > 16 || block.block_width == 0 || block.block_height == 0 ||
 	    block.block_depth == 0 || block.block_size == 0 || info.tiling.texel_width == 0 ||
 	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0);
+	EXIT_IF(info.tile_swizzle >= block.block_size ||
+	        (info.tile_swizzle & 0xffu) != 0);
 	EXIT_IF((transform == ColorTransform::SwapBgra16 && block.bytes_per_element != 8u) ||
 	        (transform == ColorTransform::Reverse10_11_11 && block.bytes_per_element != 4u));
 	const auto checked_multiply = [](uint64_t left, uint64_t right, uint64_t& result) {
@@ -118,6 +120,7 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	// ImageInfo owns the layout. Upload only the header and active mip records.
 	TilingParams params;
 	params.color_transform = static_cast<uint32_t>(transform);
+	params.tile_swizzle = info.tile_swizzle;
 	for (uint32_t level = 0; level < levels; ++level) {
 		const auto& mip    = info.mip_layout[level];
 		const auto  extent = info.MipExtent(level);

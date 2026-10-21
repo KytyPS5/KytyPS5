@@ -88,7 +88,8 @@ private:
 	struct TilingParams {
 		uint32_t                      num_texels      = 0;
 		uint32_t                      color_transform = 0;
-		std::array<uint32_t, 2>        padding {};
+		uint32_t                      tile_swizzle    = 0;
+		uint32_t                      padding         = 0;
 		std::array<Mip, MaxMipLevels> mips;
 	};
 	struct Tiling {

@@ -6662,6 +6662,196 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckTextureCacheSubresourceOverlap() {
+    constexpr const char *name = "TextureCacheSubresourceOverlap";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetTextureCache();
+    const auto mark_gpu_owned = [&](ImageId id) {
+      auto &image = cache.GetImage(id);
+      image.RefreshComplete();
+      image.ClearBufferModified();
+      image.MarkGpuModified();
+    };
+    auto multisampled = MakeLinearDesc(
+        0x1170000000ull, 256, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+        Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 4);
+    const auto unsupported = cache.FindImage(multisampled);
+    mark_gpu_owned(unsupported);
+    Require(name, "unsupported readback ownership", cache.GetImage(unsupported).SafeToDownload(),
+            "fixture did not retain GPU ownership");
+    Require(name, "unsupported readback retention",
+            BcAlias::Resolve(cache, unsupported, {}, false) &&
+                TextureCacheTestAccess::Contains(cache, unsupported) &&
+                cache.GetImage(unsupported).IsGpuModified(),
+            "unsupported readback failed or retired a retained image");
+    Require(name, "unsupported readback retirement rejected",
+            !BcAlias::Resolve(cache, unsupported, {}) &&
+                TextureCacheTestAccess::Contains(cache, unsupported) &&
+                cache.GetImage(unsupported).SafeToDownload(),
+            "failed publication discarded GPU-owned contents");
+    auto downloadable = MakeLinearDesc(
+        0x1170010000ull, 64, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+        Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+    const auto source = cache.FindImage(downloadable);
+    mark_gpu_owned(source);
+    for (const bool retire : {false, true}) {
+      Require(name, "unsupported merged readback rejected",
+              !BcAlias::Resolve(cache, source, unsupported, retire) &&
+                  TextureCacheTestAccess::Contains(cache, source) &&
+                  cache.GetImage(source).SafeToDownload() &&
+                  cache.GetImage(unsupported).SafeToDownload(),
+              "failed merged publication changed image ownership or retired the source");
+    }
+    Require(name, "stale unsupported readback discarded",
+            BcAlias::Resolve(cache, unsupported, {}, true, true) &&
+                !TextureCacheTestAccess::Contains(cache, unsupported) &&
+                cache.GetImage(source).SafeToDownload(),
+            "explicit stale-image discard failed or changed another image's ownership");
+    cache.GetImage(source).ClearGpuModified();
+    Require(name, "clean alias retirement",
+            BcAlias::Resolve(cache, source, {}) &&
+                !TextureCacheTestAccess::Contains(cache, source) &&
+                !TextureCacheTestAccess::Contains(cache, unsupported),
+            "clean images could not be retired");
+    for (const bool array_first : {false, true}) {
+      auto mipped = MakeLinearDesc(
+          0x1180000000ull + array_first * 0x100000, 0,
+          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+          Prospero::ImageType::kColor2D, {16, 16, 1}, 1, 4, 1);
+      mipped.info.tile_mode = Prospero::TileMode::kStandard64KB;
+      mipped.info.resources = {2, 1};
+      mipped.info.UpdateSize();
+      mipped.view_info.level_count = 2;
+      auto array = mipped;
+      array.info.data.size = 0;
+      array.info.resources = {1, 3};
+      array.info.UpdateSize();
+      array.view_info.level_count = 1;
+      array.view_info.layer_count = 3;
+      array.view_info.type = vk::ImageViewType::e2DArray;
+      Require(name, "different mip packing",
+              mipped.info.data.size == 0x10000 && array.info.data.size == 0x30000 &&
+                  mipped.info.BlockExtent() == array.info.BlockExtent() &&
+                  mipped.info.mip_layout[0].tail_x != array.info.mip_layout[0].tail_x,
+              "fixture lost the captured mip/layer overlap shape");
+      const auto first = cache.FindImage(array_first ? array : mipped);
+      const auto second = cache.FindImage(array_first ? mipped : array);
+      Require(name, "independent mip and layer backings",
+              first && second && first != second &&
+                  TextureCacheTestAccess::Contains(cache, first) &&
+                  TextureCacheTestAccess::Contains(cache, second) &&
+                  cache.GetImage(first).info.resources ==
+                      (array_first ? array.info.resources : mipped.info.resources) &&
+                  cache.GetImage(second).info.resources ==
+                      (array_first ? mipped.info.resources : array.info.resources) &&
+                  cache.FindImage(array_first ? array : mipped) == first &&
+                  cache.FindImage(array_first ? mipped : array) == second,
+              "crossed mip/layer counts reused, expanded, or replaced an incompatible image");
+    }
+    context.InitializeGpu(nullptr);
+    constexpr uint64_t allocation_size = 0x50000;
+    constexpr uint32_t value = 0x12345678u;
+    const auto base = LibKernel::Memory::AllocateProgramMemory(
+        0, allocation_size, Common::VirtualMemory::Mode::ReadWrite, "subresource_overlap");
+    Require(name, "GPU alias backing", base != 0, "guest backing allocation failed");
+    context.MapMemory(base, allocation_size);
+    const auto aligned_base = Common::AlignUp(base, 0x10000);
+    for (const bool array_first : {false, true}) {
+      const auto address = aligned_base + (array_first ? 0x10000 : 0);
+      auto mipped = MakeLinearDesc(address, 0, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+          Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+      mipped.info.resources.levels = mipped.view_info.level_count = 2;
+      mipped.info.UpdateSize();
+      auto array = mipped;
+      array.info.data.size = 0;
+      array.info.resources = {1, 2};
+      array.info.UpdateSize();
+      array.view_info.level_count = 1;
+      array.view_info.layer_count = 2;
+      array.view_info.type = vk::ImageViewType::e2DArray;
+      auto first_desc = array_first ? array : mipped;
+      auto second_desc = array_first ? mipped : array;
+      const auto first = cache.FindImage(first_desc);
+      (void)cache.FindTexture(first, first_desc);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = value;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), first,
+          {vk::ImageAspectFlagBits::eColor, 0, first_desc.info.resources.levels, 0,
+           first_desc.info.resources.layers}, clear);
+      if (array_first) {
+        const auto padding = address + first_desc.info.data.size;
+        cache.InvalidateMemory(padding, sizeof(value));
+        LibKernel::Memory::WriteBacking(padding, &value, sizeof(value));
+        Require(name, "crossed layout speculative CPU write",
+                cache.GetImage(first).IsGpuModified() && cache.GetImage(first).IsMaybeCpuDirty() &&
+                    !cache.GetImage(first).SafeToDownload(),
+                "the padding write did not defer GPU ownership validation");
+      }
+      const auto second = cache.FindImage(second_desc);
+      Require(name, "crossed GPU layout publication",
+              second != first && !TextureCacheTestAccess::Contains(cache, first) &&
+                  context.GetBufferCache().IsRegionGpuModified(address, first_desc.info.data.size),
+              "separating mip/layer layouts lost their GPU-owned backing");
+      (void)cache.FindTexture(second, second_desc);
+      Require(name, "crossed GPU layout contents",
+              ReadCachedTexel(name, context, second) == std::vector<u32>{value},
+              "the new mip/layer layout uploaded stale guest bytes");
+    }
+    for (const bool aged : {false, true}) {
+      const auto address = aligned_base + (aged ? 0x30000 : 0x20000);
+      auto first_desc = MakeLinearDesc(address, 0, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {128, 128, 1}, 1, 4, 1);
+      first_desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      first_desc.info.tile_swizzle = 0x3100;
+      first_desc.info.UpdateSize();
+      Require(name, "swizzled allocation size", first_desc.info.data.size == 0x10000,
+              "swizzle fixture does not fill one tile");
+      const auto first = cache.FindImage(first_desc);
+      (void)cache.FindTexture(first, first_desc);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = value;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), first,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      if (aged) {
+        for (uint32_t tick = 0; tick < 33u; ++tick) scheduler.Flush();
+        cache.GetImage(first).tick_accessed_last = 0;
+      }
+      auto second_desc = first_desc;
+      second_desc.info.tile_swizzle = 0x3200;
+      const auto second = cache.FindImage(second_desc);
+      Require(name, "swizzled GPU layout publication",
+              second != first && TextureCacheTestAccess::Contains(cache, first) == !aged &&
+                  context.GetBufferCache().IsRegionGpuModified(address, first_desc.info.data.size),
+              "separating tile swizzles lost their GPU-owned backing");
+      (void)cache.FindTexture(second, second_desc);
+      Require(name, "swizzled GPU layout contents",
+              ReadCachedTexel(name, context, second) == std::vector<u32>{value},
+              "the new tile swizzle uploaded stale guest bytes");
+      if (aged) {
+        context.GetBufferCache().ReadMemory(address, first_desc.info.data.size);
+        uint32_t published = 0u;
+        Require(name, "swizzled GPU writes reach backing",
+                LibKernel::Memory::TryReadBacking(address + 0x3100, &published, sizeof(published)) &&
+                    published == value,
+                "retired swizzled image published stale guest data");
+      }
+    }
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    Require(name, "GPU alias release",
+            LibKernel::Memory::FreeGuestMemory(base, allocation_size),
+            "guest backing release failed");
+    context.ShutdownGpu();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckTextureMetadataResize() {
     constexpr const char *name = "TextureMetadataResize";
     constexpr uint64_t page = 0x4000;
@@ -6995,6 +7185,38 @@ public:
                     native.imageLayout == vk::ImageLayout::eGeneral &&
                     TextureCacheTestAccess::Contains(texture_cache, exact),
                 "a null descriptor acquired a cache image or disturbed a real image");
+      }
+
+      {
+        auto resource = null_resource;
+        resource.numeric_class = Prospero::TextureNumericClass::Uint;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dword_count = 8;
+        descriptor.dwords = {0x131c0031u, 0xc0500000u, 0x0167c27fu, 0xd1800924u,
+                             0u, 0u, 0u, 0x0e000001u};
+        constexpr uint64_t address = base + 0x2b00000;
+        descriptor.dwords[0] = static_cast<uint32_t>(address >> 8u) | 0x31u;
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            context.GetRenderExecutor(), resource, descriptor);
+        Require(name, "TLOU swizzled texture binding",
+                binding.image_id && binding.desc.info.data.address == address &&
+                    binding.desc.info.data.size == 0x3c0000 &&
+                    binding.desc.info.DataAlignment() == 0x10000 &&
+                    binding.desc.info.tiled_slice_stride == 0x3c0000 &&
+                    binding.desc.info.tile_swizzle == 0x3100 &&
+                    texture_cache.GetImage(binding.image_id).info.tile_swizzle == 0x3100,
+                "a swizzled T# did not resolve its aligned backing and XOR");
+        descriptor.dwords[0] ^= 0x03u;
+        const auto different = RenderExecutorTestAccess::ResolveTexture(
+            context.GetRenderExecutor(), resource, descriptor);
+        Require(name, "tile swizzle cache identity",
+                different.image_id && different.image_id != binding.image_id &&
+                    different.desc.info.data.address == address &&
+                    different.desc.info.tile_swizzle == 0x3200,
+                "different pipe/bank swizzles reused the same native image");
+        TextureCacheTestAccess::DeleteImage(texture_cache, binding.image_id);
+        TextureCacheTestAccess::DeleteImage(texture_cache, different.image_id);
       }
 
       constexpr uint64_t extent_alias_offset = 0x2400000;
@@ -10976,6 +11198,7 @@ public:
       Prospero::TileMode tile;
       uint32_t levels = 1;
       bool float16 = false;
+      uint32_t swizzle = 0;
     };
     const std::array cases{
         TargetCase{width, height, 0, pitch, layout.size,
@@ -10986,6 +11209,8 @@ public:
         TargetCase{128, 128, 1, 128, 0x2be00, Prospero::TileMode::kLinear, 7, true},
         // PPSA03541: the single texel still occupies a padded 128x64 block.
         TargetCase{1, 1, 1, 128, 0x10000, Prospero::TileMode::kRenderTarget, 1, true},
+        TargetCase{128, 128, 1, 128, 0x10000, Prospero::TileMode::kRenderTarget,
+                   1, false, 0x3100},
     };
     constexpr uint64_t allocation_size = 0x410000;
 
@@ -11013,7 +11238,7 @@ public:
       HW::Context registers{};
       HW::UserConfig user_config{};
       HW::Shader shaders{};
-      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorBase(0, {.addr = base | target.swizzle});
       registers.SetColorInfo(
           0, {.format = target.float16 ? Prospero::ChannelLayout::k16_16_16_16
                                       : Prospero::ChannelLayout::k8_8_8_8,
@@ -11053,6 +11278,8 @@ public:
                   color.desc.info.extent == vk::Extent3D{width, height, 1} &&
                   color.desc.info.resources == ImageSubresources{target.levels, 1} &&
                   color.desc.info.pitch == target.pitch &&
+                  color.desc.info.data.address == base &&
+                  color.desc.info.tile_swizzle == target.swizzle &&
                   color.desc.info.data.size == target.size &&
                   color.desc.info.mip_layout[0].offset ==
                       (target.levels == 1 ? 0 : 0xbe00) &&
@@ -11097,7 +11324,7 @@ public:
             {vk::ImageAspectFlagBits::eColor, 0, target.levels, 0, 1}, clear);
         RenderExecutorTestAccess::ResetBindings(executor);
         ShaderTextureResource descriptor{{
-            static_cast<uint32_t>(base >> 8u),
+            static_cast<uint32_t>((base | target.swizzle) >> 8u),
             (static_cast<uint32_t>(target.float16
                                       ? Prospero::BufferFormat::k16_16_16_16Float
                                       : Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
@@ -11121,6 +11348,7 @@ public:
             RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
         Require(name, "target sampled alias",
                 sampled.image_id == color.image_id &&
+                    sampled.desc.info.tile_swizzle == target.swizzle &&
                     sampled.desc.info.pitch == target.pitch &&
                     sampled.desc.info.data.size == target.size &&
                     sampled.desc.info.mip_layout == color.desc.info.mip_layout &&
@@ -14921,6 +15149,7 @@ public:
             "depth-tiled color mapping failed");
     constexpr uint32_t width = 64;
     constexpr uint32_t height = 64;
+    constexpr uint32_t tile_swizzle = 0x3200;
     TileTextureBlockLayout tile_layout{};
     Require(name, "tile layout",
             TileGetTextureBlockLayout(Prospero::BufferFormat::k32Float,
@@ -14938,7 +15167,7 @@ public:
         Require(name, "texel offset",
                 TileGetBlockOffset(tile_layout.block, x, y, 0, offset),
                 "depth-tiled color texel offset is unavailable");
-        const auto index = (offset ^ block_xor) / sizeof(uint32_t);
+        const auto index = (offset ^ block_xor ^ tile_swizzle) / sizeof(uint32_t);
         Require(name, "texel address", index < expected.size(),
                 "depth-tiled color texel address exceeds its backing");
         expected[index] = 0x3f000000u + y * width + x;
@@ -14952,7 +15181,7 @@ public:
       HW::Context registers{};
       HW::UserConfig user_config{};
       HW::Shader shaders{};
-      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorBase(0, {.addr = base | tile_swizzle});
       registers.SetColorInfo(
           0, {.format = Prospero::ChannelLayout::k32,
               .channel_type = Prospero::ChannelType::kFloat,
@@ -14978,6 +15207,8 @@ public:
       Require(name, "captured target",
               color.image_id && attachment != nullptr &&
                   color.desc.info.tile_mode == Prospero::TileMode::kDepth &&
+                  color.desc.info.data.address == base &&
+                  color.desc.info.tile_swizzle == tile_swizzle &&
                   color.desc.info.pitch == 128 &&
                   color.desc.info.data.size == allocation_size &&
                   color.desc.info.mip_layout[0].size == allocation_size &&
@@ -15009,7 +15240,7 @@ public:
           uint32_t offset = 0;
           const auto valid =
               TileGetBlockOffset(tile_layout.block, x, y, 0, offset);
-          const auto index = (offset ^ block_xor) / sizeof(uint32_t);
+          const auto index = (offset ^ block_xor ^ tile_swizzle) / sizeof(uint32_t);
           recovered &= valid && index < observed.size() &&
                        observed[index] == expected[index];
         }
@@ -16453,6 +16684,8 @@ public:
       constexpr uint64_t phased_depth_address = base + 0x90000;
       constexpr uint64_t phased_stencil_address = base + 0xa0000;
       constexpr uint64_t phased_htile_address = base + 0xb0000;
+      constexpr uint32_t phased_depth_swizzle = 0x3100;
+      constexpr uint32_t phased_stencil_swizzle = 0x3200;
       HW::DepthRenderTarget phased_depth_target{};
       phased_depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
       phased_depth_target.z_info.texture_compatibility =
@@ -16463,10 +16696,10 @@ public:
       phased_depth_target.stencil_info.texture_compatibility =
           Prospero::TextureCompatibleStencil::kEnable;
       phased_depth_target.stencil_info.htile_stencil_disabled = false;
-      phased_depth_target.z_read_base_addr = phased_depth_address;
-      phased_depth_target.z_write_base_addr = phased_depth_address;
-      phased_depth_target.stencil_read_base_addr = phased_stencil_address;
-      phased_depth_target.stencil_write_base_addr = phased_stencil_address;
+      phased_depth_target.z_read_base_addr = phased_depth_address | phased_depth_swizzle;
+      phased_depth_target.z_write_base_addr = phased_depth_target.z_read_base_addr;
+      phased_depth_target.stencil_read_base_addr = phased_stencil_address | phased_stencil_swizzle;
+      phased_depth_target.stencil_write_base_addr = phased_depth_target.stencil_read_base_addr;
       phased_depth_target.htile_data_base_addr = phased_htile_address;
       phased_depth_target.size.valid = true;
       registers.SetDepthRenderTarget(phased_depth_target);
@@ -16489,6 +16722,18 @@ public:
       RenderDepthInfo phased_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), phased_depth);
+      Require(name, "independent depth/stencil swizzles",
+              phased_depth.desc.info.data.address == phased_depth_address &&
+                  phased_depth.desc.info.tile_swizzle == phased_depth_swizzle &&
+                  phased_depth.desc.info.stencil.address == phased_stencil_address &&
+                  phased_depth.desc.info.stencil_tile_swizzle == phased_stencil_swizzle,
+              "depth/stencil registers lost their backing addresses or pipe/bank XOR");
+      auto incompatible_stencil = phased_depth.desc.info;
+      incompatible_stencil.stencil_tile_swizzle ^= 0x100u;
+      Require(name, "stencil layout compatibility",
+              !phased_depth.desc.info.IsCompatible(incompatible_stencil) &&
+                  !incompatible_stencil.IsCompatible(phased_depth.desc.info),
+              "different stencil swizzles were accepted as compatible");
       // PRT permits missing backing; a fully resident target keeps the same layout and image.
       phased_depth_target.z_info.partially_resident = true;
       phased_depth_target.stencil_info.partially_resident = true;
@@ -16609,6 +16854,35 @@ public:
           "final depth acquisition did not publish and consume HTile "
           "state at the final acquisition boundary");
       RenderExecutorTestAccess::ResetBindings(executor);
+
+      for (const bool stencil : {false, true}) {
+        const auto address = stencil ? phased_depth_target.stencil_read_base_addr
+                                     : phased_depth_target.z_read_base_addr;
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        value.dwords = {static_cast<uint32_t>(address >> 8u),
+                        static_cast<uint32_t>(address >> 40u) |
+                            (static_cast<uint32_t>(stencil ? Prospero::BufferFormat::k8UInt
+                                                          : Prospero::BufferFormat::k32Float) << 20u),
+                        0, DstSel(4, 4, 4, 4) |
+                               (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+                               (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+                        0, 0x00700000u, 0, 0};
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = stencil ? Prospero::TextureNumericClass::Uint
+                                          : Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = true;
+        const auto sampled = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Require(name, "swizzled depth/stencil sampled alias",
+                sampled.image_id == phased_depth.image_id &&
+                    sampled.desc.info.tile_swizzle ==
+                        (stencil ? phased_stencil_swizzle : phased_depth_swizzle) &&
+                    texture_cache.FindTexture(sampled.image_id, sampled.desc) != nullptr,
+                "sampling a swizzled depth/stencil target created a second native image");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
 
       constexpr uint64_t depth_only_address = base + 0x140000;
       constexpr uint64_t depth_only_htile_address = base + 0x150000;
@@ -17142,7 +17416,7 @@ public:
 
       auto shared_depth_descriptor = sampled_depth_descriptor;
       shared_depth_descriptor.fields[0] =
-          static_cast<uint32_t>(phased_depth_address >> 8u);
+          static_cast<uint32_t>(phased_depth_target.z_read_base_addr >> 8u);
       shared_depth_descriptor.fields[1] =
           static_cast<uint32_t>(phased_depth_address >> 40u) |
           (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u);
@@ -18177,6 +18451,38 @@ public:
                   sampled_bytes[i] == plane_bytes[plane_offsets[i]],
                   "sampling without another depth acquisition used stale stencil bytes");
         }
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, stencil_again);
+        for (const auto offset : plane_offsets) plane_bytes[offset] = 0x67;
+        plane_depth.info.stencil_tile_swizzle = 0x100u;
+        auto rebound_depth = plane_depth;
+        Require(name, "stencil swizzle depth reuse",
+                texture_cache.FindImage(rebound_depth) == plane_depth_id,
+                "changing only stencil swizzle replaced the depth backing");
+        (void)texture_cache.FindDepthTarget(plane_depth_id, plane_depth);
+        auto preserved_readback = CreateHostBuffer(name, plane_size,
+            vk::BufferUsageFlagBits::eTransferDst, {});
+        const auto preserved = resources.GetBufferCache().ObtainBuffer(plane_address, plane_size, false);
+        const vk::BufferCopy preserved_copy{preserved.second, 0, plane_size};
+        scheduler.Current().Handle().copyBuffer(preserved.first->Handle(), preserved_readback.buffer,
+                                                1, &preserved_copy);
+        texture_cache.GetImage(plane_depth_id).Download(
+            plane_copies, plane_readback.buffer, 0, plane_readback.size);
+        scheduler.Current().Handle().pipelineBarrier2(stencil_dependency);
+        scheduler.Finish();
+        const auto rebound_values = ReadBuffer(name, plane_readback, texels + 2);
+        const auto preserved_values = ReadBuffer(name, preserved_readback, plane_size / sizeof(u32));
+        const auto *preserved_bytes = reinterpret_cast<const uint8_t *>(preserved_values.data());
+        const auto *rebound_bytes =
+            reinterpret_cast<const uint8_t *>(rebound_values.data() + texels);
+        for (uint32_t i = 0; i < texels; ++i) {
+          Require(name, "stencil swizzle preserves old layout",
+                  rebound_values[i] == std::bit_cast<uint32_t>(0.625f) &&
+                      preserved_bytes[plane_offsets[i]] == 0x67 &&
+                      rebound_bytes[i] == plane_bytes[plane_offsets[i] ^ 0x100u],
+                  "stencil rebind lost GPU contents or downloaded them with the new swizzle");
+        }
+        DestroyBuffer(&preserved_readback);
         DestroyBuffer(&plane_readback);
         DestroyBuffer(&plane_upload);
         LibKernel::Memory::InstallGpuResources(nullptr);
@@ -20990,7 +21296,8 @@ public:
                     "CPU reference address lookup failed");
             const uint64_t tiled =
                 mip.offset + uint64_t{bz} * info.tiled_slice_stride +
-                (by * columns + bx) * block.block_size + (local ^ block_xor);
+                (by * columns + bx) * block.block_size +
+                (local ^ block_xor ^ info.tile_swizzle);
             const uint64_t linear =
                 mip.linear_offset + uint64_t{z} * slice +
                 (uint64_t{y} * mip.linear_pitch + x) * block.bytes_per_element;
@@ -21501,6 +21808,14 @@ public:
       Require(name, "RGB32 texture policy",
               !TileGetTextureElementLayout(format, element),
               "12-byte texel layouts must be rejected");
+    }
+
+    for (const auto tile : {Prospero::TileMode::kDepth,
+                            Prospero::TileMode::kRenderTarget}) {
+      auto layered = MakeTilingImage(Prospero::BufferFormat::k32UInt, 259,
+                                     257, 3, 2, tile, 0, false);
+      layered.tile_swizzle = 0x3100;
+      check_round_trip("swizzled layered mips", layered.data.size, layered);
     }
 
     {
@@ -48611,6 +48926,27 @@ void CheckStorageTextureLinearUploadLayout() {
 }
 
 void CheckStorageTextureDepthTileUploadLayout() {
+  const ShaderTextureResource captured{{
+      0x131c0031u, 0xc0500000u, 0x0167c27fu, 0xd1800924u,
+      0x00000000u, 0x00000000u, 0x00000000u, 0x0e000001u}};
+  for (const auto tile : {Prospero::TileMode::kLinear,
+                          Prospero::TileMode::kStandard256B,
+                          Prospero::TileMode::kStandard4KB,
+                          Prospero::TileMode::kStandard64KB,
+                          Prospero::TileMode::kPrt,
+                          Prospero::TileMode::kDepth,
+                          Prospero::TileMode::kRenderTarget}) {
+    auto descriptor = captured;
+    descriptor.fields[3] =
+        (descriptor.fields[3] & ~(0x1fu << 20u)) |
+        (static_cast<uint32_t>(tile) << 20u);
+    const bool xor_mode = tile == Prospero::TileMode::kDepth ||
+                          tile == Prospero::TileMode::kRenderTarget;
+    Require("StorageTextureDepthTileUpload", "tile mode address decoding",
+            descriptor.Base40() == (xor_mode ? 0x131c000000ull : 0x131c003100ull) &&
+                descriptor.TileSwizzle() == (xor_mode ? 0x3100u : 0u),
+            "tile swizzle decoding changed a resource address");
+  }
   constexpr auto format = Prospero::BufferFormat::k8UInt;
   constexpr uint32_t width = 1;
   constexpr uint32_t height = 1;

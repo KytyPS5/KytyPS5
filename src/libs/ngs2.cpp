@@ -44,6 +44,7 @@ constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
     static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
+constexpr size_t NGS2_RACK_INFO_V1_1_SIZE    = 232;
 
 struct Ngs2SystemOption {
 	size_t    size                     = 0;
@@ -420,6 +421,36 @@ struct Ngs2RackInternal {
 	}
 };
 
+struct Ngs2RackContextBufferInfo {
+	void*     host_buffer;
+	size_t    host_buffer_size;
+	uintptr_t user_data;
+};
+
+struct Ngs2RackInfo {
+	char                      name[64];
+	uintptr_t                 rack_handle;
+	Ngs2RackContextBufferInfo buffer_info;
+	uintptr_t                 owner_system_handle;
+	uint32_t                  type;
+	uint32_t                  rack_id;
+	uint32_t                  uid;
+	uint32_t                  min_grain_samples;
+	uint32_t                  max_grain_samples;
+	uint32_t                  max_voices;
+	uint32_t                  max_channel_works;
+	uint32_t                  max_inputs;
+	uint32_t                  max_matrices;
+	uint32_t                  max_ports;
+	uint32_t                  state_flags;
+	float                     last_process_ratio;
+	uint64_t                  last_processed_tick;
+	uint64_t                  render_count;
+	uint32_t                  active_voice_count;
+	uint32_t                  active_channel_work_count;
+};
+static_assert(sizeof(Ngs2RackInfo) == 176);
+
 enum class Ngs2VoicePlayState : uint32_t { Empty = 0, Playing = 3, Paused = 5, Stopped = 0xb };
 
 struct Ngs2SamplerFilterParam {
@@ -533,10 +564,10 @@ struct Ngs2SamplerFilter {
 
 struct Ngs2VoiceInternal {
 	struct Port {
-		Ngs2VoiceInternal* dest   = nullptr;
-		uint32_t           input  = 0;
-		float              volume = 1.0f;
-		int32_t            matrix = -1;
+		Ngs2VoiceInternal* dest            = nullptr;
+		uint32_t           input           = 0;
+		float              volume          = 1.0f;
+		int32_t            matrix          = -1;
 	};
 	struct Block {
 		const uint8_t*    data;
@@ -567,6 +598,8 @@ struct Ngs2VoiceInternal {
 	std::vector<float>              output_matrix;
 	uint32_t                        channels        = 0;
 	uint32_t                        output_id       = 0;
+	float                           fbw_level       = 1.0f;
+	float                           lfe_level       = 1.0f;
 	bool                            rendering       = false;
 	bool                            rendered        = false;
 	bool                            has_samples     = false;
@@ -675,6 +708,7 @@ struct Ngs2VoiceInternal {
 		}
 	}
 
+	// Validates and appends waveform blocks, optionally replacing the current stream.
 	int AddWaveformBlocks(const uint8_t* data, uint32_t flags, uint32_t count,
 	                      const Ngs2WaveformBlock* waveform_blocks) {
 		const auto capacity = rack->type == Ngs2RackType::Sampler
@@ -683,8 +717,13 @@ struct Ngs2VoiceInternal {
 		if (count > capacity) {
 			return NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS;
 		}
-		EXIT_NOT_IMPLEMENTED(!accepts_blocks || (flags & ~0x17u) != 0);
-		const bool clear     = (flags & 4u) != 0;
+		const bool clear = (flags & 4u) != 0;
+		if ((!accepts_blocks && !clear) || (flags & ~0x17u) != 0) {
+			LOGF("unsupported waveform block submission: accepts_blocks = %u, flags = 0x%08" PRIx32
+			     ", count = %" PRIu32 "\n",
+			     accepts_blocks, flags, count);
+			EXIT_NOT_IMPLEMENTED(true);
+		}
 		const bool only_data = (flags & 2u) != 0;
 		const bool join      = only_data && (flags & 0x10u) == 0;
 		EXIT_NOT_IMPLEMENTED(only_data && decoder == nullptr);
@@ -722,6 +761,8 @@ struct Ngs2VoiceInternal {
 			return NGS2_ERROR_FULL_WAVEFORM_BLOCKS;
 		}
 		if (clear) {
+			// Also discards staged frames (frame_cursor, frame_samples, next_frame_samples),
+			// so a clear after a partial render cannot replay samples from the old stream.
 			ClearWaveformBlocks();
 		} else if (retained != 0) {
 			blocks.back().info.data_size = tail.info.data_size;
@@ -792,6 +833,14 @@ struct Ngs2SubmixerVoiceSetupParam {
 };
 static_assert(sizeof(Ngs2SubmixerVoiceSetupParam) == 16);
 
+struct Ngs2ReverbVoiceSetupParam {
+	Ngs2VoiceParamHeader header;
+	uint32_t             num_io_channels;
+	uint32_t             flags;
+	uint64_t             reserved;
+};
+static_assert(sizeof(Ngs2ReverbVoiceSetupParam) == 24);
+
 struct Ngs2VoicePatchParam {
 	Ngs2VoiceParamHeader header;
 	uint32_t             port;
@@ -823,6 +872,28 @@ struct Ngs2VoicePortDelayParam {
 	uint32_t             port;
 	uint32_t             num_samples;
 };
+
+struct Ngs2VoicePortInfo {
+	int32_t   matrix_id;
+	float     volume;
+	uint32_t  num_delay_samples;
+	uint32_t  dest_input_id;
+	uintptr_t dest_handle;
+};
+static_assert(sizeof(Ngs2VoicePortInfo) == 24);
+
+struct Ngs2VoiceChannelsInfo {
+	uint32_t num_channels;
+	uint32_t reserved;
+};
+static_assert(sizeof(Ngs2VoiceChannelsInfo) == 8);
+
+struct Ngs2MasteringVoiceGainParam {
+	Ngs2VoiceParamHeader header;
+	float                fbw_level;
+	float                lfe_level;
+};
+static_assert(sizeof(Ngs2MasteringVoiceGainParam) == 16);
 
 struct Ngs2VoiceCallbackParam {
 	Ngs2VoiceParamHeader header;
@@ -1494,6 +1565,111 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 	return OK;
 }
 
+// Retrieves rack properties and active-voice counts into the requested info structure.
+int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, size_t info_size) {
+	constexpr int32_t ERROR_INVALID_OUT_ADDRESS = static_cast<int32_t>(0x804a8010u);
+	constexpr int32_t ERROR_INVALID_OUT_SIZE    = static_cast<int32_t>(0x804a8011u);
+	constexpr int32_t ERROR_INVALID_RACK_HANDLE = static_cast<int32_t>(0x804a8202u);
+
+	PRINT_NAME();
+
+	if (info == nullptr) {
+		return ERROR_INVALID_OUT_ADDRESS;
+	}
+	if (rack_handle == 0) {
+		return ERROR_INVALID_RACK_HANDLE;
+	}
+	if (info_size != sizeof(Ngs2RackInfo) && info_size != NGS2_RACK_INFO_V1_1_SIZE) {
+		LOGF("Ngs2RackGetInfo: unsupported info_size = %zu (expected %zu)\n", info_size,
+		     sizeof(Ngs2RackInfo));
+		return ERROR_INVALID_OUT_SIZE;
+	}
+
+	auto* rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
+	Ngs2Internal* ngs = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		for (auto* current = g_racks_list; current != nullptr; current = current->next) {
+			if (current == rack) {
+				ngs = current->ngs;
+				break;
+			}
+		}
+	}
+	if (ngs == nullptr) {
+		return ERROR_INVALID_RACK_HANDLE;
+	}
+
+	Common::LockGuard lock(ngs->mutex);
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		bool registered = false;
+		for (auto* current = g_racks_list; current != nullptr; current = current->next) {
+			if (current == rack && current->ngs == ngs) {
+				registered = true;
+				break;
+			}
+		}
+		if (!registered) {
+			return ERROR_INVALID_RACK_HANDLE;
+		}
+	}
+
+	uint32_t rack_id = 0;
+	uint32_t max_channel_works = 0;
+	uint32_t max_inputs        = 0;
+	switch (rack->type) {
+		case Ngs2RackType::Sampler:
+			rack_id           = 0x1000;
+			max_channel_works = rack->option.sampler.max_channel_works;
+			break;
+		case Ngs2RackType::Submixer:
+			rack_id    = 0x2000;
+			max_inputs = rack->option.submixer.max_inputs;
+			break;
+		case Ngs2RackType::Reverb: rack_id = 0x2001; break;
+		case Ngs2RackType::Mastering: rack_id = 0x3000; break;
+		case Ngs2RackType::CustomSubmixer:
+			rack_id    = 0x4002;
+			max_inputs = rack->option.custom_submixer.max_inputs;
+			break;
+		case Ngs2RackType::CustomMastering:
+			rack_id    = 0x4003;
+			max_inputs = rack->option.custom_mastering.max_inputs;
+			break;
+		case Ngs2RackType::CustomSampler:
+			rack_id           = 0x4001;
+			max_channel_works = rack->option.custom_sampler.max_channel_works;
+			break;
+	}
+
+	uint32_t active_voice_count = 0;
+	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+	for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
+		active_voice_count += voices[i].state != Ngs2VoicePlayState::Empty;
+	}
+
+	std::memset(info, 0, info_size);
+	std::memcpy(info->name, rack->option.common.name, sizeof(info->name));
+	info->rack_handle          = rack_handle;
+	info->buffer_info          = {rack->buffer_info.host_buffer, rack->buffer_info.host_buffer_size,
+	                              rack->buffer_info.user_data};
+	info->owner_system_handle  = reinterpret_cast<uintptr_t>(rack->ngs);
+	info->type                 = rack_id >> 12u;
+	info->rack_id              = rack_id;
+	info->max_grain_samples    = rack->option.common.max_grain_samples;
+	info->max_voices           = rack->option.common.max_voices;
+	info->max_channel_works    = max_channel_works;
+	info->max_inputs           = max_inputs;
+	info->max_matrices         = rack->option.common.max_matrices;
+	info->max_ports            = rack->option.common.max_ports;
+	info->state_flags          = 1;
+	info->render_count         = rack->ngs->render_count;
+	info->active_voice_count   = active_voice_count;
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI Ngs2RackLock(uintptr_t rack_handle) {
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
@@ -1773,6 +1949,7 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	voice.has_samples = output != 0;
 }
 
+// Renders one voice and recursively mixes connected source voices into it.
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
@@ -1894,6 +2071,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	voice.rendered  = true;
 }
 
+// Renders all active voices in a system into the requested output buffers.
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
@@ -1947,9 +2125,12 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
 			for (uint32_t src = 0; src < voice->channels; ++src) {
-				const float level = voice->output_matrix.empty()
-				                        ? (src == dst ? 1.0f : 0.0f)
-				                        : voice->output_matrix.at(src * output.num_channels + dst);
+				const bool lfe = src == 3 && (voice->channels == 6 || voice->channels == 8);
+				const float gain = lfe ? voice->lfe_level : voice->fbw_level;
+				const float level = gain * (voice->output_matrix.empty()
+				                                 ? (src == dst ? 1.0f : 0.0f)
+				                                 : voice->output_matrix.at(
+				                                       src * output.num_channels + dst));
 				for (uint32_t i = 0; i < grain; ++i) {
 					pcm[i * output.num_channels + dst] += voice->samples[src * grain + i] * level;
 				}
@@ -2172,6 +2353,7 @@ int KYTY_SYSV_ABI Ngs2PanInit(Ngs2PanWork* work, const float* speaker_angles, fl
 	return OK;
 }
 
+// Calculates normalized speaker gains for each supplied panning angle.
 int KYTY_SYSV_ABI Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* params,
                                          uint32_t num_params, uint32_t matrix_format,
                                          float* out_volume_matrix) {
@@ -2184,9 +2366,25 @@ int KYTY_SYSV_ABI Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* 
 	EXIT_NOT_IMPLEMENTED(out_volume_matrix == nullptr && num_params != 0);
 
 	const auto channels = (matrix_format == 0 ? 2u : std::min<uint32_t>(matrix_format, 8));
+	EXIT_NOT_IMPLEMENTED(work == nullptr || work->num_speakers == 0 || work->unit_angle <= 0.0f);
+
+	constexpr float pi = 3.14159265358979323846f;
 	for (uint32_t p = 0; p < num_params; p++) {
+		float sum_squares = 0.0f;
+		std::fill_n(out_volume_matrix + p * channels, channels, 0.0f);
+		for (uint32_t c = 0; c < std::min(channels, work->num_speakers); c++) {
+			const float delta =
+			    std::remainder(params[p].angle - work->speaker_angles[c], work->unit_angle);
+			const float level = std::max(0.0f, std::cos(delta * pi / work->unit_angle));
+			out_volume_matrix[p * channels + c] = level;
+			sum_squares += level * level;
+		}
+		if (sum_squares == 0.0f) {
+			out_volume_matrix[p * channels] = 1.0f;
+			sum_squares                     = 1.0f;
+		}
 		for (uint32_t c = 0; c < channels; c++) {
-			out_volume_matrix[p * channels + c] = (c == 0 ? 1.0f : 0.0f);
+			out_volume_matrix[p * channels + c] /= std::sqrt(sum_squares);
 		}
 	}
 
@@ -2304,6 +2502,7 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
 	return OK;
 }
 
+// Applies a linked list of setup, routing, and control parameters to a voice.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamHeader* param_list) {
 	PRINT_NAME();
@@ -2372,8 +2571,19 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePatchParam));
 						const auto* patch = reinterpret_cast<const Ngs2VoicePatchParam*>(param);
 						EXIT_NOT_IMPLEMENTED(patch->port >= voice->ports.size());
-						voice->ports[patch->port].dest =
-						    reinterpret_cast<Ngs2VoiceInternal*>(patch->dest_handle);
+						auto* dest = reinterpret_cast<Ngs2VoiceInternal*>(patch->dest_handle);
+						{
+							Common::LockGuard racks_lock(g_racks_mutex);
+							for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+								if (reinterpret_cast<uintptr_t>(rack) == patch->dest_handle &&
+								    rack->type == Ngs2RackType::Mastering) {
+									EXIT_NOT_IMPLEMENTED(rack->option.common.max_voices == 0);
+									dest = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+									break;
+								}
+							}
+						}
+						voice->ports[patch->port].dest = dest;
 						voice->ports[patch->port].input = patch->dest_input_id;
 						LOGF("\t connect->port          = %u\n"
 						     "\t connect->dest_input_id = %u\n"
@@ -2421,18 +2631,52 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				}
 				break;
 			}
-			case 0x2001: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Reverb); break;
+			case 0x2001: {
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Reverb);
+				switch (param->id & 0xffffu) {
+					case 0: {
+						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2ReverbVoiceSetupParam));
+						const auto& setup =
+						    *reinterpret_cast<const Ngs2ReverbVoiceSetupParam*>(param);
+						EXIT_NOT_IMPLEMENTED(setup.num_io_channels == 0 ||
+						                     setup.num_io_channels > 8);
+						voice->ResetSetupState();
+						voice->channels = setup.num_io_channels;
+						break;
+					}
+					case 1:
+						// The dry signal is routed while reverb parameters remain unimplemented.
+						break;
+					default: EXIT("unsupported reverb control: 0x%08" PRIx32 "\n", param->id);
+				}
+				break;
+			}
 			case 0x3000: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Mastering);
 				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
 				switch (param->id & 0xffffu) {
-					case 0: voice->channels = values[0]; break;
+					case 0:
+						EXIT_NOT_IMPLEMENTED(param->size < sizeof(Ngs2VoiceParamHeader) + sizeof(uint32_t));
+						EXIT_NOT_IMPLEMENTED(values[0] == 0 ||
+						                     values[0] > voice->rack->option.mastering.max_channels);
+						voice->channels = values[0];
+						voice->SetEvent(1);
+						break;
 					case 1: {
 						const auto* matrix =
 						    reinterpret_cast<const Ngs2VoiceMatrixLevelsParam*>(param);
 						EXIT_NOT_IMPLEMENTED(matrix->matrix_id != 5);
 						voice->output_matrix.assign(matrix->levels,
 						                            matrix->levels + matrix->num_levels);
+						break;
+					}
+					case 4: {
+						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2MasteringVoiceGainParam));
+						const auto* gain = reinterpret_cast<const Ngs2MasteringVoiceGainParam*>(param);
+						EXIT_NOT_IMPLEMENTED(!std::isfinite(gain->fbw_level) ||
+						                     !std::isfinite(gain->lfe_level));
+						voice->fbw_level = gain->fbw_level;
+						voice->lfe_level = gain->lfe_level;
 						break;
 					}
 					case 5: voice->output_id = values[0]; break;
@@ -2740,6 +2984,52 @@ int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle) {
 	}
 
 	ngs->mutex.Unlock();
+
+	return OK;
+}
+
+// Retrieves the routing, gain, matrix, and destination handle for a voice port.
+int KYTY_SYSV_ABI Ngs2VoiceGetPortInfo(uintptr_t voice_handle, uint32_t port,
+                                       Ngs2VoicePortInfo* info, size_t info_size) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(info == nullptr);
+	EXIT_NOT_IMPLEMENTED(voice_handle == 0);
+	EXIT_NOT_IMPLEMENTED(info_size != sizeof(Ngs2VoicePortInfo));
+
+	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
+
+	Common::LockGuard lock(voice->rack->ngs->mutex);
+
+	EXIT_NOT_IMPLEMENTED(port >= voice->ports.size());
+
+	const auto& source = voice->ports[port];
+	*info = {source.matrix, source.volume, 0, source.input,
+	         reinterpret_cast<uintptr_t>(source.dest)};
+
+	return OK;
+}
+
+// Retrieves voice metadata selected by an NGS2 information identifier.
+int KYTY_SYSV_ABI Ngs2VoiceQueryInfo(uintptr_t voice_handle, uint32_t info_id, void* info,
+                                     size_t info_size) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(info == nullptr);
+	EXIT_NOT_IMPLEMENTED(voice_handle == 0);
+
+	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
+
+	Common::LockGuard lock(voice->rack->ngs->mutex);
+
+	switch (info_id) {
+		case 0x4001: {
+			EXIT_NOT_IMPLEMENTED(info_size != sizeof(Ngs2VoiceChannelsInfo));
+			*static_cast<Ngs2VoiceChannelsInfo*>(info) = {voice->channels, 0};
+			break;
+		}
+		default: EXIT("unsupported voice info: 0x%08" PRIx32 "\n", info_id);
+	}
 
 	return OK;
 }

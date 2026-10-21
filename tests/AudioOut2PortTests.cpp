@@ -605,6 +605,25 @@ void TestObjectBusRouting() {
 	Check(LiveDeviceCount() == 0, "object bus device leaked");
 }
 
+// Verifies handle zero remains valid for output, context teardown, and device cleanup.
+void TestZeroAudioHandleIsValid() {
+	Check(LiveDeviceCount() == 0, "zero-handle test started with a live device");
+	g_next_device = 0;
+
+	const auto context = CreateContext(1, 1);
+	auto       param   = MakeParam(0x100);
+	param.port_type    = 0x100;
+	std::vector<float> pcm(512, 0.25f);
+	SetPcm(CreatePort(context, param), pcm.data());
+
+	constexpr auto bytes = 512 * 2 * sizeof(float);
+	CheckSamples(PushPcm(context, bytes).at(0), {0.17677669f},
+	             "zero-valued audio handle did not queue object PCM");
+	AudioOut2::AudioOut2ContextDestroy(context);
+	Check(LiveDeviceCount() == 0, "zero-valued audio handle was not closed");
+	g_next_device = 1;
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -683,6 +702,7 @@ int main() {
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
+	TestZeroAudioHandleIsValid();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

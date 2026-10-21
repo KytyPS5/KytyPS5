@@ -234,6 +234,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_image_index_version++;
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -255,6 +256,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_index_version++;
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -438,13 +440,20 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		return {};
 	}
 
+	ImageIds result;
+	auto&    query = m_region_queries[((address >> 14u) ^ (size >> 10u)) % m_region_queries.size()];
+	if (query.version == m_image_index_version && query.address == address &&
+	    query.size == size && query.page_overlap == page_overlap) {
+		for (const auto id: query.ids) result.push_back(id);
+		return result;
+	}
+
 	uint32_t query_epoch = ++m_image_query_epoch;
 	if (query_epoch == 0) {
 		m_slot_images.ForEach([](ImageId, const Image& image) { image.query_epoch = 0; });
 		query_epoch = ++m_image_query_epoch;
 	}
 
-	ImageIds result;
 	ForEachPage(address, size, [&](uint64_t page) {
 		const auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr) {
@@ -464,6 +473,12 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 			}
 		});
 	});
+	query.address      = address;
+	query.size         = size;
+	query.page_overlap = page_overlap;
+	query.version      = m_image_index_version;
+	query.ids.clear();
+	for (const auto id: result) query.ids.push_back(id);
 	return result;
 }
 

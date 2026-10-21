@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/writeWatchSet.h"
 
+#include <array>
 #include <bitset>
 #include <map>
 #include <type_traits>
@@ -221,6 +222,17 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// Recent FindImagesInRegion answers. Image ranges do not change while an image is
+	// registered, so an answer holds until an image is registered or unregistered.
+	struct RegionQuery {
+		uint64_t             address      = 0;
+		uint64_t             size         = 0;
+		uint64_t             version      = 0;
+		bool                 page_overlap = false;
+		std::vector<ImageId> ids;
+	};
+	mutable std::array<RegionQuery, 64> m_region_queries {};
+	uint64_t                            m_image_index_version = 1;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

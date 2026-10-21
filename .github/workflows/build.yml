@@ -524,7 +524,9 @@ jobs:
       - name: Create release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The Actions token may not tag a commit whose workflows differ from the default
+          # branch, so a branch that changes them releases with a token allowed to
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           assets=()

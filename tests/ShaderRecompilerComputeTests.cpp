@@ -275,6 +275,10 @@ struct TextureCacheTestAccess {
     }
   }
 
+  static void MakeIdle(TextureCache &cache, ImageId id) {
+    cache.m_slot_images[id].tick_accessed_last = 0;
+  }
+
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
@@ -7259,6 +7263,47 @@ public:
                         std::vector<u32>(chain_width, chain_low_value),
                 "an equal-size one-level texture reused a cached image with a different mip "
                 "layout");
+
+        // An idle GPU-written chain replaced by a one-level texture is retired, and its
+        // contents reach the new image instead of being dropped or left behind as a stale
+        // copy that range lookups or GC could download over newer data.
+        constexpr uint64_t written_offset = chain_offset + 0x400;
+        constexpr uint32_t written_value = 0x55555555u;
+        auto* written_memory = reinterpret_cast<uint32_t*>(memory + written_offset);
+        std::fill_n(written_memory, 2 * chain_row / sizeof(uint32_t), chain_low_value);
+        auto written_chain = two_level;
+        written_chain.info.data.address = base + written_offset;
+        written_chain.info.UpdateSize();
+        const auto written_chain_image = texture_cache.FindImage(written_chain);
+        (void)texture_cache.FindTexture(written_chain_image, written_chain);
+        vk::ClearColorValue written_clear {};
+        for (auto& channel: written_clear.uint32) {
+          channel = written_value;
+        }
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), written_chain_image,
+            vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1},
+            written_clear);
+        texture_cache.MarkGpuWritten(written_chain_image);
+        while (scheduler.CurrentTick() <= 64) {
+          scheduler.Flush();
+        }
+        TextureCacheTestAccess::MakeIdle(texture_cache, written_chain_image);
+
+        auto written_one_level = one_level;
+        written_one_level.info.data.address = base + written_offset;
+        written_one_level.info.UpdateSize();
+        const auto written_one_level_image = texture_cache.FindImage(written_one_level);
+        (void)texture_cache.FindTexture(written_one_level_image, written_one_level);
+        Require(name, "idle GPU-written chain replaced by a one-level texture",
+                written_one_level_image != written_chain_image &&
+                    !TextureCacheTestAccess::Contains(texture_cache, written_chain_image) &&
+                    texture_cache.FindImageFromRange(base + written_offset, chain_row) ==
+                        written_one_level_image &&
+                    ReadCachedTexel(name, context, written_one_level_image, {},
+                                    {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, written_value),
+                "a retired GPU-written chain was kept or its contents were lost");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

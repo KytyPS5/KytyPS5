@@ -815,17 +815,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// cached image cannot serve the request.
 		const bool shared_levels_differ =
 		    requested.resources.levels != cached.info.resources.levels &&
-		    requested.resources.layers == cached.info.resources.layers &&
 		    !SharedLevelsMatch(requested, cached.info);
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
 		                 cached.info.mip_layout.begin(), SameMipPlacement)) ||
 		    shared_levels_differ) {
-			// The request becomes a separate image. Retire an idle cached image only when it
-			// mirrors guest memory; GPU-written contents stay until texture GC downloads them.
-			if (safe_to_delete && !cached.IsGpuModified()) {
-				FreeImage(cached_id);
+			// The request becomes a separate image. An idle cached image is retired; GPU-written
+			// contents are published to the buffer cache first, so the new image uploads them and
+			// no stale copy is left for range lookups or texture GC to download later.
+			if (safe_to_delete) {
+				BcAlias::Resolve(*this, cached_id, merged_id);
 			}
 			return {merged_id};
 		}

@@ -159,6 +159,8 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
+	// Loop iterations this invocation may still run (see LoopBudget in spirvEmitterProgram.cpp).
+	uint32_t                                         loop_budget_variable    = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;

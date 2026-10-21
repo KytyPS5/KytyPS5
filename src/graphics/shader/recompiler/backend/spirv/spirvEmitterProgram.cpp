@@ -160,9 +160,41 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+
+// A guest loop that never ends hangs the host GPU, and the driver then loses the device: the
+// whole emulator stops. Correct shaders end their loops; one fed corrupt data may not. Every
+// invocation may run LoopBudget iterations of its loops in all, and then each loop leaves at
+// its next exit. Exits keep their edges, only their conditions change, so the structure holds.
+constexpr uint32_t LoopBudget = 1u << 20u;
+
+// In a loop header: one iteration of the budget is spent, until none is left.
+void SpendLoopBudget(EmitterState& state) {
+	const auto left  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), left, state.loop_budget_variable);
+	const auto some  = Binary(state, spv::OpINotEqual, TypeBool(state), left, ConstantU32(state, 0));
+	const auto spent = Select(state, TypeU32(state), some, ConstantU32(state, 1), ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable,
+	                          Binary(state, spv::OpISub, TypeU32(state), left, spent));
+}
+
+uint32_t LoopBudgetSpent(EmitterState& state) {
+	const auto left = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), left, state.loop_budget_variable);
+	return Binary(state, spv::OpIEqual, TypeBool(state), left, ConstantU32(state, 0));
+}
+
+bool IsLoopMerge(const IR::Program& program, const IR::Block* block) {
+	return std::ranges::any_of(program.blocks, [block](const IR::Block* header) {
+		return header->terminator.loop_header && header->terminator.merge_block == block;
+	});
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
+		if (term.loop_header && ctx.state.loop_budget_variable != 0) {
+			SpendLoopBudget(ctx.state);
+		}
 		if (term.loop_header) {
 			const auto* merge = term.merge_block;
 			const auto* cont  = term.continue_block;
@@ -195,7 +227,16 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto       condition   = ctx.Def(block->condition);
+			const bool true_exits  = IsLoopMerge(ctx.state.program, true_block);
+			const bool false_exits = IsLoopMerge(ctx.state.program, false_block);
+			if (ctx.state.loop_budget_variable != 0 && true_exits != false_exits) {
+				const auto spent = LoopBudgetSpent(ctx.state);
+				condition = true_exits
+				                ? Binary(ctx.state, spv::OpLogicalOr, TypeBool(ctx.state), condition, spent)
+				                : Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), condition,
+				                         Unary(ctx.state, spv::OpLogicalNot, TypeBool(ctx.state), spent));
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -425,9 +466,13 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	if (state.loop_budget_variable != 0) {
+		done = Binary(state, spv::OpLogicalOr, TypeBool(state), done, LoopBudgetSpent(state));
+		SpendLoopBudget(state);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -783,6 +828,13 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.program.dispatcher_fallback ||
+	    std::ranges::any_of(program.blocks, [](const IR::Block* block) { return block->terminator.loop_header; })) {
+		state.loop_budget_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_budget_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -811,6 +863,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, LoopBudget));
 	}
 	if (state.subgroup_local_invocation_id_variable != 0 && LaneIndexFromScan(state)) {
 		// The lane index is the number of active invocations below this one, here where all

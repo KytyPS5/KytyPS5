@@ -26872,6 +26872,83 @@ TestCase WaveMinThroughDppAndReadlane() {
   return test;
 }
 
+// The wave-wide inclusive scan of EA SPORTS FC 25's decoupled look-back prefix sum: DPP row
+// shifts, a permlanex16 into rows 1 and 3, the low half's total added to the high half, and
+// lane 63 read for the wave's total. Lanes outside the starting EXEC add zero.
+TestCase WaveScanThroughDppPermlaneReadlane(u32 active_lanes) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 9, 0);                               // v9 = lane
+  code.push_back(EncodeVop1(0x01, 9, Vgpr(0)));
+  code.push_back(EncodeVop2(0x25, 10, InlineU32(1), 9));    // v10 = lane + 1
+  if (active_lanes != 64u) {
+    code.push_back(EncodeSop1(0x03, 126, 255u));
+    code.push_back(active_lanes >= 32u ? 0xffffffffu : (1u << active_lanes) - 1u);
+    code.push_back(EncodeSop1(0x03, 127, 255u));
+    code.push_back(active_lanes > 32u ? (1u << (active_lanes - 32u)) - 1u : 0u);
+  }
+  // FC 25 CS 9e22582ebaa47267, 0x1e4-0x22c and 0x238.
+  code.insert(code.end(), {0xbeea287eu,                     // s_orn2_saveexec_b64 vcc, exec
+                           0x02281480u,                     // v_cndmask_b32 v20, 0, v10, vcc
+                           0x4a2828fau, 0xff011114u,        // v_add_nc_u32_dpp row_shr:1
+                           0x4a2828fau, 0xff011214u,        // row_shr:2
+                           0x4a2828fau, 0xff011414u,        // row_shr:4
+                           0x4a2828fau, 0xff011814u,        // row_shr:8
+                           0xd7781013u, 0x03058314u,        // v_permlanex16_b32 v19, v20, -1, -1
+                           0x4a2826fau, 0xaf00e414u,        // v_add_nc_u32_dpp row_mask:0xa
+                           0x92fea0a0u,                     // s_bfm_b64 exec, 32, 32
+                           0xd7600000u, 0x00013f14u,        // v_readlane_b32 s0, v20, 31
+                           0x4a282800u,                     // v_add_nc_u32 v20, s0, v20
+                           0xbefe046au,                     // s_mov_b64 exec, vcc
+                           0xd760006au, 0x00017f14u});      // v_readlane_b32 vcc_lo, v20, 63
+  code.push_back(EncodeSop1(0x04, 126, 0xc1u));             // EXEC = all lanes
+  AppendStoreVgprAtLaneDwordOffset(&code, 20, 9, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 106, 9, 64);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = active_lanes == 64u ? "WaveScanThroughDppPermlaneReadlane64"
+                                  : "WaveScanThroughDppPermlaneReadlane40";
+  test.code = std::move(code);
+  u32 sum = 0;
+  for (u32 lane = 0; lane < 64u; ++lane) {
+    if (lane < active_lanes) sum += lane + 1u;
+    test.expected.push_back(sum);
+  }
+  test.expected.resize(128, sum);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64,
+                  O::V_CNDMASK_B32, O::V_PERMLANEX16_B32, O::S_BFM_B64, O::V_READLANE_B32,
+                  O::S_MOV_B64, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A loop that would run 2^32 times ends after the loop budget instead: a guest loop fed corrupt
+// data must not hang the host GPU.
+TestCase EndlessLoopEndsAfterLoopBudget() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(0, InlineU32(0)));
+  code.push_back(EncodeSop2(0x00, 0, 0, InlineU32(1)));   // s_add_u32 s0, s0, 1
+  code.push_back(EncodeSopc(0x06, 0, InlineU32(0)));      // s_cmp_eq_u32 s0, 0
+  code.push_back(EncodeSopp(0x04, 0xfffdu));              // s_cbranch_scc0 back to the add
+  AppendStoreSgpr(&code, 0, 0);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "EndlessLoopEndsAfterLoopBudget";
+  test.code = std::move(code);
+  test.expected = {1u << 20u};
+  test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorPermlane16FetchInactiveZero() {
   using O = ShaderOpcode;
 
@@ -40453,6 +40530,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
   AddCase(WaveMinThroughDppAndReadlane);
+  AddCase(EndlessLoopEndsAfterLoopBudget);
+  AddCase(+[]() -> TestCase { return WaveScanThroughDppPermlaneReadlane(64u); });
+  AddCase(+[]() -> TestCase { return WaveScanThroughDppPermlaneReadlane(40u); });
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));

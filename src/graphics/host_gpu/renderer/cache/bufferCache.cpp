@@ -1035,6 +1035,16 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	// Memory that GDS is saved to, the counters of append buffers, is also reset by the CPU
+	// before the next submission loads it back (FC 25). Where the buffer is guest memory itself,
+	// the CPU's zero lands at once and the save, still queued on a GPU that runs further behind
+	// than the PS5's, overwrites it: the counters grew every frame until a draw or dispatch of
+	// millions of elements hung the GPU. As a copy, a CPU write to it waits for the save and
+	// reaches the GPU in GPU order.
+	if (src_gds && dst->IsGuestBacked() && !m_copy_only.Intersects(dst->CpuAddress(), dst->Size())) {
+		m_copy_only.Add(dst->CpuAddress(), dst->Size());
+		m_demote.push_back(FindBuffer(dst_vaddr, size)); // obtaining it can have joined buffers
+	}
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {

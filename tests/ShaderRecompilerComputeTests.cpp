@@ -15943,14 +15943,37 @@ public:
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::Dynamic;
       mipped_storage_resource.mip_count = 3;
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
+      {
         auto linear_view = overwide_mipped_storage_descriptor;
         linear_view.dwords[3] &= ~(0x1fu << 20u);
-        (void)RenderExecutorTestAccess::ResolveTexture(executor, mipped_storage_resource,
-                                                       linear_view);
-      });
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        ExpectFatal("LinearStorageViewPastPhysicalMips", [&] {
+          (void)RenderExecutorTestAccess::ResolveTexture(executor, mipped_storage_resource, linear_view);
+        });
 #endif
+        linear_view.dwords[3] = (linear_view.dwords[3] & ~(0xfu << 16u)) | (3u << 16u);
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, mipped_storage_resource, linear_view);
+        Require(name, "linear storage view stays within the mip chain",
+                binding.desc.info.resources.levels == 4 &&
+                    binding.desc.view_info.base_level == 1 &&
+                    binding.desc.view_info.level_count == 3,
+                "linear storage lost its physical mip range");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        auto invalid_base = linear_view;
+        invalid_base.dwords[3] = (invalid_base.dwords[3] & ~(0xffu << 12u)) | (4u << 12u) | (4u << 16u);
+        ExpectFatal("LinearStorageBasePastPhysicalMips", [&] {
+          (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, invalid_base);
+        });
+#endif
+        linear_view.dwords[3] = (linear_view.dwords[3] & ~(0xfu << 12u)) | (3u << 12u);
+        const auto last = RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
+                                                                   linear_view);
+        Require(name, "linear storage base at MAX_MIP",
+                last.desc.info.resources.levels == 4 &&
+                    last.desc.view_info.base_level == 3 && last.desc.view_info.level_count == 1,
+                "linear storage rejected its last physical mip");
+      }
       auto sampled_overwide_resource = storage_resource;
       sampled_overwide_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -15958,6 +15981,118 @@ public:
           Prospero::TextureNumericClass::Uint;
       sampled_overwide_resource.read = true;
       sampled_overwide_resource.written = false;
+      {
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dword_count = 8;
+        descriptor.dwords = {
+            static_cast<uint32_t>((base + 0xe80000) >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u) |
+                (3u << 30u),
+            (255u >> 2u) | (143u << 14u),
+            DstSel(4, 5, 6, 7) |
+                (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0};
+        const auto physical = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = tail_gpu_value;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), physical.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        auto invalid_base = descriptor;
+        invalid_base.dwords[3] |= (1u << 12u) | (1u << 16u);
+        ExpectFatal("LinearSampledBasePastPhysicalMips", [&] {
+          (void)RenderExecutorTestAccess::ResolveTexture(
+              executor, sampled_overwide_resource, invalid_base);
+        });
+#endif
+        descriptor.dwords[3] |= 1u << 16u;
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        Require(name, "linear sampled view preserves physical mip allocation",
+                binding.image_id == physical.image_id &&
+                    binding.desc.info.resources.levels == 1 &&
+                    binding.desc.info.data == physical.desc.info.data &&
+                    binding.desc.info.mip_layout == physical.desc.info.mip_layout &&
+                    binding.desc.view_info.base_level == 0 &&
+                    binding.desc.view_info.level_count == 1 &&
+                    texture_cache.FindTexture(binding.image_id, binding.desc) != nullptr &&
+                    ReadCachedTexel(name, context, binding.image_id, {}, {1, 1, 1}) ==
+                        std::vector<u32>{tail_gpu_value},
+                "an over-wide linear sampled view changed storage or lost GPU writes");
+      }
+      {
+        auto physical_descriptor = mipped_storage_descriptor;
+        physical_descriptor.dwords[0] = static_cast<uint32_t>((base + 0x200000) >> 8u);
+        physical_descriptor.dwords[2] = (255u >> 2u) | (255u << 14u);
+        physical_descriptor.dwords[3] = DstSel(4, 5, 6, 7) | (1u << 16u) |
+            (static_cast<uint32_t>(Prospero::TileMode::kStandard4KB) << 20u) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+        physical_descriptor.dwords[5] = 0x00700010u;
+        const auto physical = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, physical_descriptor);
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = tail_gpu_value;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), physical.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1}, clear);
+        auto descriptor = physical_descriptor;
+        descriptor.dwords[3] = (descriptor.dwords[3] & ~(0xfu << 16u)) | (8u << 16u);
+        for (const uint32_t first : {0u, 1u}) {
+          descriptor.dwords[3] = (descriptor.dwords[3] & ~(0xfu << 12u)) | (first << 12u);
+          const auto binding = RenderExecutorTestAccess::ResolveTexture(
+              executor, sampled_overwide_resource, descriptor);
+          Require(name, "sampled view preserves physical mip allocation",
+                  binding.image_id == physical.image_id &&
+                      binding.desc.info.resources.levels == 2 &&
+                      binding.desc.info.data == physical.desc.info.data &&
+                      binding.desc.info.mip_layout == physical.desc.info.mip_layout &&
+                      binding.desc.view_info.base_level == first &&
+                      binding.desc.view_info.level_count == 2u - first &&
+                      texture_cache.FindTexture(binding.image_id, binding.desc) != nullptr &&
+                      ReadCachedTexel(name, context, binding.image_id, {}, {1, 1, 1}, 0, first) ==
+                          std::vector<u32>{tail_gpu_value},
+                  "an over-wide sampled view moved physical mips or lost GPU writes");
+          auto streamed_descriptor = descriptor;
+          streamed_descriptor.dwords[1] |= 8u << 16u;
+          const auto streamed = RenderExecutorTestAccess::ResolveTexture(
+              executor, sampled_overwide_resource, streamed_descriptor);
+          Require(name, "streaming minimum LOD stays inside the physical view",
+                  streamed.image_id == physical.image_id &&
+                      streamed.desc.view_info.min_lod == (1u - first) * 256u &&
+                      texture_cache.FindTexture(streamed.image_id, streamed.desc) != nullptr,
+                  "clipping a sampled view left its minimum LOD outside the Vulkan view");
+          ShaderRecompiler::IR::Program dynamic_program{};
+          dynamic_program.stage = ShaderType::Compute;
+          auto dynamic_resource = sampled_overwide_resource;
+          dynamic_resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::Dynamic;
+          dynamic_resource.mip_count = 9u - first;
+          dynamic_program.info.images.push_back(dynamic_resource);
+          set_image_bindings(dynamic_program);
+          ShaderModule dynamic_module;
+          auto &dynamic_info = dynamic_module.info;
+          dynamic_info.stage = dynamic_program.stage;
+          dynamic_info.info = std::move(dynamic_program.info);
+          dynamic_info.bindings = std::move(dynamic_program.bindings);
+          ShaderRecompiler::IR::ResourceSnapshot dynamic_snapshot;
+          dynamic_snapshot.images.push_back(descriptor);
+          ShaderStageRuntime dynamic_runtime{&dynamic_module, &dynamic_snapshot};
+          PreparedBindings dynamic_bindings;
+          executor.PrepareBindings(dynamic_runtime, dynamic_bindings);
+          executor.RebindImages(dynamic_bindings);
+          auto &dynamic = dynamic_bindings.images[0];
+          dynamic.layout = vk::ImageLayout::eGeneral;
+          Require(name, "truncated dynamic mip descriptors",
+                  dynamic.mip_views.size() == 9u - first && dynamic.mip_views[0] != nullptr &&
+                      MakeImageInfo(dynamic, 1u - first).imageView != nullptr &&
+                      MakeImageInfo(dynamic, 2u - first).imageView == nullptr &&
+                      MakeImageInfo(dynamic, 8u - first).imageView == nullptr,
+                  "truncated physical mips changed the descriptor count or acquired invalid views");
+          descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+              executor, scheduler.Current(), dynamic_bindings));
+        }
+      }
       {
         // MLB The Show 21 compresses a standalone final block through mip 9.
         constexpr uint64_t address = base + 0x180000;
@@ -53320,6 +53455,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--subresource-overlap-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTextureCacheSubresourceOverlap();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-mip-views-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {

@@ -724,6 +724,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
+	add_test(NAME texture_mip_views
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-mip-views-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback

@@ -87,6 +87,7 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 		}
 	} else if (element < texture.mip_views.size()) {
 		view = texture.mip_views[element];
+		if (view == nullptr) return {nullptr, nullptr, vk::ImageLayout::eGeneral};
 	}
 	EXIT_IF(view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
 	return {nullptr, view, texture.layout};
@@ -365,7 +366,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	const auto base_lod = view.base_level * 256u;
 	if (descriptor.MinLod() > base_lod) {
-		view.min_lod = descriptor.MinLod() - base_lod;
+		view.min_lod = std::min(descriptor.MinLod() - base_lod, (view_levels - 1u) * 256u);
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
@@ -418,10 +419,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 }
 
 static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
-                                  uint32_t view_levels, uint32_t& base_level) {
-	if (!info.IsTiled()) {
-		return false;
-	}
+                                  uint32_t& view_levels, uint32_t& base_level, bool sampled) {
 	ImageInfo physical        = info;
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
@@ -435,7 +433,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 		       left.surface_z == right.surface_z &&
 		       physical.MipExtent(target) == info.MipExtent(source);
 	};
-	if (physical.first_tail_level == info.first_tail_level &&
+	if (info.IsTiled() && physical.first_tail_level == info.first_tail_level &&
 	    physical.tiled_slice_stride == info.tiled_slice_stride &&
 	    physical.data.size == info.data.size) {
 		bool matches = true;
@@ -445,6 +443,15 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 		if (matches) {
 			return true;
 		}
+	}
+	if (sampled && base_level < physical_levels && view_levels > physical_levels - base_level) {
+		// An over-wide view must not move the mips described by MAX_MIP.
+		info        = std::move(physical);
+		view_levels = physical_levels - base_level;
+		return true;
+	}
+	if (!info.IsTiled()) {
+		return false;
 	}
 	if (metadata ||
 	    (info.TransferLayers() > 1 && physical.tiled_slice_stride != info.tiled_slice_stride)) {
@@ -500,9 +507,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
-	const auto view_levels = multisampled || single_storage_mip
-	                             ? 1u
-	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
+	auto view_levels = multisampled || single_storage_mip
+	                       ? 1u
+	                       : static_cast<uint32_t>(last_level - base_level) + 1u;
 	auto levels =
 	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
 	const auto tile       = descriptor.TileMode();
@@ -583,7 +590,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
-		                           view_base)) {
+		                           view_base, !storage)) {
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,
@@ -859,15 +866,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
-			binding.mip_views.reserve(resource.mip_count);
-			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
+			        binding.desc.view_info.level_count > resource.mip_count);
+			// Keep unavailable physical mips as null descriptor slots.
+			binding.mip_views.resize(resource.mip_count);
+			for (uint32_t mip = 0; mip < binding.desc.view_info.level_count; mip++) {
 				auto desc = binding.desc;
 				desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
 				desc.view_info.min_lod = 0;
-				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
+				binding.mip_views[mip] = texture_cache.FindTexture(binding.image_id, desc);
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {

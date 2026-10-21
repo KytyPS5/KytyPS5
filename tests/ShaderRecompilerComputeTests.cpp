@@ -7201,6 +7201,51 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
+      // Guest mip chains run backwards, so a one-level texture at the same address as a cached
+      // two-level image keeps its base level at a different offset. The cached image must not
+      // serve it. (Octopath Traveler II streams one-level textures into memory that a
+      // full-chain texture used; reading the old chain's base level showed half of another
+      // texture on the ground.)
+      {
+        constexpr uint64_t chain_offset = 0x1a30000;
+        constexpr uint32_t chain_width = 64;
+        constexpr uint32_t chain_row = 256;  // linear rows align to 256 bytes
+        constexpr uint32_t chain_low_value = 0x11111111u;   // bytes [0, 256)
+        constexpr uint32_t chain_high_value = 0x22222222u;  // bytes [256, 512)
+        auto* chain_memory = reinterpret_cast<uint32_t*>(memory + chain_offset);
+        std::fill_n(chain_memory, chain_row / sizeof(uint32_t), chain_low_value);
+        std::fill_n(chain_memory + chain_row / sizeof(uint32_t), chain_row / sizeof(uint32_t),
+                    chain_high_value);
+
+        auto two_level = MakeLinearDesc(
+            base + chain_offset, 2 * chain_row, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {chain_width, 1, 1}, 1, 4, 1);
+        two_level.info.resources.levels = 2;
+        two_level.info.mip_layout[0] = {chain_row, chain_row, chain_width, 1};
+        two_level.info.mip_layout[1] = {0, chain_row, chain_width / 2, 1};
+        two_level.view_info.level_count = 2;
+        two_level.info.UpdateSize();
+        const auto two_level_image = texture_cache.FindImage(two_level);
+        (void)texture_cache.FindTexture(two_level_image, two_level);
+        Require(name, "two-level chain base level",
+                ReadCachedTexel(name, context, two_level_image, {}, {chain_width, 1, 1}) ==
+                    std::vector<u32>(chain_width, chain_high_value),
+                "two-level image did not read its base level from the end of the chain");
+
+        auto one_level = MakeLinearDesc(
+            base + chain_offset, chain_row, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {chain_width, 1, 1}, 1, 4, 1);
+        const auto one_level_image = texture_cache.FindImage(one_level);
+        (void)texture_cache.FindTexture(one_level_image, one_level);
+        Require(name, "one-level texture over a longer chain",
+                one_level_image != two_level_image &&
+                    ReadCachedTexel(name, context, one_level_image, {}, {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, chain_low_value),
+                "a one-level texture was served by a cached image with a different mip layout");
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,

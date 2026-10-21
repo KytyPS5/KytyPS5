@@ -945,11 +945,7 @@ void DefineModule(EmitterState& state) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);
 	}
-	if (state.native_float16) {
-		state.builder.RequireCapability(spv::CapabilityFloat16);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
-		                               16u);
-	}
+	if (state.native_float16) DeclareFloat16(state);
 	if (state.program.info.float64 && !state.soft_float64) {
 		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic.
 		state.builder.RequireCapability(spv::CapabilityFloat64);

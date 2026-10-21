@@ -597,7 +597,11 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	auto pixel_format = surface_format.vk_format;
-	if (resource.depth_compare) {
+	// A 1D image cannot be a depth attachment (Contra: Operation Galuga compares against a 1D
+	// k16UNorm texture): it keeps its color format.
+	const bool one_dimensional = type == Prospero::ImageType::kColor1D ||
+	                             type == Prospero::ImageType::kColor1DArray;
+	if (resource.depth_compare && !one_dimensional) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
 			pixel_format = depth_format->depth_attachment_format;
 		}

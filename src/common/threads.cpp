@@ -18,8 +18,13 @@
 #include <string>
 #include <thread>
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <pthread.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#include <process.h>
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
@@ -376,6 +381,65 @@ void CondVar::SignalAll() {
 int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
+}
+
+struct ThreadWithStackPrivate {
+	ThreadWithStackPrivate(thread_func_t f, void* a): func(f), arg(a) {}
+
+	thread_func_t func;
+	void*         arg;
+	bool          joined = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE handle = nullptr;
+
+	static unsigned __stdcall Run(void* data) {
+		auto* t = static_cast<ThreadWithStackPrivate*>(data);
+		t->func(t->arg);
+		return 0;
+	}
+#else
+	pthread_t thread {};
+
+	static void* Run(void* data) {
+		auto* t = static_cast<ThreadWithStackPrivate*>(data);
+		t->func(t->arg);
+		return nullptr;
+	}
+#endif
+};
+
+ThreadWithStack::ThreadWithStack(thread_func_t func, void* arg, size_t stack_size)
+    : m_thread(std::make_unique<ThreadWithStackPrivate>(func, arg)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Reserve the stack; pages are committed as the thread uses them.
+	m_thread->handle = reinterpret_cast<HANDLE>(
+	    _beginthreadex(nullptr, static_cast<unsigned>(stack_size), ThreadWithStackPrivate::Run,
+	                   m_thread.get(), STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
+	EXIT_IF(m_thread->handle == nullptr);
+#else
+	pthread_attr_t attr;
+	EXIT_IF(pthread_attr_init(&attr) != 0);
+	EXIT_IF(pthread_attr_setstacksize(&attr, stack_size) != 0);
+	EXIT_IF(pthread_create(&m_thread->thread, &attr, ThreadWithStackPrivate::Run, m_thread.get()) !=
+	        0);
+	pthread_attr_destroy(&attr);
+#endif
+}
+
+ThreadWithStack::~ThreadWithStack() {
+	Join();
+}
+
+void ThreadWithStack::Join() {
+	if (m_thread->joined) return;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(GetThreadId(m_thread->handle) == GetCurrentThreadId());
+	EXIT_IF(WaitForSingleObject(m_thread->handle, INFINITE) != WAIT_OBJECT_0);
+	CloseHandle(m_thread->handle);
+#else
+	EXIT_IF(pthread_join(m_thread->thread, nullptr) != 0);
+#endif
+	m_thread->joined = true;
 }
 
 } // namespace Common

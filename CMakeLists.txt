@@ -198,6 +198,8 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 endif()
 
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
+# Only the shipped programs are link-time optimized: tests and libraries link quickly
+option(KYTY_LTO "Link-time optimize kyty_emulator, launcher and kyty_updater" OFF)
 
 config_compiler_and_linker()
 
@@ -1066,6 +1068,13 @@ if(KYTY_BUILD_LAUNCHER)
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
 	endif()
+endif()
+if(KYTY_LTO)
+	foreach(kyty_shipped_target kyty_emulator launcher kyty_updater)
+		if(TARGET ${kyty_shipped_target})
+			set_property(TARGET ${kyty_shipped_target} PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+		endif()
+	endforeach()
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)

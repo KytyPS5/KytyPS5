@@ -24,6 +24,8 @@ env:
   # A push to main is the official release of whichever repository built it
   KYTY_BUILD_ORIGIN: ${{ github.event_name == 'push' && 'Official' || github.repository != 'KytyPS5/KytyPS5' && 'Fork' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+  # A pull request is never released, so it skips the slow link-time optimization
+  KYTY_LTO: ${{ github.event_name == 'pull_request' && 'OFF' || 'ON' }}
 
 jobs:
   metadata:
@@ -109,7 +111,7 @@ jobs:
           cmake -S . -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_LTO=%KYTY_LTO% ^
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
@@ -200,7 +202,7 @@ jobs:
           cmake -S . -B _Build/macos \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_LTO="$KYTY_LTO" \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
@@ -372,7 +374,7 @@ jobs:
           cmake -S . -B _Build/linux \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_LTO="$KYTY_LTO" \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \

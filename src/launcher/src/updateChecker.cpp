@@ -110,8 +110,9 @@ void UpdateChecker::ShowPreviousResult(QWidget* parent) {
 			                                                QDir::NoDotAndDotDot)) {
 				newest = qMax(newest, entry.lastModified());
 			}
-			// A workspace touched recently may belong to a running download or helper.
-			if (newest.secsTo(QDateTime::currentDateTime()) > 15 * 60) {
+			// A workspace touched recently may belong to a running download or helper. Windows
+			// lists a file still being downloaded with a stale time, so allow a generous margin.
+			if (newest.secsTo(QDateTime::currentDateTime()) > 60 * 60) {
 				workspace.removeRecursively();
 			}
 		}

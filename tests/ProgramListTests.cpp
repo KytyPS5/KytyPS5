@@ -42,6 +42,12 @@ ProgramRecord Vertex() {
 	record.input_info      = {1, 2, 3, 4, 5, 6, 7};
 	record.specialization.buffers.push_back(
 	    {.packed_stride = 16, .descriptor_swizzle = 0x688, .zero_stride_oob = true});
+	record.specialization.buffers.push_back({.scalar_empty               = true,
+	                                         .indirect_root              = 0,
+	                                         .indirect_mapping_offset    = 12,
+	                                         .indirect_search_iterations = 3});
+	record.specialization.samplers.push_back(
+	    {.indirect_root = 1, .indirect_mapping_offset = 4, .indirect_search_iterations = 2});
 	record.specialization.images.push_back({.mip_count = 5, .indirect_root = 2, .cube = true});
 	record.specialization.images.push_back({.shader_swizzle = 0x123, .fmask = true});
 	return record;

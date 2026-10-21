@@ -26,7 +26,6 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -1019,9 +1018,8 @@ void WindowContext::CreateVulkan() {
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 	// GLSL.std.450 does not order -0 below +0 in NMin/NMax; RADV runs them as v_min/v_max with
 	// IEEE mode off, which gives the guest's NaN and signed-zero results.
-	Libs::Graphics::ShaderRecompiler::Spirv::SetNativeFloatMinMax(
-	    driver_properties.driverID == vk::DriverId::eMesaRadv &&
-	    std::getenv("KYTY_EMULATED_FLOAT_MIN_MAX") == nullptr);
+	Libs::Graphics::ShaderRecompiler::Spirv::SetNativeFloatMinMax(driver_properties.driverID ==
+	                                                              vk::DriverId::eMesaRadv);
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
 

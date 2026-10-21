@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/constRam.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -68,6 +69,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits the open host command buffer only when PlanSubmit says so.
+	void            BufferFlushIfDue();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
@@ -82,9 +85,9 @@ public:
 		return m_dispatch_indirect_args_base_addr;
 	}
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(DrawIndexArgs args);
+	bool DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
-	void DrawIndexAuto(DrawAutoArgs args);
+	bool DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
 	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -105,6 +108,16 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	// Writes a label (or with no bytes, raises only the interrupt) once the host GPU completed
+	// the work recorded before it (pendingLabels.h).
+	void WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t bytes, bool interrupt,
+	                           uint32_t interrupt_context_id);
+	// A 32-bit value as WAIT_REG_MEM and COND_EXEC see it: with the labels not written yet.
+	[[nodiscard]] uint32_t ReadLabel(const uint32_t* address);
+	// Guest memory as the command processor reads it: with pending labels, and without waiting
+	// for GPU work that does not write it (BufferCache::ReadGuestBacked).
+	template <typename T>
+	[[nodiscard]] T ReadMemory(const T* address);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
@@ -129,6 +142,11 @@ public:
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	// The GPU thread writes guest memory (a packet's data, a label): a later shader of the same
+	// submission must see it, also on a page the buffer cache keeps open (guestWriteLog.h).
+	// WriteGuest copies and logs. NoteGuestWrite only logs, for a write made in place.
+	void WriteGuest(void* dst, const void* src, uint64_t size);
+	void NoteGuestWrite(const void* dst, uint64_t size);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
@@ -176,7 +194,7 @@ private:
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
 
-	uint32_t m_const_ram[0x3000] = {0};
+	uint32_t m_const_ram[CONST_RAM_DWORDS] = {0};
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;

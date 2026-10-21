@@ -6,6 +6,8 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/framePacer.h"
+#include "graphics/guest_gpu/pendingLabels.h"
 
 #include <array>
 #include <atomic>
@@ -31,14 +33,24 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// The same, for a caller that comes back with a second part of work it has begun: when the
+	// GPU thread no longer takes commands (shutdown), nothing runs and the result is false.
+	[[nodiscard]] bool TrySendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
 	            std::span<const uint32_t> constant_commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
-	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
+	// A guest frame boundary: ages the caches in order with the guest's work. It blocks the
+	// caller while Config::GetGpuFramesInFlight() recorded frames wait for the host GPU.
 	void SuspendPoint();
+	// Counts a flip the GPU thread records; the host GPU's completion of it calls
+	// FrameCompleted on the returned pacer.
+	[[nodiscard]] std::shared_ptr<FramePacer> RecordFrame();
+	// End-of-pipe labels the host GPU has not completed (pendingLabels.h).
+	[[nodiscard]] const std::shared_ptr<PendingLabels>& Labels() const { return m_labels; }
+
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
@@ -69,7 +81,10 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	void              SubmitRecordedBeforeWaiting();
 	void              ProcessCommands();
+	// GPU thread. Writes the labels the host GPU completed, with their interrupts.
+	void              WriteCompletedLabels();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
@@ -88,13 +103,22 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
-	// Completion callbacks can outlive GuestGpu during renderer shutdown.
-	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
-	    std::make_shared<std::binary_semaphore>(1);
+	// Frames recorded ahead of the host GPU. Completion callbacks can outlive GuestGpu during
+	// renderer shutdown.
+	std::shared_ptr<FramePacer> m_frame_pacer;
+	// The renderer's (RenderContext::GetLabels).
+	std::shared_ptr<PendingLabels> m_labels;
+	// Completed labels wait for the GPU thread (set under m_queue_mutex, read without it too).
+	std::atomic_bool                m_labels_ready {false};
+	std::vector<PendingLabels::Label> m_completed_labels;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
+	// The host submission (scheduler tick) that this thread last recorded guest work into. The
+	// thread submits before it waits only when that submission is still open: what others
+	// record into the scheduler (the test harness does) is theirs to submit.
+	uint64_t        m_recorded_tick = UINT64_MAX;
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;

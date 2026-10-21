@@ -2,6 +2,7 @@
 #define KYTY_COMMON_PROFILER_H_
 
 #include "common/common.h"
+#include "common/trace.h"
 
 #include <cstdint>
 #include <tracy/Tracy.hpp> // IWYU pragma: export
@@ -49,12 +50,37 @@ struct Lifecycle {
 	    kyty_profiler_source_location_, line) {name, TracyFunction, TracyFile,                     \
 	                                           static_cast<uint32_t>(line),                        \
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
-	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
-	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
-	    TRACY_CALLSTACK, tracy::ProfilerAvailable())
+	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                            \
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line), TRACY_CALLSTACK,              \
+	    tracy::ProfilerAvailable());                                                               \
+	static ::Trace::Site KYTY_PROFILER_CONCAT(kyty_profiler_trace_site_,                           \
+	                                          line) {"prof", KYTY_PROFILER_TRACE_NAME(name)};      \
+	const ::Trace::Scope KYTY_PROFILER_CONCAT(kyty_profiler_trace_scope_, line) {                  \
+		KYTY_PROFILER_CONCAT(kyty_profiler_trace_site_, line), ::Trace::ProfEnabled()              \
+	}
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 
+// A profiler block is also a trace site (trace.h): its name, or the function's.
+#define KYTY_PROFILER_TRACE_NAME(name)                                                             \
+	(static_cast<const char*>(name) != nullptr ? static_cast<const char*>(name) : __func__)
+
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
+
+// One guest frame ends at every flip. Tracy starts only with --profile (manual lifetime):
+// FrameMark and messages reach the profiler object directly, so they run only when it is up.
+#define KYTY_PROFILER_FRAME()                                                                      \
+	do {                                                                                           \
+		if (tracy::ProfilerAvailable()) {                                                          \
+			FrameMark;                                                                             \
+		}                                                                                          \
+	} while (false)
+// A short note on the timeline, from a string literal.
+#define KYTY_PROFILER_MESSAGE(literal)                                                             \
+	do {                                                                                           \
+		if (tracy::ProfilerAvailable()) {                                                          \
+			TracyMessageL(literal);                                                                \
+		}                                                                                          \
+	} while (false)
 
 #endif /* KYTY_COMMON_PROFILER_H_ */

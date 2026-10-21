@@ -394,6 +394,42 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	               range, command);
 	destination.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	                    range, command);
+	const auto aspects = ImageViewOps::DepthAspectMask(source.backing.format);
+	if (depth_copy != stencil_copy && (aspects & vk::ImageAspectFlagBits::eDepth) &&
+	    (aspects & vk::ImageAspectFlagBits::eStencil) && source.backing.samples == 1) {
+		// One aspect of an image that has both. MoltenVK copies both planes for an image copy of
+		// one aspect, so the copy goes through a buffer: buffer copies take one aspect alone.
+		// TODO: a multisampled image cannot be copied through a buffer; on MoltenVK its copy of
+		// one aspect still copies both.
+		const auto aspect      = depth_copy ? vk::ImageAspectFlagBits::eDepth
+		                                    : vk::ImageAspectFlagBits::eStencil;
+		const auto texel_bytes =
+		    depth_copy ? uint64_t {DepthAspectTransferBytes(source.backing.format)} : uint64_t {1};
+		const auto& extent = write_desc.info.extent;
+		const auto  bytes  = Common::AlignUp(static_cast<uint64_t>(extent.width) *
+		                                         extent.height * extent.depth *
+		                                         range.layer_count * texel_bytes,
+		                                     uint64_t {4});
+		auto& staging = AcquireScratch(bytes);
+		const vk::BufferImageCopy copy {
+		    0, 0, 0, {aspect, range.base_level, range.base_layer, range.layer_count}, {}, extent};
+		command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          staging.Handle(), 1, &copy);
+		vk::BufferMemoryBarrier staged {};
+		staged.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		staged.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+		staged.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		staged.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		staged.buffer              = staging.Handle();
+		staged.offset              = 0;
+		staged.size                = bytes;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &staged, 0,
+		                        nullptr);
+		command.copyBufferToImage(staging.Handle(), destination.backing.image,
+		                          vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+		return true;
+	}
 	std::array<vk::ImageCopy, 2> regions {};
 	uint32_t                   count = 0;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {

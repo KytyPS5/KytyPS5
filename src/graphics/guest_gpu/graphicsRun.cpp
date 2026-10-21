@@ -7,10 +7,12 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -59,11 +61,19 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
-GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
+GuestGpu::GuestGpu(RenderContext& renderer)
+    : m_renderer(renderer),
+      m_frame_pacer(std::make_shared<FramePacer>(Config::GetGpuFramesInFlight())),
+      m_labels(renderer.GetLabels()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
+	m_labels->SetWake([this] {
+		Common::LockGuard lock(m_queue_mutex);
+		m_labels_ready.store(true, std::memory_order_release);
+		m_work_available.Signal();
+	});
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -82,6 +92,9 @@ void GuestGpu::Shutdown() {
 		m_stopping  = true;
 		m_work_available.SignalAll();
 	}
+	m_frame_pacer->Stop();
+	// Completions after this write nothing: the guest is shutting down.
+	m_labels->SetWake(nullptr);
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
@@ -106,8 +119,38 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
+void GuestGpu::SubmitRecordedBeforeWaiting() {
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	if (scheduler.CurrentTick() == m_recorded_tick) {
+		scheduler.SubmitIfDue(CommandScheduler::SubmitPoint::Wait);
+	}
+}
+
+void GuestGpu::WriteCompletedLabels() {
+	EXIT_IF(!IsGpuThread());
+	m_labels_ready.store(false, std::memory_order_relaxed);
+	m_completed_labels.clear();
+	m_labels->TakeCompleted(m_completed_labels);
+	auto& buffer_cache = m_renderer.GetBufferCache();
+	for (const auto& label: m_completed_labels) {
+		if (label.bytes != 0) {
+			if (!buffer_cache.WriteGuestBacked(label.address, &label.value, label.bytes)) {
+				std::memcpy(reinterpret_cast<void*>(label.address), &label.value, label.bytes);
+			}
+			buffer_cache.RecordGpuThreadWrite(label.address, label.bytes);
+			m_labels->Retire(label);
+		}
+		if (label.interrupt) {
+			m_renderer.TriggerInterrupt(label.interrupt_event, label.interrupt_context);
+		}
+	}
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	if (m_labels_ready.load(std::memory_order_acquire)) {
+		WriteCompletedLabels();
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -133,6 +176,29 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		done.release();
 	});
 	done.acquire();
+}
+
+bool GuestGpu::TrySendCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	std::binary_semaphore done {0};
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		if (!m_accepting) {
+			return false;
+		}
+		m_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_pending_commands.fetch_add(1, std::memory_order_release);
+		m_work_available.Signal();
+	}
+	done.acquire();
+	return true;
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
@@ -172,12 +238,17 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
-	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	// finish the preceding graphics frame.
+	m_frame_pacer->WaitForRoom();
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
 	m_done_num++;
+}
+
+std::shared_ptr<FramePacer> GuestGpu::RecordFrame() {
+	m_frame_pacer->FrameRecorded();
+	return m_frame_pacer;
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -246,6 +317,10 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+void CommandProcessor::BufferFlushIfDue() {
+	GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::GuestSubmission);
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -289,7 +364,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
-	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
+	WriteGuest(dst, m_const_ram + offset / 4, static_cast<uint64_t>(dw_num) * 4u);
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -316,7 +391,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadMemory(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -349,6 +424,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		*output = src[i];
 		output += !write_one_address;
 	}
+	NoteGuestWrite(dst, static_cast<uint64_t>(write_one_address ? 1u : dw_num) * sizeof(uint32_t));
+}
+
+void CommandProcessor::WriteGuest(void* dst, const void* src, uint64_t size) {
+	std::memcpy(dst, src, size);
+	NoteGuestWrite(dst, size);
+}
+
+void CommandProcessor::NoteGuestWrite(const void* dst, uint64_t size) {
+	m_renderer.GetBufferCache().RecordGpuThreadWrite(reinterpret_cast<uint64_t>(dst), size);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -358,7 +443,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	WriteGuest(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -443,20 +528,36 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Trace::SetCriticalThread();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
 	for (;;) {
+		if (gpu->m_labels_ready.load(std::memory_order_acquire)) {
+			gpu->WriteCompletedLabels();
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Nothing more to record: what this thread recorded goes to the GPU now.
+				gpu->m_queue_mutex.Unlock();
+				gpu->SubmitRecordedBeforeWaiting();
+				gpu->m_queue_mutex.Lock();
+			}
+			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping &&
+			       !gpu->m_labels_ready.load(std::memory_order_relaxed)) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				KYTY_TRACE_COLUMN(GpuIdle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+			}
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Woken to write completed labels.
+				continue;
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -477,8 +578,15 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					// Every queue waits for the guest or the GPU: submit what this thread recorded.
+					gpu->m_queue_mutex.Unlock();
+					gpu->SubmitRecordedBeforeWaiting();
+					gpu->m_queue_mutex.Lock();
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						KYTY_TRACE_COLUMN(GpuIdle);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -504,7 +612,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				KYTY_TRACE_COLUMN(GpuCommand);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -515,7 +626,13 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const auto column   = submission.type == SubmissionType::Compute ? Trace::Column::GpuCompute
+		                                                                 : Trace::Column::GpuGraphics;
+		bool       complete = false;
+		{
+			const Trace::Scope scope {Trace::ColumnSite(column)};
+			complete = gpu->Process(submission);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -537,12 +654,14 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	KYTY_TRACE_SCOPE("gpu", "ProcessSubmission");
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
 	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
+		m_renderer.GetBufferCache().BeginSubmission();
 		cp.ResetDeCe();
 		cp.SetFlip({});
 	}
@@ -575,8 +694,12 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			if (complete) {
+				m_renderer.FinishList();
+			}
 			if (progressed) {
-				cp.BufferFlush();
+				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
+				cp.BufferFlushIfDue();
 			}
 			break;
 		}
@@ -596,8 +719,12 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			if (complete) {
+				m_renderer.FinishList();
+			}
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
+				m_recorded_tick = m_renderer.GetCommandScheduler().CurrentTick();
+				cp.BufferFlushIfDue();
 			}
 			break;
 		}
@@ -607,8 +734,6 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -740,6 +865,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		// Whatever the packet prepared buffers for has been recorded by now.
+		m_renderer.GetBufferCache().SettleGpuWrites();
+		GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Packet);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -838,7 +966,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
-void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
@@ -847,7 +975,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	return m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -893,6 +1021,33 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+
+	// Arguments the GPU wrote (a culling pass, often to no instances) are read by the host GPU:
+	// reading them here waits for the GPU to finish all work recorded so far. Patched offset
+	// registers and draw counts still need the values on the CPU.
+	if (count_addr == nullptr && max_count_or_count == 1 && registers.vertex_offset == Pm4::SH_NOP &&
+	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP &&
+	    (!indexed || m_index_buffer_size != 0)) {
+		const auto args_address = m_draw_indirect_args_base_addr + data_offset;
+		const auto args_size =
+		    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+		// Memory outside the tracked guest range (a test's host buffer) is never GPU-written.
+		if (GuestRange {args_address, args_size}.Valid() &&
+		    m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size)) {
+			const bool drawn =
+			    indexed ? DrawIndex({.index_count = m_index_buffer_size,
+			                         .index_addr  = reinterpret_cast<const void*>(m_index_base_addr),
+			                         .instance_count        = 1,
+			                         .offset_source         = DrawOffsetSource::IndirectArgs,
+			                         .indirect_args_address = args_address})
+			            : DrawIndexAuto({.instance_count        = 1,
+			                             .offset_source         = DrawOffsetSource::IndirectArgs,
+			                             .indirect_args_address = args_address});
+			if (drawn) {
+				return;
+			}
+		}
+	}
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
@@ -1000,21 +1155,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
-	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
-		return;
-	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }
 
-void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1077,11 +1227,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
-
-		if (with_interrupt) {
-			TriggerEopEventAtEndOfPipe(interrupt_context_id);
-		}
+		WriteLabelAtEndOfPipe(dst, data, sizeof(data), with_interrupt, interrupt_context_id);
 	};
 
 	switch (event_write_source) {
@@ -1092,6 +1238,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
+					NoteGuestWrite(dst, uint64_t {value >> 16u} * sizeof(uint32_t));
 					if (with_interrupt) {
 						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 					}
@@ -1120,11 +1267,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
-
-					if (with_interrupt) {
-						TriggerEopEventAtEndOfPipe(interrupt_context_id);
-					}
+					WriteLabelAtEndOfPipe(dst, value, sizeof(value), with_interrupt,
+					                      interrupt_context_id);
 				};
 
 				switch (cache_action) {
@@ -1222,11 +1366,49 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+	WriteLabelAtEndOfPipe(nullptr, 0, 0, true, interrupt_context_id);
+}
+
+void CommandProcessor::WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t bytes,
+                                             bool interrupt, uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-	    });
+	if (!GuestGpu::IsGpuThread()) {
+		// Without the GPU thread nothing writes the label later (a processor of a test).
+		if (bytes != 0) {
+			WriteGuest(dst, &value, bytes);
+		}
+		if (interrupt) {
+			GetScheduler().DeferPriorityOperation(
+			    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    });
+		}
+		return;
+	}
+	const auto& labels = m_renderer.GetLabels();
+	const auto  serial = labels->Add({.address           = reinterpret_cast<uint64_t>(dst),
+	                                  .value             = value,
+	                                  .bytes             = bytes,
+	                                  .interrupt         = interrupt,
+	                                  .interrupt_event   = m_interrupt_event_id,
+	                                  .interrupt_context = interrupt_context_id});
+	GetScheduler().DeferPriorityOperation([labels, serial] { labels->Complete(serial); });
+}
+
+uint32_t CommandProcessor::ReadLabel(const uint32_t* address) {
+	return ReadMemory(address);
+}
+
+template <typename T>
+T CommandProcessor::ReadMemory(const T* address) {
+	return m_renderer.GetLabels()->Read(address, [&] {
+		T value {};
+		if (!m_renderer.GetBufferCache().ReadGuestBacked(reinterpret_cast<uint64_t>(address),
+		                                                 &value, sizeof(T))) {
+			value = *static_cast<const volatile T*>(address);
+		}
+		return value;
+	});
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1295,6 +1477,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
+			NoteGuestWrite(reinterpret_cast<const void*>(event_address), 16u * 2u * sizeof(uint64_t));
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
@@ -1313,7 +1496,10 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request, frame = m_renderer.GetGpu().RecordFrame()] {
+		    renderer.GetVideoOut().CompleteFlip(request);
+		    frame->FrameCompleted();
+	    });
 	GetScheduler().Flush();
 }
 
@@ -1328,12 +1514,15 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteGuest(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request, frame = m_renderer.GetGpu().RecordFrame()] {
+		    renderer.GetVideoOut().CompleteFlip(request);
+		    frame->FrameCompleted();
+	    });
 	GetScheduler().Flush();
 }
 
@@ -1354,14 +1543,16 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	WriteGuest(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
+	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request,
+	     frame = m_renderer.GetGpu().RecordFrame()] {
 		    renderer.GetVideoOut().CompleteFlip(request);
 		    renderer.TriggerInterrupt(event_id, 0);
+		    frame->FrameCompleted();
 	    });
 	GetScheduler().Flush();
 }
@@ -1378,8 +1569,12 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	m_renderer.GetRenderExecutor().NoteFlip();
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id, frame = m_renderer.GetGpu().RecordFrame()] {
+		    m_renderer.GetVideoOut().CompleteFlip(request_id);
+		    frame->FrameCompleted();
+	    });
 	GetScheduler().Flush();
 }
 

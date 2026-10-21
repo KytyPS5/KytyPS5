@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -50,12 +51,14 @@ public:
 	    : m_window(window), m_scheduler(scheduler) {}
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
-		for (auto& frame: m_frames) {
-			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
-			if (frame->image.image != nullptr) {
-				m_window.graphic_ctx.DeleteImage(frame->image);
+		m_window.graphic_ctx.WithQueueIdle([this] {
+			for (auto& frame: m_frames) {
+				m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
+				if (frame->image.image != nullptr) {
+					m_window.graphic_ctx.DeleteImage(frame->image);
+				}
 			}
-		}
+		});
 	}
 	KYTY_CLASS_NO_COPY(FramePool);
 
@@ -175,9 +178,12 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 
 	if (dst.image != nullptr) {
-		graphics.device.destroyImageView(view, nullptr);
-		view = nullptr;
-		graphics.DeleteImage(dst);
+		// Every command buffer committed while the image lived holds it (see queueCommits.h).
+		graphics.WithQueueIdle([&] {
+			graphics.device.destroyImageView(view, nullptr);
+			view = nullptr;
+			graphics.DeleteImage(dst);
+		});
 	}
 
 	vk::ImageCreateInfo create {};
@@ -315,6 +321,138 @@ private:
 	uint32_t                       m_frame_index         = 0;
 };
 
+// A trace screenshot (trace.h): the presented frame scaled into a small RGBA8 image and copied
+// to host memory.
+class TraceSnapshot final {
+public:
+	explicit TraceSnapshot(GraphicContext& graphics): m_graphics(graphics) {}
+	~TraceSnapshot() {
+		if (m_image.image != nullptr || m_buffer != nullptr) {
+			m_graphics.WithQueueIdle([this] { Destroy(); });
+		}
+	}
+	KYTY_CLASS_NO_COPY(TraceSnapshot);
+
+	// Records the copy of `source`, which is in the transfer source layout.
+	bool Record(vk::CommandBuffer command, const VulkanImage& source) {
+		const uint32_t width = std::min(WIDTH, source.extent.width);
+		const uint32_t height =
+		    std::max(1u, static_cast<uint32_t>(static_cast<uint64_t>(width) * source.extent.height /
+		                                       source.extent.width));
+		if ((m_image.image == nullptr || m_width != width || m_height != height) &&
+		    !Create(width, height)) {
+			return false;
+		}
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask     = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout        = vk::ImageLayout::eUndefined;
+		barrier.newLayout        = vk::ImageLayout::eTransferDstOptimal;
+		barrier.image            = m_image.image;
+		barrier.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(source.extent.width),
+		                                      static_cast<int>(source.extent.height), 1};
+		region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.dstOffsets[1]  = vk::Offset3D {static_cast<int>(width), static_cast<int>(height), 1};
+		command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal, m_image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		barrier.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier2(dependency);
+
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent      = vk::Extent3D {width, height, 1};
+		command.copyImageToBuffer(m_image.image, vk::ImageLayout::eTransferSrcOptimal, m_buffer, 1,
+		                          &copy);
+
+		vk::MemoryBarrier2 host {};
+		host.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+		host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+		vk::DependencyInfo host_dependency {};
+		host_dependency.memoryBarrierCount = 1;
+		host_dependency.pMemoryBarriers    = &host;
+		command.pipelineBarrier2(host_dependency);
+		return true;
+	}
+
+	// After the recorded commands retired.
+	void Save() {
+		vmaInvalidateAllocation(m_graphics.allocator, m_allocation, 0, VK_WHOLE_SIZE);
+		Trace::SaveScreenshot(static_cast<const uint8_t*>(m_mapped), m_width, m_height);
+	}
+
+private:
+	static constexpr uint32_t WIDTH = 960;
+
+	bool Create(uint32_t width, uint32_t height) {
+		Destroy();
+		vk::ImageCreateInfo image {};
+		image.imageType   = vk::ImageType::e2D;
+		image.extent      = vk::Extent3D {width, height, 1};
+		image.mipLevels   = 1;
+		image.arrayLayers = 1;
+		image.format      = vk::Format::eR8G8B8A8Unorm;
+		image.tiling      = vk::ImageTiling::eOptimal;
+		image.usage   = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+		image.samples = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(image, m_image)) {
+			return false;
+		}
+		vk::BufferCreateInfo buffer {};
+		buffer.size  = static_cast<vk::DeviceSize>(width) * height * 4u;
+		buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
+		VmaAllocationCreateInfo allocation {};
+		allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation.flags =
+		    VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		VmaAllocationInfo mapped {};
+		VkBuffer          handle = VK_NULL_HANDLE;
+		if (vmaCreateBuffer(m_graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer),
+		                    &allocation, &handle, &m_allocation, &mapped) != VK_SUCCESS) {
+			m_graphics.DeleteImage(m_image);
+			return false;
+		}
+		m_buffer = handle;
+		m_mapped = mapped.pMappedData;
+		m_width  = width;
+		m_height = height;
+		return true;
+	}
+
+	void Destroy() {
+		if (m_image.image != nullptr) {
+			m_graphics.DeleteImage(m_image);
+		}
+		if (m_buffer != nullptr) {
+			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_allocation);
+			m_buffer = nullptr;
+		}
+	}
+
+	GraphicContext& m_graphics;
+	VulkanImage     m_image;
+	vk::Buffer      m_buffer     = nullptr;
+	VmaAllocation   m_allocation = nullptr;
+	void*           m_mapped     = nullptr;
+	uint32_t        m_width      = 0;
+	uint32_t        m_height     = 0;
+};
+
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
@@ -359,6 +497,7 @@ struct Presenter::Impl {
 	Swapchain             swapchain;
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
+	TraceSnapshot         trace_snapshot {window.graphic_ctx};
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
@@ -531,10 +670,11 @@ void Swapchain::Destroy() {
 	}
 	auto& graphics = m_window.graphic_ctx;
 
-	{
-		Common::LockGuard queue_lock(graphics.queue_mutex);
-		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
-	}
+	// Nothing may be committed until these objects are gone: each command buffer committed while
+	// they live holds them (see queueCommits.h).
+	Common::LockGuard queue_lock(graphics.queue_mutex);
+	RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+	graphics.queue_commits.NoteIdle();
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -897,6 +1037,7 @@ Swapchain::Status Swapchain::Present() {
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		m_window.graphic_ctx.queue_commits.NotePresent();
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -1047,20 +1188,30 @@ void Presenter::Impl::Present() {
 			RecoverSwapchain(status);
 			continue;
 		}
-		// present_mutex owns the prepared frames and this scheduler. Only queue submission
-		// is shared with rendering, and it has its own queue_mutex.
-		auto&      command = present_scheduler.BeginCommand();
-		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
-		                                 swapchain.PrepareSystemOverlay();
-		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-		                                draw_system_overlay);
-		const auto tick = swapchain.Submit(present_scheduler);
-		for (const auto& layer: layers) {
-			if (layer.frame != nullptr) {
-				layer.frame->present_tick = tick;
+		bool     snapshot = false;
+		uint64_t tick     = 0;
+		{
+			Common::LockGuard render_lock(renderer.GetMutex());
+			auto&             command = present_scheduler.BeginCommand();
+			const bool        draw_system_overlay =
+			    (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			    swapchain.PrepareSystemOverlay();
+			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+			                                draw_system_overlay);
+			snapshot = layers[0].frame != nullptr && Trace::ScreenshotDue() &&
+			           trace_snapshot.Record(command.Handle(), layers[0].frame->image);
+			tick     = swapchain.Submit(present_scheduler);
+			for (const auto& layer: layers) {
+				if (layer.frame != nullptr) {
+					layer.frame->present_tick = tick;
+				}
 			}
 		}
 		status = swapchain.Present();
+		if (snapshot) {
+			present_scheduler.Wait(tick);
+			trace_snapshot.Save();
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

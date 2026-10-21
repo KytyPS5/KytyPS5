@@ -1073,6 +1073,9 @@ static int ConvertFamily(int family) {
 	}
 }
 
+// SO_BROADCAST of the guest kernel (FreeBSD).
+constexpr int GUEST_SO_BROADCAST = 0x0020;
+
 static int ConvertSocketOptionLevel(int level) {
 	return (level == 0xffff ? SOL_SOCKET : level);
 }
@@ -1080,7 +1083,7 @@ static int ConvertSocketOptionLevel(int level) {
 static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
 		switch (option) {
-			case 0x0020: return SO_BROADCAST;
+			case GUEST_SO_BROADCAST: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
 			case 0x1007: return SO_ERROR;
@@ -1097,9 +1100,15 @@ static int ConvertSocketOptionName(int level, int option) {
 #endif
 }
 
+// The guest kernel is FreeBSD: getsockopt(SO_BROADCAST) gives the option's flag bit, not 1.
+// A Linux or Windows host gives 1, a macOS host the bit. Only SO_BROADCAST is converted.
+static int GuestBroadcastValue(int value) {
+	return value != 0 ? GUEST_SO_BROADCAST : 0;
+}
+
 static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
 	switch (option) {
-		case 0x0020: return &endpoint.broadcast;
+		case GUEST_SO_BROADCAST: return &endpoint.broadcast;
 		case 0x1001: return &endpoint.send_buffer;
 		case 0x1002: return &endpoint.receive_buffer;
 		case 0x1200: return &endpoint.nonblocking;
@@ -2170,13 +2179,16 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		if (*optlen < sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
-		std::memcpy(optval, value, sizeof(int));
+		const int result = (optname == GUEST_SO_BROADCAST ? GuestBroadcastValue(*value) : *value);
+		std::memcpy(optval, &result, sizeof(int));
 		*optlen = sizeof(int);
 		return 0;
 	}
 
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
 	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool broadcast    = (level == 0xffff && optname == GUEST_SO_BROADCAST);
+	const int  optname_guest = optname;
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2213,6 +2225,10 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* error = static_cast<int*>(optval);
 		*error = ConvertHostSocketError(*error);
+	}
+	if (broadcast && len >= static_cast<SocketLength>(sizeof(int))) {
+		auto* enabled = static_cast<int*>(optval);
+		*enabled      = GuestBroadcastValue(*enabled);
 	}
 	*optlen = static_cast<uint32_t>(len);
 	return 0;

@@ -405,6 +405,8 @@ struct Context {
 
 	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
 	void                   Advance(size_t length) { native->Rip += length; }
+	[[nodiscard]] uint64_t Flags() const { return native->EFlags; }
+	void                   SetFlags(uint64_t flags) { native->EFlags = static_cast<DWORD>(flags); }
 	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
@@ -438,6 +440,8 @@ struct Context {
 	void Advance(size_t length) {
 		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
 	}
+	[[nodiscard]] uint64_t Flags() const { return native->uc_mcontext->__ss.__rflags; }
+	void SetFlags(uint64_t flags) { native->uc_mcontext->__ss.__rflags = flags; }
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
 		auto*     state       = &native->uc_mcontext->__ss;
 		uint64_t* registers[] = {&state->__rax, &state->__rcx, &state->__rdx, &state->__rbx,
@@ -488,6 +492,10 @@ struct Context {
 	void Advance(size_t length) {
 		native->uc_mcontext.gregs[REG_RIP] += static_cast<greg_t>(length);
 	}
+	[[nodiscard]] uint64_t Flags() const {
+		return static_cast<uint64_t>(native->uc_mcontext.gregs[REG_EFL]);
+	}
+	void SetFlags(uint64_t flags) { native->uc_mcontext.gregs[REG_EFL] = static_cast<greg_t>(flags); }
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		if (native->uc_mcontext.fpregs == nullptr) {
 			return nullptr;
@@ -531,8 +539,7 @@ struct Context {
 	}
 };
 
-#if !defined(__APPLE__)
-
+// SHA-NI: the console's CPU has it and games use it unchecked; Rosetta 2 does not.
 static bool TryEmulateShaNi(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	ShaNiInsn   insn {};
@@ -579,8 +586,6 @@ static bool TryEmulateShaNi(Context& context) {
 	context.Advance(insn.length);
 	return true;
 }
-
-#endif
 
 static bool TryEmulateSse4a(Context& context) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -671,6 +676,69 @@ static void FlushCacheLine(uint64_t address, ZydisRegister segment) {
 	}
 }
 
+static bool MemoryOperandAddress(const Context& context, const ZydisDecodedInstruction& instruction,
+                                 const ZydisDecodedOperand& operand, uint64_t& address) {
+	ZydisRegisterContext registers {};
+	for (uint8_t i = 0; i < 16; ++i) {
+		const auto value                         = static_cast<uint64_t>(context.Gpr(i));
+		registers.values[ZYDIS_REGISTER_RAX + i] = value;
+		registers.values[ZYDIS_REGISTER_EAX + i] = static_cast<uint32_t>(value);
+	}
+	return ZYAN_SUCCESS(
+	    ZydisCalcAbsoluteAddressEx(&instruction, &operand, context.Rip(), &registers, &address));
+}
+
+// ADCX (ADX) adds with a carry that only CF carries in and out; the other flags stay. The
+// console's CPU has it, and games use it unchecked; Rosetta 2 does not. ADOX is not emulated:
+// before ADOX, Rosetta 2 hands the signal handler stale flags (OF lost), so a result would be
+// silently wrong.
+static bool EmulateAddCarryX(Context& context, const ZydisDecodedInstruction& instruction,
+                             const ZydisDecodedOperand* operands) {
+	const auto destination = ZydisRegisterGetId(operands[0].reg.value);
+	const bool wide        = instruction.operand_width == 64;
+	if (destination < 0 || destination >= 16 || (!wide && instruction.operand_width != 32)) {
+		return false;
+	}
+	uint64_t source = 0;
+	if (operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+		const auto index = ZydisRegisterGetId(operands[1].reg.value);
+		if (index < 0 || index >= 16) {
+			return false;
+		}
+		source = static_cast<uint64_t>(context.Gpr(static_cast<uint8_t>(index)));
+	} else if (operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+	           operands[1].mem.segment != ZYDIS_REGISTER_FS &&
+	           operands[1].mem.segment != ZYDIS_REGISTER_GS) {
+		uint64_t address = 0;
+		if (!MemoryOperandAddress(context, instruction, operands[1], address)) {
+			return false;
+		}
+		std::memcpy(&source, reinterpret_cast<const void*>(address), wide ? 8 : 4);
+	} else {
+		return false;
+	}
+	constexpr uint64_t CarryFlag = 1u << 0u;
+	const auto         flags     = context.Flags();
+	const auto         carry_in  = static_cast<uint64_t>((flags & CarryFlag) != 0);
+	const auto value    = static_cast<uint64_t>(context.Gpr(static_cast<uint8_t>(destination)));
+	uint64_t   result   = 0;
+	bool       carry    = false;
+	if (wide) {
+		const auto partial = value + source;
+		result             = partial + carry_in;
+		carry              = partial < value || result < partial;
+	} else {
+		const auto sum = uint64_t {static_cast<uint32_t>(value)} + static_cast<uint32_t>(source) +
+		                 carry_in;
+		// A 32-bit destination is zero-extended, as for every 32-bit write.
+		result = static_cast<uint32_t>(sum);
+		carry  = (sum >> 32u) != 0;
+	}
+	context.Gpr(static_cast<uint8_t>(destination)) = result;
+	context.SetFlags(carry ? (flags | CarryFlag) : (flags & ~CarryFlag));
+	return true;
+}
+
 static bool TryEmulateCpuExtensions(Context& context) {
 	ZydisDecoder            decoder {};
 	ZydisDecodedInstruction instruction {};
@@ -695,18 +763,16 @@ static bool TryEmulateCpuExtensions(Context& context) {
 		context.Gpr(static_cast<uint8_t>(index)) = auxiliary;
 	} else if (instruction.mnemonic == ZYDIS_MNEMONIC_CLWB &&
 	           operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-		ZydisRegisterContext registers {};
-		for (uint8_t i = 0; i < 16; ++i) {
-			const auto value                         = static_cast<uint64_t>(context.Gpr(i));
-			registers.values[ZYDIS_REGISTER_RAX + i] = value;
-			registers.values[ZYDIS_REGISTER_EAX + i] = static_cast<uint32_t>(value);
-		}
 		uint64_t address = 0;
-		if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddressEx(&instruction, &operands[0], context.Rip(),
-		                                             &registers, &address))) {
+		if (!MemoryOperandAddress(context, instruction, operands[0], address)) {
 			return false;
 		}
 		FlushCacheLine(address, operands[0].mem.segment);
+	} else if (instruction.mnemonic == ZYDIS_MNEMONIC_ADCX &&
+	           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+		if (!EmulateAddCarryX(context, instruction, operands)) {
+			return false;
+		}
 	} else {
 		return false;
 	}
@@ -815,11 +881,26 @@ bool TryEmulate(void* native_context) {
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
 	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) ||
-#if !defined(__APPLE__)
-	       TryEmulateShaNi(context) ||
-#endif
-	       TryEmulateCpuExtensions(context);
+	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
+}
+
+const char* UnsupportedReason(const void* code) {
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (code == nullptr ||
+	    !ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code, ZYDIS_MAX_INSTRUCTION_LENGTH,
+	                                         &instruction, operands))) {
+		return nullptr;
+	}
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_ADOX) {
+		// See EmulateAddCarryX.
+		return "ADOX (ADX) is not emulated: the host has no ADX, and Rosetta 2 hands the signal "
+		       "handler stale flags before ADOX (OF is lost), so a result would be wrong";
+	}
+	return nullptr;
 }
 
 } // namespace Loader::X64InstructionEmulator

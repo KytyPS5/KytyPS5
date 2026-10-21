@@ -24,10 +24,13 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool integer_border);
+	// `view_min_lod` (U4.8) is the minimum LOD of the texture views read through the sampler,
+	// when the host cannot put it on the views (see IR::SampledResourcePair).
+	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool integer_border,
+	                       uint32_t view_min_lod = 0);
 
 private:
-	using SamplerKey = std::array<uint32_t, 5>;
+	using SamplerKey = std::array<uint32_t, 6>;
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

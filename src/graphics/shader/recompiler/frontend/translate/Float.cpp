@@ -5,8 +5,41 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+IR::U32 Translator::ReadPackedF16(const Decoder::Operand& operand) {
+	// Without selectors or modifiers the lanes are the register's halves as they are.
+	if (operand.kind != Decoder::OperandKind::FloatInlineConstant && !operand.op_sel &&
+	    operand.op_sel_hi && !operand.negate && !operand.negate_hi && !operand.absolute &&
+	    operand.sdwa_sel == 6u) {
+		return ApplyBitSourceModifiers(operand, ReadRawU32(operand));
+	}
+	const auto low  = Read16LaneBits(operand, false);
+	const auto high = Read16LaneBits(operand, true);
+	return ir.BitwiseOr(low, ir.ShiftLeftLogical(high, IR::U32(IR::Value(16u))));
+}
+
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	// Addition, multiplication and FMA are packed operations of their own: the backend runs them
+	// on native FP16 when the host has it. The result modifiers and the NaN quieting of MIN/MAX
+	// still go lane by lane through F32.
+	const auto packed = opcode == IR::ValueOpcode::FPAdd32   ? IR::ValueOpcode::PackedFPAdd16
+	                    : opcode == IR::ValueOpcode::FPMul32 ? IR::ValueOpcode::PackedFPMul16
+	                    : opcode == IR::ValueOpcode::FPFma32 ? IR::ValueOpcode::PackedFPFma16
+	                                                         : IR::ValueOpcode::Void;
+	if (packed != IR::ValueOpcode::Void && !quiet_snan && !inst.dst.clamp && inst.dst.omod == 0u) {
+		const auto lhs = ReadPackedF16(inst.src0);
+		const auto rhs = ReadPackedF16(inst.src1);
+		auto       raw = DestinationOperand(inst);
+		raw.omod       = 0u;
+		raw.clamp      = false;
+		if (packed == IR::ValueOpcode::PackedFPFma16) {
+			const auto& third = accumulator ? inst.dst : inst.src2;
+			WriteOperand(raw, ir.Emit(packed, {lhs, rhs, ReadPackedF16(third)}));
+		} else {
+			WriteOperand(raw, ir.Emit(packed, {lhs, rhs}));
+		}
+		return;
+	}
 	const auto translate_lane = [&](bool high) {
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
 		const auto rhs = ReadF16LaneAsF32(inst.src1, high);

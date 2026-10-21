@@ -83,9 +83,23 @@ void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
 void ResetInputState();
+// The gamepad player 1 uses.
 int  GetActiveControllerId();
-// True when the player has a keyboard or gamepad assigned.
+// True when the player is logged in: player 1 always, another player while its seat holds a
+// gamepad or the keyboard (playerSeats.h).
 bool IsPlayerConnected(int player);
+
+// A press of a gamepad's PS button: like its first button press, it gives the pad a seat
+// (playerSeats.h).
+void SeatGamepad(int id);
+// The gamepad in the seat of `player` (0 to 3), or 0 when the seat is empty.
+int GetGamepadOfPlayer(int player);
+// For the user service: the oldest login or logout the game has not seen.
+bool TakePlayerEvent(bool* login, int* user_id);
+// The user ids of players 1 to 4, -1 for a player who is not logged in.
+void GetLoggedInUsers(int* user_ids);
+// The player (0 to 3) of a logged-in user, or -1.
+int GetPlayerOfUser(int user_id);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

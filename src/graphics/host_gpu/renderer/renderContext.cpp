@@ -2,7 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
+#include "common/profiler.h"
+#include "common/timer.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -17,6 +22,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_buffer_cache.SetPendingLabels(m_labels.get());
 }
 
 RenderContext::~RenderContext() {
@@ -55,6 +61,8 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	PerfCounters::Add(PerfCounters::Counter::GuestFaults);
+	const PerfCounters::ScopedMicroseconds timed(PerfCounters::Counter::FaultMicroseconds);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -62,7 +70,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_texture_cache.SaveGpuWrites(fault_vaddr, fault_size);
+		constexpr uint64_t window = 64 * 1024;
+		m_buffer_cache.InvalidateWrittenMemory(
+		    fault_vaddr, IsMapped(Common::AlignDown(fault_vaddr, window), window));
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
@@ -74,6 +85,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	m_texture_cache.SaveGpuWrites(vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
@@ -87,10 +99,18 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+GuestSpan RenderContext::MappingAt(uint64_t vaddr) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.Find(vaddr);
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.QueueBdaSync(vaddr, size);
+	// The next device-address pass synchronizes the buffers of the new range only: the game's
+	// allocator maps and unmaps many times per frame, and a pass over every buffer each time cost
+	// Sonic Racing CrossWorlds ~5 ms per frame.
+	m_buffer_cache.RecordMappingChange(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -111,9 +131,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_buffer_cache.RecordMappingChange(vaddr, size);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -124,22 +146,65 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool shader_writes_addresses) {
+	if (shader_writes_addresses) {
+		m_texture_cache.DropColorMetadataFills();
+		m_buffer_cache.NoteAddressWrites();
+	}
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;
+	PerfCounters::Add(PerfCounters::Counter::UploadPasses);
+	// Shaders that read through device addresses can read any cached buffer, so every buffer must
+	// hold the CPU's latest bytes. Walking all of them before each dispatch is expensive with
+	// thousands of buffers; the buffer cache logs where the CPU wrote, and only those ranges are
+	// synchronized. A full walk runs when the log overflowed or the mapping changed.
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	struct UploadBatch {
+		BufferCache& cache;
+		explicit UploadBatch(BufferCache& buffer_cache): cache(buffer_cache) {
+			cache.BeginUploadBatch();
+		}
+		~UploadBatch() { cache.EndUploadBatch(); }
+	} upload_batch {m_buffer_cache};
+	if (!m_buffer_cache.TakeGuestWrites(m_bda_guest_writes)) {
+		Trace::AddKeyed("bda_sync_full", 0, 1);
+		KYTY_PROFILER_BLOCK("PrepareBda: every buffer");
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		return;
+	}
+	KYTY_PROFILER_BLOCK("PrepareBda: written ranges");
+	// The ranges come sorted and merged: a buffer is visited once for each run of written bytes.
+	for (const auto& write: m_bda_guest_writes) {
+		m_mapped_ranges.ForEachInRange(
+		    write.address, write.size, [this](uint64_t start, uint64_t end) {
+			    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		    });
+	}
 }
 
-void RenderContext::RunGarbageCollector() {
+void RenderContext::FinishList() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+}
+
+void RenderContext::RunGarbageCollector() {
+	// Pages the guest stopped rewriting are protected again after a while.
+	constexpr uint64_t CoolPeriodMs = 5000;
+	if (const auto now = Common::Timer::QueryPerformanceCounter() * 1000 /
+	                     Common::Timer::QueryPerformanceFrequency();
+	    now - m_last_heat_cool_ms >= CoolPeriodMs) {
+		m_last_heat_cool_ms = now;
+		RegionManager::CoolAllRegions();
+	}
+	FinishList();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 }

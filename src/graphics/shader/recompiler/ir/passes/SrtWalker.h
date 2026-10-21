@@ -4,7 +4,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -97,6 +100,89 @@ std::optional<std::array<uint64_t, Size>> AffineIndex(
 }
 
 // One memoized evaluation session shared by the entire shader resource refresh.
+// The values of a plan as small nodes in one array, for the walker. The walker touches a few
+// bytes of each value it evaluates; the plan's Inst objects are large and scattered, so a walk
+// over them is bound by cache misses. Node i is the value with evaluation index i (Build numbers
+// every value of the plan). Only the walker reads it; the plan's values stay the reference.
+class SrtNodes {
+public:
+	// Null: the plan has values the nodes cannot express, and the walker walks the values.
+	static std::shared_ptr<const SrtNodes> Build(const ResourcePlan& program);
+
+	// SetEnabled(false): walkers ignore the nodes (A/B and differential tests).
+	static void SetEnabled(bool enabled);
+	// For this thread only: a differential check runs the same walk without the nodes.
+	static void SetThreadDisabled(bool disabled);
+	[[nodiscard]] static bool Enabled();
+	// KYTY_SRT_VERIFY: MaterializeResources checks each walk over the nodes against a walk over
+	// the values, and stops the emulator when they differ.
+	static void SetVerify(bool verify);
+	[[nodiscard]] static bool Verify();
+
+private:
+	friend class SrtWalker;
+	friend class SrtNodesBuilder;
+
+	// A reference to a value: a node index, or (with ConstantBit) a constant index.
+	static constexpr uint32_t ConstantBit = 0x80000000u;
+	static constexpr uint32_t NoRef       = UINT32_MAX;
+
+	// What SrtWalker::EvaluateInst does for the value.
+	enum class Kind : uint8_t {
+		Fail,            // never evaluates
+		Pure,            // args[0..arity) through ApplyPure
+		UserData,        // aux: user data index
+		ShaderBase,
+		Phi,             // extra[aux .. aux + 2 * count): predecessor block, value
+		InvariantPhi,    // args[0]: the value every operand resolves to
+		ReadFirstLane,   // args[0]: value, args[1]: EXEC mask
+		ExtractU64,      // args[0]: packed, aux: component
+		ExtractConstruct,// args[0]: the chosen part
+		ExtractAddCarry, // args[0], args[1]: addends, aux: component
+		RawRead,         // args: low, high, offset, guard; extra[aux]: records, word3
+		Select,          // args[0]: condition, args[1], args[2]
+		LogicalAnd,
+		LogicalOr,
+	};
+
+	// RawRead bits in Node::arity.
+	static constexpr uint8_t ReadClean        = 1u;
+	static constexpr uint8_t ReadVector       = 2u;
+	static constexpr uint8_t ReadGuardImm     = 4u;
+	static constexpr uint8_t ReadBounded      = 8u;
+	static constexpr uint8_t ReadHandleBounds = 16u;
+
+	struct Node {
+		ValueOpcode             op    = ValueOpcode::Identity;
+		Kind                    kind  = Kind::Fail;
+		uint8_t                 arity = 0;
+		uint32_t                aux   = 0;
+		uint64_t                flags = 0;
+		std::array<uint32_t, 4> args {NoRef, NoRef, NoRef, NoRef};
+	};
+	static_assert(sizeof(Node) == 32);
+
+	struct Constant {
+		uint64_t bits = 0;
+		bool     ok   = false;
+	};
+
+	// The constant equal to `value`, or NoRef.
+	[[nodiscard]] uint32_t FindConstant(Value value) const;
+
+	std::vector<Node>        m_nodes;
+	std::vector<uint32_t>    m_extra;
+	std::vector<Constant>    m_constants;
+	// For walkers that need a Value again (a nested EXEC mask).
+	std::vector<Value>       m_constant_values;
+	std::vector<const Inst*> m_insts;
+	// The roots, per srt_reads entry, per descriptor source dword, per control block.
+	std::vector<uint32_t>                m_read_refs;
+	std::vector<uint8_t>                 m_read_clean;
+	std::vector<std::array<uint32_t, 8>> m_descriptor_refs;
+	std::vector<uint32_t>                m_condition_refs;
+};
+
 class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -111,26 +197,82 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	// `active_ref`: the mask's node reference, when the caller has it (SrtNodes::NoRef: found).
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
-	          SrtWalker* clean_evaluator = nullptr);
+	          SrtWalker* clean_evaluator = nullptr, uint32_t active_ref = UINT32_MAX);
 	ResourcePlan::EvaluationContext& AcquireContext();
 	void ResetUnknowns();
-	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// The same evaluation over SrtNodes.
+	bool EvaluateRef(uint32_t ref, uint64_t& result);
+	bool EvaluateNode(uint32_t index, uint64_t& result);
+	bool EvaluateNodeRawRead(const SrtNodes::Node& node, uint64_t& result);
+	[[nodiscard]] uint32_t RefOf(Value value) const;
+	[[nodiscard]] Value    ValueOf(uint32_t ref) const;
 
 	const ResourcePlan&              m_program;
+	const SrtNodes*                 m_nodes = nullptr;
+	uint32_t                        m_active_ref = SrtNodes::NoRef;
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
+	// The session's contexts, linked by next_of_session (the session's own walker keeps them).
+	mutable uint32_t                m_session_contexts = UINT32_MAX;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+};
+
+// The walk of MaterializeResources as a flat list of steps in dependency order, built once per
+// plan. A run gives the walker's values and makes the walker's reads, without recursion or memos.
+// A plan has no tape when its walk depends on runtime values or needs the strict reader:
+// branches, captured reads, specialization memory, indirect descriptors, a uniform fill, or a
+// select, short-circuit operation, phi or read-first-lane.
+class SrtTape {
+public:
+	static std::shared_ptr<const SrtTape> Build(const ResourcePlan& program);
+
+	// Runs every step. A failed step fails the steps and roots that use it, not the run. Unlike
+	// the walker, the run also reads for roots after a failed one; a failed call stops the stage.
+	void Run(const ResourcePlan& program, const SrtRuntime& runtime) const;
+	// The roots of the last run, as RefreshFlatBuffer and EvaluateDescriptor give them.
+	bool FlatBuffer(const ResourcePlan& program, std::vector<uint32_t>& flat) const;
+	bool Descriptor(const ResourcePlan& program, uint32_t source, DescriptorValue& result) const;
+
+private:
+	friend class SrtTapeBuilder;
+
+	enum class StepKind : uint8_t { UserData, ShaderBase, Pure, ExtractHalf, AddCarryHalf, RawRead };
+
+	// What a run needs of the value, copied: the plan's Inst objects are cold during a draw.
+	struct Step {
+		uint64_t                flags     = 0;
+		ValueOpcode             op        = ValueOpcode::Identity;
+		StepKind                kind      = StepKind::Pure;
+		uint8_t                 arg_count = 0;
+		// The user data index, or the half of an extract.
+		uint32_t                operand   = 0;
+		uint32_t                out       = 0;
+		std::array<uint32_t, 5> args {};
+	};
+
+	static constexpr uint32_t NoSlot = UINT32_MAX;
+
+	bool Root(uint32_t slot, uint32_t& value) const;
+
+	std::vector<Step>                    m_steps;
+	// Per srt_reads entry, and per descriptor source dword (NoSlot: not a root).
+	std::vector<uint32_t>                m_srt_slots;
+	std::vector<std::array<uint32_t, 8>> m_descriptor_slots;
+	// Constant slots are written once by Build; step slots by every run.
+	mutable std::vector<uint64_t>        m_values;
+	mutable std::vector<uint8_t>         m_ok;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -47,8 +47,6 @@ static RenderContext* g_renderer = nullptr;
 
 namespace Gen5Driver {
 
-static constexpr uint64_t DriverDmemBase = 0x0fe0000000ull;
-static constexpr uint32_t DriverDmemSize = 0x200000;
 static constexpr uint32_t AgcDmemOffset  = 0x40000;
 
 struct DriverDmem {

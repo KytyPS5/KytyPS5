@@ -5,6 +5,9 @@
 namespace Libs::Graphics {
 
 void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf) {
+	// A state the device lacks is not in the pipeline's dynamic states (see
+	// CreatePipelineInternal); it is marked clean all the same.
+	const auto& caps = graphics.host.capabilities;
 	if (dirty_state.viewports) {
 		dirty_state.viewports = false;
 		cmdbuf.setViewportWithCount(num_viewports, viewports.data());
@@ -28,15 +31,15 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 	}
 	if (dirty_state.depth_bounds_test_enabled) {
 		dirty_state.depth_bounds_test_enabled = false;
-#if !defined(__APPLE__)
-		cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enabled);
-#endif
+		if (caps.depth_bounds) {
+			cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enabled);
+		}
 	}
 	if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
 		dirty_state.depth_bounds = false;
-#if !defined(__APPLE__)
-		cmdbuf.setDepthBounds(depth_bounds_min, depth_bounds_max);
-#endif
+		if (caps.depth_bounds) {
+			cmdbuf.setDepthBounds(depth_bounds_min, depth_bounds_max);
+		}
 	}
 	if (dirty_state.depth_bias_enabled) {
 		dirty_state.depth_bias_enabled = false;
@@ -131,17 +134,15 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 	}
 	if (dirty_state.color_write_enables) {
 		dirty_state.color_write_enables = false;
-#if !defined(__APPLE__)
-		if (num_color_write_enables != 0) {
+		if (caps.color_write_enable && num_color_write_enables != 0) {
 			cmdbuf.setColorWriteEnableEXT(num_color_write_enables, color_write_enables.data());
 		}
-#endif
 	}
 	if (dirty_state.line_width) {
 		dirty_state.line_width = false;
 		cmdbuf.setLineWidth(line_width);
 	}
-	if (dirty_state.feedback_loop_aspects && graphics.attachment_feedback_loop_enabled) {
+	if (dirty_state.feedback_loop_aspects && caps.attachment_feedback_loop) {
 		dirty_state.feedback_loop_aspects = false;
 		cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_aspects);
 	}

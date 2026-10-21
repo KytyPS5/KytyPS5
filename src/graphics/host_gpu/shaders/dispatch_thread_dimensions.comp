@@ -1,0 +1,32 @@
+#version 450
+
+// The arguments of an indirect dispatch in thread dimensions are thread counts, which an earlier
+// command of the same submission can have written. Turns them into the group counts of the host
+// dispatch and the extent the dispatched shader masks its last groups with.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer args_buf {
+    uint args[];
+};
+layout(std430, binding = 1) writeonly buffer groups_buf {
+    uint groups[];
+};
+layout(std430, binding = 2) writeonly buffer extent_buf {
+    uint extent[];
+};
+
+layout(push_constant) uniform Push {
+    uvec4 group_size;
+    uint  args_dword;
+    uint  extent_dword;
+} push;
+
+void main() {
+    for (uint axis = 0u; axis < 3u; axis++) {
+        const uint threads = args[push.args_dword + axis];
+        const uint size    = max(push.group_size[axis], 1u);
+        groups[axis]                     = threads / size + uint(threads % size != 0u);
+        extent[push.extent_dword + axis] = threads;
+    }
+}

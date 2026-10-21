@@ -2,18 +2,30 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish the builds as a pre-release
+        type: boolean
+        default: false
+      notes:
+        description: Pre-release notes (generated from commits when empty)
+        type: string
+        default: ""
   push:
     branches: [ main, master ]
   pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   SCCACHE_GHA_ENABLED: "true"
-  KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
+  # A push to main is the official release of whichever repository built it
+  KYTY_BUILD_ORIGIN: ${{ github.event_name == 'push' && 'Official' || github.repository != 'KytyPS5/KytyPS5' && 'Fork' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+  # A pull request is never released, so it skips the slow link-time optimization
+  KYTY_LTO: ${{ github.event_name == 'pull_request' && 'OFF' || 'ON' }}
 
 jobs:
   metadata:
@@ -99,7 +111,7 @@ jobs:
           cmake -S . -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_LTO=%KYTY_LTO% ^
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
@@ -112,16 +124,19 @@ jobs:
       - name: Build
         shell: cmd
         run: |
+          rem The unit tests: keep them as in .github/scripts/unit-tests.sh (the Linux job checks it).
           cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            host_lowering_tests write_heat_tests perf_counters_tests guest_write_log_tests copy_workers_tests frame_pacer_tests pending_labels_tests guest_memory_window_tests gpu_write_ticks_tests readback_plan_tests pipeline_use_tests submit_plan_tests depth_snapshot_plan_tests video_out_resolution_tests cache_folder_tests file_lock_tests program_list_tests soft_float64_tests metadata_fill_tests fence_retirement_tests queue_commits_tests cache_collection_tests buffer_chunk_tests ^
+            audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests pad_input_tests player_seats_tests gamepad_quit_tests bench_script_tests image_readback_tests overlay_queue_tests const_ram_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests device_suitability_tests shader_cfg_tests archive_file_tests trophy_system_tests avplayer_file_tests vdecsw_tests ^
+            audio_out_timing_tests bit_array_tests ces_tests event_queue_lifetime_tests http_uri_parse_tests image_page_table_tests ngs2_sampler_tests png_enc_tests save_data_dialog_tests save_data_memory_tests sync_on_address_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(archive_file|audio_out2_port|audio_out_timing|avplayer_file|bit_array|buffer_chunk|cache_collection|cache_folder|ces|controller_settings|copy_workers|frame_pacer|pending_labels|guest_memory_window|gpu_write_ticks|guest_write_log|depth_snapshot_plan|device_suitability|event_queue_lifetime|fence_retirement|file_lock|host_input|host_lowering|http_uri_parse|image_page_table|image_readback|overlay_queue|const_ram|ime_dialog|lru_cache|metadata_fill|ngs2_sampler|pad_haptics|pad_input|player_seats|gamepad_quit|bench_script|perf_counters|pipeline_use|png_enc|program_list|queue_commits|readback_plan|resource_materialization|resource_tracking|save_data_dialog|save_data_memory|scalar_provenance|shader_cfg|shader_vertex_metadata|soft_float64|submit_plan|sync_on_address|trophy_system|vdecsw|video_out_resolution|virtual_memory_allocation|write_heat|emulator_present_mode_cli|emulator_present_mode_invalid|emulator_user_name_cli|emulator_user_name_too_long|emulator_video_out_resolution_cli|emulator_video_out_resolution_invalid|guest_red_zone_patcher)$"
 
       - name: Install
         shell: cmd
@@ -187,7 +202,7 @@ jobs:
           cmake -S . -B _Build/macos \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_LTO="$KYTY_LTO" \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
@@ -201,18 +216,19 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          # The unit tests are listed in .github/scripts/unit-tests.sh.
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+            --target launcher shader_recompiler_compute_tests \
+              $(.github/scripts/unit-tests.sh targets memory_tracker page_manager macos_sse4a) \
             --parallel
 
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          .github/scripts/unit-tests.sh check-registered _Build/macos memory_tracker page_manager \
+            macos_sse4a
+          ctest --test-dir _Build/macos --output-on-failure --no-tests=error \
+            -R "$(.github/scripts/unit-tests.sh filter memory_tracker page_manager macos_sse4a)"
 
       - name: Install
         shell: bash
@@ -358,7 +374,7 @@ jobs:
           cmake -S . -B _Build/linux \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_LTO="$KYTY_LTO" \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
@@ -386,18 +402,20 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          # The unit tests are listed in .github/scripts/unit-tests.sh.
           cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
+            --target launcher \
+              $(.github/scripts/unit-tests.sh targets memory_tracker page_manager) \
             --parallel
 
       - name: Test
         shell: bash
         run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          # Windows runs cmd and keeps its own copy of the list: it must match the script.
+          .github/scripts/unit-tests.sh check-windows .github/workflows/build.yml
+          .github/scripts/unit-tests.sh check-registered _Build/linux memory_tracker page_manager
+          ctest --test-dir _Build/linux --output-on-failure --no-tests=error \
+            -R "$(.github/scripts/unit-tests.sh filter memory_tracker page_manager)"
 
       - name: Install
         shell: bash
@@ -437,8 +455,8 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.release)) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
@@ -448,8 +466,21 @@ jobs:
       contents: write
     env:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      HAS_RELEASE_APP: ${{ vars.RELEASE_APP_ID != '' }}
 
     steps:
+      # The Actions token may not tag a commit whose workflows differ from the default
+      # branch, so when a release app is set up the release is made with its token
+      - name: Get release app token
+        id: app_token
+        if: env.HAS_RELEASE_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Download Windows build
         if: needs.windows.result == 'success'
         uses: actions/download-artifact@v4
@@ -506,7 +537,8 @@ jobs:
       - name: Create release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token || github.token }}
+          RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           assets=()
           for artifact in \
@@ -523,8 +555,18 @@ jobs:
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
+            flags=()
+            # A manual run publishes a test build, never the latest release
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              flags+=(--prerelease)
+            fi
+            if [[ -n "$RELEASE_NOTES" ]]; then
+              flags+=(--notes "$RELEASE_NOTES")
+            else
+              flags+=(--generate-notes)
+            fi
             gh release create "$RELEASE_NAME" "${assets[@]}" \
-              --generate-notes \
+              "${flags[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"

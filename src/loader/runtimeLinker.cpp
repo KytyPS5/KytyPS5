@@ -11,7 +11,9 @@
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
@@ -26,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +36,8 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -191,6 +196,10 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	if (Trace::Enabled() && record_id < g_stubbed_imports.size()) {
+		const auto& record = g_stubbed_imports[record_id];
+		Trace::Note("unresolved_import", record.name, record.program);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
@@ -673,6 +682,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	// The process is ending (Subsystems::EmergencyShutdownActive) while guest threads still run:
+	// a thread that fails on a subsystem already shut down waits here for the end instead of
+	// reporting a crash, and of a second shutdown racing the first.
+	if (Common::Subsystems::Exiting()) {
+		std::printf("A guest thread failed while the emulator was ending (pc=0x%016" PRIx64
+		            "); it waits for the end.\n",
+		            info->exception_address);
+		std::fflush(stdout);
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::hours(1));
+		}
+	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
@@ -684,6 +705,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+		    IsReadableRange(info->exception_address, 15)) {
+			if (const auto* reason = Loader::X64InstructionEmulator::UnsupportedReason(
+			        reinterpret_cast<const void*>(info->exception_address));
+			    reason != nullptr) {
+				std::printf("illegal instruction: %s\n", reason);
+			}
+		}
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -696,6 +725,23 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+			}
+			std::printf("\n");
+		}
+		// What the registers point at: a structure or buffer read wrong shows here.
+		const std::pair<const char*, uint64_t> registers[] = {
+		    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+		    {"rsi", info->rsi}, {"rdi", info->rdi}, {"r8", info->r8},   {"r9", info->r9},
+		    {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13},
+		    {"r14", info->r14}, {"r15", info->r15}};
+		for (const auto& [name, value]: registers) {
+			if (value < 0x10000 || !IsReadableRange(value, 128)) {
+				continue;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(value);
+			std::printf("[%s] = %016" PRIx64 ":", name, value);
+			for (int i = 0; i < 128; i++) {
+				std::printf("%s%02x", (i % 32 == 0) ? "\n " : " ", bytes[i]);
 			}
 			std::printf("\n");
 		}

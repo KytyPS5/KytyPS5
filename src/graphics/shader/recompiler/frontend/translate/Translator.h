@@ -147,6 +147,8 @@ private:
 	void V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
+	// The two FP16 lanes of a VOP3P source, with its selectors and modifiers, packed in 32 bits.
+	IR::U32 ReadPackedF16(const Decoder::Operand& operand);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
 	void Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

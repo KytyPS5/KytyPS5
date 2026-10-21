@@ -11,6 +11,7 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
@@ -96,6 +97,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	subsystems.Initialize<Trace::Lifecycle>();
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);

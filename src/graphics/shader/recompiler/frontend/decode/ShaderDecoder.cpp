@@ -426,7 +426,11 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
 			}
-			branch_targets[target_index] = true;
+			// A target outside the code (a test fragment, a malformed branch) is the CFG's to
+			// reject; decoding does not continue there.
+			if (target_index < branch_targets.size()) {
+				branch_targets[target_index] = true;
+			}
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {

@@ -16532,8 +16532,12 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 174,
-                                          .instructions = 49,
+                                         {.words = 226,
+                                          .instructions = 61,
+                                          .variables = 1,
+                                          .function_variables = 1,
+                                          .loads = 2,
+                                          .stores = 2,
                                           .phis = 1,
                                           .labels = 8,
                                           .loop_merges = 1,
@@ -16543,15 +16547,21 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   const auto structured_metrics = MeasureSpirv(structured_result.spirv);
   Check((structured_result.ir_dump.find("Phi") != std::string::npos),
         "structured Phi size fixture no longer contains an IR Phi");
+  // The one variable is the loop budget's: its first store, and a load and a store per
+  // iteration in the header (see LoopBudget in spirvEmitterProgram.cpp).
   Check(structured_metrics.phis == 1u &&
-            structured_metrics.function_variables == 0u &&
-            structured_metrics.loads == 0u && structured_metrics.stores == 0u,
+            structured_metrics.function_variables == 1u &&
+            structured_metrics.loads == 2u && structured_metrics.stores == 2u,
         "structured Phi retained a spill variable or edge memory operation");
   CheckSpirvPhiParents(structured_result.spirv);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 174,
-               .instructions = 49,
+              {.words = 226,
+               .instructions = 61,
+               .variables = 1,
+               .function_variables = 1,
+               .loads = 2,
+               .stores = 2,
                .phis = 1,
                .labels = 8,
                .loop_merges = 1,
@@ -16719,12 +16729,12 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 255,
-                                          .instructions = 70,
-                                          .variables = 3,
-                                          .function_variables = 3,
-                                          .loads = 3,
-                                          .stores = 6,
+                                         {.words = 307,
+                                          .instructions = 82,
+                                          .variables = 4,
+                                          .function_variables = 4,
+                                          .loads = 5,
+                                          .stores = 8,
                                           .phis = 2,
                                           .labels = 13,
                                           .loop_merges = 1,

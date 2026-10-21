@@ -6785,6 +6785,40 @@ public:
                   cache.FindImage(array_first ? mipped : array) == second,
               "crossed mip/layer counts reused, expanded, or replaced an incompatible image");
     }
+    for (const bool block_alias : {false, true}) {
+      auto owner = MakeLinearDesc(
+          0x1180400000ull + block_alias * 0x100000, 0,
+          vk::Format::eR32G32B32A32Uint, Prospero::BufferFormat::k32_32_32_32UInt,
+          Prospero::ImageType::kColor2D, {16, 16, 1}, 1, 16, 1);
+      owner.info.resources.levels = owner.view_info.level_count = 2;
+      owner.info.UpdateSize();
+      auto alias = owner;
+      alias.info.data.size = 0;
+      if (block_alias) {
+        alias.info.pixel_format = vk::Format::eBc3UnormBlock;
+        alias.info.guest_format = Prospero::BufferFormat::kBc3UNorm;
+        alias.info.extent = {64, 64, 1};
+        alias.info.resources.levels = alias.view_info.level_count = 1;
+      } else {
+        alias.info.resources = {1, 3};
+        alias.view_info.level_count = 1;
+        alias.view_info.layer_count = 3;
+        alias.view_info.type = vk::ImageViewType::e2DArray;
+      }
+      alias.info.UpdateSize();
+      const auto cached = cache.FindImage(owner);
+      mark_gpu_owned(cached);
+      cache.GetImage(cached).info.metadata.compression = VideoOutCompression::Unsupported;
+      Require(name, "unsupported alias fixture",
+              !block_alias || BcAlias::Matches(alias.info, cache.GetImage(cached).info),
+              "fixture did not exercise block alias resolution");
+      const auto resolved = cache.FindImage(alias);
+      Require(name, "unsupported overlap retention",
+              resolved && resolved != cached &&
+                  TextureCacheTestAccess::Contains(cache, cached) &&
+                  cache.GetImage(cached).SafeToDownload(),
+              "unsupported alias readback crashed or discarded its cached owner");
+    }
     context.InitializeGpu(nullptr);
     constexpr uint64_t allocation_size = 0x50000;
     constexpr uint32_t value = 0x12345678u;
@@ -53283,6 +53317,11 @@ int main(int argc, char **argv) {
     vulkan.CheckLargeSparseImageUpload();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--subresource-overlap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureCacheSubresourceOverlap();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -53296,6 +53335,7 @@ int main(int argc, char **argv) {
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    vulkan.CheckTextureCacheSubresourceOverlap();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
     return 0;

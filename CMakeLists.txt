@@ -737,6 +737,8 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	add_test(NAME texture_cache_subresource_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --subresource-overlap-only)
 	add_test(NAME texture_cache_htile_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME texture_cache_metadata_resize

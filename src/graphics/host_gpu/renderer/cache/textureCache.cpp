@@ -664,7 +664,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = cached.info.resources.levels < requested.resources.levels ||
+	                cached.info.resources.layers < requested.resources.layers ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -791,9 +792,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (!cached.registered) {
 		return {merged_id};
 	}
+	if (cached.IsMaybeCpuDirty()) {
+		TrackImage(cached_id);
+		(void)cached.ResolveMaybeCpuHash(cached.HashGuestEdges());
+	}
 	if (BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
 		if (!BcAlias::Resolve(*this, cached_id, merged_id)) {
-			EXIT("TextureCache: cannot preserve block alias layouts\n");
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: retaining unsupported block alias layouts\n");
 		}
 		return {merged_id};
 	}
@@ -806,6 +812,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		// Fewer mips and more layers (or vice versa) describe separate guest layouts.
+		if ((requested.resources.levels < cached.info.resources.levels &&
+		     requested.resources.layers > cached.info.resources.layers) ||
+		    (requested.resources.levels > cached.info.resources.levels &&
+		     requested.resources.layers < cached.info.resources.layers)) {
+			if (cached.SafeToDownload() && !BcAlias::Resolve(*this, cached_id, merged_id)) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "TextureCache: retaining unsupported overlapping mip/layer layouts\n");
+			}
+			return {merged_id};
+		}
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
@@ -824,7 +841,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                 }))) {
 			if ((safe_to_delete || cached.SafeToDownload()) &&
 			    !BcAlias::Resolve(*this, cached_id, merged_id, safe_to_delete, safe_to_delete)) {
-				EXIT("TextureCache: cannot preserve incompatible image layouts\n");
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "TextureCache: retaining unsupported incompatible image layouts\n");
 			}
 			return {merged_id};
 		}
@@ -858,7 +876,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
 		if (requested.pixel_format == cached.info.pixel_format &&
-		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    requested.type == cached.info.type &&
+		    (requested.resources.levels > cached.info.resources.levels ||
+		     requested.resources.layers > cached.info.resources.layers) &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
 		      requested.extent == cached.info.extent &&
@@ -1333,7 +1353,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
 				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
 					if (!BcAlias::Resolve(*this, candidate, result)) {
-						EXIT("TextureCache: cannot preserve block alias layouts\n");
+						LOGF_COLOR(Log::Color::BrightYellow,
+						           "TextureCache: retaining unsupported block alias layouts\n");
 					}
 				}
 			}
@@ -1343,7 +1364,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources.levels < desc.info.resources.levels ||
+			           resolved.info.resources.layers < desc.info.resources.layers) {
 				FreeImage(result);
 				result = {};
 			}

@@ -388,9 +388,11 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
-  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
+                                uint64_t size = 0) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
+    metadata.size = size;
     metadata.clear_mask.reset();
   }
 
@@ -6286,6 +6288,26 @@ public:
     const auto write_only_input =
         MakeInput(write_only_meta, false, true, write_only_program,
                   write_only_snapshot);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta,
+                                              64);
+    const bool mismatched_size_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, write_only_input, command);
+    Require(name, "mismatched-size write preserved",
+            !mismatched_size_consumed &&
+                !texture_cache.IsMetaCleared(write_only_meta, 0),
+            "a reused metadata address write with a different size was consumed");
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta,
+                                              128);
+    write_only_snapshot.buffers[0].dwords[2] = 0;
+    const bool empty_write_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, write_only_input, command);
+    Require(name, "zero-size write preserved",
+            !empty_write_consumed &&
+                !texture_cache.IsMetaCleared(write_only_meta, 0),
+            "an empty metadata descriptor consumed a clear");
+    write_only_snapshot.buffers[0].dwords[2] = 8;
     const bool write_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, write_only_input, command);
@@ -6637,6 +6659,49 @@ public:
     Require(name, "release physical pages",
         LibKernel::Memory::KernelReleaseDirectMemory(direct, 3u * page) == 0,
         "sparse physical release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckTextureMetadataResize() {
+    constexpr const char *name = "TextureMetadataResize";
+    constexpr uint64_t page = 0x4000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, page, Common::VirtualMemory::Mode::ReadWrite, name);
+    Require(name, "allocation", base != 0, "guest allocation failed");
+    context.MapMemory(base, page);
+    auto &cache = context.GetTextureCache();
+    auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eD32Sfloat,
+        Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+    desc.type = TextureCache::BindingType::DepthTarget;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    desc.info.htile_initial_clear = false;
+    desc.info.metadata.kind = ImageMetadataKind::Htile;
+    desc.info.metadata.range = {base + 0x100, 0x80};
+    const auto id = cache.FindImage(desc);
+    (void)cache.FindDepthTarget(id, desc);
+    for (const uint64_t size : {0x40u, 0x80u}) {
+      const auto previous_size = desc.info.metadata.range.size;
+      Require(name, "initial clear", cache.ClearMeta(base + 0x100, previous_size) &&
+          cache.IsMetaCleared(base + 0x100, 0) && cache.IsMetaCleared(base + 0x100, 8191),
+          "metadata did not record the initial clear");
+      desc.info.metadata.range.size = size;
+      (void)cache.FindDepthTarget(id, desc);
+      Require(name, "range resize", !cache.IsMetaCleared(base + 0x100, 0) &&
+          !cache.IsMetaCleared(base + 0x100, 8191) &&
+          !cache.ClearMeta(base + 0x100, previous_size) && cache.ClearMeta(base + 0x100, size),
+          "resized metadata retained a clear or accepted the old range size");
+    }
+    context.UnmapMemory(base, page);
+    scheduler.Finish();
+    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, page), "guest release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -52846,6 +52911,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--metadata-resize-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureMetadataResize();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {

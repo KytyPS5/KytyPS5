@@ -1478,6 +1478,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (metadata->second.size != desc.info.metadata.range.size) {
+			metadata->second.clear_mask.reset();
+		}
+		metadata->second.size           = desc.info.metadata.range.size;
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
@@ -1918,10 +1922,13 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return found->second.clear_mask.test(slice);
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	if (size != 0 && found->second.size != 0 && size != found->second.size) {
 		return false;
 	}
 	found->second.clear_mask.set();

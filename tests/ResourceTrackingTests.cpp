@@ -7612,6 +7612,29 @@ void TestGpuSelectedBufferRecords() {
               "affine descriptor read escaped writable-alias capture");
       }
     }
+    const auto first = (table_offset + aligned_bias + 160u) / 4u;
+    const auto format_word = memory.words[first + 3u];
+    for (uint32_t format = 78u; format < 128u; ++format) {
+      memory.words[first + 3u] = (format << 12u) | DstSel(4, 5, 6, 1);
+      Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 7u,
+            "reserved V# format aborted affine table discovery or became a resource");
+      const auto mapping = specialization.buffers[roots[0]].indirect_mapping_offset;
+      Check(snapshot.flattened_srt[mapping] == 4u &&
+                snapshot.flattened_srt[mapping + 1u] == 0u &&
+                snapshot.flattened_srt[mapping + 2u] == 1u &&
+                snapshot.flattened_srt[mapping + 4u] == 3u,
+            "reserved V# candidate changed wrapped-key mapping for valid descriptors");
+    }
+    memory.words[first + 1u] = 16u << 16u;
+    for (uint32_t format = 1u; format <= 77u; ++format) {
+      memory.words[first + 3u] = (format << 12u) | DstSel(4, 5, 6, 1);
+      Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 8u &&
+                specialization.buffers[plan.info.buffers.size()].descriptor_format ==
+                    static_cast<Prospero::BufferFormat>(format),
+            "valid V# format was filtered or lost during table refresh");
+    }
+    memory.words[first + 1u] = 8u << 16u;
+    memory.words[first + 3u] = format_word;
     // The trailing V# has only three readable DWORDs; its missing format word is zero.
     const auto tail = (table_offset + aligned_bias + 416u) / 4u;
     memory.words[tail] = 0x300000u;

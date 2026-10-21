@@ -243,11 +243,14 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
 }
 
-bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                             bool bounded_table) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
 	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
+	    (bounded_table && resource.formatted && descriptor.RawFormat() >
+	        static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float)) ||
 	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
 		value.dwords.fill(0u);
 		return true;
@@ -1874,12 +1877,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
+					const bool bounded_table = IsBoundedDescriptorTable(program, *source->indirect_descriptor);
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
 					        snapshot.buffers, specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
+						            value, source->indirect_descriptor->indexed, base, bounded_table);
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}

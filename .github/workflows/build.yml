@@ -2,6 +2,15 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish the builds as a pre-release
+        type: boolean
+        default: false
+      notes:
+        description: Pre-release notes (generated from commits when empty)
+        type: string
+        default: ""
   push:
     branches: [ main, master ]
   pull_request:
@@ -443,8 +452,8 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      ((github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5') ||
+       (github.event_name == 'workflow_dispatch' && inputs.release)) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
@@ -513,6 +522,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           assets=()
           for artifact in \
@@ -529,8 +539,18 @@ jobs:
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
+            flags=()
+            # A manual run publishes a test build, never the latest release
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              flags+=(--prerelease)
+            fi
+            if [[ -n "$RELEASE_NOTES" ]]; then
+              flags+=(--notes "$RELEASE_NOTES")
+            else
+              flags+=(--generate-notes)
+            fi
             gh release create "$RELEASE_NAME" "${assets[@]}" \
-              --generate-notes \
+              "${flags[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"

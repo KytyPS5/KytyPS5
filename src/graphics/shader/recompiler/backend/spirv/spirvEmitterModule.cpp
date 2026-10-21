@@ -806,7 +806,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
+		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
 	}
 	const bool fragment_barycentric =
@@ -849,10 +849,6 @@ void DefineModule(EmitterState& state) {
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
-			if (state.program.info.compute_derivatives) {
-				local_y = local_x / 2u;
-				local_x = 2u;
-			}
 		}
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);
@@ -869,7 +865,7 @@ void DefineModule(EmitterState& state) {
 		}
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupLinearKHR);
 	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.program.info.function_lds) {

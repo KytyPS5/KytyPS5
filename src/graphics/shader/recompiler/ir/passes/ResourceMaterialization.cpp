@@ -11,6 +11,7 @@
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -22,7 +23,11 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+// A replayed walk that leaves its trace fails quietly: the walker walks again.
+thread_local bool t_quiet_failures = false;
+
 bool SpecializationFail(std::string_view message) {
+	if (t_quiet_failures) return false;
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -1543,7 +1548,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 namespace {
 
 bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
-                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                              SrtTraceSession* trace = nullptr);
+bool MaterializeResourcesTraced(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
 bool SameSnapshot(const ResourceSnapshot& a, const ResourceSnapshot& b) {
 	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
@@ -1558,7 +1566,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	// The check walks twice, so the runtime's readers see every read twice. Tape plans have no
 	// nodes and are not checked here (TestTapeMatchesWalker covers the tape).
 	if (!SrtNodes::Verify() || program.srt_nodes == nullptr || !SrtNodes::Enabled()) {
-		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+		return MaterializeResourcesTraced(program, runtime, snapshot, specialization);
 	}
 	auto       reference_snapshot       = snapshot;
 	auto       reference_specialization = specialization;
@@ -1578,8 +1586,69 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 namespace {
 
+// KYTY_SRT_TRACE_VERIFY: each replay is checked against a walk, and the emulator stops when
+// they differ.
+bool VerifyTraces() {
+	static const bool verify = std::getenv("KYTY_SRT_TRACE_VERIFY") != nullptr;
+	return verify;
+}
+
+bool MaterializeResourcesTraced(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// Replays in a row that left the trace before the plan walks without one for a while, and
+	// the walks without a trace after a walk the trace could not hold.
+	constexpr uint32_t MaxTraceFailures = 4;
+	constexpr uint32_t TracePause       = 64;
+	constexpr uint32_t UntracedPause    = 1024;
+	// A tape or compiled walker is faster than a replay.
+	if (program.srt_tape != nullptr || program.srt_code != nullptr || program.srt_nodes == nullptr ||
+	    !SrtNodes::Enabled() || !SrtTraceSession::Enabled()) {
+		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	}
+	if (program.srt_trace_pause != 0u) {
+		program.srt_trace_pause--;
+		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	}
+	if (program.srt_trace != nullptr) {
+		SrtTraceSession replay(program, program.srt_trace);
+		t_quiet_failures = true;
+		const bool result = MaterializeResourcesOnce(program, runtime, snapshot, specialization, &replay);
+		t_quiet_failures = false;
+		if (!replay.Aborted()) {
+			program.srt_trace_failures = 0;
+			if (VerifyTraces()) {
+				auto       reference_snapshot       = snapshot;
+				auto       reference_specialization = specialization;
+				const bool reference = MaterializeResourcesOnce(program, runtime, reference_snapshot,
+				                                                reference_specialization);
+				if (result != reference ||
+				    (result && (!SameSnapshot(snapshot, reference_snapshot) ||
+				                specialization != reference_specialization))) {
+					EXIT("SrtTrace: shader 0x%016" PRIx64 " replays differently (result %d/%d)\n",
+					     program.shader_hash, result ? 1 : 0, reference ? 1 : 0);
+				}
+			}
+			return result;
+		}
+		program.srt_trace.reset();
+		if (++program.srt_trace_failures >= MaxTraceFailures) {
+			program.srt_trace_failures = 0;
+			program.srt_trace_pause    = TracePause;
+			return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+		}
+	}
+	SrtTraceSession record(program, nullptr);
+	const bool      result = MaterializeResourcesOnce(program, runtime, snapshot, specialization, &record);
+	if (result) {
+		program.srt_trace = record.Finish();
+		if (program.srt_trace == nullptr) program.srt_trace_pause = UntracedPause;
+	}
+	return result;
+}
+
 bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
-                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                              SrtTraceSession* trace) {
 	// Each walk resolves the selector keys anew.
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
@@ -1611,9 +1680,11 @@ bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& run
 			    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 		}
 	} else {
-		clean.emplace(program, CleanRuntime(observed));
+		if (trace != nullptr) trace->Attach(observed);
+		clean.emplace(program, CleanRuntime(observed), nullptr, trace);
 		walker.emplace(program, observed,
-		               capture_reads || program.requires_specialization_memory ? &*clean : nullptr);
+		               capture_reads || program.requires_specialization_memory ? &*clean : nullptr,
+		               trace);
 		if (!walker->RefreshFlatBuffer(snapshot.flattened_srt)) {
 			return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 			    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));

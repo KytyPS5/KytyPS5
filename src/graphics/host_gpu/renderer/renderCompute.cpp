@@ -333,6 +333,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// The counts as the guest gave them: threads in thread dimensions, as the fill check reads them.
+	const uint32_t guest_x = thread_group_x;
+	const uint32_t guest_y = thread_group_y;
+	const uint32_t guest_z = thread_group_z;
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
 		const uint32_t old_y = thread_group_y;
@@ -473,8 +477,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	uint32_t             fill_value = 0;
 	uint64_t             fill_size  = 0;
 	if (resources.uniform_fill.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
-	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
-	                             fill_descriptor, fill_value, fill_size)) {
+	    ResolveComputeBufferFill(input_info, guest_x, guest_y, guest_z, mode, fill_descriptor,
+	                             fill_value, fill_size)) {
 		m_context.GetTextureCache().RecordColorMetadataFill(fill_descriptor.Base48(), fill_size,
 		                                                    fill_value);
 	}

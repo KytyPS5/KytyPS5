@@ -1833,9 +1833,9 @@ bool ResourceSpecializationFits(const ShaderInfo&             info,
 		}
 		return true;
 	};
+	// Samplers are not part of a program list record (ProgramRecord), so they are not checked.
 	return fits(specialization.buffers, info.buffers.size(), BufferResource::NoIndirectBuffer) &&
-	       fits(specialization.images, info.images.size(), ImageResource::NoIndirectImage) &&
-	       fits(specialization.samplers, info.samplers.size(), SamplerResource::NoIndirectSampler);
+	       fits(specialization.images, info.images.size(), ImageResource::NoIndirectImage);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

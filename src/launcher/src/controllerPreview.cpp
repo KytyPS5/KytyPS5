@@ -135,6 +135,9 @@ void ControllerPreview::UpdateRunning() {
 		SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
 	}
 	m_pressed.clear();
+	m_stick_dir = -1;
+	m_stick_x   = 0;
+	m_stick_y   = 0;
 	m_raw_pressed.clear();
 	m_left_stick  = {};
 	m_right_stick = {};
@@ -167,6 +170,9 @@ void ControllerPreview::Refresh() {
 			if (auto* gamepad = m_gamepads.take(event.gdevice.which); gamepad != nullptr) {
 				SDL_CloseGamepad(gamepad);
 			}
+			m_stick_dir = -1;
+			m_stick_x   = 0;
+			m_stick_y   = 0;
 		} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
 			switch (event.gbutton.button) {
 				case SDL_GAMEPAD_BUTTON_DPAD_LEFT: emit NavigationInput(0); break;
@@ -212,7 +218,8 @@ void ControllerPreview::Refresh() {
 	if (!m_gamepads.isEmpty()) {
 		auto* gamepad = m_gamepads.first();
 		name          = QString::fromUtf8(SDL_GetGamepadName(gamepad));
-		// Use the first connected controller that reports a battery.
+		wired = SDL_GetGamepadConnectionState(gamepad) == SDL_JOYSTICK_CONNECTION_WIRED;
+		// Use the first connected controller that reports a battery; the wired state describes it.
 		for (auto* candidate: m_gamepads) {
 			int        percent = -1;
 			const auto power   = SDL_GetGamepadPowerInfo(candidate, &percent);
@@ -220,10 +227,10 @@ void ControllerPreview::Refresh() {
 				battery  = percent;
 				// Only an actively charging pack counts; a full wired pad is just powered by USB.
 				charging = power == SDL_POWERSTATE_CHARGING;
+				wired    = SDL_GetGamepadConnectionState(candidate) == SDL_JOYSTICK_CONNECTION_WIRED;
 				break;
 			}
 		}
-		wired = SDL_GetGamepadConnectionState(gamepad) == SDL_JOYSTICK_CONNECTION_WIRED;
 		for (const auto& binding: RAW_BUTTONS) {
 			if (SDL_GamepadHasButton(gamepad, binding.button) &&
 			    SDL_GetGamepadButton(gamepad, binding.button)) {

@@ -21,7 +21,11 @@
 #include "graphics/shader/triangleVertexValueShader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <vector>
@@ -650,6 +654,56 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 }
 
+// KYTY_PIPELINE_IR=<guest shader hashes in hex, comma-separated>: the compute pipelines of those
+// shaders.
+static bool CapturesPipelineIr(const GraphicContext& graphics, uint64_t shader_hash) {
+	static const char* wanted = std::getenv("KYTY_PIPELINE_IR");
+	if (!graphics.pipeline_executable_info_enabled || wanted == nullptr) return false;
+	for (const char* cursor = wanted; *cursor != '\0';) {
+		char* end = nullptr;
+		if (std::strtoull(cursor, &end, 16) == shader_hash) return true;
+		if (end == cursor) break;
+		cursor = *end == ',' ? end + 1 : end;
+	}
+	return false;
+}
+
+// Writes pipeline_ir_<hash>_<n>.txt in the working directory: each executable's statistics and
+// the text of its internal representations (for RADV: NIR, ACO IR and the assembly).
+static void DumpPipelineIr(GraphicContext& graphics, vk::Pipeline pipeline, uint64_t shader_hash) {
+	static std::atomic<uint32_t> count {0};
+	const auto path = fmt::format("pipeline_ir_{:016x}_{}.txt", shader_hash, count++);
+	FILE* out = std::fopen(path.c_str(), "w");
+	if (out == nullptr) return;
+	const vk::PipelineInfoKHR pipeline_info {.pipeline = pipeline};
+	const auto executables = graphics.device.getPipelineExecutablePropertiesKHR(pipeline_info).value;
+	for (uint32_t index = 0; index < executables.size(); ++index) {
+		std::fprintf(out, "=== %s: %s (subgroup %u)\n", executables[index].name.data(),
+		             executables[index].description.data(), executables[index].subgroupSize);
+		const vk::PipelineExecutableInfoKHR executable {.pipeline = pipeline, .executableIndex = index};
+		for (const auto& stat: graphics.device.getPipelineExecutableStatisticsKHR(executable).value) {
+			std::fprintf(out, "%s: %llu\n", stat.name.data(),
+			             static_cast<unsigned long long>(stat.value.u64));
+		}
+		uint32_t ir_count = 0;
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &ir_count, nullptr);
+		std::vector<vk::PipelineExecutableInternalRepresentationKHR> irs(ir_count);
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &ir_count, irs.data());
+		std::vector<std::vector<char>> texts(ir_count);
+		for (uint32_t i = 0; i < ir_count; ++i) {
+			texts[i].resize(irs[i].dataSize);
+			irs[i].pData = texts[i].data();
+		}
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &ir_count, irs.data());
+		for (uint32_t i = 0; i < ir_count; ++i) {
+			std::fprintf(out, "--- %s: %s\n", irs[i].name.data(), irs[i].description.data());
+			if (irs[i].isText) std::fwrite(texts[i].data(), 1, strnlen(texts[i].data(), texts[i].size()), out);
+			std::fprintf(out, "\n");
+		}
+	}
+	std::fclose(out);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
@@ -701,10 +755,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
+	const bool capture = CapturesPipelineIr(graphics, input_info.stage.program->shader_hash);
+	if (capture) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR |
+		              vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	}
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+	// A pipeline from the driver's cache may come without its internal representations.
+	result = graphics.device.createComputePipelines(capture ? nullptr : driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	if (capture && result == vk::Result::eSuccess) {
+		DumpPipelineIr(graphics, pipeline.pipeline, input_info.stage.program->shader_hash);
+	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

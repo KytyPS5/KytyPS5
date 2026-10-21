@@ -675,6 +675,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable {};
+	if (graphics.pipeline_executable_info_enabled) {
+		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
+		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
+		create_info.pNext                          = &pipeline_executable;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1077,6 +1083,11 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 			graphic_ctx.buffer_marker_enabled = true;
+		}
+		if (std::getenv("KYTY_PIPELINE_IR") != nullptr &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			graphic_ctx.pipeline_executable_info_enabled = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);

@@ -798,6 +798,13 @@ void WindowContext::Run() {
 	auto bench = LoadBenchScript();
 	// A step that waits for a frame is checked this often.
 	constexpr int bench_frame_poll_ms = 4;
+	// KYTY_BENCH_LIVE=<file>: key names appended to the file, one per line, are tapped as they
+	// arrive, to steer a run from what its screenshots show.
+	const char*   live_path = std::getenv("KYTY_BENCH_LIVE");
+	std::ifstream live_file;
+	std::string   live_partial;
+	std::vector<std::pair<uint64_t, std::string>> live_releases; // key ups due at a time
+	uint64_t      live_next_ms = 0;
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -852,6 +859,38 @@ void WindowContext::Run() {
 				               }
 			               });
 			wait_ms = bench->WaitMs(SDL_GetTicks(), bench_frame_poll_ms, wait_ms);
+		}
+		if (live_path != nullptr) {
+			if (!live_file.is_open()) live_file.open(live_path);
+			const auto live_now = SDL_GetTicks();
+			for (auto it = live_releases.begin(); it != live_releases.end();) {
+				if (it->first <= live_now) {
+					HostInputKey(SDL_GetKeyFromName(it->second.c_str()), false);
+					it = live_releases.erase(it);
+				} else {
+					++it;
+				}
+			}
+			if (live_file.is_open() && live_releases.empty() && live_now >= live_next_ms) {
+				live_file.clear();
+				char c = 0;
+				while (live_file.get(c)) {
+					if (c != '\n') {
+						live_partial += c;
+						continue;
+					}
+					const auto key = live_partial;
+					live_partial.clear();
+					if (key.empty() || SDL_GetKeyFromName(key.c_str()) == SDLK_UNKNOWN) continue;
+					std::printf("Bench: %llu ms, live tap %s\n", static_cast<unsigned long long>(live_now), key.c_str());
+					std::fflush(stdout);
+					HostInputKey(SDL_GetKeyFromName(key.c_str()), true);
+					live_releases.emplace_back(live_now + 150, key);
+					live_next_ms = live_now + 400; // one tap at a time, as a player would
+					break;
+				}
+			}
+			wait_ms = std::min(wait_ms, 20);
 		}
 		if (HostInputWaitEvent(&loop.event, wait_ms)) {
 			ProcessEvent(timer.GetTimeS());

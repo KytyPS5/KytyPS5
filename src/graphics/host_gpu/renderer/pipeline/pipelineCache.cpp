@@ -149,7 +149,8 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	static const bool dump_shaders = std::getenv("KYTY_DUMP_SHADERS") != nullptr;
+	if (!Config::GraphicsDebugDumpEnabled() && !dump_shaders) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -167,7 +168,9 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	// KYTY_DUMP_SHADERS: the guest binaries alone, without the rest of the debug dump.
+	static const bool dump_shaders = std::getenv("KYTY_DUMP_SHADERS") != nullptr;
+	if (!Config::GraphicsDebugDumpEnabled() && !dump_shaders) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -744,6 +747,7 @@ struct PipelineCache::ProgramCache {
 		const std::vector<uint32_t> user_data(record.user_data_count, 0u);
 		const auto                  options =
 		    MakeOptions(record.stage, record.hash, user_data, record.back_code, info);
+		DumpShaderOriginal(NamesOf(record.stage).stage_name, options.shader_hash, record.code);
 		const auto source = ShaderRecompiler::PrepareShaderSource(record.code, options);
 		// A program that calls a guest function chosen at run time is built by the draw that
 		// finds the function (see Get). Lists of older builds can name one.

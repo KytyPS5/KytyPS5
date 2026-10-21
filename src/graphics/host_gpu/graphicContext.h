@@ -35,6 +35,9 @@ struct GraphicContext {
 	bool                               dma_buf_import_enabled                = false;
 	// VK_AMD_buffer_marker, for the breadcrumbs of KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h).
 	bool                               buffer_marker_enabled                 = false;
+	// VK_KHR_pipeline_executable_properties, for KYTY_PIPELINE_IR: the driver's statistics and
+	// internal representations of the compute pipelines of one guest shader.
+	bool                               pipeline_executable_info_enabled      = false;
 	bool                               sample_rate_shading_enabled           = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// What the device enabled, not only what it supports, and the known defects of its driver.

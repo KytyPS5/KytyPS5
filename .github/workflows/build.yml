@@ -21,7 +21,8 @@ concurrency:
 
 env:
   SCCACHE_GHA_ENABLED: "true"
-  KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
+  # A push to main is the official release of whichever repository built it
+  KYTY_BUILD_ORIGIN: ${{ github.event_name == 'push' && 'Official' || github.repository != 'KytyPS5/KytyPS5' && 'Fork' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
 jobs:
@@ -452,7 +453,7 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      ((github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5') ||
+      (github.event_name == 'push' ||
        (github.event_name == 'workflow_dispatch' && inputs.release)) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||

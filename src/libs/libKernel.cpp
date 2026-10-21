@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/signalDefer.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -967,7 +968,7 @@ static int SignalDispatchHostSignal() {
 static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
                                       void* native_context) {
 	Pthread current = PthreadSelfOrNull();
-	if (current == nullptr) {
+	if (current == nullptr || Common::DeferSignalInSection()) {
 		return;
 	}
 
@@ -1001,6 +1002,8 @@ static bool EnsureHostSignalDispatchInstalled() {
 		action.sa_sigaction = HostSignalDispatchHandler;
 		sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
+		// A signal deferred in a host section (signalDefer.h) is raised again when it ends.
+		Common::SetSignalRedelivery([] { ::pthread_kill(::pthread_self(), SignalDispatchHostSignal()); });
 		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
 	}();
 	return installed;

@@ -11,6 +11,7 @@
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/trace.h"
 #include "common/virtualMemory.h"
@@ -27,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +36,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -677,6 +680,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
+		}
+	}
+	// The process is ending (Subsystems::EmergencyShutdownActive) while guest threads still run:
+	// a thread that fails on a subsystem already shut down waits here for the end instead of
+	// reporting a crash, and of a second shutdown racing the first.
+	if (Common::Subsystems::Exiting()) {
+		std::printf("A guest thread failed while the emulator was ending (pc=0x%016" PRIx64
+		            "); it waits for the end.\n",
+		            info->exception_address);
+		std::fflush(stdout);
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::hours(1));
 		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread

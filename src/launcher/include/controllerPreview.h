@@ -55,6 +55,8 @@ private:
 	bool                               m_battery_enabled = false;
 	int                                m_battery_percent = -1;
 	int                                m_stick_dir       = -1;
+	int                                m_stick_x         = 0;
+	int                                m_stick_y         = 0;
 	bool                               m_connected       = false;
 	bool                               m_wired           = false;
 	bool                               m_battery_charging = false;	QSet<QString>                      m_pressed;

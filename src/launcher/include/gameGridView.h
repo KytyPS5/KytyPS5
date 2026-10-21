@@ -239,12 +239,14 @@ public:
 
 	// Tiles are packed left to right with a constant gap, so the enlarged selected tile does not
 	// make the spacing uneven.
+	int TileSize(int row) const {
+		const int     side = iconSize().width();
+		const qreal   t    = TileScale(row);
+		return qRound(side / 2.0 + side / 4.0 * (t * t * (3.0 - 2.0 * t)));
+	}
+
 	QRect TileRect(int row) const {
-		const int side = iconSize().width();
-		const auto size = [&](int r) {
-			const qreal t = TileScale(r);
-			return qRound(side / 2.0 + side / 4.0 * (t * t * (3.0 - 2.0 * t)));
-		};
+		const auto size = [&](int r) { return TileSize(r); };
 		int x = Margin - horizontalScrollBar()->value();
 		for (int r = 0; r < row; ++r) {
 			if (!isRowHidden(r)) {
@@ -541,16 +543,24 @@ protected:
 				busy = true;
 			}
 		}
-		// The outline glow keeps animating while a game is selected.
-		if (selectionModel() != nullptr && !selectionModel()->selectedIndexes().isEmpty()) {
+		// The outline glow keeps animating while a game is selected and the grid is visible.
+		if (isVisible() && selectionModel() != nullptr &&
+		    !selectionModel()->selectedIndexes().isEmpty()) {
 			busy = true;
 		}
-		UpdateScrollRange();
-		viewport()->update();
+		if (isVisible()) {
+			UpdateScrollRange();
+			viewport()->update();
+		}
 		if (!busy) {
 			m_timer.stop();
 			m_prev = QPixmap();
 		}
+	}
+
+	void hideEvent(QHideEvent* event) override {
+		QListView::hideEvent(event);
+		m_timer.stop();
 	}
 
 	void showEvent(QShowEvent* event) override {
@@ -565,7 +575,7 @@ protected:
 		const int rows  = model() != nullptr ? model()->rowCount() : 0;
 		for (int row = 0; row < rows; ++row) {
 			if (!isRowHidden(row)) {
-				width += TileRect(row).width() + TileGap;
+				width += TileSize(row) + TileGap;
 			}
 		}
 		if (m_show_all) {

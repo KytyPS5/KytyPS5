@@ -180,18 +180,22 @@ void ControllerPreview::Refresh() {
 		} else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
 		           (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
 		            event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
-			// The left stick navigates once per push, like a d-pad.
-			const bool horizontal = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX;
-			const int  value      = event.gaxis.value;
-			int        dir        = -1;
-			if (value < -20000) dir = horizontal ? 0 : 2;
-			if (value > 20000) dir = horizontal ? 1 : 3;
-			if (dir >= 0 && dir != m_stick_dir) {
-				emit NavigationInput(dir);
+			// The left stick navigates once per push, like a d-pad. The stick is tracked as a
+			// whole: a diagonal push emits one action and re-arms only after returning to center.
+			if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) {
+				m_stick_x = event.gaxis.value;
+			} else {
+				m_stick_y = event.gaxis.value;
 			}
-			if (dir >= 0 || (m_stick_dir >= 0 && std::abs(value) < 10000 &&
-			                 (m_stick_dir < 2) == horizontal)) {
-				m_stick_dir = dir;
+			const int ax = std::abs(m_stick_x);
+			const int ay = std::abs(m_stick_y);
+			if (m_stick_dir < 0) {
+				if (ax > 20000 || ay > 20000) {
+					m_stick_dir = ax >= ay ? (m_stick_x < 0 ? 0 : 1) : (m_stick_y < 0 ? 2 : 3);
+					emit NavigationInput(m_stick_dir);
+				}
+			} else if (ax < 10000 && ay < 10000) {
+				m_stick_dir = -1;
 			}
 		}
 	}
@@ -208,12 +212,16 @@ void ControllerPreview::Refresh() {
 	if (!m_gamepads.isEmpty()) {
 		auto* gamepad = m_gamepads.first();
 		name          = QString::fromUtf8(SDL_GetGamepadName(gamepad));
-		int  percent  = -1;
-		const auto power = SDL_GetGamepadPowerInfo(gamepad, &percent);
-		if (percent >= 0 && power != SDL_POWERSTATE_NO_BATTERY && power != SDL_POWERSTATE_ERROR) {
-			battery  = percent;
-			// Only an actively charging pack counts; a full wired pad is just powered by USB.
-			charging = power == SDL_POWERSTATE_CHARGING;
+		// Use the first connected controller that reports a battery.
+		for (auto* candidate: m_gamepads) {
+			int        percent = -1;
+			const auto power   = SDL_GetGamepadPowerInfo(candidate, &percent);
+			if (percent >= 0 && power != SDL_POWERSTATE_NO_BATTERY && power != SDL_POWERSTATE_ERROR) {
+				battery  = percent;
+				// Only an actively charging pack counts; a full wired pad is just powered by USB.
+				charging = power == SDL_POWERSTATE_CHARGING;
+				break;
+			}
 		}
 		wired = SDL_GetGamepadConnectionState(gamepad) == SDL_JOYSTICK_CONNECTION_WIRED;
 		for (const auto& binding: RAW_BUTTONS) {

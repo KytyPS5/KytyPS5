@@ -85,6 +85,14 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	uint64_t samplers = 0;
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
+		auto size = std::ranges::find(pipeline.descriptor_pool_sizes, binding.descriptorType,
+		                              &vk::DescriptorPoolSize::type);
+		if (size == pipeline.descriptor_pool_sizes.end()) {
+			pipeline.descriptor_pool_sizes.push_back({binding.descriptorType, binding.descriptorCount});
+		} else {
+			EXIT_IF(binding.descriptorCount > UINT32_MAX - size->descriptorCount);
+			size->descriptorCount += binding.descriptorCount;
+		}
 		descriptor_count += binding.descriptorCount;
 		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
 		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;

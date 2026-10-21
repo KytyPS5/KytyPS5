@@ -2223,18 +2223,26 @@ public:
 
   void CheckDescriptorHeapLargeSet() {
     EnsureRuntimeContext();
-    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+    const auto &limits = m_runtime_context.GetPhysicalDeviceProperties().limits;
+    constexpr uint32_t stage_samplers = 16;
+    const auto image_limit = std::min({limits.maxPerStageDescriptorSampledImages,
+                                      limits.maxDescriptorSetSampledImages,
+                                      limits.maxPerStageResources - stage_samplers});
+    const auto image_count = std::min(3506u, image_limit);
+    std::array<vk::DescriptorSetLayoutBinding, 4> bindings{};
     constexpr std::array stages{
         vk::ShaderStageFlagBits::eVertex,
         vk::ShaderStageFlagBits::eFragment,
         vk::ShaderStageFlagBits::eCompute,
     };
-    for (uint32_t i = 0; i < bindings.size(); i++) {
+    for (uint32_t i = 0; i < stages.size(); i++) {
       bindings[i].binding = i;
       bindings[i].descriptorType = vk::DescriptorType::eSampler;
-      bindings[i].descriptorCount = 16;
+      bindings[i].descriptorCount = stage_samplers;
       bindings[i].stageFlags = stages[i];
     }
+    bindings[3] = {3, vk::DescriptorType::eSampledImage, image_count,
+                   vk::ShaderStageFlagBits::eFragment, nullptr};
     vk::DescriptorSetLayoutCreateInfo create{};
     create.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
     create.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -2254,6 +2262,14 @@ public:
                                             &pipeline_layout),
               "vkCreatePipelineLayout");
 
+    vk::DescriptorSetLayout large_layout = nullptr;
+    if (image_limit >= 9000) {
+      bindings[3].descriptorCount = 9000;
+      RequireVk("DescriptorHeapLargeSet", "larger layout",
+                m_device.createDescriptorSetLayout(&create, nullptr, &large_layout),
+                "vkCreateDescriptorSetLayout");
+    }
+
     {
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();
@@ -2263,23 +2279,38 @@ public:
       scheduler.Begin(registers, user_config, shaders);
 
       const auto commit = [&] {
-        const auto set = context.GetDescriptorHeap().Commit(layout);
+        const std::array sizes{
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 48},
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, image_count},
+        };
+        const auto set = context.GetDescriptorHeap().Commit(layout, sizes);
         Require("DescriptorHeapLargeSet", "allocation", set != nullptr,
-                "ordinary descriptor heap could not allocate an oversized sampler set");
+                "ordinary descriptor heap could not allocate a large image/sampler set");
         scheduler.Current().Handle().bindDescriptorSets(
             vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0,
             nullptr);
       };
 
-      for (uint32_t i = 0; i < 22; i++) {
+      for (uint32_t i = 0; i < 3; i++) {
         commit();
       }
       scheduler.Finish();
-      for (uint32_t i = 0; i < 21; i++) {
+      if (large_layout != nullptr) {
+        const std::array sizes{
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 48},
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 9000},
+        };
+        Require("DescriptorHeapLargeSet", "pool growth after recycling",
+                context.GetDescriptorHeap().Commit(large_layout, sizes) != nullptr,
+                "a recycled pool could not grow to fit a larger set");
+        scheduler.Finish();
+      }
+      for (uint32_t i = 0; i < 3; i++) {
         commit();
       }
     }
 
+    m_device.destroyDescriptorSetLayout(large_layout, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(layout, nullptr);
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");

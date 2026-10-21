@@ -185,6 +185,7 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		std::vector<vk::DescriptorPoolSize> descriptor_pool_sizes;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.

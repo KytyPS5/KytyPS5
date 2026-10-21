@@ -551,6 +551,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
+	graphics.denorm_preserve_f32 =
+	    float_controls.shaderDenormPreserveFloat32 == VK_TRUE &&
+	    float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;

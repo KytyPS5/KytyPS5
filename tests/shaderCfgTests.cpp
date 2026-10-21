@@ -4359,6 +4359,31 @@ void TestNewShaderRecompilerScalarB64LaneTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerF32DenormExecutionMode() {
+  const uint32_t shader[] = {
+      EncodeVop2(0x08, 2, 256, 1), // v_mul_f32 v2, v0, v1
+      EncodeSopp(0x01),
+  };
+  for (const uint8_t mode : {0xc0, 0xd0, 0xe0, 0xf0}) {
+    for (const bool host_preserves : {false, true}) {
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      ShaderComputeInputInfo compute{};
+      compute.float_mode = mode;
+      options.input_info.compute = &compute;
+      options.denorm_preserve_f32 = host_preserves;
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto source = DisassembleSpirvBinary(result.spirv);
+      Check((source.find("DenormPreserve 32") != std::string::npos) == (mode == 0xf0 && host_preserves),
+            "compute shader did not request f32 denorm preservation exactly for MODE 0xf0");
+      Check(source.find("DenormFlushToZero") == std::string::npos &&
+                source.find("DenormPreserve 16") == std::string::npos &&
+                source.find("DenormPreserve 64") == std::string::npos,
+            "compute shader declared another denorm execution mode");
+    }
+  }
+}
+
 void TestFloatComparisonInputModes() {
   using namespace ShaderRecompiler;
   const uint32_t shader[] = {
@@ -16675,6 +16700,7 @@ int main() {
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
+  TestNewShaderRecompilerF32DenormExecutionMode();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

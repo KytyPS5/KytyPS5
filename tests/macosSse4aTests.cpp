@@ -131,6 +131,45 @@ constexpr uint8_t kMwaitx[] = {
 	0xc3,             // ret
 };
 
+// SHA-NI: Rosetta 2 has none. Each blob loads xmm0 from (%rcx), the source from (%rdx) and the
+// destination from (%rsi), runs one SHA instruction, and stores the destination to (%rdi). The
+// expected values were taken from native SHA-NI. The first is the encoding PPSA08804 stopped on.
+constexpr uint8_t kSha1Msg1Xmm7Xmm8[] = {
+	0x0f, 0x10, 0x01,             // movups (%rcx), %xmm0
+	0xf3, 0x44, 0x0f, 0x6f, 0x02, // movdqu (%rdx), %xmm8
+	0xf3, 0x0f, 0x6f, 0x3e,       // movdqu (%rsi), %xmm7
+	0x41, 0x0f, 0x38, 0xc9, 0xf8, // sha1msg1 xmm7, xmm8
+	0xf3, 0x0f, 0x7f, 0x3f,       // movdqu %xmm7, (%rdi)
+	0xc3,
+};
+
+constexpr uint8_t kSha1Rnds4Xmm1Xmm2Func2[] = {
+	0x0f, 0x10, 0x01,             // movups (%rcx), %xmm0
+	0xf3, 0x0f, 0x6f, 0x12,       // movdqu (%rdx), %xmm2
+	0xf3, 0x0f, 0x6f, 0x0e,       // movdqu (%rsi), %xmm1
+	0x0f, 0x3a, 0xcc, 0xca, 0x02, // sha1rnds4 xmm1, xmm2, 2
+	0xf3, 0x0f, 0x7f, 0x0f,       // movdqu %xmm1, (%rdi)
+	0xc3,
+};
+
+// Reads xmm0 implicitly.
+constexpr uint8_t kSha256Rnds2Xmm10Xmm9[] = {
+	0x0f, 0x10, 0x01,             // movups (%rcx), %xmm0
+	0xf3, 0x44, 0x0f, 0x6f, 0x0a, // movdqu (%rdx), %xmm9
+	0xf3, 0x44, 0x0f, 0x6f, 0x16, // movdqu (%rsi), %xmm10
+	0x45, 0x0f, 0x38, 0xcb, 0xd1, // sha256rnds2 xmm10, xmm9
+	0xf3, 0x44, 0x0f, 0x7f, 0x17, // movdqu %xmm10, (%rdi)
+	0xc3,
+};
+
+constexpr uint8_t kSha1NexteXmm3Memory[] = {
+	0x0f, 0x10, 0x01,       // movups (%rcx), %xmm0
+	0xf3, 0x0f, 0x6f, 0x1e, // movdqu (%rsi), %xmm3
+	0x0f, 0x38, 0xc8, 0x1a, // sha1nexte xmm3, [rdx]
+	0xf3, 0x0f, 0x7f, 0x1f, // movdqu %xmm3, (%rdi)
+	0xc3,
+};
+
 constexpr size_t kPageSize = 4096;
 
 std::atomic<int>    g_illegal_hits {0};
@@ -357,6 +396,37 @@ void TestAdcx32Memory() {
 	Check((out[1] & kCarryFlag) != 0, "32-bit adcx sets CF on a carry out");
 }
 
+using ShaBlobFn = void (*)(uint32_t *out, const uint32_t *dest, const uint32_t *src,
+                          const uint32_t *xmm0);
+
+void TestShaNi() {
+	alignas(16) const uint32_t dest[4] {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
+	alignas(16) const uint32_t src[4] {0x61626380u, 0x00000000u, 0x00000018u, 0xc3d2e1f0u};
+	alignas(16) const uint32_t xmm0[4] {0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u};
+	struct Case {
+		ShaBlobFn   fn;
+		uint32_t    expected[4];
+		const char *text;
+	};
+	const Case cases[] = {
+	    {MapCode<ShaBlobFn>(kSha1Msg1Xmm7Xmm8),
+	     {0x67452319u, 0x2c1f4a79u, 0xffffffffu, 0xffffffffu}, "sha1msg1 xmm7, xmm8"},
+	    {MapCode<ShaBlobFn>(kSha1Rnds4Xmm1Xmm2Func2),
+	     {0xd241b645u, 0x6f5aae87u, 0xb04f413bu, 0x34ddb52eu}, "sha1rnds4 xmm1, xmm2, 2"},
+	    {MapCode<ShaBlobFn>(kSha256Rnds2Xmm10Xmm9),
+	     {0x3257db20u, 0x8179ea9eu, 0x0ea4a476u, 0xa650ba9au}, "sha256rnds2 xmm10, xmm9"},
+	    {MapCode<ShaBlobFn>(kSha1NexteXmm3Memory),
+	     {0x61626380u, 0x00000000u, 0x00000018u, 0x47df770du}, "sha1nexte xmm3, [rdx]"},
+	};
+	for (const auto &test: cases) {
+		uint32_t  out[4] {};
+		const int before = IllegalHits();
+		test.fn(out, dest, src, xmm0);
+		Check(IllegalHits() > before, test.text);
+		Check(std::memcmp(out, test.expected, sizeof(out)) == 0, test.text);
+	}
+}
+
 void TestUnknownInstructionRefused() {
 	g_refused.store(false, std::memory_order_relaxed);
 	g_refuse_skip.store(2, std::memory_order_relaxed);
@@ -547,6 +617,7 @@ int main() {
 	TestAdcx();
 	TestAdcx32Memory();
 	TestAdoxIsNamedAsUnsupported();
+	TestShaNi();
 	TestUnknownInstructionRefused();
 	TestPatchedExtrqImmediate();
 	TestPatchedExtrqRexHigh();

@@ -131,9 +131,35 @@ void TestCoveredReadSkipsMemory() {
 	      "two labels that cover a 64-bit read were not combined");
 }
 
+// GPU commands recorded after a label read its value too (FC 25 resets an append counter with a
+// label and loads it into GDS in the next submission), until a later GPU write replaces it.
+void TestGpuReadersSeePendingLabels() {
+	PendingLabels labels;
+	labels.Add({.address = 0x1000, .value = 0, .bytes = 8});
+	labels.Add({.address = 0x3000, .value = 5, .bytes = 4});
+	auto seen = labels.PendingForGpu(0x1000, 0x1004);
+	Check(seen.size() == 1 && seen[0].address == 0x1000 && seen[0].bytes == 8,
+	      "a GPU read did not see the pending label over its bytes");
+	Check(labels.PendingForGpu(0x2000, 0x3000).empty(), "a GPU read saw a label outside it");
+	labels.WrittenByGpu(0x1000, 0x1004);
+	Check(labels.PendingForGpu(0x1000, 0x1008).empty(),
+	      "a label hid a GPU write recorded after it");
+	Check(labels.Read(reinterpret_cast<const uint32_t*>(uintptr_t {0x3000})) == 5,
+	      "a GPU write elsewhere changed what the command processor sees");
+	labels.Add({.address = 0x1000, .value = 7, .bytes = 4});
+	seen = labels.PendingForGpu(0x1000, 0x1008);
+	Check(seen.size() == 1 && seen[0].value == 7, "a label after the GPU write was not seen");
+	std::vector<PendingLabels::Label> taken;
+	for (uint64_t serial = 1; serial <= 3; serial++) labels.Complete(serial);
+	labels.TakeCompleted(taken);
+	for (const auto& label: taken) labels.Retire(label);
+	Check(labels.PendingForGpu(0x0, 0x4000).empty(), "a retired label is still pending for the GPU");
+}
+
 } // namespace
 
 int main() {
+	TestGpuReadersSeePendingLabels();
 	TestPendingLabelIsSeenButNotWritten();
 	TestCompletedLabelIsWrittenInOrder();
 	TestNewestWriteWins();

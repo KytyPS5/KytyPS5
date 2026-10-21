@@ -192,26 +192,17 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                              size)) {
 		return false;
 	}
-	const bool image_clear =
-	    cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear);
-	if (!image_clear) {
-		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
-		// partial or ambiguous image backings, including pooled metadata aliases.
-		if ((descriptor.Base48() & 3u) != 0 ||
-		    !m_context.IsMapped(descriptor.Base48(), size) ||
-		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
-			return false;
-		}
-		// Metadata need not have an image backing yet. Keep proven fills in guest memory
-		// when CPU-owned, so color-clear discovery can read them without a GPU download.
-		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
+	// A fill without an image of exactly its memory runs as the dispatch, in GPU order: shaders
+	// read guest memory itself, so a CPU fill now would reach GPU work queued before it. Its
+	// value is recorded instead (RecordColorMetadataFill), which spares the read-back.
+	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
+		return false;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
+		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-		     image_clear ? "image clear" : "buffer fill", input.stage.program->shader_hash,
-		     descriptor.Base48(), size, packed_clear);
+		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
 	return true;
 }

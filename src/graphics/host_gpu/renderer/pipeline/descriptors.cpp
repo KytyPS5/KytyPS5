@@ -114,8 +114,10 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    uint32_t& range_pad) {
 	buffer_offset = 0;
+	range_pad     = 0;
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
@@ -139,6 +141,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
+	range_pad     = static_cast<uint32_t>((4u - (size + adjustment) % 4u) % 4u);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
@@ -837,13 +840,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	auto pack_range_pad = [&](uint32_t index, uint32_t pad) {
+		prepared.shader_data[layout.MemoryPadDword() + index / 16u] |= pad << ((index % 16u) * 2u);
+	};
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
+		uint32_t range_pad     = 0;
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		                                              resource, buffer_offset, range_pad);
 		pack_memory_offset(index, buffer_offset);
+		pack_range_pad(index, range_pad);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);

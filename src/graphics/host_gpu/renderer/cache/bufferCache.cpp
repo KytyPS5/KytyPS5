@@ -9,6 +9,7 @@
 #include "common/profiler.h"
 #include "common/trace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/pendingLabels.h"
 #include "graphics/host_gpu/bufferChunk.h"
 #include "graphics/host_gpu/cacheCollection.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -352,6 +353,30 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-replacement range\n");
+	}
+	// Guest memory that is a buffer itself takes each GPU write in place when the write runs: one
+	// still queued would land over the new bytes, so it is waited for (as ReadBack waits).
+	if (IsGuestBacked(vaddr, size)) {
+		const auto current   = m_scheduler.CurrentTick();
+		const bool unsettled = m_unsettled_everywhere ||
+		                       std::ranges::any_of(m_unsettled_writers, [&](BufferId id) {
+			                       if (IsBufferInvalid(id) || m_slot_buffers[id].is_deleted) {
+				                       return false;
+			                       }
+			                       const auto& buffer = m_slot_buffers[id];
+			                       return buffer.CpuAddress() < vaddr + size &&
+			                              vaddr < buffer.CpuAddress() + buffer.Size();
+		                       });
+		const auto last_write =
+		    unsettled ? current
+		              : std::max(m_guest_backed_writes.LastWrite(vaddr, size), m_address_write_tick);
+		if (last_write != 0 && !(last_write < current && m_scheduler.IsFree(last_write))) {
+			if (last_write >= current) {
+				m_scheduler.Flush();
+			}
+			m_scheduler.Wait(last_write);
+			m_scheduler.WaitPriorityOperations(last_write);
+		}
 	}
 	m_write_watches.NotifyWrite(vaddr, size);
 	// What the GPU wrote in the range is about to be overwritten in full, so it is dropped: a
@@ -924,6 +949,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
+			if (m_labels != nullptr) {
+				for (const auto& label: m_labels->PendingForGpu(vaddr, vaddr + size)) {
+					const auto* bytes = reinterpret_cast<const uint8_t*>(&label.value);
+					for (uint32_t i = 0; i < label.bytes; i++) {
+						if (label.address + i >= vaddr && label.address + i < vaddr + size) {
+							static_cast<uint8_t*>(mapped)[label.address + i - vaddr] = bytes[i];
+						}
+					}
+				}
+			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -935,6 +970,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (m_labels != nullptr) {
+		ApplyPendingLabels(buffer, vaddr, size);
+		if (is_written) {
+			m_labels->WrittenByGpu(vaddr, vaddr + size);
+		}
+	}
 	if (is_written && buffer.IsGuestBacked()) {
 		m_guest_backed_writes.Add(vaddr, size, m_scheduler.CurrentTick());
 		if (is_texel_buffer && !m_copy_only.Intersects(buffer.CpuAddress(), buffer.Size())) {
@@ -952,6 +993,29 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+void BufferCache::ApplyPendingLabels(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// A label reaches guest memory when the host GPU completed the work before it, which can be
+	// after commands recorded later read the memory: FC 25 resets an append counter with a label
+	// and loads it into GDS in the next submission, and read the stale count (or bytes another
+	// use left there) until a draw of billions of vertices hung the GPU.
+	const auto labels = m_labels->PendingForGpu(vaddr, vaddr + size);
+	if (labels.empty()) {
+		return;
+	}
+	m_scheduler.Current().EndRendering();
+	for (const auto& label: labels) {
+		for (uint32_t at = 0; at < label.bytes; at += sizeof(uint32_t)) {
+			const auto address = label.address + at;
+			if ((address & 3u) != 0 || !buffer.IsInBounds(address, sizeof(uint32_t))) {
+				continue;
+			}
+			uint32_t word = 0;
+			std::memcpy(&word, reinterpret_cast<const uint8_t*>(&label.value) + at, sizeof(word));
+			buffer.Fill(buffer.Offset(address), sizeof(word), word);
+		}
+	}
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -1025,7 +1089,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	// As a fill: a copy to or from guest memory that is a buffer itself runs in GPU order.
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !IsGuestBacked(dst_vaddr, size) &&
-	    !IsGuestBacked(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsGuestBacked(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size) &&
+	    (m_labels == nullptr || (m_labels->PendingForGpu(src_vaddr, src_vaddr + size).empty() &&
+	                             m_labels->PendingForGpu(dst_vaddr, dst_vaddr + size).empty()))) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;

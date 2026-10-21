@@ -235,6 +235,40 @@ time.
 
 The CMake source root is the repository root.
 
+#### GPU access to guest memory
+
+On Linux the GPU reads and writes guest memory in place through `/dev/udmabuf`, so buffers need no
+copies. The kernel caps each udmabuf at `size_limit_mb` (64 MiB by default), and buffers larger
+than half of that are still copied every frame. KytyPS5 reads the current limit at startup, so
+raising it is enough:
+
+```bash
+# Now:
+echo 1024 | sudo tee /sys/module/udmabuf/parameters/size_limit_mb
+# At every boot (udmabuf is often built into the kernel, where modprobe.d options do not apply):
+echo "w /sys/module/udmabuf/parameters/size_limit_mb - - - - 1024" | sudo tee /etc/tmpfiles.d/udmabuf.conf
+```
+
+Check it with `cat /sys/module/udmabuf/parameters/size_limit_mb`, and restart the emulator.
+
+#### Debugging and profiling tools (optional)
+
+These are not needed to build, but help when working on the renderer and the shader recompiler
+(Fedora package names; most distributions use the same or similar names):
+
+```bash
+sudo dnf install gdb perf valgrind strace radeontop \
+  vulkan-validation-layers spirv-tools umr
+```
+
+- `gdb` and `perf` attach to a running emulator. The Release build is stripped; the linker map
+  `_Build/linux/kyty_emulator_clang_lld.map` resolves its addresses. `perf record -e cycles:u -g
+  --user-callchains` samples user-space call stacks without changing `perf_event_paranoid`.
+- `vulkan-validation-layers` checks the renderer's Vulkan usage (the `--vulkan-validation` option).
+- `spirv-tools` disassembles and validates the SPIR-V the recompiler emits.
+- `radeontop` shows whether the GPU is busy; `umr` inspects AMD GPU state, such as the waves of a
+  hung shader (it needs root or access to the amdgpu debugfs files).
+
 ### Building on NixOS
 
 A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend

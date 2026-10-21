@@ -7911,6 +7911,21 @@ public:
                     ReadCachedTexel(name, context, one_level_image, {}, {chain_width, 1, 1}) ==
                         std::vector<u32>(chain_width, chain_low_value),
                 "a one-level texture was served by a cached image with a different mip layout");
+
+        // Same allocation size as the cached chain (as with padded tiled layouts): the
+        // equal-backing fast path must also check where the requested level sits.
+        auto one_level_padded = MakeLinearDesc(
+            base + chain_offset, 2 * chain_row, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {chain_width, 1, 1}, 1, 4, 1);
+        const auto padded_image = texture_cache.FindImage(one_level_padded);
+        (void)texture_cache.FindTexture(padded_image, one_level_padded);
+        Require(name, "equal-size one-level texture over a longer chain",
+                padded_image != two_level_image &&
+                    ReadCachedTexel(name, context, padded_image, {}, {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, chain_low_value),
+                "an equal-size one-level texture reused a cached image with a different mip "
+                "layout");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

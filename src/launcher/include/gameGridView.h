@@ -2,6 +2,7 @@
 #define GAME_GRID_VIEW_H
 
 #include "gameContent.h"
+#include "gameLogo.h"
 #include "trophyViewerDialog.h"
 
 #include <QFontMetrics>
@@ -50,6 +51,8 @@ public:
 			m_source.loadFromData(GameContent::ReadFile(key, QStringLiteral("sce_sys/pic0.png"),
 			                                            GameContent::MaxImageSize));
 		}
+		m_logo        = GameLogo::Load(key);
+		m_logo_scaled = QPixmap();
 		UpdateScaledBackground();
 		if (m_fade < 1.0) {
 			StartAnimation();
@@ -737,13 +740,26 @@ protected:
 			if (!m_title.isEmpty()) {
 				PaintButtons(painter);
 				PaintRecent(painter, r);
-				auto title_font = font();
-				title_font.setPointSizeF(font().pointSizeF() * 4.2);
-				title_font.setWeight(QFont::Black);
-				painter.setPen(Qt::white);
-				painter.setFont(title_font);
-				painter.drawText(QRect(Margin, r.bottom() - 250, qMin(r.width() - 360, 900), 220),
-				                 Qt::AlignLeft | Qt::AlignBottom | Qt::TextWordWrap, m_title);
+				const QRect title_rect(Margin, r.bottom() - 250, qMin(r.width() - 360, 900), 220);
+				if (!m_logo.isNull() && title_rect.width() > 0) {
+					const auto dpr    = devicePixelRatioF();
+					const auto target = m_logo.size().scaled(title_rect.size() * dpr, Qt::KeepAspectRatio);
+					if (m_logo_scaled.isNull() || m_logo_scaled.size() != target) {
+						m_logo_scaled = QPixmap::fromImage(
+						    m_logo.scaled(target, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+						m_logo_scaled.setDevicePixelRatio(dpr);
+					}
+					painter.drawPixmap(title_rect.left(),
+					                   title_rect.bottom() - static_cast<int>(target.height() / dpr) + 1,
+					                   m_logo_scaled);
+				} else {
+					auto title_font = font();
+					title_font.setPointSizeF(font().pointSizeF() * 4.2);
+					title_font.setWeight(QFont::Black);
+					painter.setPen(Qt::white);
+					painter.setFont(title_font);
+					painter.drawText(title_rect, Qt::AlignLeft | Qt::AlignBottom | Qt::TextWordWrap, m_title);
+				}
 			}
 
 			if (!m_progress.isEmpty()) {
@@ -830,6 +846,8 @@ private:
 	std::function<void()> m_show_all_handler;
 	bool                  m_keep_deselected = false;
 	QString               m_path;
+	QImage                m_logo;
+	QPixmap               m_logo_scaled;
 	QPixmap               m_source;
 	QPixmap               m_scaled;
 	QPoint                m_scaled_pos;

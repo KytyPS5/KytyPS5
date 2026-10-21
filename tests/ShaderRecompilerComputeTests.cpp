@@ -2001,11 +2001,13 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
-  // Host float min/max is used on AMD devices with float controls 2, as in Kyty.
+  // Host float min/max is used on RADV with float controls 2, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
-    vk::PhysicalDeviceProperties properties;
-    m_physical_device.getProperties(&properties);
-    return properties.vendorID == 0x1002u && m_float_controls2;
+    vk::PhysicalDeviceDriverProperties driver{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &driver;
+    m_physical_device.getProperties2(&properties);
+    return driver.driverID == vk::DriverId::eMesaRadv && m_float_controls2;
   }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -49025,22 +49027,18 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
-    // Host min/max must keep the emulated results on AMD GPUs.
+    // Host min/max must keep the emulated results on RADV; other drivers only
+    // compile it.
     VulkanHarness vulkan;
+    const bool supported = vulkan.SupportsNativeFloatMinMax();
     for (bool native : {false, true}) {
-      if (native && !vulkan.SupportsNativeFloatMinMax()) {
-        std::printf("Host float min/max skipped: needs an AMD GPU with float controls 2\n");
-        break;
-      }
       ShaderRecompiler::Spirv::SetNativeFloatMinMax(native);
-      auto edges = VectorMinMaxF32NanAndSignedZeroEdges();
-      if (native)
-        edges.required_spirv.push_back("FloatControls2");
-      RunCase(&vulkan, edges);
-      for (u32 wave : {32u, 64u}) {
-        auto test = VectorMinMaxF32RuntimeEdges(wave);
-        if (native)
-          test.required_spirv.push_back("FloatControls2");
+      for (auto test :
+           {VectorMinMaxF32NanAndSignedZeroEdges(),
+            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
+        auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
+        spirv = {" NMin ", " NMax ", "FloatControls2"};
+        test.compile_only = native && !supported;
         RunCase(&vulkan, test);
       }
     }

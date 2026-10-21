@@ -1020,18 +1020,21 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not find suitable device:%s", rejected_devices.c_str());
 	}
 
+	vk::PhysicalDeviceDriverProperties         driver_properties {};
 	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
 	vk::PhysicalDeviceProperties2              physical_device_properties {};
+	push_descriptor_properties.pNext = &driver_properties;
 	physical_device_properties.pNext = &push_descriptor_properties;
 	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
-	constexpr uint32_t AmdVendorId       = 0x1002;
-	// Float controls 2 makes NMin/NMax keep NaN and signed-zero results.
+	// GLSL.std.450 does not order -0 below +0 in NMin/NMax; RADV runs them as v_min/v_max with
+	// IEEE mode off, which gives the guest's NaN and signed-zero results.
 	Libs::Graphics::ShaderRecompiler::Spirv::SetNativeFloatMinMax(
-	    device_properties.vendorID == AmdVendorId && graphic_ctx.float_controls2_enabled &&
+	    driver_properties.driverID == vk::DriverId::eMesaRadv &&
+	    graphic_ctx.float_controls2_enabled &&
 	    std::getenv("KYTY_EMULATED_FLOAT_MIN_MAX") == nullptr);
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());

@@ -15,8 +15,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   bool maintenance8_enabled = false,
                                   bool emit_debug_info = false);
 
-// Emit float min/max as host instructions. AMD hosts execute them with the guest GPU's own
-// NaN and signed-zero rules; other hosts get an exact emulation. The emitted modules require
+// Emit float min/max as host instructions. RADV executes them with the guest GPU's own
+// NaN and signed-zero rules; other drivers get an emulation. The emitted modules require
 // SPV_KHR_float_controls2.
 void SetNativeFloatMinMax(bool enabled);
 

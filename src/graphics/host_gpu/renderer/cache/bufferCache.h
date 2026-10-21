@@ -168,6 +168,9 @@ private:
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
+	// What a buffer created for [vaddr, vaddr + size) covers: its chunk, as one piece of direct
+	// memory when it can be, clipped to copy-only pages, with the buffers it overlaps.
+	[[nodiscard]] OverlapResult PlanBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
@@ -228,6 +231,14 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Raised when a range is added to m_gpu_modified_ranges (see HasGpuDirtyBytes).
+	uint64_t                                          m_gpu_modified_version = 0;
+	struct CleanPage {
+		uint64_t page    = 0; // page + 1; 0: none
+		uint64_t version = 0;
+	};
+	static constexpr uint32_t                         CleanPageBits = 12;
+	std::array<CleanPage, 64>                         m_clean_pages {};
 	uint64_t                                          m_address_write_tick = 0;
 	// Prepared for a GPU write that is not recorded yet. See SettleGpuWrites.
 	static constexpr size_t                           MaxUnsettledWriters = 256;
@@ -237,7 +248,37 @@ private:
 	// next to and over images; with the buffer as guest memory itself, Sonic Racing CrossWorlds
 	// rendered its world and cars black in some frames, and in every frame when the host GPU
 	// kept pace with the guest. As copies they render as before.
+	// Only the pages written that way are copy-only. A buffer that is guest memory itself keeps
+	// out of them, and a copy holds no more than the copy-only pages it touches and the request
+	// (ClipToCopyOnly): the rest of a chunk stays guest memory, and CPU writes there need no
+	// upload. FC 25 reuses memory: whole chunks made copy-only by one formatted store sent up
+	// to 18 MB a frame of CPU writes through uploads.
 	RangeSet                                          m_copy_only;
+	// The pages marked copy-only since the last generation: a page that is not marked again for
+	// a generation (CopyOnlyGeneration collections) stops being copy-only, and the copies over it
+	// become guest memory again (ExpireCopyOnly). Memory a game reuses for other data then needs
+	// no uploads.
+	RangeSet                                          m_copy_only_marked;
+	uint32_t                                          m_copy_only_age = 0;
+	static constexpr uint32_t                         CopyOnlyGeneration = 120;
+	void                                              ExpireCopyOnly();
+	// A copy over memory that could be guest memory itself: nothing only the copy holds, no
+	// copy-only page, one piece of placeable memory.
+	[[nodiscard]] bool CanPromote(BufferId id);
+	// The copies that can be promoted are deleted: their next use makes them guest memory
+	// itself (CreateBuffer). At a collection, when no draw being prepared refers to them.
+	void PromoteCopies(std::vector<BufferId>& ids);
+	// Copies that uploaded CPU writes since the last collection while their memory could be
+	// guest memory itself: a copy made for a reason that is gone (an overlap, a copy-only page
+	// that expired under another buffer) is otherwise a copy for good, and every CPU write to
+	// it faults and is uploaded.
+	static constexpr size_t MaxUploadingCopies = 4096;
+	std::vector<BufferId>   m_uploading_copies;
+	// Adds the pages of a range to m_copy_only; false when it held them already.
+	bool MarkCopyOnly(uint64_t vaddr, uint64_t size);
+	// Narrows a new buffer's [begin, end) around [request_begin, request_end) (m_copy_only).
+	void ClipToCopyOnly(uint64_t request_begin, uint64_t request_end, uint64_t& begin,
+	                    uint64_t& end) const;
 	std::vector<BufferId>                             m_demote;
 	bool                                              m_unsettled_everywhere = false;
 	// Only tests set this: it keeps the copy path covered on a device where the CPU can read

@@ -148,10 +148,13 @@ public:
 	}
 
 	// GPU thread. The labels not retired yet over [begin, end) that GPU commands recorded now
-	// must see, oldest first.
+	// must see, oldest first. Only the GPU thread changes m_latest, so its own read needs no
+	// lock: the buffer cache asks for every buffer of every draw.
 	[[nodiscard]] std::vector<Label> PendingForGpu(uint64_t begin, uint64_t end) {
 		std::vector<Label> labels;
-		std::scoped_lock   lock {m_mutex};
+		if (m_latest.empty()) {
+			return labels;
+		}
 		ForOverlapping(begin, end, [&](Label& label) {
 			if (!label.replaced_on_gpu) {
 				labels.push_back(label);

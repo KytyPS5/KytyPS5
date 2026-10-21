@@ -303,6 +303,9 @@ private:
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// CommitBindings: the (address, size) ranges a draw or dispatch writes.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 	// Dropped whole at the end of a frame when full (bindings point into it): a frame of Crash
 	// Bandicoot 4 decodes about 1,500 different ones.
 	static constexpr size_t                MaxDecodedTextures = 4096;

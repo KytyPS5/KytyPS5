@@ -541,6 +541,122 @@ bool BufferCache::PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64
 	return published;
 }
 
+bool BufferCache::MarkCopyOnly(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	m_copy_only_marked.Add(begin, end - begin);
+	if (m_copy_only.Contains(begin, end - begin)) {
+		return false;
+	}
+	m_copy_only.Add(begin, end - begin);
+	return true;
+}
+
+void BufferCache::ExpireCopyOnly() {
+	if (++m_copy_only_age < CopyOnlyGeneration) {
+		return;
+	}
+	m_copy_only_age = 0;
+	RangeSet expired;
+	m_copy_only.ForEach([&](uint64_t begin, uint64_t end) { expired.Add(begin, end - begin); });
+	m_copy_only_marked.ForEach(
+	    [&](uint64_t begin, uint64_t end) { expired.Subtract(begin, end - begin); });
+	m_copy_only = std::move(m_copy_only_marked);
+	m_copy_only_marked.Clear();
+	if (expired.Empty() || !m_import.Enabled()) {
+		return;
+	}
+	// The copies over expired pages that hold nothing the GPU wrote: guest memory has their
+	// bytes, and their next use makes them guest memory itself (CreateBuffer). As the garbage
+	// collector, at a frame boundary, when no draw being prepared refers to them.
+	std::vector<BufferId> promote;
+	expired.ForEach([&](uint64_t begin, uint64_t end) {
+		auto it = m_buffers.upper_bound(begin);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			const auto& buffer = m_slot_buffers[it->second];
+			if (buffer.CpuAddress() + buffer.Size() > begin) {
+				promote.push_back(it->second);
+			}
+		}
+	});
+	PromoteCopies(promote);
+}
+
+bool BufferCache::CanPromote(BufferId id) {
+	if (IsBufferInvalid(id)) {
+		return false;
+	}
+	const auto& buffer  = m_slot_buffers[id];
+	const auto  address = buffer.CpuAddress();
+	const auto  bytes   = buffer.Size();
+	return !buffer.IsGuestBacked() && !buffer.is_deleted && !m_copy_only.Intersects(address, bytes) &&
+	       !m_unsettled_everywhere &&
+	       std::ranges::find(m_unsettled_writers, id) == m_unsettled_writers.end() &&
+	       m_import.CanPlace(address, bytes);
+}
+
+void BufferCache::PromoteCopies(std::vector<BufferId>& ids) {
+	std::ranges::sort(ids);
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+	for (const auto id: ids) {
+		if (!CanPromote(id)) {
+			continue;
+		}
+		const auto& buffer  = m_slot_buffers[id];
+		const auto  address = buffer.CpuAddress();
+		const auto  bytes   = buffer.Size();
+		// Only when the buffer its next use makes can be guest memory itself: a copy next to one
+		// that can't be would be made again.
+		const auto plan = PlanBuffer(address, bytes);
+		if (m_copy_only.Intersects(plan.begin, plan.end - plan.begin) ||
+		    !m_import.CanPlace(plan.begin, plan.end - plan.begin)) {
+			continue;
+		}
+		if (!m_memory_tracker.IsRegionGpuModified(address, bytes)) {
+			m_memory_tracker.UntrackMemory(address, bytes);
+			DeleteBuffer(id);
+			continue;
+		}
+		// The copy holds what the GPU wrote: a new buffer over it that is guest memory itself
+		// takes those bytes over on the GPU (JoinOverlap).
+		(void)CreateBuffer(address, bytes);
+	}
+	ids.clear();
+}
+
+void BufferCache::ClipToCopyOnly(uint64_t request_begin, uint64_t request_end, uint64_t& begin,
+                                 uint64_t& end) const {
+	if (m_copy_only.Empty()) {
+		return;
+	}
+	bool     touches = false;
+	uint64_t low     = request_begin;
+	uint64_t high    = request_end;
+	m_copy_only.ForEachInRange(begin, end - begin, [&](uint64_t from, uint64_t to) {
+		if (from < request_end && request_begin < to) {
+			touches = true;
+			low     = std::min(low, from);
+			high    = std::max(high, to);
+		}
+	});
+	if (touches) {
+		begin = std::max(begin, Common::AlignDown(low, CACHING_PAGESIZE));
+		end   = std::min(end, Common::AlignUp(high, CACHING_PAGESIZE));
+		return;
+	}
+	// Copy-only ranges are whole pages, and the request is outside them.
+	m_copy_only.ForEachInRange(begin, end - begin, [&](uint64_t from, uint64_t to) {
+		if (to <= request_begin) {
+			begin = std::max(begin, to);
+		} else if (from >= request_end) {
+			end = std::min(end, from);
+		}
+	});
+}
+
 void BufferCache::DemoteGuestBackedBuffers() {
 	if (m_demote.empty()) {
 		return;
@@ -685,9 +801,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(m_scheduler.Current().IsInvalid());
-
+BufferCache::OverlapResult BufferCache::PlanBuffer(uint64_t vaddr, uint64_t size) {
 	// The whole chunk around the first use (see bufferChunk.h).
 	const auto chunk =
 	    ChunkRange({vaddr, vaddr + size}, m_scheduler.Context().MappingAt(vaddr), s_chunk_size);
@@ -707,9 +821,13 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			end   = piece_end;
 		}
 	}
-	vaddr = begin;
-	size  = end - begin;
-	const auto overlap = ResolveOverlaps(vaddr, size);
+	ClipToCopyOnly(vaddr, vaddr + size, begin, end);
+	return ResolveOverlaps(begin, end - begin);
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(m_scheduler.Current().IsInvalid());
+	const auto overlap = PlanBuffer(vaddr, size);
 
 	const auto flags     = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
 	const auto placement = m_copy_only.Intersects(overlap.begin, overlap.end - overlap.begin)
@@ -760,6 +878,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (total_size != 0 && m_import.Enabled() && m_uploading_copies.size() < MaxUploadingCopies &&
+	    !m_copy_only.Intersects(buffer.CpuAddress(), buffer.Size()) &&
+	    m_import.CanPlace(buffer.CpuAddress(), buffer.Size())) {
+		if (const auto* owner = m_page_table.Find(buffer.CpuAddress() >> PageTable::kPageBits);
+		    owner != nullptr && *owner && &m_slot_buffers[*owner] == &buffer) {
+			m_uploading_copies.push_back(*owner);
+		}
+	}
 	if (!is_written) {
 		// Hot pages stay dirty and open after an upload (see writeHeat.h), so the CPU's next
 		// writes to them neither fault nor reach the log. The uploaded ranges that are still
@@ -978,8 +1104,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (is_written && buffer.IsGuestBacked()) {
 		m_guest_backed_writes.Add(vaddr, size, m_scheduler.CurrentTick());
-		if (is_texel_buffer && !m_copy_only.Intersects(buffer.CpuAddress(), buffer.Size())) {
-			m_copy_only.Add(buffer.CpuAddress(), buffer.Size());
+		if (is_texel_buffer && MarkCopyOnly(vaddr, size)) {
 			m_demote.push_back(id);
 		}
 	}
@@ -990,7 +1115,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			m_unsettled_everywhere = true;
 		}
 		m_write_watches.NotifyWrite(vaddr, size);
-		m_gpu_modified_ranges.Add(vaddr, size);
+		// A draw that writes the same buffer as the last one adds nothing: clean pages stay known.
+		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
+			m_gpu_modified_ranges.Add(vaddr, size);
+			m_gpu_modified_version++;
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1114,8 +1243,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	// than the PS5's, overwrites it: the counters grew every frame until a draw or dispatch of
 	// millions of elements hung the GPU. As a copy, a CPU write to it waits for the save and
 	// reaches the GPU in GPU order.
-	if (src_gds && dst->IsGuestBacked() && !m_copy_only.Intersects(dst->CpuAddress(), dst->Size())) {
-		m_copy_only.Add(dst->CpuAddress(), dst->Size());
+	if (src_gds && dst->IsGuestBacked() && MarkCopyOnly(dst_vaddr, size)) {
 		m_demote.push_back(FindBuffer(dst_vaddr, size)); // obtaining it can have joined buffers
 	}
 }
@@ -1217,7 +1345,21 @@ void BufferCache::RequestFullSynchronization() {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Shader resource walks ask word by word, mostly within a few pages. A page found clean stays
+	// clean until a GPU write is added: removals only clean more.
+	const uint64_t page     = vaddr >> CleanPageBits;
+	const bool     one_page = ((vaddr + std::max<uint64_t>(size, 1) - 1) >> CleanPageBits) == page;
+	auto&          known    = m_clean_pages[page % m_clean_pages.size()];
+	if (one_page && known.page == page + 1 && known.version == m_gpu_modified_version) {
+		return false;
+	}
+	const bool dirty = m_gpu_modified_ranges.Intersects(vaddr, size);
+	// The ranges are bytes: a clean range does not make its page clean.
+	if (one_page && !dirty &&
+	    !m_gpu_modified_ranges.Intersects(page << CleanPageBits, uint64_t {1} << CleanPageBits)) {
+		known = {page + 1, m_gpu_modified_version};
+	}
+	return dirty;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -1227,6 +1369,8 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
 	DemoteGuestBackedBuffers();
+	ExpireCopyOnly();
+	PromoteCopies(m_uploading_copies);
 	m_guest_backed_writes.ForgetCompleted(m_scheduler.GetMasterSemaphore().KnownGpuTick());
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

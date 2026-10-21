@@ -27,6 +27,9 @@ namespace Libs::Graphics {
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
+// Sets the driver options the emulator's shaders rely on. Call before the Vulkan instance is
+// created, while no other thread reads the environment.
+void        PrepareVulkanDriverEnvironment();
 
 [[nodiscard]] constexpr bool IsHdrSwapchainFormat(vk::Format format) {
 	switch (format) {

@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -481,6 +482,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+	Libs::Graphics::PrepareVulkanDriverEnvironment();
 	VirtualMemory::Init();
 	InitializeThreads();
 

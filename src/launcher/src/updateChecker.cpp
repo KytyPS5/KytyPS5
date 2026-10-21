@@ -4,6 +4,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDesktopServices>
 #include <QDir>
@@ -103,7 +104,16 @@ void UpdateChecker::ShowPreviousResult(QWidget* parent) {
 		for (const auto& name:
 		     install.entryList({QStringLiteral(".kyty-update-??????")},
 		                       QDir::Dirs | QDir::Hidden | QDir::NoSymLinks | QDir::NoDotAndDotDot)) {
-			QDir(install.filePath(name)).removeRecursively();
+			QDir       workspace(install.filePath(name));
+			QDateTime  newest = QFileInfo(workspace.path()).lastModified();
+			for (const auto& entry: workspace.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden |
+			                                                QDir::NoDotAndDotDot)) {
+				newest = qMax(newest, entry.lastModified());
+			}
+			// A workspace touched recently may belong to a running download or helper.
+			if (newest.secsTo(QDateTime::currentDateTime()) > 15 * 60) {
+				workspace.removeRecursively();
+			}
 		}
 	}
 	QFile result(QDir(directory).filePath(QStringLiteral(".kyty-update-result")));

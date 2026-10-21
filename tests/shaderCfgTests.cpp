@@ -10535,6 +10535,8 @@ void TestComputeDispatchWaveSize() {
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
+      EncodeVop2(0x23, 3, 193, 2),  // v_mbcnt_lo_u32_b32 v3, -1, v2: v3 = lane index
+      EncodeVopc(0xd4, 3 + 256, 2), // v_cmpx_gt_u32 v3, v2: EXEC = lanes above 0
       EncodeMubuf0(0x0c),
       EncodeMubuf1(0, 0, 1), // buffer_load_dword
                              // v0
@@ -10568,6 +10570,11 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
         "buffer load SPIR-V lacks storage element access");
   Check(exec_branch < array_length,
         "buffer load bounds check was emitted outside EXEC guard");
+  const auto exec_condition =
+      source.substr(exec_branch, source.find('\n', exec_branch) - exec_branch);
+  Check(exec_condition.find("%true") == std::string::npos &&
+            exec_condition.find("%false") == std::string::npos,
+        "buffer load EXEC guard condition is a constant");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
 }

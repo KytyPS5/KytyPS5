@@ -353,6 +353,30 @@ void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size)
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-replacement range\n");
 	}
+	// Guest memory that is a buffer itself takes each GPU write in place when the write runs: one
+	// still queued would land over the new bytes, so it is waited for (as ReadBack waits).
+	if (IsGuestBacked(vaddr, size)) {
+		const auto current   = m_scheduler.CurrentTick();
+		const bool unsettled = m_unsettled_everywhere ||
+		                       std::ranges::any_of(m_unsettled_writers, [&](BufferId id) {
+			                       if (IsBufferInvalid(id) || m_slot_buffers[id].is_deleted) {
+				                       return false;
+			                       }
+			                       const auto& buffer = m_slot_buffers[id];
+			                       return buffer.CpuAddress() < vaddr + size &&
+			                              vaddr < buffer.CpuAddress() + buffer.Size();
+		                       });
+		const auto last_write =
+		    unsettled ? current
+		              : std::max(m_guest_backed_writes.LastWrite(vaddr, size), m_address_write_tick);
+		if (last_write != 0 && !(last_write < current && m_scheduler.IsFree(last_write))) {
+			if (last_write >= current) {
+				m_scheduler.Flush();
+			}
+			m_scheduler.Wait(last_write);
+			m_scheduler.WaitPriorityOperations(last_write);
+		}
+	}
 	m_write_watches.NotifyWrite(vaddr, size);
 	// What the GPU wrote in the range is about to be overwritten in full, so it is dropped: a
 	// read-back of it would only make the caller wait for bytes nobody reads.

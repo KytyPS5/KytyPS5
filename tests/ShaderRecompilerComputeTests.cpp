@@ -247,6 +247,13 @@ struct TextureCacheTestAccess {
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
 
+  static bool RecordsColorMetadataFill(TextureCache &cache, uint64_t address, uint64_t size) {
+    auto lock = Lock(cache);
+    const auto fill = cache.m_color_metadata_fills.find(address);
+    return fill != cache.m_color_metadata_fills.end() && fill->second.size >= size &&
+           fill->second.consumed.empty();
+  }
+
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
@@ -11991,8 +11998,9 @@ public:
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
     };
-    // One more chunk after the cases holds the image and image-table checks below.
-    constexpr uint64_t allocation_size = cases.size() * case_size + owner_border;
+    // One more chunk after the cases holds the image and image-table checks below, and the
+    // last one the empty arguments.
+    constexpr uint64_t allocation_size = cases.size() * case_size + 2 * owner_border;
     constexpr uint64_t tail = base + cases.size() * case_size;
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -12058,7 +12066,7 @@ public:
       auto &shaders = processor.GetShCtx();
       context.MapMemory(base, allocation_size);
       // Empty CPU-owned arguments must not inspect the shader, even on a GPU-dirty page.
-      constexpr auto empty_args = base + allocation_size - case_size;
+      constexpr auto empty_args = base + allocation_size - owner_border;
       constexpr auto neighbor = empty_args + 0x100u;
       constexpr std::array<std::array<u32, 3>, 3> empty_dimensions{{
           {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
@@ -12985,13 +12993,19 @@ public:
                 !texture_cache.IsMeta(dcc_address),
                 "the native fill guessed an unbound metadata allocation's type");
         if (fill_case.goat) {
+          // The fill runs in GPU order into guest memory itself; its value is recorded, so
+          // reading the metadata needs no read-back (RecordColorMetadataFill).
+          Require(name, "Goat metadata fill is recorded",
+                  TextureCacheTestAccess::RecordsColorMetadataFill(texture_cache, dcc_address,
+                                                                   metadata_size),
+                  "Goat's proven metadata fill was not recorded, so its metadata needs a read-back");
+          scheduler.Finish();
           std::vector<uint32_t> filled_metadata(metadata_words);
-          Require(name, "Goat metadata fill stays CPU-owned",
-                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
-                      LibKernel::Memory::TryReadBacking(dcc_address, filled_metadata.data(), metadata_size) &&
+          Require(name, "Goat metadata fill value",
+                  LibKernel::Memory::TryReadBacking(dcc_address, filled_metadata.data(), metadata_size) &&
                       std::ranges::all_of(filled_metadata,
                           [&](uint32_t word) { return word == fill_case.fill; }),
-                  "Goat's proven metadata fill required a GPU readback or lost its constant value");
+                  "Goat's proven metadata fill lost its constant value");
         }
 
         const auto check_expanded_metadata = [&] {
@@ -13166,9 +13180,10 @@ public:
                 "a nonuniform metadata allocation cleared the whole target");
         fill_metadata(metadata_words);
         if (fill_case.goat) {
-          Require(name, "repeated Goat fill stays CPU-owned",
-                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
-                  "re-clearing expanded metadata required another GPU readback");
+          Require(name, "repeated Goat fill is recorded",
+                  TextureCacheTestAccess::RecordsColorMetadataFill(texture_cache, dcc_address,
+                                                                   metadata_size),
+                  "re-clearing expanded metadata was not recorded, so it needs another read-back");
         }
         bind();
         Require(name, "complete fill after partial fill",
@@ -40884,6 +40899,9 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
             "indirect store lost a buffer binding");
     compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
     compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
+    // No range pads: the bindings end where the harness's ranges end.
+    std::fill(compiled.packed_user_data.begin() + program.bindings.MemoryPadDword(),
+              compiled.packed_user_data.end(), 0u);
     ValidateSpirv(test.name, compiled.spirv);
     test.required_spirv.clear();
     test.forbidden_spirv = {"PhysicalStorageBuffer"};
@@ -40903,8 +40921,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
         if (opcode == spv::OpBitFieldUExtract) ++prefix_extracts;
         offset += words.size();
       }
+      // Two extracts: the selected binding's byte prefix, and the pad of its range's last dword
+      // that a store needs for the exact end (Bindings::MemoryPadDword).
       Require(test.name, "shared store and nonuniform pointers",
-              prefix_extracts == 1u && accessed_pointers.size() == 2u &&
+              prefix_extracts == 2u && accessed_pointers.size() == 2u &&
                   std::ranges::all_of(accessed_pointers, [&](u32 pointer) {
                     return nonuniform.contains(pointer);
                   }),

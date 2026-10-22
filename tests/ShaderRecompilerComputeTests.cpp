@@ -5412,6 +5412,89 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckBufferCacheReleasesUnboundBuffers() {
+    constexpr const char *name = "BufferCacheReleasesUnboundBuffers";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    // Direct memory: unmapping the GPU-written buffer publishes it to the direct backing.
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 8 * page;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    // Unmapping the GPU-written buffer at the end reads it back through the GPU thread.
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 8 * page);
+    // No memory pressure: only the unbound-buffer release may retire anything.
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(
+        cache, std::numeric_limits<uint64_t>::max(),
+        std::numeric_limits<uint64_t>::max());
+    const auto run_gc = [&](uint32_t ticks) {
+      for (uint32_t tick = 0; tick < ticks; ++tick) {
+        cache.RunGarbageCollector();
+      }
+    };
+
+    const auto unbound = cache.FindBuffer(base, page);
+    const auto pinned = cache.FindBuffer(base + 2 * page, page);
+    cache.PinBda(pinned);
+    (void)cache.ObtainBuffer(base + 4 * page, 16, true);
+    run_gc(200);
+    const auto recent = cache.FindBuffer(base + 6 * page, page);
+    run_gc(110);
+    Require(name, "unbound release",
+            !cache.IsRegionRegistered(base, page) &&
+                !BufferCacheTestAccess::PageOwner(cache, base) &&
+                cache.IsRegionCpuModified(base, page),
+            "a clean buffer nothing bound for 300 ticks stayed registered or tracked");
+    Require(name, "retained owners",
+            static_cast<bool>(unbound) &&
+                BufferCacheTestAccess::PageOwner(cache, base + 2 * page) == pinned &&
+                cache.IsRegionRegistered(base + 4 * page, 16) &&
+                cache.IsRegionGpuModified(base + 4 * page, 16) &&
+                BufferCacheTestAccess::PageOwner(cache, base + 6 * page) == recent,
+            "a BDA-pinned, GPU-written or recently registered buffer was released");
+
+    // A buffer that absorbs a pinned one stays pinned.
+    const auto joined = cache.FindBuffer(base + 2 * page, 2 * page);
+    run_gc(310);
+    Require(name, "pinned join",
+            BufferCacheTestAccess::PageOwner(cache, base + 3 * page) == joined &&
+                cache.IsRegionRegistered(base + 2 * page, 2 * page) &&
+                !cache.IsRegionRegistered(base + 6 * page, page),
+            "joining a pinned buffer dropped its pin, or an aged buffer was kept");
+
+    context.UnmapMemory(base, 8 * page);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -50187,6 +50270,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
     vulkan.CheckBdaSyncBatchesBuffers();
+    vulkan.CheckBufferCacheReleasesUnboundBuffers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -50421,6 +50505,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckBdaSyncBatchesBuffers();
+  vulkan.CheckBufferCacheReleasesUnboundBuffers();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

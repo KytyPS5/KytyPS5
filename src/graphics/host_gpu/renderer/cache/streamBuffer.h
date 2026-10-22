@@ -72,6 +72,9 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Recreated after a shader faulted on it through the BDA page table; never released for
+	// being unbound, since BDA reads do not refresh residency.
+	bool bda_pinned = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

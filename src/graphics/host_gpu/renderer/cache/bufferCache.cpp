@@ -399,6 +399,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
 	auto& new_buffer = m_slot_buffers[new_id];
 	auto& overlap    = m_slot_buffers[overlap_id];
+	new_buffer.bda_pinned = new_buffer.bda_pinned || overlap.bda_pinned;
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
@@ -640,8 +641,46 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::PinBda(BufferId id) {
+	if (!IsBufferInvalid(id)) {
+		m_slot_buffers[id].bda_pinned = true;
+	}
+}
+
+void BufferCache::ReleaseUnboundBuffers(uint64_t tick) {
+	// A buffer otherwise stays registered until memory pressure retires it, so its pages stay
+	// write-protected after the game reuses the memory for CPU data: every write then faults,
+	// and BDA synchronization uploads the page again. Release buffers that no draw or dispatch
+	// has bound for a while and that hold no GPU-written data. A BDA read of a released page
+	// reaches the fault buffer, which recreates the buffer and pins it.
+	constexpr uint64_t UnboundTicks = 300;
+	constexpr size_t   MaxReleased  = 16;
+	constexpr size_t   MaxVisited   = 256;
+	if (tick <= UnboundTicks) {
+		return;
+	}
+	std::vector<BufferId> released;
+	size_t                visited = 0;
+	m_lru_cache.ForEachItemBelow(tick - UnboundTicks, [&](BufferId id) {
+		const auto& buffer = m_slot_buffers[id];
+		if (!buffer.bda_pinned &&
+		    !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) &&
+		    !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			released.push_back(id);
+		}
+		return ++visited == MaxVisited || released.size() == MaxReleased;
+	});
+	for (const auto id: released) {
+		const auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		DeleteBuffer(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
+	}
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	ReleaseUnboundBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

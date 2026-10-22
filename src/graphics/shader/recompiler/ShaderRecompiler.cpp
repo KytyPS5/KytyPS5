@@ -681,11 +681,16 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 				const auto value = Produce(definition, call.src0.reg + i);
 				if (ambiguous_pc != UINT32_MAX) break;
 				if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-					EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
-					if (definitions.size() == 1u) {
-						table_reads[i] = value.Instruction();
+					// Only a single buffer read can be a function table; any other target that
+					// depends on GPU data takes the dispatch-skip fallback.
+					const auto* read = value.TryInstruction();
+					if (definitions.size() == 1u && read != nullptr &&
+					    read->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+						table_reads[i] = read;
 						continue;
 					}
+					LOGF("ShaderRecompiler CS call at pc 0x%08x: s%u depends on GPU data and is not a "
+					     "function-table read\n", call.pc, call.src0.reg + i);
 					source.unsupported_call_pc = call.pc;
 					source.calls.clear();
 					return;
@@ -835,10 +840,15 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				if (!clean.read_memory(clean.userdata, base + chunk_start, chunk))
 					EXIT("shader call at pc 0x%08x cannot read its function table at +0x%llx", pc,
 					     static_cast<unsigned long long>(chunk_start));
-				// First entry whose pair starts inside this chunk.
-				// Entries are visited in order across chunks; a pair that straddles the chunk end is
-				// re-read on its own (rare: only when the stride does not divide the chunk size).
-				const auto first_entry = (chunk_start + table.stride - 1u) / table.stride * table.stride;
+				// Each entry belongs to the chunk where its target pair starts, so every pair is
+				// visited exactly once: the first entry here is the first whose pair starts at or
+				// after chunk_start (the entry itself may start in the previous chunk). A pair that
+				// straddles the chunk end is re-read on its own. Both cases need a stride that does
+				// not divide the chunk size.
+				const auto first_entry =
+				    chunk_start <= table.low_offset
+				        ? 0u
+				        : (chunk_start - table.low_offset + table.stride - 1u) / table.stride * table.stride;
 				for (uint64_t entry = first_entry; entry + table.low_offset + 8u <= size &&
 				                                   entry + table.low_offset < chunk_start + chunk_bytes;
 				     entry += table.stride) {

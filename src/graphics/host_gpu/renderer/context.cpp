@@ -2,10 +2,12 @@
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/deviceLossReport.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -58,6 +60,14 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	if (m_graphics.device_checkpoints_enabled && !IsInvalid()) {
+		const bool draw = op == static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex) ||
+		                  op == static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto);
+		const uint64_t pixel_shader =
+		    draw && m_shaders != nullptr ? m_shaders->GetPs().ps_regs.data_addr : 0;
+		DeviceLossRecordCheckpoint(m_buffer, op, submit_id, arg0, arg1, arg2, arg3, arg4,
+		                           pixel_shader);
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

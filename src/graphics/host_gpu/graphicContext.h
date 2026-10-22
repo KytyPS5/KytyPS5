@@ -37,6 +37,8 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	bool                               device_fault_enabled                  = false;
+	bool                               device_checkpoints_enabled            = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/deviceLossReport.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -381,6 +382,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
+		DeviceLossReport(m_graphics, result);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 

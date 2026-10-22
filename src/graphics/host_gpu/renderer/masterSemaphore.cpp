@@ -2,9 +2,18 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/deviceLossReport.h"
 
 namespace Libs::Graphics {
+
+void MasterSemaphore::ReportFailure(const char* what, vk::Result result, uint64_t tick) {
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "MasterSemaphore: {} failed: {} ({}), tick={} gpu_tick={} current_tick={}\n", what,
+	    vk::to_string(result), static_cast<int>(result), tick, KnownGpuTick(), CurrentTick()));
+	DeviceLossReport(m_graphics, result);
+}
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
@@ -27,6 +36,9 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	if (result != vk::Result::eSuccess) {
+		ReportFailure("vkGetSemaphoreCounterValue", result, 0);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -53,6 +65,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
+		ReportFailure("vkWaitSemaphores", result, tick);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

@@ -6649,6 +6649,12 @@ public:
     private_words[0] = 0x55667788u;
     private_words[page / sizeof(u32) - 1u] = 0x99aabbccu;
     context.MapMemory(private_base, page);
+    const auto private_image = cache.ObtainBufferForImage(private_base, page);
+    const std::array<vk::BufferCopy, 2> private_image_copies{{
+        {private_image.second, 5u * sizeof(u32), sizeof(u32)},
+        {private_image.second + page - sizeof(u32), 6u * sizeof(u32), sizeof(u32)}}};
+    scheduler.Current().Handle().copyBuffer(private_image.first->Handle(), readback.buffer,
+        private_image_copies.size(), private_image_copies.data());
     context.MapMemory(base + page, 2u * page);
     const auto sparse_buffer = cache.ObtainBuffer(base, 2u * page, false);
     const auto private_buffer = cache.ObtainBuffer(private_base, page, false);
@@ -6673,7 +6679,8 @@ public:
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
     Require(name, "cached sparse and private upload",
-        ReadBuffer(name, readback, 5) == std::vector<u32>{0x00020001u, 0u, 0x55667788u, 0x99aabbccu, 0u} &&
+        ReadBuffer(name, readback, 7) == std::vector<u32>{0x00020001u, 0u, 0x55667788u, 0x99aabbccu, 0u,
+            0x55667788u, 0x99aabbccu} &&
         !cache.IsRegionGpuModified(base, 2u * page) &&
         !cache.IsRegionGpuModified(private_base, page),
         "cached upload lost sparse/private data or changed read-only GPU ownership");

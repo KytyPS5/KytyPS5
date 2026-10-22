@@ -595,8 +595,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
-			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+			EXIT("BufferCache: failed to read sparse guest image memory, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n", vaddr, size);
 		}
 	});
 }

@@ -81,6 +81,8 @@ struct ConfigOptions {
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
+	bool                   perf_report_enabled         = false;
+	std::filesystem::path  perf_report_file            = "_kyty_perf.txt";
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -144,6 +146,8 @@ LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
 
 bool ProfilerEnabled();
+bool PerfReportEnabled();
+std::filesystem::path PerfReportFile();
 
 bool SpirvDebugPrintfEnabled();
 

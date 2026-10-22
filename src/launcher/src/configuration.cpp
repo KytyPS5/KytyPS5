@@ -33,6 +33,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(printf_direction);
 	KYTY_CFG_SET(printf_output_file);
 	KYTY_CFG_SET(profiler_enabled);
+	KYTY_CFG_SET(perf_report_enabled);
+	KYTY_CFG_SET(perf_report_file);
 	KYTY_CFG_SET(renderdoc_enabled);
 	KYTY_CFG_SET(amd_cpu_enabled);
 #if defined(_WIN32)
@@ -86,6 +88,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(printf_direction);
 	KYTY_CFG_GET(printf_output_file);
 	KYTY_CFG_GET(profiler_enabled);
+	KYTY_CFG_GET(perf_report_enabled);
+	KYTY_CFG_GET(perf_report_file);
 	KYTY_CFG_GET(renderdoc_enabled);
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
@@ -154,7 +158,8 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if ((shader_log_direction == LogDirection::File && shader_log_folder.isEmpty()) ||
 	    (printf_direction == LogDirection::File && printf_output_file.isEmpty()) ||
-	    (command_buffer_dump_enabled && command_buffer_dump_folder.isEmpty())) {
+	    (command_buffer_dump_enabled && command_buffer_dump_folder.isEmpty()) ||
+	    (perf_report_enabled && perf_report_file.isEmpty())) {
 		return fail(tr("Enabled logging and command buffer dumps require an output path."));
 	}
 

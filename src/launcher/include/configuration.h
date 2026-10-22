@@ -79,6 +79,7 @@ class Configuration: public QObject {
 public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
+	static constexpr const char* DEFAULT_PERF_REPORT_FILE = "_kyty_perf.txt";
 
 	enum class Resolution {
 		R1280X720,
@@ -146,6 +147,8 @@ public:
 	LogDirection           printf_direction            = LogDirection::Silent;
 	QString                printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
+	bool                   perf_report_enabled         = false;
+	QString                perf_report_file            = DEFAULT_PERF_REPORT_FILE;
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
@@ -186,6 +189,8 @@ public:
 		printf_direction            = other.printf_direction;
 		printf_output_file          = other.printf_output_file;
 		profiler_enabled            = other.profiler_enabled;
+		perf_report_enabled         = other.perf_report_enabled;
+		perf_report_file            = other.perf_report_file;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
 #if defined(_WIN32)

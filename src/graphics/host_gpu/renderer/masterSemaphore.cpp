@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfReport.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -52,7 +54,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto wait_start = Common::PerfReport::Now();
+	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	Common::PerfReport::NoteGpuWait(GuestGpu::IsGpuThread(), wait_start);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfReport.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -61,12 +62,18 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const auto start     = Common::PerfReport::Now();
+	const auto downloads = Common::PerfReport::DownloadCount();
+	uint64_t   buffer_done = 0;
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		buffer_done = Common::PerfReport::Now();
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
+	Common::PerfReport::NoteFault(fault_vaddr, access == PageFaultAccess::Write, start, buffer_done,
+	                              Common::PerfReport::DownloadCount() != downloads);
 	return true;
 }
 

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <source_location>
 #include <thread>
 #include <vector>
 
@@ -24,16 +25,18 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
-	void           Flush();
-	void           Flush(SubmitInfo& submit);
-	void           FlushAndWait();
-	void           Finish();
+	// The source_location parameters only attribute GPU waits and submits in the performance
+	// report (common/perfReport.h); callers never pass them.
+	void           Flush(std::source_location site = std::source_location::current());
+	void           Flush(SubmitInfo& submit, std::source_location site = std::source_location::current());
+	void           FlushAndWait(std::source_location site = std::source_location::current());
+	void           Finish(std::source_location site = std::source_location::current());
 	CommandBuffer& BeginCommand();
-	uint64_t       Submit(SubmitInfo submit = {});
+	uint64_t       Submit(SubmitInfo submit = {}, std::source_location site = std::source_location::current());
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
-	void                      Wait(uint64_t tick);
+	void                      Wait(uint64_t tick, std::source_location site = std::source_location::current());
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);

@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfReport.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -440,6 +441,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 
 	for (;;) {
+		Common::PerfReport::MaybeWrite();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -449,7 +451,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const auto idle_start = Common::PerfReport::Now();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::PerfReport::NoteGpuIdle(idle_start);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -473,7 +477,9 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
+						const auto blocked_start = Common::PerfReport::Now();
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						Common::PerfReport::NoteGpuBlocked(blocked_start);
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {

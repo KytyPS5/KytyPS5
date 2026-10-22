@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfReport.h"
 
 #include <algorithm>
 #include <memory>
@@ -18,6 +19,7 @@ void Initialize() {
 
 void Shutdown() {
 	Common::DebugCounters::SetEnabled(false);
+	Common::PerfReport::Configure(false, {});
 	g_config.reset();
 }
 
@@ -30,6 +32,7 @@ void Load(const ConfigOptions& cfg) {
 
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	Common::PerfReport::Configure(cfg.perf_report_enabled, cfg.perf_report_file);
 }
 
 uint32_t GetScreenWidth() {
@@ -167,6 +170,14 @@ std::filesystem::path GetPrintfOutputFile() {
 
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
+}
+
+bool PerfReportEnabled() {
+	return g_config->perf_report_enabled;
+}
+
+std::filesystem::path PerfReportFile() {
+	return g_config->perf_report_file;
 }
 
 bool SpirvDebugPrintfEnabled() {

@@ -469,6 +469,12 @@
             <property name="text"><string>Tracy profiler</string></property>
            </widget>
           </item>
+          <item row="4" column="1">
+           <widget class="QCheckBox" name="checkBox_perf_report">
+            <property name="toolTip"><string>Every 5 seconds, write a summary of frame rate, GPU waits and queue submits by call site, and memory-tracking faults to the performance report file.</string></property>
+            <property name="text"><string>Performance report</string></property>
+           </widget>
+          </item>
           <item row="4" column="2">
            <widget class="QLabel" name="label_cmd_dump_folder">
             <property name="text"><string>Command buffer folder:</string></property>
@@ -477,6 +483,17 @@
           <item row="4" column="3">
            <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
             <property name="toolTip"><string>Specify directory to dump command buffers</string></property>
+            <property name="clearButtonEnabled"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item row="5" column="2">
+           <widget class="QLabel" name="label_perf_report_file">
+            <property name="text"><string>Performance report file:</string></property>
+           </widget>
+          </item>
+          <item row="5" column="3">
+           <widget class="MandatoryLineEdit" name="lineEdit_perf_report_file">
+            <property name="toolTip"><string>Specify the file to write the performance report to</string></property>
             <property name="clearButtonEnabled"><bool>true</bool></property>
            </widget>
           </item>

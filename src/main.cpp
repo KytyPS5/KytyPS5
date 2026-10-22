@@ -87,6 +87,8 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
+	::printf("  --perf-report                        Write a performance summary every 5 s.\n");
+	::printf("  --perf-report-file <path>            Performance report file. Default: _kyty_perf.txt.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
@@ -205,6 +207,7 @@ static constexpr Flag FLAGS[] = {
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
+    {"--perf-report", &ConfigOptions::perf_report_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
@@ -398,6 +401,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--perf-report-file") {
+			options.config.perf_report_file = Common::PathFromUtf8(value);
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

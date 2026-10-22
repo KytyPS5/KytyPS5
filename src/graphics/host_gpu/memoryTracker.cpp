@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/perfReport.h"
 
 namespace Libs::Graphics {
 
@@ -70,6 +71,7 @@ void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
+	Common::PerfReport::NoteBdaQueue(end - begin);
 	m_bda_sync.Add(begin, end - begin);
 }
 

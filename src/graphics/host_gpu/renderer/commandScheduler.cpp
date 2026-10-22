@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/perfReport.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -166,23 +168,27 @@ void CommandScheduler::EndRendering() {
 	}
 }
 
-void CommandScheduler::Flush() {
+void CommandScheduler::Flush(std::source_location site) {
+	Common::PerfReport::SiteScope scope(site);
 	SubmitInfo submit;
 	Flush(submit);
 }
 
-void CommandScheduler::Flush(SubmitInfo& submit) {
+void CommandScheduler::Flush(SubmitInfo& submit, std::source_location site) {
+	Common::PerfReport::SiteScope scope(site);
 	Submit(submit);
 	BeginNext();
 }
 
-void CommandScheduler::FlushAndWait() {
+void CommandScheduler::FlushAndWait(std::source_location site) {
+	Common::PerfReport::SiteScope scope(site);
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
-void CommandScheduler::Finish() {
+void CommandScheduler::Finish(std::source_location site) {
+	Common::PerfReport::SiteScope scope(site);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -192,7 +198,8 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
-void CommandScheduler::Wait(uint64_t tick) {
+void CommandScheduler::Wait(uint64_t tick, std::source_location site) {
+	Common::PerfReport::SiteScope scope(site);
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -339,7 +346,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
-uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+uint64_t CommandScheduler::Submit(SubmitInfo submit, std::source_location site) {
+	Common::PerfReport::SiteScope scope(site);
+	const auto                    submit_start = Common::PerfReport::Now();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -375,6 +384,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	Common::PerfReport::NoteQueueSubmit(GuestGpu::IsGpuThread(), submit_start);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,

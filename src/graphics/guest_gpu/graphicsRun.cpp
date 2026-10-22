@@ -30,6 +30,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -301,6 +302,23 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+namespace {
+
+// Labels that PublishLabelAfterReadbacks deferred behind readbacks, by address, with the latest
+// value deferred for each. Used only on the GPU thread: labels are deferred while processing PM4,
+// and they land through GPU-thread commands.
+struct DeferredLabel {
+	uint64_t value;
+	uint32_t size;
+};
+
+std::unordered_map<uint64_t, DeferredLabel>& DeferredLabels() {
+	static std::unordered_map<uint64_t, DeferredLabel> labels;
+	return labels;
+}
+
+} // namespace
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -325,9 +343,21 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+	if (TestWaitRegMemValue(*addr, ref, mask, func)) {
+		return;
 	}
+	// A label deferred behind readbacks is kept out of memory so guest CPU code cannot read the
+	// readback destination before its data lands. A wait in the command stream does not need
+	// that: everything recorded after it runs after the work the label signals on the host
+	// queue. Blocking until the label lands drains the host GPU instead, several times a frame
+	// in some games.
+	const auto& labels   = DeferredLabels();
+	const auto  deferred = labels.find(reinterpret_cast<uint64_t>(addr));
+	if (deferred != labels.end() && deferred->second.size == sizeof(T) &&
+	    TestWaitRegMemValue(static_cast<T>(deferred->second.value), ref, mask, func)) {
+		return;
+	}
+	SuspendPm4();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -1271,6 +1301,7 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 		return false;
 	}
 	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);
+	DeferredLabels()[reinterpret_cast<uint64_t>(dst)] = {value, size};
 	// The priority callback only hands the write to the GPU thread. The label's page can be
 	// tracked by the buffer cache (the GPU writes other bytes of it); a CPU write there faults
 	// into a buffer readback, which cannot run from a deferred operation. GPU-thread commands
@@ -1284,6 +1315,12 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 		                                      with_interrupt, interrupt_context_id, pending] {
 			std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
 			pending->fetch_sub(1, std::memory_order_acq_rel);
+			auto& labels = DeferredLabels();
+			if (const auto deferred = labels.find(reinterpret_cast<uint64_t>(dst));
+			    deferred != labels.end() && deferred->second.value == value &&
+			    deferred->second.size == size) {
+				labels.erase(deferred);
+			}
 			if (with_interrupt) {
 				renderer.TriggerInterrupt(event_id, interrupt_context_id);
 			}

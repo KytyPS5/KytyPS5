@@ -203,8 +203,13 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	const auto* entry =
 	    Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data));
 	if (entry == nullptr) {
+		char label[sizeof(entitlement_label->data) + 1] {};
+		std::memcpy(label, entitlement_label->data, sizeof(entitlement_label->data));
+		LOGF("\t addcont not found: label='%s'\n", label);
 		return APP_CONTENT_ERROR_NOT_FOUND;
 	}
+	LOGF("\t addcont label='%s' content='%s' dir='%s'\n", entry->entitlement_label.c_str(),
+	     entry->content_id.c_str(), Common::PathToString(entry->mount_dir).c_str());
 
 	std::lock_guard lock(g_addcont_mutex);
 
@@ -255,13 +260,19 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
 	PRINT_NAME();
 
-	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
+	char mount_name[sizeof(mount_point->data) + 1] {};
+	if (mount_point != nullptr) {
+		std::memcpy(mount_name, mount_point->data, sizeof(mount_point->data));
+	}
+	LOGF("\t mount_point = 0x%016" PRIx64 " data='%s'\n",
+	     reinterpret_cast<uint64_t>(mount_point), mount_name);
 
 	if (mount_point == nullptr) {
 		return APP_CONTENT_ERROR_PARAMETER;
 	}
 
 	if (mount_point->data[0] == '\0') {
+		LOGF("\t addcont unmount: empty mount point -> NOT_MOUNTED\n");
 		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
 
@@ -273,11 +284,19 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	const auto it = std::find_if(g_addcont_mounts.begin(), g_addcont_mounts.end(),
 	                             [&](const AddcontMount& m) { return m.point == point; });
 	if (it == g_addcont_mounts.end()) {
+		LOGF("\t addcont unmount: '%s' not in mount list -> NOT_MOUNTED\n", point.c_str());
 		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
-	LibKernel::FileSystem::Umount(point);
-	g_addcont_mounts.erase(it);
-	AprShared::InvalidateFailedResolves();
+	// Some titles unmount additional content after enumerating it but keep
+	// resolving files through the mount point afterwards. Call of Duty: Vanguard
+	// mounts the campaign pack (CODVCONTENTSP001), unmounts it, and then resolves
+	// /addcont0/ww_global_sp.ff and the mission .xsub files from that path;
+	// physically removing the mount makes those reads fail and the game restarts
+	// itself with DEV ERROR 6036. Keep the filesystem mount and the bookkeeping
+	// alive so later reads succeed. A subsequent mount request returns the
+	// existing mount point instead of allocating another one.
+	LOGF("\t addcont unmount: keeping '%s' mounted (label '%s')\n", point.c_str(),
+	     it->label.c_str());
 
 	return OK;
 }

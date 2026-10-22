@@ -373,7 +373,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		}
 	}
 	switch (inst.GetOpcode()) {
-		case ValueOpcode::GetAttribute: {
+		case ValueOpcode::GetAttribute:
+		case ValueOpcode::GetAttributeF16: {
 			if (!inst.Arg(0).IsImmediate() || inst.Arg(0).GetType() != Type::U32 ||
 			    !inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32) {
 				return Fail("typed attribute reference is not constant");
@@ -394,6 +395,15 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			    program.stage == ShaderType::Pixel) {
 				auto& components = inputs.components[inst.Arg(0).U32()];
 				components = std::max(components, static_cast<uint8_t>(inst.Arg(1).U32() + 1u));
+			}
+			if (inst.GetOpcode() == ValueOpcode::GetAttributeF16) {
+				if (program.stage != ShaderType::Pixel || !inst.Arg(2).IsImmediate()) {
+					return Fail("f16 attribute reference is invalid");
+				}
+				// FP16_INTERP_MODE packs two halves per dword, so smooth inputs blend unpacked
+				// vertices; flat inputs unpack the provoking vertex.
+				const auto input = inst.Arg(0).U32();
+				inputs.per_vertex[input] |= !ShaderPixelParameterIsFlat(*input_info.pixel, input);
 			}
 			break;
 		}

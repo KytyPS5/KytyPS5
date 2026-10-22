@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -140,6 +141,74 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	return writable;
 }
 
+uint32_t LoadVertexParameter(EmitterState& state, const InputBinding& input, uint32_t vertex,
+                             uint32_t chan) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
+	                          input.variable_id, ConstantU32(state, vertex),
+	                          ConstantU32(state, chan & 3u));
+	state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+	return value;
+}
+
+// Interpolates a pixel input channel to f32. A half (0 low, 1 high) selects one f16 of a packed
+// FP16_INTERP_MODE dword before blending; smooth inputs read by halves are always per-vertex.
+uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint32_t attr,
+                            uint32_t chan, std::optional<uint32_t> half) {
+	const auto select = [&](uint32_t value) {
+		if (!half) {
+			return value;
+		}
+		const auto bits     = state.builder.AllocateId();
+		const auto unpacked = state.builder.AllocateId();
+		const auto word     = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked,
+		                          GlslStd450(state), GLSLstd450UnpackHalf2x16, bits);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), word, unpacked, *half);
+		return word;
+	};
+	if (!input.per_vertex) {
+		const auto vector    = state.builder.AllocateId();
+		const auto component = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), vector, input.variable_id);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, vector,
+		                          chan & 3u);
+		return select(component);
+	}
+	if (PixelParameterIsFlat(state, attr)) {
+		const auto vertex =
+		    state.input_info.pixel->parameter_mode == ShaderPixelParameterMode::LastVertex ? 2u : 0u;
+		return select(LoadVertexParameter(state, input, vertex, chan));
+	}
+	const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
+	                                  ? IR::StageInputKind::BaryCoordNoPerspective
+	                                  : IR::StageInputKind::BaryCoordSmooth;
+	const auto barycentric      = InputVariableForKind(state, barycentric_kind);
+	uint32_t   sum              = 0;
+	for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+		const auto pointer = state.builder.AllocateId();
+		const auto weight  = state.builder.AllocateId();
+		const auto product = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+		                          pointer, barycentric, ConstantU32(state, vertex));
+		state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+		state.builder.AddFunction(spv::OpFMul, TypeF32(state), product,
+		                          select(LoadVertexParameter(state, input, vertex, chan)), weight);
+		if (vertex == 0u) {
+			sum = product;
+		} else {
+			const auto next = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFAdd, TypeF32(state), next, sum, product);
+			sum = next;
+		}
+	}
+	return sum;
+}
+
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
@@ -148,57 +217,9 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	if (state.program.stage == ShaderType::Vertex || state.program.stage == ShaderType::Local) {
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
 	}
-	const auto load_per_vertex = [&](uint32_t vertex) {
-		const auto pointer = state.builder.AllocateId();
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
-		    input->variable_id, ConstantU32(state, vertex), ConstantU32(state, chan & 3u));
-		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
-		return value;
-	};
-	if (input->per_vertex) {
-		if (PixelParameterIsFlat(state, attr)) {
-			const auto value = load_per_vertex(
-			    state.input_info.pixel->parameter_mode == ShaderPixelParameterMode::LastVertex ? 2u : 0u);
-			const auto bits  = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
-			return bits;
-		}
-		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
-		                                  ? IR::StageInputKind::BaryCoordNoPerspective
-		                                  : IR::StageInputKind::BaryCoordSmooth;
-		const auto barycentric      = InputVariableForKind(state, barycentric_kind);
-		uint32_t   sum              = 0;
-		for (uint32_t vertex = 0; vertex < 3u; vertex++) {
-			const auto pointer = state.builder.AllocateId();
-			const auto weight  = state.builder.AllocateId();
-			const auto product = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain,
-			                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
-			                          pointer, barycentric, ConstantU32(state, vertex));
-			state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
-			state.builder.AddFunction(spv::OpFMul, TypeF32(state), product, load_per_vertex(vertex),
-			                          weight);
-			if (vertex == 0u) {
-				sum = product;
-			} else {
-				const auto next = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpFAdd, TypeF32(state), next, sum, product);
-				sum = next;
-			}
-		}
-		const auto bits = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, sum);
-		return bits;
-	}
-	const auto vector    = state.builder.AllocateId();
-	const auto component = state.builder.AllocateId();
-	const auto bits      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), vector, input->variable_id);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, vector,
-	                          chan & 3u);
-	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, component);
+	const auto value = EmitPixelAttribute(state, *input, attr, chan, std::nullopt);
+	const auto bits  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 	return bits;
 }
 
@@ -209,25 +230,16 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 	if (!input->per_vertex) {
 		return EmitAttribute(ctx.state, attr, chan);
 	}
-	const auto load_vertex = [&](uint32_t vertex) {
-		const auto pointer = state.builder.AllocateId();
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
-		    input->variable_id, ConstantU32(state, vertex), ConstantU32(state, chan & 3u));
-		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
-		return value;
-	};
-
 	uint32_t selected_vertex = (mode + 1u) % 3u;
 	if (mode == 2u && PixelParameterIsFlat(state, attr)) {
 		selected_vertex =
 		    state.input_info.pixel->parameter_mode == ShaderPixelParameterMode::LastVertex ? 2u : 0u;
 	}
-	uint32_t value = load_vertex(selected_vertex);
+	uint32_t value = LoadVertexParameter(state, *input, selected_vertex, chan);
 	if (!PixelParameterIsCustom(state, attr) && mode < 2u) {
 		const auto delta = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpFSub, TypeF32(state), delta, value, load_vertex(0));
+		state.builder.AddFunction(spv::OpFSub, TypeF32(state), delta, value,
+		                          LoadVertexParameter(state, *input, 0, chan));
 		value = delta;
 	}
 	const auto bits = state.builder.AllocateId();
@@ -851,6 +863,12 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitAttribute(ctx.state, inst.Arg(0).U32(), inst.Arg(1).U32());
+}
+
+uint32_t EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto attr = inst.Arg(0).U32();
+	return EmitPixelAttribute(ctx.state, *InputBindingForParameter(ctx.state, attr), attr,
+	                          inst.Arg(1).U32(), inst.Arg(2).U32());
 }
 
 uint32_t EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst) {

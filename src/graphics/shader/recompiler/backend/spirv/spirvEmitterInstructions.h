@@ -236,6 +236,7 @@ uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst&
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);

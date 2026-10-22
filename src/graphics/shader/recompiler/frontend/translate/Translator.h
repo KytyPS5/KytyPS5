@@ -240,8 +240,8 @@ private:
 	void V_READLANE_B32(const Decoder::Instruction& inst);
 	void V_WRITELANE_B32(const Decoder::Instruction& inst);
 	void V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16);
-	void V_INTERP_P1_F32();
 	void V_INTERP_P2_F32(const Decoder::Instruction& inst);
+	void V_INTERP_P2_F16(const Decoder::Instruction& inst);
 	void V_INTERP_MOV_F32(const Decoder::Instruction& inst);
 	void EXP(const Decoder::Instruction& inst);
 

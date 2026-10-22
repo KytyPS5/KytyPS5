@@ -338,6 +338,7 @@ VALUE_OPCODE(ImageAtomicXor64, U64, ImageResource, ImageAddress, U64, U1)
 VALUE_OPCODE(ImageAtomicFMin32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicFMax32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(GetAttribute, U32, U32, U32)
+VALUE_OPCODE(GetAttributeF16, F32, U32, U32, U32)
 VALUE_OPCODE(GetInterpolationParameter, U32, U32, U32, U32)
 VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 

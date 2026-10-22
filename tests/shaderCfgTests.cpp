@@ -6832,6 +6832,50 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestVop3F16InterpolationTranslation() {
+  // v_interp_p1ll_f16 v21, v0, attr0.w high; v_interp_p2_f16 v14, v1, attr0.w, v21 high
+  // v_interp_p1ll_f16 v15, v0, attr0.z;      v_interp_p2_f16 v14, v1, attr0.z, v15 (op_sel[3])
+  const uint32_t shader[] = {
+      EncodeVop3Word0(0x342, 21),    EncodeVop3Word1(0x1c0, 256 + 0, 0),
+      EncodeVop3Word0(0x35a, 14),    EncodeVop3Word1(0x1c0, 256 + 1, 256 + 21),
+      EncodeVop3Word0(0x342, 15),    EncodeVop3Word1(0x080, 256 + 0, 0),
+      EncodeVop3Word0(0x35a, 14, 8), EncodeVop3Word1(0x080, 256 + 1, 256 + 15),
+      EncodeExp0(0x00, 0x1),         EncodeExp1(14, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  SetIdentityInterpolatorSettings(&ps_info);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.ir_dump.find("GetAttributeF16 0x00000000, 0x00000003, 0x00000001") !=
+            std::string::npos,
+        "v_interp_p2_f16 did not read the high f16 of attr0.w");
+  Check(result.ir_dump.find("GetAttributeF16 0x00000000, 0x00000002, 0x00000000") !=
+            std::string::npos,
+        "v_interp_p2_f16 did not read the low f16 of attr0.z");
+  Check(result.decoded_dump.find("v14.sdwa(sel=5") != std::string::npos,
+        "v_interp_p2_f16 op_sel[3] did not write the high half of v14");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u),
+        "f16 interpolation input was not per-vertex");
+  Check(SpirvExtInstCount(result.spirv, 62u) == 6u,
+        "f16 interpolation did not unpack each of the three vertices per read");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 133u) == 6u,
+        "f16 interpolation did not blend three barycentric weights per read");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  ps_info.interpolator_settings[0] = 0x00000400u;
+  auto flat_result = RecompileForTest(shader, options);
+  Check(SpirvExtInstCount(flat_result.spirv, 62u) == 2u &&
+            !SpirvContainsCapability(flat_result.spirv, 5284u) &&
+            SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
+        "flat f16 interpolation did not unpack only the flat provoking value");
+  CheckSpirvBinaryValidates(flat_result.spirv);
+}
+
 void TestPerspectiveCentroidInputs() {
   constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
                              std::array{5u, UINT32_MAX, 2u},
@@ -16828,6 +16872,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestVop3F16InterpolationTranslation();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();

@@ -702,27 +702,125 @@ void BufferCache::ProcessFaultBuffer() {
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = m_memory_tracker.TakeBdaSync();
+	// Most queued pages were uploaded by an ordinary binding after they were queued, so keep
+	// only the runs that are still CPU-modified, merged into contiguous spans. Only ranges inside
+	// buffers are queried: tracking state exists for those, while a mapped range can be huge.
+	struct Span {
+		BufferId id;
+		uint64_t begin;
+		uint64_t end;
+	};
+	std::vector<Span> spans;
 	pending.ForEach([&](uint64_t begin, uint64_t end) {
-		mapped.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
-			SynchronizeBuffersInRange(start, finish - start);
+		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+			auto it = m_buffers.upper_bound(start);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < finish; ++it) {
+				const auto  id     = it->second;
+				const auto& buffer = m_slot_buffers[id];
+				const auto  low    = std::max(buffer.CpuAddress(), start);
+				const auto  high   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
+				if (low >= high) {
+					continue;
+				}
+				m_memory_tracker.ForEachCpuModifiedRange(
+				    low, high - low, [&](uint64_t address, uint64_t bytes) {
+					    const auto run_begin = std::max(address, low);
+					    const auto run_end   = std::min(address + bytes, high);
+					    if (run_begin >= run_end) {
+						    return;
+					    }
+					    // Never merge across a gap: it may be dirty but unmapped.
+					    if (!spans.empty() && spans.back().id == id &&
+					        spans.back().end >= run_begin) {
+						    spans.back().end = std::max(spans.back().end, run_end);
+					    } else {
+						    spans.push_back({id, run_begin, run_end});
+					    }
+				    });
+			}
 		});
 	});
-}
-
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
+	if (spans.empty()) {
+		return;
 	}
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+
+	// A draw can find a few hundred dirty buffers. Upload them through one staging allocation
+	// and record all copies between one pair of barriers, instead of an allocation and two
+	// whole-buffer barriers per buffer.
+	struct Batch {
+		Buffer* buffer;
+		size_t  first;
+		size_t  count;
+	};
+	std::vector<vk::BufferCopy> copies;
+	std::vector<uint64_t>       sources;
+	std::vector<Batch>          batches;
+	uint64_t                    total_size = 0;
+	for (const auto& span: spans) {
+		auto&      buffer = m_slot_buffers[span.id];
+		const auto first  = copies.size();
+		m_memory_tracker.ForEachUploadRange(
+		    span.begin, span.end - span.begin, false,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    sources.push_back(address);
+			    total_size += bytes;
+		    },
+		    []() noexcept {});
+		if (copies.size() == first) {
+			continue;
+		}
+		// Copies into the same buffer share one copy command.
+		if (!batches.empty() && batches.back().buffer == &buffer &&
+		    batches.back().first + batches.back().count == first) {
+			batches.back().count += copies.size() - first;
+		} else {
+			batches.push_back({&buffer, first, copies.size() - first});
 		}
 	}
+	if (batches.empty()) {
+		return;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+
+	// The pages were re-protected above, so a write racing with this copy faults and queues
+	// its page for the next synchronization.
+	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped_memory, uint64_t base_offset) {
+		for (size_t i = 0; i < copies.size(); ++i) {
+			auto& copy = copies[i];
+			if (!LibKernel::Memory::CopySparseMemory(sources[i], mapped_memory + copy.srcOffset,
+			                                         copy.size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			copy.srcOffset += base_offset;
+		}
+	});
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       1, &before, 0, nullptr, 0, nullptr);
+	const auto staging = source.first->Handle();
+	for (const auto& batch: batches) {
+		native.copyBuffer(staging, batch.buffer->Handle(), static_cast<uint32_t>(batch.count),
+		                  copies.data() + batch.first);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+	                       1, &after, 0, nullptr, 0, nullptr);
 }
 
 } // namespace Libs::Graphics

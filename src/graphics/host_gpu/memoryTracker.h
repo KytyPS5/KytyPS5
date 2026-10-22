@@ -86,6 +86,19 @@ public:
 		});
 	}
 
+	// Calls func(address, size) for each CPU-modified run of pages in [vaddr, vaddr + size)
+	// without changing any dirty state. Memory not tracked yet counts as CPU-modified, as in
+	// IsRegionCpuModified, so this creates its tracking regions.
+	template <typename Func>
+	void ForEachCpuModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->template ForEachModifiedRange<DirtySource::Cpu, false>(
+			    manager->GetCpuAddr() + offset, bytes, func);
+		});
+	}
+
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {

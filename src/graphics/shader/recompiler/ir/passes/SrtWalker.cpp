@@ -4,17 +4,107 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <xbyak/xbyak.h>
-
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+
+// Compiled code running on this thread whose guest loads may fault, for the fault handler.
+struct LoadScope {
+	const uint8_t*               code       = nullptr;
+	size_t                       size       = 0;
+	const std::vector<uint32_t>* loads      = nullptr;
+	uint32_t                     fault_exit = 0;
+	bool                         faulted    = false;
+};
+
+constinit thread_local LoadScope* t_load_scope = nullptr;
+
+class ScopedLoads {
+public:
+	ScopedLoads(const Xbyak::CodeGenerator& code, const std::vector<uint32_t>& loads,
+	            uint32_t fault_exit)
+	    : m_scope {code.getCode(), code.getSize(), &loads, fault_exit},
+	      m_previous(std::exchange(t_load_scope, &m_scope)) {}
+	~ScopedLoads() { t_load_scope = m_previous; }
+	ScopedLoads(const ScopedLoads&)            = delete;
+	ScopedLoads& operator=(const ScopedLoads&) = delete;
+
+	[[nodiscard]] bool Faulted() const { return m_scope.faulted; }
+
+private:
+	LoadScope  m_scope;
+	LoadScope* m_previous;
+};
+
+// Loads one guest DWORD; false when the load faulted on a protected page.
+class GuardedLoad final: public Xbyak::CodeGenerator {
+public:
+	using Function = bool KYTY_SYSV_ABI (*)(uint64_t address, uint32_t* out);
+
+	GuardedLoad(): Xbyak::CodeGenerator(64) {
+		loads.push_back(static_cast<uint32_t>(getSize()));
+		mov(eax, dword[rdi]);
+		mov(dword[rsi], eax);
+		mov(eax, 1);
+		ret();
+		fault_exit = static_cast<uint32_t>(getSize());
+		xor_(eax, eax);
+		ret();
+		setProtectModeRE();
+	}
+
+	std::vector<uint32_t> loads;
+	uint32_t              fault_exit = 0;
+};
+
+const GuardedLoad& Guarded() {
+	static const GuardedLoad guarded;
+	return guarded;
+}
+
+// Ordinary reads of mapped memory. A DWORD whose load faults goes to the protected reader.
+void ReadMapped(const SrtRuntime& runtime, uint64_t address, std::span<uint32_t> values) {
+	if (runtime.read_protected == nullptr) {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		return;
+	}
+	const auto& guarded = Guarded();
+	const auto  load    = guarded.getCode<GuardedLoad::Function>();
+	ScopedLoads scope(guarded, guarded.loads, guarded.fault_exit);
+	for (size_t index = 0; index < values.size(); ++index) {
+		const auto word = address + index * sizeof(uint32_t);
+		if (!load(word, &values[index]) &&
+		    !runtime.read_protected(word, values.subspan(index, 1))) {
+			std::memcpy(&values[index], reinterpret_cast<const void*>(word), sizeof(uint32_t));
+		}
+	}
+}
+
+} // namespace
+
+bool ResumeSrtLoadFault(uint64_t pc, uint64_t& resume) noexcept {
+	auto* const scope = t_load_scope;
+	if (scope == nullptr) return false;
+	const auto base = reinterpret_cast<uint64_t>(scope->code);
+	if (pc < base || pc - base >= scope->size ||
+	    !std::binary_search(scope->loads->begin(), scope->loads->end(),
+	                        static_cast<uint32_t>(pc - base)))
+		return false;
+	scope->faulted = true;
+	resume         = base + scope->fault_exit;
+	return true;
+}
 
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
@@ -46,7 +136,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		ReadMapped(capture.m_source, address, values);
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -608,6 +698,7 @@ void CompileTreeWalker(ResourcePlan& program) {
 	// descend through its child pointers. Seed the descriptor evaluator's memo.
 	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
 		code.push(code.rdi);
+		// Pointer DWORDs are user data or were read above as values: this load cannot fault first.
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
 		code.and_(code.rdi, code.r9);
 		const auto first = reads.begin()->first;
@@ -626,6 +717,7 @@ void CompileTreeWalker(ResourcePlan& program) {
 			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
 			using Entry = ResourcePlan::EvaluationContext::Entry;
 			const auto slot = code.rdx + index * sizeof(Entry);
+			program.srt_loads.push_back(static_cast<uint32_t>(code.getSize()));
 			code.mov(code.r10d, code.dword[code.rdi + offset]);
 			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
 			code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
@@ -643,6 +735,7 @@ void CompileTreeWalker(ResourcePlan& program) {
 	}
 	code.mov(code.eax, 1);
 	code.jmp(finished, Xbyak::CodeGenerator::T_NEAR);
+	program.srt_fault_exit = static_cast<uint32_t>(code.getSize());
 	code.L(failed);
 	code.xor_(code.eax, code.eax);
 	code.L(finished);
@@ -903,7 +996,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		ReadMapped(m_runtime, address, {&word, 1});
 	}
 	result = word;
 	return true;
@@ -1307,7 +1400,12 @@ bool SrtWalker::CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool d
 	const auto& table     = *m_program.srt_read_table;
 	auto* const addresses = m_program.srt_read_addresses.data();
 	m_cursor              = addresses;
-	bool ok               = true;
+	// A faulting load fails the read; the walker reads its DWORD with the protected reader.
+	std::optional<ScopedLoads> loads;
+	if (m_runtime.read_protected != nullptr) {
+		loads.emplace(Guarded(), Guarded().loads, Guarded().fault_exit);
+	}
+	bool ok = true;
 	if (!descriptor) {
 		ok = CompiledRead(entry, out[0]);
 	} else {
@@ -1376,7 +1474,11 @@ bool SrtWalker::CompiledRead(uint32_t index, uint32_t& value) {
 	}
 	*m_cursor++     = address;
 	uint32_t loaded = 0;
-	std::memcpy(&loaded, reinterpret_cast<const void*>(address), sizeof(loaded));
+	if (!Guarded().getCode<GuardedLoad::Function>()(address, &loaded)) {
+		// A faulting load recorded its address but did not read it.
+		--m_cursor;
+		return false;
+	}
 	auto& memo      = m_context.values[read.memo];
 	memo.value      = loaded;
 	memo.generation = m_context.generation;
@@ -1415,8 +1517,15 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
-		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		std::optional<ScopedLoads> loads;
+		if (m_runtime.read_protected != nullptr) {
+			loads.emplace(*m_program.srt_code, m_program.srt_loads, m_program.srt_fault_exit);
+		}
+		const bool ok = m_program.srt_code->getCode<Walker>()(
+		    m_runtime.user_data.data(), flat.data(), m_context.values.data(), m_context.generation,
+		    m_runtime.user_data.size());
+		// After a faulting load, the slots below keep the values read before it.
+		if (ok || !loads || !loads->Faulted()) return ok;
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;

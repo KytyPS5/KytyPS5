@@ -668,8 +668,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		uint64_t resume_pc = 0;
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+		                                            info->exception_address, &resume_pc)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			if (resume_pc != 0) {
+				Common::HostException::SetInstructionPointer(*info, resume_pc);
+			}
 			return true;
 		}
 	}

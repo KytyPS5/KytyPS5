@@ -1,3 +1,5 @@
+#include "common/hostException.h"
+#include "common/virtualMemory.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -848,6 +850,206 @@ void TestCompiledSrtReadTable() {
     }
   }
   Check(failed != 0u && failed != checked, "SRT read table sweep missed successes or failures");
+}
+
+// One page that faults on reads, as for GPU writes elsewhere on it. The protected reader serves
+// its bytes from a copy; the fault handler otherwise unprotects it, as the renderer does.
+struct ProtectedPage {
+  static constexpr uint64_t kPageSize = 0x1000;
+  uint64_t base = 0;
+  std::array<uint8_t, kPageSize> copy{};
+  uint32_t resumed = 0;
+  uint32_t unprotected = 0;
+  uint32_t protected_reads = 0;
+  bool active = false;
+};
+ProtectedPage g_page;
+
+bool HandleProtectedPageFault(const Common::HostException::ExceptionInfo &info) {
+  using namespace Common::HostException;
+  if (!g_page.active || info.type != ExceptionType::AccessViolation ||
+      info.access_violation_type != AccessViolationType::Read ||
+      info.access_violation_vaddr - g_page.base >= ProtectedPage::kPageSize)
+    return false;
+  uint64_t resume = 0;
+  if (Libs::Graphics::ShaderRecompiler::IR::ResumeSrtLoadFault(info.exception_address, resume)) {
+    ++g_page.resumed;
+    SetInstructionPointer(info, resume);
+    return true;
+  }
+  ++g_page.unprotected;
+  return Common::VirtualMemory::Protect(g_page.base, ProtectedPage::kPageSize,
+                                        Common::VirtualMemory::Mode::ReadWrite);
+}
+
+bool ReadPageCopy(uint64_t address, std::span<uint32_t> out) {
+  ++g_page.protected_reads;
+  if (address < g_page.base || address - g_page.base > ProtectedPage::kPageSize - out.size_bytes())
+    return false;
+  std::memcpy(out.data(), g_page.copy.data() + (address - g_page.base), out.size_bytes());
+  return true;
+}
+
+bool ReadPageCopyStrict(void *, uint64_t address, std::span<uint32_t> out) {
+  if (address >= g_page.base && address - g_page.base < ProtectedPage::kPageSize) {
+    --g_page.protected_reads;
+    return ReadPageCopy(address, out);
+  }
+  std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+  return true;
+}
+
+void ProtectPage(bool enable) {
+  std::memcpy(g_page.copy.data(), reinterpret_cast<const void *>(g_page.base), g_page.copy.size());
+  g_page.resumed = g_page.unprotected = g_page.protected_reads = 0;
+  g_page.active = enable;
+  Check(Common::VirtualMemory::Protect(g_page.base, ProtectedPage::kPageSize,
+                                       enable ? Common::VirtualMemory::Mode::NoAccess
+                                              : Common::VirtualMemory::Mode::ReadWrite),
+        "protected SRT page could not change protection");
+}
+
+// Compiled SRT loads from a protected page fail over to the protected reader without changing
+// values or captured reads; without that reader the fault is handled as before.
+void TestCompiledSrtLoadsFromProtectedPage() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Common::VirtualMemory::Init();
+  g_page.base = Common::VirtualMemory::Alloc(0, 0x10000, Common::VirtualMemory::Mode::ReadWrite);
+  Check(g_page.base != 0 && g_page.base != UINT64_MAX, "protected SRT page allocation failed");
+  Check(Common::HostException::InstallHandler(HandleProtectedPageFault),
+        "protected SRT page fault handler was not installed");
+  const auto pointer_words = [](uint64_t address) {
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 3u,
+                                  static_cast<uint32_t>(address >> 32u) | 0xabcd0000u};
+  };
+  auto *child = reinterpret_cast<uint32_t *>(g_page.base + 0x100);
+  auto *root = reinterpret_cast<uint32_t *>(g_page.base + 0x200);
+  const std::array<uint32_t, 4> child_values{0u, 0x11111111u, 0x22222222u, 0x33333333u};
+  std::memcpy(child, child_values.data(), sizeof(child_values));
+  const auto child_words = pointer_words(g_page.base + 0x100);
+  // Pointer to the child table, a plain DWORD, the branch DWORD and a DWORD for a clean read.
+  const std::array<uint32_t, 5> root_values{child_words[0], child_words[1], 0x44444444u, 1u,
+                                            0x55555555u};
+  std::memcpy(root, root_values.data(), sizeof(root_values));
+  const auto user_data = pointer_words(g_page.base + 0x200);
+
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  // Captured block plan: compiled slot reads, interpreted condition and clean read.
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &entry = AddValueBlock(program);
+  const auto low = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  const auto high = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  const auto root_handle = emit(entry, ValueOpcode::GetAddressResource, {low, high});
+  const auto load = [&](Value handle, uint32_t offset) {
+    const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                            {handle, Value(offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    return value;
+  };
+  const auto child_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                 {load(root_handle, 0u), load(root_handle, 4u)});
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  const std::array slot_values{load(root_handle, 8u), load(root_handle, 16u),
+                               load(child_handle, 4u), load(child_handle, 8u)};
+  for (uint32_t slot = 0; slot < slot_values.size(); ++slot)
+    program.srt_reads.push_back({slot_values[slot], slot});
+  for (uint32_t slot = 0; slot < 2; ++slot)
+    emit(entry, ValueOpcode::ReadConst, {srt, Value(slot)});
+  DescriptorSource source;
+  source.dwords = {slot_values[1], Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  entry.condition = emit(entry, ValueOpcode::INotEqual32, {load(root_handle, 12u), Value(0u)});
+  for (uint32_t slot = 2; slot < 4; ++slot)
+    emit(AddValueBlock(program), ValueOpcode::ReadConst, {srt, Value(slot)});
+  entry.terminator.kind = TerminatorKind::ConditionalBranch;
+  entry.terminator.true_block = program.blocks[1];
+  entry.terminator.false_block = program.blocks[2];
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.capture_specialization_reads && plan.srt_code == nullptr &&
+            plan.srt_read_table != nullptr && plan.srt_read_entries[2] != UINT32_MAX,
+        "protected-page plan did not compile its slot reads");
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_read_table.reset();
+
+  // Tree plan: the whole walk is compiled, including the load of the child pointer.
+  Program tree = SrtProgram(0u);
+  tree.user_data_base = 4;
+  tree.user_data_count = 2;
+  {
+    auto &block = *tree.blocks[0];
+    const auto tree_root = emit(block, ValueOpcode::GetAddressResource,
+                                {emit(block, ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+                                 emit(block, ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+    const auto read = [&](Value handle, uint32_t offset) {
+      const auto value = emit(block, ValueOpcode::LoadAddressU32,
+                              {handle, Value(offset), Value(0u), Value(true)});
+      value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+      tree.srt_reads.push_back({value, static_cast<uint32_t>(tree.srt_reads.size())});
+      return value;
+    };
+    auto *leaf = tree.srt_reads[0].value.Instruction();
+    const auto pointer_low = read(tree_root, 0u);
+    const auto pointer_high = read(tree_root, 4u);
+    leaf->Arg(0).Instruction()->SetArg(0, pointer_low);
+    leaf->Arg(0).Instruction()->SetArg(1, pointer_high);
+    leaf->SetArg(1, Value(4u));
+    read(tree_root, 8u);
+  }
+  auto tree_plan = ExtractResourcePlan(tree);
+  Check(tree_plan.srt_code != nullptr,
+        "protected-page tree plan did not compile an x86 walker");
+
+  const auto runtime = [&](bool with_reader) {
+    return SrtRuntime{.user_data = user_data,
+                      .read_specialization_memory = ReadPageCopyStrict,
+                      .read_protected = with_reader ? ReadPageCopy : nullptr};
+  };
+  for (auto *current : {&plan, &interpreted, &tree_plan}) {
+    ProtectPage(false);
+    ResourceSnapshot expected;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(*current, runtime(true), expected, specialization) &&
+              g_page.protected_reads == 0,
+          "unprotected SRT page used the protected reader");
+    Check(expected.flattened_srt.size() >= 3 &&
+              expected.flattened_srt[current == &tree_plan ? 0 : 2] == child_values[1],
+          "protected-page plan read the wrong child DWORD");
+    ProtectPage(true);
+    Check(MaterializeResources(*current, runtime(true), snapshot, specialization),
+          "SRT walk failed on a protected page");
+    // A compiled load that faults is read again by the interpreter, whose load faults too.
+    const bool compiled = current != &interpreted;
+    Check(g_page.unprotected == 0 && g_page.protected_reads != 0 &&
+              (compiled ? g_page.resumed > g_page.protected_reads
+                        : g_page.resumed == g_page.protected_reads),
+          "SRT loads on a protected page waited for its GPU writes or skipped the reader");
+    Check(snapshot.flattened_srt == expected.flattened_srt &&
+              snapshot.specialization_reads == expected.specialization_reads &&
+              snapshot.buffers.size() == expected.buffers.size() &&
+              (snapshot.buffers.empty() ||
+               snapshot.buffers[0].dwords == expected.buffers[0].dwords),
+          "protected SRT reads changed values or captured reads");
+    ProtectPage(true);
+    Check(MaterializeResources(*current, runtime(false), snapshot, specialization) &&
+              snapshot.flattened_srt == expected.flattened_srt && g_page.unprotected == 1 &&
+              g_page.resumed == 0 && g_page.protected_reads == 0,
+          "SRT loads without a protected reader left the fault path");
+  }
+  ProtectPage(false);
+  g_page.active = false;
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -1909,26 +2111,13 @@ void TestIndirectImageSamplerClasses(bool mixed) {
 
 } // namespace
 
-namespace Common {
-
-int DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
-
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
-  std::abort();
-}
-
-int DbgExitIfHandler(const char *, const char *, int) { return 1; }
-
-void DbgExit(int) { std::abort(); }
-
-} // namespace Common
-
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestCompiledSrtReadsFollowBlocks();
   TestCompiledSrtDescriptorReads();
   TestCompiledSrtReadTable();
+  TestCompiledSrtLoadsFromProtectedPage();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();

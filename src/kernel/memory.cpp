@@ -871,6 +871,19 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadProtectedBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	// Shader address writes are not tracked by range: they may change any byte.
+	if (buffers.HasGpuDirtyBytes(vaddr, size) || buffers.HasAddressWritesInFlight()) {
+		buffers.ReadMemory(vaddr, size);
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
@@ -908,8 +921,10 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr, uint64_t fault_pc,
+                    uint64_t* resume_pc) noexcept {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->HandleFault(access, fault_vaddr, fault_pc, resume_pc);
 }
 
 struct PrtAperture {

@@ -729,6 +729,10 @@ struct ResourcePlan {
 	std::vector<uint32_t>         srt_read_entries;
 	std::vector<uint32_t>         srt_descriptor_entries;
 	mutable std::vector<uint64_t> srt_read_addresses;
+	// Ascending offsets of the guest loads of srt_code, and where a faulting load resumes: the
+	// code then fails, and the walker reads that DWORD itself.
+	std::vector<uint32_t> srt_loads;
+	uint32_t              srt_fault_exit = 0;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;

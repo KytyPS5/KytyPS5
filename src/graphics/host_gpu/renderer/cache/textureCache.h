@@ -76,6 +76,8 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	/// Records GPU-to-guest copies for all enrolled images and clears the enrollment set.
+	/// @return true if at least one copy was queued (its guest write lands as a priority op).
 	bool ProcessDownloadImages();
 	void RunGarbageCollector();
 

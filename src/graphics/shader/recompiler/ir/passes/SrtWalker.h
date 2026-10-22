@@ -124,8 +124,8 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
-	// Runs a compiled slot entry; false when it fails or cannot run here.
-	bool CallCompiledRead(uint32_t entry, std::span<uint32_t> out);
+	// Runs a compiled slot or descriptor entry; false when it fails or cannot run here.
+	bool CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool descriptor = false);
 	bool CompiledWord(uint32_t word, uint32_t& value);
 	bool CompiledRead(uint32_t index, uint32_t& value);
 

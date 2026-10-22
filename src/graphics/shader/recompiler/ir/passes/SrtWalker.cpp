@@ -777,13 +777,15 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	if (m_compiled_reads) m_context.values.resize(m_program.evaluation_value_count);
 }
 
-SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
-                     SrtWalker* clean_evaluator)
-    : m_program(parent.m_program), m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
+SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean, SrtWalker* clean_evaluator)
+    : m_program(parent.m_program),
+      m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
-                    (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {}
+                    (clean_evaluator != nullptr ? 2u : 0u)),
+      m_context(AcquireContext()), m_no_wait_unknowns(parent.m_no_wait_unknowns),
+      m_no_wait_failures(parent.m_no_wait_failures) {}
 
 SrtWalker::~SrtWalker() {
 	if (m_session != this) return;
@@ -866,24 +868,46 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	// Visiting and completed-unknown entries both stop repeated evaluation in this
 	// context. Only completed unknowns are retried when reachability becomes tighter.
-	if (m_context.values[index].generation == (m_context.generation | 1u) ||
-	    m_context.values[index].generation == (m_context.generation | 2u)) {
-		return false;
-	}
+	if (KnownUnknown(m_context.values[index])) return false;
 	m_context.values[index].generation = m_context.generation | 1u;
+	const auto failures                = NoWaitFailures();
 	uint64_t out = 0;
 	const bool evaluated = EvaluateInst(*inst, out);
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
-	if (!evaluated) {
-		memo.generation = m_context.generation | 2u;
-		m_context.unknowns.push_back(index);
-		return false;
-	}
+	if (!evaluated) return MarkUnknown(memo, index, failures);
 	memo.value      = out;
 	memo.generation = m_context.generation;
 	result = out;
 	return true;
+}
+
+bool SrtWalker::KnownUnknown(const ResourcePlan::EvaluationContext::Entry& memo) {
+	if (memo.generation == (m_context.generation | 3u)) {
+		// An unknown from a pending word taints the values that use it.
+		if (m_no_wait_failures != nullptr) ++*m_no_wait_failures;
+		return true;
+	}
+	return memo.generation == (m_context.generation | 1u) ||
+	       memo.generation == (m_context.generation | 2u);
+}
+
+uint32_t SrtWalker::NoWaitFailures() const {
+	return m_no_wait_failures != nullptr ? *m_no_wait_failures : 0u;
+}
+
+// Unknowns stay memoized for the session, except those that failed to read a word without
+// waiting: the waiting reader may know them, so they last only for the current condition.
+bool SrtWalker::MarkUnknown(ResourcePlan::EvaluationContext::Entry& memo, uint32_t index,
+                            uint32_t failures) {
+	if (NoWaitFailures() != failures) {
+		memo.generation = m_context.generation | 3u;
+		m_no_wait_unknowns->emplace_back(&m_context, index);
+	} else {
+		memo.generation = m_context.generation | 2u;
+		m_context.unknowns.push_back(index);
+	}
+	return false;
 }
 
 bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
@@ -1004,6 +1028,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+			if (m_no_wait_failures != nullptr) ++*m_no_wait_failures;
 			return false;
 		}
 	} else {
@@ -1628,10 +1653,19 @@ bool SrtWalker::EvaluateWithoutWaiting(Value value, uint32_t& result) {
 	const auto runtime    = m_runtime;
 	m_runtime.read_memory = m_runtime.read_specialization_memory =
 	    m_runtime.try_read_specialization_memory;
+	// Unknowns from failed reads stop repeated evaluation meanwhile; a later waiting read
+	// retries them.
+	uint32_t failures    = 0;
+	m_no_wait_unknowns   = &m_no_wait_log;
+	m_no_wait_failures   = &failures;
 	const bool evaluated = Evaluate(value, result);
+	m_no_wait_unknowns   = nullptr;
+	m_no_wait_failures   = nullptr;
 	m_runtime            = runtime;
-	// Values unknown only because a read was not waited for stay retryable by waiting reads.
-	if (!evaluated) ResetUnknowns();
+	for (const auto& [context, index]: m_no_wait_log)
+		if (context->values[index].generation == (context->generation | 3u))
+			context->values[index].generation = 0;
+	m_no_wait_log.clear();
 	return evaluated;
 }
 

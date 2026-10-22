@@ -1529,6 +1529,120 @@ void TestPendingConditionFollowsBothEdges() {
   }
 }
 
+// Without waiting, an unknown condition value stays memoized for the session, except when it
+// failed to read a word: the waiting reader may know that one, so it is evaluated again, also
+// when the condition itself is known.
+void TestNoWaitUnknownsKeepTheirMemo() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  // With a failed condition on a pending word, or with known conditions only.
+  for (const bool failed_condition : {true, false}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_base = 4;
+    program.user_data_count = 1;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    for (uint32_t i = 0; i < 5; ++i) AddValueBlock(program);
+    auto &entry = *program.blocks[0];
+    auto &second = *program.blocks[1];
+    auto &third = *program.blocks[2];
+    auto &fourth = *program.blocks[3];
+    auto &exit = *program.blocks[4];
+    const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+      return Value(&block.AppendNewInst(opcode, args));
+    };
+    const auto branch = [](Block &block, Value condition, Block &yes, Block &no) {
+      block.condition = condition;
+      block.terminator.kind = TerminatorKind::ConditionalBranch;
+      block.terminator.true_block = &yes;
+      block.terminator.false_block = &no;
+      block.AddBranch(&yes);
+      block.AddBranch(&no);
+    };
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+    const auto table = emit(entry, ValueOpcode::GetAddressResource, {Value(0x2000u), Value(0u)});
+    const auto word = [&](uint32_t offset) {
+      const auto read = emit(entry, ValueOpcode::LoadAddressU32,
+                             {table, Value(offset), Value(0u), Value(true)});
+      read.Instruction()->SetFlags(MemoryFlags{.index = 0});
+      return read;
+    };
+    const auto settled = word(0u);
+    const auto pending = word(4u);
+    const auto other = word(8u);
+    const auto late = word(12u);
+    // Below the user data base: unknown to the host.
+    const auto hidden = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    branch(entry, emit(entry, ValueOpcode::IEqual32, {settled, hidden}), second, third);
+    // Known through its right side, with an unknown left side that read a pending word.
+    branch(second,
+           emit(second, ValueOpcode::LogicalOr,
+                {emit(second, ValueOpcode::IEqual32, {late, Value(1u)}),
+                 emit(second, ValueOpcode::IEqual32, {other, Value(0x2008u)})}),
+           fourth, exit);
+    branch(third,
+           failed_condition ? emit(third, ValueOpcode::IEqual32, {pending, Value(1u)})
+                            : emit(third, ValueOpcode::IEqual32, {other, Value(1u)}),
+           fourth, exit);
+    fourth.terminator.kind = TerminatorKind::Branch;
+    fourth.terminator.true_block = &exit;
+    fourth.AddBranch(&exit);
+    exit.terminator.kind = TerminatorKind::Return;
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.control_flow.size() == 5 && plan.capture_specialization_reads,
+          "no-wait memo plan did not keep its conditions");
+
+    struct Reads {
+      uint32_t tried = 0;
+      uint32_t waited = 0;
+    } reads;
+    const std::array<uint32_t, 1> user_data{0u};
+    const SrtRuntime runtime{
+        .user_data = user_data,
+        .userdata = &reads,
+        .read_specialization_memory =
+            +[](void *data, uint64_t address, std::span<uint32_t> words) {
+              ++static_cast<Reads *>(data)->waited;
+              words[0] = static_cast<uint32_t>(address);
+              return true;
+            },
+        .try_read_specialization_memory =
+            +[](void *data, uint64_t address, std::span<uint32_t> words) {
+              ++static_cast<Reads *>(data)->tried;
+              if (address == 0x2004u || address == 0x200cu) return false;
+              words[0] = static_cast<uint32_t>(address);
+              return true;
+            }};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "no-wait memo plan failed to materialize");
+    Check(plan.visited_blocks == std::vector<uint8_t>({1, 1, 1, 1, 1}) &&
+              reads.tried == (failed_condition ? 4u : 3u) && reads.waited == 0u,
+          "unknown conditions did not follow both edges without waiting");
+    const ResourcePlan::EvaluationContext *clean = nullptr;
+    for (const auto &context : plan.evaluation_contexts)
+      if (context.active_mask.IsEmpty() && context.read_policy == 0u && !context.values.empty())
+        clean = &context;
+    Check(clean != nullptr, "no-wait memo plan has no clean context");
+    const auto memo = [&](Value value) {
+      const auto index =
+          value.Resolve().TryInstruction()->EvaluationIndex(plan.evaluation_value_count);
+      return index < clean->values.size() ? clean->values[index].generation : 0u;
+    };
+    const auto condition = [&](uint32_t block) {
+      return memo(plan.control_flow[block].condition);
+    };
+    Check(condition(0) == (clean->generation | 2u),
+          "an unknown that read no pending word lost its memo");
+    const auto *disjunction = plan.control_flow[1].condition.Resolve().TryInstruction();
+    Check(disjunction->GetOpcode() == ValueOpcode::LogicalOr, "no-wait memo plan lost its disjunction");
+    Check(memo(disjunction->Arg(0)) == 0u && (!failed_condition || condition(2) == 0u),
+          "an unknown that read a pending word kept its memo");
+    Check(condition(1) == clean->generation, "a known condition lost its memo");
+  }
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -2252,6 +2366,7 @@ int main() {
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
   TestPendingConditionFollowsBothEdges();
+  TestNoWaitUnknownsKeepTheirMemo();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();

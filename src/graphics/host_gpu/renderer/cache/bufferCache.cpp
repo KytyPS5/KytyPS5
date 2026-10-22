@@ -270,6 +270,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	// Bindings of empty buffers read this one, so it must hold zeros, not leftover memory.
+	GetBuffer(null_id).Fill(0, 16, 0);
 	m_scheduler.SetSubmitHook(
 	    [](void* self, CommandBuffer& command) {
 		    static_cast<BufferCache*>(self)->RecordMirrorCopies(command);

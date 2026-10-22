@@ -5640,6 +5640,43 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Checks that deferred BDA events stay out of TakeBdaSync until PromoteBdaSync, and that
+  // promotion moves them exactly once, both into an empty and a non-empty immediate set.
+  void CheckBdaSyncDeferredEvents() {
+    constexpr const char *name = "BdaSyncDeferredEvents";
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    // The queue only records ranges, so no memory has to be mapped here.
+    constexpr uint64_t address = 0x0000000208000000ull;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &cache = context.GetBufferCache();
+    (void)cache.TakeBdaSync();
+
+    // A game-thread write holds its BDA event back until the command processor promotes it.
+    cache.QueueBdaSync(address + 7, 1, true);
+    Require(name, "held back", cache.TakeBdaSync().Empty(),
+            "deferred BDA event was visible before promotion");
+    cache.QueueBdaSync(address + page + 7, 1);
+    auto pending = cache.TakeBdaSync();
+    Require(name, "immediate event",
+            pending.Contains(address + page, page) && !pending.Intersects(address, page),
+            "immediate BDA event waited for, or released, a deferred one");
+    cache.PromoteBdaSync();
+    pending = cache.TakeBdaSync();
+    Require(name, "promotion",
+            pending.Contains(address, page) && !pending.Intersects(address + page, page),
+            "promotion lost or widened a deferred BDA event");
+    cache.PromoteBdaSync();
+    Require(name, "single promotion", cache.TakeBdaSync().Empty(),
+            "promotion replayed an already promoted event");
+    cache.QueueBdaSync(address, page, true);
+    cache.QueueBdaSync(address + page, page);
+    cache.PromoteBdaSync();
+    Require(name, "merge", cache.TakeBdaSync().Contains(address, 2 * page),
+            "promotion did not merge with pending immediate events");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -5684,9 +5721,16 @@ public:
     snapshot(0, 0);
     snapshot(2 * page, 1);
 
+    // This thread is not the GPU thread, so the write is queued like a game thread's: BDA
+    // synchronization skips it until the command processor starts or resumes a submission.
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
     words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.PrepareBda();
+    Require(name, "deferred game-thread write",
+            cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a game-thread write reached BDA synchronization before promotion");
+    cache.PromoteBdaSync();
     context.PrepareBda();
     snapshot(16, 2);
     snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
@@ -51552,6 +51596,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
+    vulkan.CheckBdaSyncDeferredEvents();
     vulkan.CheckBdaSyncUploads();
     return 0;
   }
@@ -51787,6 +51832,7 @@ int main(int argc, char **argv) {
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaSyncDeferredEvents();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();

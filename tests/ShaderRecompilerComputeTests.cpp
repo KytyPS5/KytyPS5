@@ -428,6 +428,15 @@ struct RenderExecutorTestAccess {
     return executor.ResolveTexture(resource, value);
   }
 
+  static std::vector<ShaderRecompiler::IR::ImageResource>
+  TextureDescriptionInputs(const RenderExecutor &executor) {
+    std::vector<ShaderRecompiler::IR::ImageResource> result;
+    for (const auto &[key, entry] : executor.m_texture_descriptions) {
+      result.push_back(entry.inputs);
+    }
+    return result;
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -5319,6 +5328,246 @@ public:
     DestroyBuffer(&readback);
     Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 3 * page),
             "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckTextureLookupReuse() {
+    constexpr const char *name = "TextureLookupReuse";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t moved_offset = 0x100000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    // Unmapping reads back the guest memory a BC alias merge leaves GPU-dirty.
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      const auto Value = [&](uint64_t address) {
+        ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+                (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+            DstSel(4, 5, 6, 7) |
+                (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+                (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        return value;
+      };
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto Resolve = [&](uint64_t address) {
+        return RenderExecutorTestAccess::ResolveTexture(executor, resource, Value(address));
+      };
+
+      // An unchanged binding finds its image without searching the image page table.
+      const auto first = Resolve(base);
+      const auto epoch = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      const auto repeated = Resolve(base);
+      Require(name, "repeated binding",
+              first.image_id && repeated.image_id == first.image_id &&
+                  repeated.desc.info.data == first.desc.info.data &&
+                  repeated.desc.view_info == first.desc.view_info &&
+                  TextureCacheTestAccess::QueryEpoch(texture_cache) == epoch,
+              "an unchanged texture binding searched the image page table again");
+
+      // Fields the description does not read share its entry instead of replacing it.
+      const auto described =
+          RenderExecutorTestAccess::TextureDescriptionInputs(executor);
+      auto alias = resource;
+      alias.source = 7;
+      alias.descriptor_index = 3;
+      alias.first_use_pc = 0x40;
+      alias.indirect_search_iterations = 2;
+      alias.indirect_resources = {1};
+      const auto Unchanged = [&] {
+        return RenderExecutorTestAccess::TextureDescriptionInputs(executor) ==
+               described;
+      };
+      bool shared = true;
+      for (int i = 0; i < 2; ++i) {
+        const auto aliased = RenderExecutorTestAccess::ResolveTexture(
+            executor, alias, Value(base));
+        shared &= aliased.image_id == first.image_id &&
+                  aliased.desc.view_info == first.desc.view_info && Unchanged();
+        shared &= Resolve(base).image_id == first.image_id && Unchanged();
+      }
+      Require(name, "unread resource fields", shared,
+              "resources differing only in unread fields replaced each other's description");
+
+      // A registration change gives the result of a full search: the last exact match.
+      const auto newer = TextureCacheTestAccess::InsertImage(texture_cache, first.desc.info);
+      Require(name, "new registration", Resolve(base).image_id == newer,
+              "a lookup missed an image registered after the previous one");
+      TextureCacheTestAccess::DeleteImage(texture_cache, newer);
+      Require(name, "removed registration", Resolve(base).image_id == first.image_id,
+              "a lookup returned an image removed after the previous one");
+
+      // Another descriptor is described and searched anew.
+      const auto moved = Resolve(base + moved_offset);
+      Require(name, "changed descriptor",
+              moved.image_id && moved.image_id != first.image_id &&
+                  moved.desc.info.data.address == base + moved_offset &&
+                  Resolve(base).image_id == first.image_id,
+              "a different descriptor reused another binding");
+
+      // A registration on other pages leaves the lookups of this one valid.
+      const auto elsewhere = Resolve(base + moved_offset + 0x8000);
+      const auto unrelated_epoch = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      Require(name, "unrelated registration",
+              elsewhere.image_id && Resolve(base).image_id == first.image_id &&
+                  TextureCacheTestAccess::QueryEpoch(texture_cache) == unrelated_epoch,
+              "a registration on another page made a lookup search again");
+
+      // Re-associating a stencil plane re-describes a registered image: a
+      // plane read with the old depth's sample count stops matching it.
+      constexpr uint64_t stencil_offset = 0x180000;
+      constexpr uint64_t stencil_size = uint64_t{width} * height;
+      const auto Depth = [&](uint64_t offset, uint32_t samples) {
+        auto desc = MakeLinearDesc(
+            base + offset, uint64_t{width} * height * 4 * samples,
+            vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
+            Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, samples);
+        desc.type = BindingType::DepthTarget;
+        desc.info.stencil = {base + stencil_offset, stencil_size};
+        desc.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return texture_cache.FindImage(desc);
+      };
+      const auto Associate = [&](ImageId depth) {
+        TextureCacheTestAccess::AssociateStencil(
+            texture_cache, depth, {base + stencil_offset, stencil_size});
+      };
+      auto plane = MakeLinearDesc(base + stencil_offset, stencil_size,
+                                  vk::Format::eR8Uint,
+                                  Prospero::BufferFormat::k8UInt,
+                                  Prospero::ImageType::kColor2D,
+                                  {width, height, 1}, 1, 1, 1);
+      const auto single = Depth(0x140000, 1);
+      const auto multi = Depth(0x160000, 2);
+      Associate(single);
+      const auto association = texture_cache.FindImageFromRange(
+          base + stencil_offset, stencil_size, false);
+      Require(name, "stencil plane binding",
+              association && texture_cache.FindImage(plane) == association,
+              "a stencil plane read missed its depth association");
+      Associate(multi);
+      Require(name, "stencil plane re-association",
+              texture_cache.GetImage(association).depth_id &&
+                  texture_cache.FindImage(plane) != association,
+              "a lookup kept a stencil plane re-associated with another depth");
+
+      // A raw alias of a BC image is merged by the next full search once it
+      // holds GPU writes; an earlier match must not skip that search.
+      constexpr uint64_t bc_offset = 0x1c0000;
+      auto bc = MakeLinearDesc(base + bc_offset, 0, vk::Format::eBc7UnormBlock,
+                               Prospero::BufferFormat::kBc7UNorm,
+                               Prospero::ImageType::kColor2D, {width, height, 1},
+                               2, 16, 1);
+      auto raw = MakeLinearDesc(base + bc_offset, 0,
+                                vk::Format::eR32G32B32A32Uint,
+                                Prospero::BufferFormat::k32_32_32_32UInt,
+                                Prospero::ImageType::kColor2D,
+                                {width / 4, height / 4, 1}, 1, 16, 1);
+      bc.info.UpdateSize();
+      raw.info.UpdateSize();
+      const auto bc_image =
+          TextureCacheTestAccess::InsertImage(texture_cache, bc.info);
+      const auto raw_image =
+          TextureCacheTestAccess::InsertImage(texture_cache, raw.info);
+      Require(name, "BC alias lookup",
+              texture_cache.FindImage(bc) == bc_image &&
+                  TextureCacheTestAccess::Contains(texture_cache, raw_image),
+              "a BC image lookup merged a raw alias without GPU writes");
+      vk::ClearValue raw_clear{};
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), raw_image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, raw_clear);
+      texture_cache.MarkGpuWritten(raw_image);
+      Require(name, "BC alias merge",
+              texture_cache.FindImage(bc) == bc_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache, raw_image),
+              "a lookup skipped merging a raw alias written by the GPU");
+
+      // The same holds for a BC image across a page boundary and an alias
+      // registered on its second page only.
+      constexpr uint64_t straddle_offset = moved_offset - 0x800;
+      auto straddle = MakeLinearDesc(
+          base + straddle_offset, 0, vk::Format::eBc7UnormBlock,
+          Prospero::BufferFormat::kBc7UNorm, Prospero::ImageType::kColor2D,
+          {width, height, 1}, 1, 16, 1);
+      auto second_page = MakeLinearDesc(
+          base + moved_offset, 0, vk::Format::eR32G32B32A32Uint,
+          Prospero::BufferFormat::k32_32_32_32UInt, Prospero::ImageType::kColor2D,
+          {width / 4, height / 4, 1}, 1, 16, 1);
+      straddle.info.UpdateSize();
+      second_page.info.UpdateSize();
+      const auto straddle_image =
+          TextureCacheTestAccess::InsertImage(texture_cache, straddle.info);
+      Require(name, "page-crossing lookup",
+              straddle.info.data.End() > base + moved_offset &&
+                  texture_cache.FindImage(straddle) == straddle_image,
+              "a page-crossing BC image was not found");
+      const auto second_page_raw =
+          TextureCacheTestAccess::InsertImage(texture_cache, second_page.info);
+      Require(name, "second-page alias lookup",
+              texture_cache.FindImage(straddle) == straddle_image &&
+                  TextureCacheTestAccess::Contains(texture_cache, second_page_raw),
+              "a BC image lookup merged a second-page alias without GPU writes");
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), second_page_raw,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, raw_clear);
+      texture_cache.MarkGpuWritten(second_page_raw);
+      Require(name, "second-page alias merge",
+              texture_cache.FindImage(straddle) == straddle_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache, second_page_raw),
+              "a lookup skipped a raw alias registered on its second page");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -50255,6 +50504,11 @@ int main(int argc, char **argv) {
     CheckDepthTargetFootprints();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-lookup-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureLookupReuse();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
@@ -50493,6 +50747,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
+  vulkan.CheckTextureLookupReuse();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

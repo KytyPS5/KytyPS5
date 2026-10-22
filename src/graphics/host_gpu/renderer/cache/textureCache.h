@@ -91,8 +91,36 @@ private:
 		int32_t layer = -1;
 	};
 
+	// The requested fields that decide an exact match: SameBacking and the stencil plane test.
+	struct ExactImageKey {
+		GuestRange             data;
+		vk::Extent3D           extent;
+		ImageSubresources      resources;
+		uint32_t               samples         = 1;
+		uint32_t               bytes_per_block = 0;
+		Prospero::TileMode     tile_mode       = Prospero::TileMode::kLinear;
+		ColorTransform         transform       = ColorTransform::None;
+		vk::Format             pixel_format    = vk::Format::eUndefined;
+		Prospero::BufferFormat guest_format    = Prospero::BufferFormat::kInvalid;
+		Prospero::ImageType    type            = Prospero::ImageType::kColor2D;
+		BindingType            binding         = BindingType::Texture;
+		bool                   exact_format    = false;
+
+		bool operator==(const ExactImageKey&) const = default;
+	};
+	struct ExactImageKeyHash {
+		[[nodiscard]] size_t operator()(const ExactImageKey& key) const noexcept;
+	};
+	struct ExactImage {
+		ImageId  id;
+		uint64_t generation = 0;
+	};
+
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+	using PageGenerations =
+	    MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                        ImagePageTable::kFirstLevelBits>;
 
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
@@ -128,6 +156,11 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+
+	// Stamps the pages of a registration change; exact lookups there search again.
+	void               TouchRegistrations(uint64_t address, uint64_t size);
+	[[nodiscard]] bool RegistrationsSince(uint64_t address, uint64_t size,
+	                                      uint64_t generation) const;
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -187,6 +220,12 @@ private:
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	// Exact matches found by FindImage. The match depends on the images registered on the
+	// pages of the request and on fields fixed at their creation, so an entry holds until a
+	// registration on one of those pages changes.
+	std::unordered_map<ExactImageKey, ExactImage, ExactImageKeyHash> m_exact_images;
+	PageGenerations                                                  m_page_generations;
+	uint64_t                                                         m_registration_generation = 1;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -119,7 +120,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id         = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.unbound_lru_id = m_unbound_lru.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -135,6 +137,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
+		m_unbound_lru.Free(buffer.unbound_lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
@@ -144,6 +147,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_unbound_lru.Touch(buffer.unbound_lru_id, m_gc_tick);
 	}
 }
 
@@ -401,6 +405,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
 	auto& new_buffer = m_slot_buffers[new_id];
 	auto& overlap    = m_slot_buffers[overlap_id];
+	// The merged buffer covers the pinned one's memory, which shaders still read through BDA.
+	new_buffer.bda_pinned = new_buffer.bda_pinned || overlap.bda_pinned;
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
@@ -666,8 +672,85 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+// Marks the buffer as "read" through the BDA page table. This prevents ReleaseUnboundBuffers from
+// releasing it.
+void BufferCache::PinBda(BufferId id) {
+	// Validate the id since it was provided by FindBuffer, which doesn't return a buffer for a null
+	// address.
+	if (!IsBufferInvalid(id)) {
+		m_slot_buffers[id].bda_pinned = true;
+	}
+}
+
+// Releases up to 16 buffers that no draw or dispatch has bound for 300 garbage-collector ticks.
+void BufferCache::ReleaseUnboundBuffers(uint64_t tick) {
+	// RunGarbageCollector's memory-pressure eviction is the only other way buffers get retired,
+	// so an unused buffer's pages stay write-protected even after the game reuses the memory for
+	// CPU data. As a side-effect, every write then faults and BDA synchronization uploads the
+	// page again.
+	//
+	// To fix this issue, release buffers that no draw or dispatch has bound for a while and that
+	// hold no GPU-written data. A BDA read of a released page reaches the fault buffer, which
+	// recreates the buffer and pins it.
+	constexpr uint64_t UnboundTicks = 300;
+	constexpr size_t   MaxReleased  = 16;
+	constexpr size_t   MaxVisited   = 256;
+
+	// No buffer can have gone unbound for long enough yet. This also prevents the subtraction below
+	// from wrapping.
+	if (tick <= UnboundTicks) {
+		return;
+	}
+
+	// Fixed storage: this runs on every garbage-collector tick.
+	std::array<BufferId, MaxReleased> released;
+	std::array<BufferId, MaxVisited>  retained;
+	size_t                            released_count = 0;
+	size_t                            retained_count = 0;
+	size_t                            visited        = 0;
+	m_unbound_lru.ForEachItemBelow(tick - UnboundTicks, [&](BufferId id) {
+		const auto& buffer = m_slot_buffers[id];
+		// Keep a buffer that:
+		// - is pinned: shaders read it through the BDA page table, which does not refresh its
+		//   LRU tick, so it looks unbound however often it is actually used.
+		// - holds GPU-written data not yet read back to guest memory: that data exists only in
+		//   this buffer. The buffer cache and the memory tracker each record such writes.
+		if (!buffer.bda_pinned &&
+		    !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) &&
+		    !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			released[released_count++] = id;
+		} else {
+			retained[retained_count++] = id;
+		}
+
+		// Cap the amount of work each tick since the LRU list can hold thousands of old buffers.
+		return ++visited == MaxVisited || released_count == MaxReleased;
+	});
+
+	// The walk starts from the oldest buffer every tick, and the buffers it keeps would stay
+	// there. Move them to the young end so the next walk reaches the buffers behind them, instead
+	// of visiting the same kept buffers every tick. If there are more than MaxVisited of them, we
+	// would never get past them. They will come up again once UnboundTicks have passed.
+	// This uses its own list: moving them in m_lru_cache would hide them from memory-pressure
+	// eviction, which must still find old GPU-written buffers.
+	for (const auto id: std::span(retained.data(), retained_count)) {
+		m_unbound_lru.Touch(m_slot_buffers[id].unbound_lru_id, tick);
+	}
+
+	// Only delete the buffer after the walk, doing so earlier removes it from the LRU list being
+	// walked.
+	for (const auto id: std::span(released.data(), released_count)) {
+		const auto& buffer = m_slot_buffers[id];
+		// Drop the write protection along with the buffer, so CPU writes stop faulting.
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		DeleteBuffer(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
+	}
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	ReleaseUnboundBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

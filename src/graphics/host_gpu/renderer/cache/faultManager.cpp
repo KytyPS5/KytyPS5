@@ -140,7 +140,9 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// A shader read this memory through the BDA page table. Recreate its buffer and keep
+			// it, since BDA reads do not show up as bindings.
+			m_buffer_cache.PinBda(m_buffer_cache.FindBuffer(start, end - start));
 		});
 		m_fault_areas[area] = 0;
 	});

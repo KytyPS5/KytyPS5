@@ -95,7 +95,11 @@ public:
 	[[nodiscard]] RangeSet TakeBdaSync();
 	// Makes game-thread writes visible to the next BDA synchronization.
 	void                   PromoteBdaSync();
-	void               RunGarbageCollector();
+
+	// Marks a buffer that shaders read through the BDA page table.
+	void PinBda(BufferId id);
+
+	void RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -123,6 +127,10 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// Releases buffers no draw or dispatch has bound for a while, to keep their pages from
+	// faulting.
+	void ReleaseUnboundBuffers(uint64_t tick);
+
 	// Adds the CPU-modified pages to m_bda_upload for every buffer overlapping [begin, end).
 	void CollectBdaCopies(uint64_t begin, uint64_t end);
 	// Adds the CPU-modified pages of the provided `buffer` in [begin, end) to m_bda_upload.
@@ -147,6 +155,9 @@ private:
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
+	// Buffers by the tick they were last bound, for ReleaseUnboundBuffers. It moves the buffers
+	// it keeps to the young end, which m_lru_cache, used for memory-pressure eviction, must not do.
+	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_unbound_lru;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;

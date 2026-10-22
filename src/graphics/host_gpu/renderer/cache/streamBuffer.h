@@ -69,9 +69,14 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
+	bool   is_deleted     = false;
+	int    stream_score   = 0;
+	size_t lru_id         = 0;
+	size_t unbound_lru_id = 0;
+
+	// Set when a shader faults on this buffer through the BDA page table. BDA reads do not
+	// refresh its LRU tick, so this keeps ReleaseUnboundBuffers from releasing it.
+	bool bda_pinned = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

@@ -968,8 +968,12 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				const auto [layout, inserted] =
 				    m_tess_layouts.try_emplace(layout_hash, vertex_info[0].tess);
 				if (inserted) {
-					ShaderRecompiler::AnalyzeTessellationPrograms(
-					    vertex_params[0].code, vertex_params[1].code, layout->second);
+					if (!ShaderRecompiler::AnalyzeTessellationPrograms(
+					        vertex_params[0].code, vertex_params[1].code, layout->second)) {
+						EXIT("unsupported tessellation program shape: LS 0x%016" PRIx64
+						     " HS 0x%016" PRIx64 "\n",
+						     vertex_params[0].hash, vertex_params[1].hash);
+					}
 					StoreLayout(layout->first, layout->second);
 				}
 				tess = layout->second;

@@ -485,6 +485,41 @@ void TestBdaSyncConcurrentDrain() {
   Release(memory);
 }
 
+void TestBdaSyncDeferredEvents() {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, 2 * page, false,
+                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  (void)tracker.TakeBdaSync();
+
+  // A game-thread write releases its page at once but holds its BDA event back until the
+  // command processor promotes it.
+  tracker.InvalidateRegion(address + 7, 1, [] {}, true);
+  Check(tracker.IsRegionCpuModified(address, page) && IsWritable(memory),
+        "deferred invalidation did not release its page");
+  Check(tracker.TakeBdaSync().Empty(), "deferred BDA event was visible before promotion");
+  tracker.InvalidateRegion(address + page + 7, 1, [] {});
+  auto pending = tracker.TakeBdaSync();
+  Check(pending.Contains(address + page, page) && !pending.Intersects(address, page),
+        "immediate BDA event waited for, or released, a deferred one");
+  tracker.PromoteBdaSync();
+  pending = tracker.TakeBdaSync();
+  Check(pending.Contains(address, page) && !pending.Intersects(address + page, page),
+        "promotion lost or widened a deferred BDA event");
+  tracker.PromoteBdaSync();
+  Check(tracker.TakeBdaSync().Empty(), "promotion replayed an already promoted event");
+  tracker.QueueBdaSync(address, page, true);
+  tracker.QueueBdaSync(address + page, page);
+  tracker.PromoteBdaSync();
+  Check(tracker.TakeBdaSync().Contains(address, 2 * page),
+        "promotion did not merge with pending immediate events");
+  tracker.UntrackMemory(address, 2 * page);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1282,6 +1317,7 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestBdaSyncDirtiness();
   TestBdaSyncConcurrentDrain();
+  TestBdaSyncDeferredEvents();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

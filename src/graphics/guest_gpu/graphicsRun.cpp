@@ -318,7 +318,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
+		return;
 	}
+	// The value may come from a game thread that wrote the data it guards first; those writes
+	// must reach the BDA draws that follow, even though the submission never suspended.
+	m_renderer.GetBufferCache().PromoteBdaSync();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -538,6 +542,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
+	// Game-thread writes made before this submission, or before the wait it resumes from, must
+	// reach the BDA draws it records.
+	m_renderer.GetBufferCache().PromoteBdaSync();
 	auto&      cp          = GetProcessor(submission.queue_id);
 
 	if (first_slice) {

@@ -296,8 +296,13 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	// A game thread writes the data a submission reads before it submits the work, or before it
+	// releases a wait the command processor is blocked on, so its BDA synchronization events
+	// can wait until the command processor starts or resumes a submission. Synchronizing them
+	// at every BDA draw instead uploads data meant for later frames again and again.
+	m_memory_tracker.InvalidateRegion(
+	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); },
+	    !GuestGpu::IsGpuThread());
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {

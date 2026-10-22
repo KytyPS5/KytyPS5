@@ -5277,9 +5277,16 @@ public:
     snapshot(0, 0);
     snapshot(2 * page, 1);
 
+    // This thread is not the GPU thread, so the write is queued like a game thread's: BDA
+    // synchronization skips it until the command processor starts or resumes a submission.
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
     words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.PrepareBda();
+    Require(name, "deferred game-thread write",
+            cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a game-thread write reached BDA synchronization before promotion");
+    cache.PromoteBdaSync();
     context.PrepareBda();
     snapshot(16, 2);
     snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);

@@ -84,6 +84,8 @@ public:
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
 		m_memory_tracker.QueueBdaSync(vaddr, size);
 	}
+	// Makes game-thread writes visible to the next BDA synchronization.
+	void PromoteBdaSync() { m_memory_tracker.PromoteBdaSync(); }
 	void               RunGarbageCollector();
 
 private:

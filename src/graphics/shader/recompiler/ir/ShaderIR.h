@@ -690,6 +690,21 @@ struct ResourcePlan {
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// Compiled slot reads, run from a table when srt_code is absent: per-slot root reads
+	// (UINT32_MAX: interpreted), and room for the addresses one slot reads.
+	struct SrtReadTable {
+		static constexpr uint32_t UserData = 1u << 31;
+		// One memoized guest DWORD read. Words are UserData | index or a read index.
+		struct Read {
+			int64_t  relative = 0;
+			uint32_t memo     = 0;
+			uint32_t words[2] {};
+		};
+		std::vector<Read> reads;
+	};
+	std::unique_ptr<SrtReadTable> srt_read_table;
+	std::vector<uint32_t>         srt_read_entries;
+	mutable std::vector<uint64_t> srt_read_addresses;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;

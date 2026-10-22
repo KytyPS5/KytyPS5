@@ -1,0 +1,8 @@
+#ifndef KYTY_SHADER_CACHE_VERSION_H_
+#define KYTY_SHADER_CACHE_VERSION_H_
+
+// Hash of all graphics sources and the toolchain: recorded shader programs are compiled again
+// only by builds with the same value.
+#define KYTY_GRAPHICS_CACHE_VERSION "@KYTY_GRAPHICS_CACHE_VERSION@"
+
+#endif // KYTY_SHADER_CACHE_VERSION_H_

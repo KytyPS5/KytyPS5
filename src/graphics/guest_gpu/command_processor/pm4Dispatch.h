@@ -79,7 +79,6 @@ uint32_t HwCtxSetAaMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, 
 uint32_t HwCtxSetVtxControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetPaScExtendedControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                      uint32_t);
-uint32_t HwCtxSetAlphaToMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetDrawPayloadControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                     uint32_t);
 uint32_t HwCtxSetPrimitiveIdReset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

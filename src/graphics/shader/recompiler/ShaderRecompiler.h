@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
@@ -23,7 +24,7 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
-	bool                        maintenance8_enabled       = false;
+	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

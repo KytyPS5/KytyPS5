@@ -941,8 +941,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
+					// ADD_TID and swizzle move fixed-offset writes past write_extent.
+					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
+					const auto written_size =
+					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
+					if (written_size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written_size)) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

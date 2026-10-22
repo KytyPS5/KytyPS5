@@ -1057,8 +1057,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
-		if (layout.offset != NoImageComponent &&
-		    !offset_value.IsImmediate() && !state.maintenance8_enabled) {
+		if (layout.offset != NoImageComponent && !offset_value.IsImmediate() &&
+		    !state.profile.maintenance8) {
 			ctx.Fail(inst, "requires maintenance8 for a dynamic sample texel offset");
 		}
 		const auto samplers = LoadImageSamplers(ctx, inst);

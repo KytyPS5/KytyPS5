@@ -180,6 +180,7 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	bool             m_readback_tiled_images  = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

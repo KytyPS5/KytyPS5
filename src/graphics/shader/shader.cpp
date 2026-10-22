@@ -355,10 +355,11 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
 	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
 	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
+	// Alpha-to-mask coverage must gate depth writes, so it rules out early fragment tests.
 	ps_info.ps_early_z =
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
-	     !sh.db_shader_control.shader_mask_export_enable);
+	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
 	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {

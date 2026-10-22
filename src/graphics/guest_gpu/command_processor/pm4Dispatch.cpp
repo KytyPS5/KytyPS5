@@ -73,7 +73,6 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::DB_ALPHA_TO_MASK]                      = HwCtxSetAlphaToMask;
 	g_hw_ctx_func[Pm4::VGT_DRAW_PAYLOAD_CNTL]                 = HwCtxSetDrawPayloadControl;
 	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
 	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;

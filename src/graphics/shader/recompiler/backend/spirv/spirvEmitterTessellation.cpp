@@ -56,8 +56,10 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
+		// An HS writes only its own control point but may read any other.
 		const auto vertex =
-		    kind == Attribute::ControlOutput
+		    kind == Attribute::ControlOutput &&
+		            inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute
 		        ? EmitLaneId(state)
 		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
@@ -126,7 +128,9 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning != 2u ||
+	// CxVgtTfParam: triangles, integer or fractional-odd partitioning, clockwise output.
+	EXIT_NOT_IMPLEMENTED(tess.domain != 1u ||
+	                     (tess.partitioning != 0u && tess.partitioning != 2u) ||
 	                     tess.output_topology != 2u);
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
@@ -134,7 +138,9 @@ void DefineTessellationExecutionModes(EmitterState& state) {
 		                               tess.output_control_points);
 	} else {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSpacingFractionalOdd);
+		state.builder.AddExecutionMode(
+		    state.main_func, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
+		                                             : spv::ExecutionModeSpacingFractionalOdd);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
 	}
 }

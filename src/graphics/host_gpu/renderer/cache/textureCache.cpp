@@ -34,6 +34,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
+constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -122,7 +124,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -401,7 +404,14 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled()) {
+	// Small tiled targets are written back too: games read GPU results such as reductions and
+	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
+	// in a 1x1 R32G32 target, and its water physics read it to sample the wave heights).
+	const auto& info   = image.info;
+	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
+	                     info.extent.depth * info.resources.layers;
+	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
+	                   : m_readback_linear_images) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -1956,7 +1966,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images) {
+	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};

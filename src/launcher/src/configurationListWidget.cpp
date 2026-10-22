@@ -53,6 +53,8 @@
 #include <QPalette>
 #include <QPointer>
 #include <QProcess>
+#include <QProgressDialog>
+#include <QPromise>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -65,6 +67,7 @@
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
+#include <QtConcurrentRun>
 #include <QtCore>
 
 #ifdef __linux__
@@ -73,6 +76,7 @@
 #include <QDBusPendingCallWatcher>
 #endif
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -1414,6 +1418,71 @@ void ConfigurationListWidget::remove_save_data() {
 	}
 }
 
+void ConfigurationListWidget::compress_game() {
+	auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->currentItem());
+	if (item == nullptr) {
+		return;
+	}
+
+	const auto base    = item->GetInfo().basedir;
+	const auto archive = base + QStringLiteral(".zar");
+	const auto title   = tr("Compress to ZAR");
+	if (QFileInfo::exists(archive)) {
+		QMessageBox::warning(this, title,
+		                     tr("%1 already exists.").arg(QDir::toNativeSeparators(archive)));
+		return;
+	}
+
+	// Cancel through a flag, not the future, so a pack that already succeeded keeps its result.
+	auto  canceled = std::make_shared<std::atomic_bool>(false);
+	auto* progress = new QProgressDialog(
+	    tr("Compressing %1...").arg(QDir::toNativeSeparators(base)), tr("Cancel"), 0, 1000, this);
+	auto* watcher  = new QFutureWatcher<bool>(this);
+	// Stay modal through finalization and fsync, which follow the last progress step.
+	progress->setAutoReset(false);
+	connect(progress, &QProgressDialog::canceled, this, [canceled] { *canceled = true; });
+	connect(watcher, &QFutureWatcher<bool>::progressValueChanged, progress,
+	        &QProgressDialog::setValue);
+	connect(watcher, &QFutureWatcher<bool>::finished, this,
+	        [this, progress, watcher, canceled, base, archive, title] {
+		        // finished can arrive inside the modal dialog's setValue event processing.
+		        progress->deleteLater();
+		        watcher->deleteLater();
+		        if (!watcher->result()) {
+			        if (!*canceled) {
+				        QMessageBox::warning(
+				            this, title,
+				            tr("Could not compress %1.").arg(QDir::toNativeSeparators(base)));
+			        }
+			        return;
+		        }
+		        if (QMessageBox::Yes ==
+		                QMessageBox::question(this, title,
+		                                      tr("Created %1.\n\nDelete the original folder %2?")
+		                                          .arg(QDir::toNativeSeparators(archive),
+		                                               QDir::toNativeSeparators(base)),
+		                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) &&
+		            !QDir(base).removeRecursively()) {
+			        QMessageBox::warning(
+			            this, title, tr("Could not remove %1.").arg(QDir::toNativeSeparators(base)));
+		        }
+		        ScanGameDirectory();
+	        });
+	progress->open();
+	watcher->setFuture(QtConcurrent::run(
+	    [directory = GameContent::ToPath(base), path = GameContent::ToPath(archive),
+	     canceled](QPromise<bool>& promise) {
+		    promise.setProgressRange(0, 1000);
+		    // A pack cancelled while queued must not touch a path a later pack may already own.
+		    promise.addResult(
+		        !*canceled &&
+		        Common::PackArchive(directory, path, [&](uint64_t done, uint64_t total) {
+			        promise.setProgressValue(static_cast<int>(done * 1000 / total));
+			        return !*canceled;
+		        }));
+	    }));
+}
+
 void ConfigurationListWidget::filter_configurations(const QString& text) {
 	const auto query              = text.trimmed();
 	const bool has_query          = !query.isEmpty();
@@ -1654,6 +1723,8 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem, const QPoi
 		        }
 	        });
 	action_addcont->setEnabled(item != nullptr);
+	QAction* action_compress =
+	    menu.addAction(tr("Compress to ZAR..."), this, SLOT(compress_game()));
 	QAction* action_remove_save_data =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
 	                   tr("Remove save data..."), this, SLOT(remove_save_data()));
@@ -1677,6 +1748,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem, const QPoi
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
+		action_compress->setDisabled(item->IsRunning() || !QDir(base).exists());
 		action_remove_save_data->setDisabled(item->IsRunning() || save_data_dirs.isEmpty());
 		action_edit->setDisabled(item->IsRunning());
 		action_delete->setDisabled(item->IsRunning() || !item->GetInfo().custom_settings);
@@ -1684,6 +1756,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem, const QPoi
 		action_run->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
+		action_compress->setDisabled(true);
 		action_remove_save_data->setDisabled(true);
 		action_edit->setDisabled(true);
 		action_delete->setDisabled(true);

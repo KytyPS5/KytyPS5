@@ -296,15 +296,11 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value               = ir.ShiftLeftLogical(extended, IR::U32(IR::Value(offset)));
 				break;
 			}
-			case 2: {
-				const uint32_t field_mask = width == 32u ? 0xffffffffu : (1u << width) - 1u;
-				const auto     inserted =
-				    ir.ShiftLeftLogical(ir.BitwiseAnd(value, IR::U32(IR::Value(field_mask))),
-				                        IR::U32(IR::Value(offset)));
-				const auto cleared = ir.BitwiseAnd(ReadRawU32(PlainOperand(operand)),
-				                                   IR::U32(IR::Value(~(field_mask << offset))));
-				value              = ir.BitwiseOr(cleared, inserted);
-			} break;
+			case 2:
+				value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
+				                        {ReadRawU32(PlainOperand(operand)), value, IR::Value(offset),
+				                         IR::Value(width)}));
+				break;
 			default: EXIT("reserved SDWA DST_U mode");
 		}
 	}
@@ -453,7 +449,10 @@ void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
 	destination.omod   = 0u;
 	destination.op_sel = false;
 	destination.clamp  = false;
-	WriteRawU32(destination, ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu))));
+	// A field selector keeps only the field's bits; a full-dword SDWA selector zero-extends.
+	WriteRawU32(destination, destination.sdwa_sel == 6u
+	                             ? ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)))
+	                             : value);
 }
 
 void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
@@ -740,14 +739,16 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
                                     IR::Block& info) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
+		// A zero kind negates the vote of the nonzero kind that follows it in the enum.
+		const bool zero = kind == CFG::BranchCondition::SccZero ||
+		                  kind == CFG::BranchCondition::VccZero ||
+		                  kind == CFG::BranchCondition::ExecZero;
+		if (zero) kind = static_cast<CFG::BranchCondition>(static_cast<int>(kind) + 1);
 		IR::U1 condition;
 		switch (kind) {
 			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
-			case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-			case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
 			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-			case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
 			case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
 			case CFG::BranchCondition::ScalarInstruction:
 				EXIT_IF(instruction_branch_condition.IsEmpty());
@@ -755,7 +756,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 				break;
 			default: EXIT("block %u has an invalid native branch condition", source.id);
 		}
-		return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+		const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+		return zero ? ir.LogicalNot(vote) : vote;
 	};
 	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
 		const auto& value = graph.expressions.at(index);

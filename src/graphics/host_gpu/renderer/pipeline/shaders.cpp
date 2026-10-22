@@ -422,6 +422,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
 	multisampling.rasterizationSamples = vulkan_sample_count(static_params.samples);
 	multisampling.minSampleShading     = 1.0f;
+	multisampling.alphaToCoverageEnable =
+	    static_params.alpha_to_coverage_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineColorBlendAttachmentState color_blend_attachment[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < rendering.color_count; i++) {

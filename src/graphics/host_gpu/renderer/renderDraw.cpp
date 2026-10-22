@@ -436,7 +436,7 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
 	const auto& db = sh_regs.db_shader_control;
 	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
-	       db.shader_dual_export_enable || db.shader_execute_on_noop;
+	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask();
 }
 
 struct DrawRenderState {
@@ -935,6 +935,29 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
+	// keep those matching the raster count instead of resolving multisampled shadows.
+	const auto colors       = std::span {state.color_info, state.color_count};
+	const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
+	                                                    : state.color_info[0].desc.info.samples;
+	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+		    return color.desc.info.samples != pass_samples;
+	    })) {
+		const auto raster =
+		    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
+			return color.desc.info.samples != raster;
+		});
+		state.color_count -= static_cast<uint32_t>(dropped.size());
+		if (state.depth_info.image_id && state.depth_info.desc.info.samples != raster) {
+			state.depth_info = {};
+		}
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "Warning: dropping attachments whose sample count differs from the raster.\n");
+		}
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1227,6 +1250,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
+	vk::PipelineStageFlags shader_write_stages = {};
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+		}
+	}
+	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (shader_write_stages) {
+		// As for dispatches, buffer writes wait for earlier accesses to the memory.
+		m_context.GetCommandScheduler().EndRendering();
+		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1246,15 +1283,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	}
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();

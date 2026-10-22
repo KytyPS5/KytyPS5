@@ -168,12 +168,18 @@
              </widget>
             </item>
             <item row="6" column="1">
+             <widget class="QCheckBox" name="checkBox_readback_tiled">
+              <property name="toolTip"><string>Read back small writable tiled images</string></property>
+              <property name="text"><string>Enable tiled readback</string></property>
+             </widget>
+            </item>
+            <item row="7" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
               <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
               <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
-            <item row="7" column="1">
+            <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>

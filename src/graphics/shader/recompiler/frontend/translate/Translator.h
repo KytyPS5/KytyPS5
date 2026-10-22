@@ -113,11 +113,6 @@ private:
 	void DS_ORDERED_COUNT(const Decoder::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
-	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
-	                                 uint32_t high_result);
-	IR::U32 ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, float upper_bound,
-	                                 float safe_upper, uint32_t lower_result,
-	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
@@ -187,9 +182,8 @@ private:
 	void V_AND_OR_B32(const Decoder::Instruction& inst);
 	void V_OR3_B32(const Decoder::Instruction& inst);
 	void V_XOR3_B32(const Decoder::Instruction& inst);
-	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero);
+	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
@@ -202,7 +196,6 @@ private:
 	void S_QUADMASK_B64(const Decoder::Instruction& inst);
 	void BFM_B32(const Decoder::Instruction& inst);
 	IR::U32 RightMask32(IR::U32 count);
-	IR::U64 RightMask64(IR::U32 count);
 	void    S_BFM_B64(const Decoder::Instruction& inst);
 	void    S_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	void    S_BFE_U64(const Decoder::Instruction& inst);
@@ -247,8 +240,8 @@ private:
 	void V_READLANE_B32(const Decoder::Instruction& inst);
 	void V_WRITELANE_B32(const Decoder::Instruction& inst);
 	void V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16);
-	void V_INTERP_P1_F32();
 	void V_INTERP_P2_F32(const Decoder::Instruction& inst);
+	void V_INTERP_P2_F16(const Decoder::Instruction& inst);
 	void V_INTERP_MOV_F32(const Decoder::Instruction& inst);
 	void EXP(const Decoder::Instruction& inst);
 

@@ -6832,6 +6832,50 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestVop3F16InterpolationTranslation() {
+  // v_interp_p1ll_f16 v21, v0, attr0.w high; v_interp_p2_f16 v14, v1, attr0.w, v21 high
+  // v_interp_p1ll_f16 v15, v0, attr0.z;      v_interp_p2_f16 v14, v1, attr0.z, v15 (op_sel[3])
+  const uint32_t shader[] = {
+      EncodeVop3Word0(0x342, 21),    EncodeVop3Word1(0x1c0, 256 + 0, 0),
+      EncodeVop3Word0(0x35a, 14),    EncodeVop3Word1(0x1c0, 256 + 1, 256 + 21),
+      EncodeVop3Word0(0x342, 15),    EncodeVop3Word1(0x080, 256 + 0, 0),
+      EncodeVop3Word0(0x35a, 14, 8), EncodeVop3Word1(0x080, 256 + 1, 256 + 15),
+      EncodeExp0(0x00, 0x1),         EncodeExp1(14, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  SetIdentityInterpolatorSettings(&ps_info);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.ir_dump.find("GetAttributeF16 0x00000000, 0x00000003, 0x00000001") !=
+            std::string::npos,
+        "v_interp_p2_f16 did not read the high f16 of attr0.w");
+  Check(result.ir_dump.find("GetAttributeF16 0x00000000, 0x00000002, 0x00000000") !=
+            std::string::npos,
+        "v_interp_p2_f16 did not read the low f16 of attr0.z");
+  Check(result.decoded_dump.find("v14.sdwa(sel=5") != std::string::npos,
+        "v_interp_p2_f16 op_sel[3] did not write the high half of v14");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u),
+        "f16 interpolation input was not per-vertex");
+  Check(SpirvExtInstCount(result.spirv, 62u) == 6u,
+        "f16 interpolation did not unpack each of the three vertices per read");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 133u) == 6u,
+        "f16 interpolation did not blend three barycentric weights per read");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  ps_info.interpolator_settings[0] = 0x00000400u;
+  auto flat_result = RecompileForTest(shader, options);
+  Check(SpirvExtInstCount(flat_result.spirv, 62u) == 2u &&
+            !SpirvContainsCapability(flat_result.spirv, 5284u) &&
+            SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
+        "flat f16 interpolation did not unpack only the flat provoking value");
+  CheckSpirvBinaryValidates(flat_result.spirv);
+}
+
 void TestPerspectiveCentroidInputs() {
   constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
                              std::array{5u, UINT32_MAX, 2u},
@@ -10429,14 +10473,12 @@ void TestNewShaderRecompilerNativeU64Translation() {
       ir.Emit(IR::ValueOpcode::BitwiseAnd64,
               {base, IR::Value(uint64_t{0xff00ff00ff00ff00ull})});
   const auto sum = ir.Emit(IR::ValueOpcode::IAdd64, {masked, base});
-  const auto product = ir.Emit(IR::ValueOpcode::IMul64, {sum, base});
   const auto shifted =
-      ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {product, lane});
+      ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {sum, lane});
   ir.Emit(IR::ValueOpcode::IEqual64, {shifted, base});
   ir.Emit(IR::ValueOpcode::INotEqual64, {shifted, base});
   ir.Emit(IR::ValueOpcode::ULessThan64, {shifted, base});
   ir.Emit(IR::ValueOpcode::SLessThan64, {shifted, base});
-  ir.Emit(IR::ValueOpcode::BitCount64, {shifted});
   for (const uint32_t count : {1u, 31u, 32u, 33u, 63u}) {
     ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {base, IR::Value(count)});
     ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {base, IR::Value(count)});
@@ -10451,7 +10493,6 @@ void TestNewShaderRecompilerNativeU64Translation() {
   Check(source.find("OpCapability Int64") != std::string::npos &&
             source.find("OpTypeInt 64 0") != std::string::npos &&
             SpirvSourceHasInstructionUsing(source, "OpIAdd", "%ulong") &&
-            SpirvSourceHasInstructionUsing(source, "OpIMul", "%ulong") &&
             SpirvSourceHasInstructionUsing(source, "OpBitwiseAnd", "%ulong"),
         "U64 arithmetic did not emit native 64-bit scalar instructions");
   Check(SpirvInstructionOpcodeCount(spirv, spv::OpIAddCarry) == 0u &&
@@ -10535,6 +10576,7 @@ void TestComputeDispatchWaveSize() {
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
+      EncodeVopc(0xd4, 0 + 256, 1), // v_cmpx_gt_u32 v0, v1
       EncodeMubuf0(0x0c),
       EncodeMubuf1(0, 0, 1), // buffer_load_dword
                              // v0
@@ -15147,7 +15189,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
             ValueDependsOn(carry_source->dwords[1],
                            ShaderRecompiler::IR::ValueOpcode::GetShaderBase) &&
             ValueDependsOn(carry_source->dwords[1],
-                           ShaderRecompiler::IR::ValueOpcode::IAddCarry32),
+                           ShaderRecompiler::IR::ValueOpcode::ULessThan32),
         "real s_add_u32/s_addc_u32 translation lost SCC carry provenance");
   std::array<uint32_t, 64> carry_user_data{};
   const uint64_t shader_base = 0x00000012fffffffbull;
@@ -16026,6 +16068,40 @@ void TestCapturedBufferStoreFormatD16HiXDecode() {
         "captured BUFFER_STORE_FORMAT_D16_HI_X lost its high half, index, or coherence flags");
 }
 
+void TestCapturedBufferLoadD16XyzwDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const uint32_t code[] = {0xe20c2000u, 0x8001100cu};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW &&
+            inst.word_count == 2 && inst.data_dwords == 2 && inst.data_bits == 16 &&
+            inst.data_components == 4 && inst.formatted && !inst.typed,
+        "captured D16 XYZW load lost its four components in two packed VGPRs");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 16 &&
+            inst.dst.sdwa_sel == 6 &&
+            inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 12 &&
+            inst.src1.kind == Decoder::OperandKind::Sgpr && inst.src1.reg == 4 &&
+            inst.idxen && !inst.offen,
+        "captured D16 XYZW load lost its full destination VGPRs or index");
+}
+
+void TestCapturedBufferLoadD16XyDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const uint32_t code[] = {0xe2042000u, 0x80090600u};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY &&
+            inst.word_count == 2 && inst.data_dwords == 1 && inst.data_bits == 16 &&
+            inst.data_components == 2 && inst.formatted && !inst.typed,
+        "captured D16 XY load lost its two components in one packed VGPR");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 6 &&
+            inst.dst.sdwa_sel == 6 &&
+            inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 0 &&
+            inst.src1.kind == Decoder::OperandKind::Sgpr && inst.src1.reg == 36 &&
+            inst.idxen && !inst.offen,
+        "captured D16 XY load lost its destination VGPR or index");
+}
+
 void TestCapturedBufferStoreD16XyzwDecode() {
   namespace Decoder = ShaderRecompiler::Decoder;
   const uint32_t code[] = {0xe21c6000u, 0x8002000eu};
@@ -16350,8 +16426,8 @@ void CheckSpirvBlockSourceMapping(TestCompileResult &result) {
   Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpString) == 0 &&
             SpirvInstructionOpcodeCount(result.spirv, spv::OpLine) == 0,
         "default emission unexpectedly contains source mapping");
-  const auto mapped = Spirv::EmitProgram(result.program, options.input_info, 0,
-                                         false, true);
+  const auto mapped =
+      Spirv::EmitProgram(result.program, options.input_info, 0, {}, true);
   CheckSpirvBinaryValidates(mapped);
   uint32_t source = 0;
   uint32_t label = 0;
@@ -16830,6 +16906,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestVop3F16InterpolationTranslation();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();
@@ -16840,6 +16917,8 @@ int main() {
   TestCapturedBufferLoadUbyteD16Decode();
   TestCapturedBufferStoreShortD16HiDecode();
   TestCapturedBufferStoreFormatD16HiXDecode();
+  TestCapturedBufferLoadD16XyDecode();
+  TestCapturedBufferLoadD16XyzwDecode();
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 

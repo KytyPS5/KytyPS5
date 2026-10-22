@@ -286,6 +286,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
+	m_ui->checkBox_readback_tiled->setChecked(info.readback_tiled_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
@@ -490,6 +491,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
+	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();

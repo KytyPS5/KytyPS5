@@ -576,6 +576,12 @@ struct ShaderRegisters {
 	uint32_t m_paScShaderControl = 0;
 
 	DepthShaderControl db_shader_control;
+	bool               alpha_to_mask_enable = false;
+
+	// DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE overrides DB_ALPHA_TO_MASK per shader.
+	[[nodiscard]] bool AlphaToMask() const {
+		return alpha_to_mask_enable && !db_shader_control.alpha_to_mask_disable;
+	}
 
 	[[nodiscard]] uint32_t GetExportCount() const {
 		return 1u + ((m_spiVsOutConfig >> 1u) & 0x1Fu);
@@ -915,6 +921,7 @@ public:
 	void SetDepthShaderControl(const DepthShaderControl& value) {
 		m_sh_regs.db_shader_control = value;
 	}
+	void SetAlphaToMaskEnable(bool value) { m_sh_regs.alpha_to_mask_enable = value; }
 
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
 

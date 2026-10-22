@@ -38,9 +38,6 @@
 #include <thread>
 #include <vector>
 
-// PthreadJoin reports cancellation with the host's PTHREAD_CANCELED.
-#include <pthread.h>
-
 #if defined(__linux__)
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -225,8 +222,14 @@ void TestMutexHandoff() {
   waiter.release = true;
   waiter.resume = 2;
   void *result = nullptr;
+#if defined(__APPLE__)
+  // A canceled guest thread joins with Darwin's PTHREAD_CANCELED on macOS hosts.
+  void *const canceled = reinterpret_cast<void *>(1);
+#else
+  void *const canceled = reinterpret_cast<void *>(-1);
+#endif
   Check(PthreadJoin(waiter.thread, &result) == OK &&
-            result == PTHREAD_CANCELED && waiter.acquired && waiter.finished,
+            result == canceled && waiter.acquired && waiter.finished,
         "mutex lock defers cancellation until explicit cancellation point");
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,

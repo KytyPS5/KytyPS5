@@ -124,7 +124,7 @@ void TestWaveformQueueCapacity() {
 			for (uint32_t i = 0; i < capacity; ++i) {
 				Check(f.voice.blocks[i].data == reinterpret_cast<const uint8_t*>(pcm) &&
 				          f.voice.blocks[i].info.user_data == i + 1 &&
-				          f.voice.blocks[i].cursor == (i == 0 ? 1u : 0u),
+				          f.voice.blocks[i].data_cursor == (i == 0 ? sizeof(int16_t) : 0u),
 				      "rejected waveform request replaced an outstanding block");
 			}
 			f.Render(3);
@@ -846,11 +846,55 @@ void TestStarvationAndPause() {
 	f.Queue(pcm, 2, 0);
 	f.voice.SetEvent(16);
 	f.Render(2);
-	Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0, "paused voice consumed data");
+	Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
+	      "paused voice consumed data");
 	f.voice.SetEvent(32);
 	f.Render(2);
 	Check(f.voice.samples[0] == 0.5f && f.voice.samples[1] == 0.25f,
 	      "stream failed to resume after starvation/pause");
+}
+
+void TestPcmByteUnitStreaming() {
+	Fixture                 f(48000);
+	const int16_t           pcm[] = {0, 4096, 8192, 12288, 16384, 20480, 24576, 28672};
+	const Ngs2WaveformBlock first {0, 4, 0, 1, 5, 0, 0}, rest {4, 12, 0, 0, 99, 0, 0};
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK && f.QueueBlocks(pcm, &rest, 1, 0x12) == OK &&
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 1),
+	      "byte-unit stream was rejected or its read address ignored the skipped frame");
+	f.Render(8);
+	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0, 0, 0} &&
+	          f.voice.blocks.empty() && f.voice.decoded_samples == 5,
+	      "byte-unit stream did not play exactly its duration across data-only blocks");
+}
+
+void TestPcmSkipAcrossBlocks() {
+	Fixture                 f(48000);
+	const int16_t           pcm[] = {1, 2, 3, 8192, 16384};
+	const Ngs2WaveformBlock first {0, 4, 0, 3, 2, 0, 0}, rest {4, 6, 0, 0, 0, 0, 0};
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK, "skipping stream block was rejected");
+	f.Render(1);
+	Check(!f.voice.has_samples && f.voice.blocks.empty(), "skip-only block produced samples");
+	Check(f.QueueBlocks(pcm, &rest, 1, 2) == OK &&
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 3),
+	      "read address ignored the skip remaining from the previous block");
+	f.Render(2);
+	Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} && f.voice.decoded_samples == 2 &&
+	          f.voice.decoded_bytes == sizeof(pcm),
+	      "skip spanning blocks played skipped frames or miscounted decoded data");
+}
+
+void TestPcmBlocksEndWithTheirData() {
+	// The Last Oricru queues blocks holding fewer frames than they declare, even none.
+	Fixture                 f(48000, 2);
+	const int16_t           pcm[] = {4096, -4096, 8192, -8192, 12288, -12288};
+	const Ngs2WaveformBlock blocks[] = {
+	    {0, 0, 0, 0, 16385, 0, 0}, {0, 8, 0, 0, 4, 0, 0}, {8, 4, 0, 0, 3, 0, 0}};
+	Check(f.QueueBlocks(pcm, blocks, 3, 0) == OK, "partially filled blocks were rejected");
+	f.Render(5);
+	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0, 0, -0.125f, -0.25f,
+	                                             -0.375f, 0, 0} &&
+	          f.voice.blocks.empty() && f.voice.decoded_samples == 3,
+	      "partially filled blocks did not play their data back to back");
 }
 
 void TestMonoRateAndRouting() {
@@ -930,7 +974,7 @@ void TestSamplerReuseResetsRouting() {
 		const int16_t pcm[] = {8192, 16384, -8192, -16384};
 		f.Queue(pcm, 2, 0);
 		f.Render(1);
-		Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0,
+		Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
 		      "sampler setup started the new waveform without a play event");
 		f.voice.ports[0].dest = &mastering;
 		f.voice.SetEvent(1);
@@ -1216,7 +1260,7 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	active.Queue(pcm + 2, 1, 0);
 	active.Render(6);
 	Check(log.events.size() == 1 && active.voice.decoded_samples == 2 &&
-	          active.voice.blocks.front().cursor == 0 && active.voice.samples[2] == 0,
+	          active.voice.blocks.front().data_cursor == 0 && active.voice.samples[2] == 0,
 	      "loop callback pause consumed another iteration");
 	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0,
 	                                type == Ngs2RackType::Sampler ? 0x10000004u : 0x40010004u};
@@ -1423,7 +1467,7 @@ void TestCallbackStopsConsumption() {
 			      "completion callback failed to interrupt playback");
 			Check(f.voice.samples[0] == 0.0f && f.voice.samples[1] == 0.0f &&
 			          f.voice.decoded_samples == 1 && f.voice.blocks.size() == 1 &&
-			          f.voice.blocks.front().cursor == 0,
+			          f.voice.blocks.front().data_cursor == 0,
 			      "callback pause/stop consumed the next queued block");
 			if (event == 16) {
 				f.voice.SetEvent(32);
@@ -1523,7 +1567,7 @@ void TestCallbackReplacesSource() {
 				f.Render(4);
 				Check(!f.voice.has_samples && f.voice.samples.size() == (setup ? 4u : 8u) &&
 				          std::ranges::all_of(f.voice.samples, [](float value) { return value == 0; }) &&
-				          f.voice.blocks.size() == 1 && f.voice.blocks.front().cursor == 0,
+				          f.voice.blocks.size() == 1 && f.voice.blocks.front().data_cursor == 0,
 				      "callback source replacement used an old frame or channel layout");
 				f.Render(4);
 				const std::vector<float> expected = setup
@@ -1684,6 +1728,9 @@ int main() {
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestStarvationAndPause();
+	TestPcmByteUnitStreaming();
+	TestPcmSkipAcrossBlocks();
+	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();

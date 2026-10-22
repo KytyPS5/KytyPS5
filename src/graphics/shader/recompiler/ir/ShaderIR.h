@@ -606,6 +606,7 @@ struct DescriptorSource {
 		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
+		bool table_null_sentinel = false;
 		std::optional<PointerTable> pointer_table;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;

@@ -830,6 +830,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			     domain > table.NumRecords()))
 				return failed("indexed pointer geometry", fmt::format("rows={}", domain));
 			const bool affine = indirect.table_stride != 0u || indexed_pointer;
+			if (indirect.table_null_sentinel) {
+				const auto offset = uint64_t {(-indirect.table_stride + indirect.table_offset) & ~3u} +
+				                    (indirect.table_immediate & ~3u);
+				if (offset < table_size) return failed("sentinel is inside table bounds");
+			}
 			const bool image_heap = dword_count == 8u && pointer == nullptr;
 			const uint64_t step = indexed_pointer ? table.Stride()
 			    : indirect.table_maximum ? indirect.table_stride

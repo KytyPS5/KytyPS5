@@ -7344,6 +7344,226 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   }
 }
 
+void TestReadLaneBufferRecordSentinel() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  namespace Prospero = Libs::Graphics::Prospero;
+  for (const auto [bounded, voted, nested, stale, texture] : {
+           std::tuple{true, true, false, false, false}, std::tuple{false, true, false, false, false},
+           std::tuple{true, false, false, false, false}, std::tuple{true, true, true, false, false},
+           std::tuple{true, true, true, true, false}, std::tuple{true, true, true, false, true},
+           std::tuple{true, false, true, false, true}}) {
+    Fixture f;
+    auto* entry = f.block;
+    const auto table = f.Buffer({f.UserData(0u), f.UserData(1u), f.UserData(2u), f.UserData(3u)});
+    const auto input = f.UserData(4u);
+    const auto count_address = f.Address(f.UserData(5u), f.UserData(6u));
+    const auto runtime_count = f.Emit(ValueOpcode::LoadAddressU32,
+        {count_address, Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x140u));
+    const auto lane_id = f.Emit(ValueOpcode::LaneId);
+    const auto local = f.Emit(ValueOpcode::IMul32, {lane_id, input});
+    auto* outer = entry;
+    Inst* previous = nullptr;
+    if (nested) {
+      outer = f.AddBlock();
+      entry->AddBranch(outer);
+      entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = outer};
+      f.block = outer;
+      previous = &outer->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      previous->AddPhiOperand(entry, input);
+    }
+    const auto active = f.Emit(ValueOpcode::ULessThan32, {lane_id, Value(32u)});
+    const auto initial = f.Emit(ValueOpcode::SelectU32,
+        {active, Value(UINT32_MAX), previous != nullptr ? Value(previous) : input});
+    auto* header = f.AddBlock();
+    auto* update = f.AddBlock();
+    auto* exit = f.AddBlock();
+    outer->AddBranch(header);
+    header->AddBranch(update);
+    header->AddBranch(exit);
+    update->AddBranch(header);
+    outer->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = update, .false_block = exit};
+    update->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    f.block = header;
+    auto& carried = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    carried.AddPhiOperand(outer, stale ? Value(previous) : initial);
+    header->condition = f.Emit(ValueOpcode::IEqual32, {local, Value(0u)});
+    f.block = update;
+    const auto limit = f.Emit(ValueOpcode::UMin32, {runtime_count, Value(512u)});
+    const auto range = f.Emit(ValueOpcode::LogicalAnd, {active,
+        f.Emit(ValueOpcode::ULessThan32, {local, bounded ? limit : input})});
+    const auto selected = f.Emit(ValueOpcode::SelectU32, {range, local, Value(&carried)});
+    carried.AddPhiOperand(update, selected);
+    f.block = exit;
+    const auto ballot = f.Emit(ValueOpcode::Ballot,
+        {f.Emit(ValueOpcode::LogicalAnd, {active,
+            f.Emit(ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)})})});
+    const auto scan = f.Emit(ValueOpcode::UMin32,
+        {f.Emit(ValueOpcode::FindILsb32,
+            {f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)})}),
+         f.Emit(ValueOpcode::BitwiseOr32,
+            {f.Emit(ValueOpcode::FindILsb32,
+                {f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)})}), Value(32u)})});
+    auto* access = f.AddBlock();
+    auto* end = f.AddBlock();
+    exit->AddBranch(access);
+    exit->AddBranch(end);
+    access->AddBranch(end);
+    exit->condition = voted ? f.Emit(ValueOpcode::INotEqual32, {scan, Value(UINT32_MAX)})
+                            : f.Emit(ValueOpcode::IEqual32, {local, Value(0u)});
+    exit->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = access, .false_block = end};
+    access->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = end};
+    end->terminator.kind = CFG::TerminatorKind::Return;
+    f.block = access;
+    const auto key = f.Emit(ValueOpcode::ReadLane,
+        {Value(&carried), f.Emit(ValueOpcode::BitwiseAnd32, {scan, Value(63u)})});
+    const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(240u)});
+    if (texture) {
+      const auto material = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer}, 0x1700u));
+      const auto selected_texture = f.Emit(ValueOpcode::BitwiseAnd32, {material, Value(255u)});
+      const auto texture_offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {selected_texture, Value(5u)});
+      const auto textures = f.Address(f.UserData(7u), f.UserData(8u));
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < 8u; ++word) {
+        words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+            {textures, texture_offset, Value(0u), Value(true)},
+            f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = word * 4u}, 0x17b0u));
+      }
+      const auto image = f.Image(words);
+      const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+      f.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, f.ImageAddress(), active},
+          f.AddMemory({.kind = ResourceKind::Image, .image_dimension = Decoder::ImageDimension::Dim2D}, 0x17c4u));
+    } else {
+      std::array<Value, 4> words;
+      for (uint32_t word = 0; word < 4u; ++word) {
+        words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 96u + word * 4u}, 0x2b0u));
+      }
+      const auto handle = f.Buffer(words);
+      const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x3,
+          {handle, local, Value(0u), Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 3u, .data_bits = 32u,
+              .component_count = 3u, .formatted = true, .idxen = true}, 0x2c8u));
+      f.Emit(ValueOpcode::ReferenceU32,
+          {f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(0u)})});
+    }
+    if (nested) {
+      auto* done = f.AddBlock();
+      end->AddBranch(outer);
+      end->AddBranch(done);
+      end->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = outer, .false_block = done};
+      end->condition = f.Emit(ValueOpcode::IEqual32, {input, Value(0u)}, 0, end);
+      done->terminator.kind = CFG::TerminatorKind::Return;
+      previous->AddPhiOperand(end, Value(&carried));
+    }
+    f.PlanAndTrack();
+    auto plan = ExtractResourcePlan(f.program);
+    const auto source = texture ? plan.info.images[0].source : plan.info.buffers[0].source;
+    const auto& indirect = plan.descriptor_sources[source].indirect_descriptor;
+    const bool exact = bounded && voted && !stale;
+    if (texture) {
+      Check(indirect && indirect->selector.has_value() == exact,
+            "masked material texture key lost its selected-row proof or borrowed an unproved mask");
+      if (!exact) continue;
+      Check(indirect->selector->stride == 240u && indirect->selector->bit_mask == 255u,
+            "material texture selector lost its row spacing or bit mask");
+      LinearTestMemory memory;
+      constexpr uint32_t count_word = 512u * 240u / 4u;
+      constexpr uint32_t texture_word = count_word + 1u;
+      memory.words.resize(texture_word + 256u * 8u, 0u);
+      for (uint32_t row = 0; row < 512u; ++row) memory.words[row * 240u / 4u] = 0xabcd0000u | ((row & 1u) * 2u);
+      for (uint32_t row = 0; row < 3u; ++row) {
+        const auto word = texture_word + row * 8u;
+        memory.words[word] = row == 1u ? 8u : 0x1000u + row * 0x1000u;
+        memory.words[word + 1u] = uint32_t(Prospero::BufferFormat::k32Float) << 20u;
+        memory.words[word + 3u] = Libs::Graphics::DstSel(4, 0, 0, 1) | (9u << 28u);
+      }
+      std::array<uint32_t, 9> user_data{uint32_t(memory.base), 240u << 16u, 512u, 0x5204u, 512u,
+          uint32_t(memory.base) + count_word * 4u, 0u, uint32_t(memory.base) + texture_word * 4u, 0u};
+      FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+      const SrtRuntime runtime{.user_data = user_data,
+          .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      for (const uint32_t count : {131u, 1u, 0u, 512u}) {
+        memory.words[count_word] = count;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  snapshot.images.size() == std::max(1u, std::min(2u, count)) &&
+                  std::ranges::none_of(snapshot.images, [](const DescriptorValue& image) { return image.dwords[0] == 8u; }),
+              "material selector instantiated an unreferenced low-address texture");
+        const auto unused = memory.base + (texture_word + 8u) * 4u;
+        Check(std::ranges::none_of(snapshot.specialization_reads, [&](const auto& read) {
+                  return read.first <= unused && unused - read.first < read.second;
+              }), "material selector read an unreferenced texture descriptor");
+      }
+      continue;
+    }
+    Check(indirect && indirect->table_maximum.has_value() == exact &&
+              indirect->table_null_sentinel == exact,
+          "READLANE selection lost its bounded sentinel domain or accepted an unknown bound");
+    if (!exact) continue;
+    Check(indirect->table_maximum == 511u && !indirect->key_count.IsEmpty(),
+          "record selection lost its runtime count or widened its unsigned bound");
+    if (!nested) continue;
+    LinearTestMemory memory;
+    constexpr uint32_t count_word = 512u * 240u / 4u;
+    memory.words.resize(count_word + 1u, 0xdeadbeefu);
+    memory.words[count_word] = 512u;
+    for (uint32_t row = 0; row < 512u; ++row) {
+      const auto word = (row * 240u + 96u) / 4u;
+      memory.words[word] = 0x100000u + row * 0x1000u;
+      memory.words[word + 1u] = 12u << 16u;
+      memory.words[word + 2u] = 16u;
+      memory.words[word + 3u] = (uint32_t(Prospero::BufferFormat::k32_32_32Float) << 12u) |
+          Libs::Graphics::DstSel(4, 5, 6, 7);
+    }
+    const std::array<uint32_t, 4> garbage{0x1e0u, 0x21010101u, 0x1e1u, 0x20010001u};
+    std::copy(garbage.begin(), garbage.end(), memory.words.begin() + 0x1890u / 4u);
+    std::array<uint32_t, 7> user_data{uint32_t(memory.base), 240u << 16u, 512u, 0x5204u, 512u,
+        uint32_t(memory.base) + count_word * 4u, 0u};
+    FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+    SrtRuntime runtime{.user_data = user_data,
+        .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 513u && memory.reads == 513u,
+          "bounded selection scanned unrelated record data");
+    constexpr uint32_t unused = (131u * 240u + 96u) / 4u;
+    std::array<uint32_t, 4> saved;
+    std::copy_n(memory.words.begin() + unused, 4u, saved.begin());
+    const std::array<uint32_t, 4> inactive{0x1e0u, 0x20010001u, 0x1e0u, 0x20010001u};
+    std::copy(inactive.begin(), inactive.end(), memory.words.begin() + unused);
+    for (const uint32_t count : {0u, 1u, 131u, 64u, 131u}) {
+      memory.words[count_word] = count;
+      memory.reads = 0u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.buffers.size() == count + 1u && memory.reads == count + 1u,
+            "record selection inspected unused rows or retained an earlier runtime count");
+      Check(std::ranges::find(snapshot.specialization_reads,
+                std::pair{memory.base + count_word * 4u, uint64_t{4u}}) !=
+                snapshot.specialization_reads.end(),
+            "runtime record count escaped specialization read tracking");
+    }
+    memory.words[count_word] = 132u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "reachable invalid record was silently discarded");
+    std::copy(saved.begin(), saved.end(), memory.words.begin() + unused);
+    memory.words[count_word] = UINT32_MAX;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.buffers.size() == 513u,
+          "runtime record count escaped its static clamp");
+    user_data[2] = UINT32_MAX;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "sentinel inside the scalar table was treated as a null descriptor");
+  }
+}
+
 void TestGuardedWaterfallBufferRecords() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   namespace Prospero = Libs::Graphics::Prospero;
@@ -10094,6 +10314,7 @@ int main() {
       TestGuardedWaterfallBufferRecords();
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
+    Run("READLANE buffer record sentinel", TestReadLaneBufferRecordSentinel);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);

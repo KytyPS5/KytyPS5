@@ -793,11 +793,8 @@ private:
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
 		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
-		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-		selected.SetArg(0, info.condition);
-		selected.SetArg(1, arguments[true_arg]);
-		selected.SetArg(2, arguments[true_arg ^ 1u]);
-		cached->second = Value(&selected);
+		cached->second = EmitValue(
+		    ValueOpcode::SelectU32, {info.condition, arguments[true_arg], arguments[true_arg ^ 1u]});
 		return cached->second;
 	}
 
@@ -1031,6 +1028,7 @@ private:
 				shared_image_heap = descriptor.dword_count == 8u &&
 				    (a.table_record_bytes != 0u || b.table_record_bytes != 0u);
 				if (a.selector != b.selector || a.table_maximum != b.table_maximum ||
+				    a.table_null_sentinel != b.table_null_sentinel ||
 				    a.pointer_table != b.pointer_table ||
 				    a.table_source != b.table_source ||
 				    (!shared_image_heap && (a.table_offset != b.table_offset ||
@@ -1573,12 +1571,20 @@ private:
 			else return nullptr;
 			read = ActiveValue(value, active).TryInstruction();
 		}
+		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			uint32_t mask;
+			if (ImmediateU32(read->Arg(1), mask)) value = read->Arg(0);
+			else if (ImmediateU32(read->Arg(0), mask)) value = read->Arg(1);
+			else return nullptr;
+			selector.bit_mask &= mask;
+			read = ActiveValue(value, active).TryInstruction();
+		}
 		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitFieldUExtract) {
 			uint32_t width;
 			if (!ImmediateU32(read->Arg(1), selector.bit_offset) ||
 			    !ImmediateU32(read->Arg(2), width) || selector.bit_offset >= 32u ||
 			    width == 0u || width > 32u - selector.bit_offset) return nullptr;
-			selector.bit_mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
+			selector.bit_mask &= width == 32u ? UINT32_MAX : (1u << width) - 1u;
 			read = ActiveValue(read->Arg(0), active).TryInstruction();
 		}
 		return read;
@@ -1824,21 +1830,22 @@ private:
 		return value.Resolve();
 	}
 
+	Value EmitValue(ValueOpcode op, std::initializer_list<Value> args) {
+		auto& node = m_program.value_storage.emplace_back(op);
+		size_t index = 0;
+		for (const auto arg: args) node.SetArg(index++, arg);
+		return Value(&node);
+	}
+
 	Value RuntimeSelectorMaximum(Value value, Value key = {}, Value carried = {},
 	                             uint32_t key_maximum = UINT32_MAX, Value executing = {},
 	                             Value assumption = {}) {
-		const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args) {
-			auto& node = m_program.value_storage.emplace_back(op);
-			size_t index = 0;
-			for (const auto arg: args) node.SetArg(index++, arg);
-			return Value(&node);
-		};
 		uint32_t remaining = 4096u;
 		const auto maximum = [&](Value a, Value b) {
 			if (a == Value(UINT32_MAX) || b == Value(UINT32_MAX)) return Value(UINT32_MAX);
 			if (a == Value(0u) || a == b) return b;
 			if (b == Value(0u)) return a;
-			return emit(ValueOpcode::UMax32, {a, b});
+			return EmitValue(ValueOpcode::UMax32, {a, b});
 		};
 		const auto matches_key = [&](Value candidate, uint32_t maximum_key) {
 			candidate = candidate.Resolve();
@@ -1939,18 +1946,18 @@ private:
 			}
 			if (inst->GetOpcode() == ValueOpcode::SelectU32) {
 				const auto selected = guard.IsEmpty() ? inst->Arg(0)
-				    : emit(ValueOpcode::LogicalAnd, {guard, inst->Arg(0)});
+				    : EmitValue(ValueOpcode::LogicalAnd, {guard, inst->Arg(0)});
 				const auto a = self(self, inst->Arg(1), depth + 1u, selected);
 				const auto b = self(self, inst->Arg(2), depth + 1u, guard);
 				return finish(ValidateRuntimeValue(m_program, inst->Arg(0), RuntimeValueType::Integer)
-				    ? emit(ValueOpcode::SelectU32, {inst->Arg(0), a, b}) : maximum(a, b));
+				    ? EmitValue(ValueOpcode::SelectU32, {inst->Arg(0), a, b}) : maximum(a, b));
 			}
 			if (inst->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
 				uint32_t shift;
 				if (ImmediateU32(inst->Arg(1), shift)) {
 					const auto upper = self(self, inst->Arg(0), depth + 1u, guard);
 					return finish(upper == Value(UINT32_MAX) ? Value(UINT32_MAX >> (shift & 31u))
-					    : emit(ValueOpcode::ShiftRightLogical32, {upper, Value(shift & 31u)}));
+					    : EmitValue(ValueOpcode::ShiftRightLogical32, {upper, Value(shift & 31u)}));
 				}
 			}
 			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32) {
@@ -1969,7 +1976,7 @@ private:
 					const auto word = !guard.IsEmpty() && !carried.IsEmpty()
 					    ? project(project, source.dwords[1], guard, 0u) : source.dwords[1];
 					if (ValidateRuntimeValue(m_program, word, RuntimeValueType::Integer)) {
-						const auto format = emit(ValueOpcode::BitFieldUExtract, {word, Value(20u), Value(9u)});
+						const auto format = EmitValue(ValueOpcode::BitFieldUExtract, {word, Value(20u), Value(9u)});
 						Value result(UINT32_MAX);
 						for (const auto [native, bits]: std::array {
 						    std::pair {Prospero::BufferFormat::k8UInt, 8u},
@@ -1978,8 +1985,8 @@ private:
 						    std::pair {Prospero::BufferFormat::k16UInt, 16u},
 						    std::pair {Prospero::BufferFormat::k16_16UInt, 16u},
 						    std::pair {Prospero::BufferFormat::k16_16_16_16UInt, 16u}}) {
-							const auto matches = emit(ValueOpcode::IEqual32, {format, Value(static_cast<uint32_t>(native))});
-							result = emit(ValueOpcode::SelectU32, {matches, Value((1u << bits) - 1u), result});
+							const auto matches = EmitValue(ValueOpcode::IEqual32, {format, Value(static_cast<uint32_t>(native))});
+							result = EmitValue(ValueOpcode::SelectU32, {matches, Value((1u << bits) - 1u), result});
 						}
 						image_bound = true;
 						return finish(result);
@@ -2076,16 +2083,16 @@ private:
 				};
 				// A mandatory write below the next index prevents every later table access.
 				if (PossibleU32Bits(next_value, normalize) <= index + 1u)
-					return emit(ValueOpcode::UMin32, {original, Value(index + 1u)});
-				const auto at_index = emit(ValueOpcode::LogicalAnd,
-				    {executing, emit(ValueOpcode::IEqual32, {key, Value(index)})});
+					return EmitValue(ValueOpcode::UMin32, {original, Value(index + 1u)});
+				const auto at_index = EmitValue(ValueOpcode::LogicalAnd,
+				    {executing, EmitValue(ValueOpcode::IEqual32, {key, Value(index)})});
 				const auto next = RuntimeSelectorMaximum(normalize(next_value), key, value,
 				    UINT32_MAX, {}, at_index);
 				if (!next.IsEmpty()) {
 					const auto stops_at_index =
-					    emit(ValueOpcode::ULessThanEqual32, {next, Value(index + 1u)});
-					original = emit(ValueOpcode::SelectU32,
-					    {stops_at_index, emit(ValueOpcode::UMin32, {original, Value(index + 1u)}),
+					    EmitValue(ValueOpcode::ULessThanEqual32, {next, Value(index + 1u)});
+					original = EmitValue(ValueOpcode::SelectU32,
+					    {stops_at_index, EmitValue(ValueOpcode::UMin32, {original, Value(index + 1u)}),
 					     original});
 				}
 			}
@@ -2094,11 +2101,11 @@ private:
 		const auto next = RuntimeSelectorMaximum(count->Arg(induction->initial_arm ^ 1u), key, value, 255u);
 		if (initial.IsEmpty() || next.IsEmpty()) return original;
 		// Close the 8-bit invariant before using it to unwrap a relative VGPR index.
-		const auto bounded = emit(ValueOpcode::LogicalAnd,
-		    {emit(ValueOpcode::ULessThanEqual32, {initial, Value(255u)}),
-		     emit(ValueOpcode::ULessThanEqual32, {next, Value(255u)})});
-		return emit(ValueOpcode::SelectU32,
-		    {bounded, emit(ValueOpcode::UMin32, {original, Value(255u)}), original});
+		const auto bounded = EmitValue(ValueOpcode::LogicalAnd,
+		    {EmitValue(ValueOpcode::ULessThanEqual32, {initial, Value(255u)}),
+		     EmitValue(ValueOpcode::ULessThanEqual32, {next, Value(255u)})});
+		return EmitValue(ValueOpcode::SelectU32,
+		    {bounded, EmitValue(ValueOpcode::UMin32, {original, Value(255u)}), original});
 	}
 
 	Value FloatIndexSource(Value value, Value guard) const {
@@ -2632,36 +2639,30 @@ private:
 			return at.counter == consumed_counter && at.base == read_offset.offset + read_memory->offset;
 		});
 		if (consumed == appends.end()) return {};
-		const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args) {
-			auto& node = m_program.value_storage.emplace_back(op);
-			size_t index = 0;
-			for (const auto arg: args) node.SetArg(index++, arg);
-			return Value(&node);
-		};
 		Value bound = consumed->bound;
 		Value all_bounds = bound;
 		for (const auto& append: appends) {
 			if (EquivalentValue(m_program, consumed->bound, append.bound)) continue;
-			all_bounds = emit(ValueOpcode::UMax32, {all_bounds, append.bound});
+			all_bounds = EmitValue(ValueOpcode::UMax32, {all_bounds, append.bound});
 			auto contribution = append.bound;
 			if (append.base != consumed->base) {
 				// Each list occupies at most its producer bound in DWORDs. Only a list
 				// whose possible payload span overlaps the consumed span can supply its values.
 				const auto gap = (std::max(append.base, consumed->base) -
 				                  std::min(append.base, consumed->base)) / 4u;
-				const auto overlap = emit(ValueOpcode::ULessThan32,
+				const auto overlap = EmitValue(ValueOpcode::ULessThan32,
 				    {Value(gap), append.base < consumed->base ? append.bound : consumed->bound});
-				contribution = emit(ValueOpcode::SelectU32, {overlap, contribution, Value(0u)});
+				contribution = EmitValue(ValueOpcode::SelectU32, {overlap, contribution, Value(0u)});
 			}
-			bound = emit(ValueOpcode::UMax32, {bound, contribution});
+			bound = EmitValue(ValueOpcode::UMax32, {bound, contribution});
 		}
 		if (all_bounds == consumed->bound) return bound;
-		bound = emit(ValueOpcode::SelectU32,
-		    {emit(ValueOpcode::ULessThan32, {Value(0u), consumed->bound}), bound, Value(0u)});
+		bound = EmitValue(ValueOpcode::SelectU32,
+		    {EmitValue(ValueOpcode::ULessThan32, {Value(0u), consumed->bound}), bound, Value(0u)});
 		// Validate even disjoint producers: the address and counter proofs require
 		// every bound to fit the existing cap, including when the consumer is empty.
-		return emit(ValueOpcode::SelectU32,
-		    {emit(ValueOpcode::ULessThanEqual32, {all_bounds, Value(MaxIndirectDescriptorProbes)}),
+		return EmitValue(ValueOpcode::SelectU32,
+		    {EmitValue(ValueOpcode::ULessThanEqual32, {all_bounds, Value(MaxIndirectDescriptorProbes)}),
 		     bound, all_bounds});
 	}
 
@@ -2767,6 +2768,12 @@ private:
 				if (maximum < MaxIndirectDescriptorProbes &&
 				    uint64_t {offset} + base_offset + uint64_t {maximum} * stride <= UINT32_MAX)
 					count = Value(maximum + 1u);
+			}
+			if (count.IsEmpty()) {
+				DescriptorSource::IndirectDescriptor domain;
+				domain.table_stride = stride;
+				domain.table_offset = offset + base_offset;
+				if (SetSelectedTableMaximum(index, domain, true)) count = domain.key_count;
 			}
 		}
 		bool rows = false;
@@ -3254,10 +3261,7 @@ private:
 		}
 		const auto maximum = SelectorMaximum(lane->Arg(0), bounds, 0u, lane->Arg(1));
 		if (maximum >= INT32_MAX) return false;
-		auto& first = m_program.value_storage.emplace_back(ValueOpcode::ISub32);
-		first.SetArg(0, subtract->Arg(0));
-		first.SetArg(1, Value(maximum));
-		indirect.selector_first = Value(&first);
+		indirect.selector_first = EmitValue(ValueOpcode::ISub32, {subtract->Arg(0), Value(maximum)});
 		indirect.key_count = Value(maximum + 1u);
 		if (maximum == 127u || maximum == 255u)
 			MatchBitsetSelector(lane->Arg(0), lane->Arg(1), bounds, indirect);
@@ -3401,6 +3405,155 @@ private:
 			return false;
 		indirect.table_maximum = result.maximum;
 		indirect.key_count = result.count;
+		return true;
+	}
+
+	Value ReadLaneSelectionGuard(const Inst& lane) const {
+		const auto* index = lane.Arg(1).Resolve().TryInstruction();
+		if (index == nullptr || index->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
+		    index->Arg(1).Resolve() != Value(63u)) return {};
+		const auto* scan = index->Arg(0).Resolve().TryInstruction();
+		if (scan == nullptr || scan->GetOpcode() != ValueOpcode::UMin32) return {};
+		const auto* low = scan->Arg(0).Resolve().TryInstruction();
+		const auto* high_bit = scan->Arg(1).Resolve().TryInstruction();
+		if (low == nullptr || high_bit == nullptr || low->GetOpcode() != ValueOpcode::FindILsb32 ||
+		    high_bit->GetOpcode() != ValueOpcode::BitwiseOr32 ||
+		    high_bit->Arg(1).Resolve() != Value(32u)) return {};
+		const auto* high = high_bit->Arg(0).Resolve().TryInstruction();
+		if (high == nullptr || high->GetOpcode() != ValueOpcode::FindILsb32) return {};
+		const auto* low_word = low->Arg(0).Resolve().TryInstruction();
+		const auto* high_word = high->Arg(0).Resolve().TryInstruction();
+		if (low_word == nullptr || high_word == nullptr ||
+		    low_word->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+		    high_word->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+		    low_word->Arg(1).Resolve() != Value(0u) || high_word->Arg(1).Resolve() != Value(1u) ||
+		    low_word->Arg(0).Resolve() != high_word->Arg(0).Resolve()) return {};
+		const auto* ballot = low_word->Arg(0).Resolve().TryInstruction();
+		if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot) return {};
+		for (const auto& use: scan->Uses()) {
+			auto* compare = use.user;
+			if (compare->GetOpcode() != ValueOpcode::INotEqual32 ||
+			    compare->Arg(use.operand ^ 1u).Resolve() != Value(UINT32_MAX)) continue;
+			if (GuardedOnEntry(lane.Parent(), [&](const Block* block) { return block == scan->Parent(); },
+			    [&](const EdgePredicate& edge) {
+				    return edge.positive && edge.lanes == LaneQuantifier::All &&
+				           Implies(edge.condition, Value(compare));
+			    })) return ballot->Arg(0);
+		}
+		return {};
+	}
+
+	bool SetSelectedTableMaximum(Value key, DescriptorSource::IndirectDescriptor& indirect,
+	                             bool require_non_sentinel = false) {
+		std::vector<Value> guards;
+		Value selected_mask;
+		const auto* lane = key.Resolve().TryInstruction();
+		if (lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadLane) {
+			selected_mask = ReadLaneSelectionGuard(*lane);
+		} else if (lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane &&
+		           HasActiveLane(lane->Arg(1), lane->Parent())) selected_mask = lane->Arg(1);
+		if (!selected_mask.IsEmpty()) guards.push_back(selected_mask);
+		std::vector<Value> selected_guards;
+		for (size_t at = 0; at < guards.size(); ++at) {
+			auto* guard = SimplifyGuard(guards[at]).TryInstruction();
+			if (guard == nullptr) continue;
+			if (guard->Parent() != nullptr && AvailableBefore(*guard, *lane))
+				selected_guards.emplace_back(guard);
+			if (guard->GetOpcode() == ValueOpcode::LogicalAnd) {
+				guards.push_back(guard->Arg(0));
+				guards.push_back(guard->Arg(1));
+			}
+		}
+		struct SelectedValue {
+			Value value;
+			std::vector<Value> guards;
+		};
+		std::vector<SelectedValue> pending {{key, selected_guards}};
+		std::vector<SelectedValue> visited;
+		std::vector<Value> counts;
+		uint32_t static_count = 0u;
+		const auto add_count = [&](Value count) {
+			if (std::ranges::none_of(counts, [&](Value previous) {
+				return EquivalentValue(m_program, previous, count);
+			})) counts.push_back(count);
+		};
+		uint32_t maximum = 0u;
+		bool found = false;
+		bool sentinel = false;
+		for (size_t at = 0; at < pending.size(); ++at) {
+			const auto value = pending[at].value.Resolve();
+			uint32_t literal;
+			if (ImmediateU32(value, literal)) {
+				if (literal == UINT32_MAX) sentinel = true;
+				else {
+					maximum = std::max(maximum, literal);
+					static_count = std::max(static_count, literal + 1u);
+					found = true;
+				}
+				continue;
+			}
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr) return false;
+			auto active_guards = pending[at].guards;
+			// A carried value may come from before this iteration's mask definition.
+			std::erase_if(active_guards, [&](Value guard) {
+				return !AvailableBefore(*guard.ResolveInstruction(), *inst);
+			});
+			if (std::ranges::any_of(visited, [&](const SelectedValue& previous) {
+				return previous.value == value && previous.guards == active_guards;
+			})) continue;
+			visited.push_back({value, active_guards});
+			const auto op = inst->GetOpcode();
+			if (inst == lane && (op == ValueOpcode::ReadLane ||
+			    (!selected_guards.empty() && op == ValueOpcode::ReadFirstLane))) {
+				pending.push_back({inst->Arg(0), active_guards});
+			} else if (op == ValueOpcode::Phi || op == ValueOpcode::SelectU32) {
+				if (op == ValueOpcode::Phi && inst->NumArgs() == 0u) return false;
+				if (op == ValueOpcode::SelectU32 && std::ranges::any_of(active_guards,
+				    [&](Value guard) { return Implies(guard, inst->Arg(0)); })) {
+					pending.push_back({inst->Arg(1), active_guards});
+					continue;
+				}
+				for (size_t arm = op == ValueOpcode::Phi ? 0u : 1u; arm < inst->NumArgs(); ++arm) {
+					const auto bound = op == ValueOpcode::SelectU32
+					    ? UnsignedBound(inst->Arg(0), inst->Arg(arm), arm == 1u) : Value {};
+					const auto limit = bound.IsEmpty() ? UINT32_MAX : SelectorMaximum(bound);
+					if (limit != 0u && limit != UINT32_MAX) {
+						maximum = std::max(maximum, limit - 1u);
+						if (ValidateRuntimeValue(m_program, bound, RuntimeValueType::Integer))
+							add_count(bound);
+						else
+							static_count = std::max(static_count, limit);
+						found = true;
+					} else pending.push_back({inst->Arg(arm), active_guards});
+				}
+			} else {
+				const auto limit = SelectorMaximum(value);
+				if (limit == UINT32_MAX) return false;
+				maximum = std::max(maximum, limit);
+				static_count = std::max(static_count, limit + 1u);
+				found = true;
+			}
+		}
+		if (!found || maximum > UINT32_MAX / 4u ||
+		    uint64_t {maximum} * indirect.table_stride + indirect.table_offset > UINT32_MAX)
+			return false;
+		if (require_non_sentinel && sentinel) {
+			const auto* local = lane != nullptr && !selected_mask.IsEmpty()
+			    ? lane->Arg(0).Resolve().TryInstruction() : nullptr;
+			if (local == nullptr || !std::ranges::any_of(local->Uses(), [&](const Use& use) {
+				return use.user->GetOpcode() == ValueOpcode::INotEqual32 &&
+				       use.user->Arg(use.operand ^ 1u).Resolve() == Value(UINT32_MAX) &&
+				       Implies(selected_mask, Value(use.user));
+			})) return false;
+		}
+		indirect.table_maximum = maximum;
+		indirect.table_null_sentinel = sentinel;
+		if (static_count != 0u) indirect.key_count = Value(static_count);
+		for (const auto count: counts) {
+			indirect.key_count = indirect.key_count.IsEmpty() ? count
+			    : EmitValue(ValueOpcode::UMax32, {indirect.key_count, count});
+		}
 		return true;
 	}
 
@@ -3602,17 +3755,9 @@ private:
 					indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 					if (first != 0u) {
 						// Clamp before enumerating: negative signed bounds have no reachable keys.
-						auto& nonempty = m_program.value_storage.emplace_back(ValueOpcode::SGreaterThanEqual32);
-						nonempty.SetArg(0, bound->Arg(1));
-						nonempty.SetArg(1, Value(first));
-						auto& length = m_program.value_storage.emplace_back(ValueOpcode::ISub32);
-						length.SetArg(0, bound->Arg(1));
-						length.SetArg(1, Value(first));
-						auto& count = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-						count.SetArg(0, Value(&nonempty));
-						count.SetArg(1, Value(&length));
-						count.SetArg(2, Value(0u));
-						indirect.key_count = Value(&count);
+						const auto nonempty = EmitValue(ValueOpcode::SGreaterThanEqual32, {bound->Arg(1), Value(first)});
+						const auto length = EmitValue(ValueOpcode::ISub32, {bound->Arg(1), Value(first)});
+						indirect.key_count = EmitValue(ValueOpcode::SelectU32, {nonempty, length, Value(0u)});
 						indirect.selector_first = Value(first);
 						indirect.signed_count = false;
 					}
@@ -3858,6 +4003,11 @@ private:
 			return finish();
 		}
 		if (!legacy_store) {
+			if (table_source.dword_count == 4u && !plan.split_offsets &&
+			    SetSelectedTableMaximum(key, indirect)) {
+				indirect.table_scalar = true;
+				return finish();
+			}
 			if (!plan.split_offsets) {
 				const auto count = UnsignedResourceBound(key, handle);
 				if (!count.IsEmpty()) {

@@ -2049,10 +2049,16 @@ public:
   // eUndefined means no depth-stencil attachment is available at all.
   [[nodiscard]] vk::Format SupportedDepthStencilFormat(
       vk::Format preferred, vk::SampleCountFlagBits samples) const {
-    const auto usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
-                       vk::ImageUsageFlagBits::eSampled |
-                       vk::ImageUsageFlagBits::eTransferSrc |
-                       vk::ImageUsageFlagBits::eTransferDst;
+    // Mirror ImageUsageFlags: the constructor adds the feedback-loop bit for a
+    // sampled depth image when the device enabled it, so a format that passes
+    // this probe without it could still exit inside Image::Image.
+    auto usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                 vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc |
+                 vk::ImageUsageFlagBits::eTransferDst;
+    if (m_runtime_context.attachment_feedback_loop_enabled) {
+      usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+    }
     for (const auto candidate:
          {preferred, vk::Format::eD32SfloatS8Uint, vk::Format::eD16UnormS8Uint}) {
       vk::ImageFormatProperties properties {};

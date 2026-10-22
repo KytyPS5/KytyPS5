@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/colorClearCheck.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -14,6 +15,7 @@
 
 #include <bitset>
 #include <map>
+#include <mutex>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -76,6 +78,9 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// A GPU write may have put new fast-clear codes into color metadata the GPU check has
+	// already handled; check those slices again at their next bind.
+	void ForgetColorMetaChecks(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 
@@ -138,6 +143,11 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	// Checks GPU-written DCC metadata and applies its fast clears without a readback.
+	// Returns false when the surface cannot use the GPU check.
+	[[nodiscard]] bool          MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                                       uint64_t meta_address, uint64_t slice_size,
+	                                                       uint32_t count, uint32_t image_first);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -166,6 +176,7 @@ private:
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
+	ColorClearCheck                                   m_color_clear_check;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
@@ -173,6 +184,15 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Metadata slices the GPU check has handled since their last GPU write: slice address ->
+	// (slice size, mask of the candidate codes checked). It has its own lock, since buffer
+	// writes report to it while the texture lock may be held.
+	struct CheckedColorMeta {
+		uint64_t size;
+		uint32_t codes;
+	};
+	std::mutex                                        m_checked_color_meta_lock;
+	std::map<uint64_t, CheckedColorMeta>              m_checked_color_meta;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

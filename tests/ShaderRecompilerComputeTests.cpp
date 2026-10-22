@@ -229,6 +229,17 @@ struct TileManagerTestAccess {
 struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
+
+  static void RememberColorMetaCheck(TextureCache &cache, uint64_t address, uint64_t size,
+                                     uint32_t codes) {
+    std::scoped_lock lock{cache.m_checked_color_meta_lock};
+    cache.m_checked_color_meta[address] = {size, codes};
+  }
+
+  static bool HasColorMetaCheck(TextureCache &cache, uint64_t address) {
+    std::scoped_lock lock{cache.m_checked_color_meta_lock};
+    return cache.m_checked_color_meta.contains(address);
+  }
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 44);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
@@ -5318,6 +5329,89 @@ public:
     DestroyBuffer(&readback);
     Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 3 * page),
             "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckColorClearCheck() {
+    constexpr const char *name = "ColorClearCheck";
+    if (!m_conditional_rendering_supported) {
+      std::printf("[gpu]     %-32s skipped (no conditional rendering)\n", name);
+      return;
+    }
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    // Slice 0 is cleared to code 0x00, slice 1 to 0x40, slice 2 is 0x00 except one byte,
+    // and slice 3 holds 0xff (no clear pending).
+    constexpr uint32_t slice_size = 0x1000;
+    constexpr uint32_t slices = 4;
+    constexpr uint32_t slice_words = slice_size / 4;
+    std::vector<u32> words(slices * slice_words);
+    const auto fill = [&](uint32_t slice, u32 value) {
+      std::fill_n(words.begin() + slice * slice_words, slice_words, value);
+    };
+    fill(0, 0x00000000u);
+    fill(1, 0x40404040u);
+    fill(2, 0x00000000u);
+    words[2 * slice_words + 100] = 0x0000ff00u;
+    fill(3, 0xffffffffu);
+    auto meta = CreateHostBuffer(name, slices * slice_size,
+                                 vk::BufferUsageFlagBits::eStorageBuffer, words);
+    constexpr uint32_t code_count = 4;
+    auto readback = CreateHostBuffer(name, slices * code_count * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+
+    ColorClearCheck check(m_runtime_context, scheduler);
+    Require(name, "pipeline", check.Supported(),
+            "the check pipeline was not created with conditional rendering enabled");
+    const uint8_t codes[code_count] = {0x00, 0x40, 0x80, 0xc0};
+    const auto predicates =
+        check.Record(meta.buffer, 0, meta.size, slice_size, slices, codes, true);
+    const vk::BufferCopy copy{predicates.offset, 0, slices * code_count * sizeof(u32)};
+    auto command = scheduler.Current().Handle();
+    command.copyBuffer(predicates.buffer, readback.buffer, 1, &copy);
+    vk::MemoryBarrier to_host{};
+    to_host.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+    to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                            vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr, 0,
+                            nullptr);
+    scheduler.Finish();
+
+    Require(name, "predicates",
+            ReadBuffer(name, readback, slices * code_count) ==
+                std::vector<u32>{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+            "a uniform slice did not set exactly its code's predicate, or a mixed or "
+            "non-clear slice set one");
+    const auto after = ReadBuffer(name, meta, words.size());
+    bool cleared_reset = true;
+    for (uint32_t i = 0; i < 2 * slice_words; i++) {
+      cleared_reset = cleared_reset && after[i] == 0xffffffffu;
+    }
+    Require(name, "reset",
+            cleared_reset &&
+                std::equal(words.begin() + 2 * slice_words, words.end(),
+                           after.begin() + 2 * slice_words),
+            "matched slices were not reset to 0xff, or unmatched slices were modified");
+
+    // A GPU write over a checked slice makes it eligible for a new check; others stay.
+    auto &texture_cache = context.GetTextureCache();
+    TextureCacheTestAccess::RememberColorMetaCheck(texture_cache, 0x200000000ull, slice_size, 1);
+    TextureCacheTestAccess::RememberColorMetaCheck(texture_cache, 0x200001000ull, slice_size, 1);
+    texture_cache.ForgetColorMetaChecks(0x200000800ull, 0x10);
+    Require(name, "forget",
+            !TextureCacheTestAccess::HasColorMetaCheck(texture_cache, 0x200000000ull) &&
+                TextureCacheTestAccess::HasColorMetaCheck(texture_cache, 0x200001000ull),
+            "a GPU write did not forget exactly the checked slices it overlapped");
+    texture_cache.ForgetColorMetaChecks(0x200000000ull, 0x2000);
+
+    DestroyBuffer(&meta);
+    DestroyBuffer(&readback);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -20390,6 +20484,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_conditional_rendering_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20425,6 +20520,7 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
+    m_runtime_context.conditional_rendering_enabled = m_conditional_rendering_supported;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -20575,12 +20671,39 @@ private:
     available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceMaintenance8FeaturesKHR available_maintenance8{};
     available_maintenance8.pNext = &available_min_lod;
+    // Optional: the GPU-side color-clear check needs conditional rendering.
+    bool conditional_rendering_extension = false;
+    {
+      uint32_t extension_count = 0;
+      std::vector<vk::ExtensionProperties> extensions;
+      if (m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                               nullptr) == vk::Result::eSuccess) {
+        extensions.resize(extension_count);
+        if (m_physical_device.enumerateDeviceExtensionProperties(
+                nullptr, &extension_count, extensions.data()) != vk::Result::eSuccess) {
+          extensions.clear();
+        }
+      }
+      for (const auto &extension : extensions) {
+        conditional_rendering_extension =
+            conditional_rendering_extension ||
+            std::strcmp(extension.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) ==
+                0;
+      }
+    }
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional_rendering{};
+    available_conditional_rendering.pNext = &available_maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
-    available_robustness2.pNext = &available_maintenance8;
+    available_robustness2.pNext = conditional_rendering_extension
+                                      ? static_cast<void *>(&available_conditional_rendering)
+                                      : static_cast<void *>(&available_maintenance8);
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
     m_physical_device.getFeatures2(&available_features2);
+    m_conditional_rendering_supported =
+        conditional_rendering_extension &&
+        available_conditional_rendering.conditionalRendering == VK_TRUE;
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
     Require("VulkanHarness", "dispatch",
@@ -20709,6 +20832,12 @@ private:
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
     device_info.pNext = &robustness2;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
+    if (m_conditional_rendering_supported) {
+      conditional_rendering.conditionalRendering = true;
+      conditional_rendering.pNext = &robustness2;
+      device_info.pNext = &conditional_rendering;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -20736,6 +20865,9 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_conditional_rendering_supported) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
@@ -50095,6 +50227,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckColorClearCheck();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -50328,6 +50461,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckColorClearCheck();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

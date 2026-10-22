@@ -300,6 +300,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(color_clear_check_shader_source "${gpu_tiler_shader_dir}/color_clear_check.comp")
+set(color_clear_check_shader_spv "${gpu_tiler_generated_dir}/color_clear_check.spv")
+set(color_clear_check_shader_header "${gpu_tiler_generated_dir}/color_clear_check_spv.h")
+add_custom_command(
+	OUTPUT "${color_clear_check_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${color_clear_check_shader_spv}" "${color_clear_check_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${color_clear_check_shader_spv}
+	        -DOUTPUT=${color_clear_check_shader_header} -DSYMBOL=COLOR_CLEAR_CHECK_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${color_clear_check_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${color_clear_check_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

@@ -121,7 +121,7 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
-      m_blit_helper(graphics, scheduler),
+      m_blit_helper(graphics, scheduler), m_color_clear_check(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
@@ -1035,6 +1035,160 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+void TextureCache::ForgetColorMetaChecks(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_checked_color_meta_lock};
+	if (m_checked_color_meta.empty()) {
+		return;
+	}
+	// Entries are slice-sized (at most a few hundred KiB); start one maximal slice earlier.
+	constexpr uint64_t MaxSlice = 16ull * 1024 * 1024;
+	auto it = m_checked_color_meta.lower_bound(address > MaxSlice ? address - MaxSlice : 0);
+	while (it != m_checked_color_meta.end() && it->first < address + size) {
+		if (it->first + it->second.size > address) {
+			it = m_checked_color_meta.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+                                              uint64_t meta_address, uint64_t slice_size,
+                                              uint32_t count, uint32_t image_first) {
+	if (!m_color_clear_check.Supported()) {
+		return false;
+	}
+	const auto& view = desc.view_info;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto& image = m_slot_images[id];
+		if (image.info.IsDepth() || image.depth_id || image.info.samples != 1 ||
+		    view.level_count != 1 ||
+		    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+		      vk::FormatFeatureFlagBits::eColorAttachment)) {
+			return false;
+		}
+	}
+	// The codes this surface can decode, with the clear values the CPU path would use.
+	std::array<uint8_t, ColorClearCheck::MaxCodes>             codes {};
+	std::array<vk::ClearColorValue, ColorClearCheck::MaxCodes> colors {};
+	uint32_t                                                   code_count = 0;
+	for (const uint8_t code: {uint8_t {0x00}, uint8_t {0x40}, uint8_t {0x80}, uint8_t {0xc0},
+	                          uint8_t {0x20}}) {
+		vk::ClearColorValue color {};
+		if (DecodeColorClear(desc, code, color)) {
+			codes[code_count]  = code;
+			colors[code_count] = color;
+			code_count++;
+		}
+	}
+	if (code_count == 0) {
+		// Nothing this surface could clear to; the readback path would change nothing either.
+		return true;
+	}
+	uint32_t code_mask = 0;
+	for (uint32_t k = 0; k < code_count; k++) {
+		code_mask |= 1u << (codes[k] >> 5u); // 0x00, 0x20, 0x40, 0x80, 0xc0 -> distinct bits
+	}
+	// Slices already checked for these codes, with no GPU write since, hold no pending clear.
+	{
+		std::scoped_lock lock {m_checked_color_meta_lock};
+		bool all_checked = true;
+		for (uint32_t slice = 0; slice < count && all_checked; slice++) {
+			const auto found = m_checked_color_meta.find(meta_address + slice_size * slice);
+			all_checked      = found != m_checked_color_meta.end() &&
+			              found->second.size == slice_size &&
+			              (found->second.codes & code_mask) == code_mask;
+		}
+		if (all_checked) {
+			return true;
+		}
+	}
+
+	// The check resets a matched slice to 0xff, as the CPU path does, except for video-out
+	// surfaces, whose metadata the CPU path leaves alone.
+	const bool reset     = desc.type != BindingType::VideoOut;
+	const auto meta_size = slice_size * count;
+	const auto [meta, meta_offset] = m_buffer_cache.ObtainBuffer(meta_address, meta_size, reset);
+	const auto predicates = m_color_clear_check.Record(meta->Handle(), meta_offset, meta_size,
+	                                                   slice_size, count,
+	                                                   std::span(codes.data(), code_count), reset);
+	// After the check (whose own metadata write forgets older entries), remember these slices.
+	{
+		std::scoped_lock lock {m_checked_color_meta_lock};
+		if (m_checked_color_meta.size() > 65536) {
+			m_checked_color_meta.clear();
+		}
+		for (uint32_t slice = 0; slice < count; slice++) {
+			auto& checked = m_checked_color_meta[meta_address + slice_size * slice];
+			if (checked.size != slice_size) {
+				checked = {slice_size, 0};
+			}
+			checked.codes |= code_mask;
+		}
+	}
+
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	TrackImage(id);
+	// Bring guest data in first: a conditional clear must land on top of it, never under it.
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
+		InitializeImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			EXIT("TextureCache: conditional clear retained guest ownership\n");
+		}
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+
+	ImageViewInfo attachment_view {};
+	attachment_view.format      = view.format;
+	attachment_view.type        = count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	attachment_view.base_level  = view.base_level;
+	attachment_view.base_layer  = image_first;
+	attachment_view.layer_count = count;
+	attachment_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              {}, native);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(attachment_view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+	                           std::max(image.info.extent.height >> view.base_level, 1u)};
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = extent;
+	rendering.layerCount           = count;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	native.beginRendering(&rendering);
+	for (uint32_t slice = 0; slice < count; slice++) {
+		for (uint32_t k = 0; k < code_count; k++) {
+			vk::ConditionalRenderingBeginInfoEXT condition {};
+			condition.buffer = predicates.buffer;
+			condition.offset = predicates.offset + (uint64_t {slice} * code_count + k) * 4;
+			native.beginConditionalRenderingEXT(&condition);
+			vk::ClearAttachment clear {};
+			clear.aspectMask        = vk::ImageAspectFlagBits::eColor;
+			clear.colorAttachment   = 0;
+			clear.clearValue.color  = colors[k];
+			vk::ClearRect rect {};
+			rect.rect.extent        = extent;
+			rect.baseArrayLayer     = slice;
+			rect.layerCount         = 1;
+			native.clearAttachments(1, &clear, 1, &rect);
+			native.endConditionalRenderingEXT();
+		}
+	}
+	native.endRendering();
+	CommitGpuWrite(image);
+	return true;
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
@@ -1067,12 +1221,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	const auto slice_size = range.size / layers;
+	const bool gpu_written = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	// Metadata the GPU just wrote (typically a compute fast clear) would need a synchronous
+	// readback, which drains the GPU at the first bind of every such surface. Decide on the GPU.
+	if (gpu_written && desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+	    MaterializeColorClearOnGpu(id, desc, range.address + slice_size * first, slice_size, count,
+	                               image_first)) {
+		return;
+	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	if (gpu_written) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;

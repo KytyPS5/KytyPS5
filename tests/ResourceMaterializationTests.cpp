@@ -446,6 +446,410 @@ void TestCompiledSrtReadsFollowBlocks() {
   }
 }
 
+void TestCompiledSrtDescriptorReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 3u,
+                                  static_cast<uint32_t>(address >> 32u) | 0xabcd0000u};
+  };
+  std::array<uint32_t, 3> child{0u, 0x11111111u, 0x22222222u};
+  const auto child_words = pointer_words(child.data());
+  std::array<uint32_t, 6> constants{0xaaaa0001u, 0xbbbb0002u, 0xcccc0003u,
+                                   0xdddd0004u, 0xeeee0005u, 0xffff0006u};
+  const auto constants_address = reinterpret_cast<uint64_t>(constants.data());
+  // Pointer to the child table, a DWORD shared with a slot, the branch DWORD, a clean DWORD,
+  // then a constant-buffer V# (base, stride, records, word 3) and a descriptor index.
+  std::array<uint32_t, 11> root{child_words[0], child_words[1], 0x44444444u, 1u, 0x55555555u,
+                                0x66666666u, static_cast<uint32_t>(constants_address),
+                                static_cast<uint32_t>(constants_address >> 32u), 24u, 0x12345678u,
+                                1u};
+  const auto root_words = pointer_words(root.data());
+  std::array<uint32_t, 3> user_data{root_words[0], root_words[1], 0x0fa0u};
+
+  for (const bool blocks : {true, false}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_base = 4;
+    program.user_data_count = 3;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+    program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer});
+    auto &entry = AddValueBlock(program);
+    const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+      return Value(&block.AppendNewInst(opcode, args));
+    };
+    const auto root_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                  {emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+                                   emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+    const auto load = [&](Value handle, uint32_t offset) {
+      const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                              {handle, Value(offset), Value(0u), Value(true)});
+      value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+      return value;
+    };
+    const auto child_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                   {load(root_handle, 0u), load(root_handle, 4u)});
+    const auto shared = load(root_handle, 8u);
+    const auto written = load(root_handle, 16u);
+    const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+    for (const auto value : {shared, written}) {
+      emit(entry, ValueOpcode::ReadConst,
+           {srt, Value(static_cast<uint32_t>(program.srt_reads.size()))});
+      program.srt_reads.push_back({value, static_cast<uint32_t>(program.srt_reads.size())});
+    }
+    // 0: compiled reads, an immediate and a user-data word; 1: the DWORD of a written buffer,
+    // a clean read when reads are captured; 2: arithmetic stays interpreted.
+    DescriptorSource compiled;
+    compiled.dwords = {shared, load(child_handle, 8u), Value(0x40u),
+                       emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(6))})};
+    compiled.dword_count = 4;
+    DescriptorSource clean;
+    clean.dwords = {written, Value(0u), Value(4u), Value(0u)};
+    clean.dword_count = 4;
+    DescriptorSource arithmetic;
+    arithmetic.dwords = {emit(entry, ValueOpcode::IAdd32, {load(root_handle, 20u), Value(1u)}),
+                         Value(0u), Value(4u), Value(0u)};
+    arithmetic.dword_count = 4;
+    // 3: a register below the user data stays interpreted (and fails).
+    DescriptorSource below;
+    below.dwords = {emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(2))})};
+    below.dword_count = 1;
+    // 4: constant-buffer reads through a V# read from the table.
+    const auto buffer_handle =
+        emit(entry, ValueOpcode::GetBufferResource,
+             {load(root_handle, 24u), load(root_handle, 28u), load(root_handle, 32u),
+              load(root_handle, 36u)});
+    const auto constant = [&](Value offset, uint32_t immediate, Value handle) {
+      program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .offset = immediate});
+      const auto value = emit(entry, ValueOpcode::ReadConstBuffer, {handle, offset});
+      value.Instruction()->SetFlags(
+          MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+      return value;
+    };
+    DescriptorSource buffer;
+    buffer.dwords = {constant(Value(0u), 0u, buffer_handle), constant(Value(4u), 0u, buffer_handle),
+                     Value(4u), Value(0u)};
+    buffer.dword_count = 4;
+    // 5: a table entry selected by an index read from the SRT (index << 3, plus the immediate),
+    // through V# words read again, so that the captured order covers the index read.
+    const auto indexed_handle =
+        emit(entry, ValueOpcode::GetBufferResource,
+             {load(root_handle, 24u), load(root_handle, 28u), load(root_handle, 32u),
+              load(root_handle, 36u)});
+    const auto index = emit(entry, ValueOpcode::ShiftLeftLogical32, {load(root_handle, 40u), Value(3u)});
+    DescriptorSource indexed;
+    indexed.dwords = {constant(index, 0u, indexed_handle), constant(index, 4u, indexed_handle),
+                      Value(4u), Value(0u)};
+    indexed.dword_count = 4;
+    program.descriptor_sources = {compiled, clean, arithmetic, below, buffer, indexed};
+    program.info.buffers.push_back({.source = 0});
+    program.info.buffers.push_back({.source = 1, .written = true});
+    program.info.buffers.push_back({.source = 2});
+    program.info.buffers.push_back({.source = 4});
+    program.info.buffers.push_back({.source = 5});
+    if (blocks) {
+      entry.condition = emit(entry, ValueOpcode::INotEqual32, {load(root_handle, 12u), Value(0u)});
+      AddValueBlock(program);
+      AddValueBlock(program);
+      entry.terminator.kind = TerminatorKind::ConditionalBranch;
+      entry.terminator.true_block = program.blocks[1];
+      entry.terminator.false_block = program.blocks[2];
+      program.blocks[1]->terminator.kind = TerminatorKind::Return;
+      program.blocks[2]->terminator.kind = TerminatorKind::Return;
+    }
+
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.srt_read_table != nullptr && (plan.srt_code == nullptr) == blocks &&
+              plan.srt_descriptor_entries.size() == 6 &&
+              plan.srt_descriptor_entries[4] != UINT32_MAX &&
+              plan.srt_descriptor_entries[5] != UINT32_MAX &&
+              plan.capture_specialization_reads == blocks &&
+              plan.srt_descriptor_entries[0] != UINT32_MAX &&
+              (plan.srt_descriptor_entries[1] == UINT32_MAX) == blocks &&
+              plan.srt_descriptor_entries[2] == UINT32_MAX &&
+              plan.srt_descriptor_entries[3] == UINT32_MAX,
+          "SRT plan did not compile exactly its descriptors of compiled reads");
+    auto interpreted = ExtractResourcePlan(program);
+    interpreted.srt_read_table.reset();
+    uint32_t strict_reads = 0;
+    const auto runtime = [&](std::span<const uint32_t> words) {
+      return SrtRuntime{
+          .user_data = words,
+          .userdata = &strict_reads,
+          .read_specialization_memory = +[](void *data, uint64_t address,
+                                            std::span<uint32_t> out) {
+            ++*static_cast<uint32_t *>(data);
+            std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+            return true;
+          }};
+    };
+    for (const uint32_t value : {0x77777777u, 0x88888888u}) {
+      child[2] = value;
+      ResourceSnapshot compiled_snapshot;
+      ResourceSnapshot interpreted_snapshot;
+      ResourceSpecialization specialization;
+      strict_reads = 0;
+      Check(MaterializeResources(interpreted, runtime(user_data), interpreted_snapshot,
+                                 specialization),
+            "interpreted descriptor plan failed");
+      const auto interpreted_strict = strict_reads;
+      strict_reads = 0;
+      Check(MaterializeResources(plan, runtime(user_data), compiled_snapshot, specialization),
+            "compiled descriptor plan failed");
+      Check(compiled_snapshot.buffers.size() == 5 &&
+                compiled_snapshot.buffers[3].dwords[0] == constants[0] &&
+                compiled_snapshot.buffers[3].dwords[1] == constants[1] &&
+                compiled_snapshot.buffers[4].dwords[0] == constants[2] &&
+                compiled_snapshot.buffers[4].dwords[1] == constants[3] &&
+                compiled_snapshot.buffers[0].dwords ==
+                    std::array<uint32_t, 8>{root[2], value, 0x40u, user_data[2]} &&
+                compiled_snapshot.buffers[1].dwords[0] == root[4] &&
+                compiled_snapshot.buffers[2].dwords[0] == root[5] + 1u &&
+                compiled_snapshot.buffers == interpreted_snapshot.buffers,
+            "compiled descriptor lost a DWORD, its order or a current value");
+      Check(compiled_snapshot.specialization_reads == interpreted_snapshot.specialization_reads &&
+                strict_reads == interpreted_strict,
+            "compiled descriptor changed the captured reads or the strict reader policy");
+    }
+    {
+      // The walker memo keeps the value a compiled slot read, and a descriptor reads it there.
+      const auto direct = runtime(user_data);
+      SrtWalker clean_walker(plan, CleanRuntime(direct));
+      SrtWalker walker(plan, direct, &clean_walker);
+      std::vector<uint32_t> flat;
+      Check(walker.RefreshFlatBuffer(flat), "compiled descriptor plan refresh failed");
+      const auto loaded = root[2];
+      root[2] ^= 0xffffffffu;
+      DescriptorValue descriptor;
+      Check(walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == loaded &&
+                descriptor.dword_count == 4,
+            "compiled descriptor reloaded a value already read by its walker");
+      root[2] = loaded;
+    }
+    // A constant-buffer DWORD outside records bytes, or stride * records bytes, reads as zero.
+    for (const auto [source, entry_index, stride, records, fits] :
+         {std::tuple{4u, 0u, 0u, 8u, true}, std::tuple{4u, 0u, 0u, 7u, false},
+          std::tuple{4u, 0u, 0u, 2u, false},
+          std::tuple{4u, 0u, 4u, 2u, true}, std::tuple{4u, 0u, 4u, 1u, false},
+          std::tuple{4u, 0u, 0x3fffu, 1u, true}, std::tuple{5u, 2u, 0u, 24u, true},
+          std::tuple{5u, 2u, 0u, 23u, false}, std::tuple{5u, 2u, 2u, 12u, true},
+          std::tuple{5u, 0x20000002u, 0u, 24u, true}, std::tuple{5u, 3u, 0u, 24u, false}}) {
+      root[7] = static_cast<uint32_t>(constants_address >> 32u) | (stride << 16u);
+      root[8] = records;
+      root[10] = entry_index;
+      DescriptorValue compiled_value;
+      DescriptorValue interpreted_value;
+      Check(SrtWalker(plan, runtime(user_data)).EvaluateDescriptor(source, compiled_value) &&
+                SrtWalker(interpreted, runtime(user_data))
+                    .EvaluateDescriptor(source, interpreted_value) &&
+                compiled_value.dwords[1] ==
+                    (fits ? constants[source == 4u ? 1u : (entry_index * 2u + 1u) % 8u] : 0u) &&
+                compiled_value == interpreted_value,
+            "compiled constant-buffer read changed its bounds, stride or index");
+    }
+    root[7] = static_cast<uint32_t>(constants_address >> 32u);
+    root[8] = 24u;
+    root[10] = 1u;
+    {
+      // The user-data word is past truncated user data in both evaluators.
+      const auto truncated = runtime(std::span(user_data).first(2));
+      DescriptorValue compiled_value;
+      DescriptorValue interpreted_value;
+      Check(!SrtWalker(plan, truncated).EvaluateDescriptor(0, compiled_value) &&
+                !SrtWalker(interpreted, truncated).EvaluateDescriptor(0, interpreted_value),
+            "compiled descriptor accepted truncated user data");
+    }
+    uint32_t callbacks = 0;
+    const SrtRuntime callback_runtime{
+        .user_data = user_data,
+        .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> out) {
+          ++*static_cast<uint32_t *>(data);
+          std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+          return true;
+        },
+        .userdata = &callbacks};
+    DescriptorValue descriptor;
+    Check(SrtWalker(plan, callback_runtime).EvaluateDescriptor(0, descriptor) &&
+              callbacks == 4u && descriptor.dwords[1] == child[2],
+          "compiled descriptor bypassed a memory callback");
+    for (const int32_t offset : {-0x100, 0x7ffffff0}) {
+      program.memory_info[0].offset = static_cast<uint32_t>(offset);
+      auto bounded = ExtractResourcePlan(program);
+      auto reference = ExtractResourcePlan(program);
+      reference.srt_read_table.reset();
+      const std::array<uint32_t, 3> edge = offset < 0
+                                               ? std::array<uint32_t, 3>{0x80u, 0u, 0u}
+                                               : std::array<uint32_t, 3>{0xfffffff0u, 0xffffu, 0u};
+      DescriptorValue bounded_value;
+      DescriptorValue reference_value;
+      Check(bounded.srt_descriptor_entries[0] != UINT32_MAX &&
+                !SrtWalker(bounded, runtime(edge)).EvaluateDescriptor(0, bounded_value) &&
+                !SrtWalker(reference, runtime(edge)).EvaluateDescriptor(0, reference_value),
+            "compiled descriptor accepted address underflow or 48-bit overflow");
+    }
+    program.memory_info[0].offset = 0;
+  }
+}
+
+// Compiled reads run from one table: one read per memoized read, after the reads of its words,
+// and descriptor DWORDs as immediates, user data or reads. Every outcome matches the walker's.
+void TestCompiledSrtReadTable() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  using Table = ResourcePlan::SrtReadTable;
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address) | 1u,
+                                  static_cast<uint32_t>(address >> 32u) | 0x55550000u};
+  };
+  std::array<uint32_t, 4> child{0u, 0x11111111u, 0x22222222u, 0x33333333u};
+  std::array<uint32_t, 16> constants{};
+  for (uint32_t i = 0; i < constants.size(); ++i) constants[i] = 0xc0000000u | i;
+  const auto child_words = pointer_words(child.data());
+  const auto constants_address = reinterpret_cast<uint64_t>(constants.data());
+  // Child pointer, a constant-buffer V# (base, stride, records, word 3), an index, a branch.
+  std::array<uint32_t, 8> root{child_words[0], child_words[1],
+                               static_cast<uint32_t>(constants_address),
+                               static_cast<uint32_t>(constants_address >> 32u), 64u, 0x12345678u,
+                               1u, 1u};
+  const auto root_words = pointer_words(root.data());
+  const std::array<uint32_t, 3> user_data{root_words[0], root_words[1], 0x0fa0u};
+
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &entry = AddValueBlock(program);
+  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                {emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+                                 emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto load = [&](Value handle, uint32_t offset) {
+    const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                            {handle, Value(offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    return value;
+  };
+  const auto child_handle = emit(entry, ValueOpcode::GetAddressResource,
+                                 {load(root_handle, 0u), load(root_handle, 4u)});
+  const auto buffer_handle =
+      emit(entry, ValueOpcode::GetBufferResource,
+           {load(root_handle, 8u), load(root_handle, 12u), load(root_handle, 16u),
+            load(root_handle, 20u)});
+  const auto index = load(root_handle, 24u);
+  const auto constant = [&](Value offset, uint32_t immediate) {
+    program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .offset = immediate});
+    const auto value = emit(entry, ValueOpcode::ReadConstBuffer, {buffer_handle, offset});
+    value.Instruction()->SetFlags(
+        MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+    return value;
+  };
+  const auto shared = load(child_handle, 4u);
+  const std::array slot_values{shared, load(child_handle, 8u),
+                               constant(emit(entry, ValueOpcode::ShiftLeftLogical32,
+                                             {index, Value(1u)}),
+                                        0u),
+                               constant(Value(12u), 0u)};
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  for (uint32_t slot = 0; slot < slot_values.size(); ++slot) {
+    emit(entry, ValueOpcode::ReadConst, {srt, Value(slot)});
+    program.srt_reads.push_back({slot_values[slot], 3u - slot});
+  }
+  DescriptorSource descriptor;
+  descriptor.dwords = {Value(0x40u), emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(6))}),
+                       shared,
+                       constant(emit(entry, ValueOpcode::ShiftLeftLogical32, {index, Value(3u)}),
+                                4u)};
+  descriptor.dword_count = 4;
+  program.descriptor_sources.push_back(descriptor);
+  program.info.buffers.push_back({.source = 0});
+  entry.condition = emit(entry, ValueOpcode::INotEqual32, {load(root_handle, 28u), Value(0u)});
+  AddValueBlock(program);
+  AddValueBlock(program);
+  entry.terminator.kind = TerminatorKind::ConditionalBranch;
+  entry.terminator.true_block = program.blocks[1];
+  entry.terminator.false_block = program.blocks[2];
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+
+  auto plan = ExtractResourcePlan(program);
+  // Child pointer (2), child DWORDs (2), V# (4), index (1), constant-buffer DWORDs (3).
+  Check(plan.srt_code == nullptr && plan.srt_read_table != nullptr &&
+            plan.srt_read_table->reads.size() == 12u &&
+            plan.srt_read_addresses.size() == 12u &&
+            std::ranges::none_of(plan.srt_read_entries,
+                                 [](uint32_t read) { return read == UINT32_MAX; }) &&
+            plan.srt_descriptor_entries == std::vector<uint32_t>{0u},
+        "SRT read table lost a shared read or an entry");
+  const auto &table = *plan.srt_read_table;
+  for (uint32_t read = 0; read < table.reads.size(); ++read) {
+    const auto &entry_read = table.reads[read];
+    const auto earlier = [&](uint32_t word) { return (word & Table::UserData) != 0u || word < read; };
+    Check(std::ranges::all_of(std::span(entry_read.words).first(entry_read.buffer ? 4u : 2u),
+                              earlier) &&
+              (!entry_read.buffer || entry_read.shift == 0u || earlier(entry_read.offset)),
+          "SRT read table runs a read before the reads of its words");
+  }
+  Check(table.words.size() == 5u && table.words[0] == Table::Immediate && table.words[1] == 0x40u &&
+            table.words[2] == (Table::UserData | 2u) &&
+            table.words[3] == plan.srt_read_entries[0] && table.words[4] < table.reads.size() &&
+            table.reads[table.words[4]].buffer && table.reads[table.words[4]].shift == 4u &&
+            table.reads[table.words[4]].relative == 4,
+        "SRT read table changed the descriptor DWORDs");
+
+  auto interpreted = ExtractResourcePlan(program);
+  interpreted.srt_read_table.reset();
+  const auto runtime = [](std::span<const uint32_t> words) {
+    return SrtRuntime{
+        .user_data = words,
+        .read_specialization_memory = +[](void *, uint64_t address, std::span<uint32_t> out) {
+          std::memcpy(out.data(), reinterpret_cast<const void *>(address), out.size_bytes());
+          return true;
+        }};
+  };
+  uint32_t checked = 0;
+  uint32_t failed = 0;
+  for (const uint32_t length : {3u, 2u, 1u}) {
+    for (const uint32_t stride : {0u, 4u, 0x3fffu}) {
+      for (const uint32_t records : {0u, 3u, 4u, 16u, 28u, 64u}) {
+        for (const uint32_t entry_index : {0u, 1u, 5u, 6u, 0x40000001u}) {
+          for (const uint32_t branch : {0u, 1u}) {
+            root[3] = static_cast<uint32_t>(constants_address >> 32u) | (stride << 16u);
+            root[4] = records;
+            root[6] = entry_index;
+            root[7] = branch;
+            child[1] = 0x11110000u | checked;
+            ResourceSnapshot compiled_snapshot;
+            ResourceSnapshot interpreted_snapshot;
+            ResourceSpecialization specialization;
+            const auto words = std::span(user_data).first(length);
+            const bool compiled_ok =
+                MaterializeResources(plan, runtime(words), compiled_snapshot, specialization);
+            const bool interpreted_ok = MaterializeResources(interpreted, runtime(words),
+                                                             interpreted_snapshot, specialization);
+            Check(compiled_ok == interpreted_ok &&
+                      (!compiled_ok ||
+                       (compiled_snapshot.flattened_srt == interpreted_snapshot.flattened_srt &&
+                        compiled_snapshot.buffers == interpreted_snapshot.buffers &&
+                        compiled_snapshot.specialization_reads ==
+                            interpreted_snapshot.specialization_reads)),
+                  "SRT read table changed a value, a failure or the captured reads");
+            ++checked;
+            failed += compiled_ok ? 0u : 1u;
+          }
+        }
+      }
+    }
+  }
+  Check(failed != 0u && failed != checked, "SRT read table sweep missed successes or failures");
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtProgram(0x10000);
@@ -1523,6 +1927,8 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestCompiledSrtReadsFollowBlocks();
+  TestCompiledSrtDescriptorReads();
+  TestCompiledSrtReadTable();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();

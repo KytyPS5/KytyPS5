@@ -193,6 +193,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool FunctionTableCallsEnabled() {
+	return g_config->function_table_calls;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

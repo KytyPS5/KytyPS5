@@ -24,6 +24,11 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
+	// Experimental: link S_SWAPPC calls whose target is read from a function table at an entry
+	// selected by GPU data. Off by default because such callees may read descriptors through
+	// pointers that are also selected by GPU data, which resource tracking cannot plan yet.
+	// Set from Config::FunctionTableCallsEnabled() (--function-table-calls / launcher option).
+	bool                        function_table_calls       = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
@@ -48,15 +53,28 @@ struct CompileResult {
 struct ShaderSource {
 	struct Call {
 		uint32_t instruction;
-		std::array<IR::Value, 2> target;
+		// One candidate per definition reaching the call; all must evaluate to the same address.
+		std::array<std::vector<IR::Value>, 2> target;
 		std::bitset<128> preserved_registers;
 		uint64_t address = 0;
+		// A call through a function table in a GPU buffer: the target pair is read at a
+		// lane-selected entry (e.g. a waterfall loop over a per-thread index). Every
+		// distinct entry is linked, and a compare chain on the target pair picks the callee.
+		struct Table {
+			std::array<IR::Value, 4> descriptor;     // V# dwords of the table buffer
+			uint32_t                 stride     = 0; // bytes between entries
+			uint32_t                 low_offset = 0; // byte offset of the target's low word
+		};
+		std::optional<Table> table;
+		std::vector<uint64_t> table_targets; // distinct raw (unaligned) targets, last refresh
 	};
 	struct Linked {
 		struct Function { uint32_t offset; uint32_t size; };
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
-		std::vector<Function> functions;
+		std::vector<Function> functions;      // one per entry of callees
+		std::vector<uint64_t> callees;        // aligned addresses in link order
+		std::vector<std::vector<uint64_t>> tables; // table_targets per call site at link time
 		std::vector<uint32_t> observed_function;
 	};
 	std::vector<uint32_t> code;

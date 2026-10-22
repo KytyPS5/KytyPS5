@@ -41,6 +41,8 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Linked leaf bodies produce very deep IR value graphs; translate and compile them on a large stack.
+constexpr size_t LinkedShaderStackBytes = size_t {256} << 20u;
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
@@ -405,6 +407,7 @@ struct PipelineCache::ProgramCache {
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+		options.function_table_calls = Config::FunctionTableCallsEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 
@@ -434,7 +437,16 @@ struct PipelineCache::ProgramCache {
 		if (current != nullptr) {
 			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				// The callback is a plain function pointer, so everything it needs goes through `job`.
+				struct Job {
+					const ShaderRecompiler::ShaderSource*    source;
+					const ShaderRecompiler::CompileOptions* options;
+					ShaderRecompiler::TranslateResult*      result;
+				} job {current, &options, &translated};
+				Common::RunWithStack(LinkedShaderStackBytes, [](void* arg) {
+					auto& job = *static_cast<Job*>(arg);
+					*job.result = ShaderRecompiler::TranslateProgram(job.source->linked->decoded, *job.options);
+				}, &job);
 				translated.program.source_reads = current->reads;
 			} else {
 				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
@@ -457,9 +469,27 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.FunctionCode()));
+		// Later passes and SPIR-V emission walk the same deep graphs, so compile on the large stack too.
+		if (entry->second.call_source != nullptr) {
+			struct Job {
+				ProgramCache* self;
+				const char* stage_name;
+				const ShaderRecompiler::CompileOptions* options;
+				ShaderRecompiler::TranslateResult* translated;
+				decltype(entry) entry;
+				uint32_t* cursor;
+			} job {this, stage_name, &options, &translated, entry, &push_data_cursor};
+			Common::RunWithStack(LinkedShaderStackBytes, [](void* arg) {
+				auto& job = *static_cast<Job*>(arg);
+				job.entry->second.permutations.push_back(job.self->CompilePermutation(
+				    job.stage_name, *job.options, std::move(*job.translated), job.entry->second.specialization,
+				    *job.cursor, job.entry->second.FunctionCode()));
+			}, &job);
+		} else {
+			entry->second.permutations.push_back(CompilePermutation(
+			    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+			    entry->second.FunctionCode()));
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);

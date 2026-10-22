@@ -10828,6 +10828,95 @@ void TestGraphicsComputeGetreg() {
 #endif
 }
 
+// A function table read at a lane-selected entry (a waterfall over a per-lane index):
+// every distinct entry is linked and a compare chain on the target pair selects the callee.
+void TestFunctionTableLeafCall() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0080000ull;
+  constexpr uint64_t callee_a = base + 0x100, callee_b = base + 0x140;
+  // v_readfirstlane_b32 s4, v0 ; s_lshl_b32 s4, s4, 4
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+    uint64_t end = base + 0x14c;
+  } memory;
+  const auto set_entry = [&](uint32_t entry, uint64_t target) {
+    memory.words[entry * 4u] = static_cast<uint32_t>(target);
+    memory.words[entry * 4u + 1u] = static_cast<uint32_t>(target >> 32u);
+  };
+  set_entry(0, callee_a);
+  set_entry(1, callee_b | 1u); // SWAPPC ignores the low two bits; the chain compares the raw pair.
+  set_entry(2, callee_a);      // duplicate
+  set_entry(3, 0);             // empty slot
+  // Each callee: s_mov_b32 s5, literal ; s_setpc_b64 s[14:15] (NULL-destination SWAPPC).
+  memory.words[0x40] = EncodeSMovB32(5, 255);
+  memory.words[0x41] = 0x11111111u;
+  memory.words[0x42] = EncodeSop1(0x21, 125, 14);
+  memory.words[0x50] = EncodeSMovB32(5, 255);
+  memory.words[0x51] = 0x22222222u;
+  memory.words[0x52] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (address < base || address > m.end || out.size_bytes() > m.end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u); // stride 0: records are bytes
+  user_data[2] = 64;                                 // four 16-byte entries
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == UINT32_MAX && source.calls.size() == 1 &&
+            source.calls[0].table && source.calls[0].table->stride == 16 &&
+            source.calls[0].table->low_offset == 0,
+        "lane-selected function table was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 &&
+            source.calls[0].table_targets == std::vector<uint64_t>{callee_a, callee_b | 1u} &&
+            source.linked->callees == std::vector<uint64_t>{callee_a, callee_b},
+        "function table entries were not deduplicated into callees");
+  const auto& native = linked.instructions[source.calls[0].instruction];
+  Check(native.opcode == Decoder::Opcode::S_BRANCH && native.branch_target == 24u,
+        "native table call did not jump to the dispatcher");
+  uint32_t calls = 0;
+  for (const auto& inst : linked.instructions) {
+    if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+    ++calls;
+    const auto body = std::ranges::find(linked.instructions, inst.branch_target, &Decoder::Instruction::pc);
+    Check(body != linked.instructions.end() && body->opcode == Decoder::Opcode::S_MOV_B32,
+          "dispatcher call does not reach a callee body");
+    const auto ret = std::find_if(body, linked.instructions.end(), [](const auto& i) {
+      return i.opcode == Decoder::Opcode::S_BRANCH;
+    });
+    Check(ret != linked.instructions.end() && ret->branch_target == inst.pc + 4u,
+          "callee body does not return to its dispatcher entry");
+  }
+  Check(calls == 2, "dispatcher did not link one call per distinct target");
+  Check(std::ranges::is_sorted(linked.instructions, {}, &Decoder::Instruction::pc),
+        "linked instructions are not in pc order");
+  (void)TranslateProgram(linked, options);
+
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "unchanged function table relinked");
+  set_entry(1, callee_a);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->callees == std::vector<uint64_t>{callee_a},
+        "changed function table kept stale callees");
+  memory.words[0x41] = 0x33333333u;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 3, "changed callee code kept stale source");
+}
+
 void TestMemoryFedScalarLeafCall() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -16862,6 +16951,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestFunctionTableLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

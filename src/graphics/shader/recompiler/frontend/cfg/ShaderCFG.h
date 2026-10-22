@@ -113,9 +113,14 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, std::vector<uint32_t>& crossed_calls);
+// Vector instructions with a scalar lane-mask destination (compares, carries) write a register
+// pair only in wave64; pass wave64 = false for a wave32 program. The default is conservative.
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, bool wave64 = true);
+// Returns every instruction index whose write to `code` reaches `before`, sorted and unique.
+// UINT32_MAX stands for the shader entry (the register is still holding its user-data value).
+std::vector<uint32_t> FindScalarDefinitions(const Decoder::Program& program, const Graph& graph,
+                                            uint32_t before, uint32_t code,
+                                            std::vector<uint32_t>& crossed_calls, bool wave64 = true);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

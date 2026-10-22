@@ -1330,7 +1330,13 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 			pending->fetch_sub(1, std::memory_order_acq_rel);
 		}
 	});
-	GetScheduler().Flush();
+	// Submit at once only when this label put new readbacks in flight, so they start promptly.
+	// A label that only waits behind earlier ones lands with the current command buffer, which
+	// the command processor submits when it finishes or suspends the submission. Submitting for
+	// every such label split a frame into dozens of queue submissions.
+	if (queued) {
+		GetScheduler().Flush();
+	}
 	return true;
 }
 

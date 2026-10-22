@@ -49556,9 +49556,10 @@ void CheckPm4DeferredLabelWait(RenderContext &renderer) {
     // Pretend an earlier label is still waiting on a readback, so this one is deferred too.
     auto &behind = CommandProcessorTestAccess::LabelsBehindReadbacks(processor);
     behind.fetch_add(1);
+    const auto tick = scheduler.CurrentTick();
     Pm4Execution release_execution;
     deferred = processor.Process(release_execution, release) == Pm4ProcessResult::Complete &&
-               label == 0;
+               label == 0 && scheduler.CurrentTick() == tick;
 
     auto wait = make_wait(0x55u);
     Pm4Execution wait_execution;
@@ -49572,7 +49573,8 @@ void CheckPm4DeferredLabelWait(RenderContext &renderer) {
     behind.fetch_sub(1);
   });
   Require(name, "deferred", deferred,
-          "a label behind a readback was written at once");
+          "a label behind a readback was written at once, or one that queued no readback "
+          "submitted GPU work");
   Require(name, "wait on deferred label", passed,
           "a command-stream wait did not pass on the value of a deferred label");
   Require(name, "other value", other_blocked,

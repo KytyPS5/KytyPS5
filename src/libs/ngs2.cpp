@@ -2687,8 +2687,8 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			// the module states past the sampler state read as zero.
 			EXIT_NOT_IMPLEMENTED(state_size < sizeof(Ngs2CustomSamplerVoiceState));
 			if (state_size != configured_size) {
-				static int reported = 0;
-				if (reported++ < 4) {
+				static std::atomic<int> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
 					LOGF("\t warning: custom sampler state_size = 0x%016" PRIx64
 					     ", rack state_size = 0x%016" PRIx64 "\n",
 					     static_cast<uint64_t>(state_size), static_cast<uint64_t>(configured_size));

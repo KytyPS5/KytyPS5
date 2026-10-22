@@ -27,6 +27,8 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// Staging offset alignment for BDA buffer copies, the same as ordinary buffer uploads use.
+constexpr uint64_t StagingCopyAlignment = 4;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -733,20 +735,159 @@ RangeSet BufferCache::TakeBdaSync() {
 	return std::exchange(m_bda_sync, {});
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
+void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	// Take the queue before walking so writes queued during synchronization stay pending.
+	const auto pending = TakeBdaSync();
+
+	// Only walk ranges inside buffers since tracking state exists for those (a mapped range
+	// can be huge). A draw can find a few hundred dirty buffers, so their copies are collected
+	// first and then uploaded through a single staging allocation, between one pair of barriers,
+	// instead of an allocation and two whole-buffer barriers per buffer.
+	m_bda_upload.Clear();
+	pending.ForEach([&](uint64_t begin, uint64_t end) {
+		// Queued pages that are no longer mapped have nothing to upload.
+		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+			CollectBdaCopies(start, finish);
+		});
+	});
+
+	FlushBdaCopies();
+}
+
+// Uploads everything in m_bda_upload, if anything, and empties it.
+void BufferCache::FlushBdaCopies() {
+	// Nothing left to upload. Skip the staging allocation and the barriers.
+	if (m_bda_upload.batches.empty()) {
+		return;
+	}
+	UploadBdaCopies();
+	m_bda_upload.Clear();
+}
+
+// Adds the CPU-modified pages to m_bda_upload for every buffer overlapping [begin, end).
+void BufferCache::CollectBdaCopies(uint64_t begin, uint64_t end) {
+	// Start from the last buffer that starts at or before `begin` as it may overlap.
+	auto it = m_buffers.upper_bound(begin);
+
 	if (it != m_buffers.begin()) {
 		--it;
 	}
+
 	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+		auto&      buffer        = m_slot_buffers[it->second];
+		const auto overlap_begin = std::max(buffer.CpuAddress(), begin);
+		const auto overlap_end   = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		// That first buffer may end before `begin`.
+		if (overlap_begin >= overlap_end) {
+			continue;
+		}
+		CollectBdaBufferCopies(buffer, overlap_begin, overlap_end);
+	}
+}
+
+// Adds the CPU-modified pages of the provided `buffer` in [begin, end) to m_bda_upload.
+void BufferCache::CollectBdaBufferCopies(Buffer& buffer, uint64_t begin, uint64_t end) {
+	// Past the staging ring's size, UploadMemory makes a one-off host allocation of the whole
+	// upload. So if this range could push the upload past it, upload what was collected so far
+	// first. The range size is an upper bound on what this buffer adds.
+	if (m_bda_upload.size + (end - begin) > m_staging_buffer.Size()) {
+		FlushBdaCopies();
+	}
+	auto&      upload = m_bda_upload;
+	const auto first  = upload.copies.size();
+
+	// Most queued pages were uploaded by an ordinary binding after they were queued. The tracker
+	// only reports the runs of pages that are still CPU-modified, and marks them clean and
+	// write-protected as it reports them. Each run goes into the staging allocation after the
+	// previous one.
+	const auto add_copy = [&](uint64_t address, uint64_t size) noexcept {
+		upload.copies.emplace_back(upload.size, buffer.Offset(address), size);
+		upload.sources.push_back(address);
+		upload.size += size;
+	};
+	m_memory_tracker.ForEachUploadRange(begin, end - begin, false, add_copy, []() noexcept {});
+
+	const auto added = upload.copies.size() - first;
+	// An ordinary binding already uploaded every page queued here.
+	if (added == 0) {
+		return;
+	}
+
+	// Copies into the same buffer that directly follow the previous batch are joined to it and
+	// share one copy command.
+	if (!upload.batches.empty()) {
+		auto& last = upload.batches.back();
+		if (last.buffer == &buffer && last.first + last.count == first) {
+			last.count += added;
+			return;
 		}
 	}
+	upload.batches.push_back({&buffer, first, added});
+}
+
+// Uploads everything in m_bda_upload through one staging allocation.
+void BufferCache::UploadBdaCopies() {
+	auto& upload = m_bda_upload;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, upload.size);
+
+	// Read each run from guest memory into its place in the staging allocation. The pages were
+	// write-protected while they were collected, so a write racing with this read faults and
+	// queues its page for the next synchronization.
+	const auto fill_staging = [&](uint8_t* staging_memory, uint64_t staging_offset) {
+		for (size_t i = 0; i < upload.copies.size(); ++i) {
+			auto& copy = upload.copies[i];
+			if (!LibKernel::Memory::CopySparseMemory(upload.sources[i],
+			                                         staging_memory + copy.srcOffset, copy.size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
+			// Offsets so far count from the start of this upload whereas the copy command needs
+			// them from the start of the staging buffer.
+			copy.srcOffset += staging_offset;
+		}
+	};
+	const auto staging =
+	    UploadMemory(m_graphics, m_scheduler, m_staging_buffer, upload.size, StagingCopyAlignment,
+	                 vk::BufferUsageFlagBits::eTransferSrc, fill_staging)
+	        .first->Handle();
+	RecordBdaCopies(staging);
+}
+
+// Records the copies in m_bda_upload from `staging`, between one pair of global barriers.
+void BufferCache::RecordBdaCopies(vk::Buffer staging) {
+	const auto& upload = m_bda_upload;
+	// Copies cannot be recorded inside a render pass.
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+
+	// Earlier GPU work may still read or write these buffers. Let it finish before the copies.
+	vk::MemoryBarrier before_copies {};
+	vk::AccessFlags   source_access_mask =
+	    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+
+	before_copies.srcAccessMask = source_access_mask;
+	before_copies.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       1, &before_copies, 0, nullptr, 0, nullptr);
+
+	for (const auto& batch: upload.batches) {
+		uint32_t              batch_count = static_cast<uint32_t>(batch.count);
+		const vk::BufferCopy* buffer_copy = upload.copies.data() + batch.first;
+
+		native.copyBuffer(staging, batch.buffer->Handle(), batch_count, buffer_copy);
+	}
+
+	// Make the new data visible to everything that runs after the copies.
+	vk::MemoryBarrier after_copies {};
+	after_copies.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after_copies.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+
+	native.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	    vk::DependencyFlagBits::eByRegion, 1, &after_copies, 0, nullptr, 0, nullptr);
 }
 
 } // namespace Libs::Graphics

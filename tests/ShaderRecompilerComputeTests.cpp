@@ -5861,6 +5861,93 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Dirties pages in two separate buffers and checks that one BDA synchronization uploads each
+  // page into the right buffer at the right offset, including two separate runs in one buffer.
+  // It checks the uploaded data, not how many staging allocations were used.
+  void CheckBdaSyncBatchesBuffers() {
+    constexpr const char *name = "BdaSyncBatchesBuffers";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr auto tracker_page = TRACKER_PAGE_SIZE;
+    EnsureRuntimeContext();
+    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, 4 * page, Common::VirtualMemory::Mode::ReadWrite, "bda_sync_batches");
+    Require(name, "allocation", base != 0, "guest allocation failed");
+    auto *words = reinterpret_cast<u32 *>(base);
+    std::fill_n(words, 4 * page / sizeof(u32), 0x11111111u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, 4 * page);
+    // Two buffers with a gap, so one synchronization has to upload into both.
+    const auto first_id = cache.FindBuffer(base, page);
+    const auto second_id = cache.FindBuffer(base + 2 * page, 2 * page);
+    Require(name, "separate buffers",
+            first_id != second_id &&
+                cache.GetBuffer(first_id).CpuAddress() == base &&
+                cache.GetBuffer(second_id).CpuAddress() == base + 2 * page,
+            "the test buffers were merged");
+    context.PrepareBda();
+    Require(name, "initial upload",
+            !cache.IsRegionCpuModified(base, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, 2 * page),
+            "registration did not upload both buffers");
+
+    // Dirty one page of the first buffer and two separated pages of the second.
+    const uint64_t dirty[] = {base + tracker_page, base + 2 * page,
+                              base + 4 * page - tracker_page};
+    u32 value = 0x22222222u;
+    for (const auto address : dirty) {
+      cache.InvalidateMemory(address + 4, 1);
+      std::fill_n(reinterpret_cast<u32 *>(address), tracker_page / sizeof(u32), value);
+      value += 0x11111111u;
+    }
+    context.PrepareBda();
+    Require(name, "consumed",
+            !cache.IsRegionCpuModified(base, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, 2 * page),
+            "BDA synchronization left a dirty page in one of the buffers");
+
+    auto readback = CreateHostBuffer(name, 8 * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    // Records a copy of the word at `address` in buffer `id` into readback slot `index`.
+    const auto snapshot = [&](BufferId id, uint64_t address, uint32_t index) {
+      auto &buffer = cache.GetBuffer(id);
+      const vk::BufferCopy copy{buffer.Offset(address), index * sizeof(u32), sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+    };
+    snapshot(first_id, base, 0);
+    snapshot(first_id, dirty[0], 1);
+    snapshot(first_id, dirty[0] + tracker_page - sizeof(u32), 2);
+    snapshot(second_id, dirty[1], 3);
+    snapshot(second_id, dirty[1] + tracker_page, 4);
+    snapshot(second_id, dirty[2], 5);
+    snapshot(second_id, dirty[2] + tracker_page - sizeof(u32), 6);
+    snapshot(second_id, base + 3 * page, 7);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "GPU contents", ReadBuffer(name, readback, 8) ==
+        std::vector<u32>{0x11111111u, 0x22222222u, 0x22222222u, 0x33333333u,
+                        0x11111111u, 0x44444444u, 0x44444444u, 0x11111111u},
+        "a batched upload landed in the wrong buffer or at the wrong offset");
+    context.UnmapMemory(base, 4 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 4 * page),
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -52248,6 +52335,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckBdaSyncBatchesBuffers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -52484,6 +52572,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckBdaSyncBatchesBuffers();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

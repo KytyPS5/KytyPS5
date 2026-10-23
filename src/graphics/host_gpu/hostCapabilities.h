@@ -55,6 +55,13 @@ struct HostCapabilities {
 	// An indirect draw can start at an instance other than 0 (drawIndirectFirstInstance). Without
 	// it, the host GPU reads the arguments only of draws whose first instance it zeroes.
 	bool draw_indirect_first_instance = false;
+	// The host's 32-bit float min and max are the guest's own instructions: an AMD GPU whose
+	// shaders an AMD compiler translates (RADV's ACO, AMDVLK, AMD's driver), keeping signed zeros
+	// and NaNs. GLSL NMin/NMax then give the guest's results (the other source for a NaN, -0
+	// below +0) in one instruction, where elsewhere they take compares and selects. A fact of
+	// the vendor's hardware and compiler, which no Vulkan feature reports. Not in Full(): the
+	// expected translations are those for any device.
+	bool guest_float_min_max = false;
 	// Stages that may use subgroup operations: VkPhysicalDeviceVulkan11Properties::
 	// subgroupSupportedStages, as VkShaderStageFlagBits values.
 	uint32_t subgroup_supported_stages = 0;

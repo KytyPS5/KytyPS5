@@ -737,6 +737,7 @@ struct PipelineCache::ProgramCache {
 		    c.block_texel_view,
 		    c.maintenance8,
 		    c.draw_indirect_first_instance,
+		    c.guest_float_min_max,
 		    c.subgroup_supported_stages,
 		    c.subgroup_supported_operations,
 		    c.max_stage_samplers,

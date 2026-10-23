@@ -132,7 +132,7 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	enable(flags.bank_mask, 2u);
 	enable(flags.row_mask, 4u);
 	// Only row shifts (0x101-0x10f, 0x111-0x11f) can vacate a lane; other controls always read one.
-	const bool row_shift = !flags.dpp8 && flags.control > 0x100u && flags.control < 0x120u &&
+	const bool row_shift = flags.control > 0x100u && flags.control < 0x120u &&
 	                       flags.control != 0x110u;
 	if (!flags.bound_control && row_shift) {
 		writable = Binary(state, spv::OpLogicalAnd, TypeBool(state), writable,

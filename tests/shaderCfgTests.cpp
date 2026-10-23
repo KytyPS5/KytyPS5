@@ -7045,6 +7045,17 @@ void TestPixelAncillaryLayerInput() {
     CheckSpirvBinaryValidates(wqm_result.spirv);
   }
 
+  uint32_t dpp[] = {
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
+      EncodeVop1(0x01, 5, 250), EncodeVop1Dpp(6) | (1u << 19u), // Bound-zero DPP overwrite.
+      EncodeExp0(0x00, 0x1), EncodeExp1(5, 0, 0, 0), EncodeSopp(0x01),
+  };
+  auto dpp_result = RecompileForTest(dpp, options);
+  Check(ProgramHasInput(dpp_result.program, StageInputKind::Layer) &&
+            !ProgramHasInput(dpp_result.program, StageInputKind::PackedAncillary),
+        "DPP write retained the old ancillary register value");
+  CheckSpirvBinaryValidates(dpp_result.spirv);
+
   const uint32_t loop[] = {
       EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
       EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
@@ -7098,6 +7109,9 @@ void TestPixelAncillaryLayerInput() {
   shader[5] = EncodeExp1(6, 7, 5, 0);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "direct raw ancillary export was silently replaced after field lowering");
+  dpp[3] = EncodeVop1Dpp(6); // Without BOUND_CTRL, lanes with inactive sources keep the value.
+  ExpectFatal([&] { (void)RecompileForTest(dpp, options); },
+              "DPP write without BOUND_CTRL silently replaced the ancillary value");
 #endif
 }
 

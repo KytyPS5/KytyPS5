@@ -836,6 +836,139 @@ void TestPitchClamps() {
 	      "pitch was not clamped to four times playback speed");
 }
 
+Ngs2ReverbI3dl2Param ReverbParam(float decay, int32_t reflections, int32_t reverb, float dry = 0.0f) {
+	Ngs2ReverbI3dl2Param param {};
+	param.wet               = 1.0f;
+	param.dry               = dry;
+	param.room              = 0;
+	param.room_hf           = 0;
+	param.decay_time        = decay;
+	param.decay_hf_ratio    = 1.0f;
+	param.reflections       = reflections;
+	param.reflections_delay = 0.0f;
+	param.reverb            = reverb;
+	param.reverb_delay      = 0.0f;
+	param.diffusion         = 100.0f;
+	param.density           = 100.0f;
+	param.hf_reference      = 5000.0f;
+	return param;
+}
+
+double WindowRms(const std::vector<float>& signal, double from, double to) {
+	const auto begin = static_cast<size_t>(from * 48000), end = static_cast<size_t>(to * 48000);
+	double     sum   = 0;
+	for (size_t i = begin; i < end; ++i) {
+		sum += double(signal[i]) * signal[i];
+	}
+	return std::sqrt(sum / double(end - begin));
+}
+
+// The custom reverb module (0x1b): late reverb decays by 60 dB over decayTime, the tail ends
+// cleanly, muted I3DL2 levels give silence, and dry passes the input through.
+void TestCustomReverbDsp() {
+	constexpr uint32_t grain = 256, channels = 2;
+	Ngs2Reverb         reverb;
+	reverb.Configure(ReverbParam(1.0f, -10000, 0), 48000);
+	std::vector<float> left;
+	std::vector<float> block(size_t(grain) * channels);
+	for (uint32_t b = 0; b < 48000 * 2 / grain; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 0) {
+			block[0] = block[grain] = 1.0f; // impulse on both channels
+		}
+		reverb.Process(block.data(), channels, grain);
+		left.insert(left.end(), block.begin(), block.begin() + grain);
+	}
+	const double early = WindowRms(left, 0.10, 0.15), late = WindowRms(left, 0.40, 0.45);
+	Check(early > 0, "reverb produced no tail for an impulse");
+	const double drop_db = 20.0 * std::log10(early / late);
+	Check(drop_db > 12.0 && drop_db < 24.0, "reverb tail does not decay at about 60 dB per decayTime");
+	Check(!reverb.HasTail() && std::ranges::all_of(left.end() - grain * 20, left.end(),
+	                                               [](float sample) { return sample == 0.0f; }),
+	      "reverb tail did not end after decayTime");
+
+	// The tail's energy follows the reverb level, not the decay time: a long decay rings longer,
+	// not louder.
+	const auto tail_energy = [](float decay) {
+		Ngs2Reverb         r;
+		std::vector<float> impulse(48000 * 12, 0.0f);
+		impulse[0] = 1.0f;
+		r.Configure(ReverbParam(decay, -10000, 0), 48000);
+		r.Process(impulse.data(), 1, static_cast<uint32_t>(impulse.size()));
+		double energy = 0;
+		for (const float sample: impulse) {
+			energy += double(sample) * sample;
+		}
+		return energy;
+	};
+	const double short_energy = tail_energy(0.5f), long_energy = tail_energy(4.0f);
+	Check(short_energy > 0.5 && short_energy < 2.0 && long_energy > 0.5 && long_energy < 2.0,
+	      "reverb tail energy does not follow the reverb level");
+
+	Ngs2Reverb muted;
+	muted.Configure(ReverbParam(1.0f, -10000, -10000), 48000);
+	std::ranges::fill(block, 0.5f);
+	muted.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "muted reverb with dry 0 was not silent");
+	Ngs2Reverb dry;
+	dry.Configure(ReverbParam(1.0f, -10000, -10000, 1.0f), 48000);
+	std::ranges::fill(block, 0.5f);
+	dry.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.5f; }),
+	      "muted reverb with dry 1 did not pass the input through");
+}
+
+// Through the NGS2 API: control 0x40001b00 configures a custom submixer's reverb module, and the
+// voice keeps rendering the tail after its source stops.
+void TestCustomReverbVoice() {
+	constexpr uint32_t grain = 256;
+	Fixture            source(48000);
+	const int16_t      pcm[] = {32767};
+	source.Queue(pcm, 1, 0);
+	Ngs2Internal      system;
+	system.option.sample_rate       = 48000;
+	system.option.num_grain_samples = grain;
+	Ngs2RackInternal  rack {};
+	rack.ngs  = &system;
+	rack.type = Ngs2RackType::CustomSubmixer;
+	auto& custom = rack.option.custom_submixer.custom_rack_option;
+	custom.num_buffers = 1;
+	custom.num_modules = 1;
+	custom.module[0].module_id = 0x1b;
+	Ngs2VoiceInternal voice;
+	voice.rack     = &rack;
+	voice.channels = 1;
+	voice.state    = Ngs2VoicePlayState::Playing;
+	voice.modules.resize(1);
+	source.voice.ports.resize(1);
+	source.voice.ports[0].dest = &voice;
+	struct ReverbControl {
+		Ngs2VoiceParamHeader header {sizeof(ReverbControl), 0, 0x40001b00};
+		Ngs2ReverbI3dl2Param i3dl2;
+	} control;
+	control.i3dl2 = ReverbParam(1.0f, -10000, 0); // late reverb only: it starts ~30 ms later
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &control.header) == OK &&
+	          voice.modules[0].reverb != nullptr,
+	      "reverb module control was not accepted");
+	const std::vector<Ngs2VoiceInternal*> voices {&source.voice};
+	const auto render = [&] {
+		source.voice.rendered = false;
+		voice.rendered        = false;
+		Ngs2RenderVoice(voice, voices, grain);
+	};
+	render(); // the impulse
+	Check(voice.has_samples && voice.samples[0] == 0.0f,
+	      "reverb with dry 0 passed the direct sound through");
+	bool tail = false;
+	for (int i = 0; i < 20; ++i) { // the source is empty from here on
+		render();
+		tail = tail || (voice.has_samples &&
+		                std::ranges::any_of(voice.samples, [](float s) { return s != 0.0f; }));
+	}
+	Check(tail, "reverb tail stopped when its input did");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -1727,6 +1860,8 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestCustomReverbDsp();
+	TestCustomReverbVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

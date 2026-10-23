@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -531,6 +532,270 @@ struct Ngs2SamplerFilter {
 	}
 };
 
+// I3DL2 reverb settings (Ngs2ReverbI3DL2Param), used by the custom reverb module (0x1b).
+// Levels are millibels; wet and dry are linear gains on the module's output.
+struct Ngs2ReverbI3dl2Param {
+	float    wet;
+	float    dry;
+	int32_t  room;
+	int32_t  room_hf;
+	uint32_t reflection_pattern;
+	float    decay_time;
+	float    decay_hf_ratio;
+	int32_t  reflections;
+	float    reflections_delay;
+	int32_t  reverb;
+	float    reverb_delay;
+	float    diffusion;
+	float    density;
+	float    hf_reference;
+	uint32_t reserved[8];
+};
+static_assert(sizeof(Ngs2ReverbI3dl2Param) == 88);
+
+// An approximation of the NGS2 I3DL2 reverb: the console's algorithm is not documented, so this
+// follows the I3DL2 parameter model with a common structure. The channels are mixed to one
+// input, which passes the room gain and a one-pole high-frequency cut (room, roomHF at
+// hfReference) into a pre-delay line. Early reflections are six taps after reflectionsDelay.
+// The late reverb starts reverbDelay later: four diffusing all-passes feed an eight-line feedback
+// delay network whose lines decay at decayTime (RT60) and, above hfReference, at
+// decayTime * decayHFRatio. Density scales the line lengths. The network's input is scaled so
+// the tail's energy follows the reverb level whatever the decay time (an unscaled network gets
+// louder as the decay gets longer). Each output channel reads the lines through its own row of
+// a Hadamard matrix, so channels are decorrelated. reflectionPattern is ignored.
+class Ngs2Reverb {
+public:
+	void Configure(const Ngs2ReverbI3dl2Param& param, uint32_t rate) {
+		const auto finite = [](float value, float fallback) {
+			return std::isfinite(value) ? value : fallback;
+		};
+		// I3DL2 treats -10000 mB as silence.
+		const auto level = [](int32_t millibels, int32_t low, int32_t high) {
+			const auto clamped = std::clamp(millibels, low, high);
+			return clamped <= -10000 ? 0.0 : std::pow(10.0, clamped / 2000.0);
+		};
+		m_rate      = rate;
+		m_wet       = std::clamp(finite(param.wet, 0.0f), 0.0f, 16.0f);
+		m_dry       = std::clamp(finite(param.dry, 1.0f), 0.0f, 16.0f);
+		const auto room        = level(param.room, -10000, 0);
+		m_early_gain           = room * level(param.reflections, -10000, 1000);
+		m_late_gain            = room * level(param.reverb, -10000, 2000);
+		const auto decay       = std::clamp(double(finite(param.decay_time, 1.0f)), 0.1, 20.0);
+		const auto hf_ratio    = std::clamp(double(finite(param.decay_hf_ratio, 0.5f)), 0.1, 2.0);
+		const auto diffusion   = std::clamp(double(finite(param.diffusion, 100.0f)), 0.0, 100.0);
+		const auto density     = std::clamp(double(finite(param.density, 100.0f)), 0.0, 100.0);
+		const auto hf_ref      = std::clamp(double(finite(param.hf_reference, 5000.0f)), 20.0,
+		                                    0.45 * rate);
+		const auto omega       = 2.0 * std::numbers::pi * hf_ref / rate;
+		m_input_damping        = DampingCoefficient(level(param.room_hf, -10000, 0), omega);
+		m_reflections_delay    = Samples(std::clamp(double(finite(param.reflections_delay, 0.02f)), 0.0, 0.3));
+		m_reverb_delay         = Samples(std::clamp(double(finite(param.reverb_delay, 0.04f)), 0.0, 0.1));
+		m_allpass_gain         = 0.6 * diffusion / 100.0;
+		const double scale     = 0.4 + 0.6 * density / 100.0;
+		double       mean_length = 0.0;
+		for (size_t l = 0; l < Lines; ++l) {
+			m_line_delay[l]     = std::max<size_t>(1, Samples(LineMs[l] * 0.001 * scale));
+			const double length = double(m_line_delay[l]) / rate;
+			mean_length += length / Lines;
+			m_line_gain[l]      = std::pow(10.0, -3.0 * length / decay);
+			// High frequencies decay at decayTime * decayHFRatio; a ratio of 1 or more leaves the
+			// lines undamped.
+			const double hf_gain = std::pow(10.0, -3.0 * length / (decay * std::min(hf_ratio, 1.0)));
+			m_line_damping[l]    = DampingCoefficient(hf_gain / m_line_gain[l], omega);
+		}
+		// The input enters the lines with unit energy and a pass through a line keeps g^2 of it, so
+		// an impulse's tail would carry 1 / (1 - g^2): scale it back to unit energy.
+		const double pass_gain = std::pow(10.0, -3.0 * mean_length / decay);
+		m_late_gain *= std::sqrt(1.0 - pass_gain * pass_gain);
+		for (size_t t = 0; t < Taps; ++t) {
+			m_tap_delay[t] = m_reflections_delay + Samples(TapMs[t] * 0.001 * scale);
+		}
+		m_tail_samples = Samples(decay) + m_reflections_delay + m_reverb_delay + Samples(0.05);
+		const size_t pre_size = Samples(0.3) + Samples(0.1) + Samples(TapMs[Taps - 1] * 0.001) + 1;
+		if (m_pre.size() != pre_size || m_lines[0].size() != Samples(LineMs[Lines - 1] * 0.001) + 1) {
+			m_pre.assign(pre_size, 0.0f);
+			for (auto& line: m_lines) {
+				line.assign(Samples(LineMs[Lines - 1] * 0.001) + 1, 0.0f);
+			}
+			for (auto& allpass: m_allpass) {
+				allpass.assign(AllpassSamples, 0.0f);
+			}
+			Clear();
+		}
+		m_configured = true;
+	}
+
+	[[nodiscard]] bool Configured() const { return m_configured; }
+
+	// Whether the reverb still produces output after its input went silent.
+	[[nodiscard]] bool HasTail() const { return m_tail_remaining != 0; }
+
+	// Processes `channels` channel-major blocks of `grain` samples in place.
+	void Process(float* samples, uint32_t channels, uint32_t grain) {
+		if (!m_configured || channels == 0) {
+			return;
+		}
+		const bool silent_input = std::all_of(samples, samples + size_t(channels) * grain,
+		                                      [](float sample) { return sample == 0.0f; });
+		if (!silent_input) {
+			m_tail_remaining = m_tail_samples;
+		} else if (m_tail_remaining == 0) {
+			return; // nothing in flight: dry * 0 is 0
+		}
+		const bool wet = m_wet != 0.0 && (m_early_gain != 0.0 || m_late_gain != 0.0);
+		const double input_scale = 1.0 / channels;
+		for (uint32_t i = 0; i < grain; ++i) {
+			double mono = 0.0;
+			for (uint32_t c = 0; c < channels; ++c) {
+				mono += samples[c * grain + i];
+			}
+			std::array<double, Taps>  taps {};
+			std::array<double, Lines> outputs {};
+			if (wet) {
+				// Room level and high-frequency cut, then the pre-delay line.
+				m_input_state = (1.0 - m_input_damping) * mono * input_scale +
+				                m_input_damping * m_input_state;
+				Write(m_pre, m_pre_cursor, static_cast<float>(m_input_state));
+				for (size_t t = 0; t < Taps; ++t) {
+					taps[t] = m_early_gain * TapGain[t] * Read(m_pre, m_pre_cursor, m_tap_delay[t]);
+				}
+				double late = m_late_gain * Read(m_pre, m_pre_cursor,
+				                                 m_reflections_delay + m_reverb_delay);
+				for (size_t a = 0; a < m_allpass.size(); ++a) {
+					const size_t delay  = std::max<size_t>(1, AllpassDelays[a] * m_rate / 48000);
+					const double held   = Read(m_allpass[a], m_allpass_cursor, delay);
+					const double stored = late + m_allpass_gain * held;
+					Write(m_allpass[a], m_allpass_cursor, static_cast<float>(stored));
+					late = held - m_allpass_gain * stored;
+				}
+				std::array<double, Lines> feedback {};
+				for (size_t l = 0; l < Lines; ++l) {
+					outputs[l]    = Read(m_lines[l], m_line_cursor, m_line_delay[l]);
+					m_damped[l]   = (1.0 - m_line_damping[l]) * outputs[l] +
+					                m_line_damping[l] * m_damped[l];
+					feedback[l]   = m_line_gain[l] * m_damped[l];
+				}
+				// The normalized Hadamard mix keeps the network lossless before the line gains.
+				const auto mixed = Hadamard(feedback);
+				for (size_t l = 0; l < Lines; ++l) {
+					Write(m_lines[l], m_line_cursor,
+					      Flush(InputSigns[l] * late * LineScale + mixed[l] * LineScale));
+				}
+				Advance();
+			}
+			for (uint32_t c = 0; c < channels; ++c) {
+				double reverb = 0.0;
+				if (wet) {
+					for (size_t t = 0; t < Taps; ++t) {
+						reverb += (((t + c) & 1u) == 0 ? 1.0 : 0.5) * taps[t];
+					}
+					// Channel c reads row c of the Hadamard matrix (skipping row 0, which matches
+					// no input pattern but would make every channel share one sum).
+					const size_t row = (c + 1) % Lines;
+					for (size_t l = 0; l < Lines; ++l) {
+						reverb += HadamardSign(row, l) * outputs[l];
+					}
+				}
+				auto& sample = samples[c * grain + i];
+				sample       = static_cast<float>(m_dry * sample + m_wet * reverb);
+			}
+		}
+		m_tail_remaining = m_tail_remaining > grain ? m_tail_remaining - grain : 0;
+		if (m_tail_remaining == 0) {
+			Clear(); // drop denormal-sized leftovers so the next tail starts clean
+		}
+	}
+
+private:
+	static constexpr size_t                 Lines = 8;
+	static constexpr size_t                 Taps  = 6;
+	// Mutually prime lengths, long enough for a dense tail without audible ringing.
+	static constexpr std::array<double, Lines> LineMs {43.1, 49.7, 56.3, 61.9,
+	                                                   67.7, 73.1, 79.3, 87.1};
+	static constexpr double                    LineScale = 0.35355339059327373; // 1 / sqrt(8)
+	static constexpr std::array<double, Lines> InputSigns {1, -1, 1, 1, -1, 1, -1, -1};
+	static constexpr std::array<double, Taps>  TapMs {0.0, 3.1, 7.3, 11.9, 17.1, 23.3};
+	static constexpr std::array<double, Taps>  TapGain {0.55, 0.47, 0.40, 0.34, 0.29, 0.25};
+	static constexpr std::array<size_t, 4>     AllpassDelays {113, 241, 337, 523}; // at 48 kHz
+	static constexpr size_t                    AllpassSamples = 1024;
+
+	// Entry (row, column) of the 8x8 Sylvester Hadamard matrix.
+	static constexpr double HadamardSign(size_t row, size_t column) {
+		return (std::popcount(row & column) & 1) != 0 ? -1.0 : 1.0;
+	}
+
+	// Multiplies by the (unnormalized) 8x8 Hadamard matrix with a fast Walsh-Hadamard transform.
+	static std::array<double, Lines> Hadamard(std::array<double, Lines> v) {
+		for (size_t h = 1; h < Lines; h *= 2) {
+			for (size_t i = 0; i < Lines; i += 2 * h) {
+				for (size_t j = i; j < i + h; ++j) {
+					const double a = v[j], b = v[j + h];
+					v[j]           = a + b;
+					v[j + h]       = a - b;
+				}
+			}
+		}
+		return v;
+	}
+
+	// One-pole low-pass coefficient whose gain at `omega` is `gain` (no cut for gain >= 1).
+	static double DampingCoefficient(double gain, double omega) {
+		if (gain >= 1.0) {
+			return 0.0;
+		}
+		gain             = std::max(gain, 1e-4);
+		const double g2  = gain * gain;
+		const double b   = 1.0 - g2 * std::cos(omega);
+		const double rad = std::sqrt(std::max(b * b - (1.0 - g2) * (1.0 - g2), 0.0));
+		return std::clamp((b - rad) / (1.0 - g2), 0.0, 0.999);
+	}
+
+	[[nodiscard]] size_t Samples(double seconds) const {
+		return static_cast<size_t>(std::lround(seconds * m_rate));
+	}
+
+	static float Flush(double value) {
+		return std::abs(value) < 1e-20 ? 0.0f : static_cast<float>(value);
+	}
+
+	static void Write(std::vector<float>& line, size_t cursor, float value) {
+		line[cursor % line.size()] = value;
+	}
+
+	static double Read(const std::vector<float>& line, size_t cursor, size_t delay) {
+		return line[(cursor + line.size() - delay % line.size()) % line.size()];
+	}
+
+	void Advance() {
+		++m_pre_cursor;
+		++m_line_cursor;
+		++m_allpass_cursor;
+	}
+
+	void Clear() {
+		std::ranges::fill(m_pre, 0.0f);
+		for (auto& line: m_lines) std::ranges::fill(line, 0.0f);
+		for (auto& allpass: m_allpass) std::ranges::fill(allpass, 0.0f);
+		m_damped.fill(0.0);
+		m_input_state    = 0.0;
+		m_tail_remaining = 0;
+	}
+
+	bool                               m_configured = false;
+	uint32_t                           m_rate       = 48000;
+	double                             m_wet = 0, m_dry = 1, m_early_gain = 0, m_late_gain = 0;
+	double                             m_input_damping = 0, m_input_state = 0, m_allpass_gain = 0;
+	size_t                             m_reflections_delay = 0, m_reverb_delay = 0;
+	size_t                             m_tail_samples = 0, m_tail_remaining = 0;
+	size_t                             m_pre_cursor = 0, m_line_cursor = 0, m_allpass_cursor = 0;
+	std::array<size_t, Lines>          m_line_delay {};
+	std::array<double, Lines>          m_line_gain {}, m_line_damping {}, m_damped {};
+	std::array<size_t, Taps>           m_tap_delay {};
+	std::vector<float>                 m_pre;
+	std::array<std::vector<float>, Lines> m_lines;
+	std::array<std::vector<float>, 4>  m_allpass;
+};
+
 struct Ngs2VoiceInternal {
 	struct Port {
 		Ngs2VoiceInternal* dest   = nullptr;
@@ -548,6 +813,7 @@ struct Ngs2VoiceInternal {
 		std::vector<uint8_t>     param, work, state;
 		void                     KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*) = nullptr;
 		std::array<uintptr_t, 3> user_data {};
+		std::unique_ptr<Ngs2Reverb> reverb; // module 0x1b, once the game configures it
 		uint32_t                 flags          = 1;
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
@@ -1844,12 +2110,27 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.has_samples = true;
 			}
 		}
+		// A reverb keeps sounding after its input stops; render its tail from silence.
+		if (!voice.has_samples &&
+		    std::ranges::any_of(voice.modules, [](const auto& module) {
+			    return module.reverb != nullptr && module.reverb->HasTail();
+		    })) {
+			voice.has_samples = true;
+		}
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				const auto& info   = custom.module[m];
 				auto&       module = voice.modules[m];
+				if (info.module_id == 0x1b) {
+					// Until the game configures it, the module passes audio through unchanged.
+					if (module.reverb != nullptr) {
+						module.reverb->Process(voice.Buffer(info.source_buffer_id, grain),
+						                       voice.channels, grain);
+					}
+					continue;
+				}
 				if (info.module_id != 0x19 && info.module_id != 0x1f) {
 					if (!module.render_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
@@ -2452,13 +2733,31 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id;
 				auto& module = voice->modules[index];
 				if ((param->id & 0xffffffe0u) != (0x40000000u | module_id << 8u) ||
-				    (module_id != 0x19 && module_id != 0x1f)) {
+				    (module_id != 0x19 && module_id != 0x1b && module_id != 0x1f)) {
 					if (!module.control_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
 						    param->id));
 						module.control_warned = true;
 					}
+					break;
+				}
+				if (module_id == 0x1b) {
+					// Custom reverb module: Ngs2CustomVoiceReverbParam {header, I3DL2 settings}.
+					EXIT_NOT_IMPLEMENTED(param->size !=
+					                     sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2ReverbI3dl2Param));
+					const auto& i3dl2 = *reinterpret_cast<const Ngs2ReverbI3dl2Param*>(param + 1);
+					LOGF("\t reverb: wet = %f, dry = %f, room = %d, roomHF = %d, decay = %f, "
+					     "hfRatio = %f, reflections = %d @ %f, reverb = %d @ %f, diffusion = %f, "
+					     "density = %f, hfReference = %f\n",
+					     i3dl2.wet, i3dl2.dry, i3dl2.room, i3dl2.room_hf, i3dl2.decay_time,
+					     i3dl2.decay_hf_ratio, i3dl2.reflections, i3dl2.reflections_delay,
+					     i3dl2.reverb, i3dl2.reverb_delay, i3dl2.diffusion, i3dl2.density,
+					     i3dl2.hf_reference);
+					if (module.reverb == nullptr) {
+						module.reverb = std::make_unique<Ngs2Reverb>();
+					}
+					module.reverb->Configure(i3dl2, voice->rack->ngs->option.sample_rate);
 					break;
 				}
 				if (module_id == 0x19) {

@@ -704,6 +704,142 @@ void TestSubmixerSetupAndRouting() {
 	}
 }
 
+// A submixer's inputs after the first key its compressor (PPSA28465 routes voices to input 1 of
+// the music submixer for ducking). They must not be mixed into the output, and must not abort.
+void TestSubmixerSideChainInput() {
+	Fixture f(48000, 1);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs                          = &f.system;
+	submixer_rack.type                         = Ngs2RackType::Submixer;
+	submixer_rack.option.submixer.max_channels = 8;
+	submixer_rack.option.submixer.max_inputs   = 2;
+	Ngs2VoiceInternal submixer;
+	submixer.rack     = &submixer_rack;
+	submixer.channels = 1;
+	submixer.state    = Ngs2VoicePlayState::Playing;
+	f.voice.ports.push_back({&submixer, 1, 1.0f, -1});
+	const int16_t pcm[] = {8192, 8192};
+	f.Queue(pcm, 2, 0);
+	const std::vector<Ngs2VoiceInternal*> voices {&f.voice};
+	Ngs2RenderVoice(submixer, voices, 1);
+	Check(!submixer.has_samples && submixer.samples[0] == 0.0f,
+	      "a side-chain input was mixed into the submixer output");
+	f.voice.ports[0].input = 0;
+	f.voice.rendered = submixer.rendered = false;
+	Ngs2RenderVoice(submixer, voices, 1);
+	Check(submixer.has_samples && submixer.samples[0] == 0.25f,
+	      "the submixer's main input was not mixed");
+}
+
+Ngs2SubmixerCompressorParam CompressorParam(uint32_t flags, float threshold, float ratio,
+                                            float knee, float attack, float release) {
+	return {flags, threshold, ratio, knee, attack, release, 1.0f, 0};
+}
+
+bool Near(double value, double expected, double tolerance) {
+	return std::abs(value - expected) <= tolerance;
+}
+
+// The submixer compressor model (see Ngs2Compressor): static curve, knee, envelope and keying.
+void TestCompressorDsp() {
+	constexpr uint32_t Rate = 1000;
+	Ngs2Compressor     compressor;
+	Check(!compressor.Enabled(), "a reset compressor was enabled");
+
+	// Limiter (flags 0x1): 6 dB over a threshold of 1.0 with ratio 0.01 comes out 0.06 dB over.
+	compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 0.0f), Rate);
+	float loud[] = {2.0f};
+	compressor.Process(loud, nullptr, 1, 1);
+	Check(Near(loud[0], std::pow(2.0, 0.01), 1e-4), "the limiter curve is wrong");
+	float quiet[] = {0.5f};
+	compressor.Process(quiet, nullptr, 1, 1);
+	Check(quiet[0] == 0.5f, "the limiter changed a signal under its threshold");
+
+	// Soft knee: at the threshold, a 6 dB knee gives (1 - ratio) * 3^2 / 12 dB of reduction.
+	compressor.Configure(CompressorParam(0x1, 0.5f, 0.0f, 6.0f, 0.0f, 0.0f), Rate);
+	float knee[] = {0.5f};
+	compressor.Process(knee, nullptr, 1, 1);
+	Check(Near(knee[0], 0.5 * std::pow(10.0, -0.75 / 20.0), 1e-5), "the soft knee is wrong");
+
+	// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices): the RMS detector
+	// compares power with the threshold, so a key of 0.1 (power 0.01) is 10 dB over 0.001 and
+	// reduces the signal by 10 * (1 - ratio) dB once the RMS window fills. The main signal's own
+	// level is ignored.
+	compressor.Reset();
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+	const double       ducked = 0.5 * std::pow(10.0, -7.5 / 20.0);
+	std::vector<float> stereo(size_t(Rate) * 2, 0.5f);
+	std::vector<float> stereo_key(size_t(Rate) * 2, 0.1f);
+	std::fill(stereo_key.begin() + Rate, stereo_key.end(), -0.1f);
+	compressor.Process(stereo.data(), stereo_key.data(), 2, Rate);
+	Check(Near(stereo[Rate - 1], ducked, 1e-5) && Near(stereo[2 * Rate - 1], ducked, 1e-5),
+	      "the side-chain key did not duck the signal");
+	std::vector<float> signal(Rate, 0.5f);
+	compressor.Process(signal.data(), nullptr, 1, Rate);
+	Check(signal[Rate - 1] == 0.5f, "the compressor did not recover without a key");
+
+	// Attack and release smooth the reduction: the key takes time to duck the signal, and the
+	// signal returns gradually once the key stops.
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.1f, 5.0f), Rate);
+	std::fill(signal.begin(), signal.end(), 0.5f);
+	std::vector<float> keyed(Rate, 0.1f);
+	compressor.Process(signal.data(), keyed.data(), 1, 2);
+	Check(signal[1] < 0.5f && signal[1] > ducked * 1.5, "the attack was not gradual");
+	compressor.Process(signal.data() + 2, keyed.data() + 2, 1, Rate - 2);
+	Check(Near(signal[Rate - 1], ducked, 1e-3), "the attack did not settle");
+	std::fill(signal.begin(), signal.end(), 0.5f);
+	compressor.Process(signal.data(), nullptr, 1, Rate / 2);
+	Check(signal[Rate / 2 - 1] > ducked * 1.2 && signal[Rate / 2 - 1] < 0.45f,
+	      "the release was not gradual");
+	for (int i = 0; i < 30; ++i) {
+		std::fill(signal.begin(), signal.end(), 0.5f);
+		compressor.Process(signal.data(), nullptr, 1, Rate);
+	}
+	Check(Near(signal[Rate - 1], 0.5, 1e-3), "the release did not recover");
+
+	compressor.Configure(CompressorParam(0, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+	Check(!compressor.Enabled(), "flags 0 did not disable the compressor");
+}
+
+// A submixer with a side-chain compressor (peak-keyed here, so one sample settles it) ducks
+// input 0 while input 1 has signal.
+void TestSubmixerCompressorVoice() {
+	Fixture          music(48000, 1), speech(48000, 1);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs                          = &music.system;
+	submixer_rack.type                         = Ngs2RackType::Submixer;
+	submixer_rack.option.submixer.max_channels = 8;
+	submixer_rack.option.submixer.max_inputs   = 2;
+	Ngs2VoiceInternal submixer;
+	submixer.rack     = &submixer_rack;
+	submixer.channels = 1;
+	submixer.state    = Ngs2VoicePlayState::Playing;
+	struct {
+		Ngs2VoiceParamHeader        header {sizeof(Ngs2VoiceParamHeader) +
+                                               sizeof(Ngs2SubmixerCompressorParam),
+                                           0, 0x20000002};
+		Ngs2SubmixerCompressorParam param = CompressorParam(0x09, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f);
+	} control;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&submixer), &control.header) == OK,
+	      "the submixer rejected compressor settings");
+	Check(submixer.compressor.Enabled(), "the compressor settings were not applied");
+	music.voice.ports.push_back({&submixer, 0, 1.0f, -1});
+	speech.voice.ports.push_back({&submixer, 1, 1.0f, -1});
+	const int16_t pcm[] = {8192, 8192};
+	music.Queue(pcm, 2, 0);
+	speech.Queue(pcm, 2, 0);
+	const std::vector<Ngs2VoiceInternal*> voices {&music.voice, &speech.voice};
+	Ngs2RenderVoice(submixer, voices, 1);
+	// The key is 250 times the threshold; above it the level rises by 0.25 per input dB.
+	Check(submixer.has_samples && Near(submixer.samples[0], 0.25 * std::pow(250.0, -0.75), 1e-6),
+	      "the side-chain input did not duck the submixer");
+	speech.voice.ports.clear();
+	music.voice.rendered = speech.voice.rendered = submixer.rendered = false;
+	Ngs2RenderVoice(submixer, voices, 1);
+	Check(submixer.has_samples && submixer.samples[0] == 0.25f,
+	      "the submixer stayed ducked without a key");
+}
+
 uint32_t g_side_chain_flags = 0;
 
 void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
@@ -1727,6 +1863,9 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestSubmixerSideChainInput();
+	TestCompressorDsp();
+	TestSubmixerCompressorVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

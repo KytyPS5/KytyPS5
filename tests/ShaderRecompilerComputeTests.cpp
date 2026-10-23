@@ -46064,6 +46064,17 @@ void CheckDepthTextureEncoding() {
               IsSupportedDepthTextureEncoding(retained_metadata_address),
           "uncompressed depth rejected inactive metadata address bits");
 
+  const ShaderTextureResource pipe_aligned_depth{{
+      0x03d48800u, 0xc1600000u, 0x010dc1dfu, 0x91800204u,
+      0x00000000u, 0x00700000u, 0x00080000u, 0x00000000u,
+  }};
+  auto pipe_aligned_dcc_control = pipe_aligned_depth;
+  pipe_aligned_dcc_control.fields[6] |= 1u << 22u;
+  Require("DepthTextureEncoding", "PPSA01748 pipe-aligned uncompressed depth",
+          IsSupportedDepthTextureEncoding(pipe_aligned_depth) &&
+              !IsSupportedDepthTextureEncoding(pipe_aligned_dcc_control),
+          "uncompressed depth rejected a metadata pipe alignment flag");
+
   const ShaderTextureResource first_use_depth{{
       0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
       0x00000000u, 0x00700000u, 0x80280000u, 0x000225fdu,

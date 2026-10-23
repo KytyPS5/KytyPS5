@@ -177,7 +177,10 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 		return false;
 	}
 	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
-	if (metadata_control == 0) {
+	// META_PIPE_ALIGNED only describes the layout of a metadata surface. Without COMPRESSION_EN
+	// the texture unit reads no HTILE, so the view is plain uncompressed depth.
+	constexpr uint32_t meta_pipe_aligned = 1u << 19u;
+	if ((metadata_control & ~meta_pipe_aligned) == 0) {
 		return true;
 	}
 	constexpr uint32_t htile_control = 0x00280000u;

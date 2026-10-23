@@ -551,7 +551,9 @@ void TestMappedPixelImageTable() {
           "image table replaced descriptor dimensions with its selector");
     EliminateDeadCode(fixture.program.blocks);
     ValidateProgram(fixture.program, true);
-    LinearTestMemory data;
+    struct MappedTestMemory : LinearTestMemory {
+      std::vector<std::pair<uint64_t, uint64_t>> ranges = {{0u, 32u}, {64u, 64u}};
+    } data;
     data.words.assign(32u, 0u);
     data.fail_address = data.base + 32u;
     for (uint32_t row = 0; row < 2u; ++row) {
@@ -572,13 +574,16 @@ void TestMappedPixelImageTable() {
         .read_specialization_memory = ReadLinearTestMemory,
         .mapped_ranges = +[](void *userdata, uint64_t address, uint64_t maximum,
                              std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
-          const auto &memory = *static_cast<LinearTestMemory *>(userdata);
+          const auto &memory = *static_cast<MappedTestMemory *>(userdata);
           if (maximum == 4u) {
-            if (address >= 0x2000u && address <= 0x2100u) ranges = {{0u, 4u}};
+            if (address >= 0x2000u && address < 0x200000u) ranges = {{0u, 4u}};
             return true;
           }
-          if (address != memory.base || maximum != (uint64_t{1} << 32u)) return false;
-          ranges = {{0u, 32u}, {64u, 64u}};
+          if (address != 0x1000u || maximum != (uint64_t{1} << 32u)) return false;
+          ranges = memory.ranges.empty()
+                       ? std::vector<std::pair<uint64_t, uint64_t>>{
+                             {0u, memory.words.size() * sizeof(uint32_t)}}
+                       : memory.ranges;
           return true;
         }};
     ResourceSnapshot snapshot;
@@ -593,25 +598,96 @@ void TestMappedPixelImageTable() {
               snapshot.images[snapshot.flattened_srt[mapping + 2u]].dwords[0] == 0x20u &&
               snapshot.images[snapshot.flattened_srt[mapping + 4u]].dwords[0] == 0x21u,
           "mapped image discovery lost sparse keys or retained unmapped texture data");
+    const auto first_descriptor = snapshot.images[1].dwords;
+    const auto last_descriptor = snapshot.images[2].dwords;
     data.fail_address = data.base;
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
           "unreadable mapped image table was accepted");
     data.fail_address = UINT64_MAX;
-    runtime.mapped_ranges = +[](void *, uint64_t, uint64_t,
-                               std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
-      ranges = {{0u, uint64_t{MaxIndirectDescriptorProbes + 1u} * 32u}};
-      return true;
-    };
-    const auto reads = data.reads;
-    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && data.reads == reads,
-          "oversized mapped image table read guest memory");
-    runtime.mapped_ranges = +[](void *, uint64_t, uint64_t,
-                               std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
-      ranges = {{0u, 32u}, {64u, uint64_t{MaxIndirectDescriptorProbes} * 32u}};
-      return true;
-    };
-    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && data.reads == reads + 1u,
-          "mapped image scan reset its probe budget between ranges");
+    const uint32_t late_offset = MaxIndirectDescriptorProbes * 32u;
+    data.words.assign((late_offset + 96u) / 4u, 0u);
+    std::copy(first_descriptor.begin(), first_descriptor.end(), data.words.begin());
+    std::copy(first_descriptor.begin(), first_descriptor.end(), data.words.begin() + late_offset / 4u);
+    std::copy(last_descriptor.begin(), last_descriptor.end(), data.words.begin() + (late_offset + 64u) / 4u);
+    data.ranges = {{0u, uint64_t{MaxIndirectDescriptorProbes + 1u} * 32u},
+                   {uint64_t{MaxIndirectDescriptorProbes + 2u} * 32u, 32u}};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "mapped image table larger than the probe budget failed to materialize");
+    const auto large_mapping = specialization.images[0].indirect_mapping_offset;
+    Check(snapshot.images.size() == 3u && snapshot.flattened_srt[large_mapping] == 3u &&
+              snapshot.flattened_srt[large_mapping + 1u] == 0u &&
+              snapshot.flattened_srt[large_mapping + 3u] == late_offset &&
+              snapshot.flattened_srt[large_mapping + 5u] == late_offset + 64u &&
+              snapshot.flattened_srt[large_mapping + 2u] == snapshot.flattened_srt[large_mapping + 4u] &&
+              snapshot.images[snapshot.flattened_srt[large_mapping + 6u]].dwords == last_descriptor,
+          "batched mapped image scan lost late keys, deduplication, or sparse ranges");
+    uint64_t captured_bytes = 0u;
+    for (const auto &[address, size] : snapshot.specialization_reads) {
+      Check(size <= uint64_t{MaxIndirectDescriptorProbes} * 4u,
+            "mapped image scan exceeded its per-read scratch budget");
+      Check(address == data.base + captured_bytes + (captured_bytes > late_offset ? 32u : 0u),
+            "mapped image scan captured a gap or skipped a batch");
+      captured_bytes += size;
+    }
+    Check(captured_bytes == late_offset + 64u,
+          "mapped image scan did not capture all specialization dependencies");
+    data.fail_address = data.base + late_offset;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "unreadable late mapped image batch was accepted");
+    data.fail_address = UINT64_MAX;
+    data.base = 0x1000u + (uint64_t{1} << 32u) - 32u;
+    data.words.assign(last_descriptor.begin(), last_descriptor.end());
+    data.ranges = {{(uint64_t{1} << 32u) - 32u, 32u}};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u &&
+              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 1u] == 0xffffffe0u &&
+              snapshot.images[1].dwords == last_descriptor &&
+              snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{data.base, 32u}},
+          "mapped image scan truncated the last U32 byte-offset descriptor or its address");
+    data.base = 0x1000u;
+    data.words.assign(first_descriptor.begin(), first_descriptor.end());
+    data.ranges = {{0u, 32u}, {16u, 32u}};
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "overlapping mapped image ranges were accepted");
+
+    data.ranges.clear();
+    for (const uint32_t candidates : {4096u, 4097u}) {
+      data.words.resize(candidates * 8u);
+      for (uint32_t row = 0; row < candidates; ++row) {
+        std::copy(first_descriptor.begin(), first_descriptor.end(), data.words.begin() + row * 8u);
+        data.words[row * 8u] = 0x20u + row;
+      }
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) == (candidates == 4096u),
+            "mapped image table did not enforce its distinct candidate budget");
+    }
+    for (uint32_t row = 0; row < 4097u; ++row) data.words[row * 8u] = first_descriptor[0];
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u,
+          "duplicate mapped rows consumed the distinct candidate budget");
+
+    for (const uint32_t rows : {2u * MaxIndirectDescriptorProbes,
+                                2u * MaxIndirectDescriptorProbes + 1u}) {
+      data.words.assign(rows * 8u, 0u);
+      std::copy(first_descriptor.begin(), first_descriptor.end(), data.words.end() - 8u);
+      data.reads = 0u;
+      const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+      Check(rows == 2u * MaxIndirectDescriptorProbes
+                ? materialized && snapshot.images.size() == 2u &&
+                      snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 1u] ==
+                          (rows - 1u) * 32u
+                : !materialized && data.reads == 0u,
+            "mapped image scan lost its last permitted row or read an oversized allocation");
+    }
+    data.words.assign((2u * MaxIndirectDescriptorProbes + 2u) * 8u, 0u);
+    std::copy(first_descriptor.begin(), first_descriptor.end(), data.words.end() - 8u);
+    data.ranges = {{0u, uint64_t{MaxIndirectDescriptorProbes} * 32u},
+                   {uint64_t{MaxIndirectDescriptorProbes + 1u} * 32u,
+                    uint64_t{MaxIndirectDescriptorProbes + 1u} * 32u}};
+    data.reads = 0u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && data.reads == 8u,
+          "fragmented mapped ranges bypassed the total row budget");
+    data.ranges = {{0u, uint64_t{1} << 32u}};
+    data.reads = 0u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && data.reads == 0u,
+          "a mapped image scan read the full unbounded SMEM address domain");
     runtime.mapped_ranges = nullptr;
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
           "raw image pointer without a mapped extent was accepted");

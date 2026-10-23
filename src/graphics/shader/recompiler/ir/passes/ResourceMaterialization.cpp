@@ -21,6 +21,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+constexpr uint64_t MaxMappedDescriptorRows = 2u * MaxIndirectDescriptorProbes;
+constexpr uint32_t MaxMappedDescriptorCandidates = 4096u;
 constexpr uint32_t MaxDerivedWorkgroupEvaluations = 4u * MaxIndirectDescriptorProbes;
 
 bool SpecializationFail(std::string_view message) {
@@ -733,15 +735,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			descriptors[resource_index] = {.dword_count = dword_count};
 			snapshot.flattened_srt.push_back(0u);
 			uint64_t previous_end = 0u;
-			uint64_t probes = 0u;
+			uint64_t scanned_rows = 0u;
 			for (const auto& [offset, bytes]: ranges) {
 				if (offset < previous_end || offset > extent || bytes > extent - offset ||
 				    ((offset | bytes) & 3u) != 0u) return failed("mapped table range");
 				previous_end = offset + bytes;
 				auto first = (offset + descriptor_bytes - 1u) / descriptor_bytes * descriptor_bytes;
-				const auto count = first < previous_end ? (previous_end - first) / descriptor_bytes : 0u;
-				if (count > MaxIndirectDescriptorProbes - probes) return failed("mapped table probe limit");
-				probes += count;
+				const auto rows = first < previous_end ? (previous_end - first) / descriptor_bytes : 0u;
+				if (rows > MaxMappedDescriptorRows - scanned_rows)
+					return failed("mapped table row limit", fmt::format("rows={}", scanned_rows + rows));
+				scanned_rows += rows;
 				while (first < previous_end && previous_end - first >= descriptor_bytes) {
 					const auto count = std::min<uint64_t>((previous_end - first) / descriptor_bytes,
 					                                      MaxIndirectDescriptorProbes / read_dwords);
@@ -760,6 +763,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 							if (backing.empty() || backing.front().first != 0u || backing.front().second < 4u) continue;
 						}
 						const auto ordinal = intern_candidate(candidate);
+						if (ordinal > MaxMappedDescriptorCandidates) return failed("mapped table candidate limit");
 						if (ordinal == 0u) continue;
 						snapshot.flattened_srt.push_back(static_cast<uint32_t>(first + row * descriptor_bytes));
 						snapshot.flattened_srt.push_back(ordinal);

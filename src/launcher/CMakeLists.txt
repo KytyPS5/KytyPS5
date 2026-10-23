@@ -72,7 +72,6 @@ if(WIN32)
 			--no-system-dxc-compiler
 			--no-opengl-sw
 			--no-translations
-			--svg
 		COMMENT "Deploying Qt runtime and TLS plugins"
 		VERBATIM
 	)

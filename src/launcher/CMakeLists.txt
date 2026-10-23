@@ -1,5 +1,5 @@
 
-find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
+find_package(Qt6 6.8 COMPONENTS Concurrent Network Svg Widgets REQUIRED)
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
@@ -21,7 +21,7 @@ add_executable(launcher WIN32
 )
 
 
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Svg Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
 	LibAtrac9 kyty_git_version common)
 if(LINUX)
 	find_package(Qt6 COMPONENTS DBus REQUIRED)
@@ -72,6 +72,7 @@ if(WIN32)
 			--no-system-dxc-compiler
 			--no-opengl-sw
 			--no-translations
+			--svg
 		COMMENT "Deploying Qt runtime and TLS plugins"
 		VERBATIM
 	)
@@ -144,6 +145,7 @@ if(WIN32)
 				--no-system-dxc-compiler
 				--no-opengl-sw
 				--no-translations
+				--svg
     		)
     ")
 elseif(LINUX)
@@ -174,7 +176,7 @@ elseif(LINUX)
 	if(kyty_qt_plugins_dir)
 		message(STATUS "Qt plugins for launcher deployment: ${kyty_qt_plugins_dir}")
 		set(kyty_qt_plugin_files "")
-		foreach(kyty_qt_plugin platforms tls imageformats xcbglintegrations wayland-shell-integration)
+		foreach(kyty_qt_plugin platforms tls iconengines imageformats xcbglintegrations wayland-shell-integration)
 			if(IS_DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}")
 				file(GLOB kyty_qt_plugin_group
 					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so"

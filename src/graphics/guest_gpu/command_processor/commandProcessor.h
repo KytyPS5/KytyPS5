@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -104,6 +106,15 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
+	/// Queues pending GPU-to-guest image readbacks before an EOP label/interrupt.
+	/// @return true if readbacks were queued and the signal must be deferred behind them.
+	bool QueueReadbacksBeforeLabel();
+	/// Publishes an EOP label (low `size` bytes of `value`) behind pending image readbacks.
+	/// Labels stay in order: while an earlier label is still waiting on readbacks, later labels
+	/// are deferred behind it too. A null `dst` publishes only the interrupt (an interrupt-only
+	/// EOP). @return false if the label can be written immediately.
+	bool PublishLabelAfterReadbacks(void* dst, uint64_t value, uint32_t size, bool with_interrupt,
+	                                uint32_t interrupt_context_id);
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
@@ -147,6 +158,8 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	friend struct CommandProcessorTestAccess;
+
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
@@ -160,6 +173,9 @@ private:
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext&   m_renderer;
+	// Labels deferred behind readbacks that have not been written to guest memory yet.
+	std::shared_ptr<std::atomic<uint32_t>> m_labels_behind_readbacks =
+	    std::make_shared<std::atomic<uint32_t>>(0);
 	HW::Context      m_ctx;
 	HW::Context      m_saved_ctx;
 	bool             m_context_state_pushed = false;

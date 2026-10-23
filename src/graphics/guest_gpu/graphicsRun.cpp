@@ -30,6 +30,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,22 @@ void GuestGpu::Wake() {
 	Common::LockGuard lock(m_queue_mutex);
 	m_wake_pending = true;
 	m_work_available.Signal();
+}
+
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) {
+		return false;
+	}
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
 }
 
 void GuestGpu::ProcessCommands() {
@@ -285,6 +302,23 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+namespace {
+
+// Labels that PublishLabelAfterReadbacks deferred behind readbacks, by address, with the latest
+// value deferred for each. Used only on the GPU thread: labels are deferred while processing PM4,
+// and they land through GPU-thread commands.
+struct DeferredLabel {
+	uint64_t value;
+	uint32_t size;
+};
+
+std::unordered_map<uint64_t, DeferredLabel>& DeferredLabels() {
+	static std::unordered_map<uint64_t, DeferredLabel> labels;
+	return labels;
+}
+
+} // namespace
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -309,9 +343,21 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+	if (TestWaitRegMemValue(*addr, ref, mask, func)) {
+		return;
 	}
+	// A label deferred behind readbacks is kept out of memory so guest CPU code cannot read the
+	// readback destination before its data lands. A wait in the command stream does not need
+	// that: everything recorded after it runs after the work the label signals on the host
+	// queue. Blocking until the label lands drains the host GPU instead, several times a frame
+	// in some games.
+	const auto& labels   = DeferredLabels();
+	const auto  deferred = labels.find(reinterpret_cast<uint64_t>(addr));
+	if (deferred != labels.end() && deferred->second.size == sizeof(T) &&
+	    TestWaitRegMemValue(static_cast<T>(deferred->second.value), ref, mask, func)) {
+		return;
+	}
+	SuspendPm4();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -1054,7 +1100,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x03: with_interrupt = false; break;
 		case 0x01:
 			if (!IsAsyncComputeQueue()) {
+				// An interrupt-only EOP is a completion signal too: land pending readbacks first.
+				const bool queued = QueueReadbacksBeforeLabel();
 				TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				if (queued) {
+					GetScheduler().Flush();
+				}
 				return;
 			}
 			with_interrupt = true;
@@ -1068,6 +1119,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
+		if (PublishLabelAfterReadbacks(dst, data, sizeof(data), with_interrupt,
+		                               interrupt_context_id)) {
+			return;
+		}
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1080,7 +1135,16 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					(void)QueueReadbacksBeforeLabel();
 					SynchronizeGpu();
+					// SynchronizeGpu() waits for the GPU but not for priority callbacks: wait for
+					// readback copies and deferred labels queued by this or earlier EOPs.
+					GetScheduler().DrainPriorityOperations();
+					// Deferred labels are written by GPU-thread commands (see
+					// PublishLabelAfterReadbacks); run them so they land before this label.
+					if (g_gpu_state != nullptr) {
+						g_gpu_state->ProcessCommands();
+					}
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					if (with_interrupt) {
@@ -1111,6 +1175,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
+					if (PublishLabelAfterReadbacks(dst, static_cast<uint64_t>(value), sizeof(value),
+					                               with_interrupt, interrupt_context_id)) {
+						return;
+					}
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1212,8 +1280,79 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+// Queues pending image readbacks (see TextureCache::ProcessDownloadImages) ahead of a GPU
+// completion signal. Returns true if any were queued; the caller must then publish the signal
+// through a priority deferred operation so the guest observes it only after the data landed.
+bool CommandProcessor::QueueReadbacksBeforeLabel() {
+	Common::LockGuard lock(m_renderer.GetMutex());
+	return m_renderer.GetTextureCache().ProcessDownloadImages();
+}
+
+bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uint32_t size,
+                                                  bool with_interrupt,
+                                                  uint32_t interrupt_context_id) {
+	EXIT_IF(size != sizeof(uint32_t) && size != sizeof(uint64_t));
+	const bool queued = QueueReadbacksBeforeLabel();
+	// Priority operations run in FIFO order, so a label queued behind an earlier deferred label
+	// or an earlier readback (e.g. one queued at a suspend point) can never become visible
+	// before that data has landed.
+	if (!queued && m_labels_behind_readbacks->load(std::memory_order_acquire) == 0 &&
+	    !m_renderer.GetTextureCache().HasReadbacksInFlight()) {
+		return false;
+	}
+	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);
+	if (dst != nullptr) {
+		DeferredLabels()[reinterpret_cast<uint64_t>(dst)] = {value, size};
+	}
+	// The priority callback only hands the write to the GPU thread. The label's page can be
+	// tracked by the buffer cache (the GPU writes other bytes of it); a CPU write there faults
+	// into a buffer readback, which cannot run from a deferred operation. GPU-thread commands
+	// run in FIFO order between PM4 packets, so labels stay ordered, and the interrupt is raised
+	// by the same command after the label is visible.
+	GetScheduler().DeferPriorityOperation([&gpu = m_renderer.GetGpu(), &renderer = m_renderer,
+	                                       event_id = m_interrupt_event_id, dst, value, size,
+	                                       with_interrupt, interrupt_context_id,
+	                                       pending = m_labels_behind_readbacks] {
+		const bool sent = gpu.TrySendCommand([&renderer, event_id, dst, value, size,
+		                                      with_interrupt, interrupt_context_id, pending] {
+			if (dst != nullptr) {
+				std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
+			}
+			pending->fetch_sub(1, std::memory_order_acq_rel);
+			auto& labels = DeferredLabels();
+			if (const auto deferred = labels.find(reinterpret_cast<uint64_t>(dst));
+			    dst != nullptr && deferred != labels.end() && deferred->second.value == value &&
+			    deferred->second.size == size) {
+				labels.erase(deferred);
+			}
+			if (with_interrupt) {
+				renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			}
+		});
+		if (!sent) {
+			// The GPU is shutting down; nothing waits on the label any more.
+			pending->fetch_sub(1, std::memory_order_acq_rel);
+		}
+	});
+	// Submit at once only when this label put new readbacks in flight, so they start promptly.
+	// A label that only waits behind earlier ones lands with the current command buffer, which
+	// the command processor submits when it finishes or suspends the submission. Submitting for
+	// every such label split a frame into dozens of queue submissions.
+	if (queued) {
+		GetScheduler().Flush();
+	}
+	return true;
+}
+
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
+	// A label deferred behind readbacks lands later, through a GPU-thread command (see
+	// PublishLabelAfterReadbacks). Raising this interrupt from the priority callback could let the
+	// guest handle it and still read that label's old value, so send it the same way, behind them.
+	if (m_labels_behind_readbacks->load(std::memory_order_acquire) != 0 &&
+	    PublishLabelAfterReadbacks(nullptr, 0, sizeof(uint32_t), true, interrupt_context_id)) {
+		return;
+	}
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);

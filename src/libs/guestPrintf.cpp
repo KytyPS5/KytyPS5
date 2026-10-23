@@ -16,6 +16,10 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 namespace Libs {
@@ -777,6 +781,16 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
+		static const bool forward_to_stderr = [] {
+			const char* value = std::getenv("KYTY_GUEST_STDOUT");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (forward_to_stderr) {
+			std::string message("GUEST_STDOUT: ");
+			message.append(buffer.data(), idx);
+			std::fwrite(message.data(), 1, message.size(), stderr);
+			std::fflush(stderr);
+		}
 	}
 
 	// return written chars without terminating \0

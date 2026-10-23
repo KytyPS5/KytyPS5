@@ -79,7 +79,9 @@ void NoteFlip();
 
 // A buffer download from GPU memory started on this thread.
 inline void NoteDownload() noexcept {
-	++Detail::g_downloads;
+	if (Enabled()) {
+		++Detail::g_downloads;
+	}
 }
 [[nodiscard]] inline uint64_t DownloadCount() noexcept {
 	return Detail::g_downloads;

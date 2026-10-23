@@ -8258,6 +8258,80 @@ public:
               !texture_cache.IsMeta(base + 0x28000),
               "retiring the HTile image left its metadata registered");
 
+      // EA SPORTS UFC 6 (PPSA23566) binds one depth surface alternately as D32 with one HTile
+      // and as D32S8 with another, and fast-clears each HTile while the other variant is
+      // bound. Each switch replaces the native image; the clears must survive it.
+      constexpr uint64_t variant_data = 0x2f00000;
+      constexpr uint64_t variant_htile_d32 = 0x2f02000;
+      constexpr uint64_t variant_htile_d32s8 = 0x2f03000;
+      auto variant_d32 = MakeMetadataDepth(variant_data, variant_htile_d32);
+      variant_d32.info.htile_initial_clear = false;
+      auto variant_d32s8 = MakeMetadataDepth(variant_data, variant_htile_d32s8);
+      variant_d32s8.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      variant_d32s8.info.stencil = {base + 0x2f01000, 0x80};
+      variant_d32s8.info.htile_initial_clear = false;
+      variant_d32s8.view_info.format = vk::Format::eD32SfloatS8Uint;
+      variant_d32s8.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
+                                       vk::ImageAspectFlagBits::eStencil;
+      auto bind_variant = [&](ImageDesc desc) {
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindDepthTarget(id, desc);
+        return id;
+      };
+      const auto variant_d32_id = bind_variant(variant_d32);
+      const auto variant_d32s8_id = bind_variant(variant_d32s8);
+      Require(name, "depth variant replacement",
+              variant_d32s8_id != variant_d32_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, variant_d32_id),
+              "the D32S8 binding did not replace the D32 image");
+      Require(name, "HTile clear while the other depth variant is bound",
+              texture_cache.ClearMeta(base + variant_htile_d32),
+              "the D32 HTile was forgotten when its depth surface switched to D32S8");
+      (void)bind_variant(variant_d32);
+      Require(name, "HTile clear across depth variant replacement",
+              texture_cache.IsMetaCleared(base + variant_htile_d32, 0) &&
+                  texture_cache.ClearMeta(base + variant_htile_d32s8),
+              "the D32 rebinding lost its pending clear or the D32S8 HTile");
+      (void)bind_variant(variant_d32s8);
+      Require(name, "HTile clear across the reverse replacement",
+              texture_cache.IsMetaCleared(base + variant_htile_d32s8, 0),
+              "the D32S8 rebinding lost its pending clear");
+      auto variant_storage = MakeLinearDesc(
+          base + variant_data, sizeof(uint32_t), vk::Format::eR32Sfloat,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      variant_storage.type = BindingType::Storage;
+      variant_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      (void)texture_cache.FindImage(variant_storage);
+      Require(name, "HTile state ends with the depth surface",
+              !texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "a non-depth replacement kept the surface's HTile clear state");
+      (void)bind_variant(variant_d32s8);
+      (void)bind_variant(variant_d32);
+      Require(name, "HTile state while a depth variant remains",
+              texture_cache.IsMeta(base + variant_htile_d32) &&
+                  texture_cache.IsMeta(base + variant_htile_d32s8),
+              "the depth variants did not re-register both HTiles");
+      // A kept HTile reused by another depth surface starts from that surface's own state.
+      (void)texture_cache.ClearMeta(base + variant_htile_d32);
+      auto other_surface = MakeMetadataDepth(variant_data + 0x800, variant_htile_d32);
+      other_surface.info.htile_initial_clear = false;
+      (void)bind_variant(other_surface);
+      Require(name, "HTile clear does not move to another surface",
+              !texture_cache.IsMetaCleared(base + variant_htile_d32, 0),
+              "a depth surface inherited another surface's pending HTile clear");
+      texture_cache.UnmapMemory(base + variant_data, sizeof(uint32_t));
+      Require(name, "HTile state of a rebinding surface survives the old surface",
+              texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "retiring a surface erased an HTile another surface had rebound");
+      texture_cache.UnmapMemory(base + variant_data + 0x800, sizeof(uint32_t));
+      Require(name, "HTile state retires with the last depth image",
+              !texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "deleting the surface's last depth image kept its HTile clear state");
+
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =
           MakeLinearDesc(base + partial_unmap_image_offset, 0x2000,

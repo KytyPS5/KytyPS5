@@ -83,6 +83,9 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// Guest depth surface last bound with this HTile. One surface can use several HTile
+		// allocations, such as depth-only and depth-stencil variants.
+		uint64_t depth_address = 0;
 	};
 
 	struct OverlapResult {

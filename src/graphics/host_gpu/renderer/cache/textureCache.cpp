@@ -267,8 +267,25 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
-		m_surface_metas.erase(image->info.metadata.range.address);
+	if (image->info.IsDepth() && !image->depth_id) {
+		// HTile clear state belongs to the guest depth surface, not to one native image: UFC 6
+		// alternates D32 and D32S8 bindings with separate HTiles and clears each while the other
+		// is bound. Keep the state while another HTile depth image of the surface remains; a
+		// non-depth replacement still drops it. Entries another surface rebound are its own.
+		const auto surface  = image->info.data.address;
+		bool       retained = false;
+		for (const auto other: FindImagesInRegion(surface, image->info.data.size, false)) {
+			const auto* owner = m_slot_images.try_get(other);
+			retained |= other != id && owner != nullptr && owner->registered && !owner->depth_id &&
+			            owner->info.IsDepth() &&
+			            owner->info.metadata.kind == ImageMetadataKind::Htile &&
+			            owner->info.data.address == surface;
+		}
+		if (!retained) {
+			std::erase_if(m_surface_metas, [&](const auto& metadata) {
+				return metadata.second.depth_address == surface;
+			});
+		}
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1494,8 +1511,14 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted && image.info.htile_initial_clear) {
-			metadata->second.clear_mask.set();
+		// Key by the native image base; a layered binding may start at a later slice. Clear state
+		// kept for another surface does not carry over when this HTile changes surfaces.
+		if (inserted || metadata->second.depth_address != image.info.data.address) {
+			metadata->second.clear_mask.reset();
+			if (image.info.htile_initial_clear) {
+				metadata->second.clear_mask.set();
+			}
+			metadata->second.depth_address = image.info.data.address;
 		}
 	}
 	RefreshImage(id);

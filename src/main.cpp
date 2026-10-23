@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -524,7 +525,29 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// An exception no one catches (a worker thread of the program cache, for one) ends the process
+// with 0xC0000409 and no message: name the exception first.
+static void ReportUncaughtException() {
+#if defined(__cpp_exceptions)
+	try {
+		if (const auto exception = std::current_exception(); exception != nullptr) {
+			std::rethrow_exception(exception);
+		}
+		std::fprintf(stderr, "terminate called without an active exception\n");
+	} catch (const std::exception& error) {
+		std::fprintf(stderr, "terminate: uncaught exception: %s\n", error.what());
+	} catch (...) {
+		std::fprintf(stderr, "terminate: uncaught exception of an unknown type\n");
+	}
+#else
+	std::fprintf(stderr, "terminate called\n");
+#endif
+	std::fflush(stderr);
+	std::abort();
+}
+
 static int Main(int argc, char* argv[]) {
+	std::set_terminate(ReportUncaughtException);
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
 	// After the address-space reservations: the thread's stack must not land in the guest range.

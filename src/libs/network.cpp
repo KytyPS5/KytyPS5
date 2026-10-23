@@ -1078,7 +1078,35 @@ static int ConvertSocketOptionLevel(int level) {
 	return (level == 0xffff ? SOL_SOCKET : level);
 }
 
-static int ConvertSocketOptionName(int level, int option) {
+#if defined(_WIN32)
+// Whether Winsock implements the SOL_SOCKET option |option|, which shares its BSD number, for a get
+// (|set| false) or a set. Winsock fails the others with WSAEINVAL on datagram sockets, which would
+// hide the ENOPROTOOPT the guest expects (SO_USELOOPBACK, SO_SNDLOWAT and SO_RCVLOWAT are not
+// implemented; SO_ACCEPTCONN and SO_TYPE are get-only).
+static bool WinsockSharesSocketOption(int option, bool set) {
+	switch (option) {
+		case 0x0001:              // SO_DEBUG
+		case 0x0004:              // SO_REUSEADDR
+		case 0x0008:              // SO_KEEPALIVE
+		case 0x0010:              // SO_DONTROUTE
+		case 0x0080:              // SO_LINGER
+		case 0x0100:              // SO_OOBINLINE
+		case 0x1005:              // SO_SNDTIMEO
+		case 0x1006: return true; // SO_RCVTIMEO
+		case 0x0002:              // SO_ACCEPTCONN
+		case 0x1008: return !set; // SO_TYPE
+		default: return false;
+	}
+}
+#endif
+
+static int ConvertSocketOptionName(int level, int option, bool set) {
+#if defined(_WIN32)
+	if (level == 0xffff && option == 0x1007 && set) {
+		// SO_ERROR is get-only, but Winsock accepts a set.
+		return -1;
+	}
+#endif
 	if (level == 0xffff) {
 		switch (option) {
 			case 0x0020: return SO_BROADCAST;
@@ -1092,8 +1120,12 @@ static int ConvertSocketOptionName(int level, int option) {
 		return TCP_NODELAY;
 	}
 #if defined(_WIN32)
+	if (level == 0xffff) {
+		return WinsockSharesSocketOption(option, set) ? option : -1;
+	}
 	return option;
 #else
+	(void)set;
 	return -1;
 #endif
 }
@@ -2178,7 +2210,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
 	const bool send_timeout = (level == 0xffff && optname == 0x1105);
-	optname                = ConvertSocketOptionName(level, optname);
+	optname                 = ConvertSocketOptionName(level, optname, false);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
@@ -2290,7 +2322,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return failed ? SetHostSocketError() : 0;
 	}
 	const bool send_timeout = (level == 0xffff && optname == 0x1105);
-	optname                = ConvertSocketOptionName(level, optname);
+	optname                 = ConvertSocketOptionName(level, optname, true);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}

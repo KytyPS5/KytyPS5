@@ -2258,18 +2258,29 @@ void CheckSocketWakeup() {
             Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net send timeout rejects undersized values");
   uint32_t option_size = sizeof(timeout);
-  Check(net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
-            net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size) ==
+  for (const int option : {0x40, 0x1004, 0x7fffffff}) {
+    Check(net_setsockopt(datagram, 0xffff, option, &timeout, option_size) ==
+              Libs::Network::NET_ERROR_ENOPROTOOPT &&
+              *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
+              net_getsockopt(datagram, 0xffff, option, &timeout, &option_size) ==
+              Libs::Network::NET_ERROR_ENOPROTOOPT &&
+              *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+          "Net unknown socket options return protocol-option errors");
+  }
+  Check(net_setsockopt(datagram, 0xffff, 0x1008, &timeout, option_size) ==
             Libs::Network::NET_ERROR_ENOPROTOOPT &&
             *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
-        "Net unknown socket options return protocol-option errors");
+        "Net get-only socket options cannot be set");
 #if defined(__linux__)
   Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
             Libs::Network::NET_ERROR_ENOPROTOOPT &&
             *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
         "Net native protocol-option errors retain their guest error code");
+#elif defined(_WIN32)
+  Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
+            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
+        "Net SO_ERROR cannot be set");
 #endif
   received.fill(0);
   *net_errno = Libs::Posix::POSIX_EINVAL;

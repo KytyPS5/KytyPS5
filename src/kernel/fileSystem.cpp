@@ -104,6 +104,22 @@ static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
 }
 
+// Windows reports a path below a regular file as not found; POSIX reports ENOTDIR when an
+// existing ancestor is not a directory.
+static bool HasNonDirectoryAncestor(const std::filesystem::path& path) {
+	for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+		std::error_code error;
+		const auto      status = std::filesystem::status(parent, error);
+		if (!error && std::filesystem::exists(status)) {
+			return !std::filesystem::is_directory(status);
+		}
+		if (parent == parent.parent_path()) {
+			break;
+		}
+	}
+	return false;
+}
+
 static void FillRandomBuffer(void* buf, size_t nbytes) {
 	auto*              out = reinterpret_cast<uint8_t*>(buf);
 	std::random_device random;
@@ -1274,7 +1290,9 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	}
 	if (error) {
 		switch (static_cast<std::errc>(error.default_error_condition().value())) {
-			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+			case std::errc::no_such_file_or_directory:
+				return HasNonDirectoryAncestor(real_name) ? KERNEL_ERROR_ENOTDIR
+				                                          : KERNEL_ERROR_ENOENT;
 			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
 			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
 			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;

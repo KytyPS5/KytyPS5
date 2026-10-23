@@ -265,6 +265,40 @@ bool SpirvSourceHasInstructionUsing(const std::string &source,
   return false;
 }
 
+// Storage-buffer accesses are bounded by each slot's exact descriptor range from shader data.
+// Returns the position of the first OpULessThan whose limit is that range of `slot`, or the
+// range shifted to the view's element size; npos if there is none.
+size_t SpirvBufferRangeBoundPosition(const std::string &source,
+                                     const ShaderRecompiler::IR::Bindings &layout,
+                                     uint32_t slot = 0) {
+  const bool push = layout.UsesPushData();
+  const auto range_dword = (push ? layout.push_data_start_dword : 0u) + layout.MemoryRangeDword() + slot;
+  const auto range_pointer = std::string(push ? "%vsharp" : "%shader_data") + " %uint_0 %uint_" +
+                             std::to_string(range_dword);
+  std::unordered_set<std::string> pointers, limits;
+  std::istringstream lines(source);
+  std::string line;
+  size_t position = 0;
+  while (std::getline(lines, line)) {
+    const auto at = position;
+    position += line.size() + 1;
+    std::istringstream stream(line);
+    std::vector<std::string> words;
+    for (std::string word; stream >> word;) words.push_back(word);
+    if (words.size() < 5 || words[1] != "=") continue;
+    if (words[2] == "OpAccessChain" && line.ends_with(range_pointer)) {
+      pointers.insert(words[0]);
+    } else if (words[2] == "OpLoad" && pointers.contains(words[4])) {
+      limits.insert(words[0]);
+    } else if (words[2] == "OpShiftRightLogical" && limits.contains(words[4])) {
+      limits.insert(words[0]);
+    } else if (words[2] == "OpULessThan" && words.size() >= 6 && limits.contains(words[5])) {
+      return at;
+    }
+  }
+  return std::string::npos;
+}
+
 bool SpirvContainsOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
   for (size_t i = 5; i < binary.size();) {
     const uint32_t word = binary[i];
@@ -7463,7 +7497,7 @@ void TestNewShaderRecompilerMubufFormatTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
+void TestNewShaderRecompilerFormattedStoreUsesRuntimeRangeOnly() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x04),
       EncodeMubuf1(0, 0, 1), // buffer_store_format_x
@@ -7490,8 +7524,9 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check((source.find("OpArrayLength") != std::string::npos),
-        "formatted store SPIR-V lacks runtime storage-buffer bounds check");
+  Check(SpirvBufferRangeBoundPosition(source, result.program.bindings) != std::string::npos &&
+            source.find("OpArrayLength") == std::string::npos,
+        "formatted store SPIR-V is not bounded by the runtime descriptor range");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
@@ -10616,19 +10651,18 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
-  const auto array_length =
-      source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
+  const auto bounds_check = SpirvBufferRangeBoundPosition(source, result.program.bindings);
+  const auto bounds_branch = source.find("OpBranchConditional", bounds_check);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
         "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
+  Check(bounds_check != std::string::npos,
+        "buffer load SPIR-V lacks storage buffer range bounds check");
   Check(bounds_branch != std::string::npos,
         "buffer load SPIR-V lacks storage buffer bounds branch");
   Check(element_access != std::string::npos,
         "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
+  Check(exec_branch < bounds_check,
         "buffer load bounds check was emitted outside EXEC guard");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
@@ -10661,13 +10695,12 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
-    const auto array_length =
-        source.find("OpArrayLength", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", array_length);
+    const auto bounds_check = SpirvBufferRangeBoundPosition(source, result.program.bindings);
+    const auto bounds_branch = source.find("OpBranchConditional", bounds_check);
     const auto atomic = source.find(test.spirv, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
-    Check(array_length != std::string::npos &&
+    Check(bounds_check != std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos &&
               memory_barrier != std::string::npos,
@@ -10716,14 +10749,13 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
-    const auto array_length =
-        source.find("OpArrayLength", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", array_length);
+    const auto bounds_check = SpirvBufferRangeBoundPosition(source, result.program.bindings);
+    const auto bounds_branch = source.find("OpBranchConditional", bounds_check);
     const auto atomic =
         source.find(test.spirv_name, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
-    Check(array_length != std::string::npos &&
+    Check(bounds_check != std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos && bounds_branch < atomic,
           "64-bit buffer atomic was not guarded by storage-buffer bounds");
@@ -16778,7 +16810,7 @@ int main() {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
-  TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
+  TestNewShaderRecompilerFormattedStoreUsesRuntimeRangeOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

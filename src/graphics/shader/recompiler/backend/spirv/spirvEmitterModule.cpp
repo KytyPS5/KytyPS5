@@ -258,8 +258,10 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
-	bindings.push_data_start_dword =
-	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
+	for (uint32_t resource = 0; resource < info.buffers.size(); ++resource) {
+		bindings.lane_indexed_data |= SharedIndirectBufferResource(state, resource) != UINT32_MAX;
+	}
+	bindings.push_data_start_dword = bindings.PushDataStartFor(bindings.push_data_start_dword);
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||

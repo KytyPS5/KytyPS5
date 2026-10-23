@@ -1,5 +1,6 @@
 #include "common/additionalContent.h"
 
+#include "common/file.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <regex>
+#include <sstream>
 #include <system_error>
 
 namespace Common {
@@ -107,6 +109,90 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 		entries.push_back(std::move(entry));
 	}
 	return entries;
+}
+
+/// Read title-matched license-only entries from a host file or archive member.
+/// Reject configurations above 64 KiB and incomplete reads before parsing sections.
+std::vector<AddContentEntry> ReadLocalEntitlements(const std::filesystem::path& file,
+                                                  const std::string& title_id) {
+	if (title_id.size() != 9) {
+		return {};
+	}
+	File input(file, File::Mode::Read);
+	if (input.IsInvalid()) {
+		return {};
+	}
+	const auto size = input.Size();
+	if (size == 0 || size > 64 * 1024) {
+		return {};
+	}
+	std::string contents(static_cast<size_t>(size), '\0');
+	uint32_t bytes_read = 0;
+	input.Read(contents.data(), static_cast<uint32_t>(size), &bytes_read);
+	if (bytes_read != size) {
+		return {};
+	}
+	std::istringstream stream(contents);
+	/// Remove surrounding whitespace without changing case-sensitive field values.
+	const auto trim = [](std::string value) {
+		const auto first = value.find_first_not_of(" \t\r\n");
+		return first == std::string::npos ? std::string {} :
+		       value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+	};
+	static const std::regex pattern(
+	    "^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_[0-9]{2}-[A-Z0-9]{16}$");
+	std::map<std::string, AddContentEntry> entries;
+	std::map<std::string, std::string> fields;
+	bool psal = false, invalid = false;
+	/// Accept the completed section only for this title, service zero and NO_EXTRA_DATA.
+	const auto flush = [&] {
+		const auto id = fields.find("content_id");
+		const auto status = fields.find("download_status");
+		const auto service = fields.find("service_label");
+		if (psal && !invalid && id != fields.end() && status != fields.end() &&
+		    status->second == "NO_EXTRA_DATA" &&
+		    (service == fields.end() || service->second == "0") &&
+		    std::regex_match(id->second, pattern) && id->second.compare(7, 9, title_id) == 0) {
+			const auto label = id->second.substr(20);
+			entries.try_emplace(label, AddContentEntry {id->second, label, {}, {}});
+		}
+	};
+	std::string line;
+	while (std::getline(stream, line)) {
+		line = trim(line);
+		if (line.empty() || line[0] == '#' || line[0] == ';') {
+			continue;
+		}
+		if (line[0] == '[') {
+			flush();
+			fields.clear();
+			invalid = false;
+			psal = line == "[PSAL]";
+			continue;
+		}
+		if (!psal) {
+			continue;
+		}
+		const auto equals = line.find('=');
+		if (equals == std::string::npos) {
+			invalid = true;
+			continue;
+		}
+		const auto key = trim(line.substr(0, equals));
+		const auto value = trim(line.substr(equals + 1));
+		// Unknown options may change ownership semantics. Do not silently ignore them.
+		// Keys are not consumed by the entitlement-info APIs implemented here.
+		if ((key != "content_id" && key != "download_status" && key != "service_label" &&
+		     key != "entitlement_key") || !fields.emplace(key, value).second) {
+			invalid = true;
+		}
+	}
+	flush();
+	std::vector<AddContentEntry> result;
+	for (auto& [label, entry]: entries) {
+		result.push_back(std::move(entry));
+	}
+	return result;
 }
 
 } // namespace Common

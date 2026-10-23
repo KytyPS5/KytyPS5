@@ -167,13 +167,14 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
 
+/// Encode installed DLC as installed data, or local PSAL as license-only content.
 static NpEntitlementAccessAddcontEntitlementInfo
-MakeAddcontInfo(const Loader::AddContentEntry& entry) {
+MakeAddcontInfo(const Loader::AddContentEntry& entry, bool license_only = false) {
 	NpEntitlementAccessAddcontEntitlementInfo info {};
 	std::memcpy(info.entitlement_label.data, entry.entitlement_label.data(),
 	            entry.entitlement_label.size());
-	info.package_type    = 2; // Additional content with extra data.
-	info.download_status = 4; // Installed.
+	info.package_type    = license_only ? 3 : 2; // PSAL or additional content with data.
+	info.download_status = license_only ? 0 : 4; // NO_EXTRA_DATA or installed.
 	return info;
 }
 
@@ -407,6 +408,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
 	           : NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
 }
 
+/// Count all visible entries and copy at most list_num; local licenses use service zero.
 static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
     uint32_t service_label, NpEntitlementAccessAddcontEntitlementInfo* list, uint32_t list_num,
     uint32_t* hit_num) {
@@ -423,21 +425,29 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 
 	constexpr auto legacy_count = std::size(NP_ENTITLEMENT_ACCESS_ADDON_LIST);
 	const auto&    entries      = Loader::AddContentGetAll();
-	*hit_num                    = static_cast<uint32_t>(legacy_count + entries.size());
+	const auto&    local        = Loader::LocalEntitlementsGetAll();
+	const auto     local_count  = service_label == 0 ? local.size() : 0;
+	*hit_num = static_cast<uint32_t>(legacy_count + entries.size() + local_count);
 
 	if (list != nullptr && list_num != 0) {
 		memset(list, 0, sizeof(*list) * list_num);
 
 		const auto copy_num = std::min(list_num, *hit_num);
 		for (uint32_t i = 0; i < copy_num; i++) {
-			list[i] = i < legacy_count ? NP_ENTITLEMENT_ACCESS_ADDON_LIST[i]
-			                          : MakeAddcontInfo(entries[i - legacy_count]);
+			if (i < legacy_count) {
+				list[i] = NP_ENTITLEMENT_ACCESS_ADDON_LIST[i];
+			} else if (i < legacy_count + entries.size()) {
+				list[i] = MakeAddcontInfo(entries[i - legacy_count]);
+			} else {
+				list[i] = MakeAddcontInfo(local[i - legacy_count - entries.size()], true);
+			}
 		}
 	}
 
 	return 0;
 }
 
+/// Resolve legacy, installed, then service-zero local entitlements, in that order.
 static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
     uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
     NpEntitlementAccessAddcontEntitlementInfo* info) {
@@ -466,6 +476,16 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	        Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data))) {
 		*info = MakeAddcontInfo(*entry);
 		return 0;
+	}
+
+	if (service_label == 0) {
+		for (const auto& entry: Loader::LocalEntitlementsGetAll()) {
+			if (strncmp(entitlement_label->data, entry.entitlement_label.c_str(),
+			            sizeof(entitlement_label->data)) == 0) {
+				*info = MakeAddcontInfo(entry, true);
+				return 0;
+			}
+		}
 	}
 
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;

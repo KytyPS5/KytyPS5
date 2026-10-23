@@ -473,8 +473,11 @@ void TestSystemServiceEntitlementEvents() {
         "empty event queue reports NO_EVENT");
 }
 
-void TestAddContent(const std::filesystem::path& root) {
+/// Verify installed DLC and local PSAL discovery, isolation, precedence and API replies.
+/// Headless runs skip the existing guest-read check, which requires GPU memory tracking.
+void TestAddContent(const std::filesystem::path& root, bool verify_guest_reads = true) {
   const auto folder = root / "add-ons";
+  /// Write a complete host-side configuration or installed-package fixture.
   const auto write = [](const std::filesystem::path& path, const std::string& text) {
     std::filesystem::create_directories(path.parent_path());
     Common::File file;
@@ -483,11 +486,13 @@ void TestAddContent(const std::filesystem::path& root) {
     file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
     Check(written == text.size(), "write add-on fixture");
   };
+  /// Produce a valid, deterministic 16-character entitlement label.
   const auto label = [](unsigned index) {
     std::array<char, 17> value {};
     std::snprintf(value.data(), value.size(), "DLC%013u", index);
     return std::string(value.data());
   };
+  /// Describe an installed package belonging to one title and entitlement label.
   const auto param = [](const std::string& title, const std::string& entitlement) {
     return "{\"contentId\":\"UP0001-" + title + "_00-" + entitlement + "\"}";
   };
@@ -519,6 +524,7 @@ void TestAddContent(const std::filesystem::path& root) {
   Loader::SymbolDatabase symbols;
   Libs::InitAppContent_1(&symbols);
   Libs::LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(&symbols);
+  /// Resolve the guest API entry point used to check public entitlement behavior.
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
     Check(symbol != nullptr, "add-on export resolves");
@@ -574,12 +580,14 @@ void TestAddContent(const std::filesystem::path& root) {
             !std::string_view(point.data).ends_with('/'),
         "mount owned add-on without trailing slash");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
-  const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
-  std::array<char, 11> payload {};
-  Check(fd >= 3 && FileSystem::KernelRead(fd, payload.data(), payload.size()) == payload.size() &&
-            std::string_view(payload.data(), payload.size()) == "DLC payload" &&
-            FileSystem::KernelClose(fd) == OK,
-        "guest reads files from the selected title's add-on");
+  if (verify_guest_reads) {
+    const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
+    std::array<char, 11> payload {};
+    Check(fd >= 3 && FileSystem::KernelRead(fd, payload.data(), payload.size()) == payload.size() &&
+              std::string_view(payload.data(), payload.size()) == "DLC payload" &&
+              FileSystem::KernelClose(fd) == OK,
+          "guest reads files from the selected title's add-on");
+  }
   MountPoint repeated {};
   Check(mount(0, &info[3].label, &repeated) == OK &&
             std::strcmp(repeated.data, point.data) == 0,
@@ -611,6 +619,88 @@ void TestAddContent(const std::filesystem::path& root) {
               get(0, &info[i].label, &single) == OK,
           "GTA V entitlement lookup works without detected add-ons");
   }
+  const auto app0 = root / "local-entitlement-game";
+  /// Build one PSAL section with explicit download status and Windows line endings.
+  const auto section = [](const std::string& title, const std::string& label,
+                          const std::string& status = "NO_EXTRA_DATA") {
+    return "[PSAL]\r\ncontent_id=UP0001-" + title + "_00-" + label +
+           "\r\ndownload_status=" + status + "\r\n";
+  };
+  const auto local_label = label(70);
+  const auto valid = section("PPSA11111", local_label);
+  write(app0 / "dlc_emu.ini",
+        "; local entitlement fixture\n" + valid + valid +
+        section("PPSA22222", label(71)) +
+        section("PPSA11111", label(72), "INSTALLED") +
+        section("PPSA11111", "SHORT") +
+        section("PPSA11111", label(73)) + "service_label=1\n" +
+        section("PPSA11111", label(74)) + "download_status=NO_EXTRA_DATA\n" +
+        section("PPSA11111", label(75)) + "enabled=false\n" +
+        "[PSAC]\ncontent_id=UP0001-PPSA11111_00-" + label(76) +
+        "\ndownload_status=NO_EXTRA_DATA\n");
+  Loader::AddContentLoad({}, "PPSA11111", app0);
+  Check(Loader::LocalEntitlementsGetAll().size() == 1 &&
+            Loader::AddContentGetAll().empty(),
+        "local PSAL parser deduplicates and rejects foreign, malformed and unsupported entries");
+  Label local_query {};
+  std::memcpy(local_query.data, local_label.c_str(), 17);
+  Check(get(0, &local_query, &single) == OK && single.package_type == 3 &&
+            single.download_status == 0 &&
+            std::strcmp(single.label.data, local_query.data) == 0,
+        "configured license-only entitlement reports PSAL and NO_EXTRA_DATA without debugger");
+  std::array<Info, 5> local_info {};
+  local_info[4].package_type = 99;
+  Check(list(0, local_info.data(), 4, &count) == OK && count == 4 &&
+            std::memcmp(&local_info[3], &single, sizeof(single)) == 0 &&
+            local_info[4].package_type == 99,
+        "local entitlement list matches individual lookup and respects capacity");
+  Check(get(1, &local_query, &single) == static_cast<int>(0x817d0007u) &&
+            list(1, nullptr, 0, &count) == OK && count == 3,
+        "local entitlement does not leak to another service label");
+  Check(mount(0, &local_query, &point) == static_cast<int>(0x80d90005u),
+        "license-only entitlement does not expose a mount directory");
+  Check(get(0, &missing, &single) == static_cast<int>(0x817d0007u),
+        "local config does not grant an unlisted entitlement");
+  Loader::AddContentLoad({}, "PPSA22222", app0);
+  Check(get(0, &local_query, &single) == static_cast<int>(0x817d0007u),
+        "changing titles clears previously loaded local entitlements");
+  Loader::AddContentLoad({}, "PPSA11111", app0 / "missing");
+  Check(Loader::LocalEntitlementsGetAll().empty() &&
+            get(0, &local_query, &single) == static_cast<int>(0x817d0007u),
+        "missing config restores NO_ENTITLEMENT");
+  write(app0 / "dlc_emu.ini", valid + std::string(65536, ' '));
+  Loader::AddContentLoad({}, "PPSA11111", app0);
+  Check(Loader::LocalEntitlementsGetAll().empty(), "oversized local config is rejected");
+  write(app0 / "dlc_emu.ini", section("PPSA11111", label(0)));
+  Loader::AddContentLoad(folder, "PPSA11111", app0);
+  Check(Loader::LocalEntitlementsGetAll().empty() &&
+            list(0, nullptr, 0, &count) == OK && count == 68,
+        "installed add-on wins over duplicate local license entry");
+  const auto archived_game = root / "local-entitlement-game.zar";
+  const std::array<uint8_t, 1> archive_payload{0};
+  Check(ArchiveTests::CreateArchive(archived_game, archive_payload, valid),
+        "create archive containing a root DLC configuration");
+  const auto archived_app0 = Common::MakeArchivePath(archived_game);
+  Loader::AddContentLoad({}, "PPSA11111", archived_app0);
+  Check(Loader::LocalEntitlementsGetAll().size() == 1 &&
+            get(0, &local_query, &single) == OK && single.package_type == 3 &&
+            single.download_status == 0 &&
+            list(0, local_info.data(), local_info.size(), &count) == OK && count == 4,
+        "archive-backed app0 exposes the same local entitlement as an extracted title");
+  Loader::AddContentLoad({}, "PPSA22222", archived_app0);
+  Check(Loader::LocalEntitlementsGetAll().empty(),
+        "archive-backed local entitlement stays isolated to its title");
+  const auto oversized_archive = root / "oversized-local-entitlement-game.zar";
+  Check(ArchiveTests::CreateArchive(oversized_archive, archive_payload,
+                                   valid + std::string(65536, ' ')),
+        "create archive containing an oversized DLC configuration");
+  Loader::AddContentLoad({}, "PPSA11111", Common::MakeArchivePath(oversized_archive));
+  Check(Loader::LocalEntitlementsGetAll().empty(),
+        "archive-backed configuration enforces the uncompressed size limit");
+  Loader::AddContentLoad({}, "PPSA11111", archived_app0 / "missing");
+  Check(Loader::LocalEntitlementsGetAll().empty(),
+        "missing archive member clears previously loaded local entitlements");
+  Loader::AddContentLoad({}, "");
 }
 
 void TestSaveOpenVisibility() {
@@ -2417,6 +2507,7 @@ void CheckSocketWakeup() {
 
 } // namespace
 
+/// Run filesystem integration tests, with a headless mode for additional-content coverage.
 int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
@@ -2425,6 +2516,16 @@ int main(int argc, char** argv) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  if (argc == 2 && std::string_view(argv[1]) == "--add-content-only") {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestAddContent(temporary.Path(), false);
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: additional-content cases passed\n");
+    return 0;
+  }
 
   TestMutexHandoff();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {

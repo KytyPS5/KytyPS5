@@ -17,9 +17,10 @@ inline constexpr std::string_view UnicodeFilename =
     "asset-\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.bin";
 inline const std::string LongFilename = std::string(160, 'a') + ".bin";
 
-// Both Common::File and guest filesystem tests read the same archive layout.
+/// Create a shared archive fixture, optionally including a root DLC configuration.
 inline bool CreateArchive(const std::filesystem::path &path,
-                          std::span<const uint8_t> payload) {
+                          std::span<const uint8_t> payload,
+                          std::string_view entitlement_config = {}) {
   struct Output {
     std::filesystem::path path;
     std::ofstream stream;
@@ -27,11 +28,13 @@ inline bool CreateArchive(const std::filesystem::path &path,
   } output{.path = path};
   {
     ZArchiveWriter writer(
+        /// Open the fixture output when the archive writer requests its first part.
         [](int32_t, void *opaque) {
           auto &out = *static_cast<Output *>(opaque);
           out.stream.open(out.path, std::ios::binary | std::ios::trunc);
           out.good = out.stream.is_open();
         },
+        /// Persist each archive chunk and retain failures until fixture completion.
         [](const void *data, size_t size, void *opaque) {
           auto &out = *static_cast<Output *>(opaque);
           out.stream.write(static_cast<const char *>(data),
@@ -43,6 +46,7 @@ inline bool CreateArchive(const std::filesystem::path &path,
         !writer.MakeDir("assets/subdir", true)) {
       return false;
     }
+    /// Append one named member after the writer has accepted its file header.
     const auto add = [&](std::string_view name, const void *data, size_t size) {
       if (!writer.StartNewFile(name.data())) {
         return false;
@@ -55,6 +59,10 @@ inline bool CreateArchive(const std::filesystem::path &path,
         !add("assets/subdir/data.bin", payload.data(), payload.size()) ||
         !add(UnicodeFilename, Eboot.data(), Eboot.size()) ||
         !add(LongFilename, Eboot.data(), Eboot.size())) {
+      return false;
+    }
+    if (!entitlement_config.empty() &&
+        !add("dlc_emu.ini", entitlement_config.data(), entitlement_config.size())) {
       return false;
     }
     writer.Finalize();

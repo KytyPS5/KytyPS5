@@ -18,6 +18,10 @@ struct AddContentEntry {
 std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
                                             const std::string&           title_id);
 
+/// Read validated PSAL/NO_EXTRA_DATA entries for this title from disk or an archive.
+std::vector<AddContentEntry> ReadLocalEntitlements(const std::filesystem::path& file,
+                                                  const std::string& title_id);
+
 } // namespace Common
 
 #endif /* KYTY_COMMON_ADDITIONAL_CONTENT_H_ */

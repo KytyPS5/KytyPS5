@@ -6,9 +6,9 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -188,7 +188,15 @@ void ReportCheckpoints(vk::Queue queue) {
 bool DeviceLossCheckpointsRequested() {
 	static const bool requested = [] {
 		const char* env = std::getenv("KYTY_GPU_CHECKPOINTS");
-		return env != nullptr && std::strcmp(env, "0") != 0;
+		if (env == nullptr) {
+			return false;
+		}
+		// cmd keeps the space before && in "set KYTY_GPU_CHECKPOINTS=1 && ...".
+		std::string_view value(env);
+		while (!value.empty() && value.back() == ' ') {
+			value.remove_suffix(1);
+		}
+		return value == "1";
 	}();
 	return requested;
 }

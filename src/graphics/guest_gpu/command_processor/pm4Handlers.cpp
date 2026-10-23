@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/mipStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1313,6 +1314,17 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	const auto buffer_size = buffer[0];
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
+
+	if (MipStats::Enabled()) {
+		if (dst != nullptr && buffer_size != 0) {
+			MipStats::Report(dst, buffer_size);
+		}
+		// REPORT_AND_RESET (bit 19) or FORCE_RESET (bit 18), as AgcDcbGetLodStats encodes them.
+		if ((buffer[3] & ((1u << 19u) | (1u << 18u))) != 0) {
+			MipStats::Reset();
+		}
+		return 4;
+	}
 
 	if (dst != nullptr && buffer_size != 0) {
 		memset(dst, 0, buffer_size);

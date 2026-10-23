@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -196,6 +197,10 @@ public:
 	void FlushPendingWork();
 	// Draws or dispatches wait to be recorded (FlushPendingWork records them).
 	[[nodiscard]] bool HasPendingWork() const;
+	// Queues `action` behind the pending work (HasPendingWork): it runs when they are recorded.
+	void QueueDeferred(std::function<void()> action);
+	// The newest pending work is a dispatch: a compute chain may be open after it.
+	[[nodiscard]] bool LastPendingIsDispatch() const;
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
@@ -272,6 +277,7 @@ private:
 	// Queues the lookups of `next` on the front worker, and records the oldest pending work
 	// while more than FrontDepth wait.
 	void QueuePendingWork(CommandBuffer& buffer, PendingWork& next);
+	void TrimPendingWork(CommandBuffer& buffer);
 	// Settles and records the oldest pending work.
 	void RecordOldestPendingWork(CommandBuffer& buffer);
 	// The front worker's job for the pending work is done and still holds, or redone here.

@@ -1852,7 +1852,9 @@ void RenderExecutor::FinishDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // A draw or dispatch waiting to be recorded: what DrawIndex or DispatchDirect knew of it, with a
 // copy of its registers.
-enum class PendingKind : uint8_t { DrawIndex, DrawAuto, Dispatch };
+// Deferred: work of another packet that the command processor queued behind the draws and
+// dispatches before it, so that it records in order without recording them first.
+enum class PendingKind : uint8_t { DrawIndex, DrawAuto, Dispatch, Deferred };
 
 struct PendingWork {
 	PendingKind                   kind      = PendingKind::DrawIndex;
@@ -1881,6 +1883,8 @@ struct PendingWork {
 	// may be in what they read.
 	uint64_t gpu_modified_version = 0;
 	uint64_t ticket               = 0;
+	// Deferred work.
+	std::function<void()> deferred;
 };
 
 // KYTY_FRONT_DEPTH: how many draws or dispatches wait to be recorded while the front worker runs
@@ -1947,17 +1951,55 @@ void RenderExecutor::QueuePendingWork(CommandBuffer& buffer, PendingWork& next) 
 	next.gpu_modified_version = m_context.GetBufferCache().GpuModifiedVersion();
 	next.ticket = pipeline.worker.Start([&next, &pipeline_cache] { RunLookups(next, pipeline_cache); });
 	pipeline.next++;
-	while (pipeline.next - pipeline.first > FrontDepth()) {
+	TrimPendingWork(buffer);
+}
+
+// Records the oldest pending work while more lookups than FrontDepth wait (deferred work has
+// none), or the ring is full.
+void RenderExecutor::TrimPendingWork(CommandBuffer& buffer) {
+	auto&      pipeline = *m_front_pipeline;
+	const auto lookups  = [&] {
+		uint32_t count = 0;
+		for (auto i = pipeline.first; i != pipeline.next; i++) {
+			count += pipeline.work[i % pipeline.work.size()].kind != PendingKind::Deferred ? 1u : 0u;
+		}
+		return count;
+	};
+	while (pipeline.next - pipeline.first >= pipeline.work.size() - 1 || lookups() > FrontDepth()) {
 		RecordOldestPendingWork(buffer);
 	}
+}
+
+void RenderExecutor::QueueDeferred(std::function<void()> action) {
+	EXIT_IF(!HasPendingWork());
+	auto& pipeline = *m_front_pipeline;
+	EXIT_IF(pipeline.busy || pipeline.next - pipeline.first >= pipeline.work.size());
+	auto& next    = pipeline.work[pipeline.next % pipeline.work.size()];
+	next.kind     = PendingKind::Deferred;
+	next.deferred = std::move(action);
+	next.ticket   = 0;
+	pipeline.next++;
+	TrimPendingWork(m_context.GetCommandScheduler().Current());
+}
+
+bool RenderExecutor::LastPendingIsDispatch() const {
+	if (!HasPendingWork()) return false;
+	const auto& pipeline = *m_front_pipeline;
+	return pipeline.work[(pipeline.next - 1) % pipeline.work.size()].kind == PendingKind::Dispatch;
 }
 
 void RenderExecutor::RecordOldestPendingWork(CommandBuffer& buffer) {
 	auto& pipeline = *m_front_pipeline;
 	auto& oldest   = pipeline.work[pipeline.first % pipeline.work.size()];
 	pipeline.busy  = true;
-	SettlePendingLookups(oldest);
-	RecordPendingWork(oldest, buffer);
+	if (oldest.kind == PendingKind::Deferred) {
+		const auto action = std::move(oldest.deferred);
+		oldest.deferred   = {};
+		action();
+	} else {
+		SettlePendingLookups(oldest);
+		RecordPendingWork(oldest, buffer);
+	}
 	pipeline.first++;
 	pipeline.busy = false;
 }

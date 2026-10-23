@@ -495,10 +495,20 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
+	auto& executor     = m_renderer.GetRenderExecutor();
+	// Behind the draws and dispatches before it, which read and write the same memory.
+	const auto run = [&](auto action) {
+		if (executor.HasPendingWork()) {
+			executor.QueueDeferred(std::move(action));
+		} else {
+			action();
+		}
+	};
 	if (src_sel == 2) {
-		buffer_cache.FillBuffer(
-		    dst_address_or_offset, num_bytes,
-		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		run([&buffer_cache, dst_address_or_offset, num_bytes, dst_gds,
+		     value = static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu)] {
+			buffer_cache.FillBuffer(dst_address_or_offset, num_bytes, value, dst_gds);
+		});
 		return;
 	}
 	bool src_gds = false;
@@ -508,8 +518,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
-	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
-	                        dst_gds, src_gds);
+	run([&buffer_cache, dst_address_or_offset, src = src_address_or_offset_or_immediate, num_bytes,
+	     dst_gds, src_gds] {
+		buffer_cache.CopyBuffer(dst_address_or_offset, src, num_bytes, dst_gds, src_gds);
+	});
 }
 
 void GuestGpu::Enqueue(Submission submission) {
@@ -819,8 +831,15 @@ static bool KeepsWorkPending(const uint32_t* packet) {
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
 		case Pm4::IT_DRAW_INDIRECT_MULTI:
 		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		// Only CP state: queued draws have their argument addresses already.
+		case Pm4::IT_SET_BASE:
+		// Queued behind the pending work (CommandProcessor::DmaData).
+		case Pm4::IT_DMA_DATA:
 		case Pm4::IT_DISPATCH_DIRECT:
 		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return true;
+		// Flushes and cache writebacks order nothing the renderer does not (TriggerEvent); an
+		// occlusion counter dump writes memory.
+		case Pm4::IT_EVENT_WRITE: return (packet[1] & 0x3fu) != 0x39u;
 		case Pm4::IT_NOP: {
 			// Padding and the user data markers; other markers flip or write memory.
 			if (KYTY_PM4_R(header) != Pm4::R_ZERO) return false;
@@ -942,7 +961,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		if (!LeavesComputeChainOpen(packet_header)) {
-			GetScheduler().EndComputeChain();
+			// After the pending work: a dispatch queued last can open a chain when it is recorded.
+			// Any other queued work ends a chain it follows itself.
+			auto& executor = m_renderer.GetRenderExecutor();
+			if (executor.LastPendingIsDispatch()) {
+				executor.QueueDeferred([&scheduler = GetScheduler()] { scheduler.EndComputeChain(); });
+			} else if (!executor.HasPendingWork()) {
+				GetScheduler().EndComputeChain();
+			}
 		}
 		// Whatever the packet prepared buffers for has been recorded by now.
 		m_renderer.GetBufferCache().SettleGpuWrites();

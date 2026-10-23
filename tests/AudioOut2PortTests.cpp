@@ -17,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+namespace Libs::LibKernel {
+uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
+} // namespace Libs::LibKernel
+
 namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
@@ -438,13 +442,46 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	      "device port create failed");
 	ResetOutputCalls();
 
+	// Without a device to pace it, the sync push waits on the modelled clock for its grain.
+	const auto before = Libs::LibKernel::KernelGetProcessTime();
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "empty sync push failed");
-	Check(AudioOut2::AudioOut2ContextPush(context, 0) != OK,
+	const auto after = Libs::LibKernel::KernelGetProcessTime();
+	Check(after - before >= 512u * 1000000u / 48000u,
 	      "handle without PCM bypassed queue backpressure");
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "drained queue rejected a push");
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) != OK,
+	      "full async queue accepted another buffer");
 	Check(OutputCalls().empty(), "empty push reached the device backend");
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// Wwise renders a buffer only while GetQueueLevel reports a free slot, then waits for the sync
+// push of that buffer. A sync push that left the queue full stalled its audio thread for good.
+void TestSynchronousPushLeavesRoom() {
+	for (const bool device: {false, true}) {
+		const auto context = CreateContext(2);
+		const auto param   = MakeParam();
+		AudioOut2::AudioOut2PortHandle port = 0;
+		Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+		      "port create failed");
+		uint32_t pcm[512] {};
+		if (device) {
+			SetPcm(port, pcm);
+		}
+		for (int push = 0; push < 3; push++) {
+			Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "sync push failed");
+			uint32_t queued    = 0;
+			uint32_t available = 0;
+			Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK,
+			      "queue-level query failed");
+			Check(available != 0, device ? "device-paced sync push left the queue full"
+			                             : "sync push left the queue full");
+		}
+		AudioOut2::AudioOut2PortDestroy(port);
+		AudioOut2::AudioOut2ContextDestroy(context);
+	}
 }
 
 void TestPcmCopiedBeforeScratchBufferReuse() {
@@ -748,6 +785,7 @@ int main() {
 	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	TestSynchronousPushLeavesRoom();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();

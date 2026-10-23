@@ -382,6 +382,14 @@ void ConfigurationEditDialog::InitGameDirectories() {
 		}
 	});
 
+	// A launcher setting, shown under General in the global settings only.
+	m_close_terminal_check =
+	    new QCheckBox(tr("Close terminal window automatically"), m_ui->general_group);
+	m_close_terminal_check->setToolTip(
+	    tr("Close the terminal window automatically if the emulator exits without an error."));
+	m_ui->generalLayout->addWidget(m_close_terminal_check);
+	m_close_terminal_check->setVisible(false);
+
 	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
 	m_game_dirs_group->setVisible(false);
 
@@ -394,9 +402,12 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir) {
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir,
+                                                bool close_terminal_on_clean_exit) {
 	m_global_settings = true;
 	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
+	m_close_terminal_check->setChecked(close_terminal_on_clean_exit);
+	m_close_terminal_check->setVisible(true);
 	auto* menu = new QMenu(m_ui->settings_button);
 	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
 	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
@@ -418,6 +429,10 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 
 QString ConfigurationEditDialog::GetAddonsDirectory() const {
 	return m_global_settings ? m_addons_dir_edit->text().trimmed() : QString();
+}
+
+bool ConfigurationEditDialog::GetCloseTerminalOnCleanExit() const {
+	return m_global_settings && m_close_terminal_check->isChecked();
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -551,6 +566,7 @@ void ConfigurationEditDialog::clear() {
 	if (m_global_settings) {
 		emit PreviewControllerColor({});
 		m_game_dirs_list->clear();
+		m_close_terminal_check->setChecked(default_info.close_terminal_on_clean_exit);
 		update_game_directory_buttons();
 	}
 }

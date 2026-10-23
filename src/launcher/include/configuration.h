@@ -109,6 +109,8 @@ public:
 	QString    basedir;     /* Game base directory */
 	QString    game_path;   /* Launcher-unique game path */
 	QString    addons_dir;  /* Global setting; not saved per game. */
+	/* Global setting; not saved per game. Close the terminal after a clean (code 0) exit. */
+	bool       close_terminal_on_clean_exit = false;
 	bool       custom_settings = false;
 	GameStatus game_status     = GameStatus::Unknown;
 	QString    game_comment;

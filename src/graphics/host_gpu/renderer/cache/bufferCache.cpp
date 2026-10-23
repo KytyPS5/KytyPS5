@@ -314,10 +314,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			// A write releases the same range below, in the same critical section as its CPU
+			// claim: releasing it here as well would be a second lock acquisition on it, which is
+			// the window this change closes.
+			if (!is_write) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			}
 		}
 		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			// The guest writes these bytes, so whatever the GPU wrote is superseded -- and the
+			// GPU's release and the CPU's claim have to happen under one lock. As two calls, an
+			// upload on the renderer thread can re-mark a page GPU-dirty in between and
+			// RegionManager then exits on "CPU dirty state conflicts with GPU dirty state". This
+			// is also the path a write takes when there is nothing to download: the old code
+			// marked the page CPU-dirty over the GPU's untouched claim.
+			m_memory_tracker.TakeGpuPagesForCpu(vaddr, size);
 		}
 	});
 }

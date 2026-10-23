@@ -50,7 +50,9 @@ public:
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
-	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// A read fault of a compiled SRT load sets *resume_pc instead of downloading the page.
+	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
+	                               uint64_t fault_pc = 0, uint64_t* resume_pc = nullptr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

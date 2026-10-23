@@ -670,6 +670,8 @@ struct ResourcePlan {
 		};
 
 		std::vector<Entry> values;
+		// Values marked unknown in this generation, for SrtWalker::ResetUnknowns.
+		std::vector<uint32_t> unknowns;
 		uint64_t           generation = 0;
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
@@ -703,6 +705,34 @@ struct ResourcePlan {
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// Compiled reads, run from a table: per-slot root reads when srt_code is absent and
+	// per-descriptor offsets into words (UINT32_MAX: interpreted), and room for the addresses one
+	// entry reads.
+	struct SrtReadTable {
+		static constexpr uint32_t UserData  = 1u << 31;
+		static constexpr uint32_t Immediate = 1u << 30;
+		// One memoized guest DWORD read. Words are UserData | index or a read index.
+		struct Read {
+			int64_t  relative = 0; // address: byte offset; buffer: immediate offset
+			uint32_t memo     = 0;
+			uint32_t words[4] {};
+			uint32_t offset = 0; // buffer: constant offset, or the index word when shifted
+			uint8_t  shift  = 0; // buffer: index shift + 1, or 0 for a constant offset
+			bool     buffer = false;
+		};
+		std::vector<Read> reads;
+		// Descriptor DWORDs: Immediate with the value in the next word, UserData | index, or a
+		// read index.
+		std::vector<uint32_t> words;
+	};
+	std::unique_ptr<SrtReadTable> srt_read_table;
+	std::vector<uint32_t>         srt_read_entries;
+	std::vector<uint32_t>         srt_descriptor_entries;
+	mutable std::vector<uint64_t> srt_read_addresses;
+	// Ascending offsets of the guest loads of srt_code, and where a faulting load resumes: the
+	// code then fails, and the walker reads that DWORD itself.
+	std::vector<uint32_t> srt_loads;
+	uint32_t              srt_fault_exit = 0;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;

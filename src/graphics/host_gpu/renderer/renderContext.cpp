@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -55,7 +56,8 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
-bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr, uint64_t fault_pc,
+                                uint64_t* resume_pc) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -66,7 +68,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
+	} else if (resume_pc == nullptr ||
+	           !ShaderRecompiler::IR::ResumeSrtLoadFault(fault_pc, *resume_pc)) {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

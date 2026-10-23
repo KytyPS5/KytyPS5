@@ -656,6 +656,14 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+void BufferCache::NoteAddressWrites() {
+	m_address_write_tick = m_scheduler.CurrentTick();
+}
+
+bool BufferCache::HasAddressWritesInFlight() {
+	return m_address_write_tick != 0 && !m_scheduler.IsFree(m_address_write_tick);
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }

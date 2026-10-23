@@ -5445,6 +5445,105 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A word beside a pending GPU write on its page is read without waiting for that write; a
+  // GPU-written word, or any word while shader address writes are in flight, still waits.
+  void CheckProtectedSrtRead() {
+    constexpr const char *name = "ProtectedSrtRead";
+    constexpr uintptr_t base = 0x0000000207c00000ull;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t gpu_offset = 0x100;
+    constexpr uint64_t cpu_offset = 0x200;
+    constexpr uint32_t stale_value = 0x0badf00du;
+    constexpr uint32_t cpu_value = 0x55667788u;
+    constexpr std::array<uint32_t, 3> gpu_values{0x11223344u, 0x8899aabbu, 0x2468ace0u};
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "protected SRT read allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "protected SRT read mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + gpu_offset, &stale_value, sizeof(stale_value));
+    std::memcpy(memory + cpu_offset, &cpu_value, sizeof(cpu_value));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto gpu_write = [&](uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(base + gpu_offset, sizeof(value), true);
+        buffer->Fill(offset, sizeof(value), value);
+      };
+      const auto read = [&](uint64_t offset) {
+        uint32_t word = 0;
+        Require(name, "protected read",
+                LibKernel::Memory::TryReadProtectedBacking(base + offset, &word,
+                                                           sizeof(word)),
+                "a protected SRT word had no backing");
+        return word;
+      };
+      const auto gpu_pending = [&] {
+        return cache.HasGpuDirtyBytes(base + gpu_offset, sizeof(uint32_t));
+      };
+      const auto settled = [&](uint64_t offset) {
+        uint32_t word = 0;
+        return LibKernel::Memory::TryReadSettledBufferBacking(base + offset, &word,
+                                                              sizeof(word));
+      };
+      gpu_write(gpu_values[0]);
+      Require(name, "settled word beside a GPU write",
+              settled(cpu_offset) && !settled(gpu_offset),
+              "a settled read ignored a pending GPU write");
+      Require(name, "word beside a GPU write",
+              read(cpu_offset) == cpu_value && gpu_pending() &&
+                  cache.IsRegionGpuModified(base + cpu_offset, sizeof(uint32_t)),
+              "a word beside a GPU write waited for it");
+      Require(name, "GPU-written word", read(gpu_offset) == gpu_values[0] && !gpu_pending(),
+              "a GPU-written word was not downloaded");
+      gpu_write(gpu_values[1]);
+      cache.NoteAddressWrites();
+      Require(name, "settled read during address writes", !settled(cpu_offset),
+              "a settled read ignored shader address writes in flight");
+      Require(name, "address writes in flight",
+              read(cpu_offset) == cpu_value && !gpu_pending() &&
+                  read(gpu_offset) == gpu_values[1],
+              "a read during shader address writes did not wait for them");
+      gpu_write(gpu_values[2]);
+      Require(name, "address writes complete",
+              read(cpu_offset) == cpu_value && gpu_pending() &&
+                  read(gpu_offset) == gpu_values[2],
+              "completed shader address writes still made reads wait");
+      Require(name, "settled read after address writes", settled(cpu_offset),
+              "completed shader address writes still blocked settled reads");
+      context.UnmapMemory(base, allocation_size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "protected SRT read mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "protected SRT read allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -50954,6 +51053,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--protected-srt-read-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckProtectedSrtRead();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -51207,6 +51311,7 @@ int main(int argc, char **argv) {
   } else {
     skipped_device_checks = true;
   }
+  vulkan.CheckProtectedSrtRead();
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

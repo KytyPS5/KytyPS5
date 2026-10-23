@@ -38,6 +38,8 @@ struct ExceptionInfo {
 using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
+// From a handler: resumes the faulting thread at `address` instead of retrying the instruction.
+void SetInstructionPointer(const ExceptionInfo& info, uint64_t address);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();

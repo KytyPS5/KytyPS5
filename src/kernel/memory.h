@@ -133,13 +133,20 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread. TryReadProtectedBacking reads a page protected for GPU writes, waiting only when
+// GPU work may change these bytes (false without a backing alias). TryReadSettledBufferBacking
+// is TryReadBufferBacking without the readback: it fails while GPU writes are pending.
+bool                   TryReadProtectedBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadSettledBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// The caller resumes at *resume_pc when set.
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
+                                  uint64_t fault_pc = 0, uint64_t* resume_pc = nullptr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

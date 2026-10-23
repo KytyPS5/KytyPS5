@@ -11,6 +11,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+using SrtProtectedReader = bool (*)(uint64_t address, std::span<uint32_t> values);
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -45,19 +46,31 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Same values as read_specialization_memory, but fails instead of waiting for GPU writes.
+	SrtMemoryReader           try_read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	// Reads the DWORDs of a direct load that faulted on a protected page, waiting only for GPU
+	// writes that may change them. Without it, or when it fails, the load faults as usual.
+	SrtProtectedReader read_protected = nullptr;
 };
+
+// Host fault handler, read faults: a guest load of compiled SRT code running on this thread
+// resumes at `resume`, where the code fails and the walker reads the DWORD again.
+bool ResumeSrtLoadFault(uint64_t pc, uint64_t& resume) noexcept;
 
 class SrtReadCapture {
 public:
 	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
 	    m_source(source), m_ranges(ranges) {}
 	SrtRuntime ObservedRuntime();
+	// The ranges of an observed runtime whose ordinary reads use mapped memory directly.
+	static std::vector<std::pair<uint64_t, uint64_t>>* DirectRanges(const SrtRuntime& runtime);
 
 private:
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool TryReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 	SrtRuntime                                  m_source;
@@ -150,6 +163,15 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// Runs a compiled slot or descriptor entry; false when it fails or cannot run here.
+	bool     CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool descriptor = false);
+	bool     CompiledWord(uint32_t word, uint32_t& value);
+	bool     CompiledRead(uint32_t index, uint32_t& value);
+	bool     EvaluateWithoutWaiting(Value value, uint32_t& result);
+	bool     KnownUnknown(const ResourcePlan::EvaluationContext::Entry& memo);
+	uint32_t NoWaitFailures() const;
+	bool     MarkUnknown(ResourcePlan::EvaluationContext::Entry& memo, uint32_t index,
+	                     uint32_t failures);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -159,6 +181,15 @@ private:
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+	std::vector<std::pair<uint64_t, uint64_t>>* m_captured_ranges = nullptr;
+	bool                                        m_compiled_reads  = false;
+	uint64_t*                                   m_cursor          = nullptr;
+	// Memos marked unknown while evaluating without waiting for pending GPU writes.
+	using UnknownLog = std::vector<std::pair<ResourcePlan::EvaluationContext*, uint32_t>>;
+	UnknownLog* m_no_wait_unknowns = nullptr;
+	UnknownLog  m_no_wait_log;
+	// Readers that failed while evaluating without waiting.
+	uint32_t* m_no_wait_failures = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

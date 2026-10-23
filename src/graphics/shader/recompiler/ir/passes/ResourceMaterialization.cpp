@@ -1566,8 +1566,21 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+static bool MaterializeOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (MaterializeOnce(program, runtime, snapshot, specialization)) return true;
+	if (runtime.try_read_specialization_memory == nullptr) return false;
+	// Conditions that followed both edges may have activated sources that cannot materialize.
+	auto waiting                           = runtime;
+	waiting.try_read_specialization_memory = nullptr;
+	return MaterializeOnce(program, waiting, snapshot, specialization);
+}
+
+static bool MaterializeOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&

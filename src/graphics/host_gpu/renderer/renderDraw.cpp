@@ -1225,6 +1225,7 @@ void RenderExecutor::NoteFlip() {
 		if (m_graphics_bindings.pixel) m_graphics_bindings.pixel->images.clear();
 		m_compute_bindings.images.clear();
 		m_decoded_textures.clear();
+		m_decoded_epoch++;
 	}
 	m_frame++;
 	RegionManager::NoteFrame();

@@ -1077,10 +1077,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// issue thousands of such copies, nearly all under 64 KiB. A formatted buffer over one page
 	// keeps the full path, which takes its bytes from an image when an image holds them.
 	constexpr uint64_t StreamUploadLimit = 4 * CACHING_PAGESIZE;
-	if (!is_written &&
+	// Most ranges a draw reads are clean: asked once, first, it saves the other queries and the
+	// synchronization below, which would find nothing to upload.
+	const bool cpu_modified = !is_written && m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	if (cpu_modified &&
 	    (size <= CACHING_PAGESIZE || (!is_texel_buffer && size <= StreamUploadLimit)) &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && !IsGuestBacked(vaddr, size)) {
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) && !IsGuestBacked(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -1109,7 +1111,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	// A clean range read by a plain buffer has nothing to upload (a texel buffer can take its
+	// bytes from an image).
+	if (is_written || cpu_modified || is_texel_buffer) {
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	}
 	if (m_labels != nullptr) {
 		ApplyPendingLabels(buffer, vaddr, size);
 		if (is_written) {

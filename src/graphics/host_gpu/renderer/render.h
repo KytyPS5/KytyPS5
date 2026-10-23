@@ -393,6 +393,18 @@ private:
 	static constexpr size_t                MaxDecodedTextures = 4096;
 	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash, TextureDecodeKeyEqual>
 	    m_decoded_textures;
+	// The entry each shader image slot found last, by the slot's address: a draw that binds the
+	// same descriptor to the slot again compares instead of hashing. The resource is kept to be
+	// compared too, since a freed program's address can be reused. Void when the table is cleared.
+	struct DecodedSlot {
+		const ShaderRecompiler::IR::ImageResource* slot = nullptr;
+		ShaderRecompiler::IR::ImageResource        resource;
+		ShaderRecompiler::IR::DescriptorValue      value;
+		const DecodedTexture*                      texture = nullptr;
+		uint64_t                                   epoch   = 0;
+	};
+	std::array<DecodedSlot, 8192> m_decoded_slots {};
+	uint64_t                      m_decoded_epoch = 1;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

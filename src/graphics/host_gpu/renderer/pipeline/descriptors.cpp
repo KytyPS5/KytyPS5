@@ -467,13 +467,19 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});
-	if (decoded == m_decoded_textures.end()) {
-		auto texture = DecodeTexture(resource, value);
-		decoded = m_decoded_textures.emplace(TextureDecodeKey {value, resource}, std::move(texture))
-		              .first;
+	auto& slot = m_decoded_slots[(reinterpret_cast<uintptr_t>(&resource) * 0x9e3779b97f4a7c15ull) >>
+	                             51u];
+	if (slot.epoch != m_decoded_epoch || slot.slot != &resource || !(slot.value == value) ||
+	    !(slot.resource == resource)) {
+		auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});
+		if (decoded == m_decoded_textures.end()) {
+			auto texture = DecodeTexture(resource, value);
+			decoded = m_decoded_textures.emplace(TextureDecodeKey {value, resource}, std::move(texture))
+			              .first;
+		}
+		slot = {&resource, resource, value, &decoded->second, m_decoded_epoch};
 	}
-	const auto& texture       = decoded->second;
+	const auto& texture       = *slot.texture;
 	auto&       texture_cache = m_context.GetTextureCache();
 	if (texture.null_descriptor) {
 		return {.layout = vk::ImageLayout::eGeneral};

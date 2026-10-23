@@ -128,6 +128,15 @@ jobs:
         run: |
           cmake --install _Build/windows --prefix _Build/windows/install
 
+      - name: Verify SVG icon deployment
+        shell: pwsh
+        run: |
+          foreach ($file in @('Qt6Svg.dll', 'iconengines/qsvgicon.dll')) {
+            if (-not (Test-Path -LiteralPath "_Build/windows/install/$file")) {
+              throw "Missing SVG runtime dependency: $file"
+            }
+          }
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -252,6 +261,7 @@ jobs:
           install_dir="_Build/macos/install"
           app_dir="$install_dir/KytyPS5.app"
           test -d "$app_dir"
+          test -f "$app_dir/Contents/PlugIns/iconengines/libqsvgicon.dylib"
           for binary in \
             "$install_dir/kyty_emulator" \
             "$install_dir/libMoltenVK.dylib" \
@@ -407,6 +417,7 @@ jobs:
       - name: Verify artifacts
         shell: bash
         run: |
+          test -f _Build/linux/install/plugins/iconengines/libqsvgicon.so
           file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
           test -x _Build/linux/install/kyty_updater

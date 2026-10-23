@@ -2078,9 +2078,17 @@ std::pair<vk::Buffer, uint64_t> RenderExecutor::PrepareIndirectArgs(CommandBuffe
 	              sizeof(vk::DrawIndirectCommand) == 4 * sizeof(uint32_t));
 	const uint64_t size = indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                              : sizeof(vk::DrawIndirectCommand);
+	PerfCounters::Add(PerfCounters::Counter::HostArgsDraws);
 	const auto [source, source_offset] =
 	    m_context.GetBufferCache().ObtainBuffer(emit.indirect_args_address, size, false);
 	EXIT_IF(source == nullptr);
+	// The guest lays the arguments out as Vulkan does, so the draw reads them where they are: no
+	// copy, and no barrier that would end the render pass and drain the GPU. Every GPU write
+	// ends with a barrier that covers indirect reads (the compute chain's ShaderAccessBarrier,
+	// ShaderWriteBarrier, the buffer cache's copies and fills).
+	if (emit.indirect_offsets && (source_offset & 3u) == 0) {
+		return {source->Handle(), source_offset};
+	}
 	auto& copy = AcquireScratch(size);
 	buffer.EndRendering();
 	const auto vk_buffer = buffer.Handle();

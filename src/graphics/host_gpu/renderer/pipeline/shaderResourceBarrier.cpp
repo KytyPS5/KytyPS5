@@ -57,6 +57,7 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
+	                        vk::AccessFlagBits::eIndirectCommandRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
 	                        vk::AccessFlagBits::eColorAttachmentWrite;

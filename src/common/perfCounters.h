@@ -33,6 +33,8 @@ enum class Counter : uint8_t {
 	LeftOutDraws,      // draws left out while their pipeline is built
 	ReadbackBytes,     // bytes copied from GPU images or buffers back to guest memory
 	GpuMicroseconds,   // host GPU time of the command buffers that completed (KYTY_GPU_TIME)
+	HostArgsDraws,     // indirect draws whose arguments the host GPU reads (copied, behind barriers)
+	CpuArgsDraws,      // indirect draws whose arguments the CPU reads
 	Count,
 };
 
@@ -79,6 +81,8 @@ using Gauges                       = std::array<int64_t, GaugeCount>;
 		case Counter::LeftOutDraws: return "left_out_draws";
 		case Counter::ReadbackBytes: return "readback_bytes";
 		case Counter::GpuMicroseconds: return "gpu_us";
+		case Counter::HostArgsDraws: return "host_args_draws";
+		case Counter::CpuArgsDraws: return "cpu_args_draws";
 		case Counter::Count: break;
 	}
 	return "?";

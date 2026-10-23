@@ -836,6 +836,33 @@ void TestPitchClamps() {
 	      "pitch was not clamped to four times playback speed");
 }
 
+// SamplerVoicePeakMeterParam (0x10000009): the voice state reports the largest absolute sample of
+// the last render while the peak meter is enabled, and 0 otherwise.
+void TestPeakMeter() {
+	Fixture       f(48000);
+	const int16_t pcm[] = {8192, -16384, 4096, 0, 2048, 0};
+	f.Queue(pcm, 6, 0);
+	struct PeakMeter {
+		Ngs2VoiceParamHeader header {16, 0, 0x10000009};
+		uint32_t             enable   = 1;
+		uint32_t             reserved = 0;
+	} meter;
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "peak height reported while the peak meter is disabled");
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Render(2);
+	Check(f.State().peak_height == 0.125f, "peak height is not the largest sample of the render");
+	f.Render(2);
+	Check(f.State().peak_height == 0.0625f, "peak height kept a sample from an earlier render");
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "peak height not cleared once the voice ran out of data");
+	meter.enable = 0;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK &&
+	          f.State().peak_height == 0.0f,
+	      "disabling the peak meter did not clear the peak height");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -1727,6 +1754,7 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestPeakMeter();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

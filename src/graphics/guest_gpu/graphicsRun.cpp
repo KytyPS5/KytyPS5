@@ -446,16 +446,27 @@ void GuestGpu::ThreadRun(void* data) {
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		bool                         idle_timeout   = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				const auto idle_start = Common::PerfReport::Now();
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				if (Common::PerfReport::Enabled()) {
+					// Wake up periodically so an idle GPU thread still writes the report on time.
+					idle_timeout = !gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100'000);
+				} else {
+					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				}
 				Common::PerfReport::NoteGpuIdle(idle_start);
+				if (idle_timeout) {
+					break;
+				}
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (idle_timeout) {
+				// Nothing to take: check the report (at the top of the loop) outside the lock.
+			} else if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
@@ -496,6 +507,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = true;
 				has_submission    = true;
 			}
+		}
+		if (idle_timeout) {
+			continue;
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();

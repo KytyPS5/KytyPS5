@@ -39,6 +39,7 @@ struct Stat {
 struct GpuWrite {
 	uint64_t size        = 0;
 	uint64_t shader_hash = 0;
+	uint64_t order       = 0; // when it was last bound, to prefer the newest overlapping binding
 };
 
 // Everything below is reset after each interval except `gpu_writes`, `fault_pages`,
@@ -59,6 +60,7 @@ struct State {
 	std::unordered_map<size_t, Stat>      fault_threads;
 	std::unordered_map<uint64_t, uint64_t> fault_pages; // page -> interval of its last fault
 	std::map<uint64_t, GpuWrite>          gpu_writes;   // by base address
+	uint64_t                              gpu_write_order = 0;
 	Stat                                  waits_total;
 	Stat                                  submits_total;
 	Stat                                  faults;
@@ -346,16 +348,17 @@ void NoteFault(uint64_t address, bool write, uint64_t start, uint64_t buffer_don
 		return;
 	}
 	s.download_faults.Add(elapsed);
-	// Find the GPU-written binding that covers the page. Bindings can nest, so look back a few.
+	// Find the most recently bound GPU-written binding that covers the page. Bindings can overlap,
+	// so check the nearest 64 bases below the address (a bound that keeps this cheap per fault).
 	const GpuWrite* owner = nullptr;
 	uint64_t        base  = 0;
 	auto            it    = s.gpu_writes.upper_bound(address);
 	for (int i = 0; i < 64 && it != s.gpu_writes.begin(); i++) {
 		--it;
-		if (address < it->first + it->second.size) {
+		if (address - it->first < it->second.size &&
+		    (owner == nullptr || it->second.order > owner->order)) {
 			owner = &it->second;
 			base  = it->first;
-			break;
 		}
 	}
 	char key[160];
@@ -384,6 +387,7 @@ void NoteGpuWrite(uint64_t address, uint64_t size, uint64_t shader_hash) {
 	auto& entry       = s.gpu_writes[address];
 	entry.size        = std::max(entry.size, size);
 	entry.shader_hash = shader_hash;
+	entry.order       = ++s.gpu_write_order;
 }
 
 void NoteProtect(uint64_t lock_start, uint64_t call_start) {

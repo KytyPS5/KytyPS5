@@ -520,7 +520,11 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.printf_output_file = ui.lineEdit_printf_file->text();
 	info.profiler_enabled = ui.checkBox_profiler->isChecked();
 	info.perf_report_enabled = ui.checkBox_perf_report->isChecked();
-	info.perf_report_file    = ui.lineEdit_perf_report_file->text();
+	// A blank file name (spaces included) would make the enabled report write nothing.
+	const auto perf_report_file = ui.lineEdit_perf_report_file->text();
+	info.perf_report_file       = info.perf_report_enabled && perf_report_file.trimmed().isEmpty()
+	                                  ? QString::fromLatin1(Configuration::DEFAULT_PERF_REPORT_FILE)
+	                                  : perf_report_file;
 }
 
 void ConfigurationEditDialog::save() {

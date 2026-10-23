@@ -197,6 +197,10 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 
 ConfigurationItem::~ConfigurationItem() = default;
 
+QString ConfigurationItem::SizeText() const {
+	return text(SizeColumn);
+}
+
 void ConfigurationItem::Update(bool reload_icon) {
 	const auto display_text = GetDisplayText(*m_info);
 	const auto path         = GetPathText(*m_info);

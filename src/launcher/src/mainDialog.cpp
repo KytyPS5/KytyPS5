@@ -21,7 +21,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QObject>
-#include <QPointer>
+#include <QPainter>#include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -105,9 +105,7 @@ private:
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
 	ControllerPreview m_controller_preview;
-	TitleSound      m_title_sound;
-	QString         m_interpreter;
-
+	TitleSound      m_title_sound;	QString         m_interpreter;
 	QProcess m_process;
 
 	QPointer<ConfigurationItem> m_running_item;
@@ -139,17 +137,26 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
-	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint |
+	                            Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
-		Update();
+	const auto update_title_sound = [this]() {
 		const auto* item = m_ui->widget->GetSelectedItem();
 		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
 		                           ? item->GetInfo().basedir
 		                           : QString());
+	};
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this, update_title_sound]() {
+		Update();
+		update_title_sound();
+		if (m_ui->widget->GetSelectedItem() != nullptr) {
+			m_title_sound.PlayNavigation();
+		}
 	});
+	// The first game is selected while the widget is built, before this connection exists.
+	update_title_sound();
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
@@ -176,13 +183,37 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		m_ui->widget->WriteSettings();
 	});
 
+	m_controller_preview.SetBatteryMonitor(true);
+	connect(&m_controller_preview, &ControllerPreview::NavigationInput, this,
+	        [this](int action) { m_ui->widget->GamepadNavigate(action); }, Qt::QueuedConnection);
+	connect(&m_controller_preview, &ControllerPreview::StateChanged, this, [this]() {
+		const bool wired = m_controller_preview.ControllerWired();
+		const bool charging = m_controller_preview.BatteryCharging();
+		// Wired and not charging: only the controller + cable glyph is shown.
+		const int percent = !m_controller_preview.ControllerConnected() ? -1
+		                    : (wired && !charging)                    ? 101
+		                                                              : m_controller_preview.BatteryPercent();
+		m_ui->widget->SetControllerBattery(percent, charging);
+	});
+
 	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
 		m_update_checker->SetGameRunning(state != QProcess::NotRunning);
+		if (state == QProcess::Running) {
+			m_main_dialog->showMinimized();
+		}
 		if (state == QProcess::NotRunning) {
+			m_main_dialog->setWindowState(m_main_dialog->windowState() & ~Qt::WindowMinimized);
+			m_main_dialog->show();
+			m_main_dialog->raise();
+			m_main_dialog->activateWindow();
 			if (m_running_item != nullptr) {
 				m_running_item->SetRunning(false);
 			}
 			Update();
+			const auto* selected = m_ui->widget->GetSelectedItem();
+			if (selected != nullptr) {
+				m_title_sound.SetTitle(selected->GetInfo().basedir);
+			}
 		}
 	});
 
@@ -343,8 +374,14 @@ static bool CreateBashScript(const QString& interpreter, const QStringList& args
 			s << " " << BashQuote(arg);
 		}
 		s << "\n";
+		// Keep the terminal open only after a failure, so the launcher is restored as soon as the
+		// emulator exits normally.
+		s << "rc=$?\n";
+		s << "if [ $rc -ne 0 ]; then\n";
 		s << "echo Press any key...\n";
 		s << "read -n1\n";
+		s << "fi\n";
+		s << "exit $rc\n";
 
 		file.close();
 
@@ -467,11 +504,13 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	}
 #elif defined(_WIN32)
 	{
-		// Use nativeArguments so Qt does not re-quote the /K command string.
+		// Use nativeArguments so Qt does not re-quote the command string. /C closes the console
+		// when the emulator exits (so the launcher is restored); it is kept open on failure.
 		process->setProgram(CMD_EXE);
 		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K \"") +
-		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
+		process->setNativeArguments(QStringLiteral("/C \"") +
+		                            BuildWinCmdKCommand(interpreter, args) +
+		                            QStringLiteral(" || pause\""));
 	}
 #else
 	process->setProgram(interpreter);

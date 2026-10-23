@@ -3,6 +3,7 @@
 
 #include "configuration.h"
 
+#include <QCursor>
 #include <QMap>
 #include <QString>
 #include <QStringList>
@@ -30,6 +31,10 @@ public:
 	void SetRunEnabled(bool flag) { m_run_enabled = flag; }
 	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
 	void SetControllerPreview(ControllerPreview* preview) { m_controller_preview = preview; }
+	void SetControllerBattery(int percent, bool charging);
+	void ApplyGridMinimum();
+	// Controller navigation of the grid view; ignored unless the grid is shown in the active window.
+	void GamepadNavigate(int action);
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
@@ -73,7 +78,11 @@ protected slots:
 
 private:
 	void               SelectItem(QTreeWidgetItem* witem);
-	void               ShowContextMenu(QTreeWidgetItem* witem);
+	void               UpdateGridDetails();
+	void               ApplyGridLimit();
+	void               ShowAllGames();
+	void                          SelectFirstVisibleItem();
+	void               ShowContextMenu(QTreeWidgetItem* witem, const QPoint& pos = QCursor::pos());
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();
 	void               ImportGameSettings(QWidget* parent);
@@ -87,7 +96,8 @@ private:
 	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
 	QString                       m_addons_dir;
-	Configuration                 m_global_info;
+	bool                          m_show_latest_activity = true;
+	Configuration                  m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;
 	ControllerPreview*            m_controller_preview = nullptr;

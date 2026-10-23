@@ -27,6 +27,7 @@
 #include <QTabWidget>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <utility>
 
 namespace {
@@ -280,6 +281,55 @@ QPixmap LoadGameArt(const Configuration* game, int height) {
 }
 
 } // namespace
+
+bool TrophyViewerDialog::GetProgress(const Configuration* info, const QString& runtime_directory,
+                                     unsigned& earned, unsigned& total, unsigned& percent) {
+	if (info == nullptr || !HasTrophyData(info)) {
+		return false;
+	}
+	const auto progress = GetGameProgress(info, runtime_directory);
+	earned              = progress.earned;
+	total               = progress.total;
+	percent             = progress.Percentage();
+	return true;
+}
+
+std::vector<TrophyViewerDialog::RecentTrophy>
+TrophyViewerDialog::GetRecent(const Configuration* info, const QString& runtime_directory,
+                              int count) {
+	std::vector<RecentTrophy> result;
+	if (info == nullptr || count <= 0) {
+		return result;
+	}
+	const auto reader = Common::OpenArchive(GameContent::ToPath(info->basedir));
+	for (const auto& file: FindTrophyFiles(info)) {
+		const auto package =
+		    Common::Trophies::LoadPackage(GameContent::ToPath(file), info->console_language);
+		const auto unlocks = LoadUnlocks(*info, runtime_directory, file);
+		for (const auto& [id, tick]: unlocks.timestamps) {
+			const auto found = package.trophies.find(id);
+			if (found == package.trophies.end() || !unlocks.unlocked.contains(id)) {
+				continue;
+			}
+			const auto& trophy = found->second;
+			RecentTrophy recent;
+			recent.name     = TrophyName(id, trophy, false);
+			recent.category = GradeToText(trophy.grade);
+			recent.earned   = QDateTime::fromMSecsSinceEpoch(
+                static_cast<qint64>((tick - Common::Trophies::UnixEpochTick) / 1000));
+			recent.icon     = TrophyIcon(trophy, true, false, 128);
+			recent.cup      = MakeCupIcon(GradeColor(trophy.grade), 36);
+			result.push_back(std::move(recent));
+		}
+	}
+	std::ranges::sort(result, [](const RecentTrophy& a, const RecentTrophy& b) {
+		return a.earned > b.earned;
+	});
+	if (result.size() > static_cast<size_t>(count)) {
+		result.resize(static_cast<size_t>(count));
+	}
+	return result;
+}
 
 void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& games,
                                       const QString& runtime_directory, QWidget* parent) {

@@ -22,7 +22,13 @@ public:
 	void SetPreviewEnabled(bool enabled);
 	void Stop();
 	void SetSuspended(bool suspended);
+	void SetBatteryMonitor(bool enabled);
 
+	// -1 when no connected controller reports a battery.
+	[[nodiscard]] int  BatteryPercent() const { return m_battery_percent; }
+	[[nodiscard]] bool BatteryCharging() const { return m_battery_charging; }
+	[[nodiscard]] bool ControllerConnected() const { return m_connected; }
+	[[nodiscard]] bool ControllerWired() const { return m_wired; }
 	[[nodiscard]] const QSet<QString>& Pressed() const { return m_pressed; }
 	[[nodiscard]] const QSet<QString>& RawPressed() const { return m_raw_pressed; }
 	[[nodiscard]] QPointF              LeftStick() const { return m_left_stick; }
@@ -32,6 +38,8 @@ public:
 
 signals:
 	void StateChanged();
+	// 0 left, 1 right, 2 up, 3 down, 4 accept (A / cross)
+	void NavigationInput(int action);
 
 private:
 	void UpdateRunning();
@@ -44,7 +52,14 @@ private:
 	QColor                             m_color;
 	bool                               m_preview_enabled = false;
 	bool                               m_suspended       = false;
-	QSet<QString>                      m_pressed;
+	bool                               m_battery_enabled = false;
+	int                                m_battery_percent = -1;
+	int                                m_stick_dir       = -1;
+	int                                m_stick_x         = 0;
+	int                                m_stick_y         = 0;
+	bool                               m_connected       = false;
+	bool                               m_wired           = false;
+	bool                               m_battery_charging = false;	QSet<QString>                      m_pressed;
 	QSet<QString>                      m_raw_pressed;
 	QPointF                            m_left_stick;
 	QPointF                            m_right_stick;

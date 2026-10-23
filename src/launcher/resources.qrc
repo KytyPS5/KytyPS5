@@ -11,6 +11,9 @@
   <file alias="kyty-small.svg">icons/kyty-small.svg</file>
   <file alias="hidden-trophy.png">../../assets/images/hidden-trophy.png</file>
  </qresource>
+ <qresource prefix="/sounds">
+  <file alias="navigation.wav">sounds/navigation.wav</file>
+ </qresource>
  <qresource prefix="/styles">
   <file alias="launcher.qss">styles/launcher.qss</file>
  </qresource>

@@ -95,8 +95,15 @@ void ControllerPreview::SetSuspended(bool suspended) {
 	}
 }
 
+void ControllerPreview::SetBatteryMonitor(bool enabled) {
+	if (m_battery_enabled != enabled) {
+		m_battery_enabled = enabled;
+		UpdateRunning();
+	}
+}
+
 void ControllerPreview::UpdateRunning() {
-	if (!m_suspended && (m_preview_enabled || m_color.isValid())) {
+	if (!m_suspended && (m_preview_enabled || m_color.isValid() || m_battery_enabled)) {
 		if (m_timer.isActive()) {
 			return;
 		}
@@ -128,10 +135,17 @@ void ControllerPreview::UpdateRunning() {
 		SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
 	}
 	m_pressed.clear();
+	m_stick_dir = -1;
+	m_stick_x   = 0;
+	m_stick_y   = 0;
 	m_raw_pressed.clear();
 	m_left_stick  = {};
 	m_right_stick = {};
 	m_device_name.clear();
+	m_battery_percent  = -1;
+	m_battery_charging = false;
+	m_connected        = false;
+	m_wired            = false;
 	m_error = m_suspended ? tr("Preview is paused while a game is running.") : QString();
 	emit StateChanged();
 }
@@ -156,6 +170,39 @@ void ControllerPreview::Refresh() {
 			if (auto* gamepad = m_gamepads.take(event.gdevice.which); gamepad != nullptr) {
 				SDL_CloseGamepad(gamepad);
 			}
+			m_stick_dir = -1;
+			m_stick_x   = 0;
+			m_stick_y   = 0;
+		} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+			switch (event.gbutton.button) {
+				case SDL_GAMEPAD_BUTTON_DPAD_LEFT: emit NavigationInput(0); break;
+				case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: emit NavigationInput(1); break;
+				case SDL_GAMEPAD_BUTTON_DPAD_UP: emit NavigationInput(2); break;
+				case SDL_GAMEPAD_BUTTON_DPAD_DOWN: emit NavigationInput(3); break;
+				case SDL_GAMEPAD_BUTTON_SOUTH: emit NavigationInput(4); break;
+				case SDL_GAMEPAD_BUTTON_EAST: emit NavigationInput(5); break;
+				default: break;
+			}
+		} else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+		           (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
+		            event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
+			// The left stick navigates once per push, like a d-pad. The stick is tracked as a
+			// whole: a diagonal push emits one action and re-arms only after returning to center.
+			if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) {
+				m_stick_x = event.gaxis.value;
+			} else {
+				m_stick_y = event.gaxis.value;
+			}
+			const int ax = std::abs(m_stick_x);
+			const int ay = std::abs(m_stick_y);
+			if (m_stick_dir < 0) {
+				if (ax > 20000 || ay > 20000) {
+					m_stick_dir = ax >= ay ? (m_stick_x < 0 ? 0 : 1) : (m_stick_y < 0 ? 2 : 3);
+					emit NavigationInput(m_stick_dir);
+				}
+			} else if (ax < 10000 && ay < 10000) {
+				m_stick_dir = -1;
+			}
 		}
 	}
 
@@ -164,9 +211,26 @@ void ControllerPreview::Refresh() {
 	QPointF       left;
 	QPointF       right;
 	QString       name;
+	int           battery  = -1;
+	bool          charging = false;
+	bool          connected = !m_gamepads.isEmpty();
+	bool          wired     = false;
 	if (!m_gamepads.isEmpty()) {
 		auto* gamepad = m_gamepads.first();
 		name          = QString::fromUtf8(SDL_GetGamepadName(gamepad));
+		wired = SDL_GetGamepadConnectionState(gamepad) == SDL_JOYSTICK_CONNECTION_WIRED;
+		// Use the first connected controller that reports a battery; the wired state describes it.
+		for (auto* candidate: m_gamepads) {
+			int        percent = -1;
+			const auto power   = SDL_GetGamepadPowerInfo(candidate, &percent);
+			if (percent >= 0 && power != SDL_POWERSTATE_NO_BATTERY && power != SDL_POWERSTATE_ERROR) {
+				battery  = percent;
+				// Only an actively charging pack counts; a full wired pad is just powered by USB.
+				charging = power == SDL_POWERSTATE_CHARGING;
+				wired    = SDL_GetGamepadConnectionState(candidate) == SDL_JOYSTICK_CONNECTION_WIRED;
+				break;
+			}
+		}
 		for (const auto& binding: RAW_BUTTONS) {
 			if (SDL_GamepadHasButton(gamepad, binding.button) &&
 			    SDL_GetGamepadButton(gamepad, binding.button)) {
@@ -223,7 +287,12 @@ void ControllerPreview::Refresh() {
 		}
 	}
 	if (pressed != m_pressed || raw != m_raw_pressed || left != m_left_stick ||
-	    right != m_right_stick || name != m_device_name) {
+	    right != m_right_stick || name != m_device_name || battery != m_battery_percent ||
+	    charging != m_battery_charging || connected != m_connected || wired != m_wired) {
+		m_connected        = connected;
+		m_wired            = wired;
+		m_battery_percent  = battery;
+		m_battery_charging = charging;
 		m_pressed     = pressed;
 		m_raw_pressed = raw;
 		m_left_stick  = left;

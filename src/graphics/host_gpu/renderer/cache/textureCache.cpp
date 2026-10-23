@@ -1324,6 +1324,31 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
+		if (!result && desc.type == BindingType::Texture && desc.info.samples == 1) {
+			// Some shaders describe a render target as a taller texture (same address,
+			// pitch and layout). Sample the real target instead of an empty image.
+			for (const auto candidate: candidates) {
+				const auto* src = m_slot_images.try_get(candidate);
+				if (src == nullptr || !src->registered || src->depth_id || src->info.IsDepth() ||
+				    !src->usage.render_target || src->IsCpuDirty() ||
+				    src->info.samples != 1 || src->info.data.address != desc.info.data.address ||
+				    src->info.pitch != desc.info.pitch ||
+				    src->info.tile_mode != desc.info.tile_mode ||
+				    src->info.bytes_per_block != desc.info.bytes_per_block ||
+				    src->info.pixel_format != desc.info.pixel_format ||
+				    src->info.GetColorTransform() != desc.info.GetColorTransform() ||
+				    src->info.type != desc.info.type ||
+				    src->info.resources != desc.info.resources ||
+				    src->info.extent.width != desc.info.extent.width ||
+				    src->info.extent.height >= desc.info.extent.height ||
+				    src->info.data.size >= desc.info.data.size) {
+					continue;
+				}
+				result = candidate;
+				break;
+			}
+		}
+
 		if (result && !m_slot_images[result].depth_id) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {

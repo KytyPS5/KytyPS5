@@ -128,7 +128,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    resource.formatted || resource.read, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;

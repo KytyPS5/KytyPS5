@@ -303,17 +303,17 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
-	// Lets a fault handler on this thread report that it waited for a download.
-	Common::PerfReport::NoteDownload();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	bool downloaded = false;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &downloaded] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
+		downloaded = true;
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
@@ -323,6 +323,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (downloaded) {
+		// SendCommandSync has returned, so the flag is final. Counted on this thread: the fault
+		// handler that called us compares its thread-local count to report a download.
+		Common::PerfReport::NoteDownload();
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

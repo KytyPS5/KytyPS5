@@ -87,8 +87,11 @@ struct State {
 };
 
 State& Get() {
-	static State state;
-	return state;
+	// Never destroyed: Config::Shutdown can stop the report from a static destructor that runs
+	// after this function's static would have been destroyed (for example a static Subsystems
+	// created before the first Config::Load). Locking a destroyed mutex throws on macOS.
+	static auto* const state = new State;
+	return *state;
 }
 
 uint64_t Elapsed(uint64_t start) {
@@ -264,6 +267,9 @@ void NoteGpuWait(bool gpu_thread, uint64_t start) {
 	auto             name    = SiteName(gpu_thread);
 	auto&            s       = Get();
 	std::scoped_lock guard {s.lock};
+	if (!Enabled()) {
+		return; // stopped (and its last block written) while this event waited for the lock
+	}
 	s.waits[std::move(name)].Add(elapsed);
 	s.waits_total.Add(elapsed);
 }
@@ -276,6 +282,9 @@ void NoteQueueSubmit(bool gpu_thread, uint64_t start) {
 	auto             name    = SiteName(gpu_thread);
 	auto&            s       = Get();
 	std::scoped_lock guard {s.lock};
+	if (!Enabled()) {
+		return; // stopped (and its last block written) while this event waited for the lock
+	}
 	s.submits[std::move(name)].Add(elapsed);
 	s.submits_total.Add(elapsed);
 }
@@ -307,6 +316,9 @@ void NoteFault(uint64_t address, bool write, uint64_t start, uint64_t buffer_don
 	const auto       thread  = std::hash<std::thread::id> {}(std::this_thread::get_id());
 	auto&            s       = Get();
 	std::scoped_lock guard {s.lock};
+	if (!Enabled()) {
+		return; // stopped (and its last block written) while this event waited for the lock
+	}
 	s.faults.Add(elapsed);
 	if (write) {
 		if (buffer_done != 0) {
@@ -363,6 +375,9 @@ void NoteGpuWrite(uint64_t address, uint64_t size, uint64_t shader_hash) {
 	}
 	auto&            s = Get();
 	std::scoped_lock guard {s.lock};
+	if (!Enabled()) {
+		return; // stopped (and its last block written) while this event waited for the lock
+	}
 	if (s.gpu_writes.size() >= MaxGpuWrites) {
 		s.gpu_writes.clear();
 	}

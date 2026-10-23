@@ -23,7 +23,8 @@ frame rate with the report on was within run-to-run noise of the frame rate with
 The GPU command thread writes each block between commands. While it is stuck in one long
 command an interval stretches, so check the interval length printed on each block's first line.
 When the emulator exits, including on a fatal error, the time since the last block is written as
-a final block marked "last, partial", so even a session shorter than one interval gets a report.
+a final block marked "last, partial" if at least 100 ms have passed, so a session shorter than
+one interval still gets a report unless it ends within 100 ms of starting.
 
 ## Reading it
 
@@ -75,7 +76,7 @@ is where to look.
 | `GPU command thread` | Share of the interval the GPU command thread had no work (*idle*), or had work but every queue waited on a guest condition such as `WAIT_REG_MEM` (*blocked*). | Near 0% idle with a low frame rate means the command thread is the bottleneck: read the rest of the block. High *blocked* means it is waiting for the game's CPU threads. |
 | `GPU waits` | Times a CPU thread blocked on the GPU timeline semaphore, and the total time. | Every wait stalls the CPU until the GPU finishes all earlier work. See *by call site* below. |
 | `queue submits` | Vulkan queue submissions and the time spent submitting. | Many submits per frame usually come from synchronous downloads or flushes. |
-| `write-tracking faults` | Guest writes to memory the GPU caches track, and the time spent in the fault handler. | The handler runs on the faulting game thread, so this time blocks the game directly. |
+| `write-tracking faults` | Guest reads and writes that fault on memory the GPU caches track, and the time spent in the fault handler. Read faults are also counted on their own line. | The handler runs on the faulting game thread, so this time blocks the game directly. |
 | `faults that downloaded GPU data first` | Faults on pages the GPU had written: the handler waited for the GPU thread to download them before the write could continue. | Usually the most expensive kind. See *download faults by the shader write* below. |
 | `pages` | Pages faulting for the first time vs. faulting again in the same interval. | Repeat faults mean memory ping-pongs between CPU and GPU ownership. |
 | `tracking protection changes` | Page-protection changes made by write tracking: time waiting for the address-space lock, and time in the OS call. | High call time means many small protection changes. |

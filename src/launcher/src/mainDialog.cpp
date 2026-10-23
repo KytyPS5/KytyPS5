@@ -332,7 +332,7 @@ static QString BashQuote(QString value) {
 }
 
 static bool CreateBashScript(const QString& interpreter, const QStringList& args,
-                             const QString& file_name) {
+                             const QString& file_name, bool close_on_clean_exit) {
 	QFile file(file_name);
 	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
 		QTextStream s(&file);
@@ -343,6 +343,12 @@ static bool CreateBashScript(const QString& interpreter, const QStringList& args
 			s << " " << BashQuote(arg);
 		}
 		s << "\n";
+		if (close_on_clean_exit) {
+			// Keep the terminal open only when the emulator failed.
+			s << "status=$?\n";
+			s << "if [ $status -eq 0 ]; then exit 0; fi\n";
+			s << "echo \"Exited with code $status.\"\n";
+		}
 		s << "echo Press any key...\n";
 		s << "read -n1\n";
 
@@ -446,7 +452,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 
 #ifdef __linux__
 	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
-	if (!CreateBashScript(interpreter, args, bash_file_name)) {
+	if (!CreateBashScript(interpreter, args, bash_file_name, info.close_terminal_on_clean_exit)) {
 		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
 		QApplication::quit();
 		return;
@@ -470,8 +476,12 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		// Use nativeArguments so Qt does not re-quote the /K command string.
 		process->setProgram(CMD_EXE);
 		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K \"") +
-		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
+		// With the option on, "&& exit" closes the window only after a clean (code 0) exit;
+		// otherwise /K keeps the prompt open with the output.
+		process->setNativeArguments(
+		    QStringLiteral("/K \"") + BuildWinCmdKCommand(interpreter, args) +
+		    (info.close_terminal_on_clean_exit ? QStringLiteral(" && exit") : QString()) +
+		    QLatin1Char('"'));
 	}
 #else
 	process->setProgram(interpreter);

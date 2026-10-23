@@ -80,6 +80,7 @@ constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
 constexpr char CONF_GAME_DIRS[]    = "game_dirs";
 constexpr char CONF_ADDONS_DIR[]   = "addons_dir";
+constexpr char CONF_CLOSE_TERMINAL[] = "close_terminal_on_clean_exit";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
 
@@ -403,6 +404,7 @@ void ConfigurationListWidget::WriteSettings() {
 	m_game_dirs = NormalizeGameDirectories(m_game_dirs);
 	s->setValue(CONF_GAME_DIRS, m_game_dirs);
 	s->setValue(CONF_ADDONS_DIR, m_addons_dir);
+	s->setValue(CONF_CLOSE_TERMINAL, m_close_terminal_on_clean_exit);
 	s->setValue("grid_view", m_ui->grid_view_button->isChecked());
 	s->setValue("grid_icon_width", m_ui->grid_size_slider->value());
 	s->remove(CONF_GAME_DIR);
@@ -453,6 +455,7 @@ void ConfigurationListWidget::ReadSettings() {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
 	m_addons_dir = NormalizeGameDirectory(s->value(CONF_ADDONS_DIR).toString());
+	m_close_terminal_on_clean_exit = s->value(CONF_CLOSE_TERMINAL, false).toBool();
 	s->endGroup();
 
 	s->beginGroup(CONF_GLOBAL);
@@ -518,6 +521,7 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	}
 	info->host_input_mapping = m_global_info.host_input_mapping;
 	info->addons_dir         = m_addons_dir;
+	info->close_terminal_on_clean_exit = m_close_terminal_on_clean_exit;
 	return info;
 }
 
@@ -903,7 +907,7 @@ void ConfigurationListWidget::edit_global_settings() {
 
 	ConfigurationEditDialog dlg(info, this);
 	dlg.setWindowTitle(tr("Global settings"));
-	dlg.SetGlobalSettings(m_game_dirs, m_addons_dir);
+	dlg.SetGlobalSettings(m_game_dirs, m_addons_dir, m_close_terminal_on_clean_exit);
 	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
 	        &ConfigurationListWidget::PreviewControllerColor);
 	connect(&dlg, &ConfigurationEditDialog::ImportGameSettings, this,
@@ -918,6 +922,7 @@ void ConfigurationListWidget::edit_global_settings() {
 		const bool game_dirs_changed = game_dirs != m_game_dirs;
 		m_game_dirs                  = game_dirs;
 		m_addons_dir                 = NormalizeGameDirectory(dlg.GetAddonsDirectory());
+		m_close_terminal_on_clean_exit = dlg.GetCloseTerminalOnCleanExit();
 		WriteSettings();
 		if (game_dirs_changed) {
 			ScanGameDirectory();

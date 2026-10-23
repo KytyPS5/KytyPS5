@@ -87,6 +87,7 @@ private:
 	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
 	QString                       m_addons_dir;
+	bool                          m_close_terminal_on_clean_exit = false;
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;

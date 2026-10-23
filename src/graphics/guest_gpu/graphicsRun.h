@@ -68,6 +68,7 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	void              FlushMergedSubmissions();
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
@@ -79,9 +80,11 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::atomic_uint64_t                           m_work_generation {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
+	std::atomic_bool                               m_merge_pending {false};
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;

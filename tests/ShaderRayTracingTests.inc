@@ -45,10 +45,15 @@ void TestRayTracingInstructions() {
   D::DecodeProgram(literal, decoded);
   Check(decoded.instructions.size() == 2 && decoded.instructions[0].opcode == D::Opcode::S_MOV_B32,
         "BVH-shaped scalar literal was decoded as an instruction");
+  for (const auto words : {std::array{0xf1989f01u, 0x40081014u}}) { // A16
+    const std::array stubbed{words[0], words[1], EncodeSopp(0x01)};
+    const auto miss = RecompileForTest(stubbed, MakeCompileOptions(ShaderType::Compute));
+    Check(miss.program.uses_bvh_intersect_stub &&
+              CountSourceOccurrences(miss.ir_dump, "BvhIntersect") == 0,
+          "BVH encoding without an emulated path did not lower to a constant miss");
+  }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  for (const auto words : {std::array{0xf19c9f01u, 0x40081014u}, // BVH64 A16
-                           std::array{0xf1989f01u, 0x40081014u}, // BVH32 A16
-                           std::array{0xf1981f01u, 0x00081014u}, // not R128
+  for (const auto words : {std::array{0xf1981f01u, 0x00081014u}, // not R128
                            std::array{0xf1989f01u, 0x80081014u}}) { // D16
     const std::array unsupported{words[0], words[1], EncodeSopp(0x01)};
     ExpectFatal([&]() { (void)RecompileForTest(unsupported, MakeCompileOptions(ShaderType::Compute)); },

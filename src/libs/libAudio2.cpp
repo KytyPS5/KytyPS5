@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <vector>
 
 namespace Libs::Audio {
@@ -170,14 +171,31 @@ static std::atomic_uint64_t g_audioout2_next_context {1};
 static std::atomic_uint64_t g_audioout2_next_port {1};
 static AudioOut2UserHandle g_audioout2_next_user = 1;
 
+struct AudioOut2GrainPort {
+	AudioOut2PortHandle   port         = 0;
+	int                   audio_handle = 0;
+	std::vector<uint8_t>  pcm;
+	std::array<float, 16> gains {};
+};
+
+// One grain of a context's output: its device ports and its mixed object bus.
+struct AudioOut2Grain {
+	std::vector<AudioOut2GrainPort> ports;
+	std::vector<float>              object_mix;
+};
+
 struct AudioOut2ContextState {
-	bool                   used                = false;
-	AudioOut2ContextHandle handle              = 0;
-	uint32_t               queue_depth         = 4;
-	uint32_t               queued              = 0;
-	uint32_t               num_grains          = 512;
-	uint64_t               last_update         = 0;
-	int                    object_audio_handle = 0;
+	bool                       used             = false;
+	AudioOut2ContextHandle     handle           = 0;
+	uint32_t                   queue_depth      = 4;
+	uint32_t                   queued           = 0;
+	uint32_t                   num_grains       = 512;
+	uint64_t                   last_update      = 0;
+	uint64_t                   last_update_frac = 0; // in 1/48000 us
+	bool                       idle             = true;
+	std::deque<AudioOut2Grain> advanced;
+	bool                       uses_advance        = false;
+	int                        object_audio_handle = 0;
 };
 
 struct AudioOut2PortStateEntry {
@@ -194,6 +212,7 @@ struct AudioOut2PortStateEntry {
 	std::array<float, 16>  gains {};
 	uint32_t               ambisonics        = UINT32_MAX;
 	bool                   attributes_locked = false;
+	bool                   pcm_fresh         = false;
 	std::vector<uint8_t>   pcm_data;
 };
 struct AudioOut2SpeakerArrayState {
@@ -260,6 +279,14 @@ static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHand
 
 static AudioOut2Submission& audioout2_submission(const AudioOut2ContextState& context) {
 	return g_audioout2_submissions[&context - g_audioout2_contexts.data()];
+}
+
+static constexpr uint64_t AUDIO_OUT2_CLOCK_RATE = 48000;
+
+// Grain length in 1/48000 us units, i.e. samples * 1000000.
+static uint64_t audioout2_grain_scaled(uint32_t grains) {
+	const auto sample_count = static_cast<uint64_t>(grains == 0 ? 512u : grains);
+	return std::max<uint64_t>(sample_count * 1000000u, 1000u * AUDIO_OUT2_CLOCK_RATE);
 }
 
 static uint32_t audioout2_grain_micros(uint32_t grains) {
@@ -331,27 +358,72 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
+	// The modelled output takes one grain per tick of a free-running clock, like a hardware mixer.
 	const auto now = LibKernel::KernelGetProcessTime();
-	if (state->last_update == 0 || state->queued == 0) {
+	if (state->last_update == 0) {
 		state->last_update = now;
 		return;
 	}
 
-	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
-	if (now <= state->last_update || grain_micros == 0) {
+	const auto grain = audioout2_grain_scaled(state->num_grains);
+	if (now <= state->last_update) {
 		return;
 	}
-
-	const auto elapsed = now - state->last_update;
-	const auto drained = std::min<uint64_t>(state->queued, elapsed / grain_micros);
-	if (drained == 0) {
+	const auto elapsed = (now - state->last_update) * AUDIO_OUT2_CLOCK_RATE;
+	if (elapsed < state->last_update_frac + grain) {
 		return;
 	}
+	const auto ticks = (elapsed - state->last_update_frac) / grain;
 
+	const auto drained = std::min<uint64_t>(state->queued, ticks);
 	state->queued -= static_cast<uint32_t>(drained);
-	state->last_update += drained * grain_micros;
-	if (state->queued == 0) {
-		state->last_update = now;
+	if (ticks > drained) {
+		state->idle = true;
+	}
+	const auto advance = state->last_update_frac + ticks * grain;
+	state->last_update += advance / AUDIO_OUT2_CLOCK_RATE;
+	state->last_update_frac = advance % AUDIO_OUT2_CLOCK_RATE;
+}
+
+static void audioout2_accept_grain_locked(AudioOut2ContextState* state) {
+	if (state->queued == 0 && state->idle) {
+		// The output ran dry, so its clock restarts with this grain.
+		state->last_update      = LibKernel::KernelGetProcessTime();
+		state->last_update_frac = 0;
+		state->idle             = false;
+	}
+	if (state->queued < state->queue_depth) {
+		state->queued++;
+	}
+}
+
+static uint64_t audioout2_micros_to_next_tick_locked(const AudioOut2ContextState& state) {
+	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state.num_grains));
+	const auto now          = LibKernel::KernelGetProcessTime();
+	const auto next_tick =
+	    state.last_update + (state.last_update_frac + audioout2_grain_scaled(state.num_grains) +
+	                         AUDIO_OUT2_CLOCK_RATE - 1) /
+	                            AUDIO_OUT2_CLOCK_RATE;
+	return next_tick > now ? std::min(next_tick - now, grain_micros + 1) : 1;
+}
+
+// A synchronous push returns once the queue can take another grain.
+static void audioout2_wait_for_free_slot(AudioOut2ContextHandle ctx) {
+	for (;;) {
+		uint64_t sleep_micros = 0;
+		g_audioout2_state_mutex.Lock();
+		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+			audioout2_update_context_locked(state);
+			if (state->queued >= state->queue_depth) {
+				sleep_micros = audioout2_micros_to_next_tick_locked(*state);
+			}
+		}
+		g_audioout2_state_mutex.Unlock();
+
+		if (sleep_micros == 0) {
+			return;
+		}
+		Common::Thread::SleepMicro(static_cast<uint32_t>(sleep_micros));
 	}
 }
 
@@ -371,18 +443,89 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
 
-static bool audioout2_context_has_queueable_device(const AudioOut2ContextState& context) {
-	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == context.handle && !state.pcm_data.empty()) {
-			const int handle = audioout2_port_type_is_object(state.port_type)
-			                       ? context.object_audio_handle
-			                       : state.audio_handle;
-			if (AudioInternal::AudioOutHasDevice(handle)) {
-				return true;
+using AudioOut2StereoGains = std::array<float, 2>;
+
+using AudioOut2AmbisonicsTable = std::array<AudioOut2StereoGains, 36>;
+
+// ACN/SN3D orders 0-5 to stereo: a 24-speaker max-rE ring warped onto +-30 deg, front +2 dB.
+static AudioOut2AmbisonicsTable audioout2_build_ambisonics_table() {
+	constexpr int                 order      = 5;
+	constexpr int                 speakers   = 24;
+	constexpr double              pi         = 3.14159265358979323846;
+	const double                  front_gain = std::pow(10.0, 2.0 / 20.0);
+	std::array<double, order + 1> sn3d {};   // horizon amplitude of the sectoral harmonics
+	std::array<double, order + 1> weight {}; // max-rE
+	for (int l = 0; l <= order; l++) {
+		double factorial = 1.0;
+		double odd       = 1.0;
+		for (int i = 2; i <= 2 * l; i++) {
+			factorial *= i;
+		}
+		for (int i = 1; i < 2 * l; i += 2) {
+			odd *= i;
+		}
+		sn3d[l]   = l == 0 ? 1.0 : std::sqrt(2.0 / factorial) * odd;
+		weight[l] = std::cos(l * pi / (2 * order + 2));
+	}
+	std::array<std::array<double, 2>, 36> gains {};
+	std::array<std::array<double, 2>, 36> flat {};
+	for (int k = 0; k < speakers; k++) {
+		const double azimuth  = 2.0 * pi * k / speakers; // counterclockwise, 0 = front
+		const double lateral  = std::asin(std::clamp(std::sin(azimuth), -1.0, 1.0));
+		const double side     = std::clamp(lateral / (pi / 6.0), -1.0, 1.0);
+		const double pan      = (1.0 - side) * pi / 4.0;
+		const double out[2]   = {std::cos(pan) / speakers, std::sin(pan) / speakers};
+		const double ahead    = std::max(0.0, std::cos(azimuth));
+		const double emphasis = 1.0 + (front_gain - 1.0) * ahead * ahead;
+		for (int ch = 0; ch < 2; ch++) {
+			std::array<double, 36> row {};
+			row[0] = out[ch] * weight[0];
+			for (int l = 1; l <= order; l++) {
+				row[l * l + 2 * l] = out[ch] * 2.0 * weight[l] * std::cos(l * azimuth) / sn3d[l];
+				row[l * l]         = out[ch] * 2.0 * weight[l] * std::sin(l * azimuth) / sn3d[l];
+			}
+			for (size_t i = 0; i < row.size(); i++) {
+				flat[i][ch] += row[i];
+				gains[i][ch] += row[i] * emphasis;
 			}
 		}
 	}
-	return false;
+	double front = flat[0][0];
+	for (int l = 1; l <= order; l++) {
+		front += flat[l * l + 2 * l][0] * sn3d[l];
+	}
+	AudioOut2AmbisonicsTable result {};
+	for (size_t i = 0; i < result.size(); i++) {
+		for (int ch = 0; ch < 2; ch++) {
+			result[i][ch] = static_cast<float>(gains[i][ch] * 0.70710678118654752 / front);
+		}
+	}
+	return result;
+}
+
+static const AudioOut2AmbisonicsTable& audioout2_ambisonics_stereo() {
+	static const AudioOut2AmbisonicsTable table = audioout2_build_ambisonics_table();
+	return table;
+}
+
+static bool audioout2_object_stereo_gains(uint32_t ambisonics, AudioOut2StereoGains* gains) {
+	const auto& acn = audioout2_ambisonics_stereo();
+	if (ambisonics == UINT32_MAX) {
+		*gains = {0.70710678f, 0.70710678f};
+	} else if (ambisonics >= 64 && ambisonics < 64 + acn.size()) {
+		*gains = acn[ambisonics - 64];
+	} else if (ambisonics <= 3) {
+		// FuMa W is -3 dB relative to SN3D; FuMa orders its first-order terms X, Y, Z.
+		static constexpr uint32_t FUMA_TO_ACN[4] = {0, 3, 1, 2};
+		*gains                                   = acn[FUMA_TO_ACN[ambisonics]];
+		if (ambisonics == 0) {
+			(*gains)[0] *= 1.41421356f;
+			(*gains)[1] *= 1.41421356f;
+		}
+	} else {
+		return false;
+	}
+	return true;
 }
 
 static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
@@ -391,21 +534,14 @@ static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
 		mix.resize(static_cast<size_t>(num_grains) * 2, 0.0f);
 	}
 
-	// Center ordinary objects. First-order stereo ambisonics uses left/right-facing
-	// cardioids; FuMa W has a different normalization from ACN/SN3D W.
-	constexpr float half_power = 0.70710678f;
-	float           left = half_power, right = half_power;
-	switch (object.ambisonics) {
-		case UINT32_MAX:
-		case 64: break;
-		case 0: left = right = 1.0f; break;
-		case 2:
-		case 65: right = -half_power; break;
-		default: return;
+	AudioOut2StereoGains stereo {};
+	if (!audioout2_object_stereo_gains(object.ambisonics, &stereo)) {
+		return;
 	}
-	left *= object.gains[0];
-	right *= object.gains[0];
-	for (uint32_t frame = 0; frame < num_grains; frame++) {
+	const float left   = stereo[0] * object.gains[0];
+	const float right  = stereo[1] * object.gains[0];
+	const auto  frames = std::min<size_t>(mix.size() / 2, object.samples_num);
+	for (size_t frame = 0; frame < frames; frame++) {
 		const float sample =
 		    object.audio_format == AudioInternal::Format::FloatMono
 		        ? reinterpret_cast<const float*>(object.pcm_data.data())[frame]
@@ -415,8 +551,49 @@ static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
 	}
 }
 
-static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2Submission& out,
-                                          bool blocking) {
+static AudioOut2Grain audioout2_snapshot_context_locked(const AudioOut2ContextState& context,
+                                                        bool                         fresh_only) {
+	AudioOut2Grain grain;
+	for (const auto& state: g_audioout2_ports) {
+		if (!state.used || state.context != context.handle || state.pcm_data.empty()) {
+			continue;
+		}
+		// A port given no new PCM since the last advance is silent for this grain.
+		const bool stale = fresh_only && !state.pcm_fresh;
+		if (audioout2_port_type_is_object(state.port_type)) {
+			if (context.object_audio_handle > 0) {
+				grain.object_mix.resize(static_cast<size_t>(context.num_grains) * 2, 0.0f);
+				if (!stale) {
+					audioout2_mix_object(grain.object_mix, context.num_grains, state);
+				}
+			}
+		} else if (state.audio_handle > 0 && grain.ports.size() < AudioInternal::OUT_PORTS_MAX) {
+			grain.ports.push_back(AudioOut2GrainPort {
+			    state.handle, state.audio_handle,
+			    stale ? std::vector<uint8_t>(state.pcm_data.size(), 0) : state.pcm_data,
+			    state.gains});
+		}
+	}
+	for (auto& sample: grain.object_mix) {
+		const float magnitude = std::abs(sample);
+		if (magnitude > 0.9f) {
+			sample = std::copysign(0.9f + 0.1f * std::tanh((magnitude - 0.9f) / 0.1f), sample);
+		}
+	}
+	return grain;
+}
+
+static void audioout2_drop_dead_ports_locked(AudioOut2Grain* grain, int object_audio_handle) {
+	std::erase_if(grain->ports, [](const AudioOut2GrainPort& entry) {
+		const auto* state = audioout2_find_port_locked(entry.port);
+		return state == nullptr || state->audio_handle != entry.audio_handle;
+	});
+	if (object_audio_handle <= 0) {
+		grain->object_mix.clear();
+	}
+}
+
+static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2Submission& out) {
 	Common::LockGuard submit_lock(out.mutex);
 	g_audioout2_state_mutex.Lock();
 	auto* context = audioout2_find_context_locked(ctx);
@@ -424,31 +601,60 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 		g_audioout2_state_mutex.Unlock();
 		return;
 	}
-	out.object_mix.clear();
-	std::vector<AudioInternal::OutputParam> params;
-	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	for (const auto& state: g_audioout2_ports) {
-		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
-			continue;
-		}
-		if (audioout2_port_type_is_object(state.port_type)) {
-			audioout2_mix_object(out.object_mix, context->num_grains, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			const auto i = params.size();
-			out.pcm[i]   = state.pcm_data;
-			out.gains[i] = state.gains;
-			params.push_back({state.audio_handle, out.pcm[i].data(), out.gains[i].data()});
+	AudioOut2Grain grain;
+	if (!context->advanced.empty()) {
+		grain = std::move(context->advanced.front());
+		context->advanced.pop_front();
+		audioout2_drop_dead_ports_locked(&grain, context->object_audio_handle);
+	} else {
+		grain = audioout2_snapshot_context_locked(*context, false);
+		if (context->uses_advance) {
+			// A push with no new advance is an underrun; replaying the last grain buzzes.
+			for (auto& port: grain.ports) {
+				std::fill(port.pcm.begin(), port.pcm.end(), uint8_t {0});
+			}
+			std::fill(grain.object_mix.begin(), grain.object_mix.end(), 0.0f);
 		}
 	}
+	std::vector<AudioInternal::OutputParam> params;
+	params.reserve(AudioInternal::OUT_PORTS_MAX);
+	for (auto& port: grain.ports) {
+		const auto i = params.size();
+		out.pcm[i]   = std::move(port.pcm);
+		out.gains[i] = port.gains;
+		params.push_back({port.audio_handle, out.pcm[i].data(), out.gains[i].data()});
+	}
+	out.object_mix = std::move(grain.object_mix);
 	if (!out.object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
 		params.push_back({context->object_audio_handle, out.object_mix.data()});
 	}
 	g_audioout2_state_mutex.Unlock();
 	if (!params.empty()) {
+		// The modelled queue paces every push, so the device only needs a jitter cushion.
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-		                                     blocking);
+		                                     false, true);
 	}
 }
+
+static void audioout2_wait_for_advanced_grain(AudioOut2ContextHandle ctx) {
+	const auto start = LibKernel::KernelGetProcessTime();
+	for (;;) {
+		uint64_t limit = 0;
+		{
+			Common::LockGuard lock(g_audioout2_state_mutex);
+			auto*             state = audioout2_find_context_locked(ctx);
+			if (state == nullptr || !state->uses_advance || !state->advanced.empty()) {
+				return;
+			}
+			limit = 2ull * audioout2_grain_micros(state->num_grains);
+		}
+		if (LibKernel::KernelGetProcessTime() - start >= limit) {
+			return;
+		}
+		Common::Thread::SleepMicro(250);
+	}
+}
+
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle > 0) {
 		AudioInternal::AudioOutClose(audio_handle);
@@ -585,11 +791,19 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+		auto grain = audioout2_snapshot_context_locked(*state, true);
 		audioout2_update_context_locked(state);
+		state->uses_advance = true;
+		state->advanced.push_back(std::move(grain));
+		const size_t limit = 2 * std::max<size_t>(state->queue_depth, 4);
+		while (state->advanced.size() > limit) {
+			state->advanced.pop_front();
+		}
 	}
 	for (auto& port: g_audioout2_ports) {
 		if (port.used && port.context == ctx) {
 			port.attributes_locked = false;
+			port.pcm_fresh         = false;
 		}
 	}
 	g_audioout2_state_mutex.Unlock();
@@ -598,30 +812,29 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
-	uint32_t sleep_micros = audioout2_grain_micros(512);
+	uint64_t sleep_micros = audioout2_grain_micros(512);
+
+	if (blocking != 0) {
+		audioout2_wait_for_advanced_grain(ctx);
+	}
 
 	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
+		// Every push, synchronous or not, takes a slot of the modelled queue.
 		g_audioout2_state_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
 			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = LibKernel::KernelGetProcessTime();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
+			if (state->queued < state->queue_depth) {
+				audioout2_accept_grain_locked(state);
 				auto& submission = audioout2_submission(*state);
 				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
+				audioout2_queue_context_audio(ctx, submission);
+				// Wwise renders only into a free slot after a synchronous push returns.
+				if (blocking != 0) {
+					audioout2_wait_for_free_slot(ctx);
+				}
 				return OK;
 			}
+			sleep_micros = audioout2_micros_to_next_tick_locked(*state);
 		}
 		g_audioout2_state_mutex.Unlock();
 
@@ -629,7 +842,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			return AUDIO_OUT2_ERROR_NOT_READY;
 		}
 
-		Common::Thread::SleepMicro(sleep_micros);
+		Common::Thread::SleepMicro(static_cast<uint32_t>(sleep_micros));
 	}
 }
 
@@ -645,12 +858,14 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
+		const auto backlog =
+		    state->advanced.size() > 1 ? static_cast<uint32_t>(state->advanced.size() - 1) : 0u;
+		const auto level = std::min(state->queued + backlog, state->queue_depth);
 		if (queue_level != nullptr) {
-			*queue_level = state->queued;
+			*queue_level = level;
 		}
 		if (available_queues != nullptr) {
-			*available_queues =
-			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
+			*available_queues = state->queue_depth - level;
 		}
 	}
 	g_audioout2_state_mutex.Unlock();
@@ -797,6 +1012,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			return AUDIO_OUT2_ERROR_INVALID_PARAM;
 		}
 		seen |= 1u << id;
+		// An object's attributes are frozen from its PCM until the next advance.
 		if (id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM && state->attributes_locked) {
 			continue;
 		}
@@ -814,11 +1030,14 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				break;
 			}
 			case AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN: {
+				// Wwise passes an 8-float gain vector even for a mono pad-speaker port.
 				const auto channels = audioout2_data_format_channels(state->data_format);
-				if (attribute.value_size != channels * sizeof(float)) {
+				if (attribute.value_size < channels * sizeof(float) ||
+				    attribute.value_size % sizeof(float) != 0 ||
+				    attribute.value_size > gains.size() * sizeof(float)) {
 					return AUDIO_OUT2_ERROR_INVALID_PARAM;
 				}
-				std::memcpy(gains.data(), attribute.value, attribute.value_size);
+				std::memcpy(gains.data(), attribute.value, channels * sizeof(float));
 				for (uint32_t ch = 0; ch < channels; ch++) {
 					if (!std::isfinite(gains[ch]) || gains[ch] < 0.0f) {
 						return AUDIO_OUT2_ERROR_INVALID_PARAM;
@@ -850,6 +1069,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			state->pcm_data.clear();
 		}
 		state->attributes_locked = audioout2_port_type_is_object(state->port_type);
+		state->pcm_fresh         = !state->pcm_data.empty();
 	}
 	return OK;
 }

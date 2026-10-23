@@ -5,26 +5,39 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <map>
+#include <utility>
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
+	// Allocates only for a range that touches no existing one: a merge reuses a node.
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
-		uint64_t begin = address;
-		uint64_t last  = end;
-		while (it != m_ranges.end() && it->first <= last) {
-			begin = std::min(begin, it->first);
-			last  = std::max(last, it->second);
-			it    = m_ranges.erase(it);
+		if (it == m_ranges.end() || it->first > end) {
+			m_ranges.emplace_hint(it, address, end);
+			return;
 		}
-		m_ranges.emplace(begin, last);
+		auto last = std::max(end, it->second);
+		auto next = std::next(it);
+		while (next != m_ranges.end() && next->first <= last) {
+			last = std::max(last, next->second);
+			next = m_ranges.erase(next);
+		}
+		if (it->first <= address) {
+			it->second = last;
+			return;
+		}
+		auto node     = m_ranges.extract(it);
+		node.key()    = address;
+		node.mapped() = last;
+		m_ranges.insert(next, std::move(node));
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {

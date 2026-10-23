@@ -251,7 +251,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	counts[static_cast<size_t>(Kind::FaultBuffer)]  = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
@@ -263,7 +263,8 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
+	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0 ||
+	    state.requirements.dispatch_thread_limit) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -279,7 +280,9 @@ void DefineDescriptors(EmitterState& state) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			// Set and binding come from the functions the host writes descriptors through.
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+			                            IR::NativeDescriptorSet(state.program.stage));
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
@@ -348,13 +351,14 @@ void DefineDescriptors(EmitterState& state) {
 				}
 				break;
 			default: {
-				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
-				        IR::ImageResourceClass::None);
+				EXIT_IF(IR::ImageBindingResourceClass(kind) == IR::ImageResourceClass::None);
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
 				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
-				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
-				state.builder.AddName(definition.variable,
-				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				                 counts[index], IR::NativeDescriptorSet(state.program.stage),
+				                 IR::NativeBinding(state.program.stage, kind));
+				state.builder.AddName(
+				    definition.variable,
+				    ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
 				break;
 			}
 		}
@@ -622,7 +626,7 @@ void DefineOutputs(EmitterState& state) {
 		}
 	}
 	if (state.program.stage == ShaderType::Mesh) {
-		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
+		DefineMeshOutputs(state);
 		return;
 	}
 	if (state.program.stage == ShaderType::Vertex &&
@@ -677,6 +681,13 @@ void DefineOutputs(EmitterState& state) {
 				binding.variable_id = BuiltIn(state.depth_variable, TypeF32(state), "gl_FragDepth",
 				                              spv::BuiltInFragDepth);
 				break;
+			case IR::StageOutputKind::Stencil:
+				state.builder.RequireExtension("SPV_EXT_shader_stencil_export");
+				state.builder.RequireCapability(spv::CapabilityStencilExportEXT);
+				binding.variable_id =
+				    BuiltIn(state.stencil_ref_variable, TypeI32(state), "gl_FragStencilRefARB",
+				            spv::BuiltInFragStencilRefEXT);
+				break;
 			case IR::StageOutputKind::SampleMask:
 				binding.variable_id =
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
@@ -703,7 +714,9 @@ void DefineOutputs(EmitterState& state) {
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
 				                         state.program.stage == ShaderType::Pixel &&
 				                         state.input_info.pixel->dual_source_blending;
-				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
+				if (dual_source && binding.index > 1) {
+					state.Refuse("dual-source blending with an export past MRT1");
+				}
 				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
 				                            spv::DecorationLocation,
 				                            dual_source ? 0u : binding.location);
@@ -725,6 +738,9 @@ void DefineModule(EmitterState& state) {
 	DefineInputs(state);
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
+	if (state.Refused()) {
+		return;
+	}
 	DefineDescriptors(state);
 	if (state.program.info.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
@@ -745,6 +761,14 @@ void DefineModule(EmitterState& state) {
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
+		if (state.input_info.vertex->mesh.task_payload) {
+			const auto pointer = TypeU32ArrayPointer(
+			    state, spv::StorageClassTaskPayloadWorkgroupEXT, IR::MeshTaskPayloadDwordCount);
+			state.mesh_payload_variable = state.builder.DefineGlobalVariable(
+			    pointer, spv::StorageClassTaskPayloadWorkgroupEXT);
+			state.interface_variables.push_back(state.mesh_payload_variable);
+			state.builder.AddName(state.mesh_payload_variable, "task_payload");
+		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {
@@ -761,7 +785,8 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma || state.program.info.uses_image_heap) {
+	if (state.program.info.uses_dma || state.requirements.dispatch_thread_limit ||
+	    state.program.info.uses_image_heap) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -829,7 +854,9 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma || state.program.info.uses_image_heap
+	state.builder.AddMemoryModel(state.program.info.uses_dma ||
+	                                     state.requirements.dispatch_thread_limit ||
+	                                     state.program.info.uses_image_heap
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
@@ -838,8 +865,10 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
 	if (state.program.info.float64) {
-		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
-		                     state.input_info.compute->float_mode != 0xc0);
+		if (state.program.stage == ShaderType::Compute &&
+		    state.input_info.compute->float_mode != 0xc0) {
+			state.Refuse("FP64 compute requires float mode 0xc0");
+		}
 		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
@@ -873,7 +902,9 @@ void DefineModule(EmitterState& state) {
 		}
 		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+		    !state.input_info.pixel->ps_sample_mask_export_enable &&
+		    // A stencil test consuming a reference this shader computes cannot run before it.
+		    state.stencil_ref_variable == 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 	}

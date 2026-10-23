@@ -1,8 +1,9 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -11,6 +12,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
+#include "graphics/shader/recompiler/ir/passes/IndexRangeFold.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -20,11 +23,17 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <functional>
+#include <list>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -32,6 +41,527 @@ namespace {
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
+
+enum class CfgOutcome { BuildRejected, Irreducible, StructurizeFailed, Structured };
+
+// An estimate that bounds the cache; dominator sets are quadratic in the block count.
+size_t GraphFootprint(const CFG::Graph& graph) {
+	const auto words = [](const std::vector<uint32_t>& value) {
+		return value.capacity() * sizeof(uint32_t);
+	};
+	size_t bytes = sizeof(CFG::Graph) + graph.unsupported_reason.capacity();
+	bytes += graph.blocks.capacity() * sizeof(CFG::BasicBlock);
+	bytes += graph.back_edges.capacity() * sizeof(CFG::BackEdge);
+	bytes += graph.natural_loops.capacity() * sizeof(CFG::NaturalLoop);
+	bytes += graph.components.capacity() * sizeof(CFG::StronglyConnectedComponent);
+	bytes += graph.expressions.capacity() * sizeof(CFG::ConditionExpression);
+	bytes += words(graph.code_table_load_pcs);
+	for (const auto& block: graph.blocks) {
+		bytes += words(block.predecessors) + words(block.successors) + words(block.dominators);
+		bytes += block.assignments.capacity() * sizeof(CFG::BasicBlock::Assignment);
+		bytes += words(block.terminator.indirect_target_pcs) +
+		         words(block.terminator.indirect_targets) +
+		         words(block.terminator.indirect_selector_values) +
+		         words(block.terminator.indirect_selector_targets);
+	}
+	for (const auto& loop: graph.natural_loops) {
+		bytes += words(loop.body_blocks);
+	}
+	for (const auto& component: graph.components) {
+		bytes += words(component.blocks) + words(component.entry_blocks);
+	}
+	return bytes;
+}
+
+uint64_t HashCodeWords(std::span<const uint32_t> front, std::span<const uint32_t> back) {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&hash](uint64_t value) {
+		for (uint32_t byte = 0; byte < sizeof(value); byte++) {
+			hash ^= (value >> (byte * 8u)) & 0xffu;
+			hash *= 0x100000001b3ull;
+		}
+	};
+	mix(front.size());
+	for (const auto word: front) {
+		mix(word);
+	}
+	for (const auto word: back) {
+		mix(word);
+	}
+	return hash;
+}
+
+void PutU32(std::vector<uint8_t>& out, uint32_t value) {
+	out.push_back(static_cast<uint8_t>(value));
+	out.push_back(static_cast<uint8_t>(value >> 8u));
+	out.push_back(static_cast<uint8_t>(value >> 16u));
+	out.push_back(static_cast<uint8_t>(value >> 24u));
+}
+
+void PutU64(std::vector<uint8_t>& out, uint64_t value) {
+	PutU32(out, static_cast<uint32_t>(value));
+	PutU32(out, static_cast<uint32_t>(value >> 32u));
+}
+
+void PutWords(std::vector<uint8_t>& out, const std::vector<uint32_t>& words) {
+	PutU32(out, static_cast<uint32_t>(words.size()));
+	for (const auto word: words) {
+		PutU32(out, word);
+	}
+}
+
+struct Reader {
+	const uint8_t* data = nullptr;
+	size_t         size = 0;
+	size_t         at   = 0;
+	bool           ok   = true;
+
+	uint32_t U32() {
+		if (!ok || at + 4u > size) {
+			ok = false;
+			return 0;
+		}
+		const uint32_t value = static_cast<uint32_t>(data[at]) |
+		                       (static_cast<uint32_t>(data[at + 1]) << 8u) |
+		                       (static_cast<uint32_t>(data[at + 2]) << 16u) |
+		                       (static_cast<uint32_t>(data[at + 3]) << 24u);
+		at += 4u;
+		return value;
+	}
+	uint64_t U64() {
+		const auto low  = U32();
+		const auto high = U32();
+		return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32u);
+	}
+	bool Count(uint32_t& out, size_t element_bytes) {
+		out = U32();
+		if (!ok || static_cast<size_t>(out) * element_bytes > size - at) {
+			ok = false;
+			return false;
+		}
+		return true;
+	}
+	std::vector<uint32_t> Words() {
+		std::vector<uint32_t> words;
+		uint32_t              count = 0;
+		if (!Count(count, 4u)) {
+			return words;
+		}
+		words.resize(count);
+		for (uint32_t i = 0; i < count; i++) {
+			words[i] = U32();
+		}
+		return words;
+	}
+};
+
+void PutTerminator(std::vector<uint8_t>& out, const CFG::Terminator& value) {
+	PutU32(out, static_cast<uint32_t>(value.kind));
+	PutU32(out, static_cast<uint32_t>(value.condition));
+	PutU32(out, value.true_block);
+	PutU32(out, value.false_block);
+	PutU32(out, value.merge_block);
+	PutU32(out, value.continue_block);
+	PutU32(out, value.indirect_pc_sgpr);
+	PutU32(out, value.indirect_selector_code);
+	PutWords(out, value.indirect_target_pcs);
+	PutWords(out, value.indirect_targets);
+	PutWords(out, value.indirect_selector_values);
+	PutWords(out, value.indirect_selector_targets);
+	PutU32(out, value.expression);
+	PutU32(out, value.loop_header ? 1u : 0u);
+}
+
+void GetTerminator(Reader& in, CFG::Terminator& value) {
+	value.kind                      = static_cast<CFG::TerminatorKind>(in.U32());
+	value.condition                 = static_cast<CFG::BranchCondition>(in.U32());
+	value.true_block                = in.U32();
+	value.false_block               = in.U32();
+	value.merge_block               = in.U32();
+	value.continue_block            = in.U32();
+	value.indirect_pc_sgpr          = in.U32();
+	value.indirect_selector_code    = in.U32();
+	value.indirect_target_pcs       = in.Words();
+	value.indirect_targets          = in.Words();
+	value.indirect_selector_values  = in.Words();
+	value.indirect_selector_targets = in.Words();
+	value.expression                = in.U32();
+	value.loop_header               = in.U32() != 0u;
+}
+
+void SerializeGraph(std::vector<uint8_t>& out, const CFG::Graph& graph) {
+	PutU32(out, static_cast<uint32_t>(graph.blocks.size()));
+	for (const auto& block: graph.blocks) {
+		PutU32(out, block.id);
+		PutU32(out, block.start_pc);
+		PutU32(out, block.end_pc);
+		PutU32(out, block.inst_begin);
+		PutU32(out, block.inst_end);
+		PutU32(out, static_cast<uint32_t>(block.assignments.size()));
+		for (const auto& assignment: block.assignments) {
+			PutU32(out, assignment.variable);
+			PutU32(out, assignment.expression);
+		}
+		PutWords(out, block.predecessors);
+		PutWords(out, block.successors);
+		PutWords(out, block.dominators);
+		PutTerminator(out, block.terminator);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.expressions.size()));
+	for (const auto& expression: graph.expressions) {
+		PutU32(out, static_cast<uint32_t>(expression.op));
+		PutU32(out, expression.lhs);
+		PutU32(out, expression.rhs);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.back_edges.size()));
+	for (const auto& edge: graph.back_edges) {
+		PutU32(out, edge.from);
+		PutU32(out, edge.to);
+		PutU32(out, edge.natural ? 1u : 0u);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.natural_loops.size()));
+	for (const auto& loop: graph.natural_loops) {
+		PutU32(out, loop.header);
+		PutU32(out, loop.latch);
+		PutWords(out, loop.body_blocks);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.components.size()));
+	for (const auto& component: graph.components) {
+		PutWords(out, component.blocks);
+		PutWords(out, component.entry_blocks);
+		PutU32(out, component.irreducible ? 1u : 0u);
+	}
+	PutWords(out, graph.code_table_load_pcs);
+	PutU32(out, graph.entry_block);
+	PutU32(out, graph.irreducible ? 1u : 0u);
+	PutU32(out, graph.unsupported ? 1u : 0u);
+	PutU32(out, static_cast<uint32_t>(graph.failure_kind));
+	PutU32(out, graph.failure_block);
+	PutU32(out, graph.failure_pc);
+	PutU32(out, static_cast<uint32_t>(graph.unsupported_reason.size()));
+	out.insert(out.end(), graph.unsupported_reason.begin(), graph.unsupported_reason.end());
+}
+
+bool DeserializeGraph(Reader& in, CFG::Graph& graph) {
+	uint32_t count = 0;
+	if (!in.Count(count, 32u)) {
+		return false;
+	}
+	graph.blocks.resize(count);
+	for (auto& block: graph.blocks) {
+		block.id             = in.U32();
+		block.start_pc       = in.U32();
+		block.end_pc         = in.U32();
+		block.inst_begin     = in.U32();
+		block.inst_end       = in.U32();
+		uint32_t assignments = 0;
+		if (!in.Count(assignments, 8u)) {
+			return false;
+		}
+		block.assignments.resize(assignments);
+		for (auto& assignment: block.assignments) {
+			assignment.variable   = in.U32();
+			assignment.expression = in.U32();
+		}
+		block.predecessors = in.Words();
+		block.successors   = in.Words();
+		block.dominators   = in.Words();
+		GetTerminator(in, block.terminator);
+		if (!in.ok) {
+			return false;
+		}
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.expressions.resize(count);
+	for (auto& expression: graph.expressions) {
+		expression.op  = static_cast<CFG::ConditionExpression::Op>(in.U32());
+		expression.lhs = in.U32();
+		expression.rhs = in.U32();
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.back_edges.resize(count);
+	for (auto& edge: graph.back_edges) {
+		edge.from    = in.U32();
+		edge.to      = in.U32();
+		edge.natural = in.U32() != 0u;
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.natural_loops.resize(count);
+	for (auto& loop: graph.natural_loops) {
+		loop.header      = in.U32();
+		loop.latch       = in.U32();
+		loop.body_blocks = in.Words();
+		if (!in.ok) {
+			return false;
+		}
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.components.resize(count);
+	for (auto& component: graph.components) {
+		component.blocks       = in.Words();
+		component.entry_blocks = in.Words();
+		component.irreducible  = in.U32() != 0u;
+		if (!in.ok) {
+			return false;
+		}
+	}
+	graph.code_table_load_pcs = in.Words();
+	graph.entry_block         = in.U32();
+	graph.irreducible         = in.U32() != 0u;
+	graph.unsupported         = in.U32() != 0u;
+	graph.failure_kind        = static_cast<CFG::FailureKind>(in.U32());
+	graph.failure_block       = in.U32();
+	graph.failure_pc          = in.U32();
+	uint32_t reason_size      = 0;
+	if (!in.Count(reason_size, 1u)) {
+		return false;
+	}
+	graph.unsupported_reason.assign(reinterpret_cast<const char*>(in.data + in.at), reason_size);
+	in.at += reason_size;
+	return in.ok;
+}
+
+uint64_t HashBytesFnv(const uint8_t* data, size_t size) {
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (size_t i = 0; i < size; i++) {
+		hash ^= data[i];
+		hash *= 0x100000001b3ull;
+	}
+	return hash;
+}
+
+// Keyed on the code words alone: a new input to BuildGraph or Structurize must join the key.
+class CfgCache {
+public:
+	static constexpr size_t Budget     = size_t {64} << 20u;
+	static constexpr size_t EntryLimit = Budget / 8u;
+
+	bool Get(std::span<const uint32_t> code, std::span<const uint32_t> back_code,
+	         CFG::Graph& native, CFG::Graph& structured, CfgOutcome& outcome) {
+		const auto                        hash = HashCodeWords(code, back_code);
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		const auto                        range = m_index.equal_range(hash);
+		for (auto it = range.first; it != range.second; ++it) {
+			const auto& entry = *it->second;
+			if (!std::ranges::equal(entry.code, code) ||
+			    !std::ranges::equal(entry.back_code, back_code)) {
+				continue;
+			}
+			native     = entry.native;
+			structured = entry.structured;
+			outcome    = entry.outcome;
+			m_entries.splice(m_entries.begin(), m_entries, it->second);
+			m_hits++;
+			return true;
+		}
+		m_misses++;
+		return false;
+	}
+
+	void Put(std::span<const uint32_t> code, std::span<const uint32_t> back_code,
+	         const CFG::Graph& native, const CFG::Graph& structured, CfgOutcome outcome) {
+		const auto bytes = GraphFootprint(native) + GraphFootprint(structured) +
+		                   (code.size() + back_code.size()) * sizeof(uint32_t) + sizeof(Entry);
+		if (bytes > EntryLimit) {
+			return;
+		}
+		const auto                        hash = HashCodeWords(code, back_code);
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		while (m_bytes + bytes > Budget && !m_entries.empty()) {
+			Evict();
+		}
+		m_entries.push_front(Entry {.code       = {code.begin(), code.end()},
+		                            .back_code  = {back_code.begin(), back_code.end()},
+		                            .native     = native,
+		                            .structured = structured,
+		                            .outcome    = outcome,
+		                            .hash       = hash,
+		                            .bytes      = bytes});
+		m_index.emplace(hash, m_entries.begin());
+		m_bytes += bytes;
+	}
+
+	static constexpr uint64_t FileMagic  = 0x3443464759544b53ull; // "SKTYGFC4"
+	static constexpr size_t   FileBudget = Budget;
+
+	void OpenFile(const std::string& path, uint64_t stamp) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		m_path  = path;
+		m_stamp = stamp;
+		if (path.empty() || stamp == 0u) {
+			m_path.clear();
+			return;
+		}
+		LoadLocked();
+	}
+
+	void Flush() {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_path.empty()) {
+			return;
+		}
+		StoreLocked();
+	}
+
+	CfgCacheStats Stats() {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		return {.hits = m_hits, .misses = m_misses};
+	}
+
+private:
+	struct Entry {
+		std::vector<uint32_t> code;
+		std::vector<uint32_t> back_code;
+		CFG::Graph            native;
+		CFG::Graph            structured;
+		CfgOutcome            outcome = CfgOutcome::Structured;
+		uint64_t              hash    = 0;
+		size_t                bytes   = 0;
+	};
+
+	// Called with the lock held.
+	bool Holds(const Entry& entry) const {
+		const auto range = m_index.equal_range(entry.hash);
+		for (auto it = range.first; it != range.second; ++it) {
+			if (std::ranges::equal(it->second->code, entry.code) &&
+			    std::ranges::equal(it->second->back_code, entry.back_code)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Called with the lock held.
+	void LoadLocked() {
+		std::ifstream file(m_path, std::ios::binary);
+		if (!file) {
+			return;
+		}
+		std::vector<uint8_t> blob((std::istreambuf_iterator<char>(file)),
+		                          std::istreambuf_iterator<char>());
+		file.close();
+		Reader in {.data = blob.data(), .size = blob.size()};
+		if (in.U64() != FileMagic || !in.ok) {
+			return;
+		}
+		if (in.U64() != m_stamp || !in.ok) {
+			return;
+		}
+		while (in.ok && in.at < in.size) {
+			const auto payload_size = in.U32();
+			const auto checksum     = in.U64();
+			if (!in.ok || payload_size == 0u || payload_size > in.size - in.at) {
+				break;
+			}
+			const auto* payload = in.data + in.at;
+			if (HashBytesFnv(payload, payload_size) != checksum) {
+				break;
+			}
+			Reader body {.data = payload, .size = payload_size};
+			Entry  entry;
+			entry.code      = body.Words();
+			entry.back_code = body.Words();
+			entry.outcome   = static_cast<CfgOutcome>(body.U32());
+			if (!body.ok || !DeserializeGraph(body, entry.native) ||
+			    !DeserializeGraph(body, entry.structured) || entry.code.empty()) {
+				break;
+			}
+			in.at += payload_size;
+			entry.hash  = HashCodeWords(entry.code, entry.back_code);
+			entry.bytes = GraphFootprint(entry.native) + GraphFootprint(entry.structured) +
+			              (entry.code.size() + entry.back_code.size()) * sizeof(uint32_t) +
+			              sizeof(Entry);
+			if (entry.bytes > EntryLimit || m_bytes + entry.bytes > Budget || Holds(entry)) {
+				continue;
+			}
+			m_bytes += entry.bytes;
+			m_entries.push_back(std::move(entry));
+			m_index.emplace(m_entries.back().hash, std::prev(m_entries.end()));
+		}
+	}
+
+	// Called with the lock held.
+	void StoreLocked() {
+		std::vector<uint8_t> blob;
+		PutU64(blob, FileMagic);
+		PutU64(blob, m_stamp);
+		for (const auto& entry: m_entries) {
+			std::vector<uint8_t> payload;
+			PutWords(payload, entry.code);
+			PutWords(payload, entry.back_code);
+			PutU32(payload, static_cast<uint32_t>(entry.outcome));
+			SerializeGraph(payload, entry.native);
+			SerializeGraph(payload, entry.structured);
+			if (blob.size() + payload.size() + 12u > FileBudget) {
+				break;
+			}
+			PutU32(blob, static_cast<uint32_t>(payload.size()));
+			PutU64(blob, HashBytesFnv(payload.data(), payload.size()));
+			blob.insert(blob.end(), payload.begin(), payload.end());
+		}
+		// Renamed over the target, so the live file is only ever replaced whole.
+		std::error_code error;
+		const auto      target = std::filesystem::path(m_path);
+		if (target.has_parent_path()) {
+			std::filesystem::create_directories(target.parent_path(), error);
+		}
+		const auto temporary = std::filesystem::path(m_path + ".tmp");
+		{
+			std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+			if (!file) {
+				return;
+			}
+			file.write(reinterpret_cast<const char*>(blob.data()),
+			           static_cast<std::streamsize>(blob.size()));
+			file.flush();
+			if (!file) {
+				file.close();
+				std::filesystem::remove(temporary, error);
+				return;
+			}
+		}
+		std::filesystem::rename(temporary, target, error);
+		if (error) {
+			std::filesystem::remove(temporary, error);
+		}
+	}
+
+	// Called with the lock held.
+	void Evict() {
+		const auto& victim = m_entries.back();
+		const auto  range  = m_index.equal_range(victim.hash);
+		for (auto it = range.first; it != range.second; ++it) {
+			if (it->second == std::prev(m_entries.end())) {
+				m_index.erase(it);
+				break;
+			}
+		}
+		m_bytes -= victim.bytes;
+		m_entries.pop_back();
+	}
+
+	std::mutex                                                    m_mutex;
+	std::list<Entry>                                              m_entries;
+	std::unordered_multimap<uint64_t, std::list<Entry>::iterator> m_index;
+	size_t                                                        m_bytes  = 0;
+	uint64_t                                                      m_hits   = 0;
+	uint64_t                                                      m_misses = 0;
+	std::string                                                   m_path;
+	uint64_t                                                      m_stamp = 0;
+};
+
+CfgCache& StructurizedCfgCache() {
+	static CfgCache cache;
+	return cache;
 }
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
@@ -481,13 +1011,28 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// An unresolvable call is a ray-tracing any-hit call: it accepts every hit (s16 = EXEC).
+void StubCall(Decoder::Program& program, uint32_t instruction) {
+	program.instructions[instruction].call_stub = true;
+}
+
 void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
-	EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
 		source.calls.push_back({.instruction = i});
 	}
+	const auto stub_all = [&] {
+		for (const auto& site: source.calls)
+			StubCall(source.decoded, site.instruction);
+		source.calls.clear();
+	};
+	// Only compute targets are re-executed on the host.
+	if (options.stage != ShaderType::Compute || options.input_info.compute == nullptr) {
+		stub_all();
+		return;
+	}
+	bool       failed = false;
 	const auto graph = CFG::BuildGraph(source.decoded);
 	Program query;
 	query.stage = options.stage;
@@ -521,11 +1066,19 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
 		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
+		if (index == CFG::AmbiguousScalarDefinition) {
+			failed = true;
+			return Value(0u);
+		}
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
 		if (index == UINT32_MAX) {
-			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
+			if (code < query.user_data_base ||
+			    code - query.user_data_base >= query.user_data_count) {
+				failed = true;
+				return Value(0u);
+			}
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
 		}
 		auto [entry, inserted] = producers.try_emplace(index);
@@ -553,27 +1106,40 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 			block.Instructions().splice(block.end(), translated.Instructions());
 			producer.ready = true;
 		}
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
+		if (!producer.ready || !producer.values.contains(code)) {
+			failed = true;
+			return Value(0u);
+		}
 		return producer.values.at(code).Resolve();
 	};
 	for (auto& site: source.calls) {
 		const auto& call = source.decoded.instructions[site.instruction];
-		EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
-		                     call.dst.kind != Decoder::OperandKind::Sgpr ||
-		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
+		if (call.src0.kind != Decoder::OperandKind::Sgpr ||
+		    call.dst.kind != Decoder::OperandKind::Sgpr || call.src0.reg != call.dst.reg ||
+		    call.dst.reg >= 105u) {
+			StubCall(source.decoded, site.instruction);
+			continue;
+		}
 		for (uint32_t i = 0; i < 2u; ++i) {
 			const auto value = Register(site.instruction, call.src0.reg + i);
-			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
-				source.unsupported_call_pc = call.pc;
-				source.calls.clear();
+			// A producer the host could not build poisons every later query: stub them all.
+			if (failed) {
+				stub_all();
 				return;
+			}
+			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
+				StubCall(source.decoded, site.instruction);
+				break;
 			}
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, value);
 			site.target[i] = Value(&root);
 		}
 	}
+	// Removed only now: a later site's register search records crossed calls by instruction.
+	std::erase_if(source.calls, [&](const ShaderSource::Call& site) {
+		return source.decoded.instructions[site.instruction].call_stub;
+	});
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
 	RemoveIdentities(query);
@@ -607,31 +1173,48 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTargets(source, options);
-		source.code.assign(code.begin(), code.end());
-		source.decoded.code = source.code;
+		if (!source.calls.empty()) {
+			source.code.assign(code.begin(), code.end());
+			source.decoded.code = source.code;
+		}
 	}
 	return source;
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
-	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
 	auto& reads = source.reads;
 	reads.clear();
+	// Every call site is an any-hit stub: nothing to link.
+	if (source.calls.empty()) return source.decoded;
 	IR::SrtReadCapture capture(runtime, reads);
 	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
 	IR::SrtWalker walker(source.call_targets, clean);
+	// An unlinkable call takes the any-hit stub; the next refresh tries to link it again.
+	const auto stubbed = [&]() -> const Decoder::Program& {
+		if (source.linked && source.linked->functions.empty()) return source.linked->decoded;
+		ShaderSource::Linked stub {.code = source.code, .decoded = source.decoded};
+		for (const auto& site: source.calls)
+			StubCall(stub.decoded, site.instruction);
+		source.linked               = std::move(stub);
+		source.linked->decoded.code = source.linked->code;
+		++source.revision;
+		return source.linked->decoded;
+	};
 	for (auto& site: source.calls) {
 		uint32_t low = 0, high = 0;
 		if (!walker.Evaluate(site.target[0], low) || !walker.Evaluate(site.target[1], high))
-			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
-			     source.decoded.instructions[site.instruction].pc);
+			return stubbed();
 		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
 		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
-		EXIT_IF(address == 0u);
+		if (address == 0u) return stubbed();
 		site.address = address;
 	}
 	const auto query_reads = reads.size();
-	if (source.linked) {
+	const auto unlinked_leaf = [&]() -> const Decoder::Program& {
+		reads.resize(query_reads);
+		return stubbed();
+	};
+	if (source.linked && !source.linked->functions.empty()) {
 		auto& linked = *source.linked;
 		bool unchanged = true;
 		for (size_t i = 0; i < source.calls.size(); ++i) {
@@ -657,7 +1240,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	}
 	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
 	const auto& last = source.decoded.instructions.back();
-	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
+	if (last.opcode != Decoder::Opcode::S_ENDPGM) return unlinked_leaf();
 	// Keep the caller's data/footer at native offsets. Expand leaf CFGs per call site
 	// before SSA, so return edges neither require a dispatcher nor merge resource roots.
 	uint32_t function_pc = last.pc + last.word_count * sizeof(uint32_t);
@@ -678,7 +1261,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				for (;;) {
 					if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
 					                       std::span(words).first(count)))
-						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
+						return unlinked_leaf();
 					inst = {};
 					Decoder::DecodeInstruction(words, 0u, inst);
 					if (inst.word_count <= count) break;
@@ -687,9 +1270,10 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				inst.pc = index * sizeof(uint32_t);
 				if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
 				index += inst.word_count;
-				EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_ENDPGM);
+				if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+				    inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+				    inst.opcode == Decoder::Opcode::S_ENDPGM)
+					return unlinked_leaf();
 				function.push_back(inst);
 				if (inst.opcode == Decoder::Opcode::S_SETPC_B64) break;
 			}
@@ -698,19 +1282,21 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		EXIT_IF(function_pc > UINT32_MAX - function_size);
 		const auto function_offset = static_cast<uint32_t>(linked.code.size());
 		for (auto inst: function) {
-			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
-			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+			if (CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
+			    CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u))
+				return unlinked_leaf();
 			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
 				if (site.preserved_registers[code] && CFG::MayWriteScalarRegister(inst, code))
-					EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
+					return unlinked_leaf();
 			}
 			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
 			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
-				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
+				if (inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg)
+					return unlinked_leaf();
 				inst.opcode = Decoder::Opcode::S_BRANCH;
 				inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
 			} else if (Decoder::IsDirectBranch(inst.opcode)) {
-				EXIT_IF(inst.branch_target >= function_size);
+				if (inst.branch_target >= function_size) return unlinked_leaf();
 				inst.branch_target += function_pc;
 			}
 			inst.pc += function_pc;
@@ -742,10 +1328,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
 	EXIT_IF(decoded.instructions.empty());
+	bool linked_call = false;
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
-			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
-				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
+			if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+			if (inst.branch_target == UINT32_MAX && !inst.call_stub) {
+				TranslateResult refused;
+				refused.status.ok     = false;
+				refused.status.pc     = inst.pc;
+				refused.status.reason = "shader call must be linked before translation";
+				return refused;
+			}
+			linked_call |= inst.branch_target != UINT32_MAX;
 		}
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
@@ -770,39 +1364,70 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
-	     StageName(options.stage), options.shader_hash);
-	auto native_cfg = CFG::BuildGraph(decoded);
+	CFG::Graph native_cfg;
 	CFG::Graph structured_cfg;
-	auto* selected_cfg = &native_cfg;
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
-	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(native_cfg.blocks.size()),
-	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
-	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	if (native_cfg.irreducible) {
-		LogDispatcherFallback(options, native_cfg, "build");
-	} else {
-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+	auto       cfg_outcome = CfgOutcome::Structured;
+	// Keyed by the words the program was decoded from, which include a linked SWAPPC leaf.
+	const bool cfg_cached = StructurizedCfgCache().Get(decoded.code, options.back_code, native_cfg,
+	                                                   structured_cfg, cfg_outcome);
+	if (!cfg_cached) {
+		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-		structured_cfg = CFG::Structurize(native_cfg);
-		if (structured_cfg.unsupported) {
-			native_cfg.unsupported = true;
-			native_cfg.failure_kind = structured_cfg.failure_kind;
-			native_cfg.failure_block = structured_cfg.failure_block;
-			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
-			LogDispatcherFallback(options, native_cfg, "structurize");
-		} else {
-			selected_cfg = &structured_cfg;
-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
-			     static_cast<uint64_t>(selected_cfg->blocks.size()));
-		}
-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
-		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+		native_cfg = CFG::BuildGraph(decoded);
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+		     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-		     static_cast<uint64_t>(selected_cfg->blocks.size()),
-		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
+		     static_cast<uint64_t>(native_cfg.blocks.size()),
+		     static_cast<uint64_t>(native_cfg.natural_loops.size()),
+		     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+		if (native_cfg.unsupported) {
+			cfg_outcome = CfgOutcome::BuildRejected;
+		} else if (native_cfg.irreducible) {
+			cfg_outcome = CfgOutcome::Irreducible;
+			LogDispatcherFallback(options, native_cfg, "build");
+		} else {
+			LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+			     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+			structured_cfg = CFG::Structurize(native_cfg);
+			if (structured_cfg.unsupported) {
+				cfg_outcome                   = CfgOutcome::StructurizeFailed;
+				native_cfg.unsupported        = true;
+				native_cfg.failure_kind       = structured_cfg.failure_kind;
+				native_cfg.failure_block      = structured_cfg.failure_block;
+				native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
+				structured_cfg                = {};
+				LogDispatcherFallback(options, native_cfg, "structurize");
+			} else {
+				LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+				     static_cast<uint64_t>(structured_cfg.blocks.size()));
+			}
+			const auto& selected =
+			    cfg_outcome == CfgOutcome::Structured ? structured_cfg : native_cfg;
+			LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+			     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+			     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+			     static_cast<uint64_t>(selected.blocks.size()),
+			     static_cast<uint64_t>(selected.natural_loops.size()), phase_ms());
+		}
+		StructurizedCfgCache().Put(decoded.code, options.back_code, native_cfg, structured_cfg,
+		                           cfg_outcome);
+	}
+	const auto* selected_cfg =
+	    cfg_outcome == CfgOutcome::Structured ? &structured_cfg : &native_cfg;
+	if (cfg_outcome == CfgOutcome::BuildRejected) {
+		TranslateResult result;
+		result.status.ok     = false;
+		result.status.pc     = native_cfg.failure_pc;
+		result.status.reason = native_cfg.unsupported_reason;
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.cfg_dump     = CFG::GraphToString(native_cfg);
+		}
+		return result;
+	}
+	if (cfg_cached && cfg_outcome != CfgOutcome::Structured) {
+		LogDispatcherFallback(options, native_cfg,
+		                      cfg_outcome == CfgOutcome::Irreducible ? "build" : "structurize");
 	}
 
 	const auto& cfg = *selected_cfg;
@@ -818,13 +1443,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage            = options.stage,
-	    .wave_size        = options.wave_size,
-	    .shader_hash      = options.shader_hash,
-	    .user_data_base   = options.user_data_base,
-	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info       = options.input_info,
-	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .stage              = options.stage,
+	    .wave_size          = options.wave_size,
+	    .host_subgroup_size = options.host_subgroup_size,
+	    .shader_hash        = options.shader_hash,
+	    .user_data_base     = options.user_data_base,
+	    .user_data_count    = static_cast<uint32_t>(options.user_data.size()),
+	    .input_info         = options.input_info,
+	    .embedded_fetch     = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
@@ -833,12 +1459,28 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	std::vector<IR::Inst*> exec_reads;
+	for (auto* block: ir.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == IR::ValueOpcode::GetExec) {
+				exec_reads.push_back(&inst);
+			}
+		}
+	}
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	};
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	// Before identities are removed: the former GetExec reads are still identities in place.
+	IR::EliminateDeadLaneWriteMasks(ir, exec_reads);
+	if (IR::FoldUnreachableIndexCompares(ir) != 0) {
+		// Twice: the first pass reaches loop phis before their back edges are rewritten.
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	}
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
@@ -847,11 +1489,17 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
-	if (decoded.has_swap_pc) {
+	if (linked_call) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
-		for (const auto* block: ir.blocks)
-			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
+		for (const auto* block: ir.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != IR::ValueOpcode::GetShaderBase) continue;
+				TranslateResult refused;
+				refused.status.ok     = false;
+				refused.status.reason = "a linked call's native return PC reaches GPU data";
+				return refused;
+			}
+		}
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
@@ -862,8 +1510,19 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	ir.robust_buffer_access2 = options.robust_buffer_access2;
+	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
+	ir.refuse_indirect_buffer_table = options.refuse_indirect_buffer_table;
+	auto tracking = IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	ir.refuse_indirect_buffer_table = nullptr;
 	TranslateResult result;
+	if (!tracking.ok) {
+		result.status.ok     = false;
+		result.status.pc     = tracking.pc;
+		result.status.reason = std::move(tracking.reason);
+		result.program       = std::move(ir);
+		return result;
+	}
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
@@ -872,12 +1531,31 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	return result;
 }
 
+CfgCacheStats CfgCacheStatistics() {
+	return StructurizedCfgCache().Stats();
+}
+
+void OpenCfgCacheFile(const std::string& path, uint64_t stamp) {
+	StructurizedCfgCache().OpenFile(path, stamp);
+}
+
+void FlushCfgCacheFile() {
+	StructurizedCfgCache().Flush();
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
-	IR::ApplyResourceSpecialization(ir, specialization);
+	if (!IR::ApplyResourceSpecialization(ir, specialization)) {
+		CompileResult refused;
+		refused.status.ok     = false;
+		refused.status.pc     = 0;
+		refused.status.reason = "resource specialization does not describe this translation";
+		refused.program       = std::move(ir);
+		return refused;
+	}
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
@@ -918,6 +1596,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (IR::EliminateUndemandedWriteMasks(ir) != 0) {
+		IR::RemoveIdentities(ir);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
@@ -930,8 +1612,20 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
+	std::string refusal;
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
+	                                options.emit_debug_info, &refusal);
+	if (!refusal.empty()) {
+		CompileResult refused;
+		refused.status.ok     = false;
+		refused.status.pc     = 0;
+		refused.status.reason = std::move(refusal);
+		refused.program       = std::move(ir);
+		return refused;
+	}
+	if (spirv.size() >= Spirv::DriverSimplifyMinWords()) {
+		Spirv::SimplifyForDriver(spirv);
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,

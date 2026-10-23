@@ -325,7 +325,25 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_dispatch_threads gpu_dispatch_threads.comp)
+add_gpu_blit_shader(gpu_page_diff gpu_page_diff.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
+
+set(gpu_mesh_indirect_include "${gpu_tiler_shader_dir}/gpu_mesh_indirect.inc")
+set(gpu_mesh_indirect_source "${gpu_tiler_shader_dir}/gpu_mesh_indirect.task")
+set(gpu_mesh_indirect_spv "${gpu_blit_generated_dir}/gpu_mesh_indirect_task.spv")
+set(gpu_mesh_indirect_header "${gpu_blit_generated_dir}/gpu_mesh_indirect_task_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_mesh_indirect_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        "-I${gpu_tiler_shader_dir}" -o "${gpu_mesh_indirect_spv}" "${gpu_mesh_indirect_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_mesh_indirect_spv} -DOUTPUT=${gpu_mesh_indirect_header}
+	        -DSYMBOL=GPU_MESH_INDIRECT_TASK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_mesh_indirect_source}" "${gpu_mesh_indirect_include}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
@@ -470,6 +488,7 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderGsAssembly.cpp"
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
@@ -478,6 +497,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
@@ -491,6 +511,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 )
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
@@ -568,6 +589,8 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(ajm_instance_tests "${KYTY_TESTS_DIR}/AjmInstanceTests.cpp")
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -586,6 +609,13 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
+
+add_executable(umtx_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/UmtxTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/umtx.cpp"
+)
+target_link_libraries(umtx_tests common)
+target_include_directories(umtx_tests PRIVATE ${inc_headers})
 
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
@@ -613,20 +643,52 @@ add_custom_command(
 	DEPENDS "${gpu_test_ms_depth_source}"
 	VERBATIM
 )
+set(gpu_test_mesh_indirect_source
+	"${gpu_tiler_shader_dir}/gpu_test_mesh_indirect.comp")
+set(gpu_test_mesh_indirect_spv
+	"${gpu_test_generated_dir}/gpu_test_mesh_indirect.spv")
+set(gpu_test_mesh_indirect_header
+	"${gpu_test_generated_dir}/gpu_test_mesh_indirect_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_test_mesh_indirect_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        "-I${gpu_tiler_shader_dir}" -o "${gpu_test_mesh_indirect_spv}"
+	        "${gpu_test_mesh_indirect_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_mesh_indirect_spv}
+	        -DOUTPUT=${gpu_test_mesh_indirect_header} -DSYMBOL=GPU_TEST_MESH_INDIRECT_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_test_mesh_indirect_source}" "${gpu_mesh_indirect_include}"
+	VERBATIM
+)
 target_sources(shader_recompiler_compute_tests PRIVATE
-	"${gpu_test_ms_depth_header}")
+	"${gpu_test_ms_depth_header}" "${gpu_test_mesh_indirect_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_executable(unfoldable_rebuild_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/UnfoldableRebuildTests.cpp"
+)
+target_link_libraries(unfoldable_rebuild_tests common fmt::fmt)
+target_include_directories(unfoldable_rebuild_tests PRIVATE ${inc_headers})
+
+add_executable(vram_headroom_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VramHeadroomTests.cpp"
+)
+target_link_libraries(vram_headroom_tests common fmt::fmt)
+target_include_directories(vram_headroom_tests PRIVATE ${inc_headers})
+
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+		virtual_memory_allocation_tests)
+	if(KYTY_CLANG_CL)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	else()
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
-	endforeach()
-endif()
+	endif()
+endforeach()
 
 if(BUILD_TESTING)
 	add_test(NAME emulator_user_name_cli
@@ -657,9 +719,11 @@ if(BUILD_TESTING)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
+	add_test(NAME umtx COMMAND $<TARGET_FILE:umtx_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME ajm_instance COMMAND $<TARGET_FILE:ajm_instance_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
@@ -682,6 +746,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_mesh_indirect
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	add_test(NAME graphics_dispatch_guard
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-guard-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
@@ -704,6 +772,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME compute_image_copy
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-image-copy-only)
+	add_test(NAME dispatch_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
+	add_test(NAME long_recording_submit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
 	add_test(NAME image_transfer_layout
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
 
@@ -711,18 +785,42 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
 	add_test(NAME host_image_allocation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
+	add_test(NAME texture_cache_layout_alias
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layout-alias-only)
+	add_test(NAME texture_cache_layout_alias_narrow
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layout-alias-narrow-only)
+	add_test(NAME texture_cache_raw_image_read
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --raw-image-read-only)
+	add_test(NAME texture_cache_raw_image_read_layered
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --raw-image-read-layered-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME texture_cache_image_download_plan
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-download-plan-only)
+	add_test(NAME texture_cache_large_image_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --large-image-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
+	add_test(NAME texture_cache_meta_slice_clear
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --meta-slice-clear-only)
+	add_test(NAME shader_wave64_execz_loop_exit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --execz-loop-exit-only)
+	add_test(NAME texture_cache_stencil_plane_equal_footprint
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-only)
+	add_test(NAME gpu_submission_merge
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submission-merge-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
+	add_test(NAME buffer_cache_bda_store
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-bda-only)
+	add_test(NAME buffer_cache_ring_image_head
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-ring-image-head-only)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
@@ -730,6 +828,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+
+	add_test(NAME unfoldable_rebuild COMMAND $<TARGET_FILE:unfoldable_rebuild_tests>)
+
+	add_test(NAME vram_headroom COMMAND $<TARGET_FILE:vram_headroom_tests>)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
@@ -750,11 +852,13 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		umtx_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		ajm_instance_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests
@@ -766,6 +870,8 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		unfoldable_rebuild_tests
+		vram_headroom_tests
 	)
 endif()
 

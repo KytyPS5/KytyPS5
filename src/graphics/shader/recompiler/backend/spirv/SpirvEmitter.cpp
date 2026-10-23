@@ -7,8 +7,92 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <fmt/format.h>
+#include <span>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint64_t WorkgroupStorageBound(std::span<const uint32_t> spirv) {
+	struct Layout {
+		uint64_t size  = 0;
+		uint64_t align = 1;
+	};
+	std::unordered_map<uint32_t, Layout>   types;
+	std::unordered_map<uint32_t, uint64_t> constants;
+	std::unordered_map<uint32_t, uint32_t> pointees;
+	std::unordered_set<uint32_t>           blocks;
+	const auto                             align_up = [](uint64_t value, uint64_t align) {
+		return (value + align - 1u) / align * align;
+	};
+	uint64_t separate = 0;
+	uint64_t aliased  = 0;
+	for (size_t at = 5; at < spirv.size();) {
+		const auto op    = static_cast<spv::Op>(spirv[at] & 0xffffu);
+		const auto count = spirv[at] >> 16u;
+		if (count == 0 || at + count > spirv.size()) {
+			break;
+		}
+		const auto word = [&](uint32_t index) { return spirv[at + index]; };
+		switch (op) {
+			case spv::OpDecorate:
+				if (word(2) == spv::DecorationBlock) {
+					blocks.insert(word(1));
+				}
+				break;
+			case spv::OpConstant: constants[word(2)] = word(3); break;
+			case spv::OpTypeBool: types[word(1)] = {4, 4}; break;
+			case spv::OpTypeInt:
+			case spv::OpTypeFloat: types[word(1)] = {word(2) / 8u, word(2) / 8u}; break;
+			case spv::OpTypeVector: {
+				const auto component = types[word(2)];
+				types[word(1)]       = {component.size * word(3),
+				                        component.align * (word(3) == 2u ? 2u : 4u)};
+				break;
+			}
+			case spv::OpTypeArray: {
+				const auto element = types[word(2)];
+				types[word(1)]     = {align_up(element.size, element.align) * constants[word(3)],
+				                      element.align};
+				break;
+			}
+			case spv::OpTypeStruct: {
+				Layout layout {};
+				for (uint32_t member = 2; member < count; member++) {
+					const auto field = types[word(member)];
+					layout.size      = align_up(layout.size, field.align) + field.size;
+					layout.align     = std::max(layout.align, field.align);
+				}
+				layout.size    = align_up(layout.size, layout.align);
+				types[word(1)] = layout;
+				break;
+			}
+			case spv::OpTypePointer:
+				if (word(2) == spv::StorageClassWorkgroup) {
+					pointees[word(1)] = word(3);
+				}
+				break;
+			case spv::OpVariable:
+				if (word(3) == spv::StorageClassWorkgroup) {
+					const auto type   = pointees[word(1)];
+					const auto layout = types[type];
+					if (blocks.contains(type)) {
+						aliased = std::max(aliased, layout.size);
+					} else {
+						separate += layout.size + layout.align - 1u;
+					}
+				}
+				break;
+			case spv::OpFunction: at = spirv.size(); continue;
+			default: break;
+		}
+		at += count;
+	}
+	return separate + aliased;
+}
 
 namespace {
 
@@ -25,8 +109,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
-	bool uses_flattened_srt = std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	                          std::ranges::any_of(program.info.images, uses_mapping);
+	bool       uses_flattened_srt   = std::ranges::any_of(program.info.buffers, uses_mapping) ||
+	                                  std::ranges::any_of(program.info.images, uses_mapping);
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
@@ -43,7 +127,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+			       if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
@@ -204,9 +288,58 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 } // namespace
 
+Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
+	SpirvRequirements requirements {};
+	const auto        refuse = [&](const IR::Inst& inst, const char* reason) {
+		if (requirements.refusal == nullptr) {
+			requirements.refusal      = reason;
+			requirements.refused_inst = &inst;
+		}
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
+				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					Fail(program, "buffer operation has invalid memory metadata");
+				}
+				const auto& memory = program.memory_info[memory_index];
+				// A planning-only read is never emitted; its resource is still a register.
+				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
+					if (memory.resource >= program.info.buffers.size()) {
+						Fail(program, "buffer operation has invalid resource metadata");
+					}
+					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u &&
+					    program.stage != ShaderType::Compute) {
+						refuse(inst, "buffer ADD_TID is only valid for compute shaders");
+					}
+				}
+			}
+			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+			if (shared_access == IR::SharedAccess::Atomic) {
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (index >= program.memory_info.size()) {
+					Fail(program, "shared operation has invalid memory metadata");
+				}
+				const auto kind = program.memory_info[index].kind;
+				// The 64-bit LDS view is a Workgroup block, which only compute LDS has.
+				if ((IR::SharedComponentCount(inst.GetOpcode()) == 2u ||
+				     inst.GetType() == IR::Type::U64) &&
+				    (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute)) {
+					refuse(inst, "64-bit shared atomics require compute LDS");
+				}
+			}
+			if (inst.GetOpcode() == IR::ValueOpcode::DispatchThreadInRange) {
+				requirements.dispatch_thread_limit = true;
+			}
+		}
+	}
+	return requirements;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info, std::string* refusal) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -222,6 +355,23 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, profile);
+	const auto   refused = [&]() -> std::vector<uint32_t> {
+		const auto* inst = state.refused_inst;
+		auto        text = fmt::format("SPIR-V emission refused: opcode={} reason={}",
+		                               inst != nullptr ? IR::ValueOpcodeName(inst->GetOpcode())
+		                                               : std::string_view {"none"},
+		                               state.refusal);
+		if (refusal == nullptr) {
+			EXIT("%s hash=0x%016" PRIx64 " stage=%u\n", text.c_str(), program.shader_hash,
+			     static_cast<unsigned>(program.stage));
+		}
+		*refusal = std::move(text);
+		return {};
+	};
+	if (state.requirements.refusal != nullptr) {
+		state.Refuse(state.requirements.refusal, state.requirements.refused_inst);
+		return refused();
+	}
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",
@@ -235,9 +385,15 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
+	if (state.Refused()) {
+		return refused();
+	}
 	ValidateNativeProgram(program,
 	                      program.stage == ShaderType::Compute && input_info.compute->lds_storage);
 	EmitProgram(state);
+	if (state.Refused()) {
+		return refused();
+	}
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 

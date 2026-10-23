@@ -2,6 +2,9 @@
 
 #include "common/alignment.h"
 
+#include <memory>
+#include <optional>
+
 namespace Libs::Graphics {
 namespace {
 
@@ -20,6 +23,78 @@ bool IsDepthPlane(const ImageInfo& info) {
 	       (info.tile_mode == Prospero::TileMode::kDepth ||
 	        info.tile_mode == Prospero::TileMode::kLinear);
 }
+
+// Every field TryUpdateSizeUncached reads. A field it starts reading must be added here.
+struct LayoutInputs {
+	vk::Format             pixel_format = vk::Format::eUndefined;
+	Prospero::BufferFormat guest_format = Prospero::BufferFormat::kInvalid;
+	Prospero::ImageType    type         = Prospero::ImageType::kColor2D;
+	vk::Extent3D           extent       = {};
+	ImageSubresources      resources;
+	uint32_t               pitch           = 0;
+	uint32_t               bytes_per_block = 0;
+	uint32_t               samples         = 0;
+	Prospero::TileMode     tile_mode       = Prospero::TileMode::kLinear;
+	uint64_t               data_size       = 0;
+	// Only the Standard4KB compact-mip check (CompactMipSize) reads these two.
+	uint64_t data_address = 0;
+	bool     has_metadata = false;
+
+	explicit LayoutInputs(const ImageInfo& info)
+	    : pixel_format(info.pixel_format), guest_format(info.guest_format), type(info.type),
+	      extent(info.extent), resources(info.resources), pitch(info.pitch),
+	      bytes_per_block(info.bytes_per_block), samples(info.samples), tile_mode(info.tile_mode),
+	      data_size(info.data.size),
+	      data_address(info.tile_mode == Prospero::TileMode::kStandard4KB ? info.data.address : 0),
+	      has_metadata(info.tile_mode == Prospero::TileMode::kStandard4KB && info.HasMetadata()) {}
+	bool operator==(const LayoutInputs&) const = default;
+
+	[[nodiscard]] uint64_t Hash() const {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const uint64_t word:
+		     {static_cast<uint64_t>(pixel_format), static_cast<uint64_t>(guest_format),
+		      static_cast<uint64_t>(type), uint64_t {extent.width}, uint64_t {extent.height},
+		      uint64_t {extent.depth}, uint64_t {resources.levels}, uint64_t {resources.layers},
+		      uint64_t {pitch}, uint64_t {bytes_per_block}, uint64_t {samples},
+		      static_cast<uint64_t>(tile_mode), data_size, data_address, uint64_t {has_metadata}}) {
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+		return hash ^ (hash >> 29u);
+	}
+};
+
+// Every field TryUpdateSizeUncached writes.
+struct LayoutOutputs {
+	uint64_t                     data_size       = 0;
+	uint32_t                     pitch           = 0;
+	uint32_t                     bytes_per_block = 0;
+	std::array<ImageMipInfo, 16> mip_layout {};
+	TileTextureBlockLayout       tiling;
+	uint64_t                     tiled_slice_stride  = 0;
+	uint64_t                     linear_slice_stride = 0;
+	uint32_t                     first_tail_level    = 16;
+
+	explicit LayoutOutputs(const ImageInfo& info)
+	    : data_size(info.data.size), pitch(info.pitch), bytes_per_block(info.bytes_per_block),
+	      mip_layout(info.mip_layout), tiling(info.tiling),
+	      tiled_slice_stride(info.tiled_slice_stride),
+	      linear_slice_stride(info.linear_slice_stride), first_tail_level(info.first_tail_level) {}
+	void ApplyTo(ImageInfo& info) const {
+		info.data.size           = data_size;
+		info.pitch               = pitch;
+		info.bytes_per_block     = bytes_per_block;
+		info.mip_layout          = mip_layout;
+		info.tiling              = tiling;
+		info.tiled_slice_stride  = tiled_slice_stride;
+		info.linear_slice_stride = linear_slice_stride;
+		info.first_tail_level    = first_tail_level;
+	}
+};
+
+struct LayoutMemoEntry {
+	LayoutInputs  inputs;
+	LayoutOutputs outputs;
+};
 
 GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
 	const auto& block = info.tiling.block;
@@ -76,14 +151,35 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
-void ImageInfo::UpdateSize() {
+bool ImageInfo::TryUpdateSize() {
+	constexpr size_t                                               MemoEntries = 256;
+	thread_local std::unique_ptr<std::optional<LayoutMemoEntry>[]> memo;
+	if (memo == nullptr) {
+		memo = std::make_unique<std::optional<LayoutMemoEntry>[]>(MemoEntries);
+	}
+	const LayoutInputs inputs(*this);
+	auto&              entry = memo[inputs.Hash() % MemoEntries];
+	if (entry && entry->inputs == inputs) {
+		entry->outputs.ApplyTo(*this);
+		return true;
+	}
+	if (!TryUpdateSizeUncached()) {
+		return false;
+	}
+	entry.emplace(LayoutMemoEntry {inputs, LayoutOutputs(*this)});
+	return true;
+}
+
+bool ImageInfo::TryUpdateSizeUncached() {
 	EXIT_IF(guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
 	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
 	        resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
 	        !std::has_single_bit(samples));
 	const bool auto_size = data.size == 0;
 	TileTextureElementLayout element {};
-	EXIT_NOT_IMPLEMENTED(!TileGetTextureElementLayout(guest_format, element));
+	if (!TileGetTextureElementLayout(guest_format, element)) {
+		return false;
+	}
 	if (bytes_per_block == 0) {
 		bytes_per_block = element.bytes;
 	}
@@ -98,37 +194,48 @@ void ImageInfo::UpdateSize() {
 	first_tail_level               = 16;
 
 	if (samples > 1) {
-		EXIT_NOT_IMPLEMENTED(IsVolume() || resources.levels != 1 ||
-		                     (tile_mode != Prospero::TileMode::kDepth &&
-		                      tile_mode != Prospero::TileMode::kRenderTarget));
+		if (IsVolume() || resources.levels != 1 ||
+		    (tile_mode != Prospero::TileMode::kDepth &&
+		     tile_mode != Prospero::TileMode::kRenderTarget)) {
+			return false;
+		}
 		const auto fragments = std::countr_zero(samples);
 		if (pitch == 0) {
 			pitch = tile_mode == Prospero::TileMode::kDepth
 			            ? TileGetDepthPitch(extent.width, bytes_per_block, fragments)
 			            : TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
 		}
-		EXIT_NOT_IMPLEMENTED(!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
+		if (!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling)) {
+			return false;
+		}
 		if (data.size == 0) {
 			TileSizeAlign slice {};
-			EXIT_NOT_IMPLEMENTED(!TileGetRenderTargetSize(extent.width, extent.height, pitch,
-			                                              bytes_per_block, slice, fragments));
+			if (!TileGetRenderTargetSize(extent.width, extent.height, pitch, bytes_per_block, slice,
+			                             fragments)) {
+				return false;
+			}
 			data.size = Multiply(slice.size, resources.layers);
 		}
 		EXIT_IF(data.size % resources.layers != 0);
 		tiled_slice_stride = data.size / resources.layers;
 		mip_layout[0]      = {0, data.size, pitch, extent.height};
-		return;
+		return true;
 	}
 
 	if (pitch == 0) {
 		pitch = TileGetTexturePitch(guest_format, extent.width, tile_mode);
 	}
-	EXIT_IF(pitch == 0);
+	if (pitch == 0) {
+		return false;
+	}
 	if (IsDepthPlane(*this) && resources.levels == 1) {
-		EXIT_NOT_IMPLEMENTED(IsVolume());
+		if (IsVolume()) {
+			return false;
+		}
 		if (IsTiled()) {
-			EXIT_NOT_IMPLEMENTED(
-			    !TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
+			if (!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling)) {
+				return false;
+			}
 		}
 		if (data.size == 0) {
 			TileSizeAlign slice {};
@@ -142,7 +249,7 @@ void ImageInfo::UpdateSize() {
 		linear_slice_stride = slice;
 		tiled_slice_stride  = IsTiled() ? slice : 0;
 		mip_layout[0]       = {0, data.size, pitch, extent.height, 0, slice, pitch};
-		return;
+		return true;
 	}
 	if (!IsTiled()) {
 		TileSizeAlign  total {};
@@ -179,7 +286,9 @@ void ImageInfo::UpdateSize() {
 		                                          IsVolume() ? extent.depth : 1u,
 		                                          resources.levels,
 		                                          resources.layers};
-		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface));
+		if (!TileGetTiledTextureLayout(description, surface)) {
+			return false;
+		}
 		tiling             = surface.texture;
 		first_tail_level   = surface.first_tail_level;
 		tiled_slice_stride = surface.block_slice_size;
@@ -217,6 +326,11 @@ void ImageInfo::UpdateSize() {
 			data.size = mip_layout[0].size = compact_size;
 		}
 	}
+	return true;
+}
+
+void ImageInfo::UpdateSize() {
+	EXIT_NOT_IMPLEMENTED(!TryUpdateSize());
 }
 
 uint32_t ImageInfo::DataAlignment() const {

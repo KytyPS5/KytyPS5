@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -14,6 +15,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -78,6 +80,105 @@ uint32_t PossibleU32Bits(Value value) {
 	return PossibleU32Bits(value, [](Value at) { return at.Resolve(); });
 }
 
+// Every value `value & mask` can take, when the expression proves a handful of them.
+bool PossibleMaskedValues(Value value, uint32_t mask, std::vector<uint32_t>& out,
+                          uint32_t depth = 0) {
+	constexpr size_t MaxValues = 8;
+	const auto       add       = [&](uint32_t candidate) {
+		if (std::ranges::find(out, candidate) == out.end()) {
+			out.push_back(candidate);
+		}
+		return out.size() <= MaxValues;
+	};
+	value = value.Resolve();
+	if (mask == 0) {
+		return add(0);
+	}
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 && add(value.U32() & mask);
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 16) {
+		return false;
+	}
+	const auto immediate = [&](size_t index, uint32_t& result) {
+		const auto arg = inst->Arg(index).Resolve();
+		if (!arg.IsImmediate() || arg.GetType() != Type::U32) {
+			return false;
+		}
+		result = arg.U32();
+		return true;
+	};
+	const auto combine = [&](Value a, uint32_t mask_a, Value b, uint32_t mask_b, auto&& op) {
+		std::vector<uint32_t> left;
+		std::vector<uint32_t> right;
+		if (!PossibleMaskedValues(a, mask_a, left, depth + 1) ||
+		    !PossibleMaskedValues(b, mask_b, right, depth + 1)) {
+			return false;
+		}
+		for (const auto x: left) {
+			for (const auto y: right) {
+				if (!add(op(x, y) & mask)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+	const auto through = [&](Value source, uint32_t source_mask, auto&& map) {
+		std::vector<uint32_t> values;
+		if (!PossibleMaskedValues(source, source_mask, values, depth + 1)) {
+			return false;
+		}
+		return std::ranges::all_of(values, [&](uint32_t x) { return add(map(x) & mask); });
+	};
+	uint32_t a = 0;
+	uint32_t b = 0;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::SelectU32:
+			return PossibleMaskedValues(inst->Arg(1), mask, out, depth + 1) &&
+			       PossibleMaskedValues(inst->Arg(2), mask, out, depth + 1);
+		case ValueOpcode::BitwiseOr32:
+			return combine(inst->Arg(0), mask, inst->Arg(1), mask,
+			               [](uint32_t x, uint32_t y) { return x | y; });
+		case ValueOpcode::BitwiseAnd32:
+			if (immediate(1, a)) {
+				return through(inst->Arg(0), mask & a, [](uint32_t x) { return x; });
+			}
+			return combine(inst->Arg(0), mask, inst->Arg(1), mask,
+			               [](uint32_t x, uint32_t y) { return x & y; });
+		case ValueOpcode::ShiftLeftLogical32:
+			if (!immediate(1, a)) {
+				return false;
+			}
+			a &= 31u;
+			return through(inst->Arg(0), mask >> a, [a](uint32_t x) { return x << a; });
+		case ValueOpcode::ShiftRightLogical32:
+			if (!immediate(1, a)) {
+				return false;
+			}
+			a &= 31u;
+			return through(inst->Arg(0), mask << a, [a](uint32_t x) { return x >> a; });
+		case ValueOpcode::BitFieldUExtract: {
+			if (!immediate(1, a) || !immediate(2, b) || a >= 32u || b == 0u || b > 32u - a) {
+				return false;
+			}
+			const uint32_t field = b == 32u ? UINT32_MAX : (1u << b) - 1u;
+			return through(inst->Arg(0), (mask & field) << a, [a](uint32_t x) { return x >> a; });
+		}
+		case ValueOpcode::BitFieldInsert: {
+			if (!immediate(2, a) || !immediate(3, b) || a >= 32u || b == 0u || b > 32u - a) {
+				return false;
+			}
+			const uint32_t field = (b == 32u ? UINT32_MAX : (1u << b) - 1u) << a;
+			return combine(
+			    inst->Arg(0), mask & ~field, inst->Arg(1), (mask & field) >> a,
+			    [a, field](uint32_t x, uint32_t y) { return (x & ~field) | ((y << a) & field); });
+		}
+		default: return false;
+	}
+}
+
 bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	high = high.Resolve();
 	active = active.Resolve();
@@ -86,6 +187,15 @@ bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	while (const auto* select = high.TryInstruction()) {
 		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) break;
 		high = select->Arg(1).Resolve();
+	}
+	// The aperture match reads address bits [63:48] only, whatever the low half holds.
+	std::vector<uint32_t> tags;
+	if (PossibleMaskedValues(high, 0xffff0000u, tags) && !tags.empty() &&
+	    std::ranges::all_of(tags, [](uint32_t tag) {
+		    return tag == (Decoder::PrivateApertureHigh & 0xffff0000u) ||
+		           tag == (Decoder::SharedApertureHigh & 0xffff0000u);
+	    })) {
+		return true;
 	}
 	uint32_t lower = 0, upper = UINT32_MAX;
 	if (high.IsImmediate() && high.GetType() == Type::U32) {
@@ -380,11 +490,13 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
+		m_info.uses_dma   = false;
+		m_info.writes_dma = false;
+		m_info.dma_pointers.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
-	void Run() {
+	ResourceTrackingStatus Run() {
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
@@ -393,9 +505,10 @@ public:
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectDescriptors();
+		if (!m_status.ok) return m_status;
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
-				Collect(inst);
+				if (!Collect(inst)) return m_status;
 			}
 		}
 		LinkImageAliases();
@@ -543,12 +656,97 @@ public:
 				for (const auto& use: uses) use.user->SetArg(use.operand, key);
 			}
 		}
+		m_program.srt_read_order             = OrderSrtReadsAgainstWrites();
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
+		return m_status;
 	}
 
 private:
+	// Per flat SRT slot, the buffers a store can have written before a read of that slot.
+	std::vector<SrtReadWriteOrder> OrderSrtReadsAgainstWrites() const {
+		const auto                                 count = m_program.blocks.size();
+		std::unordered_map<const Block*, uint32_t> indices;
+		for (uint32_t i = 0; i < count; i++)
+			indices.emplace(m_program.blocks[i], i);
+		const auto written = [&](const Inst& inst, SrtReadWriteOrder& order) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			if (image == ImageAccess::Write || image == ImageAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+				order.unknown = true;
+				return;
+			}
+			if (buffer != BufferAccess::Write && buffer != BufferAccess::Atomic) return;
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				order.unknown = true;
+				return;
+			}
+			const auto& memory = m_program.memory_info[index];
+			if (memory.planning_only || memory.kind != ResourceKind::Buffer ||
+			    memory.resource >= m_info.buffers.size() || memory.resource >= 64u) {
+				order.unknown = true;
+				return;
+			}
+			order.buffers |= uint64_t {1} << memory.resource;
+		};
+		const auto merge = [](SrtReadWriteOrder& into, const SrtReadWriteOrder& from) {
+			const auto before = into;
+			into.buffers |= from.buffers;
+			into.unknown = into.unknown || from.unknown;
+			return into != before;
+		};
+		std::vector<SrtReadWriteOrder> generated(count, SrtReadWriteOrder {.unknown = false});
+		for (uint32_t i = 0; i < count; i++)
+			for (const auto& inst: *m_program.blocks[i])
+				written(inst, generated[i]);
+		std::vector<SrtReadWriteOrder> entry(count, SrtReadWriteOrder {.unknown = false});
+		std::vector<uint32_t>          pending(count);
+		std::vector<uint8_t>           queued(count, 1u);
+		for (uint32_t i = 0; i < count; i++)
+			pending[i] = i;
+		while (!pending.empty()) {
+			const auto block = pending.back();
+			pending.pop_back();
+			queued[block] = 0u;
+			auto exit     = entry[block];
+			merge(exit, generated[block]);
+			for (const auto* successor: m_program.blocks[block]->ImmSuccessors()) {
+				const auto next = indices.find(successor);
+				if (next == indices.end()) return {};
+				if (merge(entry[next->second], exit) && !queued[next->second]) {
+					queued[next->second] = 1u;
+					pending.push_back(next->second);
+				}
+			}
+		}
+		std::vector<SrtReadWriteOrder> order(m_program.srt_reads.size());
+		std::vector<uint8_t>           seen(order.size(), 0u);
+		for (uint32_t i = 0; i < count; i++) {
+			auto running = entry[i];
+			for (const auto& inst: *m_program.blocks[i]) {
+				if (inst.GetOpcode() == ValueOpcode::ReadConst) {
+					const auto slot = inst.Arg(1).Resolve();
+					if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+					    slot.U32() >= order.size())
+						continue;
+					auto& into = order[slot.U32()];
+					if (!seen[slot.U32()]) {
+						seen[slot.U32()] = 1u;
+						into             = SrtReadWriteOrder {.unknown = false};
+					}
+					merge(into, running);
+					continue;
+				}
+				written(inst, running);
+			}
+		}
+		return order;
+	}
+
 	struct HandlePatch {
 		Inst*    handle   = nullptr;
 		uint32_t resource = 0;
@@ -566,6 +764,11 @@ private:
 		uint32_t pc;
 		DescriptorSource source;
 		Value planning_handle;
+	};
+
+	struct MemoryAccessors {
+		uint32_t    count = 0;
+		const Inst* only  = nullptr;
 	};
 
 	struct IndirectDescriptorPlan {
@@ -589,6 +792,16 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		EXIT("%s", message.c_str());
 		std::abort();
+	}
+
+	// A guest shader this pass cannot model: records the first reason and unwinds.
+	bool Reject(uint32_t pc, const std::string& reason) const {
+		if (m_status.ok) {
+			m_status.ok     = false;
+			m_status.pc     = pc;
+			m_status.reason = reason;
+		}
+		return false;
 	}
 
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
@@ -705,29 +918,71 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// Iterative: descriptor dwords can sit on SSA chains tens of thousands of values deep.
 	Value LowerDescriptorValue(Value value) {
-		value            = value.Resolve();
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return value;
-		// The scalar planner owns reads and lowers their address handles separately.
-		uint32_t memory_index = 0;
-		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
-		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
-		if (!inserted) return cached->second;
-		if (inst->GetOpcode() != ValueOpcode::Phi) {
-			Inst* projected = nullptr;
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
-				if (lowered == inst->Arg(arg).Resolve()) continue;
-				if (projected == nullptr) {
-					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
-					for (size_t i = 0; i < inst->NumArgs(); ++i) projected->SetArg(i, inst->Arg(i));
-				}
-				projected->SetArg(arg, lowered);
+		struct Frame {
+			const Inst*                            inst;
+			std::map<const Inst*, Value>::iterator cached;
+			size_t                                 arg       = 0;
+			Inst*                                  projected = nullptr;
+		};
+		std::vector<Frame> stack;
+		Value              lowered;
+		// Returns true with `lowered` set, or pushes a frame whose operands must be lowered first.
+		const auto enter = [&](Value operand) {
+			operand          = operand.Resolve();
+			const auto* inst = operand.TryInstruction();
+			lowered          = operand;
+			if (inst == nullptr) return true;
+			// The scalar planner owns reads and lowers their address handles separately.
+			uint32_t memory_index = 0;
+			if (ScalarReadMemory(*inst, memory_index) != nullptr) return true;
+			const auto [cached, inserted] = m_descriptor_values.emplace(inst, operand);
+			if (!inserted) {
+				lowered = cached->second;
+				return true;
 			}
-			if (projected != nullptr) cached->second = Value(projected);
-			return cached->second;
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				cached->second = LowerDescriptorPhi(*inst, operand);
+				lowered        = cached->second;
+				return true;
+			}
+			stack.push_back({inst, cached});
+			return false;
+		};
+		if (enter(value)) return lowered;
+		bool pending = false;
+		for (;;) {
+			auto&       frame = stack.back();
+			const auto* inst  = frame.inst;
+			if (pending) {
+				pending = false;
+				if (lowered != inst->Arg(frame.arg).Resolve()) {
+					if (frame.projected == nullptr) {
+						frame.projected = &m_program.value_storage.emplace_back(
+						    inst->GetOpcode(), inst->Flags<uint64_t>());
+						for (size_t i = 0; i < inst->NumArgs(); ++i)
+							frame.projected->SetArg(i, inst->Arg(i));
+					}
+					frame.projected->SetArg(frame.arg, lowered);
+				}
+				++frame.arg;
+			}
+			if (frame.arg < inst->NumArgs()) {
+				// A pushed frame invalidates `frame` and lowers its own operands first.
+				pending = enter(inst->Arg(frame.arg));
+				continue;
+			}
+			if (frame.projected != nullptr) frame.cached->second = Value(frame.projected);
+			lowered = frame.cached->second;
+			stack.pop_back();
+			if (stack.empty()) return lowered;
+			pending = true;
 		}
+	}
+
+	Value LowerDescriptorPhi(const Inst& phi, Value value) {
+		const auto* inst = &phi;
 		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
 			return value;
 		}
@@ -776,8 +1031,7 @@ private:
 		selected.SetArg(0, info.condition);
 		selected.SetArg(1, inst->Arg(true_arg));
 		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
-		cached->second = Value(&selected);
-		return cached->second;
+		return Value(&selected);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -822,45 +1076,350 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
-	void CollectScalarRead(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return;
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
-			Fail(use_pc, "cyclic typed planning value without a phi");
+	// Iterative: slices run thousands of instructions deep. Post-order fixes m_scalar_reads slots.
+	void CollectScalarRead(Value root, uint32_t root_pc) {
+		struct Frame {
+			Inst*                                   inst;
+			bool                                    hoist;
+			std::vector<std::pair<Value, uint32_t>> operands;
+			size_t                                  next;
+		};
+		std::vector<Frame> stack;
+		const auto         enter = [&](Value value, uint32_t use_pc) {
+			value = value.Resolve();
+			if (value.IsImmediate()) return;
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+			const auto cycle = std::ranges::find(m_srt_visiting, inst);
+			if (cycle != m_srt_visiting.end()) {
+				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
+					    return value->GetOpcode() == ValueOpcode::Phi;
+				    }))
+					return;
+				Fail(use_pc, "cyclic typed planning value without a phi");
+			}
+			if (m_srt_visited.contains(inst)) return;
+			m_srt_visiting.push_back(inst);
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*inst, memory_index);
+			Frame       frame {inst, false, {}, 0};
+			if (memory != nullptr) {
+				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				const auto  width  = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+				if (handle == nullptr ||
+				    handle->GetOpcode() != (width == 4u ? ValueOpcode::GetBufferResource
+				                                        : ValueOpcode::GetAddressResource))
+					Fail(use_pc, "scalar read has an invalid resource handle");
+				DescriptorSource source;
+				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
+				           inst->Flags<MemoryFlags>().pc);
+				const auto offset = inst->Arg(1).Resolve();
+				// A flat slot holds one word; a carried descriptor names a record per iteration.
+				frame.hoist = offset.IsImmediate() && offset.GetType() == Type::U32 &&
+				              !ReadsThroughCarriedDescriptor(*inst, source);
+				for (uint32_t word = 0; word < width; ++word)
+					frame.operands.emplace_back(source.dwords[word], inst->Flags<MemoryFlags>().pc);
+				for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
+					frame.operands.emplace_back(inst->Arg(arg), use_pc);
+			} else {
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+					frame.operands.emplace_back(inst->Arg(arg), use_pc);
+			}
+			stack.push_back(std::move(frame));
+		};
+		enter(root, root_pc);
+		while (!stack.empty()) {
+			auto& frame = stack.back();
+			if (frame.next < frame.operands.size()) {
+				const auto [value, use_pc] = frame.operands[frame.next++];
+				enter(value, use_pc);
+				continue;
+			}
+			m_srt_visiting.pop_back();
+			m_srt_visited.insert(frame.inst);
+			if (frame.hoist) m_scalar_reads.push_back(frame.inst);
+			stack.pop_back();
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
-		m_srt_visiting.push_back(inst);
-		uint32_t memory_index = 0;
-		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
+	}
+
+	bool CarriedValue(Value value, uint32_t depth, std::vector<const Inst*>& seen) const {
+		constexpr uint32_t MaxCarriedDepth = 24;
+		if (depth > MaxCarriedDepth) {
+			return false;
 		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
-		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		m_scalar_reads.push_back(inst);
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(seen, inst) != seen.end()) {
+			return false;
+		}
+		seen.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			return ResolveInvariantPhi(m_program, value).IsEmpty();
+		}
+		for (uint32_t arg = 0; arg < inst->NumArgs(); arg++) {
+			if (CarriedValue(inst->Arg(arg), depth + 1, seen)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool ReadsThroughCarriedDescriptor(const Inst& read, const DescriptorSource& source) const {
+		// Only a scalar buffer read stays in the shader; a raw address read keeps being hoisted.
+		if (read.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+			return false;
+		}
+		for (uint32_t word = 0; word < source.dword_count; word++) {
+			std::vector<const Inst*> seen;
+			if (CarriedValue(source.dwords[word], 0, seen)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	struct HostEvaluated {
+		std::unordered_set<const Inst*> strict;
+		std::unordered_set<const Inst*> decodable;
+	};
+
+	bool RelativeStoreHandle(const Inst& handle, DmaPointer* pointer = nullptr) const {
+		const auto op    = handle.GetOpcode();
+		const auto words = op == ValueOpcode::GetBufferResource    ? 4u
+		                   : op == ValueOpcode::GetAddressResource ? 2u
+		                                                           : 0u;
+		if (words == 0u || handle.NumArgs() < words) {
+			return false;
+		}
+		const auto user_reg = [](const Inst* inst, uint32_t& reg) {
+			if (inst == nullptr || inst->GetOpcode() != ValueOpcode::GetUserData ||
+			    inst->Arg(0).GetType() != Type::ScalarReg) {
+				return false;
+			}
+			reg = RegIndex(inst->Arg(0).ScalarRegister());
+			return true;
+		};
+		uint32_t   base_lo       = UINT32_MAX;
+		uint32_t   base_hi       = UINT32_MAX;
+		const auto record_offset = [&](const Inst& load, int64_t& offset) {
+			uint32_t    index  = 0;
+			const auto* memory = ScalarReadMemory(load, index);
+			const auto* record = load.Arg(0).Resolve().TryInstruction();
+			const auto  extra  = load.Arg(1).Resolve();
+			uint32_t    lo     = UINT32_MAX;
+			uint32_t    hi     = UINT32_MAX;
+			if (memory == nullptr || record == nullptr ||
+			    record->GetOpcode() != ValueOpcode::GetAddressResource || record->NumArgs() != 2u ||
+			    !user_reg(record->Arg(0).Resolve().TryInstruction(), lo) ||
+			    !user_reg(record->Arg(1).Resolve().TryInstruction(), hi) || !extra.IsImmediate() ||
+			    extra.GetType() != Type::U32) {
+				return false;
+			}
+			if (base_lo == UINT32_MAX) {
+				base_lo = lo;
+				base_hi = hi;
+			} else if (lo != base_lo || hi != base_hi) {
+				return false;
+			}
+			offset = (static_cast<int64_t>(static_cast<int32_t>(memory->offset)) & ~int64_t {3}) +
+			         static_cast<int64_t>(extra.U32() & ~3u);
+			return true;
+		};
+		struct Leaves {
+			std::vector<uint32_t> regs;
+			std::vector<int64_t>  loads;
+		};
+		const auto collect = [&](Value root, Leaves& out) {
+			std::vector<const Inst*>        pending;
+			std::unordered_set<const Inst*> seen;
+			const auto                      visit = [&](Value value) {
+				value = value.Resolve();
+				if (value.IsImmediate()) {
+					return true;
+				}
+				const auto* inst = value.TryInstruction();
+				if (inst == nullptr) {
+					return false;
+				}
+				pending.push_back(inst);
+				return true;
+			};
+			if (!visit(root)) {
+				return false;
+			}
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				if (!seen.insert(inst).second) {
+					continue;
+				}
+				if (seen.size() > 128u) {
+					return false;
+				}
+				const auto inst_op = inst->GetOpcode();
+				if (inst_op == ValueOpcode::GetUserData) {
+					uint32_t reg = 0;
+					if (!user_reg(inst, reg)) {
+						return false;
+					}
+					out.regs.push_back(reg);
+					continue;
+				}
+				if (inst_op == ValueOpcode::LoadAddressU32) {
+					int64_t offset = 0;
+					if (!record_offset(*inst, offset)) {
+						return false;
+					}
+					out.loads.push_back(offset);
+					continue;
+				}
+				// Only arithmetic on those leaves: anything else could move the base anywhere.
+				if (inst_op == ValueOpcode::Phi || inst_op == ValueOpcode::ReadConst ||
+				    inst_op == ValueOpcode::ReadConstBuffer ||
+				    BufferAccessOf(inst_op) != BufferAccess::None ||
+				    AddressOpcodeInfoOf(inst_op).access != AddressAccess::None) {
+					return false;
+				}
+				for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+					if (!visit(inst->Arg(arg))) {
+						return false;
+					}
+				}
+			}
+			return true;
+		};
+		Leaves low;
+		Leaves high;
+		if (!collect(handle.Arg(0), low) || !collect(handle.Arg(1), high) || low.loads.empty() ||
+		    base_lo == UINT32_MAX) {
+			return false;
+		}
+		const auto has = [](const auto& list, auto item) {
+			return std::ranges::find(list, item) != list.end();
+		};
+		const auto offset = low.loads.front();
+		const bool shape =
+		    offset >= 0 && offset <= INT32_MAX &&
+		    std::ranges::all_of(low.loads, [&](int64_t item) { return item == offset; }) &&
+		    std::ranges::all_of(low.regs, [&](uint32_t reg) { return reg == base_lo; }) &&
+		    has(low.regs, base_lo) &&
+		    std::ranges::all_of(
+		        high.loads, [&](int64_t item) { return item == offset || item == offset + 4; }) &&
+		    has(high.loads, offset + 4) &&
+		    std::ranges::all_of(high.regs,
+		                        [&](uint32_t reg) { return reg == base_lo || reg == base_hi; }) &&
+		    has(high.regs, base_hi);
+		if (!shape) {
+			return false;
+		}
+		if (pointer != nullptr) {
+			*pointer                 = {};
+			pointer->user_data       = true;
+			pointer->store           = true;
+			pointer->lo              = base_lo;
+			pointer->hi              = base_hi;
+			pointer->relative_offset = static_cast<uint32_t>(offset);
+			if (const auto* top = handle.Arg(1).Resolve().TryInstruction();
+			    top != nullptr && top->GetOpcode() == ValueOpcode::BitwiseOr32) {
+				for (uint32_t arg = 0; arg < top->NumArgs(); ++arg) {
+					const auto mask = top->Arg(arg).Resolve();
+					if (mask.IsImmediate() && mask.GetType() == Type::U32) {
+						pointer->high_mask = mask.U32();
+					}
+				}
+			}
+			if (words == 4u) {
+				const auto records    = handle.Arg(2).Resolve();
+				int64_t    records_at = 0;
+				if (records.IsImmediate() && records.GetType() == Type::U32) {
+					pointer->records = records.U32();
+				} else if (const auto* load = records.TryInstruction();
+				           load != nullptr && load->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				           record_offset(*load, records_at) && records_at >= 0 &&
+				           records_at <= INT32_MAX) {
+					pointer->records_offset = static_cast<uint32_t>(records_at);
+				}
+			}
+		}
+		return true;
+	}
+
+	HostEvaluated HostEvaluatedValues() const {
+		HostEvaluated result;
+		const auto    close = [](std::unordered_set<const Inst*>& needed, auto&& roots) {
+			std::vector<const Inst*> pending;
+			const auto               need = [&](Value value) {
+				if (value.IsEmpty()) return;
+				const auto* inst = value.Resolve().TryInstruction();
+				if (inst != nullptr && needed.insert(inst).second) pending.push_back(inst);
+			};
+			roots(need);
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+					need(inst->Arg(arg));
+			}
+		};
+		// A BDA store miss is dropped, so a handle written through must be bound by the host.
+		std::unordered_set<const Inst*> written;
+		{
+			std::vector<const Inst*> pending;
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					const auto op     = inst.GetOpcode();
+					const auto buffer = BufferAccessOf(op);
+					if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+					    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+						if (const auto* handle = inst.Arg(0).Resolve().TryInstruction())
+							pending.push_back(handle);
+					}
+				}
+			}
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				if (!written.insert(inst).second) continue;
+				const auto op = inst->GetOpcode();
+				if (op == ValueOpcode::GetAddressResource || op == ValueOpcode::GetBufferResource)
+					continue;
+				for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+					const auto operand = inst->Arg(arg).Resolve();
+					if (operand.GetType() == Type::BufferResource ||
+					    operand.GetType() == Type::AddressResource) {
+						if (const auto* handle = operand.TryInstruction())
+							pending.push_back(handle);
+					}
+				}
+			}
+		}
+		const auto handles = [&](bool decodable) {
+			return [&, decodable](auto&& need) {
+				for (auto* block: m_program.blocks) {
+					for (auto& inst: *block) {
+						const auto op                = inst.GetOpcode();
+						const bool buffer_or_address = op == ValueOpcode::GetAddressResource ||
+						                               op == ValueOpcode::GetBufferResource;
+						const bool image_or_sampler  = op == ValueOpcode::GetImageResource ||
+						                               op == ValueOpcode::GetSamplerResource;
+						const bool strict =
+						    image_or_sampler || (buffer_or_address && written.contains(&inst) &&
+						                         !RelativeStoreHandle(inst));
+						if (decodable ? buffer_or_address && !strict : strict) {
+							for (uint32_t arg = 0; arg < inst.NumArgs(); ++arg)
+								need(inst.Arg(arg));
+						}
+					}
+				}
+				if (!decodable) {
+					for (const auto* block: m_program.blocks)
+						need(block->indirect_target);
+				}
+			};
+		};
+		close(result.strict, handles(false));
+		close(result.decodable, handles(true));
+		return result;
 	}
 
 	void PlanScalarReads() {
@@ -912,8 +1471,14 @@ private:
 					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
 			}
 		}
+		const auto host_needed = HostEvaluatedValues();
+		m_program.data_flat_slots.clear();
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
+			// A read the materializer could not fold stays a native load.
+			if (std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
+			    m_program.unfoldable_pcs.end())
+				continue;
 			auto& memory = m_program.memory_info[flags.index];
 			const auto* handle = read->Arg(0).Resolve().TryInstruction();
 			auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
@@ -937,7 +1502,19 @@ private:
 				if (same) break;
 			}
 			const bool keep = slot == m_program.srt_reads.size();
-			if (keep) m_program.srt_reads.push_back({Value(read), slot});
+			// 0: the host needs the word; 1: data only; 2: a buffer or address handle word.
+			const uint8_t kind = read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			                             host_needed.strict.contains(read)
+			                         ? 0u
+			                     : host_needed.decodable.contains(read) ? 2u
+			                                                            : 1u;
+			if (keep) {
+				m_program.srt_reads.push_back({Value(read), slot});
+				m_program.data_flat_slots.push_back(kind);
+			} else {
+				auto& merged = m_program.data_flat_slots[slot];
+				merged       = merged == 0u || kind == 0u ? 0u : std::max(merged, kind);
+			}
 			auto* block = read->Parent();
 			auto& list = block->Instructions();
 			const auto where = std::ranges::find_if(list, [&](const Inst& inst) {
@@ -1094,7 +1671,33 @@ private:
 		           : nullptr;
 	}
 
+	static bool IsMemoryAccess(ValueOpcode op) {
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// Descriptor planning neither adds nor renumbers memory accesses, so this holds while it runs.
+	void IndexMemoryAccessors() {
+		m_memory_accessors.assign(m_program.memory_info.size(), {});
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if (!IsMemoryAccess(inst.GetOpcode())) continue;
+				const auto index = inst.Flags<MemoryFlags>().index;
+				if (index < m_memory_accessors.size()) {
+					m_memory_accessors[index].count++;
+					m_memory_accessors[index].only = &inst;
+				}
+			}
+		}
+	}
+
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		if (!m_memory_accessors.empty()) {
+			if (index >= m_memory_accessors.size()) return true;
+			const auto& accessors = m_memory_accessors[index];
+			return accessors.count == 0u || (accessors.count == 1u && accessors.only == &owner);
+		}
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
 				const auto op = inst.GetOpcode();
@@ -3214,6 +3817,21 @@ private:
 		return true;
 	}
 
+	// A GPU-written, host-unevaluable or unfoldable table is decoded in the shader instead.
+	bool DemoteBufferTable(const Inst& handle, const DescriptorSource& table) const {
+		if (std::ranges::any_of(handle.Uses(), [&](const Use& use) {
+			    return std::ranges::find(m_program.unfoldable_pcs,
+			                             use.user->Flags<MemoryFlags>().pc) !=
+			           m_program.unfoldable_pcs.end();
+		    }))
+			return true;
+		if (!m_program.refuse_indirect_buffer_table) return false;
+		auto sources = m_sources;
+		sources.push_back(table);
+		return m_program.refuse_indirect_buffer_table(m_program, sources,
+		                                              static_cast<uint32_t>(sources.size() - 1u));
+	}
+
 	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -3259,6 +3877,7 @@ private:
 			source.dword_count = 4u;
 			source.dwords.fill(Value(0u));
 			source.indirect_descriptor = std::move(indirect);
+			if (DemoteBufferTable(handle, source)) return false;
 			plan.handle = &handle;
 			plan.source = InternSource(source);
 			plan.key = key;
@@ -3675,6 +4294,7 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		IndexMemoryAccessors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
@@ -3712,7 +4332,8 @@ private:
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))
-								Fail(flags.pc, "shared descriptor read has incompatible keys");
+								return void(Reject(flags.pc,
+								                   "shared descriptor read has incompatible keys"));
 						}
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
@@ -3725,6 +4346,7 @@ private:
 				            memory.resource * 4u, false);
 			}
 		}
+		m_memory_accessors.clear();
 	}
 
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
@@ -3732,38 +4354,78 @@ private:
 	               bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
-			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
+			return Reject(pc,
+			              fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
+			// The caller decodes an all-DWORD buffer descriptor in the shader instead.
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			return Reject(pc, fmt::format("{} dword {} is not a valid runtime value",
+			                              ValueOpcodeName(expected), bad_dword));
 		}
 		source = InternSource(descriptor);
 		return true;
 	}
 
-	void ValidateAddressHandle(Value value, uint32_t pc) const {
+	bool ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
-			Fail(pc, "address operation requires GetAddressResource");
+			return Reject(pc, "address operation requires GetAddressResource");
 		}
 		if (handle->NumArgs() != 2) {
 			Fail(pc, "GetAddressResource must have two address dwords");
 		}
+		return true;
+	}
+
+	// An unmapped BDA page reads zero and drops stores until its fault is processed.
+	void RecordDmaPointer(const Inst& handle, bool store) {
+		DmaPointer pointer;
+		pointer.store = store;
+		for (uint32_t word = 0; word < 2u; word++) {
+			const auto* source = handle.Arg(word).Resolve().TryInstruction();
+			if (source == nullptr) return;
+			uint32_t index = 0;
+			bool     user  = false;
+			if (source->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = source->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32) return;
+				index = slot.U32();
+			} else if (source->GetOpcode() == ValueOpcode::GetUserData &&
+			           source->Arg(0).GetType() == Type::ScalarReg) {
+				index = RegIndex(source->Arg(0).ScalarRegister());
+				user  = true;
+			} else {
+				return;
+			}
+			if (word == 0u) {
+				pointer.user_data = user;
+				pointer.lo        = index;
+			} else if (user != pointer.user_data) {
+				return;
+			} else {
+				pointer.hi = index;
+			}
+		}
+		if (std::ranges::find(m_info.dma_pointers, pointer) == m_info.dma_pointers.end())
+			m_info.dma_pointers.push_back(pointer);
 	}
 
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
+		const auto index   = inst.Arg(1).Resolve();
+		const bool indexed = inst.GetOpcode() != ValueOpcode::ReadConstBuffer &&
+		                     !(index.IsImmediate() && index.U32() == 0u);
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
 				Merge(m_info.buffers[i], memory, inst, pc);
+				m_info.buffers[i].unindexed = m_info.buffers[i].unindexed && !indexed;
 				return i;
 			}
 		}
@@ -3773,6 +4435,7 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
+		resource.unindexed    = !indexed;
 		Merge(resource, memory, inst, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
@@ -3886,20 +4549,21 @@ private:
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}
 
-	void AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
+	bool AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
 		for (const auto& patch: m_handle_patches) {
 			if (patch.handle == handle) {
 				if (patch.resource != resource) {
-					Fail(pc, fmt::format("{} is reused with incompatible resource classes",
-					                     ValueOpcodeName(handle->GetOpcode())));
+					return Reject(pc, fmt::format("{} is reused with incompatible resource classes",
+					                              ValueOpcodeName(handle->GetOpcode())));
 				}
-				return;
+				return true;
 			}
 		}
 		m_handle_patches.push_back({handle, resource});
+		return true;
 	}
 
-	void AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
+	bool AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
 	                    uint32_t pc) {
 		for (auto& patch: m_memory_patches) {
 			if (patch.index != index) {
@@ -3907,29 +4571,113 @@ private:
 			}
 			if (patch.resource != resource ||
 			    (has_sampler && patch.has_sampler && patch.sampler != sampler)) {
-				Fail(pc, "memory metadata is reused with incompatible resources");
+				return Reject(pc, "memory metadata is reused with incompatible resources");
 			}
 			if (has_sampler) {
 				patch.sampler     = sampler;
 				patch.has_sampler = true;
 			}
-			return;
+			return true;
 		}
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
+		return true;
 	}
 
-	void Collect(Inst& inst) {
+	// A handle that reads a scalar the materializer proved it cannot fold stays a GPU value.
+	bool ReadsUnfoldableScalar(const Inst& handle) const {
+		if (m_program.unfoldable_pcs.empty()) return false;
+		std::vector<const Inst*>        pending {&handle};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!seen.insert(inst).second) continue;
+			if (inst != &handle && inst->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+			    std::ranges::find(m_program.unfoldable_pcs, inst->Flags<MemoryFlags>().pc) !=
+			        m_program.unfoldable_pcs.end())
+				return true;
+			for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+				if (const auto* operand = inst->Arg(arg).Resolve().TryInstruction())
+					pending.push_back(operand);
+		}
+		return false;
+	}
+
+	// A handle on a non-invariant loop phi: the one shape whose fixpoint a walk can fail to prove.
+	bool CarriesLoopPhi(const Inst& handle) const {
+		std::vector<const Inst*>        pending {&handle};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!seen.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				if (ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(inst))).IsEmpty())
+					return true;
+				continue;
+			}
+			for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+				if (const auto* operand = inst->Arg(arg).Resolve().TryInstruction())
+					pending.push_back(operand);
+		}
+		return false;
+	}
+
+	static bool IsDynamicMemoryOrigin(Value value, uint32_t depth = 0) {
+		if (depth > 8) return false;
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) return false;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::LoadAddressU32 ||
+		    BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None)
+			return true;
+		for (size_t i = 0; i < inst->NumArgs(); i++)
+			if (IsDynamicMemoryOrigin(inst->Arg(i), depth + 1)) return true;
+		return false;
+	}
+
+	// Decodes the V# in the shader; stores and atomics need one the shader reads from memory.
+	bool TakeIndirectBuffer(const Inst& inst, uint32_t index, uint32_t pc) {
+		const auto op     = inst.GetOpcode();
+		auto&      memory = m_program.memory_info[index];
+		const bool load   = BufferAccessOf(op) == BufferAccess::Read;
+		auto*      handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+		    memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+		                                                       : ResourceKind::Buffer) ||
+		    (load && !memory.SupportsIndirectBufferLoad(op)))
+			return false;
+		if (!load) {
+			DescriptorSource descriptor;
+			MakeSource(*handle, 4u, false, false, memory.resource * 4u, descriptor, pc);
+			if (std::none_of(descriptor.dwords.begin(), descriptor.dwords.begin() + 4,
+			                 [](Value word) { return IsDynamicMemoryOrigin(word); }))
+				return false;
+			m_program.has_address_writes = true;
+			m_info.writes_dma            = true;
+			DmaPointer pointer;
+			if (RelativeStoreHandle(*handle, &pointer) &&
+			    std::ranges::find(m_info.dma_pointers, pointer) == m_info.dma_pointers.end())
+				m_info.dma_pointers.push_back(pointer);
+		}
+		memory.kind     = ResourceKind::IndirectBuffer;
+		m_info.uses_dma = true;
+		return true;
+	}
+
+	bool Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect) {
 			m_info.uses_dma = true;
-			return;
+			return true;
 		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
 		if (buffer == BufferAccess::None && address_info.access == AddressAccess::None &&
 		    image_info.access == ImageAccess::None) {
-			return;
+			return true;
 		}
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
@@ -3940,7 +4688,7 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
-			return;
+			return true;
 		}
 		Inst*    handle   = nullptr;
 		uint32_t source   = 0;
@@ -3953,37 +4701,43 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
-				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
-					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
-				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
-				return;
+				if (!m_status.ok || TakeIndirectBuffer(inst, flags.index, flags.pc))
+					return m_status.ok;
+				return Reject(
+				    flags.pc,
+				    "buffer descriptor is not a valid runtime value; GPU-selected access "
+				    "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load, "
+				    "or a buffer store or atomic");
+			} else if ((ReadsUnfoldableScalar(*handle) ||
+			            (std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
+			                 m_program.unfoldable_pcs.end() &&
+			             CarriesLoopPhi(*handle))) &&
+			           // A BDA store miss is dropped: only a store span the host can name may move.
+			           (buffer == BufferAccess::Read || RelativeStoreHandle(*handle)) &&
+			           TakeIndirectBuffer(inst, flags.index, flags.pc)) {
+				return true;
 			}
 			resource = AddBuffer(source, memory, inst, flags.pc);
 			if (resource == UINT32_MAX) {
-				Fail(flags.pc, "buffer resource limit exceeded");
+				return Reject(flags.pc, "buffer resource limit exceeded");
 			}
-			AddHandlePatch(handle, resource, flags.pc);
-			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
-			return;
+			return AddHandlePatch(handle, resource, flags.pc) &&
+			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
 		}
 		if (address_info.access != AddressAccess::None) {
 			if (!IsAddressResourceKind(memory.kind)) {
-				Fail(flags.pc, "address operation has invalid resource kind");
+				return Reject(flags.pc, "address operation has invalid resource kind");
 			}
 			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
 			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
-				ValidateAddressHandle(inst.Arg(0), flags.pc);
+				if (!ValidateAddressHandle(inst.Arg(0), flags.pc)) return false;
 				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
+					return Reject(
+					    flags.pc,
+					    "local FLAT access requires DWORD data and per-thread scratch storage");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
-				return;
+				return true;
 			}
 			if (memory.kind == ResourceKind::Scratch) {
 				handle = inst.Arg(0).Resolve().TryInstruction();
@@ -3992,35 +4746,39 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					return Reject(flags.pc,
+					              "scratch operation requires a nonzero AGC per-thread size");
 				}
-				return;
+				return true;
 			}
-			ValidateAddressHandle(inst.Arg(0), flags.pc);
+			if (!ValidateAddressHandle(inst.Arg(0), flags.pc)) return false;
+			RecordDmaPointer(*inst.Arg(0).Resolve().TryInstruction(),
+			                 address_info.access == AddressAccess::Write);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+				m_info.writes_dma            = true;
 			}
 			m_info.uses_dma = true;
-			return;
+			return true;
 		}
 
 		if (memory.kind != ResourceKind::Image ||
 		    image_info.resource_class == ImageResourceClass::None) {
-			Fail(flags.pc, "image operation has invalid resource kind");
+			return Reject(flags.pc, "image operation has invalid resource kind");
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
-		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
-			          memory.resource * 4u, handle, source);
+		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
+		                      memory.resource * 4u, handle, source)) {
+			return false;
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
+			return Reject(flags.pc, "image resource limit exceeded");
 		}
-		AddHandlePatch(handle, resource, flags.pc);
+		if (!AddHandlePatch(handle, resource, flags.pc)) return false;
 		uint32_t sampler = 0;
 		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
@@ -4035,21 +4793,22 @@ private:
 			    ? FindIndirectDescriptor(*sampler_handle) : nullptr;
 			if (selected_sampler != nullptr) {
 				sampler_source = selected_sampler->source;
-			} else {
-				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+			} else if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			                      memory.sampler * 4u, sampler_handle, sampler_source, true,
+			                      sample_adjust)) {
+				return false;
 			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
-				Fail(flags.pc, "sampler resource limit exceeded");
+				return Reject(flags.pc, "sampler resource limit exceeded");
 			}
 			m_info.samplers[sampler].gather_lod |=
 			    op == ValueOpcode::ImageGatherRaw &&
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
-			AddHandlePatch(sampler_handle, sampler, flags.pc);
+			if (!AddHandlePatch(sampler_handle, sampler, flags.pc)) return false;
 			AddSampledPair(resource, sampler, flags.pc);
 		}
-		AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
+		return AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
 	}
 
 	const DescriptorSource* Source(uint32_t source) const {
@@ -4088,15 +4847,17 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>                 m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
+	std::vector<MemoryAccessors>                    m_memory_accessors;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
+	mutable ResourceTrackingStatus                  m_status;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,
@@ -4160,10 +4921,11 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 
 } // namespace
 
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    ShaderStageInputInfo input) {
-	Tracker(program, decoded, native_cfg, input).Run();
-	program.uniform_fill = RecognizePatternFill(program, decoded, input);
+ResourceTrackingStatus TrackResources(Program& program, const Decoder::Program& decoded,
+                                      const CFG::Graph& native_cfg, ShaderStageInputInfo input) {
+	auto status = Tracker(program, decoded, native_cfg, input).Run();
+	if (status.ok) program.uniform_fill = RecognizePatternFill(program, decoded, input);
+	return status;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

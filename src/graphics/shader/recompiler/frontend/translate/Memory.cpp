@@ -130,6 +130,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.coherent = (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::Flat ||
 	                   memory.kind == ResourceKind::Global) &&
 	                  !buffer_atomic && (decoded.glc || decoded.dlc);
+	memory.glc           = decoded.glc;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
@@ -948,6 +949,14 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
 			return;
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			if ((inst.image_sample_flags & Decoder::ImageSampleFlagA16) != 0u) {
+				// No a16 BvhIntersect: report a miss (INVALID_NODE pointers, NaN distances).
+				program.uses_bvh_intersect_stub = true;
+				for (uint32_t component = 0; component < 4; ++component) {
+					WriteOperand(OffsetOperand(inst.dst, component), IR::Value(0xffffffffu));
+				}
+				return;
+			}
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
 			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
 			    inst.image_address_components - 10u);
@@ -1167,13 +1176,29 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
+		case Decoder::Opcode::IMAGE_GATHER4:
+		case Decoder::Opcode::IMAGE_GATHER4_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_L:
+		case Decoder::Opcode::IMAGE_GATHER4_B:
+		case Decoder::Opcode::IMAGE_GATHER4_B_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_C_L:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_O:
+		case Decoder::Opcode::IMAGE_GATHER4_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_L_O:
+		case Decoder::Opcode::IMAGE_GATHER4_B_O:
+		case Decoder::Opcode::IMAGE_GATHER4_B_CL_O:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
 

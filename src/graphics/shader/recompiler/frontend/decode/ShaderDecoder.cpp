@@ -123,10 +123,14 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* sample_name =
-	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
+	const char* mimg_name = nullptr;
+	if (inst.opcode == Opcode::IMAGE_SAMPLE) {
+		mimg_name = MimgSampleOpcodeName(inst.opcode_id);
+	} else if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY) {
+		mimg_name = MimgBvhOpcodeName(inst.opcode_id);
+	}
 	const std::string_view name =
-	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
+	    mimg_name != nullptr ? mimg_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
 	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
@@ -140,15 +144,32 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_GATHER4_CL:
 		case Opcode::IMAGE_GATHER4_L:
+		case Opcode::IMAGE_GATHER4_B:
+		case Opcode::IMAGE_GATHER4_B_CL:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_CL:
 		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_B:
+		case Opcode::IMAGE_GATHER4_C_B_CL:
 		case Opcode::IMAGE_GATHER4_C_LZ:
+		case Opcode::IMAGE_GATHER4_O:
+		case Opcode::IMAGE_GATHER4_CL_O:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_B_O:
+		case Opcode::IMAGE_GATHER4_B_CL_O:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4_C_CL_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
+		case Opcode::IMAGE_GATHER4_C_B_O:
+		case Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
@@ -382,7 +403,11 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
-			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+			// BuildGraph refuses a program holding an UNSUPPORTED instruction.
+			SetRawWords(inst, code, word_index, 1);
+			SetUnsupported(inst, Family::Unknown, code[word_index] >> 26u,
+			               "RDNA2 instruction family is not implemented");
+			return;
 	}
 }
 
@@ -417,7 +442,13 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		const auto& inst = program.instructions.back();
+		auto& inst = program.instructions.back();
+		if (inst.word_count == 0) {
+			// A zero-width instruction would never advance the decode.
+			SetRawWords(inst, code, word_index, 1);
+			SetUnsupported(inst, Family::Unknown, code[word_index] >> 26u,
+			               "decoder produced a zero-length instruction");
+		}
 		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 
@@ -543,6 +574,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SETPC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_SWAPPC_B64:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_swappc_b64 {}, {}", inst.pc,
+			                                               OperandToString(inst.dst).c_str(),
+			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_SETREG_B32:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),
@@ -612,13 +647,29 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_GATHER4_CL:
 		case Opcode::IMAGE_GATHER4_L:
+		case Opcode::IMAGE_GATHER4_B:
+		case Opcode::IMAGE_GATHER4_B_CL:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_CL:
 		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_B:
+		case Opcode::IMAGE_GATHER4_C_B_CL:
 		case Opcode::IMAGE_GATHER4_C_LZ:
+		case Opcode::IMAGE_GATHER4_O:
+		case Opcode::IMAGE_GATHER4_CL_O:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_B_O:
+		case Opcode::IMAGE_GATHER4_B_CL_O:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4_C_CL_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
+		case Opcode::IMAGE_GATHER4_C_B_O:
+		case Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:

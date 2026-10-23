@@ -3,6 +3,9 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <span>
+#include <string_view>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -45,20 +48,46 @@ struct ResourceSpecialization {
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
 	std::vector<Sampler> samplers;
+	// A slot whose descriptor is null or unread; any shape serves it, so equality ignores these.
+	std::vector<bool> unbound_buffers;
+	std::vector<bool> unbound_images;
 
-	bool operator==(const ResourceSpecialization&) const = default;
+	bool operator==(const ResourceSpecialization& other) const {
+		return buffers == other.buffers && images == other.images && samplers == other.samplers;
+	}
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
-// Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// Bit r for each user-data register r below 64 that the plan evaluates on the host.
+[[nodiscard]] uint64_t PlanUserDataRegisters(const ResourcePlan& plan);
+
+// Whether materialization would refuse buffer table `table_source` now; false when it cannot tell.
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime);
+
+// One line naming why the last MaterializeResources on this thread refused.
+std::string_view LastMaterializeFailure();
+
+// Refreshes cached resources and specialization. A refusal leaves the specialization untouched.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables = nullptr);
+
+bool               RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                          ResourceSpecialization& specialization);
+[[nodiscard]] bool ReadOverlapsWrittenBuffer(const ResourcePlan&     program,
+                                             const ResourceSnapshot& snapshot, uint64_t address,
+                                             uint64_t bytes);
+[[nodiscard]] bool SpecializationServes(const ResourceSpecialization& built,
+                                        const ResourceSpecialization& wanted);
+void               InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                                        ResourceSpecialization&                        wanted);
 
 // Applies an already-derived specialization to native IR before layout and emission.
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
 // null. Entries of one kind specialize identically.

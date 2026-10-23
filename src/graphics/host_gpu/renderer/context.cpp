@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -23,13 +24,142 @@ bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
 }
 
+namespace {
+
+// A group stays small enough that the pairwise range test stays cheap.
+constexpr uint32_t MaxDeferredDispatches = 128;
+constexpr size_t   MaxDeferredRanges     = 256;
+
+} // namespace
+
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FlushTransferBarrier();
+	if (m_deferred_barrier && !m_deferred_joining) {
+		FlushDeferredBarrier();
+	}
+	m_handle_requests++;
 	return m_buffer;
+}
+
+CommandBuffer::DeferredJoin CommandBuffer::JoinDeferredBarrier(const DispatchAccess& access,
+                                                               bool                  writes) const {
+	EXIT_IF(m_deferred_joining);
+	if (!m_deferred_barrier || (writes && !m_deferred_full) ||
+	    m_deferred_dispatches >= MaxDeferredDispatches ||
+	    m_deferred_access.ranges.size() + access.ranges.size() > MaxDeferredRanges) {
+		return {};
+	}
+	if (access.ConflictsWith(m_deferred_access)) {
+		return {};
+	}
+	m_deferred_joining = true;
+	return {true, m_deferred_full};
+}
+
+void CommandBuffer::DeferBarrier(const DispatchAccess& access, bool full) const {
+	if (m_deferred_joining) {
+		EXIT_IF(!m_deferred_barrier);
+		m_deferred_access.Merge(access);
+		m_deferred_dispatches++;
+		m_deferred_joining = false;
+	} else {
+		EXIT_IF(m_deferred_barrier);
+		m_deferred_barrier    = true;
+		m_deferred_full       = full;
+		m_deferred_dispatches = 1;
+		m_deferred_access     = access;
+	}
+}
+
+void CommandBuffer::FlushDeferredBarrier() const {
+	EXIT_IF(m_deferred_joining);
+	if (!m_deferred_barrier) {
+		return;
+	}
+	// The barrier each dispatch of the group would have recorded right after itself.
+	ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (m_deferred_full) {
+		m_full_barrier_mark = m_handle_requests;
+	}
+	m_deferred_barrier    = false;
+	m_deferred_full       = false;
+	m_deferred_dispatches = 0;
+	m_deferred_access.Clear();
+}
+
+vk::CommandBuffer CommandBuffer::BeginTransfer(std::span<const TransferRange> reads,
+                                               std::span<const TransferRange> writes) const {
+	EXIT_IF(m_deferred_joining);
+	EndRendering();
+	const auto key = [](const TransferRange& range) {
+		return reinterpret_cast<uint64_t>(static_cast<VkBuffer>(range.buffer));
+	};
+	const auto overlaps = [&](const TransferRange& range, bool write) {
+		return std::ranges::any_of(m_transfer_access.ranges, [&](const auto& recorded) {
+			return (write || recorded.write) && recorded.key == key(range) &&
+			       recorded.begin < range.offset + range.size && range.offset < recorded.end;
+		});
+	};
+	if (!m_transfer_open) {
+		const auto        native = Handle();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask =
+		    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                       nullptr);
+		m_transfer_open = true;
+		m_transfer_access.Clear();
+	} else {
+		if (std::ranges::any_of(reads, [&](const auto& range) { return overlaps(range, false); }) ||
+		    std::ranges::any_of(writes, [&](const auto& range) { return overlaps(range, true); })) {
+			vk::MemoryBarrier between {};
+			between.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			between.dstAccessMask =
+			    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+			m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &between, 0,
+			                         nullptr, 0, nullptr);
+			m_transfer_access.Clear();
+		}
+		m_handle_requests++;
+	}
+	for (const auto& range: reads) {
+		m_transfer_access.Add(DispatchAccess::Space::HostBuffer, key(range), range.offset,
+		                      range.size, false);
+	}
+	for (const auto& range: writes) {
+		m_transfer_access.Add(DispatchAccess::Space::HostBuffer, key(range), range.offset,
+		                      range.size, true);
+	}
+	return m_buffer;
+}
+
+void CommandBuffer::FlushTransferBarrier() const {
+	if (!m_transfer_open) {
+		return;
+	}
+	m_transfer_open = false;
+	m_transfer_access.Clear();
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                         nullptr);
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_transfer_open = false;
+	m_transfer_access.Clear();
+	m_indirect_barrier_holds = false;
+	m_deferred_barrier       = false;
+	m_deferred_joining       = false;
+	m_deferred_dispatches    = 0;
+	m_deferred_access.Clear();
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -104,6 +234,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	m_rendering_clear =
+	    depth_stencil.depth_clear || depth_stencil.stencil_clear ||
+	    std::any_of(colors.begin(), colors.begin() + state.num_color_attachments,
+	                [](const auto& color) { return color.loadOp == vk::AttachmentLoadOp::eClear; });
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
 	for (auto& color: m_render_state.color_attachments) {
@@ -119,8 +253,9 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
-	m_rendering    = false;
-	m_render_state = {};
+	m_rendering              = false;
+	m_render_state           = {};
+	m_indirect_barrier_holds = false;
 }
 
 } // namespace Libs::Graphics

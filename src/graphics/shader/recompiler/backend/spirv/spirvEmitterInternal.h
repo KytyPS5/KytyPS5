@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,16 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// What the backend needs beyond the requirement flags ShaderInfo collection records.
+struct SpirvRequirements {
+	bool dispatch_thread_limit = false;
+	// The first guest feature the backend cannot express; the program is refused, not emitted.
+	const char*     refusal      = nullptr;
+	const IR::Inst* refused_inst = nullptr;
+};
+
+SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
 struct BufferDefinition {
 	uint32_t variable             = 0;
 	uint32_t type                 = 0;
@@ -76,7 +87,8 @@ struct ImageDefinition {
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_), profile(profile_) {
+	      program(program_), input_info(input_info_), profile(profile_),
+	      requirements(AnalyzeProgramRequirements(program_)) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
@@ -91,6 +103,7 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	const Profile&                                      profile;
 	uint32_t                                        debug_source = 0;
+	const SpirvRequirements                             requirements;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -115,6 +128,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                           bda_store_pointer_function        = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
@@ -140,10 +154,23 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                                                            mesh_payload_variable = 0;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t stencil_bit_pass_variable = 0;
+	// KYTY_CS_LOOP_BUDGET guard: loops charge a per-invocation budget and leave when it runs out.
+	uint32_t loop_budget_variable    = 0;
+	uint32_t loop_budget_limit       = 0;
+	uint32_t loop_budget_guarded     = 0;
+	uint32_t loop_budget_unguardable = 0;
+	// Set when a pointer load read a page the host could not serve yet.
+	uint32_t bda_miss_variable = 0;
+	// Latch block -> loop header id, for latches whose branch carries the budget.
+	std::unordered_map<const IR::Block*, uint32_t> loop_budget_latch;
+	// Charge sites in loops with atomics: a BDA-miss exit there could strand a work queue.
+	std::unordered_set<const IR::Block*> loop_bda_exit_exempt;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -154,11 +181,23 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                             stencil_ref_variable                  = 0;
 	uint32_t                   object_primitive_id_variable          = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	// The first construct the backend cannot express; not an emitter invariant.
+	const char*     refusal      = nullptr;
+	const IR::Inst* refused_inst = nullptr;
+
+	void Refuse(const char* reason, const IR::Inst* inst = nullptr) {
+		if (refusal == nullptr) {
+			refusal      = reason;
+			refused_inst = inst;
+		}
+	}
+	[[nodiscard]] bool Refused() const { return refusal != nullptr; }
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -258,6 +297,7 @@ struct ValueEmitContext {
 	const IR::ExportInfo& Export(const IR::Inst& inst) const;
 	[[noreturn]] void     Fail(const char* reason) const;
 	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
+	uint32_t              Refuse(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
@@ -365,8 +405,7 @@ uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::Storag
 void     DefineModule(EmitterState& state);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
-void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
-                           uint32_t cull_distance_count);
+void     DefineMeshOutputs(EmitterState& state);
 void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);

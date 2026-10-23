@@ -10,9 +10,13 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -20,11 +24,140 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+std::string& MaterializeFailure() {
+	static thread_local std::string reason;
+	return reason;
+}
+
+// A refusal skips the draw; its caller reports MaterializeFailure() as its one line.
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	MaterializeFailure() = message;
 	return false;
 }
+
+std::string_view RefusalName(const SrtWalker& walker, const SrtWalker& clean) {
+	return SrtRefusalName(walker.Refusal() != SrtRefusal::None ? walker.Refusal()
+	                                                           : clean.Refusal());
+}
+
+bool PhiRefusal(SrtRefusal refusal) {
+	return refusal == SrtRefusal::VaryingPhi || refusal == SrtRefusal::PhiNoEntry ||
+	       refusal == SrtRefusal::PhiMerge;
+}
+
+bool RefuseRead(void*, uint64_t, std::span<uint32_t>) {
+	return false;
+}
+
+// Records each specialization read with the flat SRT slot whose walk issued it.
+class SpecializationReadCapture {
+public:
+	SpecializationReadCapture(const SrtRuntime& source, ResourceSnapshot& snapshot,
+	                          std::vector<uint8_t>& conditions)
+	    : m_source(source), m_ranges(snapshot.specialization_reads),
+	      m_slots(snapshot.specialization_read_slots), m_conditions(conditions) {}
+
+	SrtRuntime ObservedRuntime() {
+		auto runtime        = m_source;
+		runtime.userdata    = this;
+		runtime.read_memory = ReadOrdinary;
+		runtime.read_specialization_memory =
+		    m_source.read_specialization_memory != nullptr ? ReadStrict : nullptr;
+		runtime.read_condition_memory =
+		    m_source.read_condition_memory != nullptr ? ReadCondition : nullptr;
+		runtime.gpu_owned       = m_source.gpu_owned != nullptr ? GpuOwned : nullptr;
+		runtime.readable_extent = m_source.readable_extent != nullptr ? ReadableExtent : nullptr;
+		runtime.read_specialization_block =
+		    m_source.read_specialization_block != nullptr ? ReadBlock : nullptr;
+		runtime.hash_specialization_block =
+		    m_source.hash_specialization_block != nullptr ? HashBlock : nullptr;
+		runtime.walk_restarted = m_source.walk_restarted != nullptr ? WalkRestarted : nullptr;
+		runtime.zero_read      = m_source.zero_read != nullptr ? ZeroRead : nullptr;
+		return runtime;
+	}
+
+private:
+	static SpecializationReadCapture& Of(void* userdata) {
+		return *static_cast<SpecializationReadCapture*>(userdata);
+	}
+
+	void Record(uint64_t address, uint64_t bytes, bool condition = false) {
+		m_ranges.emplace_back(address, bytes);
+		m_slots.push_back(CurrentSrtReadSlot());
+		// Heap tables join the reads without a condition (AddHeapRead).
+		m_conditions.resize(m_ranges.size() - 1u, 0u);
+		m_conditions.push_back(condition ? 1u : 0u);
+	}
+
+	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& capture = Of(userdata);
+		if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address,
+		                                                 values))
+			return false;
+		capture.Record(address, values.size_bytes());
+		return true;
+	}
+
+	static bool ReadCondition(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& capture = Of(userdata);
+		if (!capture.m_source.read_condition_memory(capture.m_source.userdata, address, values))
+			return false;
+		capture.Record(address, values.size_bytes(), true);
+		return true;
+	}
+
+	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& capture = Of(userdata);
+		if (capture.m_source.read_memory != nullptr) {
+			if (!capture.m_source.read_memory(capture.m_source.userdata, address, values))
+				return false;
+		} else {
+			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		}
+		capture.Record(address, values.size_bytes());
+		return true;
+	}
+
+	static bool GpuOwned(void* userdata, uint64_t address, uint64_t size) {
+		auto& capture = Of(userdata);
+		return capture.m_source.gpu_owned(capture.m_source.userdata, address, size);
+	}
+
+	static uint64_t ReadableExtent(void* userdata, uint64_t address, uint64_t size) {
+		auto& capture = Of(userdata);
+		return capture.m_source.readable_extent(capture.m_source.userdata, address, size);
+	}
+
+	static bool ReadBlock(void* userdata, uint64_t address, void* data, uint64_t size) {
+		auto& capture = Of(userdata);
+		if (!capture.m_source.read_specialization_block(capture.m_source.userdata, address, data,
+		                                                size))
+			return false;
+		capture.Record(address, size);
+		return true;
+	}
+
+	static bool HashBlock(void* userdata, uint64_t address, uint64_t size, uint64_t* hash) {
+		auto& capture = Of(userdata);
+		return capture.m_source.hash_specialization_block(capture.m_source.userdata, address, size,
+		                                                  hash);
+	}
+
+	static void WalkRestarted(void* userdata) {
+		auto& capture = Of(userdata);
+		capture.m_source.walk_restarted(capture.m_source.userdata);
+	}
+
+	static void ZeroRead(void* userdata) {
+		auto& capture = Of(userdata);
+		capture.m_source.zero_read(capture.m_source.userdata);
+	}
+
+	SrtRuntime                                  m_source;
+	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+	std::vector<uint32_t>&                      m_slots;
+	std::vector<uint8_t>&                       m_conditions;
+};
 
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
@@ -196,14 +329,13 @@ void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
-	std::vector<const Inst*> visited;
+	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		auto* inst = pending.back().Resolve().TryInstruction();
 		pending.pop_back();
-		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+		if (inst == nullptr || !visited.insert(inst).second) {
 			continue;
 		}
-		visited.push_back(inst);
 		if (planned_reads.contains(inst)) {
 			auto flags = inst->Flags<SrtReadFlags>();
 			flags.clean = 1u;
@@ -295,6 +427,14 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	return indirect.sources.empty() && (!indirect.selector || indirect.table_scalar) &&
 	       (indirect.key_count.IsEmpty() || indirect.table_maximum) && indirect.workgroup_axis == UINT32_MAX &&
 	       table != nullptr && table->dword_count == 4u;
+}
+
+// A table the GPU wrote is decoded in the shader: a host snapshot of it can name a stale record.
+bool BufferTableGpuWritten(const DescriptorValue& table_value, const SrtRuntime& runtime) {
+	ShaderBufferResource table;
+	return runtime.gpu_owned != nullptr && DecodeBufferDescriptor(table_value, table) &&
+	       table.Base48() != 0u && table.GetSize() != 0u &&
+	       runtime.gpu_owned(runtime.userdata, table.Base48(), table.GetSize());
 }
 
 bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offset) {
@@ -691,7 +831,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
 				                                view)) {
-					snapshot.specialization_reads.emplace_back(table_base, table_size);
+					snapshot.AddHeapRead(table_base, table_size);
 					if (view.kinds.empty()) return true;
 					auto root = root_resource;
 					root.indirect_root = resource_index;
@@ -852,6 +992,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	return true;
 }
 
+bool ValidGatherLodSampler(const DescriptorValue& sampler) {
+	const auto control  = sampler.dwords[2];
+	const auto filter   = (control >> 26u) & 3u;
+	const auto perf_mip = (sampler.dwords[1] >> 24u) & 15u;
+	// MipNone always selects the base level. Point/linear selection requires zero
+	// primary/secondary bias; linear mip snapping is not implemented.
+	return !(filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
+	         (filter == 2u && perf_mip != 0u));
+}
+
 } // namespace
 
 struct SamplerPlan {
@@ -905,6 +1055,7 @@ private:
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
+	specialization.unbound_images.assign(specialization.images.size(), false);
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -923,6 +1074,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			// A null sampled view reads zero whatever its shape, so any module serves it.
+			specialization.unbound_images[i] =
+			    image.indirect_root == ImageResource::NoIndirectImage &&
+			    base.resource_class != ImageResourceClass::Storage && !base.written && !base.atomic;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -1221,6 +1376,7 @@ static bool IsFullDispatchPredicate(Value value, uint32_t depth = 0) {
 		return IsFullDispatchPredicate(inst->Arg(0), depth + 1) &&
 		       IsFullDispatchPredicate(inst->Arg(1), depth + 1);
 	}
+	if (inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) return true;
 	if (inst->GetOpcode() != ValueOpcode::ULessThan32) return false;
 	const auto* global = inst->Arg(0).Resolve().TryInstruction();
 	const auto* extent = inst->Arg(1).Resolve().TryInstruction();
@@ -1280,7 +1436,8 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    store->Arg(3).Resolve() != Value(true)) return {};
+		    !IsFullDispatchPredicate(store->Arg(3)))
+			return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();
@@ -1341,68 +1498,286 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
-	ResourcePlan plan;
+static BufferCopy AnalyzeBufferCopy(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
+	    !program.info.samplers.empty() || !program.info.images.empty() ||
+	    program.info.buffers.size() != 2) {
+		return {};
+	}
+	std::unordered_set<const Block*> visited;
+	std::vector<const Inst*>         stores;
+	const auto*                      block = program.blocks.front();
+	for (;;) {
+		if (block == nullptr || !visited.insert(block).second) return {};
+		for (const auto& inst: *block) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			if (!inst.MayHaveSideEffects()) continue;
+			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write ||
+			    stores.size() >= BufferCopy::MaxPairs)
+				return {};
+			stores.push_back(&inst);
+		}
+		const auto& term = block->terminator;
+		if (term.kind == CFG::TerminatorKind::Return) break;
+		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		block = term.true_block;
+	}
+	if (stores.empty() || visited.size() != program.blocks.size()) return {};
+
+	constexpr std::array store_ops {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+	                                ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+	constexpr std::array load_ops {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+	                               ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4};
+	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
+	                                 ValueOpcode::CompositeConstructU32x3,
+	                                 ValueOpcode::CompositeConstructU32x4};
+	constexpr std::array extracts {ValueOpcode::CompositeExtractU32x2,
+	                               ValueOpcode::CompositeExtractU32x3,
+	                               ValueOpcode::CompositeExtractU32x4};
+	// Raw dword elements addressed by index alone; a format or type conversion is not a copy.
+	const auto raw_element = [](const MemoryInfo& memory, uint32_t words) {
+		return !memory.formatted && !memory.typed && memory.idxen && !memory.offen &&
+		       memory.offset == 0 && memory.data_bits == 32 && memory.data_dwords == words &&
+		       !memory.planning_only && memory.kind == ResourceKind::Buffer;
+	};
+	BufferCopy result;
+	for (const auto* store: stores) {
+		const auto store_op = std::ranges::find(store_ops, store->GetOpcode());
+		if (store_op == store_ops.end()) return {};
+		const auto words = static_cast<uint32_t>(store_op - store_ops.begin() + 1);
+		const auto guard = store->Arg(5).Resolve();
+		if (store->Arg(2).Resolve() != Value(0u) || store->Arg(3).Resolve() != Value(0u) ||
+		    !IsFullDispatchPredicate(guard))
+			return {};
+		const auto& store_memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
+		if (!raw_element(store_memory, words)) return {};
+
+		// The stored value must be the loaded one, component for component.
+		const Inst* load = nullptr;
+		const auto  data = ResolveActiveU32(store->Arg(4), guard);
+		if (words == 1) {
+			load = data.TryInstruction();
+		} else {
+			const auto* vector = data.TryInstruction();
+			if (vector == nullptr || vector->GetOpcode() != composites[words - 2]) return {};
+			for (uint32_t i = 0; i < words; ++i) {
+				const auto* extract = ResolveActiveU32(vector->Arg(i), guard).TryInstruction();
+				if (extract == nullptr || extract->GetOpcode() != extracts[words - 2] ||
+				    extract->Arg(1).Resolve() != Value(i))
+					return {};
+				const auto* source = extract->Arg(0).Resolve().TryInstruction();
+				if (source == nullptr || (load != nullptr && source != load)) return {};
+				load = source;
+			}
+		}
+		if (load == nullptr || load->GetOpcode() != load_ops[words - 1] ||
+		    load->Arg(1).Resolve() != store->Arg(1).Resolve() ||
+		    load->Arg(2).Resolve() != Value(0u) || load->Arg(3).Resolve() != Value(0u) ||
+		    !IsFullDispatchPredicate(load->Arg(4).Resolve()))
+			return {};
+		const auto& load_memory = program.memory_info.at(load->Flags<MemoryFlags>().index);
+		if (!raw_element(load_memory, words) || load_memory.resource == store_memory.resource)
+			return {};
+
+		const auto element = FillIndex(store->Arg(1), 0, guard);
+		if (!element || (*element)[1] != 1 || (*element)[2] == 0 || (*element)[0] > UINT32_MAX)
+			return {};
+		if (result.pairs == 0) {
+			result.src          = load_memory.resource;
+			result.dst          = store_memory.resource;
+			result.words        = words;
+			result.group_stride = static_cast<uint32_t>((*element)[2]);
+		} else if (result.src != load_memory.resource || result.dst != store_memory.resource ||
+		           result.words != words || result.group_stride != (*element)[2]) {
+			return {};
+		}
+		result.offsets[result.pairs++] = static_cast<uint32_t>((*element)[0]);
+	}
+	const auto& source      = program.info.buffers.at(result.src);
+	const auto& destination = program.info.buffers.at(result.dst);
+	if (source.written || source.atomic || !destination.written || destination.read ||
+	    destination.atomic)
+		return {};
+	result.valid = true;
+	return result;
+}
+
+namespace {
+
+// Copies a value graph out of a translated program into a plan that owns it.
+class PlanValueCloner {
+public:
+	PlanValueCloner(const Program& program, ResourcePlan& plan): m_program(program), m_plan(plan) {}
+
+	// An explicit stack, so a deep chain cannot exhaust the native one.
+	Value operator()(Value value) {
+		Value result;
+		auto  root = Enter(value, result);
+		if (!root) {
+			return result;
+		}
+		m_stack.clear();
+		m_stack.push_back(*root);
+		while (!m_stack.empty()) {
+			auto& frame = m_stack.back();
+			if (frame.index == frame.source->NumArgs()) {
+				const auto done = Value(frame.target);
+				m_stack.pop_back();
+				if (!m_stack.empty()) {
+					Attach(m_stack.back(), done);
+				}
+				continue;
+			}
+			Value operand;
+			if (auto child = Enter(frame.source->Arg(frame.index), operand)) {
+				m_stack.push_back(*child);
+			} else {
+				Attach(frame, operand);
+			}
+		}
+		return result;
+	}
+
+	[[nodiscard]] bool Failed() const { return m_failed; }
+
+private:
+	struct Frame {
+		const Inst* source = nullptr;
+		Inst*       target = nullptr;
+		size_t      index  = 0;
+	};
+
+	std::optional<Frame> Enter(Value value, Value& result) {
+		for (;;) {
+			value              = value.Resolve();
+			const auto* source = value.TryInstruction();
+			if (source == nullptr) {
+				result = value;
+				return std::nullopt;
+			}
+			if (source->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = source->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_program.srt_reads.size()) {
+					m_failed = true;
+					result   = Value(0u);
+					return std::nullopt;
+				}
+				value = m_program.srt_reads[slot.U32()].value;
+				continue;
+			}
+			if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
+			    ValidateRuntimeValue(m_program, source->Arg(0))) {
+				// Uniform values need no new EXEC context; preserve their shared evaluation memo.
+				value = source->Arg(0);
+				continue;
+			}
+			if (source->GetOpcode() == ValueOpcode::Phi) {
+				const auto invariant = ResolveInvariantPhi(m_program, value);
+				if (!invariant.IsEmpty() && invariant != value) {
+					value = invariant;
+					continue;
+				}
+			}
+			if (const auto found = m_cloned.find(source); found != m_cloned.end()) {
+				result = Value(found->second);
+				return std::nullopt;
+			}
+			if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+				m_plan.requires_specialization_memory = true;
+				m_plan.capture_specialization_reads   = true;
+			}
+			auto& target =
+			    m_plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+			if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
+			    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+				target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
+			}
+			m_cloned.emplace(source, &target);
+			result = Value(&target);
+			return Frame {.source = source, .target = &target};
+		}
+	}
+
+	static void Attach(Frame& frame, Value operand) {
+		if (frame.source->GetOpcode() == ValueOpcode::Phi) {
+			frame.target->AddPhiOperand(nullptr, operand);
+		} else {
+			frame.target->SetArg(frame.index, operand);
+		}
+		frame.index++;
+	}
+
+	const Program&                         m_program;
+	ResourcePlan&                          m_plan;
+	std::unordered_map<const Inst*, Inst*> m_cloned;
+	std::vector<Frame>                     m_stack;
+	bool                                   m_failed = false;
+};
+
+void CopyPlanHeader(const Program& program, ResourcePlan& plan) {
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
 	plan.user_data_count            = program.user_data_count;
+	plan.wave_size                  = program.wave_size;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
 	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
+	plan.frozen_values              = true;
+}
 
-	std::unordered_map<const Inst*, Inst*> cloned;
-	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
-		value              = value.Resolve();
-		const auto* source = value.TryInstruction();
-		if (source == nullptr) {
-			return value;
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadConst) {
-			const auto slot = source->Arg(1).Resolve();
-			EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
-			        slot.U32() >= program.srt_reads.size());
-			return Clone(program.srt_reads[slot.U32()].value);
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
-		    ValidateRuntimeValue(program, source->Arg(0))) {
-			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
-			return Clone(source->Arg(0));
-		}
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(program, value);
-			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
+} // namespace
+
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime) {
+	if (runtime.read_specialization_memory == nullptr || table_source >= sources.size()) {
+		return false;
+	}
+	if (sources[table_source].indirect_descriptor) {
+		table_source = sources[table_source].indirect_descriptor->table_source;
+		if (table_source >= sources.size()) return false;
+	}
+	const auto&     table = sources[table_source];
+	ResourcePlan    plan;
+	PlanValueCloner clone(program, plan);
+	CopyPlanHeader(program, plan);
+	auto& target       = plan.descriptor_sources.emplace_back();
+	target.dword_count = table.dword_count;
+	for (uint32_t dword = 0; dword < table.dword_count; dword++) {
+		target.dwords[dword] = clone(table.dwords[dword]);
+	}
+	if (clone.Failed()) return false;
+	DescriptorValue value;
+	SrtWalker       clean(plan, CleanRuntime(runtime));
+	// A table V# the host cannot evaluate would refuse every materialization of its enumeration.
+	return !clean.EvaluateDescriptor(0, value) || BufferTableGpuWritten(value, runtime);
+}
+
+uint64_t PlanUserDataRegisters(const ResourcePlan& plan) {
+	uint64_t registers = 0;
+	for (const auto& inst: plan.value_storage) {
+		if (inst.GetOpcode() == ValueOpcode::GetUserData) {
+			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+			if (reg < 64u) {
+				registers |= uint64_t {1} << reg;
 			}
 		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
-			return Value(found->second);
-		}
-		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			plan.requires_specialization_memory = true;
-			plan.capture_specialization_reads   = true;
-		}
-		auto& target =
-		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
-		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
-		    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
-		}
-		cloned.emplace(source, &target);
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
-			}
-		} else {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.SetArg(index, Clone(source->Arg(index)));
-			}
-		}
-		return Value(&target);
-	};
+	}
+	return registers;
+}
+
+ResourcePlan ExtractResourcePlan(const Program& program) {
+	ResourcePlan plan;
+	CopyPlanHeader(program, plan);
+	plan.data_flat_slots = program.data_flat_slots;
+	plan.srt_read_order  = program.srt_read_order;
+	plan.unfoldable_pcs  = program.unfoldable_pcs;
+
+	PlanValueCloner Clone(program, plan);
 
 	bool capture_indirect_reads = false;
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
@@ -1439,7 +1814,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.selector_groups[source] = group;
 	}
 	plan.srt_reads.reserve(program.srt_reads.size());
+	plan.srt_read_pcs.reserve(program.srt_reads.size());
 	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.ResolveInstruction();
+		plan.srt_read_pcs.push_back(inst != nullptr ? inst->Flags<MemoryFlags>().pc : UINT32_MAX);
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
 	// Retain integer control expressions with opaque varying leaves. Their identities
@@ -1518,6 +1896,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	plan.uniform_fill = program.uniform_fill.fill.kind != UniformFillKind::None
 	    ? program.uniform_fill : AnalyzeUniformFill(program);
+	plan.buffer_copy  = AnalyzeBufferCopy(program);
 	for (auto& value: plan.uniform_fill.values) value = Clone(value);
 	plan.uniform_fill.pattern_size = Clone(plan.uniform_fill.pattern_size);
 	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
@@ -1560,111 +1939,93 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
 		}
 	}
+	EXIT_IF(Clone.Failed());
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	CompileSrtWalker(plan);
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	for (auto& keys: program.selector_keys) keys.resolved = false;
-	if (!program.resource_tracking_complete ||
-	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
-	     runtime.read_specialization_memory == nullptr)) {
-		return false;
-	}
-	const auto uses_workgroup_count = [](const DescriptorSource& source) {
-		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
-	};
-	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
-	    (runtime.indirect_args_address != 0u &&
-	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
-	auto& reads = snapshot.specialization_reads;
-	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
-	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
-		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
-	}
-	const auto active = std::span<const uint8_t>(program.active_sources);
-	std::array<uint32_t, 3> workgroup_counts {};
-	if (runtime.indirect_args_address != 0u) {
-		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
-			if ((!active.empty() && !active[source]) ||
-			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
-			if ((runtime.indirect_args_address & 3u) != 0u ||
-			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
-			               observed, workgroup_counts)) return false;
-			observed.workgroup_counts = workgroup_counts;
-			break;
+std::string_view LastMaterializeFailure() {
+	return MaterializeFailure();
+}
+
+bool ReadOverlapsWrittenBuffer(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                               uint64_t address, uint64_t bytes) {
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base = buffer.Base48();
+		const auto size = buffer.GetSize();
+		if (size != 0u && bytes != 0u && address < base + size && base < address + bytes) {
+			return true;
 		}
 	}
-	snapshot.uniform_fill = {};
-	const auto& fill = program.uniform_fill;
-	auto words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
-	bool uniform_fill = words != 0;
-	if (uniform_fill && !fill.pattern_size.IsEmpty())
-		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
-	uint32_t elements = 0;
-	if (uniform_fill && !fill.element_count.IsEmpty())
-		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
-	}
-	if (uniform_fill) {
-		snapshot.uniform_fill = fill.fill;
-		snapshot.uniform_fill.value = stored[0];
-		snapshot.uniform_fill.bounded_elements = elements;
-	}
-	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
-		if (source >= program.descriptor_sources.size()) {
-			return false;
+	return false;
+}
+
+// Drops captured reads no write can precede; true when a refusable branch condition read remains.
+static bool CapturedReadsOverlapWrites(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                       std::vector<uint8_t>& conditions) {
+	auto&             reads = snapshot.specialization_reads;
+	auto&             slots = snapshot.specialization_read_slots;
+	std::vector<bool> exempt(reads.size(), false);
+	bool              any_exempt = false;
+	bool              overlap    = false;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base     = buffer.Base48();
+		const auto size     = buffer.GetSize();
+		const bool sentinel = buffer.NumRecords() == UINT32_MAX;
+		if (base == 0u || size == 0u) continue;
+		// The leading ranges are the linked code. They only detect a changed leaf.
+		for (size_t r = program.source_reads.size(); r < reads.size(); ++r) {
+			const auto [address, bytes] = reads[r];
+			if (bytes == 0u || exempt[r] || snapshot.HeapRead(r) ||
+			    (sentinel ? address > base || base - address >= bytes
+			              : address >= base + size || base >= address + bytes))
+				continue;
+			const auto  slot = r < slots.size() ? slots[r] : UINT32_MAX;
+			const auto* order =
+			    program.stage == ShaderType::Compute && slot < program.srt_read_order.size()
+			        ? &program.srt_read_order[slot]
+			        : nullptr;
+			if (order == nullptr || order->unknown || i >= 64u ||
+			    ((order->buffers >> i) & 1u) != 0u) {
+				overlap = overlap || (r < conditions.size() && conditions[r] != 0u);
+				continue;
+			}
+			exempt[r]  = true;
+			any_exempt = true;
 		}
-		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
-			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
+	}
+	if (any_exempt) {
+		size_t kept = 0;
+		for (size_t r = 0; r < reads.size(); ++r) {
+			if (exempt[r]) continue;
+			reads[kept] = reads[r];
+			if (r < slots.size()) slots[kept] = slots[r];
+			if (r < conditions.size()) conditions[kept] = conditions[r];
+			kept++;
 		}
-		value = {};
-		value.dword_count = program.descriptor_sources[source].dword_count;
-		return true;
-	};
-	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
-	                                 size_t candidates) {
-		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
-		    kind, resource, source, candidates));
-	};
-	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.assign(program.info.buffers.size(), {});
+		reads.resize(kept);
+		slots.resize(std::min(slots.size(), kept));
+		conditions.resize(std::min(conditions.size(), kept));
+	}
+	return overlap;
+}
+
+static bool SpecializeBuffers(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization) {
+	specialization.unbound_buffers.assign(snapshot.buffers.size(), false);
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
 		if (base_index >= program.info.buffers.size()) return false;
-		const auto& base = program.info.buffers[base_index];
-		if (i < program.info.buffers.size()) {
-			const auto* source = Source(program, base.source);
-			if (source == nullptr) return false;
-			if (source->indirect_descriptor.has_value()) {
-				snapshot.buffers[i] = {.dword_count = 4u};
-				if (active.empty() || active[base.source]) {
-					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
-					        }))
-						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
-				}
-			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
-				return false;
-			}
-		}
+		const auto&          base             = program.info.buffers[base_index];
 		auto&                descriptor_value = snapshot.buffers[i];
 		ShaderBufferResource descriptor;
 		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
@@ -1682,6 +2043,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		// No access indexes this buffer, so only a swizzle or ADD_TID makes its stride matter.
+		if (base.unindexed && (packed_stride & ((1u << 14u) | (1u << 20u))) == 0u) {
+			packed_stride = 0u;
+		}
 		auto& buffer         = specialization.buffers[i];
 		buffer.packed_stride = packed_stride;
 		buffer.descriptor_format =
@@ -1689,7 +2054,164 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		const auto* source        = Source(program, base.source);
+		specialization.unbound_buffers[i] =
+		    i < program.info.buffers.size() &&
+		    buffer.indirect_root == BufferResource::NoIndirectBuffer && source != nullptr &&
+		    !source->indirect_descriptor &&
+		    (descriptor.Base48() == 0u || descriptor.GetSize() == 0u);
 	}
+	return true;
+}
+
+static uint32_t SrtReadPc(const ResourcePlan& program, uint32_t slot) {
+	if (program.frozen_values) {
+		return slot < program.srt_read_pcs.size() ? program.srt_read_pcs[slot] : UINT32_MAX;
+	}
+	const auto* read = slot < program.srt_reads.size()
+	                       ? program.srt_reads[slot].value.ResolveInstruction()
+	                       : nullptr;
+	return read != nullptr ? read->Flags<MemoryFlags>().pc : UINT32_MAX;
+}
+
+static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                            std::vector<uint8_t>&  conditions,
+                            std::vector<uint32_t>* refused_tables) {
+	for (auto& keys: program.selector_keys) keys.resolved = false;
+	if (!program.resource_tracking_complete ||
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
+		return SpecializationFail("resource plan is incomplete");
+	}
+	const auto uses_workgroup_count = [](const DescriptorSource& source) {
+		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
+	};
+	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
+	    (runtime.indirect_args_address != 0u &&
+	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
+	snapshot.specialization_reads = program.source_reads;
+	snapshot.specialization_read_slots.assign(program.source_reads.size(), UINT32_MAX);
+	conditions.assign(program.source_reads.size(), 0u);
+	SpecializationReadCapture capture {runtime, snapshot, conditions};
+	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	SrtWalker clean(program, CleanRuntime(observed));
+	SrtWalker walker(program, observed,
+	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	static thread_local std::vector<uint32_t> gpu_owned_slots;
+	gpu_owned_slots.clear();
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, true, nullptr,
+	                              refused_tables != nullptr ? &gpu_owned_slots : nullptr)) {
+		// A hoisted read of data the GPU owns stays a native load on rebuild.
+		for (const auto slot: gpu_owned_slots) {
+			const auto pc = SrtReadPc(program, slot);
+			if (pc != UINT32_MAX) refused_tables->push_back(pc);
+		}
+		return SpecializationFail(fmt::format(
+		    "SRT refresh complete={} reads={} user_data={}: {}", program.srt_plan_complete,
+		    program.srt_reads.size(), runtime.user_data.size(), RefusalName(walker, clean)));
+	}
+	const auto active = std::span<const uint8_t>(program.active_sources);
+	std::array<uint32_t, 3> workgroup_counts {};
+	if (runtime.indirect_args_address != 0u) {
+		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
+			if ((!active.empty() && !active[source]) ||
+			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
+			if ((runtime.indirect_args_address & 3u) != 0u ||
+			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u, observed,
+			               workgroup_counts))
+				return SpecializationFail("indirect dispatch arguments are unreadable");
+			observed.workgroup_counts = workgroup_counts;
+			break;
+		}
+	}
+	snapshot.uniform_fill = {};
+	snapshot.buffer_copy          = program.buffer_copy;
+	const auto& fill = program.uniform_fill;
+	auto words = fill.fill.words;
+	std::array<uint32_t, 4> stored {};
+	bool uniform_fill = words != 0;
+	bool                    words_agree  = true;
+	if (uniform_fill && !fill.pattern_size.IsEmpty())
+		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
+	uint32_t elements = 0;
+	if (uniform_fill && !fill.element_count.IsEmpty())
+		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
+	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]);
+		words_agree  = words_agree && stored[i] == stored[0];
+	}
+	if (uniform_fill) {
+		snapshot.uniform_fill = fill.fill;
+		snapshot.uniform_fill.value = stored[0];
+		snapshot.uniform_fill.word_values      = stored;
+		snapshot.uniform_fill.words_agree      = words_agree;
+		snapshot.uniform_fill.bounded_elements = elements;
+	}
+	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
+		if (source >= program.descriptor_sources.size()) {
+			return SpecializationFail(fmt::format("descriptor source {} is missing", source));
+		}
+		if (active.empty() || active[source]) {
+			auto& evaluator = capture_reads && written ? clean : walker;
+			return evaluator.EvaluateDescriptor(source, value) ||
+			       SpecializationFail(fmt::format("descriptor evaluation source={}: {}", source,
+			                                      SrtRefusalName(evaluator.Refusal())));
+		}
+		value = {};
+		value.dword_count = program.descriptor_sources[source].dword_count;
+		return true;
+	};
+	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
+	                                 size_t candidates) {
+		// Keep the table's own reason; name the resource only when it gave none.
+		return MaterializeFailure().empty() ? SpecializationFail(fmt::format(
+		                                          "indirect {} resource={} source={} candidates={}",
+		                                          kind, resource, source, candidates))
+		                                    : false;
+	};
+	// Every resource the host cannot re-evaluate is named, so one rebuild decodes them all.
+	bool       refused = false;
+	const auto refuse  = [&](uint32_t pc) {
+		refused_tables->push_back(pc);
+		refused = true;
+	};
+	snapshot.buffers.resize(program.info.buffers.size());
+	specialization.buffers.assign(program.info.buffers.size(), {});
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& base   = program.info.buffers[i];
+		const auto* source = Source(program, base.source);
+		if (source == nullptr) return SpecializationFail("buffer source is missing");
+		if (source->indirect_descriptor.has_value()) {
+			snapshot.buffers[i] = {.dword_count = 4u};
+			if (!active.empty() && !active[base.source]) continue;
+			const auto& indirect = *source->indirect_descriptor;
+			if (refused_tables != nullptr && indirect.sources.empty()) {
+				DescriptorValue table;
+				if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+				    BufferTableGpuWritten(table, runtime)) {
+					refuse(base.first_use_pc);
+					continue;
+				}
+			}
+			MaterializeFailure().clear();
+			if (!MaterializeIndirectDescriptor(
+			        program, base.source, i, 4u, 4u, observed, clean, snapshot, snapshot.buffers,
+			        specialization.buffers, [&](DescriptorValue& value) {
+				        return NormalizeIndirectBuffer(value, indirect.indexed, base);
+			        }))
+				return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+		} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
+			auto& evaluator = capture_reads && base.written ? clean : walker;
+			if (refused_tables == nullptr || !PhiRefusal(evaluator.Refusal())) return false;
+			refuse(base.first_use_pc);
+		}
+	}
+	if (refused) {
+		return SpecializationFail(
+		    "a descriptor the host cannot re-evaluate is decoded in the shader on rebuild");
+	}
+	if (!SpecializeBuffers(program, snapshot, specialization)) return false;
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1707,7 +2229,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
-			return false;
+			return SpecializationFail("image source is missing");
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
@@ -1716,6 +2238,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			MaterializeFailure().clear();
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
@@ -1741,14 +2264,17 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
-		if (base_index >= program.info.samplers.size()) return false;
+		if (base_index >= program.info.samplers.size()) {
+			return SpecializationFail(fmt::format("sampler resource {} has an invalid root", i));
+		}
 		if (i < program.info.samplers.size()) {
 			auto source = program.info.samplers[i].source;
 			const auto* descriptor = Source(program, source);
-			if (descriptor == nullptr) return false;
+			if (descriptor == nullptr) return SpecializationFail("sampler source is missing");
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
+				MaterializeFailure().clear();
 				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
 				        specialization.samplers,
@@ -1759,21 +2285,204 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (!evaluate(source, snapshot.samplers[i])) return false;
 			}
 		}
-		if (program.info.samplers[base_index].gather_lod) {
-			const auto control = snapshot.samplers[i].dwords[2];
-			const auto filter = (control >> 26u) & 3u;
-			const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
-			// MipNone always selects the base level. Point/linear selection requires zero
-			// primary/secondary bias; linear mip snapping is not implemented.
-			if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
-			    (filter == 2u && perf_mip != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
-			}
+		if (program.info.samplers[base_index].gather_lod &&
+		    !ValidGatherLodSampler(snapshot.samplers[i])) {
+			return SpecializationFail("explicit-LOD gather requires None, unbiased Point, or "
+			                          "unbiased Linear without mip snapping");
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	conditions.resize(snapshot.specialization_reads.size(), 0u);
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+static void ClearMaterialization(ResourceSnapshot&       snapshot,
+                                 ResourceSpecialization& specialization) {
+	snapshot.buffers.clear();
+	snapshot.images.clear();
+	snapshot.samplers.clear();
+	snapshot.flattened_srt.clear();
+	snapshot.user_data.clear();
+	snapshot.specialization_reads.clear();
+	snapshot.specialization_read_slots.clear();
+	snapshot.uniform_fill = {};
+	snapshot.buffer_copy  = {};
+	specialization.buffers.clear();
+	specialization.images.clear();
+	specialization.samplers.clear();
+	specialization.unbound_buffers.clear();
+	specialization.unbound_images.clear();
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables) {
+	static thread_local ResourceSnapshot       next;
+	static thread_local ResourceSpecialization next_specialization;
+	static thread_local std::vector<uint8_t>   conditions;
+	const auto                                 refuse = [&] {
+		snapshot = next;
+		return false;
+	};
+	MaterializeFailure().clear();
+	ClearMaterialization(next, next_specialization);
+	if (!MaterializeInto(program, runtime, next, next_specialization, conditions, refused_tables)) {
+		return refuse();
+	}
+	if (CapturedReadsOverlapWrites(program, next, conditions)) {
+		// A condition read from a written buffer cannot prune blocks: walk them all.
+		if (runtime.walk_restarted != nullptr) runtime.walk_restarted(runtime.userdata);
+		auto unpruned                  = runtime;
+		unpruned.read_condition_memory = RefuseRead;
+		ClearMaterialization(next, next_specialization);
+		if (!MaterializeInto(program, unpruned, next, next_specialization, conditions,
+		                     refused_tables)) {
+			return refuse();
+		}
+		CapturedReadsOverlapWrites(program, next, conditions);
+	}
+	snapshot       = next;
+	specialization = next_specialization;
+	return true;
+}
+
+bool RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	if (snapshot.buffers.size() != program.info.buffers.size() ||
+	    snapshot.images.size() < program.info.images.size() ||
+	    specialization.images.size() != snapshot.images.size() ||
+	    snapshot.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	specialization.buffers.assign(program.info.buffers.size(), {});
+	if (!SpecializeBuffers(program, snapshot, specialization)) return false;
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image  = program.info.images[i];
+		const auto* source = Source(program, image.source);
+		if (source == nullptr) return false;
+		// Indirect tables are not replayed; a heap root keeps its kinds, which its replay acquires.
+		const bool indirect = source->indirect_descriptor.has_value();
+		const bool heap     = indirect && specialization.images[i].heap;
+		const auto mapping  = specialization.images[i].indirect_mapping_offset;
+		if (indirect && !heap) return false;
+		specialization.images[i] = {
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
+		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .cube                       = image.cube,
+		};
+		if (heap) {
+			// As the heap hook leaves it before BuildResourceSpecialization.
+			specialization.images[i].indirect_root           = i;
+			specialization.images[i].indirect_mapping_offset = mapping;
+			specialization.images[i].heap                    = true;
+		}
+		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			snapshot.images[i].dwords.fill(0);
+		}
+	}
+	for (size_t i = program.info.images.size(); i < specialization.images.size(); ++i) {
+		const auto root = specialization.images[i].indirect_root;
+		if (root >= program.info.images.size() || !specialization.images[root].heap) return false;
+		specialization.images[i] = specialization.images[root];
+	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		if (program.info.samplers[i].gather_lod && !ValidGatherLodSampler(snapshot.samplers[i])) {
+			return false;
+		}
+	}
+	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+namespace {
+
+bool SelectsOne(uint32_t swizzle) {
+	for (uint32_t component = 0; component < 4; component++) {
+		if (GetDstSel(swizzle, component) == 1u) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Out of bounds, a read is zero except where dst_sel names the constant one.
+bool UnboundBufferServes(const ResourceSpecialization::Buffer& built,
+                         const ResourceSpecialization::Buffer& wanted) {
+	auto shape               = wanted;
+	shape.packed_stride      = built.packed_stride;
+	shape.descriptor_format  = built.descriptor_format;
+	shape.descriptor_swizzle = built.descriptor_swizzle;
+	shape.zero_stride_oob    = built.zero_stride_oob;
+	return shape == built && (built == wanted || (!SelectsOne(built.descriptor_swizzle) &&
+	                                              !SelectsOne(wanted.descriptor_swizzle)));
+}
+
+bool UnboundImageServes(const ResourceSpecialization::Image& built,
+                        const ResourceSpecialization::Image& wanted) {
+	auto shape      = wanted;
+	shape.dimension = built.dimension;
+	return shape == built && built.dimension != Decoder::ImageDimension::Unknown &&
+	       built.dimension != Decoder::ImageDimension::Dim2DMsaa &&
+	       built.dimension != Decoder::ImageDimension::Dim2DMsaaArray;
+}
+
+bool Unbound(const std::vector<bool>& flags, size_t index) {
+	return index < flags.size() && flags[index];
+}
+
+} // namespace
+
+bool SpecializationServes(const ResourceSpecialization& built,
+                          const ResourceSpecialization& wanted) {
+	if (built.buffers.size() != wanted.buffers.size() ||
+	    built.images.size() != wanted.images.size() || built.samplers != wanted.samplers) {
+		return false;
+	}
+	for (size_t index = 0; index < wanted.buffers.size(); index++) {
+		if (!(Unbound(wanted.unbound_buffers, index)
+		          ? UnboundBufferServes(built.buffers[index], wanted.buffers[index])
+		          : built.buffers[index] == wanted.buffers[index])) {
+			return false;
+		}
+	}
+	for (size_t index = 0; index < wanted.images.size(); index++) {
+		if (!(Unbound(wanted.unbound_images, index)
+		          ? UnboundImageServes(built.images[index], wanted.images[index])
+		          : built.images[index] == wanted.images[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                          ResourceSpecialization&                        wanted) {
+	for (auto donor = donors.rbegin(); donor != donors.rend(); ++donor) {
+		const auto& from = **donor;
+		if (from.buffers.size() != wanted.buffers.size() ||
+		    from.images.size() != wanted.images.size() || from.samplers != wanted.samplers) {
+			continue;
+		}
+		for (size_t index = 0; index < wanted.buffers.size(); index++) {
+			if (Unbound(wanted.unbound_buffers, index) && !Unbound(from.unbound_buffers, index) &&
+			    UnboundBufferServes(from.buffers[index], wanted.buffers[index])) {
+				wanted.buffers[index]         = from.buffers[index];
+				wanted.unbound_buffers[index] = false;
+			}
+		}
+		for (size_t index = 0; index < wanted.images.size(); index++) {
+			if (Unbound(wanted.unbound_images, index) && !Unbound(from.unbound_images, index) &&
+			    UnboundImageServes(from.images[index], wanted.images[index])) {
+				wanted.images[index]         = from.images[index];
+				wanted.unbound_images[index] = false;
+			}
+		}
+	}
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
@@ -1813,11 +2522,28 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 	return resource;
 }
 
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
+bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
-	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size() ||
-	        program.info.samplers.size() > specialization.samplers.size());
+	if (program.info.buffers.size() > specialization.buffers.size() ||
+	    program.info.images.size() > specialization.images.size() ||
+	    program.info.samplers.size() > specialization.samplers.size()) {
+		return false;
+	}
+	for (const auto& source: specialization.buffers) {
+		if (source.indirect_root != BufferResource::NoIndirectBuffer &&
+		    source.indirect_root >= program.info.buffers.size())
+			return false;
+	}
+	for (const auto& source: specialization.images) {
+		if (source.indirect_root != ImageResource::NoIndirectImage &&
+		    source.indirect_root >= program.info.images.size())
+			return false;
+	}
+	for (const auto& source: specialization.samplers) {
+		if (source.indirect_root != SamplerResource::NoIndirectSampler &&
+		    source.indirect_root >= program.info.samplers.size())
+			return false;
+	}
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();
@@ -2063,6 +2789,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

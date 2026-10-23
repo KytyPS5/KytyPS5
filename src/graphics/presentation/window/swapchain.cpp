@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -715,9 +716,10 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 		create.pColorBlendState    = &blend;
 		create.pDynamicState       = &dynamic;
 		create.layout              = m_overlay_layout;
-		RequireVulkanSuccess(
-		    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_overlay_pipeline),
-		    "create video-out overlay pipeline");
+		RequireVulkanSuccess(device.createGraphicsPipelines(
+		                         m_window.render_context->GetPipelineCache().DriverCache(), 1,
+		                         &create, nullptr, &m_overlay_pipeline),
+		                     "create video-out overlay pipeline");
 		device.destroyShaderModule(fragment, nullptr);
 		device.destroyShaderModule(vertex, nullptr);
 	}
@@ -738,6 +740,7 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
+	DisturbGraphicsBindings();
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
 	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
@@ -921,6 +924,8 @@ Presenter::~Presenter() = default;
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
                                           bool headset) {
+	// One presented frame has passed; image staleness is judged in frames.
+	m_impl->renderer.GetTextureCache().AdvanceFrame();
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;

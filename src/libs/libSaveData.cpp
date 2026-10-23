@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
+#include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
@@ -122,6 +123,7 @@ struct SaveDataParam {
 	int64_t  mtime;
 	uint8_t  reserved[32];
 };
+static_assert(sizeof(SaveDataParam) == Dialog::SaveDataDialog::SAVE_DATA_PARAM_SIZE);
 
 struct SaveParamTextField {
 	char*  data;
@@ -487,31 +489,25 @@ static void queue_save_data_event(uint32_t type, int32_t user_id,
 	}
 }
 
+// '%' matches any run of characters, including none; '_' matches exactly one.
 static bool dir_name_match(const char* str, const char* pattern) {
-	while (*str != '\0' && *pattern != '\0') {
+	for (; *pattern != '\0'; pattern++) {
 		if (*pattern == '%') {
 			for (const char* s = str;; s++) {
 				if (dir_name_match(s, pattern + 1)) {
 					return true;
 				}
 				if (*s == '\0') {
-					break;
+					return false;
 				}
 			}
-			return false;
 		}
-		if (*pattern == '_') {
-			str++;
-			pattern++;
-			continue;
-		}
-		if (*pattern != *str) {
+		if (*str == '\0' || (*pattern != '_' && *pattern != *str)) {
 			return false;
 		}
 		str++;
-		pattern++;
 	}
-	return *str == '\0' && *pattern == '\0';
+	return *str == '\0';
 }
 
 static int mount_save_data(int slot, const std::filesystem::path& directory,
@@ -524,6 +520,31 @@ static int mount_save_data(int slot, const std::filesystem::path& directory,
 	result->required_blocks = 0;
 	result->mount_status    = status;
 	return OK;
+}
+
+static std::string param_text(const char* text, size_t size) {
+	return {text, static_cast<size_t>(std::find(text, text + size, '\0') - text)};
+}
+
+static bool save_dialog_info(int32_t user_id, const char* title_id, const char* dir_name,
+                             Dialog::SystemDialog::SaveListEntry* entry, void* param) {
+	if (!valid_path_component(dir_name) ||
+	    (title_id != nullptr && title_id[0] != '\0' && !valid_path_component(title_id))) {
+		return false;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const auto        directory = save_directory(
+	    title_id != nullptr && title_id[0] != '\0' ? title_id : get_title_id(), dir_name, user_id);
+	SaveDataParam loaded {};
+	if (load_save_param(directory, &loaded) != OK) {
+		return false;
+	}
+	entry->title     = param_text(loaded.title, sizeof(loaded.title));
+	entry->sub_title = param_text(loaded.sub_title, sizeof(loaded.sub_title));
+	entry->detail    = param_text(loaded.detail, sizeof(loaded.detail));
+	entry->mtime     = loaded.mtime;
+	std::memcpy(param, &loaded, sizeof(loaded));
+	return true;
 }
 
 int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
@@ -616,9 +637,35 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
+	const auto sort_value = [&](const std::string& name) -> uint64_t {
+		switch (cond->key) {
+			case SaveDataSortKey::UserParam: {
+				SaveDataParam param {};
+				return read_save_param(save_param_path(root / name), &param) == OK
+				           ? param.user_param
+				           : 0;
+			}
+			case SaveDataSortKey::Mtime:
+				return static_cast<uint64_t>(newest_save_time(root / name));
+			case SaveDataSortKey::Blocks:
+			case SaveDataSortKey::FreeBlocks: {
+				uint64_t blocks = 0;
+				return read_save_blocks(root / name, &blocks) == OK ? blocks : 0;
+			}
+			default: return 0;
+		}
+	};
+	std::vector<std::pair<uint64_t, std::string>> sorted;
+	for (const auto& name: dir_list) {
+		sorted.emplace_back(sort_value(name), name);
+	}
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+		return a.first != b.first ? a.first < b.first
+		                          : std::strcmp(a.second.c_str(), b.second.c_str()) < 0;
 	});
+	for (size_t i = 0; i < sorted.size(); i++) {
+		dir_list[i] = std::move(sorted[i].second);
+	}
 
 	if (cond->order == SaveDataSortOrder::Descent) {
 		std::vector<std::string> reversed;
@@ -1331,6 +1378,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 } // namespace LibSaveDataNative
 
 LIB_DEFINE(InitSaveData_1) {
+	Dialog::SaveDataDialog::SetSaveInfoProvider(SaveData::save_dialog_info);
 	LIB_FUNC("TywrFKCoLGY", SaveData::SaveDataInitialize3);
 	LIB_FUNC("dyIhnXq-0SM", SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("ZP4e7rlzOUk", SaveData::SaveDataMount3);

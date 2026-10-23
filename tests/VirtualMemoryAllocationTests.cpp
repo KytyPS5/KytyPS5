@@ -4,6 +4,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -153,6 +154,27 @@ void CheckFailed(const char* test, int result, const char* action) {
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr uint64_t RacedAllocationSize = 0x10000;
+constexpr uint64_t GuestMinimumReserve = 0x1000000;
+uint64_t           g_raced_hole_start  = 0;
+uint64_t           g_raced_hole_size   = 0;
+uint64_t           g_raced_allocation  = 0;
+
+// A host thread allocating inside a free hole between the boot scan's query and its reserve.
+void OccupyGuestReserveHole(uintptr_t start, size_t size) {
+	if (size <= GuestMinimumReserve + RacedAllocationSize) {
+		Libs::LibKernel::Memory::TestBeforeNextGuestReserve(OccupyGuestReserveHole);
+		return;
+	}
+	g_raced_hole_start = start;
+	g_raced_hole_size  = size;
+	g_raced_allocation = reinterpret_cast<uint64_t>(
+	    VirtualAlloc(reinterpret_cast<void*>(start + size - RacedAllocationSize),
+	                 RacedAllocationSize, MEM_RESERVE, PAGE_NOACCESS));
+}
+#endif
+
 void InitSubsystems() {
 	static bool initialized = false;
 	if (initialized) {
@@ -190,6 +212,9 @@ void InitSubsystems() {
 	      "failed to read flexible memory size from param.json");
 	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Libs::LibKernel::Memory::TestBeforeNextGuestReserve(OccupyGuestReserveHole);
+#endif
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
 	initialized = true;
@@ -292,6 +317,87 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 		            static_cast<unsigned long long>(result.patched_memory_instruction_count), intact);
 	}
 
+	// clang's small-frame layout: a frame pointer, no `sub rsp`, locals at [rbp - disp] below rsp.
+	std::vector<uint8_t> frame_code;
+	const auto emit = [&frame_code](std::initializer_list<uint8_t> bytes) {
+		frame_code.insert(frame_code.end(), bytes.begin(), bytes.end());
+	};
+	const auto emit64 = [&frame_code](uint64_t value) {
+		const auto offset = frame_code.size();
+		frame_code.resize(offset + sizeof(value));
+		std::memcpy(frame_code.data() + offset, &value, sizeof(value));
+	};
+	// Later functions are found from int3 padding or a code pointer, not described to the patcher.
+	const auto pad = [&frame_code]() {
+		do {
+			frame_code.push_back(0xcc);
+		} while (frame_code.size() % 16 != 0);
+	};
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x41, 0x57});                       // push r15
+	emit({0x41, 0x56});                       // push r14
+	emit({0x41, 0x55});                       // push r13
+	emit({0x41, 0x54});                       // push r12
+	emit({0x53});                             // push rbx  (rbp - rsp is now 0x28)
+	emit({0x48, 0xb8});
+	emit64(SENTINEL);                         // movabs rax, sentinel
+	emit({0x48, 0xb9});
+	emit64(SENTINEL);                         // movabs rcx, sentinel
+	emit({0x48, 0x89, 0x45, 0xc0});           // mov [rbp-0x40], rax  (== [rsp-0x18])
+	emit({0x48, 0x89, 0x45, 0xb8});           // mov [rbp-0x48], rax  (== [rsp-0x20])
+	emit({0xc7, 0x45, 0xcc, 0x44, 0x33, 0x22, 0x11}); // mov dword [rbp-0x34], 0x11223344
+	emit({0xc6, 0x45, 0xd6, 0x5a});           // mov byte [rbp-0x2a], 0x5a
+	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8b, 0x45, 0xc0});           // mov rax, [rbp-0x40]
+	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
+	emit({0x0f, 0x94, 0xc0});                 // sete al
+	emit({0x0f, 0xb6, 0xc0});                 // movzx eax, al
+	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});     // pop rbx; pop r12; pop r13
+	emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+	pad();
+
+	// Same prologue, every rbp access at or above rsp: no red zone. Analyzed only, never called.
+	const auto above_offset = frame_code.size();
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x41, 0x57, 0x41, 0x56, 0x41, 0x55}); // push r15; push r14; push r13
+	emit({0x41, 0x54, 0x53});                 // push r12; push rbx
+	emit({0x48, 0x8b, 0x45, 0xf8});           // mov rax, [rbp-0x08]
+	emit({0x48, 0x8b, 0x4d, 0xd8});           // mov rcx, [rbp-0x28]
+	emit({0x48, 0x03, 0x45, 0x10});           // add rax, [rbp+0x10]
+	emit({0x48, 0x8b, 0x17});                 // mov rdx, [rdi] (faultable, 3 bytes)
+	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});     // pop rbx; pop r12; pop r13
+	emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+	pad();
+
+	// An unmodelled rsp adjustment poisons the frame-pointer distance. Analyzed only.
+	const auto unknown_offset = frame_code.size();
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x53});                             // push rbx
+	emit({0x48, 0x83, 0xe4, 0xe0});           // and rsp, -0x20
+	emit({0x48, 0x8b, 0x45, 0xb8});           // mov rax, [rbp-0x48]
+	emit({0x48, 0x8b, 0x0f});                 // mov rcx, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8d, 0x65, 0xf8});           // lea rsp, [rbp-0x08]
+	emit({0x5b, 0x5d, 0xc3});                 // pop rbx; pop rbp; ret
+	Check(test, frame_code.size() < CODE_SIZE, "generated patch test code is too large");
+	std::memcpy(reinterpret_cast<void*>(mapping), frame_code.data(), frame_code.size());
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, frame_code.size()),
+	      "failed to flush generated test code");
+	const bool frame_reproduced = !run_fault();
+	Loader::RegisterGuestInstructionPatchModule(
+	    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+	    TRAMPOLINE_SIZE);
+	const std::array<Loader::RedZoneFunctionRange, 1> unwind_functions = {
+	    Loader::RedZoneFunctionRange {.start = static_cast<uintptr_t>(mapping), .size = above_offset}};
+	const std::array<uintptr_t, 1> code_pointers = {static_cast<uintptr_t>(mapping + unknown_offset)};
+	const auto frame_result = Loader::PatchGuestInstructions(
+	    mapping, frame_code.size(),
+	    {.unwind_functions = unwind_functions, .code_pointers = code_pointers, .execute_only = true},
+	    true, false);
+	const bool frame_preserved = run_fault();
+
 	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
 	RemoveVectoredExceptionHandler(handler);
 	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
@@ -299,14 +405,202 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
 
 	Check(test, reproduced, "test harness did not reproduce red-zone corruption");
+	Check(test, frame_reproduced,
+	      "test harness did not reproduce frame-pointer red-zone corruption");
 	Check(test, covered, "static patcher did not cover the faultable instruction");
+	Check(test, frame_result.red_zone_function_count == 1 &&
+	                frame_result.memory_instruction_count >= 1 &&
+	                frame_result.patched_memory_instruction_count >= 1 &&
+	                frame_result.unrelocatable_memory_instruction_count == 0,
+	      "static patcher did not cover the frame-pointer faultable instruction");
+	Check(test, frame_result.frame_pointer_red_zone_function_count == 1,
+	      "static patcher mis-classified a frame-pointer addressed red zone");
+	Check(test, frame_result.sweep_trusted && frame_result.function_count == 3 &&
+	                frame_result.padding_function_count == 1 &&
+	                frame_result.code_pointer_function_count == 1,
+	      "static patcher did not discover the undescribed functions");
 	Check(test, preserved, "patched fault still corrupted the guest red zone");
+	Check(test, frame_preserved,
+	      "patched fault still corrupted the frame-pointer addressed red zone");
+	Check(test, freed, "failed to free patch test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// SILENT HILL Townfall's VectorVM handlers: an rbp frame, no `sub rsp`, and a switch jump table.
+void TestWindowsGuestRedZoneJumpTables() {
+	const char* test = "WindowsGuestRedZoneJumpTables";
+	constexpr uint64_t SENTINEL        = 0x1122334455667788ull;
+	constexpr uint64_t CODE_SIZE       = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	const auto         mapping         = Libs::LibKernel::Memory::AllocateProgramMemory(
+        0x0000000902000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+        Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_jump_table_test");
+	Check(test, mapping != 0, "failed to allocate patch test code");
+
+	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
+	const auto run_fault = [&] {
+		DWORD old_protection = 0;
+		Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+	};
+
+	enum class Fixture { ResolvedTable, UnresolvedTable, DeadRedZone };
+	struct Outcome {
+		bool                        reproduced = false;
+		bool                        preserved  = false;
+		bool                        wrapped    = false;
+		Loader::GuestInstructionPatchResult result;
+	};
+	const auto run_fixture = [&](Fixture fixture) {
+		std::vector<uint8_t> code;
+		const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
+			code.insert(code.end(), bytes.begin(), bytes.end());
+		};
+		const auto emit32 = [&code](uint32_t value) {
+			const auto offset = code.size();
+			code.resize(offset + sizeof(value));
+			std::memcpy(code.data() + offset, &value, sizeof(value));
+		};
+		const auto emit64 = [&code](uint64_t value) {
+			const auto offset = code.size();
+			code.resize(offset + sizeof(value));
+			std::memcpy(code.data() + offset, &value, sizeof(value));
+		};
+		const auto patch8 = [&code](size_t at, size_t target) {
+			code[at] = static_cast<uint8_t>(target - (at + 1));
+		};
+		const auto patch32 = [&code](size_t at, int64_t value) {
+			const auto narrow = static_cast<int32_t>(value);
+			std::memcpy(code.data() + at, &narrow, sizeof(narrow));
+		};
+		const bool live = fixture != Fixture::DeadRedZone;
+
+		emit({0x55});                               // push rbp
+		emit({0x48, 0x89, 0xe5});                   // mov rbp, rsp
+		emit({0x41, 0x57, 0x41, 0x56, 0x41, 0x55}); // push r15; push r14; push r13
+		emit({0x41, 0x54, 0x53});                   // push r12; push rbx  (rbp - rsp is now 0x28)
+		emit({0x48, 0xb8});
+		emit64(SENTINEL);                           // movabs rax, sentinel
+		if (live) {
+			emit({0x48, 0x89, 0x45, 0xc0});         // mov [rbp-0x40], rax  (== [rsp-0x18])
+			emit({0x48, 0x89, 0x45, 0xb8});         // mov [rbp-0x48], rax
+		}
+		emit({0x31, 0xc9});                         // xor ecx, ecx
+		emit({0x83, 0xf9, 0x01});                   // cmp ecx, 1
+		emit({0x77, 0x00});                         // ja default
+		const auto default_jump = code.size() - 1;
+		emit({0x48, 0x8d, 0x15});                   // lea rdx, [rip + table]
+		const auto table_rel = code.size();
+		emit32(0);
+		emit({0x48, 0x63, 0x0c, 0x8a});             // movsxd rcx, dword [rdx + rcx*4]
+		emit({0x48, 0x01, 0xd1});                   // add rcx, rdx
+		emit({0xff, 0xe1});                         // jmp rcx
+		const auto case0 = code.size();
+		const auto fault_offset = code.size();
+		emit({0x48, 0x8b, 0x87, 0x00, 0x00, 0x00, 0x00}); // mov rax, [rdi+0] (faultable, 7 bytes)
+		emit({0xeb, 0x00});                         // jmp join
+		const auto join_jump = code.size() - 1;
+		const auto case1 = code.size();
+		patch8(default_jump, case1);
+		emit({0x48, 0x31, 0xc0});                   // xor rax, rax
+		const auto join = code.size();
+		patch8(join_jump, join);
+		if (!live) {
+			emit({0x48, 0xb8});
+			emit64(SENTINEL);                       // movabs rax, sentinel
+			emit({0x48, 0x89, 0x45, 0xc0});         // mov [rbp-0x40], rax
+		}
+		emit({0x48, 0x8b, 0x45, 0xc0});             // mov rax, [rbp-0x40]
+		emit({0x48, 0xb9});
+		emit64(SENTINEL);                           // movabs rcx, sentinel
+		emit({0x48, 0x39, 0xc8});                   // cmp rax, rcx
+		emit({0x0f, 0x94, 0xc0});                   // sete al
+		emit({0x0f, 0xb6, 0xc0});                   // movzx eax, al
+		emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});       // pop rbx; pop r12; pop r13
+		emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+		while (code.size() % 4 != 0) {
+			code.push_back(0xcc);
+		}
+		const auto table = code.size();
+		patch32(table_rel, static_cast<int64_t>(table) - static_cast<int64_t>(table_rel + 4));
+		emit32(static_cast<uint32_t>(static_cast<int32_t>(case0 - table)));
+		emit32(static_cast<uint32_t>(static_cast<int32_t>(case1 - table)));
+		Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
+
+		std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
+		      "failed to flush generated test code");
+		Outcome outcome;
+		outcome.reproduced = !run_fault();
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+		    TRAMPOLINE_SIZE);
+		if (fixture == Fixture::UnresolvedTable) {
+			// The table lies outside the patched execute-only segment, as rodata does in a game.
+			const std::array<Loader::RedZoneFunctionRange, 1> unwind_functions = {
+			    Loader::RedZoneFunctionRange {.start = static_cast<uintptr_t>(mapping), .size = table}};
+			outcome.result = Loader::PatchGuestInstructions(
+			    mapping, table, {.unwind_functions = unwind_functions, .execute_only = true}, true,
+			    false);
+		} else {
+			outcome.result =
+			    Loader::PatchGuestInstructions(mapping, code.size(), function_starts, true, false);
+		}
+		outcome.wrapped   = *reinterpret_cast<const uint8_t*>(mapping + fault_offset) == 0xe9;
+		outcome.preserved = run_fault();
+		Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+		std::printf("[host]    red-zone jump table fixture=%d red_zone=%llu frame=%llu "
+		            "conservative=%llu patched=%llu wrapped=%d preserved=%d mem=%llu unrel=%llu stack=%llu ctl=%llu\n",
+		            static_cast<int>(fixture),
+		            static_cast<unsigned long long>(outcome.result.red_zone_function_count),
+		            static_cast<unsigned long long>(outcome.result.frame_pointer_red_zone_function_count),
+		            static_cast<unsigned long long>(outcome.result.conservative_frame_pointer_function_count),
+		            static_cast<unsigned long long>(outcome.result.patched_memory_instruction_count),
+		            outcome.wrapped, outcome.preserved, static_cast<unsigned long long>(outcome.result.memory_instruction_count), static_cast<unsigned long long>(outcome.result.unrelocatable_memory_instruction_count), static_cast<unsigned long long>(outcome.result.stack_dependent_memory_instruction_count), static_cast<unsigned long long>(outcome.result.control_flow_memory_instruction_count));
+		return outcome;
+	};
+
+	const auto resolved   = run_fixture(Fixture::ResolvedTable);
+	const auto unresolved = run_fixture(Fixture::UnresolvedTable);
+	const auto dead       = run_fixture(Fixture::DeadRedZone);
+
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
+	g_red_zone_fault_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, resolved.reproduced && unresolved.reproduced,
+	      "test harness did not reproduce red-zone corruption behind a jump table");
+	Check(test, resolved.wrapped && resolved.preserved &&
+	                resolved.result.frame_pointer_red_zone_function_count == 1 &&
+	                resolved.result.conservative_frame_pointer_function_count == 0 &&
+	                resolved.result.unrelocatable_memory_instruction_count == 0,
+	      "a live red zone across a resolved jump table was not protected precisely");
+	Check(test, unresolved.wrapped && unresolved.preserved &&
+	                unresolved.result.frame_pointer_red_zone_function_count == 1 &&
+	                unresolved.result.conservative_frame_pointer_function_count == 1 &&
+	                unresolved.result.unrelocatable_memory_instruction_count == 0,
+	      "an unresolved jump table did not fall back to protecting the whole function");
+	Check(test, !dead.reproduced && !dead.wrapped && dead.preserved &&
+	                dead.result.conservative_frame_pointer_function_count == 0,
+	      "an access with a dead red zone was wrapped");
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
+}
+void TestWindowsGuestRedZoneJumpTables() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneJumpTables");
 }
 #endif
 
@@ -432,6 +726,36 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestGuestReserveSurvivesConcurrentHostAllocation() {
+	const char* test = "GuestReserveSurvivesConcurrentHostAllocation";
+
+	Check(test,
+	      g_raced_allocation != 0 &&
+	          g_raced_allocation == g_raced_hole_start + g_raced_hole_size - RacedAllocationSize,
+	      "the racing host allocation was not placed inside a scanned hole");
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<const void*>(g_raced_allocation), &info, sizeof(info)) !=
+	              0 &&
+	          info.State == MEM_RESERVE &&
+	          reinterpret_cast<uint64_t>(info.AllocationBase) == g_raced_allocation &&
+	          info.RegionSize == RacedAllocationSize,
+	      "the racing host allocation did not survive the guest reservation");
+	Check(test,
+	      !Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(g_raced_allocation,
+	                                                             RacedAllocationSize),
+	      "the guest address space claimed the racing host allocation");
+	Check(test,
+	      Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(
+	          g_raced_hole_start, g_raced_hole_size - RacedAllocationSize),
+	      "the rest of the raced hole was left unreserved");
+
+	std::printf("[host]    %-48s ok (hole 0x%016" PRIx64 "+0x%" PRIx64 ")\n", test,
+	            g_raced_hole_start, g_raced_hole_size);
+}
+#endif
 
 void TestSparseBackingReadPreservesResidency() {
 	const char*        test        = "SparseBackingReadPreservesResidency";
@@ -1624,6 +1948,24 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
 	          0xf30,
 	      "ClampRangeSize did not stop at an unmapped span");
+	// RE9 binds descriptors whose base is unmapped; that must report zero, not abort.
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize, SceKernelPageSize) == 0,
+	      "ClampRangeSize did not report an unmapped base as zero");
+	// Reading an unmapped guest pointer from the descriptor evaluator must refuse, not fault.
+	uint32_t evaluator_word = 0xc0ffee;
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadGpuCleanBacking(base + SceKernelPageSize,
+	                                                      &evaluator_word,
+	                                                      sizeof(evaluator_word)),
+	      "the descriptor read accepted an unmapped guest address");
+	Check(test, evaluator_word == 0xc0ffee,
+	      "a refused descriptor read modified its destination");
+	uint32_t mapped_word = 0;
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, &mapped_word,
+	                                                     sizeof(mapped_word)),
+	      "the descriptor read refused a mapped guest address");
 
 	info = Query(test, base + SceKernelPageSize, SceKernelVqFindNext);
 	ExpectRange(test, info, base + SceKernelPageSize * 2, base + SceKernelPageSize * 4,
@@ -4814,6 +5156,123 @@ void TestSmallFiberStacksAndMigration() {
 	}
 }
 #endif
+// Repeated identical buffer-range reports are summarised, never silenced.
+void TestBufferRangeReportsSummariseRepeats() {
+	const char* test = "BufferRangeReportsSummariseRepeats";
+	using Policy     = Libs::LibKernel::Memory::BufferRangeReportPolicy;
+
+	constexpr uint64_t kArena     = 0x000000223d000000ull;
+	constexpr uint64_t kDeclared  = 0x280000;
+	constexpr uint64_t kCommitted = 0x10000;
+	constexpr uint64_t kRepeats   = 177618; // the RE9 capture's count for this exact shape
+
+	Policy policy;
+
+	const auto first = policy.Observe(kArena, kDeclared, kCommitted);
+	Check(test, first.report, "the first sighting of a short range was not reported");
+	Check(test, first.occurrences == 1, "the first sighting did not count as one occurrence");
+
+	uint64_t reports       = 1;
+	uint64_t last_reported = 1;
+	for (uint64_t i = 1; i < kRepeats; i++) {
+		const auto decision = policy.Observe(kArena, kDeclared, kCommitted);
+		Check(test, decision.occurrences == i + 1,
+		      "a repeated range lost track of how often it had been seen");
+		if (decision.report) {
+			Check(test, decision.occurrences > last_reported,
+			      "a repeat was reported without advancing the occurrence count");
+			last_reported = decision.occurrences;
+			reports++;
+		}
+	}
+	// Logarithmic, so a longer run costs a handful more lines and never a proportional flood.
+	Check(test, reports <= 16,
+	      "an unchanging range was reported " + std::to_string(reports) +
+	          " times; it must be summarised, not restated per draw");
+	Check(test, reports >= 3,
+	      "an unchanging range must keep re-reporting, or a stale descriptor goes unnoticed");
+	Check(test, last_reported > kRepeats / 4,
+	      "the last report was too early to show the range was still recurring at the end");
+
+	// A growing arena changes its committed extent; that is news, not a repeat.
+	const auto grown = policy.Observe(kArena, kDeclared, kCommitted + 0x10000);
+	Check(test, grown.report, "a changed committed extent was not reported");
+	Check(test, grown.occurrences == 1, "a changed committed extent did not restart its count");
+
+	// Distinct ranges are tracked apart: a second arena reports on its own first sighting.
+	const auto other = policy.Observe(0x0000002216000000ull, 0x2000000, 0x1c10000);
+	Check(test, other.report && other.occurrences == 1,
+	      "a different range was suppressed by an unrelated range's history");
+
+        // Two descriptors bound alternately that hash to the same set.
+        Policy interleaved;
+        uint64_t interleaved_reports = 0;
+        for (uint64_t i = 0; i < kRepeats; i++) {
+          interleaved_reports +=
+              interleaved.Observe(kArena + 0x400000, kDeclared, kCommitted)
+                  .report;
+          interleaved_reports +=
+              interleaved.Observe(0x0000002216000000ull, 0x2000000, 0x1c10000)
+                  .report;
+        }
+        Check(test, interleaved_reports <= 32,
+              "two alternately bound ranges were reported " +
+                  std::to_string(interleaved_reports) +
+                  " times; they must not evict each other");
+
+        std::printf("[host]    %-48s ok (%" PRIu64 " lines for %" PRIu64 " events)\n", test, reports,
+	            kRepeats);
+}
+
+// An upload cannot refuse, so the sparse copy serves the committed bytes and zeroes the rest.
+void TestPartialBackingReadServesCommittedGranules() {
+	const char*        test      = "PartialBackingReadServesCommittedGranules";
+	constexpr uint64_t kPages    = 3;
+	const auto         size      = SceKernelPageSize * kPages;
+	int64_t            phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, size, SceKernelProtCpuRw,
+	                                                            0, phys_addr, SceKernelPageSize,
+	                                                            "partial_backing_read"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	std::memset(reinterpret_cast<void*>(base), 0xaa, SceKernelPageSize);
+	std::memset(reinterpret_cast<void*>(base + SceKernelPageSize * 2), 0xbb, SceKernelPageSize);
+
+	// A released granule inside a surface whose descriptor still names the whole allocation.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	std::vector<uint8_t> bytes(size, 0x5a);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
+	      "the dense reader accepted a partly committed span");
+	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t v) { return v == 0x5a; }),
+	      "a refused dense read modified its destination");
+
+	Check(test, Libs::LibKernel::Memory::CopySparseMemory(base, bytes.data(), size),
+	      "the sparse copy refused a partly committed span");
+	Check(test,
+	      std::all_of(bytes.begin(), bytes.begin() + SceKernelPageSize,
+	                  [](uint8_t v) { return v == 0xaa; }) &&
+	          std::all_of(bytes.begin() + SceKernelPageSize, bytes.begin() + SceKernelPageSize * 2,
+	                      [](uint8_t v) { return v == 0; }) &&
+	          std::all_of(bytes.begin() + SceKernelPageSize * 2, bytes.end(),
+	                      [](uint8_t v) { return v == 0xbb; }),
+	      "the sparse copy did not serve the committed granules and zero the hole");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
 
 } // namespace
 
@@ -4932,6 +5391,7 @@ int main(int argc, char** argv) {
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
+		RunTest(TestWindowsGuestRedZoneJumpTables);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
@@ -4946,11 +5406,17 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
+	RunTest(TestWindowsGuestRedZoneJumpTables);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
+	RunTest(TestBufferRangeReportsSummariseRepeats);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestGuestReserveSurvivesConcurrentHostAllocation);
+#endif
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
 	RunTest(TestSparseReadDuringDirectCommit);
+	RunTest(TestPartialBackingReadServesCommittedGranules);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);

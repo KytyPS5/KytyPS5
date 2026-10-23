@@ -409,8 +409,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (lds != 0 || inst.glc || (inst.slc && !IsFlatStoreOpcode(inst.opcode)) || seg == 3u) {
-		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
+	// With no FLAT atomics decoded, GLC/SLC/DLC are only cache policy.
+	if (lds != 0 || seg == 3u) {
+		SetUnsupported(inst, Family::FLAT, opcode, "FLAT LDS or segment is not implemented");
 		return;
 	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -477,6 +478,11 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
+	}
+	if (inst.gds &&
+	    (inst.opcode == Opcode::DS_MAX_RTN_U64 || inst.opcode == Opcode::DS_CMPST_RTN_B64)) {
+		// A 64-bit atomic needs an eight-byte typed view of the storage, and only LDS has one.
+		SetUnsupported(inst, Family::DS, opcode, "DS 64-bit atomic is available only for LDS");
 	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,

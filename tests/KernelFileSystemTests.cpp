@@ -1766,6 +1766,35 @@ void CheckAprPaths(const std::filesystem::path &root) {
         "APR rejects an unterminated prefix");
   CheckAmprOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");
+
+  // Save data is rewritten while mounted, so APR must not serve a stale size or a stale ENOENT.
+  const auto save_root = root / "apr-save";
+  std::filesystem::create_directories(save_root);
+  FileSystem::Mount(save_root, "/savedata0");
+  const auto write_save = [&](const char *name, size_t size) {
+    Common::File save;
+    Check(save.Create(save_root / name), "create APR save fixture");
+    const std::string bytes(size, 'S');
+    save.Write(bytes.data(), static_cast<uint32_t>(bytes.size()));
+    save.Close();
+  };
+  const char *save_path[] = {"/savedata0/data000.bin"};
+  uint32_t save_id = 0;
+  uint64_t save_size = 0;
+  write_save("data000.bin", 5);
+  Check(resolve("", save_path, 1, &save_id, &save_size, &error_index) == OK && save_size == 5,
+        "APR resolves the first save");
+  std::filesystem::remove(save_root / "data000.bin");
+  write_save("data000.bin", 9);
+  Check(resolve("", save_path, 1, &save_id, &save_size, &error_index) == OK && save_size == 9,
+        "APR sees a save replaced with a different size");
+  const char *later_path[] = {"/savedata0/data001.bin"};
+  Check(resolve("", later_path, 1, &save_id, &save_size, &error_index) == -1,
+        "APR reports a save that does not exist yet");
+  write_save("data001.bin", 4);
+  Check(resolve("", later_path, 1, &save_id, &save_size, &error_index) == OK && save_size == 4,
+        "APR finds a save created after a failed lookup");
+  FileSystem::Umount("/savedata0");
 }
 
 std::array<int, 2> CreateTcpPair() {

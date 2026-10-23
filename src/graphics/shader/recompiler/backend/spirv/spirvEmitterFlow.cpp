@@ -211,6 +211,11 @@ uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint
 }
 
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
+	if (state.program.stage == ShaderType::Pixel &&
+	    ShaderPixelParameterIsDefault(*state.input_info.pixel, attr)) {
+		return ConstantU32(
+		    state, ShaderPixelParameterDefaultComponent(*state.input_info.pixel, attr, chan));
+	}
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -226,8 +231,15 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 
 uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32_t chan,
                                     uint32_t mode) {
-	auto&       state = ctx.state;
+	auto& state = ctx.state;
+	if (ShaderPixelParameterIsDefault(*state.input_info.pixel, attr)) {
+		// The constant sits in P0; the vertex deltas of a constant are zero.
+		return mode == 2u ? EmitAttribute(state, attr, chan) : ConstantU32(state, 0);
+	}
 	const auto* input = InputBindingForParameter(state, attr);
+	if (input == nullptr) {
+		return ConstantU32(state, 0);
+	}
 	if (!input->per_vertex) {
 		return EmitAttribute(ctx.state, attr, chan);
 	}
@@ -397,7 +409,11 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 				const auto viewport = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), viewport, raw,
 				                          ConstantU32(state, 16), ConstantU32(state, 4));
-				state.builder.AddFunction(spv::OpStore, state.viewport_index_variable, viewport);
+				const auto pointer =
+				    state.program.stage == ShaderType::Mesh
+				        ? MeshOutputPointer(state, IR::StageOutputKind::ViewportIndex)
+				        : state.viewport_index_variable;
+				state.builder.AddFunction(spv::OpStore, pointer, viewport);
 			}
 			continue;
 		}
@@ -409,8 +425,13 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 		const auto raw = ExportRawComponent(ctx, data, component);
 		const auto f32 = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw);
+		const bool mesh = state.program.stage == ShaderType::Mesh;
 		if (output.point_size) {
-			state.builder.AddFunction(spv::OpStore, state.point_size_variable, f32);
+			state.builder.AddFunction(spv::OpStore,
+			                          mesh
+			                              ? MeshOutputPointer(state, IR::StageOutputKind::PointSize)
+			                              : state.point_size_variable,
+			                          f32);
 			continue;
 		}
 		auto StoreDistance = [&](IR::StageOutputKind kind, uint32_t index) {
@@ -459,6 +480,7 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+// TypeU64 is a uvec2: the constants below are per-32-bit-half, so every shift is componentwise.
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -518,6 +540,37 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto f32 = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw);
 				state.builder.AddFunction(spv::OpStore, state.depth_variable, f32);
+			}
+			if ((exp.en & 2u) != 0u && state.stencil_ref_variable != 0) {
+				// Vulkan has one reference per fragment: prefer the op value, it reaches the plane.
+				const uint32_t shift =
+				    state.input_info.pixel->ps_stencil_op_val_export_enable ? 8u : 0u;
+				const auto raw      = ExportRawComponent(ctx, data, 1);
+				auto       selected = raw;
+				if (shift != 0) {
+					const auto shifted = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), shifted,
+					                          raw, ConstantU32(state, shift));
+					selected = shifted;
+				}
+				const auto masked = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), masked, selected,
+				                          ConstantU32(state, 0xffu));
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitcast, TypeI32(state), value, masked);
+				state.builder.AddFunction(spv::OpStore, state.stencil_ref_variable, value);
+			}
+			if ((exp.en & 2u) != 0u && state.stencil_bit_pass_variable != 0) {
+				// Op value 15:8; the return path discards the fragment when this bit is clear.
+				const uint32_t bit     = 8u + state.input_info.pixel->ps_stencil_bit_pass - 1u;
+				const auto     raw     = ExportRawComponent(ctx, data, 1);
+				const auto     shifted = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), shifted, raw,
+				                          ConstantU32(state, bit));
+				const auto keep = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), keep, shifted,
+				                          ConstantU32(state, 1u));
+				state.builder.AddFunction(spv::OpStore, state.stencil_bit_pass_variable, keep);
 			}
 			if ((exp.en & 4u) != 0u && state.sample_mask_variable != 0) {
 				const auto raw     = ExportRawComponent(ctx, data, 2);
@@ -651,6 +704,15 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+			if (exp.kind == IR::ExportTargetKind::Parameter) {
+				for (const auto& binding: state.outputs) {
+					if (binding.kind == IR::StageOutputKind::Parameter &&
+					    binding.index == exp.index && binding.variable_id != variable &&
+					    binding.variable_id != 0) {
+						state.builder.AddFunction(spv::OpStore, binding.variable_id, value);
+					}
+				}
+			}
 		}
 	});
 }
@@ -684,11 +746,13 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
-	                        ? spv::MemorySemanticsUniformMemoryMask
-	                        : spv::MemorySemanticsWorkgroupMemoryMask;
-	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
-	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
+	// s_barrier also orders buffer traffic; LDS in a storage buffer is uniform memory itself.
+	const auto lds_memory = state.lds_storage_class == spv::StorageClassStorageBuffer
+	                            ? spv::MemorySemanticsMaskNone
+	                            : spv::MemorySemanticsWorkgroupMemoryMask;
+	const auto semantics  = tessellation ? spv::MemorySemanticsMaskNone
+	                                     : spv::MemorySemanticsAcquireReleaseMask | lds_memory |
+	                                           spv::MemorySemanticsUniformMemoryMask;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
@@ -699,16 +763,84 @@ uint32_t EmitLaneId(EmitterState& state) {
 	           : EmitSubgroupLocalInvocationId(state);
 }
 
+static uint32_t EmitMeshPayloadLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassTaskPayloadWorkgroupEXT),
+	    pointer, state.mesh_payload_variable, ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto index  = inst.Arg(0).U32();
-	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+	const bool index_bound = index == IR::PushData::MeshIndexBoundParameter;
+	if (state.program.stage != ShaderType::Mesh ||
+	    (index >= IR::PushData::MeshDrawDwordCount && !index_bound)) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	return EmitPushDataLoad(state, ConstantU32(state, index));
+	if (state.mesh_payload_variable != 0) {
+		return EmitMeshPayloadLoad(state, index_bound ? IR::MeshTaskPayloadIndexBound : index);
+	}
+	return EmitPushDataLoad(
+	    state, ConstantU32(state, index_bound ? IR::PushData::MeshIndexBoundDword(
+	                                                state.input_info.vertex->user_clip_planes)
+	                                          : index));
+}
+
+uint32_t EmitDispatchThreadInRange(EmitterState& state) {
+	const auto load_push = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, index));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		const auto wide = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUConvert, TypeU64(state), wide, value);
+		return wide;
+	};
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpShiftLeftLogical, TypeU64(state), high, load_push(1),
+	                          ConstantU32(state, 32));
+	const auto base = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU64(state), base, load_push(0), high);
+	uint32_t in_range = ConstantBool(state, true);
+	for (uint32_t axis = 0; axis < 3u; axis++) {
+		const auto offset = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUConvert, TypeU64(state), offset,
+		                          ConstantU32(state, axis * 4u));
+		const auto address = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIAdd, TypeU64(state), address, base, offset);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		const auto limit = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), limit, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		const auto thread = EmitBuiltinU32(state, IR::StageInputKind::GlobalInvocationId, axis);
+		const auto below  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), below, thread, limit);
+		const auto both = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, in_range, below);
+		in_range = both;
+	}
+	return in_range;
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	if (state.mesh_payload_variable != 0) {
+		const auto& sgprs = state.input_info.vertex->mesh.payload_user_sgprs;
+		// Written in this order by the command processor, so the last naming of a register wins.
+		for (uint32_t slot = static_cast<uint32_t>(sgprs.size()); slot-- > 0;) {
+			if (sgprs[slot] != ShaderMeshInputInfo::NoPayloadSgpr &&
+			    IR::RegIndex(reg) == 8u + sgprs[slot]) {
+				return EmitMeshPayloadLoad(state, IR::PushData::MeshDrawDwordCount + slot);
+			}
+		}
+	}
 
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {
@@ -791,7 +923,53 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	if (ctx.other_half != nullptr) {
+		return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	}
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto bool_ = TypeBool(state);
+	// RDNA 2 takes the lane from SSRC1[5:0] in wave64 and SSRC1[4:0] in wave32.
+	const auto lane = EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1),
+	                                ConstantU32(state, state.program.wave_size == 32u ? 31u : 63u));
+	const auto ballot = ctx.Ballot(IR::Value(true));
+	const auto low    = state.builder.AllocateId();
+	const auto high   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, high, ballot, 1);
+	const auto bit   = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
+	const auto upper = Binary(state, spv::OpUGreaterThanEqual, bool_, lane, ConstantU32(state, 32));
+	const auto word  = Select(state, u32, upper, high, low);
+	const auto live  = Binary(
+	    state, spv::OpINotEqual, bool_,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, word,
+	                  EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 1), bit)),
+	    ConstantU32(state, 0));
+	// Lanes 0..bit of the named lane's word; (2 << 31) wraps to 0, so bit 31 keeps the whole word.
+	const auto at_or_below =
+	    EmitBinaryU32(state, spv::OpISub,
+	                  EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 2), bit),
+	                  ConstantU32(state, 1));
+	const auto low_live =
+	    Select(state, u32, upper, low, EmitBinaryU32(state, spv::OpBitwiseAnd, low, at_or_below));
+	const auto high_live =
+	    Select(state, u32, upper, EmitBinaryU32(state, spv::OpBitwiseAnd, high, at_or_below),
+	           ConstantU32(state, 0));
+	const auto low_msb  = state.builder.AllocateId();
+	const auto high_msb = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, u32, low_msb, GlslStd450(state), GLSLstd450FindUMsb,
+	                          low_live);
+	state.builder.AddFunction(spv::OpExtInst, u32, high_msb, GlslStd450(state), GLSLstd450FindUMsb,
+	                          high_live);
+	const auto high_any = Binary(state, spv::OpINotEqual, bool_, high_live, ConstantU32(state, 0));
+	const auto any_live =
+	    Binary(state, spv::OpINotEqual, bool_,
+	           EmitBinaryU32(state, spv::OpBitwiseOr, low_live, high_live), ConstantU32(state, 0));
+	const auto below =
+	    Select(state, u32, high_any,
+	           EmitBinaryU32(state, spv::OpIAdd, high_msb, ConstantU32(state, 32)), low_msb);
+	const auto source = Select(state, u32, live, lane, Select(state, u32, any_live, below, lane));
+	return ctx.Shuffle(inst, 0, source);
 }
 
 uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -867,9 +1045,19 @@ uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto attr = inst.Arg(0).U32();
-	return EmitPixelAttribute(ctx.state, *InputBindingForParameter(ctx.state, attr), attr,
-	                          inst.Arg(1).U32(), inst.Arg(2).U32());
+	auto&      state = ctx.state;
+	const auto attr  = inst.Arg(0).U32();
+	const auto chan  = inst.Arg(1).U32();
+	if (ShaderPixelParameterIsDefault(*state.input_info.pixel, attr)) {
+		return EmitBitcastU32ToF32(
+		    state, ConstantU32(state, ShaderPixelParameterDefaultComponent(*state.input_info.pixel,
+		                                                                   attr, chan)));
+	}
+	const auto* input = InputBindingForParameter(state, attr);
+	if (input == nullptr || input->variable_id == 0) {
+		return ConstantF32Value(state, 0.0f);
+	}
+	return EmitPixelAttribute(state, *input, attr, chan, inst.Arg(2).U32());
 }
 
 uint32_t EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst) {

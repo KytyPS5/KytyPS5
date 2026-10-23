@@ -4,12 +4,15 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/dispatchHazard.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -48,11 +51,17 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+// Nonzero address: the GPU reads up to count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
 	uint64_t address = 0;
 	uint32_t count   = 0;
 	uint32_t stride  = 0;
+	// Guest dword that caps the record count on the GPU, or 0.
+	uint64_t count_address = 0;
+	// The SH registers the packet writes each record's start vertex, instance and index to.
+	uint32_t vertex_offset_register   = Pm4::SH_NOP;
+	uint32_t instance_offset_register = Pm4::SH_NOP;
+	uint32_t index_offset_register    = Pm4::SH_NOP;
 };
 
 struct DrawIndexArgs {
@@ -64,7 +73,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
-	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	// Indices from index_addr past this many lie outside INDEX_BUFFER_SIZE and read as zero.
+	uint32_t index_limit = UINT32_MAX;
+	// With indirect records, index_addr is the index base and index_count INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
 };
 
@@ -76,6 +87,28 @@ struct DrawAutoArgs {
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
 	DrawIndirectArgs indirect;
+};
+
+// Drawn, or why the draw needs its counts on the CPU.
+enum class IndirectDrawResult : uint8_t {
+	Drawn,
+	MissingFeature,
+	Misaligned,
+	ArgsUnmapped,
+	MergedGeometry,
+	QuadList,
+	IndexType,
+	IndexBufferUnset,
+	IndexBufferTooLarge,
+	IndexBufferUnmapped,
+	CustomRestart,
+	MeshStage,
+	MeshFastLaunchIndexed,
+	MeshTaskLimit,
+	MeshNoGroups,
+	MeshOffsetRegister,
+	MeshPayloadLimit,
+	OffsetRegister,
 };
 
 struct SubmitInfo {
@@ -104,6 +137,12 @@ struct SubmitInfo {
 	}
 };
 
+struct TransferRange {
+	vk::Buffer buffer = nullptr;
+	uint64_t   offset = 0;
+	uint64_t   size   = 0;
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -116,6 +155,38 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IndirectArgsBarrierHolds() const noexcept {
+		return m_rendering && m_indirect_barrier_holds;
+	}
+	void MarkIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = true; }
+	void InvalidateIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = false; }
+	[[nodiscard]] bool FullBarrierIsLast() const noexcept {
+		return m_full_barrier_mark == m_handle_requests;
+	}
+	void MarkFullBarrier() const noexcept { m_full_barrier_mark = m_handle_requests; }
+	// The open render pass clears an attachment when it begins: restarting it would clear again.
+	[[nodiscard]] bool RenderingWithClear() const noexcept {
+		return m_rendering && m_rendering_clear;
+	}
+
+	struct DeferredJoin {
+		bool joined = false;
+		// Everything recorded before the group is ordered before the joining dispatch too.
+		bool ordered_before = false;
+	};
+	[[nodiscard]] DeferredJoin JoinDeferredBarrier(const DispatchAccess& access, bool writes) const;
+	// Leaves this dispatch's barrier pending: starts a group, or extends the one just joined.
+	void               DeferBarrier(const DispatchAccess& access, bool full) const;
+	// A dispatch skipped after joining leaves the group as it was.
+	void               CancelDeferredJoin() const noexcept { m_deferred_joining = false; }
+	void               FlushDeferredBarrier() const;
+	[[nodiscard]] bool HasDeferredBarrier() const noexcept { return m_deferred_barrier; }
+
+	// Transfers recorded back to back share one barrier pair; Handle() records the closing half.
+	[[nodiscard]] vk::CommandBuffer BeginTransfer(std::span<const TransferRange> reads,
+	                                              std::span<const TransferRange> writes) const;
+	void                            FlushTransferBarrier() const;
+	[[nodiscard]] bool              HasTransferBarrier() const noexcept { return m_transfer_open; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -146,17 +217,33 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	mutable bool        m_rendering = false;
+	// The open pass began by clearing an attachment; m_render_state no longer says so.
+	mutable bool           m_rendering_clear        = false;
+	mutable bool           m_indirect_barrier_holds = false;
+	mutable uint64_t       m_handle_requests        = 0;
+	mutable uint64_t       m_full_barrier_mark      = UINT64_MAX;
+	mutable bool           m_deferred_barrier       = false;
+	mutable bool           m_deferred_full          = false;
+	mutable bool           m_deferred_joining       = false;
+	mutable uint32_t       m_deferred_dispatches    = 0;
+	mutable DispatchAccess m_deferred_access;
+	mutable bool           m_transfer_open = false;
+	mutable DispatchAccess m_transfer_access;
+	HW::Context*           m_registers   = nullptr;
+	HW::UserConfig*        m_user_config = nullptr;
+	HW::Shader*            m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };
 
+class ThreadDispatcher;
+class MeshIndirectVerifier;
+
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -168,16 +255,25 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
-	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
-	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings);
+	bool                           ResolveStageImages(PreparedBindings& bindings);
+	void                           AcquireStageImageViews(PreparedBindings& bindings);
+	bool                           ResolveColorTargets(std::span<RenderColorInfo> colors);
+	[[nodiscard]] const char*      ScalarReadConflict(std::span<PreparedBindings* const> bindings);
+	// False, with nothing bound, when the draw or dispatch must be dropped.
+	[[nodiscard]] bool CommitBindings(CommandBuffer&                     buffer,
+	                                  vk::PipelineBindPoint              pipeline_bind_point,
+	                                  const PipelineCache::Pipeline&     pipeline,
+	                                  std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
-	// False, with nothing drawn, when the draw's indirect records need CPU counts.
-	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// False, with nothing drawn, when the draw's indirect records need CPU counts; refusal says
+	// why.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	               IndirectDrawResult* refusal = nullptr);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args,
+	              IndirectDrawResult* refusal = nullptr);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -189,7 +285,8 @@ private:
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
-	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target,
+	                                            uint8_t stencil_export_bits = 0);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
@@ -197,6 +294,9 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                      uint32_t         render_target_slice_offset,
+	                                      DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
@@ -214,25 +314,72 @@ private:
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
+	[[nodiscard]] bool        TryConsumeComputeRecordFill(const ShaderComputeInputInfo& input,
+	                                                      CommandBuffer& command, uint32_t group_x,
+	                                                      uint32_t group_y, uint32_t group_z,
+	                                                      uint32_t mode);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        TryConsumeComputeImageCopy(const ShaderComputeInputInfo& input,
+	                                                     CommandBuffer& command, uint32_t group_x,
+	                                                     uint32_t group_y, uint32_t group_z,
+	                                                     uint32_t mode);
+	[[nodiscard]] ThreadDispatcher&     ThreadDispatch();
+	[[nodiscard]] MeshIndirectVerifier& MeshIndirectVerify();
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	DispatchAccess                        m_dispatch_access;
 	std::vector<ImageId>                  m_bound_images;
+	struct LastGraphicsBindings {
+		VkCommandBuffer       command          = nullptr;
+		uint64_t              tick             = 0;
+		uint64_t              epoch            = 0;
+		VkPipelineLayout      layout           = nullptr;
+		uint64_t              layout_signature = 0;
+		VkPipeline            pipeline         = nullptr;
+		bool                  pixel_set_bound  = false;
+		// Binding the heap set below a bound pixel set disturbs it unless a heap set was bound.
+		bool                  heap_set_bound = false;
+		std::vector<uint64_t> pixel_content;
+	};
+	LastGraphicsBindings  m_last_graphics;
+	std::vector<uint64_t> m_pixel_content_scratch;
+	[[nodiscard]] bool    LastGraphicsBindingsValid(vk::CommandBuffer command);
+	// Scratch for CommitBindings: the ranges this op writes, checked against captured reads.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
+	// Where the scheduler's DynamicState was last committed: command buffer and binding epoch.
+	VkCommandBuffer                       m_dynamic_state_command = nullptr;
+	uint64_t                              m_dynamic_state_epoch   = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::unique_ptr<ThreadDispatcher>     m_thread_dispatch;
+	std::unique_ptr<MeshIndirectVerifier> m_mesh_indirect_verifier;
+	// KYTY_NO_MESH_INDIRECT; the verifier is a test hook.
+	bool m_mesh_indirect        = true;
+	bool m_mesh_indirect_verify = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
 
+[[nodiscard]] bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                            uint64_t& source, uint64_t& destination,
+                                            uint64_t& size);
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
+// A constant store into every record of a buffer whose stride is wider than the element.
+[[nodiscard]] bool ResolveComputeRecordFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                            ShaderBufferResource&    descriptor,
+                                            std::array<uint32_t, 4>& pattern,
+                                            uint32_t& pattern_words, uint64_t& size);
 
 } // namespace Libs::Graphics
 

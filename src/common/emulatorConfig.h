@@ -51,6 +51,9 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
+	// The guest display extent; zero follows the window.
+	uint32_t                       render_width                = 0;
+	uint32_t                       render_height               = 0;
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
@@ -84,7 +87,8 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = false;
+	// CPU reads of image memory never fault; only readback returns GPU-written linear surfaces.
+	bool                   readback_linear_images          = true;
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
@@ -106,6 +110,8 @@ void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
+uint32_t                              GetRenderWidth();
+uint32_t                              GetRenderHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();

@@ -4,8 +4,11 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <chrono>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <span>
@@ -30,16 +33,26 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// VK_EXT_robustness2: an out-of-range buffer read returns zero and a write is discarded.
+	bool                               robust_buffer_access2_enabled         = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// Without VK_EXT_shader_stencil_export the guest's stencil exports are dropped at compile.
+	bool                               shader_stencil_export_enabled          = false;
+	bool                               pipeline_library_enabled               = false;
+	bool                               pipeline_library_fast_linking          = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
+	// A guest indirect draw with a GPU-written count stays on the GPU only with this.
+	bool                                      draw_indirect_count_enabled           = false;
+	bool                                      sparse_residency_buffer_enabled       = false;
 	bool                                      mesh_shader_enabled                   = false;
+	bool                                      task_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -50,7 +63,10 @@ struct GraphicContext {
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
+	uint32_t                                  queue_count  = 1;
 	vk::Queue                          queue        = nullptr;
+	// A second queue of `queue_family`, or null; CommandScheduler::RunDetached submits to it.
+	vk::Queue readback_queue = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -99,12 +115,23 @@ struct GraphicContext {
 		return alignment != 0 ? alignment : 1;
 	}
 
+	struct ImageAllocationReport {
+		vk::Result             result                = vk::Result::eSuccess;
+		uint64_t               size                  = 0;
+		bool                   host_fallback_allowed = true;
+		Headroom::MemoryBudget budget;
+
+		[[nodiscard]] bool Failed() const noexcept { return result != vk::Result::eSuccess; }
+	};
+
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// Without VK_EXT_memory_budget `reported` is false and only the raw heap size is known.
+	[[nodiscard]] Headroom::MemoryBudget GetMemoryBudget() const;
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
@@ -113,13 +140,47 @@ struct GraphicContext {
 		bool     device_local = false;
 	};
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// Bytes this image would need, measured by creating an unbacked VkImage; 0 if that fails.
+	[[nodiscard]] uint64_t ImageMemorySize(const vk::ImageCreateInfo& info) const;
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                                   ImageAllocationReport* report = nullptr);
 	void                   DeleteImage(VulkanImage& image);
+	// Destroys every idle pooled image and returns the bytes released.
+	uint64_t TrimImagePool();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	struct ImagePoolKey {
+		vk::ImageCreateFlags    flags;
+		vk::ImageType           type   = vk::ImageType::e2D;
+		vk::Format              format = vk::Format::eUndefined;
+		vk::Extent3D            extent;
+		uint32_t                mip_levels = 1;
+		uint32_t                layers     = 1;
+		vk::SampleCountFlagBits samples    = vk::SampleCountFlagBits::e1;
+		vk::ImageUsageFlags     usage;
+
+		bool operator==(const ImagePoolKey&) const = default;
+	};
+	struct PooledImage {
+		ImagePoolKey                          key;
+		vk::Image                             image      = nullptr;
+		VmaAllocation                         allocation = nullptr;
+		uint64_t                              size       = 0;
+		std::chrono::steady_clock::time_point released;
+	};
+
+	[[nodiscard]] bool TakePooledImage(const ImagePoolKey& key, VulkanImage& image);
+	[[nodiscard]] bool PoolImage(VulkanImage& image);
+	void               ExpirePooledImages(std::vector<PooledImage>& victims, uint64_t incoming);
+
+	std::mutex              m_image_pool_mutex;
+	std::deque<PooledImage> m_image_pool;
+	uint64_t                m_image_pool_bytes = 0;
+	uint64_t                m_image_pool_limit = 0;
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -133,6 +194,7 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	bool                    flushed     = false;
 };
 
 struct VulkanImage {
@@ -151,6 +213,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Plain create info in device-local memory, so an identical request can reuse it.
+	bool poolable = false;
 };
 
 

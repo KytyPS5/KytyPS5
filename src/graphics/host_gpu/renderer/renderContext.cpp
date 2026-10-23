@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -64,7 +65,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_texture_cache.InvalidateWriteFault(fault_vaddr);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
@@ -82,6 +83,11 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool RenderContext::IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.Intersects(vaddr, size);
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -91,9 +97,18 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.QueueBdaSync(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		m_buffer_cache.QueueBdaSync(vaddr, size);
+	}
+	// New backing changes the bytes without a write fault, so images over it must reload.
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_image_heap.InvalidateMemory(vaddr, size);
+}
+
+void RenderContext::ProtectMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
+	m_page_manager.ReapplyProtection(vaddr, size, mode);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -103,19 +118,16 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
+		const bool active = m_command_scheduler.Active();
 		m_buffer_cache.InvalidateMemory(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
+		m_buffer_cache.ForgetBdaResidency(vaddr, size);
+		if (m_texture_cache.UnmapMemory(vaddr, size) && active) {
+			m_command_scheduler.EndRendering();
+		}
 		m_image_heap.UnmapMemory(vaddr, size);
+		if (active) {
+			m_command_scheduler.WaitGuestWrites(vaddr, size);
+		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};
@@ -128,14 +140,106 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::ForgetMemory(uint64_t vaddr, uint64_t size) {
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported memory forget from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	if (IsAnyMapped(vaddr, size)) {
+		UnmapMemory(vaddr, size);
+		return;
+	}
+	m_buffer_cache.InvalidateMemory(vaddr, size);
+	const auto forget = [this, vaddr, size] {
+		const bool active = m_command_scheduler.Active();
+		m_buffer_cache.ForgetBdaResidency(vaddr, size);
+		if (m_texture_cache.UnmapMemory(vaddr, size) && active) {
+			m_command_scheduler.EndRendering();
+		}
+	};
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		forget();
+		return;
+	}
+	m_gpu->SendCommand(forget);
+}
+
+void RenderContext::PrepareBda(bool stores) {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+	if (stores || m_buffer_cache.HasUnmarkedBdaStores()) {
+		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, stores);
+		m_buffer_cache.ClearUnmarkedBdaStores();
+	}
 	m_fault_process_pending = true;
+}
+
+void RenderContext::PrefetchBda(uint64_t address, bool store) {
+	constexpr uint64_t Window = 256 * 1024;
+	if (address == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	if (begin > UINT64_MAX - Window) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, Window, [&](uint64_t start, uint64_t end) {
+		if (start <= address && end > address) {
+			m_buffer_cache.PrefetchBda(start, end - start, store);
+		}
+	});
+}
+
+void RenderContext::PrefetchBdaStoreRun(uint64_t address) {
+	constexpr uint64_t MaxRun = 256 * 1024 * 1024;
+	if (address == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	uint64_t   end   = begin;
+	for (uint64_t cursor = begin; end - begin < MaxRun;) {
+		uint64_t start  = 0;
+		uint64_t length = 0;
+		if (!Libs::LibKernel::Memory::QueryCommittedRange(cursor, &start, &length) ||
+		    start + length <= cursor) {
+			break;
+		}
+		end    = start + length;
+		cursor = end;
+	}
+	if (end <= begin) {
+		return;
+	}
+	end = std::min(end, begin + MaxRun);
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t first, uint64_t last) {
+		m_buffer_cache.PrefetchBda(first, last - first, false);
+	});
+}
+
+void RenderContext::PrefetchBdaRange(uint64_t address, uint64_t size, bool store) {
+	if (address == 0 || size == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	const auto last  = address + size - 1;
+	if (last < address) {
+		return;
+	}
+	const auto end = (last | (BufferCache::CACHING_PAGESIZE - 1)) + 1;
+	if (end <= begin) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+		m_buffer_cache.PrefetchBda(start, finish - start, store, finish - start);
+	});
 }
 
 void RenderContext::RunGarbageCollector() {
@@ -143,8 +247,13 @@ void RenderContext::RunGarbageCollector() {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
+	if (m_buffer_cache.HasUnmarkedBdaStores()) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, false);
+		m_buffer_cache.ClearUnmarkedBdaStores();
+	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(true);
 	m_buffer_cache.RunGarbageCollector();
 }
 

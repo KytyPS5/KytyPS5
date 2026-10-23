@@ -5,6 +5,8 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -20,10 +22,14 @@ struct Profile {
 inline constexpr Profile DefaultProfile {};
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
+// Unexpressible programs yield no words and name why in `refusal`; without one, fatal.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+                                  bool emit_debug_info = false, std::string* refusal = nullptr);
+
+// Vulkan's bound on Workgroup storage: std430, worst variable order, Block variables alias.
+[[nodiscard]] uint64_t WorkgroupStorageBound(std::span<const uint32_t> spirv);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

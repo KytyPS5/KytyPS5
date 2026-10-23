@@ -101,6 +101,13 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// GS_VGPR_COMP_CNT / ES_VGPR_COMP_CNT: the last VGPR the SPI pre-loads for each half.
+	uint32_t                 gs_vgpr_component_count = 0;
+	uint32_t                 es_vgpr_component_count = 0;
+	static constexpr uint8_t NoPayloadSgpr           = 0xff;
+	// Task-launched: draw parameters and start vertex/instance/index SGPRs come from the payload.
+	bool                   task_payload = false;
+	std::array<uint8_t, 3> payload_user_sgprs {NoPayloadSgpr, NoPayloadSgpr, NoPayloadSgpr};
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -159,6 +166,8 @@ struct ShaderVertexInputInfo {
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
+	uint32_t                    param_duplicate_mask = 0;
+	uint8_t                     param_duplicate_source[32] {};
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };
@@ -171,6 +180,8 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint64_t           indirect_args_address       = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	// A GPU-converted indirect dispatch: thread extents come from PushData::DispatchLimit.
+	bool               dispatch_thread_limit_on_gpu = false;
 	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
@@ -211,6 +222,10 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
+	// MRTZ channel 1 carries the stencil test value in 7:0 and the op value in 15:8.
+	bool                                           ps_stencil_test_val_export_enable = false;
+	bool                                           ps_stencil_op_val_export_enable   = false;
+	uint8_t                                        ps_stencil_bit_pass               = 0;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
 	bool                                           object_primitive_id          = false;
@@ -243,6 +258,14 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+bool     ShaderPixelParameterGroupIsFlat(const ShaderPixelInputInfo& info,
+                                         std::span<const uint32_t> active_inputs, uint32_t input);
+bool     ShaderPixelParameterIsDefault(const ShaderPixelInputInfo& info, uint32_t input);
+uint32_t ShaderPixelParameterDefaultComponent(const ShaderPixelInputInfo& info, uint32_t input,
+                                              uint32_t component);
+void     ShaderPixelParameterDuplicates(const ShaderPixelInputInfo& info,
+                                        std::span<const uint32_t> active_inputs, uint32_t& mask,
+                                        uint8_t (&source)[32]);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;

@@ -4,14 +4,16 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
 #include <bitset>
+#include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -19,6 +21,8 @@ namespace Libs::Graphics::ShaderRecompiler {
 struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
+	// See IR::ResourcePlan::host_subgroup_size.
+	uint32_t                    host_subgroup_size         = 64;
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
@@ -29,12 +33,28 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// VK_EXT_robustness2 on the device: buffer accesses then need no range test of their own.
+	bool robust_buffer_access2 = false;
+	// See IR::ResourcePlan::unfoldable_pcs.
+	std::span<const uint32_t> unfoldable_pcs;
+	// See IR::Program::refuse_indirect_buffer_table; dropped before TranslateProgram returns.
+	std::function<bool(const IR::Program& program, std::span<const IR::DescriptorSource> sources,
+	                   uint32_t source)>
+	    refuse_indirect_buffer_table;
+};
+
+// A guest shader the recompiler refuses; the caller drops its draws.
+struct RecompileStatus {
+	bool        ok = true;
+	uint32_t    pc = 0;
+	std::string reason;
 };
 
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	RecompileStatus status;
 };
 
 struct CompileResult {
@@ -42,7 +62,20 @@ struct CompileResult {
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;
+	RecompileStatus        status;
 };
+
+struct CfgCacheStats {
+	uint64_t hits   = 0;
+	uint64_t misses = 0;
+};
+
+[[nodiscard]] CfgCacheStats CfgCacheStatistics();
+
+// `stamp` must change whenever CFG::BuildGraph, CFG::Structurize or CFG::Graph changes; 0 disables.
+void OpenCfgCacheFile(const std::string& path, uint64_t stamp);
+
+void FlushCfgCacheFile();
 
 // Decoded source and typed scalar call queries are retained once per cache source.
 struct ShaderSource {
@@ -62,8 +95,7 @@ struct ShaderSource {
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
-	std::vector<Call> calls;
-	uint32_t unsupported_call_pc = UINT32_MAX;
+	std::vector<Call>                          calls;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

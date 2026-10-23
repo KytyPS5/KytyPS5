@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderGsAssembly.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 
@@ -355,11 +356,17 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
 	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
 	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
+	ps_info.ps_stencil_test_val_export_enable =
+	    sh.db_shader_control.shader_stencil_test_val_export_enable;
+	ps_info.ps_stencil_op_val_export_enable =
+	    sh.db_shader_control.shader_stencil_op_val_export_enable;
 	// Alpha-to-mask coverage must gate depth writes, so it rules out early fragment tests.
 	ps_info.ps_early_z =
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
-	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
+	     !sh.db_shader_control.shader_mask_export_enable &&
+	     !sh.db_shader_control.shader_stencil_test_val_export_enable &&
+	     !sh.db_shader_control.shader_stencil_op_val_export_enable && !sh.AlphaToMask());
 	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
@@ -381,12 +388,14 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool async_compute             = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
+	const bool dispatch_thread_limit_on_gpu = info.dispatch_thread_limit_on_gpu;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
 	const auto indirect_args_address      = info.indirect_args_address;
 	info                                  = {};
 	info.async_compute                    = async_compute;
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
+	info.dispatch_thread_limit_on_gpu       = dispatch_thread_limit_on_gpu;
 	info.host_subgroup_size               = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
 	info.indirect_args_address            = indirect_args_address;
@@ -434,11 +443,22 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
-		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		key.insert(key.end(),
+		           {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		            mesh.scratch_size_dwords, mesh.input_primitive, mesh.primitives_per_group,
+		            mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
+		            mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch),
+		            mesh.gs_vgpr_component_count, mesh.es_vgpr_component_count,
+		            static_cast<uint32_t>(mesh.task_payload)});
+		if (mesh.task_payload) {
+			key.insert(key.end(), mesh.payload_user_sgprs.begin(), mesh.payload_user_sgprs.end());
+		}
+	}
+	key.push_back(info.param_duplicate_mask);
+	for (uint32_t location = 0; location < 32u; location++) {
+		if ((info.param_duplicate_mask & (1u << location)) != 0) {
+			key.push_back(info.param_duplicate_source[location]);
+		}
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -481,6 +501,9 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
+	key.push_back(static_cast<uint32_t>(info.ps_stencil_test_val_export_enable));
+	key.push_back(static_cast<uint32_t>(info.ps_stencil_op_val_export_enable));
+	key.push_back(static_cast<uint32_t>(info.ps_stencil_bit_pass));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.object_primitive_id));
@@ -510,7 +533,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	              (static_cast<uint32_t>(info.async_compute) << 1u) |
+	              (static_cast<uint32_t>(info.dispatch_thread_limit_on_gpu) << 2u));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
@@ -576,27 +600,28 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                     group.primitive_group_size != 1u || group.vertex_group_size != 1u ||
 		                     user_vgpr.vgpr1 || user_vgpr.vgpr2 || user_vgpr.vgpr3 ||
 		                     mesh.max_vertices != sh.m_vgtGsMaxVertOut);
-	} else if (merged) {
-		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
-	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
-	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
-	    mesh.max_vertices == 0u) {
-		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
-		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
-		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
+	const ShaderGsAssemblyRegisters gs_regs {
+	    .gs_vgpr_component_count = regs.gs_regs.rsrc1.gs_vgpr_component_count,
+	    .es_vgpr_component_count = regs.gs_regs.rsrc2.es_vgpr_component_count,
+	    .gs_out_prim_type        = sh.m_vgtGsOutPrimType,
+	    .gs_max_vert_out         = sh.m_vgtGsMaxVertOut,
+	    .primitive_group_size    = group.primitive_group_size,
+	    .vertex_group_size       = group.vertex_group_size,
+	    .native_ngg              = native_ngg,
+	};
+	if (const char* error = ShaderBuildGsAssembly(gs_regs, mesh); error != nullptr) {
+		LOGF("\t warning: dropping GS draw: %s\n", error);
+		return {};
 	}
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices) :
 	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
-	EXIT_IF(mesh.primitives_per_group == 0u);
+	if (mesh.primitives_per_group == 0u) {
+		LOGF("\t warning: dropping GS draw: subgroup holds no complete output primitive\n");
+		return {};
+	}
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
 	mesh.max_primitives = mesh.primitives_per_group * (sh.m_geNggSubgrpCntl & 0x1ffu);
 	const auto threads = std::max(native_ngg && !mesh.fast_launch ? mesh.vertices_per_group

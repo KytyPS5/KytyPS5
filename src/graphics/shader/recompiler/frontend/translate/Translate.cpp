@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -121,6 +122,11 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	result.dpp                = false;
 	result.dpp8               = false;
 	return result;
+}
+
+// An EXEC bit for a lane no ballot can reach never clears, so guest mask drains hang the GPU.
+IR::U32 Translator::ClampGhostLanes(IR::U32 high_word) {
+	return program.upper_lane_half_is_ghost ? IR::U32(IR::Value(0u)) : high_word;
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
@@ -326,7 +332,8 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
 				                        DppFlags(operand)));
 			} else {
-				value = ir.Select(ir.GetExec(), value, old);
+				value = IR::U32(ir.Emit(IR::ValueOpcode::SelectU32, {ir.GetExec(), value, old},
+				                        IR::VgprWriteMaskFlag));
 			}
 			ir.SetVectorReg(reg, value);
 			break;
@@ -336,6 +343,7 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetVcc(ThreadBit({value, ir.GetVccHi()}));
 			break;
 		case Decoder::OperandKind::VccHi:
+			// Not clamped: compilers use a dead VCC's halves as ordinary scalar registers.
 			ir.SetVccHi(IR::U32(value));
 			ir.SetVcc(ThreadBit({ir.GetVccLo(), value}));
 			break;
@@ -344,10 +352,12 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetExecLo(IR::U32(value));
 			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
 			break;
-		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
+		case Decoder::OperandKind::ExecHi: {
+			const auto clamped = ClampGhostLanes(IR::U32(value));
+			ir.SetExecHi(clamped);
+			ir.SetExec(ThreadBit({ir.GetExecLo(), clamped}));
 			break;
+		}
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
 			break;
@@ -590,12 +600,15 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 		return;
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
+		case Decoder::OperandKind::ExecLo: {
+			const std::array<IR::U32, 2> clamped {value[0], ClampGhostLanes(value[1])};
+			ir.SetExec(ThreadBit(clamped));
+			ir.SetExecLo(clamped[0]);
+			ir.SetExecHi(clamped[1]);
 			return;
+		}
 		case Decoder::OperandKind::VccLo:
+			// Deliberately unclamped; see the VccHi case in WriteRawU32.
 			ir.SetVcc(ThreadBit(value));
 			ir.SetVccLo(value[0]);
 			ir.SetVccHi(value[1]);
@@ -1006,6 +1019,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	result.host_subgroup_size  = options.host_subgroup_size;
+	// Only a workgroup stage splits wave64 over a 32-wide subgroup; elsewhere lanes 32+ are absent.
+	result.upper_lane_half_is_ghost =
+	    options.wave_size == 64u && options.host_subgroup_size == 32u &&
+	    ShaderWorkgroupInput(options.stage, options.input_info) == nullptr;
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1144,12 +1162,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		if (options.stage == ShaderType::Compute &&
 		    options.input_info.compute->dispatch_thread_dimensions) {
-			for (uint32_t axis = 0; axis < 3u; axis++) {
-				const auto extent = IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::GetDispatchThreadExtent, {IR::Value(axis)}));
+			if (options.input_info.compute->dispatch_thread_limit_on_gpu) {
+				// A GPU-converted indirect dispatch leaves its thread extents in GPU memory.
 				initial_exec = entry_ir.LogicalAnd(
-				    initial_exec,
-				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis), extent));
+				    initial_exec, IR::U1(entry_ir.Emit(IR::ValueOpcode::DispatchThreadInRange)));
+			} else {
+				for (uint32_t axis = 0; axis < 3u; axis++) {
+					const auto extent = IR::U32(
+					    entry_ir.Emit(IR::ValueOpcode::GetDispatchThreadExtent, {IR::Value(axis)}));
+					initial_exec = entry_ir.LogicalAnd(
+					    initial_exec,
+					    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis),
+					                       extent));
+				}
 			}
 		}
 		entry_ir.SetExec(initial_exec);
@@ -1271,8 +1296,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				// GS_VGPR_COMP_CNT: VGPR2 = primitive ID, VGPR3 = GS invocation ID.
+				if (mesh.gs_vgpr_component_count >= 2u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
+					                      entry_ir.IAdd(primitive_chunk, local));
+				}
+				if (mesh.gs_vgpr_component_count >= 3u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), u32(0));
+				}
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+				// Indices past INDEX_BUFFER_SIZE read zero.
+				const auto index_readable =
+				    entry_ir.ULessThan(input_vertex, draw(IR::PushData::MeshIndexBoundParameter));
 				const auto index_low    = draw(4);
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
 				                                           entry_ir.IMul(input_vertex, index_bytes));
@@ -1284,12 +1320,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				const auto packed_index = entry_ir.Emit(
 				    IR::ValueOpcode::LoadAddressU32,
 				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
+				     entry_ir.LogicalAnd(
+				         entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices)),
+				         index_readable)},
 				    IR::MemoryFlags {.index = memory_index});
 				const auto index = IR::U32(entry_ir.Emit(
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
 				     entry_ir.IMul(index_bytes, u32(8))}));
+				// The merged wave's ES half: VGPR5 = vertex index, VGPR8 = instance index.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(
@@ -1384,6 +1423,23 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
+			// SGPR3 = MERGED_WAVE_INFO: [7:0] ES vertices, [15:8] GS primitives (ballot count).
+			const auto imm = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+			if (options.user_data_base > 3u) {
+				const auto counts = entry_ir.BitwiseOr(
+				    vertex_count, entry_ir.ShiftLeftLogical(vertex_count, imm(8u)));
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+				                      entry_ir.BitwiseOr(counts, imm(1u << 28u)));
+			}
+			// ES vertex offsets in slots v0[15:2], v0[31:18], v1[15:2]: the lane's own vertex.
+			{
+				const auto own_slot = entry_ir.ShiftLeftLogical(
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::LaneId)), imm(2u));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(0),
+				    entry_ir.BitwiseOr(own_slot, entry_ir.ShiftLeftLogical(own_slot, imm(16u))));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1), own_slot);
+			}
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),

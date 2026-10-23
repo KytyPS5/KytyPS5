@@ -117,7 +117,10 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	std::unique_ptr<std::atomic_uint32_t> call_count = std::make_unique<std::atomic_uint32_t>(0);
 };
+
+constexpr uint32_t UNRESOLVED_STUB_LOGS_PER_SYMBOL = 8;
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
@@ -170,8 +173,15 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
                                       const RelocationInfo& ri) {
-	for (const auto& record: g_stubbed_imports) {
+	const auto program_name = program != nullptr ? Common::PathToString(program->file_name) : "";
+
+	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
+			record.index   = index;
+			record.name    = ri.name;
+			record.type    = ri.type;
+			record.bind    = ri.bind;
+			record.program = program_name;
 			return record.thunk_vaddr;
 		}
 	}
@@ -182,8 +192,8 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	record.name        = ri.name;
 	record.type        = ri.type;
 	record.bind        = ri.bind;
-	record.program     = Common::PathToString(program->file_name);
-	g_stubbed_imports.push_back(record);
+	record.program     = program_name;
+	g_stubbed_imports.push_back(std::move(record));
 	const auto record_id                     = g_stubbed_imports.size() - 1;
 	const auto thunk                         = AllocateUnresolvedImportThunk(record_id);
 	g_stubbed_imports[record_id].thunk_vaddr = thunk;
@@ -193,20 +203,20 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
-		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
+	if (record_id < g_stubbed_imports.size()) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.call_count->fetch_add(1) < UNRESOLVED_STUB_LOGS_PER_SYMBOL) {
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
 			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
-		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
 		}
+	} else if (log_index < UNRESOLVED_STUB_LOGS_PER_SYMBOL) {
+		printf("Unresolved import stub called: <bad-record>\n");
+		LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
+		     log_index, record_id);
 	}
 	return 0;
 }
@@ -1170,6 +1180,105 @@ RuntimeLinker::~RuntimeLinker() {
 	Clear();
 }
 
+static void PatchProgramGuestInstructions(Program* program) {
+	const bool emulate_amd = Config::AmdCpuEnabled();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+#else
+	const bool protect_memory_faults = false;
+#endif
+	const auto* ehdr        = program->elf->GetEhdr();
+	const auto* phdr        = program->elf->GetPhdr();
+	const auto  module_name = Common::PathToString(program->file_name.filename());
+
+	std::vector<RedZoneFunctionRange> unwind_functions;
+	bool                              have_function_starts = false;
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type == PT_GNU_EH_FRAME) {
+			have_function_starts = DecodeEhFrameFunctions(phdr[i].p_vaddr + program->base_vaddr,
+			                                              phdr[i].p_memsz, &unwind_functions) &&
+			                       !unwind_functions.empty();
+		}
+	}
+	if (!have_function_starts) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "{}: {} not patched (function boundaries unavailable)\n",
+		    emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection", module_name));
+	}
+
+	std::vector<uintptr_t> code_pointers;
+	const auto*            info = program->dynamic_info.get();
+	if (info != nullptr && info->rela_table != nullptr) {
+		for (uint64_t i = 0; i < info->rela_table_total_size / sizeof(Elf64_Rela); i++) {
+			const auto& rela = info->rela_table[i];
+			if (rela.GetType() == R_X86_64_RELATIVE) {
+				code_pointers.push_back(program->base_vaddr + rela.r_addend);
+			}
+		}
+	}
+	if (info != nullptr && info->symbol_table != nullptr) {
+		for (uint64_t i = 0; i < info->symbol_table_total_size / sizeof(Elf64_Sym); i++) {
+			const auto& sym = info->symbol_table[i];
+			if (sym.GetType() == STT_FUNC && sym.st_shndx != 0 && sym.st_value != 0) {
+				code_pointers.push_back(program->base_vaddr + sym.st_value);
+			}
+		}
+	}
+
+	GuestInstructionPatchResult totals {};
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_memsz == 0 || (phdr[i].p_type != PT_LOAD && phdr[i].p_type != PT_OS_RELRO) ||
+		    !Common::VirtualMemory::IsExecute(GetMode(phdr[i].p_flags))) {
+			continue;
+		}
+		const uint64_t   segment_addr = phdr[i].p_vaddr + program->base_vaddr;
+		const uint64_t   segment_size = phdr[i].p_filesz;
+		RedZoneCodeHints hints {.unwind_functions = unwind_functions,
+		                        .code_pointers    = code_pointers,
+		                        .execute_only     = (phdr[i].p_flags & PF_R) == 0};
+		const auto       result = PatchGuestInstructions(segment_addr, segment_size, hints,
+		                                                 protect_memory_faults, emulate_amd);
+		totals.reciprocal_sqrt += result.reciprocal_sqrt;
+		totals.extrq += result.extrq;
+		totals.insertq += result.insertq;
+		totals.rdpid += result.rdpid;
+		totals.clwb += result.clwb;
+		if (protect_memory_faults) {
+			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+			     module_name.c_str(), result.function_count, result.red_zone_function_count,
+			     result.memory_instruction_count, result.patched_memory_instruction_count,
+			     result.short_memory_instruction_count,
+			     result.stack_dependent_memory_instruction_count,
+			     result.control_flow_memory_instruction_count,
+			     result.unrelocatable_memory_instruction_count);
+		}
+	}
+	if (emulate_amd && have_function_starts) {
+		InstructionPatchCounts combined {};
+		std::string            details;
+		for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
+		                                  {"EXTRQ", totals.extrq},
+		                                  {"INSERTQ", totals.insertq},
+		                                  {"RDPID", totals.rdpid},
+		                                  {"CLWB", totals.clwb}}) {
+			combined += counts;
+			if (!details.empty()) details += "; ";
+			details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
+			                       counts.trapped, counts.Skipped());
+		}
+		const auto  found   = combined.found;
+		const auto  skipped = combined.Skipped();
+		const char* status  = found == 0         ? "no matching instructions"
+		                      : skipped == found ? "not patched"
+		                      : skipped != 0     ? "partially patched"
+		                                         : "patched";
+		Log::WriteToConsoleAndLog(
+		    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+	}
+}
+
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1192,6 +1301,9 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	if (program->elf->IsValid()) {
 		LoadProgramToMemory(program);
 		ParseProgramDynamicInfo(program);
+		if (program->instruction_trampoline_size != 0) {
+			PatchProgramGuestInstructions(program);
+		}
 		CreateSymbolDatabase(program);
 	} else {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
@@ -1717,10 +1829,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
 
-	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-	uint64_t                                   eh_frame_header_addr = 0;
-	uint64_t                                   eh_frame_header_size = 0;
-
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
 			uint64_t segment_addr        = phdr[i].p_vaddr + program->base_vaddr;
@@ -1742,7 +1850,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
 				PatchProgram(program, segment_addr, segment_memory_size);
-				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
 
 			if (!skip_protect) {
@@ -1776,70 +1883,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			EXIT_IF(phdr[i].p_vaddr >= program->base_size);
 
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
-		}
-
-		if (patch_guest_instructions && phdr[i].p_type == PT_GNU_EH_FRAME) {
-			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
-			eh_frame_header_size = phdr[i].p_memsz;
-		}
-	}
-
-	if (patch_guest_instructions) {
-		std::vector<uintptr_t> function_starts;
-		const bool             have_function_starts =
-		    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
-		                                &function_starts) &&
-		    !function_starts.empty();
-		const auto module_name = Common::PathToString(program->file_name.filename());
-		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
-			                module_name));
-		}
-		GuestInstructionPatchResult totals {};
-		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
-			totals.reciprocal_sqrt += result.reciprocal_sqrt;
-			totals.extrq += result.extrq;
-			totals.insertq += result.insertq;
-			totals.rdpid += result.rdpid;
-			totals.clwb += result.clwb;
-			if (protect_memory_faults) {
-				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
-				     result.memory_instruction_count, result.patched_memory_instruction_count,
-				     result.short_memory_instruction_count,
-				     result.stack_dependent_memory_instruction_count,
-				     result.control_flow_memory_instruction_count,
-				     result.unrelocatable_memory_instruction_count);
-			}
-		}
-		if (emulate_amd && have_function_starts) {
-			InstructionPatchCounts combined {};
-			std::string            details;
-			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
-			                                  {"EXTRQ", totals.extrq},
-			                                  {"INSERTQ", totals.insertq},
-			                                  {"RDPID", totals.rdpid},
-			                                  {"CLWB", totals.clwb}}) {
-				combined += counts;
-				if (!details.empty()) details += "; ";
-				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
-				                       counts.trapped, counts.Skipped());
-			}
-			const auto  found   = combined.found;
-			const auto  skipped = combined.Skipped();
-			const char* status  = found == 0         ? "no matching instructions"
-			                      : skipped == found ? "not patched"
-			                      : skipped != 0     ? "partially patched"
-			                                         : "patched";
-			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
 	}
 

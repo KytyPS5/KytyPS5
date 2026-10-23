@@ -8,8 +8,10 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -44,6 +46,7 @@
 #include <iterator>
 #include <span>
 #include <sstream>
+#include <string_view>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -58,6 +61,11 @@
 
 namespace Libs::Graphics {
 namespace {
+
+// Upstream removed Common::ContainsStr; these tests only ever needed a substring test.
+[[nodiscard]] static bool ContainsStr(std::string_view haystack, std::string_view needle) {
+	return haystack.find(needle) != std::string_view::npos;
+}
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -196,6 +204,98 @@ CfgInstructionCoverage(const ShaderRecompiler::CFG::Graph &graph,
   return coverage;
 }
 
+// Walks a CFG deciding each guest branch from a seed keyed by the guest instruction and its count.
+struct CfgWalk {
+  std::vector<uint32_t> executed;
+  bool finished = false;
+  bool exhausted = false;
+};
+
+uint64_t CfgWalkHash(uint64_t value) {
+  value += 0x9e3779b97f4a7c15ull;
+  value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+  value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+  return value ^ (value >> 31u);
+}
+
+CfgWalk WalkCfg(const ShaderRecompiler::CFG::Graph &graph, uint64_t seed,
+                uint32_t step_limit = 1u << 16u) {
+  using ShaderRecompiler::CFG::ConditionExpression;
+  using ShaderRecompiler::CFG::TerminatorKind;
+
+  CfgWalk walk;
+  std::unordered_map<uint32_t, uint32_t> decided;
+  std::unordered_map<uint32_t, bool> variables;
+  const auto decide = [&](uint32_t branch) {
+    const auto visit = decided[branch]++;
+    return (CfgWalkHash(seed ^ (uint64_t{branch} << 20u) ^ visit) & 1u) != 0u;
+  };
+  const auto evaluate = [&](auto &&self, uint32_t index) -> bool {
+    const auto &value = graph.expressions.at(index);
+    switch (value.op) {
+    case ConditionExpression::Op::Constant: return value.lhs != 0;
+    case ConditionExpression::Op::Variable: return variables[value.lhs];
+    case ConditionExpression::Op::Not: return !self(self, value.lhs);
+    case ConditionExpression::Op::Or:
+      return self(self, value.lhs) || self(self, value.rhs);
+    case ConditionExpression::Op::Native: break;
+    }
+    std::abort();
+  };
+  uint32_t block_id = graph.entry_block;
+  for (uint32_t step = 0; step < step_limit; step++) {
+    const auto *block = graph.FindBlock(block_id);
+    if (block == nullptr) {
+      return walk;
+    }
+    for (auto inst = block->inst_begin; inst < block->inst_end; inst++) {
+      walk.executed.push_back(inst);
+    }
+    for (const auto &assignment : block->assignments) {
+      const auto &expression = graph.expressions.at(assignment.expression);
+      // A captured guest predicate ends the guest code that computes it.
+      variables[assignment.variable] =
+          expression.op == ConditionExpression::Op::Native
+              ? block->inst_end != block->inst_begin && decide(block->inst_end - 1u)
+              : evaluate(evaluate, assignment.expression);
+    }
+    const auto &terminator = block->terminator;
+    switch (terminator.kind) {
+    case TerminatorKind::Return:
+      walk.finished = true;
+      return walk;
+    case TerminatorKind::Branch:
+      block_id = terminator.true_block;
+      break;
+    case TerminatorKind::ConditionalBranch: {
+      const bool take = terminator.expression != UINT32_MAX
+                            ? evaluate(evaluate, terminator.expression)
+                            : block->inst_end != block->inst_begin &&
+                                  decide(block->inst_end - 1u);
+      block_id = take ? terminator.true_block : terminator.false_block;
+      break;
+    }
+    default:
+      return walk;
+    }
+  }
+  walk.exhausted = true;
+  return walk;
+}
+
+// Structurization may not change the sequence of guest blocks the shader runs.
+void CheckCfgPathsMatch(const ShaderRecompiler::CFG::Graph &original,
+                        const ShaderRecompiler::CFG::Graph &structured,
+                        const char *what, uint32_t seeds = 512u) {
+  for (uint32_t seed = 0; seed < seeds; seed++) {
+    const auto before = WalkCfg(original, seed);
+    const auto after = WalkCfg(structured, seed);
+    Check(!before.exhausted && !after.exhausted, what);
+    Check(before.finished && after.finished, what);
+    Check(before.executed == after.executed, what);
+  }
+}
+
 void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string messages;
@@ -211,6 +311,14 @@ void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
 
   if (!tools.Validate(binary)) {
     std::fprintf(stderr, "SPIR-V binary validation failed:\n%s\n",
+                 messages.c_str());
+    std::abort();
+  }
+  // The driver simplification of every module these tests build must validate too.
+  auto simplified = binary;
+  if (ShaderRecompiler::Spirv::SimplifyForDriver(simplified) &&
+      !tools.Validate(simplified)) {
+    std::fprintf(stderr, "driver-simplified SPIR-V validation failed:\n%s\n",
                  messages.c_str());
     std::abort();
   }
@@ -1299,7 +1407,13 @@ void TestNormalizedImageContracts() {
             !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat,
                                              vk::Format::eR32Sfloat) &&
             ImageViewOps::FormatsCompatible(vk::Format::eBc3UnormBlock,
-                                            vk::Format::eR32G32B32A32Uint),
+                                            vk::Format::eR32G32B32A32Uint) &&
+            !ImageViewOps::FormatsCompatible(vk::Format::eB8G8R8A8Unorm,
+                                             vk::Format::eB10G11R11UfloatPack32) &&
+            !ImageViewOps::FormatsCompatible(vk::Format::eB10G11R11UfloatPack32,
+                                             vk::Format::eB8G8R8A8Unorm) &&
+            !ImageViewOps::FormatsCompatible(vk::Format::eR32Uint,
+                                             vk::Format::eE5B9G9R9UfloatPack32),
         "Vulkan image-view compatibility classes diverged from production");
 }
 
@@ -1848,10 +1962,11 @@ void TestShaderStageBarriers() {
       RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
   Check(SpirvContainsOpcode(result.spirv, 224),
         "SPIR-V binary does not contain OpControlBarrier");
+  // AcquireRelease | WorkgroupMemory | UniformMemory: s_barrier orders buffer traffic too.
   Check(
-      std::find(result.spirv.begin(), result.spirv.end(), 264u) !=
+      std::find(result.spirv.begin(), result.spirv.end(), 328u) !=
           result.spirv.end(),
-      "SPIR-V barrier does not use workgroup acquire-release memory semantics");
+      "SPIR-V barrier does not order workgroup and buffer memory with acquire-release");
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto vertex_result =
@@ -4688,6 +4803,14 @@ void TestImageAtomicWidthDecoder() {
       }
     }
   }
+  const uint32_t add64[] = {EncodeMimg0(0x11u, 3u), captured[1]};
+  DecodeInstruction(add64, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_ATOMIC_ADD && decoded.data_bits == 64u,
+        "64-bit image atomic add was not decoded");
+  const uint32_t unsupported[] = {EncodeMimg0(0x14u, 3u), captured[1]};
+  DecodeInstruction(unsupported, 0, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.data_bits == 64u,
+        "unsupported 64-bit image atomic silently decoded as 32-bit");
 }
 
 void TestNewShaderDecoderArchitecture() {
@@ -4901,6 +5024,64 @@ void TestNewShaderDecoderArchitecture() {
             byte_left_shift.src1.value == 1u,
         "decoder rejected or misdecoded captured V_LSHLREV_B32 byte shift");
 
+  // VOPC opcode 153 is V_CMPX_LT_I16 and 154 is V_CMPX_EQ_I16.
+  const uint32_t vopc_sdwa_cmpx_lt_i16[] = {
+      0x7d3236f9u,
+      0x85050027u, // v_cmpx_lt_i16 v39.word1, s27.word1
+  };
+  Instruction cmpx_lt_i16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmpx_lt_i16, 0u,
+                                               cmpx_lt_i16);
+  Check(cmpx_lt_i16.family == Family::VOPC &&
+            cmpx_lt_i16.opcode == Opcode::V_CMPX_LT_I16 &&
+            cmpx_lt_i16.word_count == 2u && cmpx_lt_i16.src_count == 2u &&
+            cmpx_lt_i16.dst.kind == OperandKind::ExecLo &&
+            cmpx_lt_i16.src0.kind == OperandKind::Vgpr &&
+            cmpx_lt_i16.src0.reg == 39u && cmpx_lt_i16.src0.sdwa_sel == 5u &&
+            !cmpx_lt_i16.src0.sdwa_sext && !cmpx_lt_i16.src0.negate &&
+            !cmpx_lt_i16.src0.absolute &&
+            cmpx_lt_i16.src1.kind == OperandKind::Sgpr &&
+            cmpx_lt_i16.src1.reg == 27u && cmpx_lt_i16.src1.sdwa_sel == 5u &&
+            !cmpx_lt_i16.src1.sdwa_sext && !cmpx_lt_i16.src1.negate &&
+            !cmpx_lt_i16.src1.absolute,
+        "decoder rejected or misdecoded captured VOPC SDWA V_CMPX_LT_I16");
+
+  const uint32_t vopc_sdwa_cmpx_eq_i16[] = {0x7d3436f9u, 0x85050027u};
+  Instruction cmpx_eq_i16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmpx_eq_i16, 0u,
+                                               cmpx_eq_i16);
+  Check(cmpx_eq_i16.family == Family::VOPC &&
+            cmpx_eq_i16.opcode == Opcode::V_CMPX_EQ_I16 &&
+            cmpx_eq_i16.dst.kind == OperandKind::ExecLo &&
+            cmpx_eq_i16.src0.reg == 39u && cmpx_eq_i16.src1.reg == 27u,
+        "decoder misdecoded VOPC opcode 154 as something other than V_CMPX_EQ_I16");
+
+  const uint32_t vopc_sdwa_cmp_nlt_f16[] = {
+      0x7ddde0f9u,
+      0x86068210u, // v_cmp_nlt_f16 s2, v16, 0.5
+  };
+  Instruction cmp_nlt_f16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmp_nlt_f16, 0u,
+                                               cmp_nlt_f16);
+  Check(cmp_nlt_f16.family == Family::VOPC &&
+            cmp_nlt_f16.opcode == Opcode::V_CMP_NLT_F16 &&
+            cmp_nlt_f16.word_count == 2u && cmp_nlt_f16.src_count == 2u &&
+            cmp_nlt_f16.dst.kind == OperandKind::Sgpr &&
+            cmp_nlt_f16.dst.reg == 2u &&
+            cmp_nlt_f16.src0.kind == OperandKind::Vgpr &&
+            cmp_nlt_f16.src0.reg == 16u && cmp_nlt_f16.src0.sdwa_sel == 6u &&
+            !cmp_nlt_f16.src0.sdwa_sext &&
+            cmp_nlt_f16.src1.kind == OperandKind::FloatInlineConstant &&
+            cmp_nlt_f16.src1.value == 0x3f000000u &&
+            cmp_nlt_f16.src1.sdwa_sel == 6u && !cmp_nlt_f16.src1.sdwa_sext,
+        "decoder rejected or misdecoded captured VOPC SDWA V_CMP_NLT_F16");
+
+  // SDWA on a 64-bit compare is not encodable, so it must stay rejected.
+  const uint32_t vopc_sdwa_u64[] = {0x7dc200f9u, 0x86060610u};
+  Instruction sdwa_u64;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_u64, 0u, sdwa_u64);
+  Check(sdwa_u64.opcode == Opcode::UNSUPPORTED,
+        "decoder accepted SDWA on a 64-bit VOPC compare");
   const uint32_t vop2_sdwa_byte_left_destination[] = {
       0x340a08f9u, 0x01861187u, // v_lshlrev_b32 v5.byte1, 7, v4.byte1; preserve
   };
@@ -6838,6 +7019,347 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestFlatAliasOfCustomInput() {
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 1, 0, 2), // v_interp_mov_f32 v12, p0, attr1.x (custom)
+      EncodeVintrp(2, 13, 1, 1, 0), // v_interp_mov_f32 v13, p10, attr1.y (custom)
+      EncodeVintrp(2, 14, 2, 2, 2), // v_interp_mov_f32 v14, p0, attr2.z (flat alias)
+      EncodeExp0(0x00, 0x7),
+      EncodeExp1(12, 13, 14, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 3;
+  ps_info.custom_interpolation_mask = 0x3u;
+  SetIdentityInterpolatorSettings(&ps_info);
+  ps_info.interpolator_settings[2] = 0x00000400u | 1u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  auto result = RecompileForTest(shader, options);
+  Check(!SpirvHasDecorationValue(result.spirv, 30u, 2u),
+        "flat alias of a custom input moved to a location no vertex stage writes");
+  Check(SpirvDecorationValueCount(result.spirv, 30u, 1u) == 1u,
+        "flat alias of a custom input did not share the custom input's variable");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 1u, 5285u),
+        "shared custom/flat variable is not PerVertexKHR");
+  Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 1u, 14u),
+        "shared custom/flat variable was decorated Flat");
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "in_param_1 %uint_0 %uint_2"),
+        "flat alias did not read the provoking vertex of the shared variable");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t interpolated_shader[] = {
+      EncodeVintrp(2, 12, 1, 0, 2), // v_interp_mov_f32 v12, p0, attr1.x (custom)
+      EncodeVintrp(0, 14, 2, 2, 0), // v_interp_p1_f32 v14, v0, attr2.z (flat alias)
+      EncodeVintrp(1, 14, 2, 2, 1), // v_interp_p2_f32 v14, v1, attr2.z
+      EncodeExp0(0x00, 0x3),
+      EncodeExp1(12, 14, 0, 0),
+      0xbf810000u,
+  };
+  auto interpolated = RecompileForTest(interpolated_shader, options);
+  const auto interpolated_source = DisassembleSpirvBinary(interpolated.spirv);
+  Check(!SpirvHasDecorationValue(interpolated.spirv, 30u, 2u) &&
+            SpirvSourceHasInstructionUsing(interpolated_source, "OpAccessChain",
+                                           "in_param_1 %uint_0 %uint_2") &&
+            !SpirvSourceHasInstructionUsing(interpolated_source, "OpAccessChain",
+                                            "in_param_1 %uint_1 %uint_2"),
+        "interpolated flat alias of a custom input was not read from the provoking vertex");
+  CheckSpirvBinaryValidates(interpolated.spirv);
+
+  ps_info.custom_interpolation_mask = 0;
+  // Outside rectangle expansion a flat alias reads its smooth input's provoking vertex.
+  auto smooth = RecompileForTest(shader, options);
+  const auto smooth_source = DisassembleSpirvBinary(smooth.spirv);
+  Check(!SpirvHasDecorationValue(smooth.spirv, 30u, 2u) &&
+            SpirvDecorationValueCount(smooth.spirv, 30u, 1u) == 1u &&
+            SpirvHasDecorationValueWithDecoration(smooth.spirv, 30u, 1u, 5285u) &&
+            SpirvSourceHasInstructionUsing(smooth_source, "OpAccessChain",
+                                           "in_param_1 %uint_0 %uint_2"),
+        "flat alias of a smooth input did not read the first vertex of the shared variable");
+  CheckSpirvBinaryValidates(smooth.spirv);
+  ps_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+  auto last = RecompileForTest(shader, options);
+  Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(last.spirv), "OpAccessChain",
+                                       "in_param_1 %uint_2 %uint_2"),
+        "flat alias of a smooth input did not read the last provoking vertex");
+  CheckSpirvBinaryValidates(last.spirv);
+  // Rectangle expansion alone gives the flat alias its own flat output.
+  ps_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  auto rectangle = RecompileForTest(shader, options);
+  Check(SpirvHasDecorationValueWithDecoration(rectangle.spirv, 30u, 2u, 14u),
+        "flat alias of a smooth input lost its separate flat location");
+  CheckSpirvBinaryValidates(rectangle.spirv);
+}
+
+void TestFlatAliasOfSmoothInputDuplicates() {
+  ShaderPixelInputInfo ps{};
+  ps.input_num = 2;
+  ps.interpolator_settings[0] = 1u;               // smooth, vertex output 1
+  ps.interpolator_settings[1] = 0x00000400u | 1u; // flat, vertex output 1
+  const std::array<uint32_t, 2> active{0u, 1u};
+  uint32_t mask = 0;
+  uint8_t source[32]{};
+  // Provoking-vertex modes share the vertex output (upstream b38b7454a): nothing to duplicate.
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "flat alias of a smooth input asked for a duplicate outside rectangles");
+  ps.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 1u && source[0] == 1u,
+        "flat alias of a smooth input did not ask for a duplicate of output 1 at location 0");
+  ps.custom_interpolation_mask = 1u; // the custom group reads the flat value per vertex
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "flat alias of a custom input still asked for a duplicate");
+  ps.custom_interpolation_mask = 0;
+  ps.interpolator_settings[1] = 2u; // separate outputs: nothing to duplicate
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "distinct vertex outputs asked for a duplicate");
+
+  const uint32_t vertex_shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),     // POS0
+      EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7),     // PARAM0
+      EncodeExp0(0x21, 0xf), EncodeExp1(8, 9, 10, 11),   // PARAM1
+      EncodeExp0(0x22, 0xf), EncodeExp1(12, 13, 14, 15), // PARAM2
+      0xbf810000u,
+  };
+  ShaderVertexInputInfo vertex{};
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  auto plain = RecompileForTest(vertex_shader, options);
+  Check(!SpirvHasDecorationValue(plain.spirv, 30u, 3u),
+        "vertex shader without duplicates wrote an extra location");
+  CheckSpirvBinaryValidates(plain.spirv);
+
+  vertex.param_duplicate_mask = 1u << 3u;
+  vertex.param_duplicate_source[3] = 1u;
+  auto duplicated = RecompileForTest(vertex_shader, options);
+  const auto duplicated_source = DisassembleSpirvBinary(duplicated.spirv);
+  Check(SpirvHasDecorationValue(duplicated.spirv, 30u, 3u) &&
+            SpirvSourceHasInstructionUsing(duplicated_source, "OpStore", "%out_param_1_at_3"),
+        "vertex shader did not write the duplicate of output 1 at location 3");
+  CheckSpirvBinaryValidates(duplicated.spirv);
+
+  vertex.param_duplicate_mask = 1u << 2u;
+  vertex.param_duplicate_source[2] = 0u;
+  auto moved = RecompileForTest(vertex_shader, options);
+  const auto moved_source = DisassembleSpirvBinary(moved.spirv);
+  Check(SpirvDecorationValueCount(moved.spirv, 30u, 2u) == 1u &&
+            SpirvHasDecorationValue(moved.spirv, 30u, 3u) &&
+            SpirvSourceHasInstructionUsing(moved_source, "OpStore", "%out_param_0_at_2"),
+        "duplicate did not displace the export at its location");
+  CheckSpirvBinaryValidates(moved.spirv);
+
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t mesh_shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x21, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo mesh_input{};
+  auto &mesh = mesh_input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 3840;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  mesh.host_subgroup_size = 32;
+  ShaderRecompiler::CompileOptions mesh_options{};
+  mesh_options.stage = ShaderType::Mesh;
+  mesh_options.input_info.vertex = &mesh_input;
+  mesh_options.emit_debug_info = true; // The check finds the duplicate output by its OpName.
+  auto mesh_plain = RecompileForTest(mesh_shader, mesh_options, nullptr, nullptr,
+                                     PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(mesh_plain.spirv);
+  Check(!SpirvHasDecorationValue(mesh_plain.spirv, 30u, 5u),
+        "mesh shader without duplicates wrote an extra location");
+  mesh_input.param_duplicate_mask = 1u << 5u;
+  mesh_input.param_duplicate_source[5] = 1u;
+  auto mesh_duplicated = RecompileForTest(mesh_shader, mesh_options, nullptr, nullptr,
+                                          PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(mesh_duplicated.spirv);
+  const auto mesh_source = DisassembleSpirvBinary(mesh_duplicated.spirv);
+  Check(SpirvHasDecorationValue(mesh_duplicated.spirv, 30u, 5u) &&
+            SpirvSourceHasInstructionUsing(mesh_source, "OpAccessChain", "%out_param_1_at_5"),
+        "mesh shader did not copy out the duplicate of output 1 at location 5");
+}
+
+// The task front's mesh variant reads the packet's offset SGPRs from the task payload.
+void TestMeshTaskPayloadVariant() {
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t mesh_shader[] = {
+      EncodeSMovB32(20, 255), 0x1003u,
+      EncodeSMovB32(124, 20), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop2(0x25, 5, 12, 5),                  // v_add_nc_u32 v5, s12, v5
+      EncodeMubuf0(0x0c), EncodeMubuf1(0, 2, 5),   // buffer_load_dword v0, v5, s[8:11]
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 16> user_data{};
+  // A null V# would fold the load, and with it the start-vertex read, to zero.
+  user_data[8] = 0x1000u;
+  user_data[10] = 64u;
+  user_data[11] = 3u << 28u;
+  ShaderVertexInputInfo mesh_input{};
+  auto &mesh = mesh_input.mesh;
+  mesh.threads_num[0] = 32;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 32;
+  mesh.vertices_per_group = 32;
+  mesh.max_vertices = 32;
+  mesh.max_primitives = 32;
+  mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kPointList);
+  mesh.host_subgroup_size = 32;
+  mesh.wave_size = 32;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.emit_debug_info = true; // The checks find SPIR-V objects by OpName.
+  options.wave_size = 32;
+  options.user_data = user_data;
+  options.input_info.vertex = &mesh_input;
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(
+      ShaderRecompiler::TranslateProgram(mesh_shader, options).program);
+  const auto plan_registers = ShaderRecompiler::IR::PlanUserDataRegisters(plan);
+  Check(plan_registers == 0xf00u,
+        "the plan did not name exactly the V# registers it evaluates on the host");
+  auto direct = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                 PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(direct.spirv);
+  const auto direct_source = DisassembleSpirvBinary(direct.spirv);
+  Check(direct_source.find("TaskPayloadWorkgroupEXT") == std::string::npos,
+        "a direct mesh module declared a task payload");
+  mesh.task_payload = true;
+  mesh.payload_user_sgprs = {4, ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr};
+  auto variant = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                  PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(variant.spirv);
+  const auto variant_source = DisassembleSpirvBinary(variant.spirv);
+  Check(CountSourceOccurrences(variant_source, "OpVariable %_ptr_TaskPayloadWorkgroupEXT") == 1 &&
+            SpirvSourceHasInstructionUsing(variant_source, "OpEntryPoint", "%task_payload"),
+        "the task-launched mesh variant does not take one payload through its interface");
+  // Draw dword 0 and the start-vertex slot come from the payload, not from push constants.
+  Check(CountSourceOccurrences(variant_source, "OpAccessChain %_ptr_TaskPayloadWorkgroupEXT_uint "
+                                               "%task_payload") >= 2,
+        "the variant read its draw parameters or start vertex elsewhere");
+  // The mesh allocation counters are two Workgroup dwords; the payload is not Workgroup storage.
+  Check(ShaderRecompiler::Spirv::WorkgroupStorageBound(direct.spirv) >= 2 * sizeof(uint32_t) &&
+            ShaderRecompiler::Spirv::WorkgroupStorageBound(variant.spirv) ==
+                ShaderRecompiler::Spirv::WorkgroupStorageBound(direct.spirv),
+        "the Workgroup storage bound missed the mesh shared arrays or counted the payload");
+  mesh.task_payload = false;
+  mesh.payload_user_sgprs = {ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr};
+  Check(RecompileForTest(mesh_shader, options, nullptr, nullptr, PushData::MeshDrawDwordCount)
+                .spirv == direct.spirv,
+        "a direct mesh module changed after its task variant was built");
+  std::vector<uint32_t> direct_key;
+  std::vector<uint32_t> variant_key;
+  BuildStageStaticKey(mesh_input, direct_key);
+  mesh.task_payload = true;
+  BuildStageStaticKey(mesh_input, variant_key);
+  Check(direct_key != variant_key, "the task variant shares the direct mesh program's key");
+
+  // Fast launch uses the same variant: the task front leaves draw dword 1 zero.
+  constexpr std::array<uint8_t, 3> no_sgprs{ShaderMeshInputInfo::NoPayloadSgpr,
+                                            ShaderMeshInputInfo::NoPayloadSgpr,
+                                            ShaderMeshInputInfo::NoPayloadSgpr};
+  mesh.fast_launch = true;
+  mesh.primitives_per_group = 1;
+  mesh.vertices_per_group = 1;
+  mesh.task_payload = false;
+  mesh.payload_user_sgprs = no_sgprs;
+  const auto fast_direct = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                            PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(fast_direct.spirv);
+  Check(DisassembleSpirvBinary(fast_direct.spirv).find("TaskPayloadWorkgroupEXT") ==
+            std::string::npos,
+        "a direct fast-launch mesh module declared a task payload");
+  std::vector<uint32_t> fast_direct_key;
+  BuildStageStaticKey(mesh_input, fast_direct_key);
+  mesh.task_payload = true;
+  mesh.payload_user_sgprs = {4, ShaderMeshInputInfo::NoPayloadSgpr,
+                             ShaderMeshInputInfo::NoPayloadSgpr};
+  const auto fast_variant = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                             PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(fast_variant.spirv);
+  const auto fast_source = DisassembleSpirvBinary(fast_variant.spirv);
+  Check(CountSourceOccurrences(fast_source, "OpVariable %_ptr_TaskPayloadWorkgroupEXT") == 1 &&
+            SpirvSourceHasInstructionUsing(fast_source, "OpEntryPoint", "%task_payload") &&
+            CountSourceOccurrences(fast_source, "OpAccessChain %_ptr_TaskPayloadWorkgroupEXT_uint "
+                                                "%task_payload %uint_1") == 1 &&
+            CountSourceOccurrences(fast_source, "OpAccessChain %_ptr_TaskPayloadWorkgroupEXT_uint "
+                                                "%task_payload %uint_6") == 1,
+        "the fast-launch variant read its subgroup offsets or start vertex elsewhere");
+  std::vector<uint32_t> fast_variant_key;
+  BuildStageStaticKey(mesh_input, fast_variant_key);
+  Check(fast_variant_key != fast_direct_key && fast_variant_key != variant_key,
+        "the fast-launch task variant shares another mesh program's key");
+  mesh.task_payload = false;
+  mesh.payload_user_sgprs = no_sgprs;
+  Check(RecompileForTest(mesh_shader, options, nullptr, nullptr, PushData::MeshDrawDwordCount)
+                .spirv == fast_direct.spirv,
+        "a direct fast-launch mesh module changed after its task variant was built");
+}
+
+void TestPixelDefaultValueInputs() {
+  ShaderPixelInputInfo ps{};
+  ps.input_num = 2;
+  SetIdentityInterpolatorSettings(&ps);
+  ps.interpolator_settings[1] = 0x00000020u | (1u << 8u); // DEFAULT_VAL 0001
+  Check(ShaderPixelParameterIsDefault(ps, 1) && !ShaderPixelParameterIsDefault(ps, 0),
+        "OFFSET bit 5 without FLAT_SHADE was not read as a default value");
+  Check(ShaderPixelParameterDefaultComponent(ps, 1, 3) == 0x3f800000u &&
+            ShaderPixelParameterDefaultComponent(ps, 1, 0) == 0u,
+        "DEFAULT_VAL 1 did not decode to (0,0,0,1)");
+  auto explicit_ps = ps;
+  explicit_ps.interpolator_settings[1] = 0x00000420u | 1u;
+  Check(!ShaderPixelParameterIsDefault(explicit_ps, 1),
+        "explicit (flat, OFFSET bit 5) input was read as a default value");
+  auto fp16_ps = ps;
+  fp16_ps.interpolator_settings[1] |= 0x00080000u;
+  Check(!ShaderPixelParameterIsDefault(fp16_ps, 1), "FP16 input was read as a default value");
+  auto two = ps;
+  two.interpolator_settings[1] = 0x00000020u | (2u << 8u);
+  Check(ShaderPixelParameterDefaultComponent(two, 1, 0) == 0x3f800000u &&
+            ShaderPixelParameterDefaultComponent(two, 1, 3) == 0u,
+        "DEFAULT_VAL 2 did not decode to (1,1,1,0)");
+
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 0, 0, 2), // v_interp_mov_f32 v12, p0, attr0.x
+      EncodeVintrp(2, 13, 1, 3, 2), // v_interp_mov_f32 v13, p0, attr1.w (default)
+      EncodeVintrp(0, 14, 1, 0, 0), // v_interp_p1_f32 v14, v0, attr1.x (default)
+      EncodeVintrp(1, 14, 1, 0, 1), // v_interp_p2_f32 v14, v1, attr1.x
+      EncodeExp0(0x00, 0x7),
+      EncodeExp1(12, 13, 14, 0),
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps;
+  auto result = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(!SpirvHasDecorationValue(result.spirv, 30u, 1u) &&
+            source.find("in_param_1") == std::string::npos,
+        "default-value input still declared an interface variable");
+  Check(source.find("%uint_1065353216") != std::string::npos,
+        "default-value input did not read its DEFAULT_VAL constant");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  ps.interpolator_settings[1] = 1u;
+  auto mapped = RecompileForTest(shader, options);
+  Check(SpirvHasDecorationValue(mapped.spirv, 30u, 1u),
+        "an ordinary input lost its vertex output");
+  CheckSpirvBinaryValidates(mapped.spirv);
+}
+
 void TestVop3F16InterpolationTranslation() {
   // v_interp_p1ll_f16 v21, v0, attr0.w high; v_interp_p2_f16 v14, v1, attr0.w, v21 high
   // v_interp_p1ll_f16 v15, v0, attr0.z;      v_interp_p2_f16 v14, v1, attr0.z, v15 (op_sel[3])
@@ -7590,6 +8112,176 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+// A FLAT load carrying only the DLC cache hint, and s_sext_i32_i16 into vcc_lo.
+void TestNewShaderRecompilerFlatCachePolicyAndScalarSext() {
+  const uint32_t shader[] = {
+      0xdc341000u, 0x007d0004u,          // flat_load_dwordx2 v[0:1], v[4:5] dlc
+      EncodeFlat0(0x0c, 2, 0) | (1u << 16u),
+      EncodeFlat1(2, 0x7d, 0, 4),        // global_load_dword v2, v[4:5], off glc
+      0xbeea1a0bu,                       // s_sext_i32_i16 vcc_lo, s11
+      EncodeSop1(0x19, 3, 1),            // s_sext_i32_i8 s3, s1
+      EncodeVop1(0x01, 6, 3),            // v_mov_b32 v6, s3
+      EncodeVop1(0x01, 7, 106),          // v_mov_b32 v7, vcc_lo
+      EncodeFlat0(0x1c, 2, 0),
+      EncodeFlat1(0, 0x7d, 6, 4),        // global_store_dword v[4:5], v6, off
+      EncodeFlat0(0x1c, 2, 4),
+      EncodeFlat1(0, 0x7d, 7, 4),        // global_store_dword v[4:5], v7, off offset:4
+      EncodeFlat0(0x1d, 2, 8),
+      EncodeFlat1(0, 0x7d, 0, 4),        // global_store_dwordx2 v[4:5], v[0:1], off offset:8
+      EncodeFlat0(0x1c, 2, 16),
+      EncodeFlat1(0, 0x7d, 2, 4),        // global_store_dword v[4:5], v2, off offset:16
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "FLAT cache-policy bits or S_SEXT were still refused");
+  Check(result.decoded_dump.find("S_SEXT_I32_I16 vcc_lo, s11") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I16");
+  Check(result.decoded_dump.find("S_SEXT_I32_I8 s3, s1") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I8");
+  Check(result.ir_dump.find("BitFieldSExtract %2, 0x00000000, 0x00000010") != std::string::npos,
+        "S_SEXT_I32_I16 did not lower to a 16-bit sign extract");
+  Check(result.ir_dump.find("BitFieldSExtract %1, 0x00000000, 0x00000008") != std::string::npos,
+        "S_SEXT_I32_I8 did not lower to an 8-bit sign extract");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for S_SEXT");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+// The shipped waterfall loops over a per-lane T# record, wave64 and wave32.
+void TestWaterfallImageRecord() {
+  using namespace ShaderRecompiler::IR;
+  struct Shape {
+    const char *name;
+    uint32_t wave;
+    uint32_t heap;      // first SGPR of the heap V# the loop reads
+    uint32_t sampler;   // first SGPR of its S#
+    uint32_t index;     // VGPR holding the per-lane record index
+    uint32_t coords;    // first VGPR of the sample address
+    uint32_t result;    // VGPR the sample writes
+    uint32_t guard;     // the shipped V_CMPX that drops lanes with no record (index -1)
+    std::vector<uint32_t> loop;
+  };
+  const std::array<Shape, 2> shapes{{
+      {"wave64 waterfall (cs 05b58beb)", 64u, 88u, 40u, 4u, 8u, 20u, 0x7daa08c1u,
+       {0xe0382020u, 0x80160004u, 0xe0382010u, 0x80160404u, 0xbe9e047eu, 0xbe8f141eu,
+        0xbea0047eu, 0xbf8c3f71u, 0xd760000eu, 0x00001f02u, 0xd760000du, 0x00001f01u,
+        0xd760000cu, 0x00001f00u, 0xbf8c3f70u, 0xd760000bu, 0x00001f07u, 0xd760000au,
+        0x00001f06u, 0xd7600009u, 0x00001f05u, 0xd7600008u, 0x00001f04u, 0xd760000fu,
+        0x00001f03u, 0x7da4060fu, 0x7da4040eu, 0x7da4020du, 0x7da4000cu, 0x7da40e0bu,
+        0x7da40c0au, 0x7da40a09u, 0x7da40808u, 0x7da456f9u, 0x8686002bu, 0x7da454f9u,
+        0x8686002au, 0x7da452f9u, 0x86860029u, 0x7da450f9u, 0x86860028u, 0xbeea047eu,
+        0xbf880003u, 0x7e1402f4u, 0xf0900808u, 0x01421408u, 0x8a9e6a1eu, 0xbefe0420u,
+        0xbf85ffd4u}},
+      {"wave32 waterfall (cs 4c2c31fe)", 32u, 24u, 60u, 10u, 14u, 2u, 0x7daa14c1u,
+       {0xe0382010u, 0x8006060au, 0xe0382020u, 0x80060a0au, 0xbe8d037eu, 0xbe8b130du,
+        0xbeeb037eu, 0xbf8c3f70u, 0xd760000au, 0x0000170cu, 0xd7600009u, 0x0000170bu,
+        0xd7600008u, 0x0000170au, 0xd7600007u, 0x00001709u, 0xd7600006u, 0x00001708u,
+        0xd7600005u, 0x00001707u, 0xd7600004u, 0x00001706u, 0xd760000bu, 0x0000170du,
+        0x7da41a0bu, 0x7da4180au, 0x7da41609u, 0x7da41408u, 0x7da41207u, 0x7da41006u,
+        0x7da40e05u, 0x7da40c04u, 0x7da47ef9u, 0x8686003fu, 0x7da47cf9u, 0x8686003eu,
+        0x7da47af9u, 0x8686003du, 0x7da478f9u, 0x8686003cu, 0xbeea037eu, 0xbf880002u,
+        0xf0900f08u, 0x01e1020eu, 0x8a0d6a0du, 0xbefe036bu, 0xbf85ffd6u}},
+  }};
+
+  std::vector<uint32_t> heap_words(64u * 48u / sizeof(uint32_t));
+  std::vector<uint32_t> output(64u);
+  const auto heap_address = reinterpret_cast<uint64_t>(heap_words.data());
+  const auto output_address = reinterpret_cast<uint64_t>(output.data());
+  const auto heap_v = [&](uint32_t stride, bool swizzle,
+                          Prospero::BufferFormat format = Prospero::BufferFormat::k32Float) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(heap_address),
+        static_cast<uint32_t>((heap_address >> 32u) & 0xffffu) | (stride << 16u) |
+            (swizzle ? 1u << 31u : 0u),
+        // Structured bounds (OOB_SELECT 0): the record grid the hardware steps by stride.
+        64u, static_cast<uint32_t>(format) << 12u};
+  };
+
+  for (const auto &shape : shapes) {
+    std::vector<uint32_t> code{
+        EncodeSop1(0x04, shape.heap, 0),          // s_mov_b64 heap[0:1], s[0:1]
+        EncodeSop1(0x04, shape.heap + 2u, 2),     // s_mov_b64 heap[2:3], s[2:3]
+        EncodeSop1(0x04, shape.sampler, 8),       // s_mov_b64 sampler[0:1], s[8:9]
+        EncodeSop1(0x04, shape.sampler + 2u, 10), // s_mov_b64 sampler[2:3], s[10:11]
+        EncodeSop1(0x04, 20, 12),                 // s_mov_b64 s[20:21], s[12:13]
+        EncodeSop1(0x04, 22, 14),                 // s_mov_b64 s[22:23], s[14:15]
+        EncodeVop1(0x01, shape.index, 256),       // v_mov_b32 index, v0
+        EncodeVop1(0x01, shape.coords, 128),      // v_mov_b32 coords.x, 0
+        EncodeVop1(0x01, shape.coords + 1u, 128), // v_mov_b32 coords.y, 0
+        EncodeVop1(0x01, shape.coords + 2u, 128), // v_mov_b32 coords.lod, 0
+    };
+    code.push_back(shape.guard); // v_cmpx_ne_u32 exec, -1, index
+    code.insert(code.end(), shape.loop.begin(), shape.loop.end());
+    code.push_back(EncodeMubuf0(0x1c));
+    code.push_back(EncodeMubuf1(shape.result, 5, 0)); // buffer_store_dword result, v0, s[20:23]
+    code.push_back(EncodeSopp(0x01));
+
+    std::array<uint32_t, 16> user_data{};
+    const auto set_heap = [&](std::array<uint32_t, 4> v) {
+      std::copy(v.begin(), v.end(), user_data.begin());
+    };
+    set_heap(heap_v(48u, false));
+    user_data[12] = static_cast<uint32_t>(output_address);
+    user_data[13] = static_cast<uint32_t>((output_address >> 32u) & 0xffffu) | (4u << 16u);
+    user_data[14] = 64u;
+    user_data[15] = 3u << 28u;
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = shape.wave;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.thread_ids_num = 1;
+    compute.wave_size = shape.wave;
+    compute.host_subgroup_size = shape.wave;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.wave_size = shape.wave;
+    options.host_subgroup_size = shape.wave;
+    options.user_data = user_data;
+    const std::string name = shape.name;
+
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Check(translated.status.ok,
+          (name + ": the waterfall record was refused: " + translated.status.reason).c_str());
+    const auto &program = translated.program;
+    Check(program.info.images.size() == 1u &&
+              program.descriptor_sources[program.info.images[0].source]
+                  .indirect_descriptor.has_value(),
+          (name + ": expected one indirect image table").c_str());
+    const auto &indirect =
+        *program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+    // The T# ends a 48-byte record whose step is the heap V#'s own stride.
+    Check(indirect.table_record_bytes == 48u && indirect.table_stride == 0u &&
+              !indirect.table_scalar,
+          (name + ": the record did not become a V#-strided heap table at +16")
+              .c_str());
+
+    // The record steps by the heap V#'s own stride.
+    const auto plan = ExtractResourcePlan(program);
+    for (const uint32_t stride : {48u, 64u}) {
+      set_heap(heap_v(stride, false));
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(
+          MaterializeResources(
+              plan,
+              {.user_data = user_data,
+               .read_memory = ReadHostTestMemory,
+               .read_specialization_memory = ReadHostTestMemory},
+              snapshot, specialization),
+          (name + ": the waterfall record table did not materialize").c_str());
+    }
+    set_heap(heap_v(48u, false));
+
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
@@ -9085,6 +9777,112 @@ void TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgLoopContinueSharedSelectionMerge() {
+  // Two selections in one while(true) share the merge guarding the only S_ENDPGM.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0),      // entry condition
+      EncodeSMovB32(1, 129),       // entry work
+      EncodeSopc(0x06, 1, 1),      // loop header / outer condition
+      EncodeSopp(0x05, 4),         // outer arm -> shared merge
+      EncodeSopc(0x06, 2, 2),      // inner condition
+      EncodeSopp(0x04, 2),         // inner arm -> shared merge
+      EncodeSMovB32(3, 129),       // inner continue arm work
+      EncodeSopp(0x02, 3),         // inner continue arm -> latch
+      EncodeSMovB32(4, 129),       // shared merge work
+      EncodeSopc(0x06, 3, 3),      // exit condition
+      EncodeSopp(0x05, 1),         // -> s_endpgm, else fall through to the latch
+      EncodeSopp(0x02, 0xfff6u),   // latch -> loop header
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  ShaderRecompiler::CFG::Graph graph;
+  graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(!graph.irreducible && graph.natural_loops.size() == 1u,
+        "loop-continue shared-merge fixture has the wrong native CFG");
+
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "loop-continue shared-merge structurization changed semantic coverage");
+
+  const auto *outer = graph.FindBlockByPc(0x08u);
+  const auto *inner = graph.FindBlockByPc(0x10u);
+  Check(outer != nullptr && inner != nullptr &&
+            outer->terminator.merge_block != UINT32_MAX &&
+            inner->terminator.merge_block != UINT32_MAX &&
+            outer->terminator.merge_block != inner->terminator.merge_block,
+        "loop-continue shared-merge constructs do not have distinct merges");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos,
+        "loop-continue shared merge unexpectedly selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLoopContinueArmSharesEnclosingMerge() {
+  // An inner selection's else arm continues the loop; its join does not post-dominate it.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),     // 0x00 entry work
+      EncodeSopc(0x06, 1, 1),    // 0x04 loop header / enclosing selection condition
+      EncodeSopp(0x05, 6),       // 0x08 enclosing arm -> shared merge
+      EncodeSopc(0x06, 2, 2),    // 0x0c inner selection condition
+      EncodeSopp(0x05, 2),       // 0x10 inner arm -> inner join
+      EncodeSopc(0x06, 3, 3),    // 0x14 inner else arm
+      EncodeSopp(0x05, 5),       // 0x18 inner else arm -> latch (continue)
+      EncodeSMovB32(4, 129),     // 0x1c inner join work
+      EncodeSopp(0x02, 0),       // 0x20 inner join -> shared merge
+      EncodeSMovB32(5, 129),     // 0x24 shared merge work
+      EncodeSopc(0x06, 6, 6),    // 0x28 exit condition
+      EncodeSopp(0x05, 1),       // 0x2c -> s_endpgm, else fall through to the latch
+      EncodeSopp(0x02, 0xfff4u), // 0x30 latch -> loop header
+      0xbf810000u,               // 0x34 s_endpgm
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 8u && graph.natural_loops.size() == 1u,
+        "loop-continue arm fixture has the wrong native CFG");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported,
+        graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "loop-continue arm structurization changed semantic coverage");
+
+  std::vector<uint32_t> merges;
+  for (const auto &block : graph.blocks) {
+    if (block.terminator.merge_block == UINT32_MAX) {
+      continue;
+    }
+    Check(std::ranges::find(merges, block.terminator.merge_block) ==
+              merges.end(),
+          "structurization left two constructs sharing one merge block");
+    merges.push_back(block.terminator.merge_block);
+  }
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251u) == 0u,
+        "loop-continue arm shader unexpectedly selected dispatcher fallback");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 59u) <= 16u,
+        "structured loop-continue arm shader still spills to function variables");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0),      // preheader condition
@@ -9552,6 +10350,60 @@ void TestNativeConstantSamplerSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// A static sampler built by SALU moves whose SGPRs an EXEC mask reuses on an arm that never samples.
+void TestNativeConstantSamplerSource() {
+  constexpr uint32_t nested = 15, sample = 19, join = 21, end = 23;
+  const std::array<uint32_t, 24> guarded{
+      EncodeSopk(0x00, 16, 146),          // s_movk_i32 s16, 146
+      EncodeSop2(0x24, 17, 140, 140),     // s_bfm_b32 s17, 12, 12
+      EncodeSMovB32(18, 255), 0x06500000u,
+      EncodeSMovB32(19, 244),             // s_mov_b32 s19, 2.0
+      EncodeSopc(0x07, 21, 128),
+      EncodeSopp(0x04, end - 6 - 1),
+      EncodeSopc(0x07, 20, 130),
+      EncodeSopp(0x04, sample - 8 - 1),
+      EncodeVop3Word0(0xc5, 16), EncodeVop3Word1(256, 128, 0), // v_cmp_ne_u32 s[16:17], v0, 0
+      EncodeSopc(0x07, 20, 129),
+      EncodeSopp(0x04, nested - 12 - 1),
+      EncodeVop1(0x01, 0, 128),
+      EncodeSopp(0x02, join - 14 - 1),
+      EncodeSMovB32(18, 137), EncodeSMovB32(19, 138),
+      EncodeVop1(0x01, 0, 129),
+      EncodeSopp(0x02, join - 18 - 1),
+      EncodeMimg0(0x20, 0x1), EncodeMimg1(0, 2, 4, 2),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto user_data = ImageTestUserData();
+  user_data[13] = 1u;
+  const std::array<uint32_t, 4> sampler{146u, 0x00fff000u, 0x06500000u, 0u};
+  for (uint32_t mode = 0; mode != 3; ++mode) {
+    user_data[12] = mode;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data_base = 8;
+    options.user_data = user_data;
+    Check(ShaderRecompiler::TranslateProgram(guarded, options).status.ok,
+          "a constant sampler the native control flow alone reaches was refused");
+    const auto result = RecompileForTest(guarded, options);
+    const auto expected = mode == 2u ? sampler : std::array<uint32_t, 4>{};
+    Check(result.resources.samplers.size() == 1u &&
+              result.resources.samplers[0].dword_count == expected.size() &&
+              std::equal(expected.begin(), expected.end(),
+                         result.resources.samplers[0].dwords.begin()),
+          "guarded native sample did not bind the constant sampler it reads");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+
+  // The masked arm now falls into the sample, so the sampler is no longer one constant.
+  auto reached = guarded;
+  reached[14] = EncodeSopp(0x02, sample - 14 - 1);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data_base = 8;
+  options.user_data = user_data;
+  Check(!ShaderRecompiler::TranslateProgram(reached, options).status.ok,
+        "a sampler an EXEC mask can reach was resolved to a constant");
+}
+
 void TestBoundedMaterialBufferStores(bool scalar_key) {
   // Captured batch search and descriptor waterfall, with deformation arithmetic removed.
   const uint32_t shader[] = {
@@ -9650,12 +10502,20 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   Check(materialize(), "restored material batch failed to materialize");
   auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
   CheckSpirvBinaryValidates(result.spirv);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   auto unbounded = code;
   unbounded[0x3cu / 4u] = EncodeSopc(0x0bu, 14u, 13u); // s_cmp_le_u32 admits wraparound.
-  ExpectFatal([&] { ShaderRecompiler::TranslateProgram(unbounded, options); },
-              "material selection accepted an inclusive induction bound");
-#endif
+  // No bounded table then: the store decodes its V# in the shader instead of enumerating one.
+  const auto unbounded_result = ShaderRecompiler::TranslateProgram(unbounded, options);
+  const auto &unbounded_program = unbounded_result.program;
+  Check(unbounded_result.status.ok && unbounded_program.info.writes_dma &&
+            std::ranges::none_of(unbounded_program.info.buffers,
+                                 [](const auto &buffer) { return buffer.written; }) &&
+            std::ranges::any_of(unbounded_program.memory_info,
+                                [](const auto &memory) {
+                                  return memory.kind ==
+                                         ShaderRecompiler::IR::ResourceKind::IndirectBuffer;
+                                }),
+        "material selection accepted an inclusive induction bound");
 }
 
 void TestNativeDescriptorProvenanceKeepsGpuSelection() {
@@ -10006,6 +10866,242 @@ void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
             SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "shared-region/early-break routing lost structured loop control");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgSharedContinueForwarder() {
+  // A loop continued from two selections through one block holding only its S_BRANCH.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),     // 0: entry
+      EncodeSopc(0x06, 0, 0),    // 1: loop header
+      EncodeSopp(0x04, 4),       // 1 -> 4 or 2
+      EncodeSopc(0x06, 1, 1),    // 2: early continue
+      EncodeSopp(0x04, 7),       // 2 -> 7 or 3
+      EncodeSopc(0x06, 2, 2),    // 3: selection into the continuing region
+      EncodeSopp(0x04, 4),       // 3 -> 6 or 4
+      EncodeSopc(0x06, 3, 3),    // 4: join
+      EncodeSopp(0x04, 4),       // 4 -> 8 or 5
+      EncodeSMovB32(4, 129),     // 5: loop tail
+      EncodeSopp(0x02, 0xfff6u), // 5 -> 1
+      EncodeSMovB32(5, 129),     // 6: continuing region
+      EncodeSopp(0x02, 0xfff4u), // 7: shared forwarder -> 1
+      0xbf810000u,               // 8: return
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  const auto *forwarder = graph.FindBlockByPc(0x30u);
+  Check(graph.blocks.size() == 9u && graph.natural_loops.size() == 2u &&
+            forwarder != nullptr &&
+            forwarder->predecessors == std::vector<uint32_t>({2, 6}),
+        "shared continue forwarder fixture has the wrong native CFG");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "shared continue forwarder split duplicated semantic instructions");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "shared continue forwarder selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgSelectionOnlyBreaksAndContinues() {
+  // Every arm of a selection inside a loop continues or breaks; its only join is the loop merge.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),     // 0: entry
+      EncodeSopc(0x06, 0, 0),    // 1: loop header
+      EncodeSopp(0x04, 13),      // 1 -> merge or 2
+      EncodeSopc(0x06, 1, 1),    // 2: early continue
+      EncodeSopp(0x04, 9),       // 2 -> continue or 3
+      EncodeSopc(0x06, 2, 2),    // 3: selection without a join
+      EncodeSopp(0x05, 3),       // 3 -> 6 or 4
+      EncodeSopc(0x06, 3, 3),    // 4
+      EncodeSopp(0x04, 7),       // 4 -> merge or 5
+      EncodeSopp(0x02, 4),       // 5: forwarder -> continue
+      EncodeSopc(0x06, 4, 4),    // 6
+      EncodeSopp(0x04, 2),       // 6 -> continue or 7
+      EncodeSopc(0x06, 5, 5),    // 7
+      EncodeSopp(0x04, 2),       // 7 -> merge or continue
+      EncodeSMovB32(4, 129),     // continue
+      EncodeSopp(0x02, 0xfff1u), // continue -> 1
+      EncodeSMovB32(5, 129),     // merge
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 10u && graph.natural_loops.size() == 1u &&
+            graph.natural_loops.front().latch == 8u,
+        "break/continue-only selection fixture has the wrong native CFG");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "break/continue-only selection duplicated semantic instructions");
+  Check(std::ranges::any_of(graph.blocks,
+                            [](const auto &block) { return block.terminator.loop_header; }),
+        "break/continue-only selection lost the natural loop");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "break/continue-only selection selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLargeEarlyReturnGraph() {
+  std::vector<uint32_t> shader = {EncodeSMovB32(0, 129)};
+  for (uint32_t exit = 0; exit < 1800u; exit++) {
+    shader.push_back(EncodeSopc(0x06, 0, 0)); // early return test
+    shader.push_back(EncodeSopp(0x04, 1));    // -> next test or return
+    shader.push_back(0xbf810000u);            // return
+  }
+  const uint32_t loop[] = {
+      EncodeSopc(0x06, 1, 1),    // loop header
+      EncodeSopp(0x04, 2),       // -> second latch or first latch
+      EncodeSMovB32(2, 129),     // first latch
+      EncodeSopp(0x02, 0xfffcu), // -> header
+      EncodeSopc(0x06, 2, 2),    // second latch
+      EncodeSopp(0x04, 0xfffau), // -> header or exit
+      0xbf810000u,
+  };
+  shader.insert(shader.end(), std::begin(loop), std::end(loop));
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 3604u && graph.back_edges.size() == 2u,
+        "large early-return fixture has the wrong native CFG");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "large early-return structurization duplicated semantic instructions");
+}
+
+void CheckCfgStructuresEnteredBlock(std::span<const uint32_t> shader,
+                                size_t native_blocks, size_t native_loops,
+                                const char *name) {
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(shader, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == native_blocks &&
+            graph.natural_loops.size() == native_loops,
+        name);
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        name);
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        name);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgRoutedSharedTail() {
+  // Inside a loop, a block both arms fall into holds instructions, so it cannot be split.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0),    // 0: loop header
+      EncodeSopp(0x04, 34),      // 0 -> 23 or 1
+      EncodeSopc(0x06, 0, 0),    // 1
+      EncodeSopp(0x04, 30),      // 1 -> 21 or 2
+      EncodeSopc(0x06, 0, 0),    // 2
+      EncodeSopp(0x04, 27),      // 2 -> 20 or 3
+      EncodeSopc(0x06, 0, 0),    // 3
+      EncodeSopp(0x04, 5),       // 3 -> 7 or 4
+      EncodeSopc(0x06, 0, 0),    // 4
+      EncodeSopp(0x04, 3),       // 4 -> 7 or 5
+      EncodeSopc(0x06, 0, 0),    // 5
+      EncodeSopp(0x04, 1),       // 5 -> 7 or 6
+      EncodeSMovB32(1, 129),     // 6
+      EncodeSopc(0x06, 0, 0),    // 7
+      EncodeSopp(0x04, 17),      // 7 -> 19 or 8
+      EncodeSopc(0x06, 0, 0),    // 8
+      EncodeSopp(0x04, 16),      // 8 -> 20 or 9
+      EncodeSopc(0x06, 0, 0),    // 9
+      EncodeSopp(0x04, 1),       // 9 -> 11 or 10
+      EncodeSMovB32(1, 129),     // 10
+      EncodeSopc(0x06, 0, 0),    // 11
+      EncodeSopp(0x04, 9),       // 11 -> 18 or 12
+      EncodeSopc(0x06, 0, 0),    // 12
+      EncodeSopp(0x04, 1),       // 12 -> 14 or 13
+      EncodeSMovB32(1, 129),     // 13
+      EncodeSopc(0x06, 0, 0),    // 14
+      EncodeSopp(0x04, 1),       // 14 -> 16 or 15
+      EncodeSMovB32(1, 129),     // 15
+      EncodeSopc(0x06, 0, 0),    // 16
+      EncodeSopp(0x04, 1),       // 16 -> 18 or 17
+      EncodeSMovB32(1, 129),     // 17
+      EncodeSopp(0x02, 0),       // 18: forwarder -> 19
+      EncodeSMovB32(1, 129),     // 19: shared tail
+      EncodeSMovB32(1, 129),     // 20
+      EncodeSMovB32(1, 129),     // 21
+      EncodeSopp(0x02, 0xffdcu), // 22: forwarder -> 0
+      EncodeSMovB32(1, 129),     // 23: return
+      0xbf810000u,
+  };
+  CheckCfgStructuresEnteredBlock(shader, 23u, 1u,
+                             "shared loop tail was not structured");
+}
+
+void TestNewShaderRecompilerCfgRoutedEarlyExit() {
+  // One arm exits early to the post-dominator of a block both arms enter.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0
+      EncodeSopp(0x04, 3),    // 0 -> 3 or 1
+      EncodeSopp(0x02, 0),    // 1: forwarder -> 2
+      EncodeSopc(0x06, 0, 0), // 2
+      EncodeSopp(0x04, 2),    // 2 -> 5 or 3
+      EncodeSopp(0x02, 0),    // 3: forwarder -> 4
+      EncodeSMovB32(1, 129),  // 4: entered from both arms
+      0xbf810000u,            // 5: return
+  };
+  CheckCfgStructuresEnteredBlock(shader, 6u, 0u,
+                             "early exit around a shared block was not structured");
+}
+
+void TestNewShaderRecompilerCfgRoutedSharedReturn() {
+  // Returns early through its own epilogue past a block both arms enter.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0
+      EncodeSopp(0x04, 6),    // 0 -> 5 or 1
+      EncodeSopc(0x06, 0, 0), // 1
+      EncodeSopp(0x04, 3),    // 1 -> 4 or 2
+      EncodeSopc(0x06, 0, 0), // 2
+      EncodeSopp(0x04, 4),    // 2 -> 6 or 3
+      EncodeSopp(0x02, 1),    // 3: forwarder -> 5
+      EncodeSMovB32(1, 129),  // 4
+      EncodeSMovB32(1, 129),  // 5: entered from both arms, return
+      0xbf810000u,
+      EncodeSMovB32(1, 129), // 6: early return
+      0xbf810000u,
+  };
+  CheckCfgStructuresEnteredBlock(shader, 7u, 0u,
+                             "early return past a shared block was not structured");
 }
 
 void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
@@ -10885,17 +11981,21 @@ void TestMemoryFedScalarLeafCall() {
   const auto options = MakeCompileOptions(ShaderType::Compute);
   const uint32_t gpu_callable[] = {EncodeVop1(0x02, 4, 256),
       EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  const auto skipped = PrepareShaderSource(gpu_callable, options);
-  Check(skipped.unsupported_call_pc == 12u && skipped.calls.empty(),
-        "GPU-buffer callable did not report its unsupported call site");
+  const auto stubbed = PrepareShaderSource(gpu_callable, options);
+  const auto& stub_site = stubbed.decoded.instructions[2];
+  Check(stub_site.pc == 12u && stub_site.call_stub && stub_site.branch_target == UINT32_MAX &&
+            stubbed.calls.empty(),
+        "GPU-buffer callable was not stubbed at its call site");
+  const auto stub_result = RecompileForTest(gpu_callable, options);
+  Check(!stub_result.spirv.empty() && stub_result.program.uses_call_stub,
+        "GPU-buffer callable was not compiled with the any-hit stub");
   auto source = PrepareShaderSource(shader, options);
   Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
             source.decoded.instructions[source.calls.front().instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
-              "unresolved SWAPPC silently fell through");
-#endif
+  // Translating before the refresh links the call is refused, not run as a fall-through.
+  Check(!TranslateProgram(source.decoded, options).status.ok,
+        "unresolved SWAPPC silently fell through");
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
             linked.instructions[source.calls.front().instruction].branch_target == 0x44 &&
@@ -10964,25 +12064,30 @@ void TestMemoryFedScalarLeafCall() {
   (void)RefreshShaderSource(source, runtime);
   Check(source.revision == 3 && source.reads.back().second == 8,
         "shorter exact-boundary leaf was not decoded after a failed old-span read");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // An unlinkable call takes the any-hit stub while unlinkable and links again once it can.
+  const auto takes_stub = [&](const Decoder::Program &program) {
+    const auto &call = program.instructions[source.calls.front().instruction];
+    return source.linked->functions.empty() && call.call_stub && call.branch_target == UINT32_MAX;
+  };
   memory.clean = false;
-  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
-              "unreadable call dependencies reused stale linked code");
+  Check(takes_stub(RefreshShaderSource(source, runtime)) && source.revision == 4,
+        "unreadable call dependencies reused stale linked code");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 4, "a still-unlinkable call rebuilt its stub");
   memory.clean = true;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 5 && !source.linked->functions.empty(),
+        "a readable leaf was not linked again after the stub");
   auto ordinary = runtime;
   ordinary.read_specialization_memory = nullptr;
-  ExpectFatal([&] { (void)RefreshShaderSource(source, ordinary); },
-              "call target query accepted an ordinary non-strict memory reader");
+  Check(takes_stub(RefreshShaderSource(source, ordinary)) && source.revision == 6,
+        "call target query accepted an ordinary non-strict memory reader");
   std::vector<uint32_t> escaping(std::begin(shader), std::end(shader) - 1);
   escaping.insert(escaping.end(), {EncodeVop1(0x01, 1, 14),
       EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0), EncodeSopp(0x01)});
-  ExpectFatal([&] {
-    auto escaping_source = PrepareShaderSource(escaping, options);
-    (void)TranslateProgram(RefreshShaderSource(escaping_source, runtime), options);
-  }, "saved native return PC escaped into GPU data");
-  memory.words[96] = EncodeSMovB32(14, 129);
-  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
-              "leaf clobbering its return pair was linked");
+  auto escaping_source = PrepareShaderSource(escaping, options);
+  Check(!TranslateProgram(RefreshShaderSource(escaping_source, runtime), options).status.ok,
+        "saved native return PC escaped into GPU data");
   // AND_B64 must replace the preceding high-half definition.
   const uint32_t high_writer[] = {
       EncodeSMovB32(15, 129), EncodeSop2(0x0f, 14, 128, 128),
@@ -10995,12 +12100,24 @@ void TestMemoryFedScalarLeafCall() {
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
-              "ambiguous reaching definitions were accepted for a call target");
+  // A target the host cannot pin to one definition is not linked: every call takes the stub.
+  const auto all_stubbed = [](const ShaderSource &prepared) {
+    return prepared.calls.empty() &&
+           std::ranges::all_of(prepared.decoded.instructions, [](const auto &inst) {
+             return inst.opcode != Decoder::Opcode::S_SWAPPC_B64 || inst.call_stub;
+           });
+  };
+  Check(all_stubbed(PrepareShaderSource(joined, options)),
+        "ambiguous reaching definitions were accepted for a call target");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
-              "a native return pair was accepted as a later call target");
-#endif
+  Check(all_stubbed(PrepareShaderSource(multiple, options)),
+        "a native return pair was accepted as a later call target");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 7 && !source.linked->functions.empty(),
+        "a call target read through a strict reader was not linked again");
+  memory.words[96] = EncodeSMovB32(14, 129);
+  Check(takes_stub(RefreshShaderSource(source, runtime)) && source.revision == 8,
+        "leaf clobbering its return pair was linked");
 }
 
 void TestNewShaderRecompilerSetpcBranch() {
@@ -11020,6 +12137,147 @@ void TestNewShaderRecompilerSetpcBranch() {
   Check((result.ir_dump.find("successors=[") != std::string::npos),
         "S_SETPC_B64 did not participate in CFG");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestPlainSetpcThroughS6DecodesFollowingCode() {
+  using namespace ShaderRecompiler::Decoder;
+  // Only a merged-stage front half stops at s6; plain code continues.
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 6, 0),      // s_getpc_b64 s[6:7]
+      EncodeSop2(0x00, 6, 6, 140), // s_add_u32 s6, s6, 12
+      EncodeSop1(0x20, 0, 6),      // s_setpc_b64 s[6:7]
+      EncodeSMovB32(0, 129),       0xbf810000u,
+  };
+
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions.size() == 5u &&
+            program.instructions[2].opcode == Opcode::S_SETPC_B64 &&
+            program.instructions[2].src0.kind == OperandKind::Sgpr &&
+            program.instructions[2].src0.reg == 6u &&
+            program.instructions.back().opcode == Opcode::S_ENDPGM,
+        "plain s_setpc_b64 s6 stopped decoding the code after it");
+  const Program front_half = DecodeFrontProgram(shader);
+  Check(front_half.instructions.size() == 3u,
+        "front half decode did not stop at s_setpc_b64 s6");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("s_endpgm") != std::string::npos,
+        "plain s_setpc_b64 s6 lost the code after it");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestSwappcAcceptsEveryHit() {
+  using namespace ShaderRecompiler::Decoder;
+  // The any-hit function is a record the GPU selects per lane from a hit-group table.
+  const uint32_t shader[] = {
+      EncodeVop1(0x02, 4, 256),             // v_readfirstlane_b32 s4, v0
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, // s_buffer_load_dwordx2 s[14:15], s[0:3], s4
+      EncodeSop1(0x21, 14, 14),             // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSMovB32(0, 16),                 // s_mov_b32 s0, s16
+      0xbf810000u,
+  };
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions[2].opcode == Opcode::S_SWAPPC_B64 &&
+            program.instructions[2].dst.kind == OperandKind::Sgpr &&
+            program.instructions[2].dst.reg == 14u,
+        "s_swappc_b64 did not decode as a call through s[14:15]");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.spirv.empty() && result.program.uses_call_stub,
+        "a shader calling an any-hit function was not compiled with the call stubbed");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // A target combined from a loaded record is still one the host cannot resolve.
+  const uint32_t combined[] = {
+      EncodeVop1(0x02, 4, 256),             // v_readfirstlane_b32 s4, v0
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, // s_buffer_load_dwordx2 s[14:15], s[0:3], s4
+      EncodeSop2(0x00, 14, 14, 255), 64u,   // s_add_u32 s14, s14, 64
+      EncodeSop2(0x0e, 15, 15, 255), 0xffffu, // s_and_b32 s15, s15, 0xffff
+      EncodeSop1(0x21, 14, 14),             // s_swappc_b64 s[14:15], s[14:15]
+      0xbf810000u,
+  };
+  const auto combined_result = RecompileForTest(combined, options);
+  Check(!combined_result.spirv.empty() && combined_result.program.uses_call_stub,
+        "a call through a combined GPU-selected target was not stubbed");
+  // The branch's spelling: a call whose return pair is not its target pair is not linked either.
+  const uint32_t separate_pair[] = {
+      EncodeSMovB32(4, 255), 0xb7cb0000u, // s_mov_b32 s4, lo(target)
+      EncodeSMovB32(5, 255), 0x20u,       // s_mov_b32 s5, hi(target)
+      EncodeSop1(0x21, 14, 4),            // s_swappc_b64 s[14:15], s[4:5]
+      0xbf810000u,
+  };
+  const auto separate_result = RecompileForTest(separate_pair, options);
+  Check(!separate_result.spirv.empty() && separate_result.program.uses_call_stub,
+        "a call through a separate register pair was not stubbed");
+
+  // Only compute call targets are re-executed on the host; a graphics-stage call takes the stub.
+  const uint32_t pixel_call[] = {
+      EncodeSMovB32(14, 255), 0xb7cb0000u, // s_mov_b32 s14, lo(target)
+      EncodeSMovB32(15, 255), 0x20u,       // s_mov_b32 s15, hi(target)
+      EncodeSop1(0x21, 14, 14),            // s_swappc_b64 s[14:15], s[14:15]
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      0xbf810000u,
+  };
+  const auto pixel_result = RecompileForTest(pixel_call, MakeCompileOptions(ShaderType::Pixel));
+  Check(!pixel_result.spirv.empty() && pixel_result.program.uses_call_stub,
+        "a graphics-stage call was not compiled with the any-hit stub");
+  CheckSpirvBinaryValidates(pixel_result.spirv);
+
+  // A target the host can evaluate is a call to link, not an any-hit stub.
+  const uint32_t constant_target[] = {
+      EncodeSMovB32(14, 255), 0xb7cb0000u, // s_mov_b32 s14, lo(target)
+      EncodeSMovB32(15, 255), 0x20u,       // s_mov_b32 s15, hi(target)
+      EncodeSop1(0x21, 14, 14),            // s_swappc_b64 s[14:15], s[14:15]
+      0xbf810000u,
+  };
+  const auto source = ShaderRecompiler::PrepareShaderSource(constant_target, options);
+  Check(source.calls.size() == 1u && !source.decoded.instructions[2].call_stub,
+        "a host-evaluable call target was stubbed instead of linked");
+}
+
+void TestFrontHalfDecodeStopsAtHandoff() {
+  using namespace ShaderRecompiler::Decoder;
+  // s_setpc_b64 s6 at word 103, then padding and the "sl00" metadata tag at word 112.
+  const uint32_t code[] = {
+      0xbfa00003u, 0x8f6a9003u, 0x94fe6ac1u, 0xbf880062u, 0xd7650007u, 0x000100c1u, 0xf4040607u,
+      0xfa000000u, 0xbf8cc07fu, 0x8f6b8419u, 0x93eaff19u, 0x0001001au, 0x876bff6bu, 0x000001f0u,
+      0xbf066a80u, 0xf4080406u, 0xd6000000u, 0xbe8e03ffu, 0x022c0204u, 0xbe8f03ffu, 0x0fac03acu,
+      0x8594807eu, 0x9396ff19u, 0x00070007u, 0x93ebff19u, 0x00020005u, 0x8f6a8c16u, 0x98ebff6bu,
+      0x000c0000u, 0xbf8cc07fu, 0x8717ff13u, 0xfff80000u, 0xd5010006u, 0x00520b08u, 0x88146a17u,
+      0x94ea6b0eu, 0x9399ff19u, 0x000c000eu, 0x886a6a14u, 0xbf068016u, 0xd7660009u, 0x00020ec1u,
+      0x85136a13u, 0x8f6b8418u, 0x93eaff18u, 0x0001001au, 0x876bff6bu, 0x000001f0u, 0xbf066a80u,
+      0xf4080506u, 0xd6000000u, 0x858c807eu, 0x939aff18u, 0x00070007u, 0x93ebff18u, 0x00020005u,
+      0xbf8cc07fu, 0x871bff17u, 0xfff80000u, 0x8f6a8c1au, 0x98ebff6bu, 0x000c0000u, 0x881b6a1bu,
+      0x94ea6b0eu, 0xe0042000u, 0x19040606u, 0xd501000au, 0x00320b08u, 0x886b6a1bu, 0x9398ff18u,
+      0x000c000eu, 0x93eaff03u, 0x00040018u, 0xbf06801au, 0xd7460005u, 0x04250c6au, 0x85176b17u,
+      0xf4280704u, 0xfa000010u, 0xe0042000u, 0x1805090au, 0xf4201a84u, 0xfa000000u, 0x160a0a9cu,
+      0xbf8cc07fu, 0x4a10106au, 0x7e160280u, 0x7e1802f2u, 0xd8340018u, 0x00000805u, 0xd8380504u,
+      0x000c0b05u, 0xbf8c3f71u, 0xd5410007u, 0x007c3b07u, 0xd5410006u, 0x00783906u, 0xd8380100u,
+      0x00070605u, 0xbf8c3f70u, 0xd8380302u, 0x000a0905u, 0xbf8cc07fu, 0xbe802006u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0x00000000u, 0x00000000u, 0x00000000u,
+      0x30306c73u, 0x000000cdu, 0x000000e8u, 0x00000000u, 0x00102961u, 0x10204900u, 0x10254024u,
+      0x00001041u, 0x100401a6u, 0x40401009u, 0x10462042u, 0x104c104bu, 0x104e104du, 0x1079606fu,
+      0x1085107au, 0x006e0000u, 0x10255700u, 0x0f650000u, 0x22102120u, 0x00402420u, 0x200f6500u,
+      0x40241021u, 0x0f640000u, 0x24102120u, 0x45000040u, 0x00004024u, 0x2b10294du, 0x44000010u,
+      0x00004024u, 0xe00da0c1u, 0x88181000u, 0xd2f2c70fu, 0x00208574u, 0x818f6f04u, 0x85680080u,
+      0x15010901u, 0x8a04018au, 0x63030801u, 0x819e018fu, 0x97150080u, 0x81a81001u, 0x03200080u,
+      0x00019e10u, 0x0501a810u, 0x8518285au, 0x01b05101u, 0x01971017u, 0x0201b546u, 0x01ac0000u,
+      0xbc01ac41u, 0xc43e2001u, 0x01ca2001u, 0x01c40100u, 0xa80b0001u, 0x0404a946u, 0x8a801174u,
+      0xa32040a0u, 0x01c5d985u, 0x00000000u, 0x00000000u, 0x65726162u, 0x746f6f66u, 0xa287d836u,
+      0x00000000u, 0x00000001u, 0x000001b4u, 0x00000000u, 0x000000e8u, 0xa89d1c6eu, 0x18b642a3u,
+      0x00000000u, 0x00000000u,
+  };
+  Check(code[112] == 0x30306c73u, "front half fixture lost its metadata tag");
+  const Program program = DecodeFrontProgram(code);
+  const auto &last = program.instructions.back();
+  Check(last.opcode == Opcode::S_SETPC_B64 && last.src0.kind == OperandKind::Sgpr &&
+            last.src0.reg == 6u && last.pc == 103u * 4u && last.word_count == 1u,
+        "front half decode did not stop at its stage hand-off");
 }
 
 void TestFusedShaderHandoffPreservesRegisters() {
@@ -11066,14 +12324,22 @@ void TestFusedShaderHandoffPreservesRegisters() {
   const uint32_t call_front[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x20, 0, 6)};
   Check(Decoder::DecodeFrontProgram(call_front).has_swap_pc,
         "front decoder omitted its scalar call");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ExpectFatal([&] { (void)PrepareShaderSource(call_front, options); },
-              "fused front call bypassed the non-compute rejection");
+  // The host re-executes only compute call targets; a graphics-stage call is an any-hit stub.
+  const auto stubbed_call = [](const ShaderSource &source) {
+    return source.decoded.has_swap_pc && source.calls.empty() &&
+           std::ranges::all_of(source.decoded.instructions, [](const auto &inst) {
+             return inst.opcode != Decoder::Opcode::S_SWAPPC_B64 || inst.call_stub;
+           });
+  };
+  Check(stubbed_call(PrepareShaderSource(call_front, options)),
+        "fused front call bypassed the non-compute rejection");
   const uint32_t call_back[] = {EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   options.back_code = call_back;
-  ExpectFatal([&] { (void)PrepareShaderSource(front, options); },
-              "fused back call metadata was not propagated");
-#endif
+  const auto back_call = PrepareShaderSource(front, options);
+  Check(stubbed_call(back_call) &&
+            back_call.decoded.code.size() ==
+                Decoder::DecodeFrontProgram(front).code.size() + std::size(call_back),
+        "fused back call metadata was not propagated");
 }
 
 void TestMeshExportStorage() {
@@ -11210,6 +12476,101 @@ void TestMeshExportStorage() {
           "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
     Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
+  }
+}
+
+// RE9 mesh ecd43ec21aab8c51: S_BUFFER_LOAD through a GPU-selected V# must emit.
+void TestMeshDynamicScalarBufferLoad() {
+  std::vector<uint32_t> code = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+  };
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    code.insert(code.end(), {EncodeVop1(0x01, 20, 128 + dword),
+                             EncodeMubuf0(0x0c), EncodeMubuf1(4 + dword, 2, 20)});
+  }
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    code.push_back(EncodeVop1(0x02, 16 + dword, 256 + 4 + dword)); // v_readfirstlane_b32
+  }
+  code.insert(code.end(), {
+      EncodeSmem0(0x0a, 20, 8), 16u | (125u << 25u), // s_buffer_load_dwordx4 s[20:23], s[16:19], 16
+      EncodeSmem0(0x08, 24, 8), 13u << 25u,          // s_buffer_load_dword s24, s[16:19], s13
+      EncodeVop1(0x01, 9, 20), EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 20),
+      EncodeVop1(0x01, 10, 24), EncodeMubuf0(0x1c), EncodeMubuf1(10, 2, 21),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  });
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 64;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 64;
+  mesh.max_primitives = 62;
+  std::array<uint32_t, 14> user_data{};
+  user_data[8] = 0x10000008u;
+  user_data[9] = 4u << 16u;
+  user_data[10] = 64u;
+  user_data[11] = 0x00027000u;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(std::ranges::any_of(result.program.memory_info,
+                              [](const auto &memory) {
+                                return memory.kind ==
+                                       ShaderRecompiler::IR::ResourceKind::IndirectBuffer;
+                              }),
+          "mesh S_BUFFER_LOAD through a GPU-selected V# did not take the in-shader decode");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpConvertUToPtr") != std::string::npos,
+          "mesh S_BUFFER_LOAD through a GPU-selected V# did not read by device address");
+  }
+}
+
+void TestMeshAuxiliaryPositionOutputs() {
+  // Point size, layer, viewport index and clip/cull distances reach the mesh output interface.
+  const uint32_t code[] = {
+      EncodeSMovB32(12, 255), 0x1003u, EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x0d, 0x5, false), EncodeExp1(0, 0, 0, 0), // point size, layer, viewport
+      EncodeExp0(0x0e, 0x7, false), EncodeExp1(0, 0, 0, 0), // clip 0, clip 1, cull 0
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 22u) | (1u << 16u) | (1u << 18u) |
+                            (1u << 19u) | 0x3u | (1u << 10u);
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.emit_debug_info = true; // The checks find SPIR-V objects by OpName.
+  options.input_info.vertex = &input;
+  for (const auto subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    for (const auto *text :
+         {"Capability ClipDistance", "Capability CullDistance", "BuiltIn ClipDistance",
+          "BuiltIn CullDistance", "BuiltIn PointSize", "BuiltIn Layer",
+          "BuiltIn ViewportIndex", "OpTypeArray %float %uint_2", "OpTypeArray %float %uint_1"}) {
+      Check(source.find(text) != std::string::npos,
+            "mesh auxiliary position output is missing from the SPIR-V interface");
+    }
   }
 }
 
@@ -11632,6 +12993,7 @@ void TestMeshInputAssembly() {
     uint32_t wave_size = 64;
     bool fast_launch = false;
     uint32_t threads = 256;
+    uint32_t readable = UINT32_MAX;
   };
   std::vector<Case> cases = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
@@ -11693,6 +13055,13 @@ void TestMeshInputAssembly() {
       {Prospero::PrimitiveType::kTriList, 256, 256, 0, 64, 0, 0, 11,
        0x82001520, 0x154ff000, 192, 193, 194, 0, 75, false, 32, false, 256},
   };
+  // Vertex 170 is the last index inside INDEX_BUFFER_SIZE, then the first past it.
+  cases.push_back({Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
+                   0x40000309, 0x00c09000, 6, 7, 8, 340, 0xabcc, true, 64, false, 256, 171});
+  cases.push_back({Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
+                   0x40000309, 0x00c09000, 6, 7, 8, 340, UINT32_MAX, false, 64, false, 256, 170});
+  cases.push_back({Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, 5, 0x40000309,
+                   0x00c09000, 6, 7, 8, 340, 5, false, 64, false, 256, 0});
   for (const uint32_t wave_size : {32u, 64u}) {
     for (const uint32_t threads : {wave_size, 2u * wave_size}) {
       for (const uint32_t group : {0u, 1u, 11u}) {
@@ -11731,8 +13100,9 @@ void TestMeshInputAssembly() {
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
+    // The readable index bound is draw parameter 6 (PushData::MeshIndexBoundParameter).
     const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
+                             test.address_low, 0x12, test.readable};
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
@@ -12251,6 +13621,232 @@ void TestTypedSpirvSerialization() {
   check_serialization(spv::StorageClassPrivate, spv::FunctionControlMaskNone,
                       spv::DecorationRelaxedPrecision, GLSLstd450FAbs, -1,
                       0x80000000u);
+}
+
+// Guarded buffer/LDS loads are speculated; a guarded store and volatile load keep their branches.
+void TestDriverSimplifySpeculatesGuardedLoads() {
+  const char *text = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %buf %lds
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %blk Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+       %bool = OpTypeBool
+         %v3 = OpTypeVector %u32 3
+        %pv3 = OpTypePointer Input %v3
+        %gid = OpVariable %pv3 Input
+        %arr = OpTypeRuntimeArray %u32
+        %blk = OpTypeStruct %arr
+       %pblk = OpTypePointer StorageBuffer %blk
+        %buf = OpVariable %pblk StorageBuffer
+       %pu32 = OpTypePointer StorageBuffer %u32
+         %c0 = OpConstant %u32 0
+         %c1 = OpConstant %u32 1
+        %c64 = OpConstant %u32 64
+    %lds_arr = OpTypeArray %u32 %c64
+       %plds = OpTypePointer Workgroup %lds_arr
+        %lds = OpVariable %plds Workgroup
+      %pwu32 = OpTypePointer Workgroup %u32
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3 %gid
+          %x = OpCompositeExtract %u32 %g 0
+        %len = OpArrayLength %u32 %buf 0
+        %inb = OpULessThan %bool %x %len
+               OpSelectionMerge %m1 None
+               OpBranchConditional %inb %t1 %m1
+         %t1 = OpLabel
+         %p1 = OpAccessChain %pu32 %buf %c0 %x
+         %v1 = OpLoad %u32 %p1
+               OpBranch %m1
+         %m1 = OpLabel
+         %r1 = OpPhi %u32 %v1 %t1 %c0 %entry
+        %odd = OpBitwiseAnd %u32 %x %c1
+       %even = OpIEqual %bool %odd %c0
+               OpSelectionMerge %m2 None
+               OpBranchConditional %even %m2 %t2
+         %t2 = OpLabel
+         %p2 = OpAccessChain %pwu32 %lds %x
+         %v2 = OpLoad %u32 %p2
+               OpBranch %m2
+         %m2 = OpLabel
+         %r2 = OpPhi %u32 %c1 %m1 %v2 %t2
+         %s1 = OpSelect %u32 %even %r1 %r2
+         %a1 = OpIAdd %u32 %s1 %c1
+         %s2 = OpSelect %u32 %even %a1 %s1
+               OpSelectionMerge %m3 None
+               OpBranchConditional %inb %t3 %m3
+         %t3 = OpLabel
+         %p3 = OpAccessChain %pu32 %buf %c0 %x
+         %w3 = OpLoad %u32 %p3 Volatile
+               OpBranch %m3
+         %m3 = OpLabel
+         %r3 = OpPhi %u32 %w3 %t3 %c0 %m2
+         %s3 = OpIAdd %u32 %s2 %r3
+               OpSelectionMerge %m4 None
+               OpBranchConditional %inb %t4 %m4
+         %t4 = OpLabel
+         %p4 = OpAccessChain %pu32 %buf %c0 %x
+               OpStore %p4 %s3
+               OpBranch %m4
+         %m4 = OpLabel
+               OpReturn
+               OpFunctionEnd
+)";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::vector<uint32_t> binary;
+  Check(tools.Assemble(text, &binary), "driver simplify fixture did not assemble");
+  CheckSpirvBinaryValidates(binary);
+
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary),
+        "driver simplify refused a module it emitted the shape of");
+  CheckSpirvBinaryValidates(binary);
+
+  const auto source = DisassembleSpirvBinary(binary);
+  const auto count = [&](const char *needle) {
+    size_t n = 0;
+    for (auto at = source.find(needle); at != std::string::npos;
+         at = source.find(needle, at + 1)) {
+      n++;
+    }
+    return n;
+  };
+  Check(count("OpSelectionMerge") == 2,
+        "driver simplify: the volatile load or the store lost its branch");
+  Check(count("OpPhi") == 1, "driver simplify: a speculated merge kept its phi");
+  Check(count("Volatile") == 1, "driver simplify: the volatile load changed");
+  Check(count("OpStore") == 1, "driver simplify: the store changed");
+
+  // Running it again finds nothing more to speculate and changes nothing.
+  auto again = binary;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(again) && again == binary,
+        "driver simplify is not idempotent");
+}
+
+// Bit-exact value replacements; loads, decorated arithmetic and sibling-branch values stay.
+void TestDriverSimplifyFoldsValues() {
+  const char *text = R"(
+               OpCapability Shader
+       %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %buf
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %blk Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+               OpDecorate %exact NoContraction
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+        %f32 = OpTypeFloat 32
+        %v2f = OpTypeVector %f32 2
+       %bool = OpTypeBool
+         %v3 = OpTypeVector %u32 3
+        %pv3 = OpTypePointer Input %v3
+        %gid = OpVariable %pv3 Input
+        %arr = OpTypeRuntimeArray %u32
+        %blk = OpTypeStruct %arr
+       %pblk = OpTypePointer StorageBuffer %blk
+        %buf = OpVariable %pblk StorageBuffer
+       %pu32 = OpTypePointer StorageBuffer %u32
+         %c0 = OpConstant %u32 0
+         %c1 = OpConstant %u32 1
+        %c16 = OpConstant %u32 16
+      %cffff = OpConstant %u32 65535
+       %fone = OpConstant %f32 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3 %gid
+          %x = OpCompositeExtract %u32 %g 0
+         %p0 = OpAccessChain %pu32 %buf %c0 %x
+         %v0 = OpLoad %u32 %p0
+        %v0b = OpLoad %u32 %p0
+         %f0 = OpBitcast %f32 %v0
+        %f0s = OpFAdd %f32 %f0 %fone
+         %b0 = OpBitcast %u32 %f0s
+         %f1 = OpBitcast %f32 %b0
+      %exact = OpFMul %f32 %f1 %f1
+      %loose = OpFMul %f32 %f1 %f1
+     %loose2 = OpFMul %f32 %f1 %f1
+         %lo = OpBitFieldUExtract %u32 %v0b %c0 %c16
+        %lom = OpBitwiseAnd %u32 %lo %cffff
+         %hi = OpBitFieldUExtract %u32 %v0b %c16 %c16
+         %ul = OpExtInst %v2f %glsl UnpackHalf2x16 %lom
+         %el = OpCompositeExtract %f32 %ul 0
+         %uh = OpExtInst %v2f %glsl UnpackHalf2x16 %hi
+         %eh = OpCompositeExtract %f32 %uh 0
+        %sum = OpFAdd %f32 %el %eh
+        %cmp = OpULessThan %bool %x %c16
+               OpSelectionMerge %merge None
+               OpBranchConditional %cmp %then %else
+       %then = OpLabel
+         %d1 = OpBitcast %f32 %v0
+         %t1 = OpFAdd %f32 %d1 %sum
+               OpBranch %merge
+       %else = OpLabel
+         %s1 = OpBitcast %f32 %x
+               OpBranch %merge
+      %merge = OpLabel
+         %ph = OpPhi %f32 %t1 %then %s1 %else
+         %s2 = OpBitcast %f32 %x
+         %a1 = OpFAdd %f32 %ph %exact
+         %a2 = OpFAdd %f32 %a1 %loose
+         %a3 = OpFAdd %f32 %a2 %loose2
+         %a4 = OpFAdd %f32 %a3 %s2
+         %w0 = OpBitcast %u32 %v0b
+         %a5 = OpBitcast %f32 %w0
+         %a6 = OpFAdd %f32 %a4 %a5
+        %out = OpBitcast %u32 %a6
+               OpStore %p0 %out
+               OpReturn
+               OpFunctionEnd
+)";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::vector<uint32_t> binary;
+  Check(tools.Assemble(text, &binary), "value fold fixture did not assemble");
+  CheckSpirvBinaryValidates(binary);
+
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary),
+        "driver simplify refused the value fold fixture");
+  CheckSpirvBinaryValidates(binary);
+
+  const auto source = DisassembleSpirvBinary(binary);
+  const auto count = [&](const char *needle) {
+    size_t n = 0;
+    for (auto at = source.find(needle); at != std::string::npos;
+         at = source.find(needle, at + 1)) {
+      n++;
+    }
+    return n;
+  };
+  // Kept: f0, the sibling-branch s1, the merge-block s2, a5 and the stored result.
+  Check(count("OpBitcast") == 5, "value fold: wrong bitcasts left (round trip, "
+                                 "dominated duplicate, sibling)");
+  Check(count("UnpackHalf2x16") == 1,
+        "value fold: the two halves do not share one unpack");
+  Check(count("OpBitwiseAnd") == 0,
+        "value fold: the mask after a 16-bit extract stayed");
+  Check(count("OpBitFieldUExtract") == 0,
+        "value fold: an extract feeding an unpack stayed");
+  Check(count("OpLoad") == 3, "value fold: a load was merged or dropped");
+  Check(count("OpFMul") == 2, "value fold: the decorated multiply was merged, "
+                              "or the plain duplicate was not");
+  Check(count("NoContraction") == 1, "value fold: the decoration changed");
+
+  auto again = binary;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(again) && again == binary,
+        "value fold is not idempotent");
 }
 
 void TestDeferredSpirvPhiPatching() {
@@ -13821,7 +15417,7 @@ void TestAutomaticObjectPrimitiveId() {
   options.user_data = user_data;
   const auto prefix = PushData::GraphicsDrawDwords(false, true);
   Check(prefix == 1 && PushData::GraphicsDrawDwords(false, false) == 0 &&
-            PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
+            PushData::GraphicsDrawDwords(true, false) == PushData::MeshIndexBoundDword(0) + 1,
         "graphics draw data reserved an incorrect prefix");
   for (const uint32_t start : {prefix, PushData::DwordCount}) {
     const auto result = RecompileForTest(shader, options, nullptr, nullptr, start);
@@ -14751,7 +16347,7 @@ void TestPatternFill() {
       Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
             "pattern fill did not materialize");
       const auto &fill = snapshot.uniform_fill;
-      Check((fill.kind == UniformFillKind::Buffer) == expected,
+      Check((fill.kind == UniformFillKind::Buffer && fill.words_agree) == expected,
             "pattern fill used inactive words or retained a stale result");
       if (expected)
         Check(fill.value == userdata[4] && fill.words == 1 &&
@@ -15989,6 +17585,70 @@ void TestPixelProgramCacheBindingIdentity() {
 
 }
 
+// A material id exported through MRTZ channel 1 with STENCIL_OP_VAL_EXPORT_ENABLE set.
+void TestPixelStencilReferenceExport() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x08, 0x3), EncodeExp1(3, 0, 0, 0), 0xbf810000u,
+  };
+
+  const auto compile = [&](ShaderPixelInputInfo &info) {
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &info;
+    return RecompileForTest(shader, options);
+  };
+
+  ShaderPixelInputInfo no_export{};
+  const auto dropped = compile(no_export);
+  Check(!ContainsStr(DisassembleSpirvBinary(dropped.spirv),
+                             "FragStencilRefEXT"),
+        "MRTZ stencil channel produced a stencil reference the registers never asked for");
+
+  ShaderPixelInputInfo op_export{};
+  op_export.ps_stencil_op_val_export_enable = true;
+  const auto exported = compile(op_export);
+  const auto source = DisassembleSpirvBinary(exported.spirv);
+  Check(ContainsStr(source, "FragStencilRefEXT") &&
+            ContainsStr(source, "StencilExportEXT") &&
+            ContainsStr(source, "SPV_EXT_shader_stencil_export"),
+        "MRTZ stencil channel did not reach FragStencilRefEXT");
+  Check(ContainsStr(source, "OpShiftRightLogical"),
+        "exported stencil op value was not taken from bits 15:8");
+  CheckSpirvBinaryValidates(exported.spirv);
+
+  ShaderPixelInputInfo test_export{};
+  test_export.ps_stencil_test_val_export_enable = true;
+  const auto test_source = DisassembleSpirvBinary(compile(test_export).spirv);
+  Check(ContainsStr(test_source, "FragStencilRefEXT") &&
+            !ContainsStr(test_source, "OpShiftRightLogical"),
+        "exported stencil test value was not taken from bits 7:0");
+
+  Check(MakeStageStaticKey(no_export) != MakeStageStaticKey(op_export) &&
+            MakeStageStaticKey(op_export) != MakeStageStaticKey(test_export),
+        "pixel shader identity omitted the stencil reference export");
+
+  ShaderPixelInputInfo bit_pass{};
+  bit_pass.ps_depth_export_enable = true;
+  bit_pass.ps_stencil_bit_pass = 3;
+  const auto variant = compile(bit_pass);
+  const auto variant_source = DisassembleSpirvBinary(variant.spirv);
+  Check(!ContainsStr(variant_source, "FragStencilRefEXT") &&
+            !ContainsStr(variant_source, "StencilExportEXT"),
+        "the stencil replay variant still asks for the stencil export builtin");
+  Check(ContainsStr(variant_source, "FragDepth"),
+        "the stencil replay variant dropped the depth export it is matched by");
+  Check(ContainsStr(variant_source, "stencil_bit_pass_keep") &&
+            ContainsStr(variant_source, "OpKill") &&
+            ContainsStr(variant_source, "OpShiftRightLogical") &&
+            ContainsStr(variant_source, "OpConstant %uint 10"),
+        "the stencil replay variant does not discard on exported op value bit 2");
+  CheckSpirvBinaryValidates(variant.spirv);
+  auto other_bit = bit_pass;
+  other_bit.ps_stencil_bit_pass = 4;
+  Check(MakeStageStaticKey(bit_pass) != MakeStageStaticKey(other_bit) &&
+            MakeStageStaticKey(bit_pass) != MakeStageStaticKey(ShaderPixelInputInfo{}),
+        "pixel shader identity omitted the stencil replay bit");
+}
+
 void TestGraphicsPushConstantPlacement() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
   constexpr uint32_t OffsetDecoration = 35;
@@ -16215,9 +17875,8 @@ void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
   Check((result.ir_dump.find("GetScratchResource") != std::string::npos) &&
             result.program.scratch_dwords == 1,
         "SCRATCH incorrectly entered guest address tracking");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   // A local aperture proof must not admit a median which can still produce a
-  // canonical global address. Such stores need the existing ownership proof.
+  // canonical global address.
   const uint32_t mixed_domain_store[] = {
       EncodeSop1(0x04, 8, 237), // s_mov_b64 s[8:9], private_base
       EncodeVop3Word0(0x159, 1),
@@ -16225,8 +17884,9 @@ void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
       EncodeFlat0(0x1c, 0, 0), EncodeFlat1(0, 0x7d, 3, 0),
       EncodeSopp(0x01),
   };
-  ExpectFatal([&]() { (void)RecompileForTest(mixed_domain_store, options); },
-              "mixed local/global FLAT store bypassed GPU ownership tracking");
+  // A store that may reach a canonical global address goes through the BDA store page table.
+  Check(RecompileForTest(mixed_domain_store, options).program.info.writes_dma,
+        "mixed local/global FLAT store bypassed GPU ownership tracking");
   const uint32_t changed_mask_store[] = {
       EncodeSop1(0x04, 8, 237), EncodeSop1(0x04, 10, 235),
       EncodeVop1(0x01, 1, 128), // canonical old address high
@@ -16236,9 +17896,8 @@ void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
       EncodeFlat0(0x1c, 0, 0), EncodeFlat1(0, 0x7d, 3, 0),
       EncodeSopp(0x01),
   };
-  ExpectFatal([&]() { (void)RecompileForTest(changed_mask_store, options); },
-              "FLAT proof discarded a differently predicated address value");
-#endif
+  Check(RecompileForTest(changed_mask_store, options).program.info.writes_dma,
+        "FLAT proof discarded a differently predicated address value");
 }
 
 void TestCompilerStageInputOwnership() {
@@ -16745,15 +18404,135 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 }
 
 #include "ShaderRayTracingTests.inc"
+// A jump into the middle of a later selection's arm gives that arm two entries.
+const uint32_t kEnteredRegionShader[] = {
+    EncodeSopc(0x06, 0, 0),
+    EncodeSopp(0x04, 4), // 0: jump into the region at 3, else 1
+    EncodeSopc(0x06, 1, 1),
+    EncodeSopp(0x04, 7), // 1: selection header -> merge 5, else 2
+    EncodeSMovB32(2, 129),
+    EncodeSopp(0x02, 0), // 2: the header's own way into 3
+    EncodeSMovB32(3, 129),
+    EncodeSopc(0x06, 2, 2),
+    EncodeSopp(0x04, 0xfffdu), // 3: entered block, loops on itself, else 4
+    EncodeSMovB32(4, 129),
+    EncodeSopp(0x02, 0), // 4 -> 5
+    EncodeSMovB32(5, 129),
+    0xbf810000u, // 5: merge
+};
+
+void TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion() {
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{kEnteredRegionShader},
+                                           decoded);
+  const auto original = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(original.blocks.size() == 6u && original.natural_loops.size() == 1u &&
+            original.natural_loops.front().header == 3u,
+        "entered-region fixture has the wrong native CFG");
+  const auto *entered = original.FindBlock(3u);
+  Check(entered != nullptr && entered->predecessors.size() == 3u,
+        "the entered block should be reached from outside the region, from "
+        "inside it, and from its own latch");
+
+  const auto native_coverage =
+      CfgInstructionCoverage(original, decoded.instructions.size());
+  const auto graph = ShaderRecompiler::CFG::Structurize(original);
+  Check(!graph.unsupported,
+        "an externally entered selection region did not structure");
+  const auto structured_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  for (size_t index = 0; index < structured_coverage.size(); index++) {
+    Check(structured_coverage[index] >= native_coverage[index],
+          "structurization dropped a guest instruction");
+  }
+  CheckCfgPathsMatch(original, graph,
+                     "structurizing an externally entered region changed the "
+                     "path the shader takes");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  auto result = RecompileForTest(kEnteredRegionShader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "an externally entered selection region still took the dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // Control: the same shape with block 0 skipping the region has one entry.
+  uint32_t single_entry[std::size(kEnteredRegionShader)];
+  std::copy(std::begin(kEnteredRegionShader), std::end(kEnteredRegionShader),
+            std::begin(single_entry));
+  single_entry[1] = EncodeSopp(0x04, 9); // 0 -> the merge, not into the region
+  ShaderRecompiler::Decoder::Program single_decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{single_entry},
+                                           single_decoded);
+  auto single_graph = ShaderRecompiler::CFG::BuildGraph(single_decoded);
+  const auto single_coverage =
+      CfgInstructionCoverage(single_graph, single_decoded.instructions.size());
+  single_graph = ShaderRecompiler::CFG::Structurize(single_graph);
+  Check(!single_graph.unsupported,
+        "the single-entry control did not structure");
+  Check(CfgInstructionCoverage(single_graph,
+                               single_decoded.instructions.size()) ==
+            single_coverage,
+        "a region with one entry was copied anyway");
+}
 
 } // namespace
 } // namespace Libs::Graphics
+
+// The CFG cache is keyed by the guest code body alone.
+void TestStructurizedCfgIsCachedByBody() {
+  using namespace Libs::Graphics;
+  // Distinctive immediates, so no other case can have cached them first.
+  const std::array<uint32_t, 2> body{0xBF80002Au, 0xBF810000u};
+  const std::array<uint32_t, 3> other{0xBF80002Au, 0xBF80002Bu, 0xBF810000u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  const auto before = ShaderRecompiler::CfgCacheStatistics();
+  auto cold = ShaderRecompiler::TranslateProgram(body, options);
+  const auto after_cold = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_cold.misses == before.misses + 1u && after_cold.hits == before.hits,
+        "the first translation of a body did not miss the CFG cache");
+  Check(!cold.cfg_dump.empty(),
+        "the fixture did not reach a structured graph, so it proves nothing");
+
+  auto warm = ShaderRecompiler::TranslateProgram(body, options);
+  const auto after_warm = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_warm.hits == after_cold.hits + 1u && after_warm.misses == after_cold.misses,
+        "the second translation of one body structurized it again");
+  Check(warm.cfg_dump == cold.cfg_dump,
+        "the cached graph is not the graph the build produced");
+  Check(warm.status.ok == cold.status.ok,
+        "a cached graph changed what the translation decided");
+
+  auto different = ShaderRecompiler::TranslateProgram(other, options);
+  const auto after_different = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_different.misses == after_warm.misses + 1u &&
+            after_different.hits == after_warm.hits,
+        "a different guest body was served another body's graph");
+  Check(different.cfg_dump != cold.cfg_dump,
+        "two different bodies produced the same graph, so this case cannot tell them apart");
+
+  // A permutation miss or another stage changes no code, so it must hit.
+  auto pixel_options = MakeCompileOptions(ShaderType::Pixel);
+  pixel_options.dump_ir = true;
+  ShaderRecompiler::TranslateProgram(body, pixel_options);
+  const auto after_stage = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_stage.hits == after_different.hits + 1u &&
+            after_stage.misses == after_different.misses,
+        "the same body at another stage rebuilt a graph the stage cannot affect");
+}
 
 int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // These cases read the module before driver simplification.
+  ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(UINT32_MAX);
   TestRayTracingInstructions();
+  TestStructurizedCfgIsCachedByBody();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
@@ -16762,6 +18541,8 @@ int main() {
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
+  TestDriverSimplifySpeculatesGuardedLoads();
+  TestDriverSimplifyFoldsValues();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
@@ -16811,6 +18592,8 @@ int main() {
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
+  TestNewShaderRecompilerFlatCachePolicyAndScalarSext();
+  TestWaterfallImageRecord();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();
@@ -16839,6 +18622,8 @@ int main() {
   TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
   TestNewShaderRecompilerCfgMultipleLoopLatches();
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+  TestNewShaderRecompilerCfgLoopContinueSharedSelectionMerge();
+  TestNewShaderRecompilerCfgLoopContinueArmSharesEnclosingMerge();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
@@ -16849,6 +18634,7 @@ int main() {
   TestNativeGuardedSamplerSource(false);
   TestNativeGuardedSamplerSource(true);
   TestNativeConstantSamplerSelection();
+  TestNativeConstantSamplerSource();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
   TestCfgSiblingSharedExit();
@@ -16857,6 +18643,12 @@ int main() {
   TestNewShaderRecompilerCfgAlternatingSharedReturns();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
+  TestNewShaderRecompilerCfgSharedContinueForwarder();
+  TestNewShaderRecompilerCfgSelectionOnlyBreaksAndContinues();
+  TestNewShaderRecompilerCfgLargeEarlyReturnGraph();
+  TestNewShaderRecompilerCfgRoutedSharedTail();
+  TestNewShaderRecompilerCfgRoutedEarlyExit();
+  TestNewShaderRecompilerCfgRoutedSharedReturn();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation();
@@ -16876,10 +18668,15 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestPlainSetpcThroughS6DecodesFollowingCode();
+  TestSwappcAcceptsEveryHit();
+  TestFrontHalfDecodeStopsAtHandoff();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshDynamicScalarBufferLoad();
+  TestMeshAuxiliaryPositionOutputs();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();
@@ -16934,6 +18731,10 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestFlatAliasOfCustomInput();
+  TestFlatAliasOfSmoothInputDuplicates();
+  TestPixelDefaultValueInputs();
+  TestMeshTaskPayloadVariant();
   TestVop3F16InterpolationTranslation();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
@@ -16941,6 +18742,7 @@ int main() {
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
+  TestPixelStencilReferenceExport();
   TestGraphicsPushConstantPlacement();
   TestCapturedBufferLoadUbyteD16Decode();
   TestCapturedBufferStoreShortD16HiDecode();
@@ -16949,6 +18751,7 @@ int main() {
   TestCapturedBufferLoadD16XyzwDecode();
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
+  TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 

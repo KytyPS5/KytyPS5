@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <string>
+#include <vector>
+
 namespace Libs::Dialog {
 
 namespace CommonDialog {
@@ -70,7 +73,7 @@ int KYTY_SYSV_ABI MsgDialogProgressBarSetMsg(int target, const char* msg);
 
 namespace SystemDialog {
 
-enum class Kind { Error, Signin };
+enum class Kind { Error, Signin, SaveList };
 
 struct HostSnapshot {
 	Kind     kind;
@@ -84,12 +87,42 @@ struct VisualState {
 	uint64_t revision;
 };
 
+struct SaveListEntry {
+	std::string dir_name;
+	std::string title;
+	std::string sub_title;
+	std::string detail;
+	int64_t     mtime = 0;
+};
+
+struct SaveListSnapshot {
+	uint64_t                   generation   = 0;
+	int32_t                    display_type = 0;
+	bool                       has_new_item = false;
+	std::string                new_item_title;
+	std::vector<SaveListEntry> entries;
+};
+
 bool        GetHostSnapshot(HostSnapshot* snapshot);
+bool        GetSaveListSnapshot(SaveListSnapshot* snapshot);
 VisualState GetVisualState() noexcept;
 void        SetVisibilityCallback(void (*callback)());
 bool        HostClose(uint64_t generation);
+// entry < 0 selects the new-save item.
+bool HostSelectSave(uint64_t generation, int32_t entry);
 
 } // namespace SystemDialog
+
+namespace SaveDataDialog {
+
+constexpr size_t SAVE_DATA_PARAM_SIZE = 1328;
+
+// Fills the entry and the guest SceSaveDataParam bytes; false when the save does not exist.
+using SaveInfoProvider = bool (*)(int32_t user_id, const char* title_id, const char* dir_name,
+                                  SystemDialog::SaveListEntry* entry, void* param);
+void SetSaveInfoProvider(SaveInfoProvider provider);
+
+} // namespace SaveDataDialog
 
 namespace ErrorDialog {
 

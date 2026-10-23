@@ -51,6 +51,10 @@ static void PrintUsage() {
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
+	    "  --render-width <num>                 Guest render width. Default: the window width.\n");
+	::printf("  --render-height <num>                Guest render height. Default: the window "
+	         "height.\n");
+	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
@@ -89,7 +93,8 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
-	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
+	::printf("  --no-readback-linear-images          Do not read back writable linear images on "
+	         "submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
@@ -209,6 +214,7 @@ static constexpr Flag FLAGS[] = {
     {"--profile", &ConfigOptions::profiler_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
+    {"--no-readback-linear-images", &ConfigOptions::readback_linear_images, false},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
@@ -313,6 +319,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.screen_height) ||
 			    options.config.screen_height == 0) {
 				::printf("invalid screen height: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--render-width") {
+			if (!ParseUint32(value, options.config.render_width) ||
+			    options.config.render_width == 0) {
+				::printf("invalid render width: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--render-height") {
+			if (!ParseUint32(value, options.config.render_height) ||
+			    options.config.render_height == 0) {
+				::printf("invalid render height: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--user-name") {

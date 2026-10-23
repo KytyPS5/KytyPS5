@@ -4,15 +4,15 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <xbyak/xbyak.h>
-
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -50,6 +50,62 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
 	return runtime;
+}
+
+namespace {
+
+thread_local uint32_t            g_srt_read_slot  = UINT32_MAX;
+thread_local const RawReadEvent* g_raw_read_event = nullptr;
+
+class SrtReadSlotScope {
+public:
+	explicit SrtReadSlotScope(uint32_t slot): m_saved(g_srt_read_slot) { g_srt_read_slot = slot; }
+	~SrtReadSlotScope() { g_srt_read_slot = m_saved; }
+	SrtReadSlotScope(const SrtReadSlotScope&)            = delete;
+	SrtReadSlotScope& operator=(const SrtReadSlotScope&) = delete;
+
+private:
+	uint32_t m_saved;
+};
+
+class RawReadEventScope {
+public:
+	explicit RawReadEventScope(const RawReadEvent& event): m_saved(g_raw_read_event) {
+		g_raw_read_event = &event;
+	}
+	~RawReadEventScope() { g_raw_read_event = m_saved; }
+	RawReadEventScope(const RawReadEventScope&)            = delete;
+	RawReadEventScope& operator=(const RawReadEventScope&) = delete;
+
+private:
+	const RawReadEvent* m_saved;
+};
+
+} // namespace
+
+uint32_t CurrentSrtReadSlot() {
+	return g_srt_read_slot;
+}
+
+const RawReadEvent* CurrentRawReadEvent() {
+	return g_raw_read_event;
+}
+
+std::string_view SrtRefusalName(SrtRefusal reason) {
+	switch (reason) {
+		case SrtRefusal::None: return "no recorded reason";
+		case SrtRefusal::UnsupportedOpcode: return "unsupported opcode";
+		case SrtRefusal::UnsupportedOperand: return "unsupported operand";
+		case SrtRefusal::UndefinedValue: return "undefined value";
+		case SrtRefusal::VaryingPhi: return "loop-carried value varies per iteration";
+		case SrtRefusal::PhiNoEntry: return "loop-carried value has no entry value";
+		case SrtRefusal::PhiMerge: return "loop-carried value has disagreeing entry values";
+		case SrtRefusal::ReadOutOfBounds: return "read address out of range";
+		case SrtRefusal::ReadRefused: return "guest read refused";
+		case SrtRefusal::GpuOwned: return "GPU-owned data";
+		case SrtRefusal::VaryingLane: return "value varies per lane";
+	}
+	return "unknown reason";
 }
 
 namespace {
@@ -118,6 +174,31 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
+uint32_t DescriptorLoadDwords(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::LoadBufferU32x2: return 2u;
+		case ValueOpcode::LoadBufferU32x4: return 4u;
+		default: return 0u;
+	}
+}
+
+// A V# held in a buffer, read by one uniform DWORDX2/X4 load with no index or per-lane offset.
+bool IsDescriptorLoad(const ResourcePlan& values, const Inst& inst) {
+	const auto dwords = DescriptorLoadDwords(inst.GetOpcode());
+	if (dwords == 0u || inst.NumArgs() != 5u || inst.Arg(4).GetType() != Type::U1) {
+		return false;
+	}
+	const auto index = inst.Flags<MemoryFlags>().index;
+	if (index >= values.memory_info.size()) {
+		return false;
+	}
+	const auto& memory = values.memory_info[index];
+	return memory.kind == ResourceKind::Buffer && !memory.typed && !memory.formatted &&
+	       !memory.idxen && !memory.offen && memory.data_bits == 32u &&
+	       memory.data_dwords == dwords && memory.component_index == 0u &&
+	       inst.Arg(1).Resolve() == Value(0u) && inst.Arg(2).Resolve() == Value(0u);
+}
+
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
@@ -129,6 +210,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
@@ -137,8 +219,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
+		case ValueOpcode::SMulHi:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::UMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -151,14 +236,26 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::WqmU64:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThan64:
 		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::SLessThanEqual32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::UGreaterThanEqual32:
+		case ValueOpcode::SGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::INotEqual64:
@@ -166,14 +263,207 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
 		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
 		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
 		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32:
 		case ValueOpcode::FPIsNan32:
 		case ValueOpcode::FPMul32:
 		case ValueOpcode::FPRecipIFlag32:
 		case ValueOpcode::FPTrunc32: return true;
 		default: return false;
 	}
+}
+
+// Ops whose rule reads exactly this many operands, in order, before anything else.
+uint32_t PlainArgCount(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::ConditionRef:
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::WqmU64:
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPRecipIFlag32:
+		case ValueOpcode::FPTrunc32: return 1;
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::SMulHi:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftLeftLogical64:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::ShiftRightLogical64:
+		case ValueOpcode::ShiftRightArithmetic32:
+		case ValueOpcode::ShiftRightArithmetic64:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::UGreaterThanEqual32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
+		case ValueOpcode::SGreaterThanEqual32:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalXor:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32: return 2;
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32: return 3;
+		case ValueOpcode::BitFieldInsert: return 4;
+		default: return 0;
+	}
+}
+
+// The rule's operand order: ULessThan32 reads its bound first.
+uint32_t ChainArgument(ValueOpcode op, uint32_t step) {
+	return op == ValueOpcode::ULessThan32 ? 1u - step : step;
+}
+
+// An operand value that decides the result on its own, as the rule would short-circuit.
+bool DecidesResult(ValueOpcode op, uint32_t argument, uint64_t value) {
+	switch (op) {
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::ULessThanEqual32: return argument == 0u && value == 0u;
+		case ValueOpcode::LogicalOr: return argument == 0u && value != 0u;
+		case ValueOpcode::ULessThan32: return argument == 1u && static_cast<uint32_t>(value) == 0u;
+		default: return false;
+	}
+}
+
+// Whether the rule can still succeed after this operand failed.
+bool ToleratesFailedOperand(ValueOpcode op) {
+	return op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr;
+}
+
+// Whether a predicate reads nothing but the lane index and constants.
+bool IsClosedPredicate(Value root) {
+	std::vector<const Inst*>        pending;
+	std::unordered_set<const Inst*> seen;
+	const auto                      push = [&](Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst != nullptr && seen.insert(inst).second) pending.push_back(inst);
+	};
+	push(root);
+	while (!pending.empty()) {
+		const auto* inst = pending.back();
+		pending.pop_back();
+		const auto op    = inst->GetOpcode();
+		const auto plain = PlainArgCount(op);
+		bool       pure  = plain != 0 && inst->NumArgs() >= plain;
+		switch (op) {
+			case ValueOpcode::LaneId:
+			case ValueOpcode::DispatchThreadInRange:
+			case ValueOpcode::Ballot:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectF32:
+			case ValueOpcode::CompositeExtractU64: pure = true; break;
+			case ValueOpcode::CompositeExtractU32x4: {
+				const auto* source =
+				    inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+				pure = source != nullptr && source->GetOpcode() == ValueOpcode::Ballot;
+				break;
+			}
+			default: break;
+		}
+		if (!pure) return false;
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			push(inst->Arg(index));
+		}
+	}
+	return true;
 }
 
 class RuntimeValidator {
@@ -185,6 +475,20 @@ public:
 	bool Run(Value value) { return Validate(value); }
 
 private:
+	// Operands are walked on an explicit stack: integer chains run tens of thousands deep.
+	struct Scope {
+		Value active_mask;
+		bool  lane_bound                     = false;
+		bool  operator==(const Scope&) const = default;
+	};
+	struct Frame {
+		const Inst* inst;
+		Scope       scope;
+		uint32_t    next;
+		uint32_t    count;
+		bool        require_uniform;
+	};
+
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			if (!Validate(inst.Arg(index), require_uniform)) return false;
@@ -193,6 +497,34 @@ private:
 	}
 
 	bool Validate(Value value, bool require_uniform = true) {
+		const auto base = m_stack.size();
+		if (const auto entered = Enter(value, require_uniform)) return *entered;
+		bool failed = false;
+		for (;;) {
+			auto& frame = m_stack.back();
+			if (!failed && frame.next < frame.count) {
+				const auto arg     = frame.inst->Arg(frame.next++);
+				const auto entered = Enter(arg, frame.require_uniform);
+				failed             = entered.has_value() && !*entered;
+				continue;
+			}
+			const auto done = frame;
+			m_stack.pop_back();
+			const bool valid = Finish(done.inst, done.require_uniform, done.scope, !failed);
+			if (m_stack.size() == base) return valid;
+			failed = !valid;
+		}
+	}
+
+	bool Finish(const Inst* inst, bool require_uniform, const Scope& scope, bool valid) {
+		m_visiting.erase(inst);
+		if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+		if (valid && require_uniform) m_validated_uniform[inst].push_back(scope);
+		return valid;
+	}
+
+	// Empty when the operands still have to be walked: their frame is on the stack.
+	std::optional<bool> Enter(Value value, bool require_uniform) {
 		value = value.Resolve();
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
 		if (m_type != RuntimeValueType::Any &&
@@ -215,12 +547,30 @@ private:
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		if (require_uniform) {
+			const auto cached = m_validated_uniform.find(inst);
+			if (cached != m_validated_uniform.end() &&
+			    std::ranges::find(cached->second, Scope {m_active_mask, m_lane_bound}) !=
+			        cached->second.end()) {
+				return true;
+			}
+		}
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
-		const auto finish = [&](bool valid) {
-			m_visiting.erase(inst);
-			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+		const Scope scope {m_active_mask, m_lane_bound};
+		const auto finish = [&](bool valid) { return Finish(inst, require_uniform, scope, valid); };
+		const auto operands = [&](bool uniform) -> std::optional<bool> {
+			m_stack.push_back({inst, scope, 0u, static_cast<uint32_t>(inst->NumArgs()), uniform});
+			return std::nullopt;
+		};
+		const auto under_mask = [&](Value mask, Value operand, bool lane_bound) {
+			const Scope outer {m_active_mask, m_lane_bound};
+			m_active_mask    = mask;
+			m_lane_bound     = lane_bound;
+			const bool valid = Validate(operand);
+			m_active_mask    = outer.active_mask;
+			m_lane_bound     = outer.lane_bound;
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -240,15 +590,12 @@ private:
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return finish(false);
 			}
-			if (m_type != RuntimeValueType::Any) {
-				const auto active_mask = m_active_mask;
-				m_active_mask          = {};
-				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
-				m_active_mask          = active_mask;
-				if (!valid) return finish(false);
+			if (m_type != RuntimeValueType::Any &&
+			    !under_mask({}, m_program.srt_reads[slot.U32()].value, false)) {
+				return finish(false);
 			}
 		}
-		if (!require_uniform) return finish(ValidateArguments(*inst, false));
+		if (!require_uniform) return operands(false);
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
 		    inst->Arg(0).Resolve() == m_active_mask) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
@@ -293,6 +640,21 @@ private:
 			}
 			return finish(Validate(invariant));
 		}
+		if (op == ValueOpcode::Ballot) {
+			// Re-executed per lane and every lane counts: an all-true mask, not the enclosing one.
+			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::U1) {
+				return finish(false);
+			}
+			return finish(under_mask(Value(true), inst->Arg(0), true));
+		}
+		if (op == ValueOpcode::DispatchThreadInRange) {
+			return finish(inst->NumArgs() == 0);
+		}
+		if (op == ValueOpcode::LaneId) {
+			// Only a ballot re-executes its predicate per lane; elsewhere the value varies per
+			// lane.
+			return finish(inst->NumArgs() == 0 && m_lane_bound);
+		}
 		if (op == ValueOpcode::ReadFirstLane) {
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
 			    inst->Arg(1).GetType() != Type::U1) {
@@ -301,11 +663,7 @@ private:
 			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
 				return finish(false);
 			}
-			const auto active_mask = m_active_mask;
-			m_active_mask          = inst->Arg(1).Resolve();
-			const bool valid       = Validate(inst->Arg(0));
-			m_active_mask          = active_mask;
-			return finish(valid);
+			return finish(under_mask(inst->Arg(1).Resolve(), inst->Arg(0), false));
 		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
@@ -328,16 +686,36 @@ private:
 				return finish(Validate(inst->Arg(0)) &&
 				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 			}
+		} else if (DescriptorLoadDwords(op) != 0u) {
+			if (!IsDescriptorLoad(m_program, *inst) ||
+			    inst->Arg(0).ResolveInstruction() == nullptr ||
+			    inst->Arg(0).ResolveInstruction()->GetOpcode() != ValueOpcode::GetBufferResource) {
+				return finish(false);
+			}
+			const auto guard = inst->Arg(4).Resolve();
+			return finish(
+			    Validate(inst->Arg(0)) && Validate(inst->Arg(3)) &&
+			    ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
 				return finish(false);
 			}
-		} else if (op == ValueOpcode::CompositeExtractU32x2) {
+		} else if (op == ValueOpcode::CompositeExtractU32x2 ||
+		           op == ValueOpcode::CompositeExtractU32x4) {
 			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			const bool  wide   = op == ValueOpcode::CompositeExtractU32x4;
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= 2u || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
+			    index.U32() >= (wide ? 4u : 2u)) {
+				return finish(false);
+			}
+			const auto producer = source->GetOpcode();
+			const bool known =
+			    wide ? producer == ValueOpcode::Ballot || producer == ValueOpcode::LoadBufferU32x4
+			         : producer == ValueOpcode::CompositeConstructU32x2 ||
+			               producer == ValueOpcode::LoadBufferU32x2;
+			if (!known) {
 				return finish(false);
 			}
 		}
@@ -355,17 +733,19 @@ private:
 		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
 			return finish(false);
 		}
-		return finish(ValidateArguments(*inst, true));
+		return operands(true);
 	}
 
-	const ResourcePlan&             m_program;
-	RuntimeValueType                m_type;
-	bool                            m_wave_uniform;
-	Value                           m_active_mask;
-	std::unordered_set<const Inst*> m_visiting;
-	std::unordered_set<const Inst*> m_validated_dependencies;
+	const ResourcePlan&                                 m_program;
+	RuntimeValueType                                    m_type;
+	bool                                                m_wave_uniform;
+	Value                                               m_active_mask;
+	bool                                                m_lane_bound = false;
+	std::vector<Frame>                                  m_stack;
+	std::unordered_set<const Inst*>                     m_visiting;
+	std::unordered_set<const Inst*>                     m_validated_dependencies;
+	std::unordered_map<const Inst*, std::vector<Scope>> m_validated_uniform;
 };
-
 
 } // namespace
 
@@ -494,21 +874,99 @@ void CompileSrtWalker(ResourcePlan& program) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
+size_t RawReadOffsetArgument(ValueOpcode op) {
+	return DescriptorLoadDwords(op) != 0u ? 3u : 1u;
+}
+
+bool RawReadShapeOf(const ResourcePlan& program, const Inst& inst, uint32_t component_bytes,
+                    RawReadShape& shape) {
+	const auto index = inst.Flags<SrtReadFlags>().index;
+	if (index >= program.memory_info.size()) {
+		return false;
+	}
+	const auto op = inst.GetOpcode();
+	shape.immediate =
+	    static_cast<int64_t>(static_cast<int32_t>(program.memory_info[index].offset)) +
+	    component_bytes;
+	shape.kind = op == ValueOpcode::ReadConstBuffer ? RawReadShape::Kind::ConstBuffer
+	             : op == ValueOpcode::LoadBufferU32 ? RawReadShape::Kind::VectorBuffer
+	             : DescriptorLoadDwords(op) != 0u   ? RawReadShape::Kind::VectorDescriptor
+	                                                : RawReadShape::Kind::Address;
+	return true;
+}
+
+SrtRefusal RawReadAddressFrom(const RawReadShape& shape, const std::array<uint64_t, 5>& operands,
+                              uint64_t& address, bool& zero) {
+	zero              = false;
+	const auto high   = operands[1];
+	const auto offset = operands[2];
+	const auto base   = ((high << 32u) | static_cast<uint32_t>(operands[0])) & AddressMask;
+	if (shape.kind == RawReadShape::Kind::Address) {
+		const auto relative = (shape.immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		return AddSignedAddress(base & ~uint64_t {3}, relative, address)
+		           ? SrtRefusal::None
+		           : SrtRefusal::ReadOutOfBounds;
+	}
+	const auto records = operands[3];
+	const auto word3   = operands[4];
+	if (shape.immediate < 0) {
+		return SrtRefusal::UnsupportedOperand;
+	}
+	const auto byte_offset = (static_cast<uint64_t>(shape.immediate) & ~uint64_t {3}) +
+	                         (static_cast<uint32_t>(offset) & ~3u);
+	const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+	if (shape.kind != RawReadShape::Kind::ConstBuffer) {
+		// Only the uniform, unswizzled DWORD address is evaluated on the host.
+		if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u) {
+			return SrtRefusal::UnsupportedOperand;
+		}
+		if ((shape.kind == RawReadShape::Kind::VectorBuffer && stride == 0u) || records == 0u ||
+		    ((word3 >> 12u) & 0x7fu) == 0u) {
+			zero = true;
+			return SrtRefusal::None;
+		}
+	}
+	const auto size = stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+	                               : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+	if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		zero = true;
+		return SrtRefusal::None;
+	}
+	address = (base & ~uint64_t {3}) + byte_offset;
+	return SrtRefusal::None;
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_session(this),
-      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {}
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator), m_session(this),
+      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_state(&m_own_state),
+      m_context(AcquireContext()) {}
 
-SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
-                     SrtWalker* clean_evaluator)
-    : m_program(parent.m_program), m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
+SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean, SrtWalker* clean_evaluator,
+                     bool isolated)
+    : m_program(parent.m_program),
+      m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
-                    (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {}
+                    (clean_evaluator != nullptr ? 2u : 0u)),
+      m_isolated(isolated || parent.m_isolated), m_state(parent.m_state),
+      m_context(AcquireContext()) {
+	// A walker that takes phis on trust or binds a lane keeps its own memo, as do its children.
+	if (!isolated && parent.m_isolated) {
+		m_assumed        = parent.m_assumed;
+		m_barred         = parent.m_barred;
+		m_lane           = parent.m_lane;
+		m_suspended_lane = parent.m_suspended_lane;
+	}
+}
 
 SrtWalker::~SrtWalker() {
+	if (m_isolated) {
+		m_context.session = nullptr;
+		return;
+	}
 	if (m_session != this) return;
 	for (auto& context: m_program.evaluation_contexts)
 		if (context.session == this) context.session = nullptr;
@@ -517,6 +975,7 @@ SrtWalker::~SrtWalker() {
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
 	if (!EvaluateWide(value, wide)) {
+		m_refusal = m_state->last;
 		return false;
 	}
 	result = static_cast<uint32_t>(wide);
@@ -526,14 +985,15 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 	ResourcePlan::EvaluationContext* unused = nullptr;
 	for (auto& context: m_program.evaluation_contexts) {
-		if (context.session == m_session && context.active_mask == m_active_mask &&
-		    context.read_policy == m_read_policy) return context;
+		if (!m_isolated && context.session == m_session && context.active_mask == m_active_mask &&
+		    context.read_policy == m_read_policy)
+			return context;
 		if (context.session == nullptr && unused == nullptr) unused = &context;
 	}
 	auto& context = unused != nullptr ? *unused : m_program.evaluation_contexts.emplace_back();
-	context.session = m_session;
+	context.session     = m_isolated ? this : m_session;
 	context.active_mask = m_active_mask;
-	context.read_policy = m_read_policy;
+	context.read_policy = static_cast<uint8_t>(m_read_policy | (m_isolated ? 4u : 0u));
 	context.generation += 4;
 	return context;
 }
@@ -550,6 +1010,64 @@ float SrtWalker::Float32(uint64_t bits) {
 	return std::bit_cast<float>(static_cast<uint32_t>(bits));
 }
 
+bool SrtWalker::Refuse(SrtRefusal reason) {
+	m_state->last = reason;
+	++m_state->refusals;
+	return false;
+}
+
+bool SrtWalker::RefuseVolatile(SrtRefusal reason) {
+	++m_state->volatile_refusals;
+	return Refuse(reason);
+}
+
+uint64_t SrtWalker::VolatileRefusals() const {
+	return m_state->volatile_refusals +
+	       (m_clean_evaluator != nullptr ? m_clean_evaluator->m_state->volatile_refusals : 0u);
+}
+
+bool SrtWalker::Delegate(SrtWalker& walker, Value value, uint64_t& result) {
+	if (walker.EvaluateWide(value, result)) return true;
+	if (walker.m_state != m_state) Refuse(walker.m_state->last);
+	return false;
+}
+
+SrtWalker::Visit SrtWalker::BeginVisit(ResourcePlan::EvaluationContext::Entry& entry) {
+	Visit visit {++m_state->visits, VolatileRefusals(), m_state->cycle_root, DependenceScope(),
+	             false};
+	entry.generation    = m_context.generation | 1u;
+	entry.value         = visit.order;
+	m_state->cycle_root = UINT64_MAX;
+	if (visit.lane != nullptr) {
+		visit.outer_dependent = visit.lane->dependent;
+		visit.lane->dependent = false;
+	}
+	return visit;
+}
+
+void SrtWalker::EndVisit(const Visit& visit, uint32_t index, bool evaluated, uint64_t value) {
+	const auto cycle_root = m_state->cycle_root;
+	m_state->cycle_root   = std::min(visit.outer_cycle_root, cycle_root);
+	const bool dependent  = visit.lane != nullptr && visit.lane->dependent;
+	if (visit.lane != nullptr) visit.lane->dependent = visit.outer_dependent || dependent;
+	// Evaluation may grow the dense memo vector.
+	auto& memo          = m_context.values[index];
+	memo.lane_dependent = dependent;
+	if (evaluated) {
+		memo.value      = value;
+		memo.generation = m_context.generation;
+	} else if (cycle_root < visit.order || VolatileRefusals() != visit.volatile_refusals ||
+	           (dependent && m_shares_lanes)) {
+		// A path-dependent refusal (outer cycle, GPU-owned slot) is retried, not remembered.
+		memo.generation = 0;
+		return;
+	} else {
+		memo.value      = static_cast<uint64_t>(m_state->last);
+		memo.generation = m_context.generation | 2u;
+	}
+	if (dependent && m_shares_lanes) m_lane_entries.push_back(index);
+}
+
 bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
@@ -560,7 +1078,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 			case Type::U32: result = value.U32(); return true;
 			case Type::U64: result = value.U64(); return true;
 			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
+			default: return Refuse(SrtRefusal::UnsupportedOperand);
 		}
 	}
 	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
@@ -569,43 +1087,148 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
+	// A value a fixpoint trial assumes answers before the memo.
+	if (const auto* assumed = m_assumed.find(inst); assumed != nullptr) {
+		result = *assumed;
+		return true;
+	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 	if (index >= m_context.values.size()) {
 		m_context.values.resize(m_program.evaluation_value_count);
 	}
-	if (m_context.values[index].generation == m_context.generation) {
-		result = m_context.values[index].value;
+	auto& entry = m_context.values[index];
+	if (entry.generation == m_context.generation ||
+	    entry.generation == (m_context.generation | 2u)) {
+		if (auto* scope = DependenceScope(); scope != nullptr && entry.lane_dependent) {
+			scope->dependent = true;
+		}
+		if (entry.generation != m_context.generation) {
+			return Refuse(static_cast<SrtRefusal>(entry.value));
+		}
+		result = entry.value;
 		return true;
 	}
-	// Visiting and completed-unknown entries both stop repeated evaluation in this
-	// context. Only completed unknowns are retried when reachability becomes tighter.
-	if (m_context.values[index].generation == (m_context.generation | 1u) ||
-	    m_context.values[index].generation == (m_context.generation | 2u)) {
-		return false;
+	// A value still being evaluated: a cycle, which only a loop phi can close.
+	if (entry.generation == (m_context.generation | 1u)) {
+		m_state->cycle_root = std::min(m_state->cycle_root, entry.value);
+		return Refuse(SrtRefusal::VaryingPhi);
 	}
-	m_context.values[index].generation = m_context.generation | 1u;
-	uint64_t out = 0;
-	const bool evaluated = EvaluateInst(*inst, out);
-	// Recursive evaluation may grow the dense memo vector.
-	auto& memo = m_context.values[index];
-	if (!evaluated) {
-		memo.generation = m_context.generation | 2u;
-		return false;
+	const auto visit     = BeginVisit(entry);
+	uint64_t   out       = 0;
+	const auto plain     = PlainArgCount(inst->GetOpcode());
+	const bool evaluated = plain != 0 && inst->NumArgs() >= plain ? EvaluateChain(*inst, out)
+	                                                              : EvaluateInst(*inst, out);
+	EndVisit(visit, index, evaluated, out);
+	if (evaluated) result = out;
+	return evaluated;
+}
+
+const Inst* SrtWalker::ColdPlainOperand(Value value, uint32_t& index) {
+	value            = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || (!m_active_mask.IsEmpty() && value == m_active_mask)) {
+		return nullptr;
 	}
-	memo.value      = out;
-	memo.generation = m_context.generation;
-	result = out;
-	return true;
+	const auto count = PlainArgCount(inst->GetOpcode());
+	if (count == 0 || inst->NumArgs() < count || m_assumed.contains(inst)) {
+		return nullptr;
+	}
+	index = inst->EvaluationIndex(m_program.evaluation_value_count);
+	if (index >= m_context.values.size()) {
+		m_context.values.resize(m_program.evaluation_value_count);
+	}
+	const auto generation = m_context.values[index].generation;
+	return (generation | 3u) == (m_context.generation | 3u) ? nullptr : inst;
+}
+
+// EvaluateWide's recursion through plain operations, on an explicit stack in rule operand order.
+bool SrtWalker::EvaluateChain(const Inst& root, uint64_t& result) {
+	struct Frame {
+		const Inst* inst;
+		uint32_t    index;
+		uint32_t    next;
+		uint32_t    count;
+		Visit       visit;
+	};
+	static thread_local std::vector<Frame> stack;
+	struct Unwind {
+		std::vector<Frame>& frames;
+		size_t              base;
+		~Unwind() { frames.resize(base); }
+	} const unwind {stack, stack.size()};
+	const auto base = unwind.base;
+	stack.push_back({&root, 0u, 0u, PlainArgCount(root.GetOpcode()), {}});
+	bool failed = false;
+	// Applies an operand's outcome to the frame that asked for it.
+	const auto settle = [&](bool ok, uint64_t value) {
+		auto&      owner    = stack.back();
+		const auto op       = owner.inst->GetOpcode();
+		const auto argument = ChainArgument(op, owner.next - 1u);
+		if (!ok) {
+			failed = !ToleratesFailedOperand(op);
+		} else if (DecidesResult(op, argument, value)) {
+			owner.next = owner.count;
+		}
+	};
+	for (;;) {
+		auto& frame = stack.back();
+		if (!failed && frame.next < frame.count) {
+			const auto arg = frame.inst->Arg(ChainArgument(frame.inst->GetOpcode(), frame.next++));
+			uint32_t   index = 0;
+			if (const auto* cold = ColdPlainOperand(arg, index)) {
+				const auto visit = BeginVisit(m_context.values[index]);
+				stack.push_back({cold, index, 0u, PlainArgCount(cold->GetOpcode()), visit});
+				continue;
+			}
+			// EvaluateWide can re-enter this walk and grow the stack, so `frame` may dangle.
+			uint64_t   value = 0;
+			const bool ok    = EvaluateWide(arg, value);
+			settle(ok, value);
+			continue;
+		}
+		const auto current   = frame;
+		uint64_t   out       = 0;
+		const bool evaluated = !failed && EvaluateInst(*current.inst, out);
+		if (stack.size() == base + 1u) {
+			result = out;
+			return evaluated;
+		}
+		EndVisit(current.visit, current.index, evaluated, out);
+		stack.pop_back();
+		failed = false;
+		settle(evaluated, out);
+	}
 }
 
 bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 	return EvaluateWide(inst.Arg(index), result);
+}
+
+const ResourcePlan::PhiPlan* SrtWalker::FrozenPhiPlan(const Inst& inst) {
+	if (!m_program.frozen_values) {
+		return nullptr;
+	}
+	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
+	if (index < m_program.phi_plan_index.size() && m_program.phi_plan_index[index] != UINT32_MAX) {
+		return &m_program.phi_plans[m_program.phi_plan_index[index]];
+	}
+	const Value phi(const_cast<Inst*>(&inst));
+	auto&       plan = m_program.phi_plans.emplace_back();
+	plan.invariant   = ResolveInvariantPhi(m_program, phi);
+	if (plan.invariant.IsEmpty()) {
+		plan.entry = ResolveCyclicPhiEntry(m_program, phi, &plan.web);
+	}
+	if (index >= m_program.phi_plan_index.size()) {
+		m_program.phi_plan_index.resize(index + 1u, UINT32_MAX);
+	}
+	m_program.phi_plan_index[index] = static_cast<uint32_t>(m_program.phi_plans.size() - 1u);
+	return &plan;
 }
 
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
@@ -616,24 +1239,72 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 			if (m_reachable_blocks != nullptr &&
 			    !m_reachable_blocks->at(control->second[index])) continue;
 			uint64_t incoming = 0;
-			if (!Arg(inst, index, incoming) || (found && incoming != result)) return false;
+			if (!Arg(inst, index, incoming)) return false;
+			if (found && incoming != result) return Refuse(SrtRefusal::VaryingPhi);
 			result = incoming;
 			found = true;
 		}
-		return found;
+		return found || Refuse(SrtRefusal::UndefinedValue);
 	}
-	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-	return !value.IsEmpty() && EvaluateWide(value, result);
+	const Value phi(const_cast<Inst*>(&inst));
+	const auto* frozen = FrozenPhiPlan(inst);
+	const auto  value = frozen != nullptr ? frozen->invariant : ResolveInvariantPhi(m_program, phi);
+	if (!value.IsEmpty()) {
+		return EvaluateWide(value, result);
+	}
+	if (m_barred.contains(&inst)) {
+		return Refuse(SrtRefusal::VaryingPhi);
+	}
+	// Loop-carried: assume the entry value and require every operand of the phi web to reproduce
+	// it.
+	std::vector<const Inst*> resolved_web;
+	CyclicPhiFailure         failure;
+	const auto entry = frozen != nullptr
+	                       ? frozen->entry
+	                       : ResolveCyclicPhiEntry(m_program, phi, &resolved_web, &failure);
+	if (entry.IsEmpty()) {
+		if (frozen != nullptr) ResolveCyclicPhiEntry(m_program, phi, nullptr, &failure);
+		return Refuse(failure.reason == CyclicPhiReject::Merge ? SrtRefusal::PhiMerge
+		                                                       : SrtRefusal::PhiNoEntry);
+	}
+	const auto& web       = frozen != nullptr ? frozen->web : resolved_web;
+	uint64_t    candidate = 0;
+	if (!EvaluateWide(entry, candidate)) {
+		return false;
+	}
+	// A separate memo: this walk already holds the operands the phi was reached through.
+	SrtWalker trial(*this, m_active_mask, false, m_clean_evaluator, true);
+	trial.m_assumed        = m_assumed;
+	trial.m_barred         = m_barred;
+	trial.m_lane           = m_lane;
+	trial.m_suspended_lane = m_suspended_lane;
+	for (const auto* member: web) {
+		if (trial.m_assumed.emplace(member, candidate) != candidate) {
+			return Refuse(SrtRefusal::VaryingPhi);
+		}
+	}
+	for (const auto* member: web) {
+		for (size_t index = 0; index < member->NumArgs(); index++) {
+			uint64_t carried = 0;
+			if (!trial.EvaluateWide(member->Arg(index), carried)) return false;
+			if (carried != candidate) return Refuse(SrtRefusal::VaryingPhi);
+		}
+	}
+	result = candidate;
+	return true;
 }
 
 bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	const auto index = inst.Arg(1).Resolve();
 	if (!index.IsImmediate() || index.GetType() != Type::U32) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	const auto component = index.U32();
+	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU32x4) {
+		return EvaluateExtractU32x4(inst, component, result);
+	}
 	if (component >= 2u) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
 		uint64_t packed = 0;
@@ -645,21 +1316,52 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	}
 	const auto* source = inst.Arg(0).ResolveInstruction();
 	if (source == nullptr) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
 	}
-	return false;
+	if (source->GetOpcode() == ValueOpcode::LoadBufferU32x2 &&
+	    IsDescriptorLoad(m_program, *source)) {
+		if (m_clean_evaluator != nullptr && m_clean_evaluator->m_active_mask == m_active_mask) {
+			return Delegate(*m_clean_evaluator, Value(const_cast<Inst*>(&inst)), result);
+		}
+		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
+	}
+	return Refuse(SrtRefusal::UnsupportedOperand);
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
-	const auto flags = inst.Flags<SrtReadFlags>();
-	if (flags.index >= m_program.memory_info.size()) {
-		return false;
+bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result) {
+	const auto* source = inst.Arg(0).ResolveInstruction();
+	if (source == nullptr || component >= 4u) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
-	const auto& mem    = m_program.memory_info[flags.index];
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	if (source->GetOpcode() == ValueOpcode::Ballot) {
+		// The ballot packs lanes 0-31 and 32-63 into the low two dwords; the upper two are zero.
+		uint64_t mask = 0;
+		if (!Arg(inst, 0, mask)) {
+			return false;
+		}
+		result = component < 2u ? static_cast<uint32_t>(mask >> (component * 32u)) : 0u;
+		return true;
+	}
+	if (source->GetOpcode() == ValueOpcode::LoadBufferU32x4 &&
+	    IsDescriptorLoad(m_program, *source)) {
+		if (m_clean_evaluator != nullptr && m_clean_evaluator->m_active_mask == m_active_mask) {
+			return Delegate(*m_clean_evaluator, Value(const_cast<Inst*>(&inst)), result);
+		}
+		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
+	}
+	return Refuse(SrtRefusal::UnsupportedOperand);
+}
+
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes) {
+	RawReadShape shape;
+	if (!RawReadShapeOf(m_program, inst, component_bytes, shape)) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
+	}
+	const bool vector = shape.kind == RawReadShape::Kind::VectorBuffer ||
+	                    shape.kind == RawReadShape::Kind::VectorDescriptor;
 	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
 	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
 		uint64_t enabled = 0;
@@ -671,68 +1373,130 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
+	}
+	RawReadEvent event {.inst = &inst, .component_bytes = component_bytes};
+	auto&        operands = event.operands;
+	if (!Arg(*handle, 0, operands[0]) || !Arg(*handle, 1, operands[1]) ||
+	    !Arg(inst, RawReadOffsetArgument(inst.GetOpcode()), operands[2])) {
 		return false;
 	}
-	uint64_t low    = 0;
-	uint64_t high   = 0;
-	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
-		return false;
+	if (shape.kind != RawReadShape::Kind::Address) {
+		if (handle->NumArgs() != 4u) return Refuse(SrtRefusal::UnsupportedOperand);
+		if (!Arg(*handle, 2, operands[3]) || !Arg(*handle, 3, operands[4])) return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-			return false;
-		}
-		if (immediate < 0) {
-			return false;
-		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
-				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
-			}
-		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			result = 0u;
-			return true;
-		}
-		address = (base & ~uint64_t {3}) + byte_offset;
-	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
-		}
+	uint64_t address = 0;
+	if (const auto refusal = RawReadAddressFrom(shape, operands, address, event.zero);
+	    refusal != SrtRefusal::None) {
+		return Refuse(refusal);
+	}
+	const RawReadEventScope event_scope(event);
+	if (event.zero) {
+		if (m_runtime.zero_read != nullptr) m_runtime.zero_read(m_runtime.userdata);
+		result = 0u;
+		return true;
+	}
+	if (const auto slot = g_srt_read_slot;
+	    m_runtime.gpu_owned != nullptr && slot < m_program.data_flat_slots.size() &&
+	    m_program.data_flat_slots[slot] != 0u &&
+	    m_program.srt_reads[slot].value.Resolve().TryInstruction() == &inst &&
+	    m_runtime.gpu_owned(m_runtime.userdata, address, sizeof(uint32_t))) {
+		return RefuseVolatile(SrtRefusal::GpuOwned);
 	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
+			return Refuse(SrtRefusal::ReadRefused);
 		}
 	} else {
-		if (vector) return false;
+		if (vector) return Refuse(SrtRefusal::ReadRefused);
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
 	return true;
 }
 
+void SrtWalker::BarAssumptions(SrtWalker& walker) const {
+	// A lane walk resolves selects on its own mask, so assumptions made above it need not hold.
+	walker.m_barred = m_barred;
+	for (const auto& assumed: m_assumed)
+		walker.m_barred.insert(assumed.first);
+}
+
+uint32_t SrtWalker::ClosedBallotIndex(const Inst& ballot) {
+	const auto index = ballot.EvaluationIndex(m_program.evaluation_value_count);
+	auto&      table = m_program.closed_ballots;
+	if (index >= table.size()) {
+		table.resize(std::max<size_t>(index + 1u, m_program.evaluation_value_count));
+	}
+	auto& entry = table[index];
+	if (entry.state == ResourcePlan::ClosedBallot::Unknown) {
+		entry.state = IsClosedPredicate(ballot.Arg(0)) ? ResourcePlan::ClosedBallot::Closed
+		                                               : ResourcePlan::ClosedBallot::Open;
+	}
+	return entry.state == ResourcePlan::ClosedBallot::Open ? UINT32_MAX : index;
+}
+
+void SrtWalker::ForgetLaneValues() {
+	for (const auto index: m_lane_entries)
+		m_context.values[index].generation = 0;
+	m_lane_entries.clear();
+}
+
+bool SrtWalker::EvaluateBallot(const Inst& inst, uint64_t& result) {
+	// One bit per lane; a predicate that never asks for the lane takes one walk for the wave.
+	const auto lanes = m_program.wave_size;
+	if (lanes == 0u || lanes > 64u) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
+	}
+	const auto wave = lanes == 64u ? ~uint64_t {0} : (uint64_t {1} << lanes) - 1u;
+	// A predicate of the lane index and constants alone has one mask per frozen plan.
+	const auto closed = m_program.frozen_values ? ClosedBallotIndex(inst) : UINT32_MAX;
+	if (closed != UINT32_MAX &&
+	    m_program.closed_ballots[closed].state == ResourcePlan::ClosedBallot::Known) {
+		result = m_program.closed_ballots[closed].mask;
+		return true;
+	}
+	LaneScope scope;
+	SrtWalker clean_lane(*this, Value(true), true, nullptr, true);
+	SrtWalker lane_walk(*this, Value(true), false, &clean_lane, true);
+	for (auto* walker: {&clean_lane, &lane_walk}) {
+		walker->m_lane         = &scope;
+		walker->m_shares_lanes = true;
+		BarAssumptions(*walker);
+	}
+	uint64_t mask = 0;
+	for (scope.lane = 0; scope.lane < lanes; ++scope.lane) {
+		scope.dependent = false;
+		clean_lane.ForgetLaneValues();
+		lane_walk.ForgetLaneValues();
+		uint64_t taken = 0;
+		if (!lane_walk.EvaluateWide(inst.Arg(0), taken)) {
+			return false;
+		}
+		if (scope.lane == 0u && !scope.dependent) {
+			mask = taken != 0u ? wave : 0u;
+			break;
+		}
+		if (taken != 0u) mask |= uint64_t {1} << scope.lane;
+	}
+	if (closed != UINT32_MAX) {
+		m_program.closed_ballots[closed] = {ResourcePlan::ClosedBallot::Known, mask};
+	}
+	result = mask;
+	return true;
+}
+
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
+	const auto refusals = m_state->refusals;
+	if (EvaluateRule(inst, result)) return true;
+	// The operands evaluated but this instruction cannot combine them.
+	if (m_state->refusals == refusals) Refuse(SrtRefusal::UnsupportedOperand);
+	return false;
+}
+
+bool SrtWalker::EvaluateRule(const Inst& inst, uint64_t& result) {
 	uint64_t   a       = 0;
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
@@ -740,6 +1504,13 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	const auto ternary = [&]() {
 		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 	};
+	const auto s32 = [](uint64_t value) {
+		return std::bit_cast<int32_t>(static_cast<uint32_t>(value));
+	};
+	const auto f32 = [](float value) {
+		return static_cast<uint64_t>(std::bit_cast<uint32_t>(value));
+	};
+	const auto nan2 = [&]() { return std::isnan(Float32(a)) || std::isnan(Float32(b)); };
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
@@ -753,18 +1524,56 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 		case ValueOpcode::ReadFirstLane: {
+			// A uniform operand, so a ballot lane bound above does not reach it.
+			auto* lane       = m_lane;
+			auto* suspended  = m_suspended_lane;
+			m_suspended_lane = DependenceScope();
+			m_lane           = nullptr;
+			bool evaluated   = false;
 			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
-				return EvaluateWide(inst.Arg(0), result);
+				evaluated = EvaluateWide(inst.Arg(0), result);
+			} else {
+				SrtWalker clean_active(*this, inst.Arg(1), true);
+				SrtWalker active(*this, inst.Arg(1), false, &clean_active);
+				evaluated = active.EvaluateWide(inst.Arg(0), result);
 			}
-			SrtWalker clean_active(*this, inst.Arg(1), true);
-			SrtWalker active(*this, inst.Arg(1), false, &clean_active);
-			return active.EvaluateWide(inst.Arg(0), result);
+			m_lane           = lane;
+			m_suspended_lane = suspended;
+			return evaluated;
+		}
+		case ValueOpcode::Ballot: return EvaluateBallot(inst, result);
+		case ValueOpcode::DispatchThreadInRange: result = 1u; return true;
+		case ValueOpcode::LaneId:
+			// Only a per-lane sweep binds the lane; elsewhere the value varies per lane.
+			if (m_lane == nullptr) return Refuse(SrtRefusal::VaryingLane);
+			m_lane->dependent = true;
+			result            = m_lane->lane;
+			return true;
+		case ValueOpcode::ReadConst: {
+			const auto slot = inst.Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) {
+				return false;
+			}
+			// A flat slot is also refreshed outside any lane sweep, so it must hold without a lane.
+			auto* lane       = m_lane;
+			auto* suspended  = m_suspended_lane;
+			m_suspended_lane = DependenceScope();
+			m_lane           = nullptr;
+			const SrtReadSlotScope scope(slot.U32());
+			const bool read  = EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
+			m_lane           = lane;
+			m_suspended_lane = suspended;
+			return read;
 		}
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 		case ValueOpcode::CompositeExtractU64:
-		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4: return EvaluateExtract(inst, result);
 		case ValueOpcode::CompositeConstructU64:
+		// A U32x2 packs into the same 64-bit word the extract cases read back.
+		case ValueOpcode::CompositeConstructU32x2:
 			if (!binary()) {
 				return false;
 			}
@@ -779,7 +1588,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				    (inst.Flags<SrtReadFlags>().clean != 0u ||
 				     (inst.GetOpcode() == ValueOpcode::LoadBufferU32 &&
 				      m_clean_evaluator->m_active_mask == m_active_mask))) {
-					return m_clean_evaluator->EvaluateWide(Value(const_cast<Inst*>(&inst)), result);
+					return Delegate(*m_clean_evaluator, Value(const_cast<Inst*>(&inst)), result);
 				}
 				return EvaluateRawRead(inst, result);
 			}
@@ -820,12 +1629,28 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::SMulHi:
+			if (binary()) {
+				const auto product = static_cast<int64_t>(s32(a)) * static_cast<int64_t>(s32(b));
+				result             = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32u);
+				return true;
+			}
+			return false;
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
 			if (binary()) {
 				result = inst.GetOpcode() == ValueOpcode::UMin32
 				    ? std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b))
 				    : std::max(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
+			if (binary()) {
+				result = static_cast<uint32_t>(inst.GetOpcode() == ValueOpcode::SMin32
+				                                   ? std::min(s32(a), s32(b))
+				                                   : std::max(s32(a), s32(b)));
 				return true;
 			}
 			return false;
@@ -888,6 +1713,96 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2: {
+			if (!Arg(inst, 0, a)) return false;
+			const auto x = Float32(a);
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::FPAbs32: result = f32(std::fabs(x)); break;
+				case ValueOpcode::FPNeg32: result = f32(-x); break;
+				case ValueOpcode::FPSaturate32: result = f32(std::clamp(x, 0.0f, 1.0f)); break;
+				case ValueOpcode::FPRoundEven32: result = f32(std::nearbyint(x)); break;
+				case ValueOpcode::FPFloor32: result = f32(std::floor(x)); break;
+				case ValueOpcode::FPCeil32: result = f32(std::ceil(x)); break;
+				case ValueOpcode::FPFract32: result = f32(x - std::floor(x)); break;
+				case ValueOpcode::FPSqrt: result = f32(std::sqrt(x)); break;
+				case ValueOpcode::FPRecip32: result = f32(1.0f / x); break;
+				case ValueOpcode::FPRecipSqrt32: result = f32(1.0f / std::sqrt(x)); break;
+				case ValueOpcode::FPExp2: result = f32(std::exp2(x)); break;
+				default: result = f32(std::log2(x)); break;
+			}
+			return true;
+		}
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32: {
+			if (!ternary()) return false;
+			const auto x  = Float32(a);
+			const auto y  = Float32(b);
+			const auto z  = Float32(c);
+			const auto lo = std::fmin(std::fmin(x, y), z);
+			const auto hi = std::fmax(std::fmax(x, y), z);
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::FPMinTri32: result = f32(lo); break;
+				case ValueOpcode::FPMaxTri32: result = f32(hi); break;
+				case ValueOpcode::FPMedTri32: result = f32(x + y + z - lo - hi); break;
+				default: result = f32(x * y + z); break;
+			}
+			return true;
+		}
+		case ValueOpcode::FPLdexp:
+			if (binary()) {
+				result = f32(std::ldexp(Float32(a), s32(b)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32: {
+			if (!binary()) return false;
+			const auto x = Float32(a);
+			const auto y = Float32(b);
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::FPAdd32: result = f32(x + y); break;
+				case ValueOpcode::FPSub32: result = f32(x - y); break;
+				case ValueOpcode::FPMin32: result = f32(std::fmin(x, y)); break;
+				case ValueOpcode::FPMax32: result = f32(std::fmax(x, y)); break;
+				case ValueOpcode::FPOrdEqual32: result = x == y; break;
+				case ValueOpcode::FPOrdNotEqual32: result = !nan2() && x != y; break;
+				case ValueOpcode::FPOrdLessThan32: result = x < y; break;
+				case ValueOpcode::FPOrdGreaterThan32: result = x > y; break;
+				case ValueOpcode::FPUnordEqual32: result = nan2() || x == y; break;
+				case ValueOpcode::FPUnordNotEqual32: result = x != y; break;
+				case ValueOpcode::FPUnordLessThan32: result = nan2() || x < y; break;
+				case ValueOpcode::FPUnordGreaterThan32: result = nan2() || x > y; break;
+				case ValueOpcode::FPUnordLessThanEqual32: result = nan2() || x <= y; break;
+				default: result = nan2() || x >= y; break;
+			}
+			return true;
+		}
 		case ValueOpcode::BitwiseAnd32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a & b);
@@ -915,6 +1830,51 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitwiseNot32:
 			if (Arg(inst, 0, a)) {
 				result = ~static_cast<uint32_t>(a);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitReverse32:
+			if (Arg(inst, 0, a)) {
+				auto value = static_cast<uint32_t>(a);
+				value      = ((value & 0x55555555u) << 1u) | ((value >> 1u) & 0x55555555u);
+				value      = ((value & 0x33333333u) << 2u) | ((value >> 2u) & 0x33333333u);
+				value      = ((value & 0x0f0f0f0fu) << 4u) | ((value >> 4u) & 0x0f0f0f0fu);
+				value      = ((value & 0x00ff00ffu) << 8u) | ((value >> 8u) & 0x00ff00ffu);
+				result     = (value << 16u) | (value >> 16u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitCount32:
+			if (Arg(inst, 0, a)) {
+				result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(a)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindUMsb32:
+			if (Arg(inst, 0, a)) {
+				const auto value = static_cast<uint32_t>(a);
+				result =
+				    value == 0u ? UINT32_MAX : static_cast<uint32_t>(31 - std::countl_zero(value));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindILsb32:
+			if (Arg(inst, 0, a)) {
+				const auto value = static_cast<uint32_t>(a);
+				result = value == 0u ? UINT32_MAX : static_cast<uint32_t>(std::countr_zero(value));
+				return true;
+			}
+			return false;
+		case ValueOpcode::WqmU64:
+			// S_WQM_B64: every group of four mask bits becomes all ones if any of them is set.
+			if (Arg(inst, 0, a)) {
+				const auto quads = [](uint32_t word) {
+					auto bits = word | (word >> 1u);
+					bits |= bits >> 2u;
+					return static_cast<uint32_t>((bits & 0x11111111u) * 0x0fu);
+				};
+				result = quads(static_cast<uint32_t>(a)) |
+				         (static_cast<uint64_t>(quads(static_cast<uint32_t>(a >> 32u))) << 32u);
 				return true;
 			}
 			return false;
@@ -1013,7 +1973,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectF32: {
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-			if (predicate.EvaluateWide(inst.Arg(0), a)) {
+			if (Delegate(predicate, inst.Arg(0), a)) {
 				return Arg(inst, a != 0u ? 1u : 2u, result);
 			}
 			return false;
@@ -1065,10 +2025,36 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::UGreaterThanEqual32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::UGreaterThan64:
+			if (binary()) {
+				result = inst.GetOpcode() == ValueOpcode::ULessThan64 ? a < b : a > b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThan64:
+			if (binary()) {
+				result = std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 			if (binary()) {
-				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
-				         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+				switch (inst.GetOpcode()) {
+					case ValueOpcode::SLessThan32: result = s32(a) < s32(b); break;
+					case ValueOpcode::SLessThanEqual32: result = s32(a) <= s32(b); break;
+					case ValueOpcode::SGreaterThan32: result = s32(a) > s32(b); break;
+					default: result = s32(a) >= s32(b); break;
+				}
 				return true;
 			}
 			return false;
@@ -1118,13 +2104,15 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU32: return false;
+		case ValueOpcode::UndefU32: return Refuse(SrtRefusal::UndefinedValue);
 		default: break;
 	}
-	return false;
+	return Refuse(SrtRefusal::UnsupportedOpcode);
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	m_refusal = SrtRefusal::None;
 	if (source >= m_program.descriptor_sources.size()) {
+		m_refusal = SrtRefusal::UnsupportedOperand;
 		return false;
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];
@@ -1138,7 +2126,9 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
-bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWalker* conditions,
+                                  std::vector<uint32_t>* gpu_owned_slots) {
+	m_refusal = SrtRefusal::None;
 	if (!m_program.srt_plan_complete) return false;
 	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
 		flat.resize(m_program.srt_reads.size());
@@ -1149,15 +2139,30 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
 		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
 	}
+	const auto fail = [&](SrtRefusal reason) {
+		m_refusal = reason;
+		return false;
+	};
+	bool       owned   = false;
 	const auto refresh = [&](uint32_t slot) {
-		if (slot >= m_program.srt_reads.size()) return false;
+		if (slot >= m_program.srt_reads.size()) return fail(SrtRefusal::UnsupportedOperand);
 		const auto& read = m_program.srt_reads[slot];
 		const auto* inst = read.value.ResolveInstruction();
 		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
-			return false;
+			return fail(SrtRefusal::ReadRefused);
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size()) return fail(SrtRefusal::UnsupportedOperand);
+		const SrtReadSlotScope scope(slot);
+		if (evaluator.Evaluate(read.value, flat[read.flat_offset])) return true;
+		if (gpu_owned_slots != nullptr && evaluator.m_refusal == SrtRefusal::GpuOwned) {
+			// A data slot the GPU owns stays a native load; the caller learns every such slot.
+			gpu_owned_slots->push_back(slot);
+			flat[read.flat_offset] = 0u;
+			owned                  = true;
+			return true;
+		}
+		return fail(evaluator.m_refusal);
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
@@ -1166,19 +2171,22 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 			if (!refresh(slot)) return false;
 		}
-		return true;
+		return !owned || fail(SrtRefusal::GpuOwned);
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& reachable = m_program.reachable_blocks;
 	auto& pending = m_program.pending_blocks;
 	visited.assign(m_program.control_flow.size(), 1u);
-	ResetUnknowns();
-	m_reachable_blocks = &visited;
-	if (m_clean_evaluator != nullptr) {
-		m_clean_evaluator->ResetUnknowns();
-		m_clean_evaluator->m_reachable_blocks = &visited;
+	auto& predicate = conditions != nullptr          ? *conditions
+	                  : m_clean_evaluator != nullptr ? *m_clean_evaluator
+	                                                 : *this;
+	for (auto* walker: {this, m_clean_evaluator, conditions}) {
+		if (walker == nullptr) continue;
+		walker->ResetUnknowns();
+		walker->m_reachable_blocks = &visited;
 	}
-	for (;;) {
+	// Without pruning every block counts as reachable and no branch condition is read.
+	while (prune) {
 		reachable.assign(m_program.control_flow.size(), 0u);
 		pending.clear();
 		pending.push_back(0u);
@@ -1188,8 +2196,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			if (reachable.at(index)) continue;
 			reachable[index] = 1u;
 			const auto& block = m_program.control_flow[index];
-			uint32_t condition = 0;
-			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			uint32_t    condition = 0;
 			if (!block.condition.IsEmpty() &&
 			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
 			    predicate.Evaluate(block.condition, condition)) {
@@ -1203,8 +2210,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (m_program.control_phi_predecessors.empty()) break;
 		// Only unknown values need another evaluation: successful Phi facts remain
 		// true as their possible predecessors shrink. Keep uniform-read memos stable.
-		ResetUnknowns();
-		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
+		for (auto* walker: {this, m_clean_evaluator, conditions})
+			if (walker != nullptr) walker->ResetUnknowns();
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
@@ -1217,7 +2224,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		for (const auto slot: block.srt_reads)
 			if (!refresh(slot)) return false;
 	}
-	return true;
+	return !owned || fail(SrtRefusal::GpuOwned);
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {

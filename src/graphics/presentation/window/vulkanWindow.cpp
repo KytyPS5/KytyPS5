@@ -440,11 +440,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	// A second queue of the same family carries readbacks that must not wait behind the first.
+	uint32_t queue_family_count = 0;
+	physical_device.getQueueFamilyProperties(&queue_family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> queue_families(queue_family_count);
+	physical_device.getQueueFamilyProperties(&queue_family_count, queue_families.data());
+	EXIT_IF(queue_family >= queue_family_count);
+	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
+	vk::DeviceQueueCreateInfo  queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = std::min(2u, queue_families[queue_family].queueCount);
+	queue_create_info.pQueuePriorities = queue_priorities.data();
+	graphics.queue_count               = queue_create_info.queueCount;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -492,6 +499,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		feedback_dynamic.pNext = supported_features2.pNext;
 		feedback_layout.pNext  = &feedback_dynamic;
 		supported_features2.pNext = &feedback_layout;
+	}
+	// Optional: without it pipelines are built monolithically.
+	const auto available_device_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+	    "vkEnumerateDeviceExtensionProperties",
+	    [&](uint32_t* count, vk::ExtensionProperties* values) {
+		    return physical_device.enumerateDeviceExtensionProperties(nullptr, count, values);
+	    });
+	const bool pipeline_library_extensions =
+	    HasExtension(available_device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+	    HasExtension(available_device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library {};
+	if (pipeline_library_extensions) {
+		graphics_pipeline_library.pNext = supported_features2.pNext;
+		supported_features2.pNext       = &graphics_pipeline_library;
 	}
 	const bool provoking_extension =
 	    HasExtension(device_extensions, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
@@ -547,6 +568,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	features12.drawIndirectCount        = supported_features12.drawIndirectCount;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -564,6 +586,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	graphics.task_shader_enabled = graphics.mesh_shader_enabled && supported_mesh.taskShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -577,6 +600,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
+	}
+	vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library_properties {};
+	if (pipeline_library_extensions) {
+		graphics_pipeline_library_properties.pNext = properties2.pNext;
+		properties2.pNext                          = &graphics_pipeline_library_properties;
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
@@ -597,6 +625,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	graphics.pipeline_library_enabled =
+	    pipeline_library_extensions && graphics_pipeline_library.graphicsPipelineLibrary == VK_TRUE;
+	// Without fast linking a link is itself a compile, so the library is not used.
+	graphics.pipeline_library_fast_linking =
+	    graphics.pipeline_library_enabled &&
+	    graphics_pipeline_library_properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+	LOGF("Vulkan pipeline library: extensions=%s feature=%s fast_linking=%s\n",
+	     pipeline_library_extensions ? "true" : "false",
+	     graphics.pipeline_library_enabled ? "true" : "false",
+	     graphics.pipeline_library_fast_linking ? "true" : "false");
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -649,6 +687,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	graphics.draw_indirect_count_enabled                  = features12.drawIndirectCount;
+	{
+		vk::PhysicalDeviceProperties properties {};
+		physical_device.getProperties(&properties);
+		const bool sparse_queue = static_cast<bool>(queue_families[queue_family].queueFlags &
+		                                            vk::QueueFlagBits::eSparseBinding);
+		const bool sparse_residency_buffer =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && sparse_queue;
+		device_features.sparseBinding            = sparse_residency_buffer ? VK_TRUE : VK_FALSE;
+		device_features.sparseResidencyBuffer    = sparse_residency_buffer ? VK_TRUE : VK_FALSE;
+		graphics.sparse_residency_buffer_enabled = sparse_residency_buffer;
+		LOGF("\tsparse residency buffers: %s\n", sparse_residency_buffer ? "true" : "false");
+	}
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
@@ -691,6 +744,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;
+	graphics.robust_buffer_access2_enabled = robustness2.robustBufferAccess2 == VK_TRUE;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = &robustness2;
@@ -706,6 +760,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = graphics.mesh_shader_enabled;
+	mesh_features.taskShader            = graphics.task_shader_enabled;
 	feedback_dynamic.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
@@ -733,10 +788,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
 	}
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enable_pipeline_library {};
+	std::vector<const char*>                             enabled_extensions = device_extensions;
+	if (graphics.pipeline_library_enabled) {
+		enabled_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+		enabled_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+		enable_pipeline_library.graphicsPipelineLibrary = VK_TRUE;
+		enable_pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
+		create_info.pNext                               = &enable_pipeline_library;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
-	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
-	create_info.ppEnabledExtensionNames = device_extensions.data();
+	create_info.enabledExtensionCount   = static_cast<uint32_t>(enabled_extensions.size());
+	create_info.ppEnabledExtensionNames = enabled_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
 
 	vk::Device device = nullptr;
@@ -1103,6 +1167,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		graphic_ctx.shader_stencil_export_enabled =
+		    HasExtension(available_extensions, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+		if (graphic_ctx.shader_stencil_export_enabled) {
+			device_extensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+			LOGF("Shader stencil export support: Yes (%s)\n", device_properties.deviceName.data());
+		} else {
+			LOGF("Shader stencil export support: No - the selected device (%s) does not "
+			     "expose %s\n",
+			     device_properties.deviceName.data(), VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
@@ -1131,6 +1205,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.queue_count > 1) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

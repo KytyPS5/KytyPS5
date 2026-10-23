@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -38,7 +39,12 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 	entry[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
-	const auto read     = [&](const Operand& operand) -> Address {
+	// Set while the walk models the patch ordinal instead of the control-point index; see below.
+	bool       patch_ordinal = false;
+	const auto ordinal       = [&] {
+		return patch_ordinal ? Address {Kind::Affine, 1u, 0u} : constant(0u);
+	};
+	const auto read = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
 			return {};
@@ -51,7 +57,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		}
 		// The native packed HS ID's low byte is the patch ordinal. The logical
 		// interface addresses one patch, as in the frontend's v1 initialization.
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
+		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return ordinal();
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -98,101 +104,145 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		return changed;
 	};
 
-	uint32_t stride = 0, patch_begin = UINT32_MAX, patch_end = 0;
-	for (bool repeat = true; repeat;) {
-		repeat    = false;
-		registers = entry;
-		for (const auto& inst: program.instructions) {
-			if (const auto join = joins.find(inst.pc); join != joins.end()) {
-				merge(registers, join->second);
-				joins.erase(join);
-			}
-			if (const auto loop = loops.find(inst.pc); loop != loops.end())
-				merge(registers, loop->second);
-			if (IsDirectBranch(inst.opcode)) {
-				const bool back = inst.branch_target <= inst.pc;
-				const auto [join, inserted] =
-				    (back ? loops : joins).try_emplace(inst.branch_target, registers);
-				const bool changed = !inserted && merge(join->second, registers);
-				repeat |= back && (inserted || changed);
-			}
-			const bool local_store  = IsDsWriteOpcode(inst.opcode);
-			const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
-			const bool control_store = !local && buffer_store &&
-			                           inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
-			if ((local && local_store) || control_store) {
-				const auto address = read(inst.src0);
-				if (address.kind != Kind::Affine) {
-					EXIT("%s tessellation address is not affine at pc 0x%08x\n",
-					     local ? "LS" : "HS", inst.pc);
+	uint32_t                     stride = 0, patch_begin = UINT32_MAX, patch_end = 0;
+	std::unordered_set<uint32_t> ordinal_stores;
+	const auto                   walk = [&] {
+		stride      = 0;
+		patch_begin = UINT32_MAX;
+		patch_end   = 0;
+		joins.clear();
+		loops.clear();
+		for (bool repeat = true; repeat;) {
+			repeat         = false;
+			registers      = entry;
+			bool reachable = true;
+			for (const auto& inst: program.instructions) {
+				if (const auto join = joins.find(inst.pc); join != joins.end()) {
+					if (reachable)
+						merge(registers, join->second);
+					else
+						registers = join->second;
+					reachable = true;
+					joins.erase(join);
 				}
-				if (address.coefficient != 0u) {
-					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
-					                     (stride != 0u && stride != address.coefficient));
-					stride = address.coefficient;
-				} else if (control_store) {
-					// Control-point-independent HS outputs are patch constants.
-					const auto begin = address.constant + inst.offset;
-					patch_begin      = std::min(patch_begin, begin);
-					patch_end        = std::max(patch_end, begin + 4u * inst.data_dwords);
+				if (const auto loop = loops.find(inst.pc); loop != loops.end()) {
+					if (reachable)
+						merge(registers, loop->second);
+					else
+						registers = loop->second;
+					reachable = true;
 				}
-			}
-			// Store vdata is a source, despite occupying the decoder's dst field.
-			if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
-			const auto lhs   = read(inst.src0);
-			const auto rhs   = read(inst.src1);
-			const auto third = read(inst.src2);
-			Address    value;
-			switch (inst.opcode) {
-				case Opcode::V_BFE_U32:
-					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
-					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
-					    third.coefficient == 0u) {
-						if (rhs.constant == 8u && third.constant == 5u)
-							value = {Kind::Affine, 1u, 0u};
-						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+				// Code after an unconditional jump runs only if a branch targets it.
+				if (!reachable) continue;
+				if (IsDirectBranch(inst.opcode)) {
+					const bool back = inst.branch_target <= inst.pc;
+					const auto [join, inserted] =
+					    (back ? loops : joins).try_emplace(inst.branch_target, registers);
+					const bool changed = !inserted && merge(join->second, registers);
+					repeat |= back && (inserted || changed);
+					reachable = inst.opcode != Opcode::S_BRANCH;
+				}
+				const bool local_store   = IsDsWriteOpcode(inst.opcode);
+				const bool buffer_store  = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
+				                           inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
+				                           inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
+				                           inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
+				const bool control_store = !local && buffer_store &&
+				                           inst.src2.kind == OperandKind::Sgpr &&
+				                           inst.src2.reg == 2u;
+				if (patch_ordinal && control_store) {
+					// Control points move with the patch ordinal; the patch constants do not.
+					const auto address = read(inst.src0);
+					if (address.kind == Kind::Affine && address.coefficient != 0u) {
+						EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
+						                     (stride != 0u && stride != address.coefficient));
+						stride = address.coefficient;
+						ordinal_stores.insert(inst.pc);
 					}
-					break;
-				case Opcode::V_AND_B32:
-					if ((lhs.kind == Kind::PackedControlPoint && rhs == constant(0xffu)) ||
-					    (rhs.kind == Kind::PackedControlPoint && lhs == constant(0xffu)))
-						value = constant(0u);
-					break;
-				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
-				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
-				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
-				case Opcode::V_MAD_U32_U24:
-					value = add(multiply(low24(lhs), low24(rhs)), third);
-					break;
-				case Opcode::V_LSHL_ADD_U32:
-					if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
-						value = add(multiply(lhs, constant(1u << rhs.constant)), third);
-					break;
-				case Opcode::V_LSHLREV_B32:
-					if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
-						value = multiply(rhs, constant(1u << lhs.constant));
-					break;
-				case Opcode::V_SUB_NC_U32:
-					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-					    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-						value =
-						    affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
-					break;
-				default: break;
+				} else if ((local && local_store) ||
+				           (control_store && !ordinal_stores.contains(inst.pc))) {
+					const auto address = read(inst.src0);
+					if (address.kind != Kind::Affine) {
+						EXIT("%s tessellation address is not affine at pc 0x%08x\n",
+						     local ? "LS" : "HS", inst.pc);
+					}
+					if (address.coefficient != 0u) {
+						EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
+						                     (stride != 0u && stride != address.coefficient));
+						stride = address.coefficient;
+					} else if (control_store) {
+						// Control-point-independent HS outputs are patch constants.
+						const auto begin = address.constant + inst.offset;
+						patch_begin      = std::min(patch_begin, begin);
+						patch_end        = std::max(patch_end, begin + 4u * inst.data_dwords);
+					}
+				}
+				// Store vdata is a source, despite occupying the decoder's dst field.
+				if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
+				const auto lhs   = read(inst.src0);
+				const auto rhs   = read(inst.src1);
+				const auto third = read(inst.src2);
+				Address    value;
+				switch (inst.opcode) {
+					case Opcode::V_BFE_U32:
+						if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
+						    rhs.coefficient == 0u && third.kind == Kind::Affine &&
+						    third.coefficient == 0u) {
+							if (rhs.constant == 8u && third.constant == 5u)
+								value =
+								    patch_ordinal ? constant(0u) : Address {Kind::Affine, 1u, 0u};
+							if (rhs.constant == 0u && third.constant == 8u) value = ordinal();
+						}
+						break;
+					case Opcode::V_AND_B32:
+						if ((lhs.kind == Kind::PackedControlPoint && rhs == constant(0xffu)) ||
+						    (rhs.kind == Kind::PackedControlPoint && lhs == constant(0xffu)))
+							value = ordinal();
+						break;
+					case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
+					case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
+					case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
+					case Opcode::V_MAD_U32_U24:
+						value = add(multiply(low24(lhs), low24(rhs)), third);
+						break;
+					case Opcode::V_LSHL_ADD_U32:
+						if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
+							value = add(multiply(lhs, constant(1u << rhs.constant)), third);
+						break;
+					case Opcode::V_LSHLREV_B32:
+						if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
+							value = multiply(rhs, constant(1u << lhs.constant));
+						break;
+					case Opcode::V_SUB_NC_U32:
+						if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
+						    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
+							value = affine(lhs.coefficient - rhs.coefficient,
+							               lhs.constant - rhs.constant);
+						break;
+					default: break;
+				}
+				if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
+				    inst.dst.dpp)
+					value = {};
+				for (uint32_t index = 0; index < std::max(inst.data_dwords, 1u) &&
+				                         inst.dst.reg + index < registers.size();
+				     index++) {
+					registers[inst.dst.reg + index] = {};
+				}
+				registers.at(inst.dst.reg) = value;
 			}
-			if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
-			    inst.dst.dpp)
-				value = {};
-			for (uint32_t index = 0;
-			     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size();
-			     index++) {
-				registers[inst.dst.reg + index] = {};
-			}
-			registers.at(inst.dst.reg) = value;
 		}
+	};
+	walk();
+	// A one-control-point HS may skip the index: its control points move with the patch ordinal.
+	if (!local && control_points == 1u && stride == 0u) {
+		patch_ordinal = true;
+		walk();
+		const auto ordinal_stride = stride;
+		patch_ordinal             = false;
+		walk();
+		EXIT_NOT_IMPLEMENTED(stride != 0u);
+		stride = ordinal_stride;
 	}
 	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
 	(local ? info.ls_stride : info.hs_stride) = stride;
@@ -235,7 +285,9 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 	// Pure address arithmetic that stays behind EXEC selects; mul24 lowers to IMul32 of BFEs.
 	const auto opcode = source->GetOpcode();
 	if (opcode != ValueOpcode::IAdd32 && opcode != ValueOpcode::ISub32 &&
-	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract)
+	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract &&
+	    opcode != ValueOpcode::ShiftLeftLogical32 && opcode != ValueOpcode::BitwiseAnd32 &&
+	    opcode != ValueOpcode::BitwiseOr32)
 		return value;
 	std::array<Value, 3> args;
 	bool                 changed = false;

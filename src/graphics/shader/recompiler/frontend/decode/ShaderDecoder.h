@@ -707,13 +707,29 @@ enum class Opcode {
 	IMAGE_ATOMIC_FMIN,
 	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
+	IMAGE_GATHER4,
+	IMAGE_GATHER4_CL,
 	IMAGE_GATHER4_L,
+	IMAGE_GATHER4_B,
+	IMAGE_GATHER4_B_CL,
 	IMAGE_GATHER4_LZ,
 	IMAGE_GATHER4_C,
+	IMAGE_GATHER4_C_CL,
 	IMAGE_GATHER4_C_L,
+	IMAGE_GATHER4_C_B,
+	IMAGE_GATHER4_C_B_CL,
 	IMAGE_GATHER4_C_LZ,
+	IMAGE_GATHER4_O,
+	IMAGE_GATHER4_CL_O,
+	IMAGE_GATHER4_L_O,
+	IMAGE_GATHER4_B_O,
+	IMAGE_GATHER4_B_CL_O,
 	IMAGE_GATHER4_LZ_O,
 	IMAGE_GATHER4_C_O,
+	IMAGE_GATHER4_C_CL_O,
+	IMAGE_GATHER4_C_L_O,
+	IMAGE_GATHER4_C_B_O,
+	IMAGE_GATHER4_C_B_CL_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
 	V_INTERP_P1_F32,
@@ -865,6 +881,8 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	// An unlinked S_SWAPPC_B64 that translates as the any-hit stub (see PrepareCallTargets).
+	bool           call_stub                                    = false;
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;

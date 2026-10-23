@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Source {
+    uint source[];
+};
+
+layout(std430, binding = 1) buffer Target {
+    uint target[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint source_word;
+    uint target_word;
+    uint local_x;
+    uint local_y;
+    uint local_z;
+    uint max_x;
+    uint max_y;
+    uint max_z;
+} parameters;
+
+uint Groups(uint threads, uint local_size) {
+    return threads / local_size + uint(threads % local_size != 0u);
+}
+
+void main() {
+    const uvec3 threads = uvec3(source[parameters.source_word], source[parameters.source_word + 1u],
+                                source[parameters.source_word + 2u]);
+    const uvec3 local_size =
+        max(uvec3(parameters.local_x, parameters.local_y, parameters.local_z), uvec3(1u));
+    uvec3 groups = uvec3(Groups(threads.x, local_size.x), Groups(threads.y, local_size.y),
+                         Groups(threads.z, local_size.z));
+    // Past the device limit the dispatch is undefined and a TDR, so it is skipped.
+    if (any(greaterThan(groups, uvec3(parameters.max_x, parameters.max_y, parameters.max_z)))) {
+        groups = uvec3(0u);
+    }
+    const uint base = parameters.target_word;
+    target[base + 0u] = groups.x;
+    target[base + 1u] = groups.y;
+    target[base + 2u] = groups.z;
+    target[base + 4u] = threads.x;
+    target[base + 5u] = threads.y;
+    target[base + 6u] = threads.z;
+}

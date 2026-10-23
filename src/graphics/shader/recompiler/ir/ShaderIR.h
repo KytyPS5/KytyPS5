@@ -15,9 +15,11 @@
 #include <array>
 #include <bit>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -81,10 +83,16 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	bool                    glc                                                   = false;
 
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
 		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
 		       !typed && !formatted && data_bits == 32u;
+	}
+
+	[[nodiscard]] bool IsCoherentBufferPairStore(ValueOpcode opcode) const {
+		return kind == ResourceKind::Buffer && opcode == ValueOpcode::StoreBufferU32x2 &&
+		       coherent && !typed && !formatted && data_bits == 32u;
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
@@ -140,6 +148,7 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	bool                   unindexed = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -263,6 +272,8 @@ enum class StageOutputKind {
 	Mrt,
 	ObjectPrimitiveId,
 	Depth,
+	// The per-pixel stencil reference from MRTZ channel 1; reaches Vulkan as FragStencilRefEXT.
+	Stencil,
 	SampleMask,
 	PointSize,
 	ClipDistance,
@@ -369,18 +380,29 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	static constexpr uint32_t        DispatchLimitDwordCount = 2;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
 	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
 	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
+	// Indices inside INDEX_BUFFER_SIZE from the draw's first index; after the user clip planes.
+	static constexpr uint32_t MeshIndexBoundParameter = MeshDrawDwordCount;
+
+	[[nodiscard]] static constexpr uint32_t MeshIndexBoundDword(uint32_t user_clip_planes) {
+		return user_clip_planes != 0 ? UserClipPlaneDword + 4u * std::bit_width(user_clip_planes)
+		                             : MeshDrawDwordCount;
+	}
 
 	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
 	                                                           uint32_t user_clip_planes = 0) {
+		if (mesh) {
+			return MeshIndexBoundDword(user_clip_planes) + 1u;
+		}
 		if (user_clip_planes != 0) {
 			return UserClipPlaneDword + 4u * std::bit_width(user_clip_planes);
 		}
-		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
+		return static_cast<uint32_t>(object_id);
 	}
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
@@ -389,9 +411,19 @@ struct PushData {
 	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
 		return CanFit(cursor, size) ? cursor : NoStart;
 	}
+	[[nodiscard]] static constexpr bool StartServes(uint32_t start, uint32_t cursor) {
+		return start == NoStart || start >= cursor;
+	}
 };
 
+// A null V# binds one dword at this offset, so every index lies past it: reads zero, writes drop.
+inline constexpr uint32_t NullBufferByteOffset = 252;
+inline constexpr uint32_t NullBufferRange      = 4;
+
 static_assert(sizeof(PushData) == 128);
+// Task payload: mesh draw dwords, start vertex/instance/index for the user SGPRs, index bound.
+inline constexpr uint32_t MeshTaskPayloadDwordCount = PushData::MeshDrawDwordCount + 4;
+inline constexpr uint32_t MeshTaskPayloadIndexBound = PushData::MeshDrawDwordCount + 3;
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
@@ -402,6 +434,33 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	return static_cast<uint32_t>(kind) +
 	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
+
+// The pixel stage has its own set, so a fragment library's layout depends on the pixel shader
+// alone. It follows the image heap's set; a graphics layout holds at most these sets.
+constexpr uint32_t PixelDescriptorSet       = ImageHeapSet + 1u;
+constexpr uint32_t NativeDescriptorSetCount = PixelDescriptorSet + 1u;
+
+[[nodiscard]] constexpr uint32_t NativeDescriptorSet(ShaderType stage) {
+	return stage == ShaderType::Pixel ? PixelDescriptorSet : 0u;
+}
+
+[[nodiscard]] constexpr uint32_t NativeDescriptorSetForBinding(uint32_t native_binding) {
+	return native_binding / static_cast<uint32_t>(DescriptorBindingKind::Count) == 1u
+	           ? PixelDescriptorSet
+	           : 0u;
+}
+
+[[nodiscard]] constexpr bool NativeDescriptorSetAgrees(ShaderType stage) {
+	constexpr auto last = static_cast<DescriptorBindingKind>(
+	    static_cast<uint32_t>(DescriptorBindingKind::Count) - 1u);
+	return NativeDescriptorSetForBinding(NativeBinding(stage, DescriptorBindingKind {})) ==
+	           NativeDescriptorSet(stage) &&
+	       NativeDescriptorSetForBinding(NativeBinding(stage, last)) == NativeDescriptorSet(stage);
+}
+static_assert(NativeDescriptorSetAgrees(ShaderType::Vertex) &&
+              NativeDescriptorSetAgrees(ShaderType::Pixel) &&
+              NativeDescriptorSetAgrees(ShaderType::TessellationControl) &&
+              NativeDescriptorSetAgrees(ShaderType::TessellationEvaluation));
 
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
@@ -514,6 +573,19 @@ struct Bindings {
 	bool operator==(const Bindings& other) const = default;
 };
 
+struct DmaPointer {
+	bool     user_data       = false;
+	bool     store           = false;
+	uint32_t lo              = 0;
+	uint32_t hi              = 0;
+	uint32_t relative_offset = UINT32_MAX;
+	uint32_t records_offset  = UINT32_MAX;
+	uint32_t records         = 0;
+	uint32_t high_mask       = 0;
+
+	bool operator==(const DmaPointer& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	static constexpr uint32_t MaxImages       = 64;
@@ -531,6 +603,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	bool                             writes_dma                    = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -555,6 +628,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	std::vector<DmaPointer>          dma_pointers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -625,6 +699,13 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct SrtReadWriteOrder {
+	uint64_t buffers = 0;
+	bool     unknown = true;
+
+	bool operator==(const SrtReadWriteOrder& other) const = default;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -643,6 +724,10 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// Bit r: the host resource plan evaluates user-data register r.
+	uint64_t plan_user_data_registers = 0;
+	// Spirv::WorkgroupStorageBound of the module.
+	uint64_t                      workgroup_storage_bytes = 0;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 };
@@ -664,9 +749,11 @@ struct ResourcePlan {
 	};
 
 	struct EvaluationContext {
+		// A remembered refusal (generation | 2) keeps its reason in `value`.
 		struct Entry {
-			uint64_t value      = 0;
-			uint64_t generation = 0;
+			uint64_t value          = 0;
+			uint64_t generation     = 0;
+			bool     lane_dependent = false;
 		};
 
 		std::vector<Entry> values;
@@ -688,6 +775,12 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
+	// On the plan because the host walk re-executes a readfirstlane once per lane.
+	uint32_t wave_size          = 64;
+	uint32_t host_subgroup_size = 64;
+	// The guest wave is wider than the lanes the emitted module can activate.
+	bool                                                   upper_lane_half_is_ghost = false;
+	bool                                                   robust_buffer_access2    = false;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
@@ -695,13 +788,20 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<SrtReadWriteOrder>                         srt_read_order;
+	std::vector<uint8_t>                                   data_flat_slots;
+	// The guest pc of each `srt_reads` slot (a plan's cloned reads keep only SrtReadFlags).
+	std::vector<uint32_t>                      srt_read_pcs;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// `first_use_pc` of each resource a materialization proved the host cannot re-evaluate.
+	std::vector<uint32_t>                 unfoldable_pcs;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	BufferCopy                            buffer_copy;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
@@ -712,6 +812,21 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	bool                                    frozen_values = false;
+	struct ClosedBallot {
+		enum State : uint8_t { Unknown, Open, Closed, Known };
+		State    state = Unknown;
+		uint64_t mask  = 0;
+	};
+	mutable std::vector<ClosedBallot> closed_ballots;
+	// Pure functions of a frozen plan's instructions; a deque so a held web survives later inserts.
+	struct PhiPlan {
+		Value                    invariant;
+		Value                    entry;
+		std::vector<const Inst*> web;
+	};
+	mutable std::vector<uint32_t> phi_plan_index;
+	mutable std::deque<PhiPlan>   phi_plans;
 };
 
 struct Program: ResourcePlan {
@@ -726,9 +841,12 @@ struct Program: ResourcePlan {
 
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
-	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// A hardware ray-tracing intersect was lowered to a constant miss.
+	bool uses_bvh_intersect_stub = false;
+	// Set when an S_SWAPPC_B64 call was replaced by an any-hit that accepts every hit.
+	bool                          uses_call_stub      = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
@@ -736,6 +854,10 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	// Whether materialization would refuse indirect buffer table `source` against guest memory now.
+	std::function<bool(const Program& program, std::span<const DescriptorSource> sources,
+	                   uint32_t source)>
+	                              refuse_indirect_buffer_table;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
@@ -753,6 +875,31 @@ bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,
                                const DescriptorSource::IndirectDescriptor& right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+
+// Why a loop-carried phi web has no single entry value: no operand enters it, or two disagree.
+enum class CyclicPhiReject { None, NoEntry, Merge };
+
+struct CyclicPhiFailure {
+	CyclicPhiReject reason = CyclicPhiReject::None;
+	Value           entry;
+	Value           other;
+};
+
+// Valid only while nothing rewrites the program's instructions.
+struct CyclicPhiEntryCache {
+	struct Answer {
+		Value                    entry;
+		std::vector<const Inst*> web;
+		CyclicPhiFailure         reject;
+	};
+	const ResourcePlan*                     program = nullptr;
+	std::unordered_map<const Inst*, Answer> answers;
+};
+
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out = nullptr,
+                            CyclicPhiFailure*         reject  = nullptr,
+                            CyclicPhiEntryCache*      cache   = nullptr);
 Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

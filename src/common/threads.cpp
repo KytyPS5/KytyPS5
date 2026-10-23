@@ -231,6 +231,18 @@ void Thread::SleepNano(uint64_t nanos) {
 #endif
 }
 
+void Thread::PreferPerformance() {
+#ifdef KYTY_WIN_CS
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+	// Opting out of execution-speed throttling marks the thread high QoS for the hybrid scheduler.
+	THREAD_POWER_THROTTLING_STATE state {};
+	state.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	state.StateMask   = 0;
+	(void)SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state));
+#endif
+}
+
 bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }

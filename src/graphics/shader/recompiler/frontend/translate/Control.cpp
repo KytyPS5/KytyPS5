@@ -235,6 +235,16 @@ void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	WriteOperand(high, words[1]);
 }
 
+// The any-hit stub: a PS5 any-hit function returns the accepting lanes in s16; accept every hit.
+void Translator::S_SWAPPC_B64(const Decoder::Instruction& inst) {
+	S_GETPC_B64(inst);
+	Decoder::Operand verdict;
+	verdict.kind = Decoder::OperandKind::Sgpr;
+	verdict.reg  = 16;
+	WriteMask(verdict, ir.GetExec(), program.wave_size == 64u);
+	program.uses_call_stub = true;
+}
+
 void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.src1));
 	WriteOperand(DestinationOperand(inst), result);

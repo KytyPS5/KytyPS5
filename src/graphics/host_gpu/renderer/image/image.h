@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -16,6 +17,8 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+[[nodiscard]] uint64_t NextImageWriteEpoch() noexcept;
 
 class Buffer;
 class CommandScheduler;
@@ -47,7 +50,9 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// With `report`, a failed device allocation sets BackingFailed() instead of exiting.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      GraphicContext::ImageAllocationReport* report = nullptr);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -59,11 +64,15 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	void MarkShaderWritesFlushed(std::optional<ImageSubresourceRange> range);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	// Copies these regions of a size-compatible colour image, leaving the rest of this one as is.
+	void CopyRegions(Image& source, std::span<const vk::ImageCopy> regions);
+	void CopyLayers(Image& source, uint32_t base_layer, uint32_t layer_count);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
@@ -103,15 +112,56 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified = true;
+		++m_gpu_write_serial;
+		m_gpu_write_epoch = NextImageWriteEpoch();
+		m_superseded_since_gpu_write.clear();
+		std::fill(layer_content.begin(), layer_content.end(), m_gpu_write_epoch);
+	}
+	void ClearGpuModified() noexcept { m_gpu_modified = false; }
+	// Counts GPU writes, never reset - unlike m_gpu_modified, which only the free path clears.
+	[[nodiscard]] uint64_t GpuWriteSerial() const noexcept { return m_gpu_write_serial; }
+	[[nodiscard]] uint64_t GpuWriteEpoch() const noexcept { return m_gpu_write_epoch; }
+	[[nodiscard]] uint64_t BufferWriteEpoch() const noexcept { return m_buffer_write_epoch; }
+	// After a same-layout alias copy, the copied write's epoch until this image is written again.
+	[[nodiscard]] uint64_t ContentEpoch() const noexcept {
+		return alias_stamp_epoch != 0 && m_gpu_write_epoch == alias_stamp_epoch
+		           ? alias_content_epoch
+		           : m_gpu_write_epoch;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept {
-		m_buffer_modified = true;
+	void               MarkBufferModified() noexcept { MarkBufferModified(NextImageWriteEpoch()); }
+	// `epoch` is when the write landed, not when it was noticed.
+	void MarkBufferModified(uint64_t epoch) noexcept {
+		m_buffer_modified    = true;
+		m_buffer_write_epoch = epoch;
+		m_superseded.clear();
+		m_superseded_since_gpu_write.clear();
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	// Guest bytes a later GPU buffer write replaced; never written back from this image.
+	bool               Supersede(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsSuperseded() const noexcept { return !m_superseded.empty(); }
+	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>> SupersededRanges() const noexcept {
+		return m_superseded;
+	}
+	[[nodiscard]] bool SupersededAfterLastGpuWrite() const noexcept {
+		return IsSuperseded() && m_superseded_epoch > m_gpu_write_epoch;
+	}
+	// Whether GPU buffer writes after the last GPU write replaced all of the range.
+	[[nodiscard]] bool SupersededSinceGpuWrite(uint64_t address, uint64_t size) const noexcept;
+	// Empty while SupersededAfterLastGpuWrite() holds means too many ranges to keep.
+	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>>
+	SupersededSinceGpuWriteRanges() const noexcept {
+		return m_superseded_since_gpu_write;
+	}
+	void ClearSuperseded() noexcept {
+		m_superseded.clear();
+		m_superseded_since_gpu_write.clear();
+	}
+	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -121,6 +171,7 @@ public:
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
+	[[nodiscard]] bool     BackingFailed() const noexcept { return m_backing_failed; }
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
@@ -140,12 +191,22 @@ public:
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
 
-	ImageInfo        info;
-	VulkanImage      backing;
+	[[nodiscard]] static bool FormatHasStencil(vk::Format format) noexcept;
+	// vkCmdCopyImage needs matching aspect masks, so only identical formats carry stencil.
+	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
+	                                             vk::Format destination) noexcept;
+	// Bit-identical under VK_KHR_maintenance8; 24-bit depth keeps the buffered copy's packing.
+	[[nodiscard]] static bool DepthColorCopyCompatible(vk::Format source,
+	                                                   vk::Format destination) noexcept;
+
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered = false;
+	// Parked: registered and collectable, but no longer an answer to an overlapping lookup.
+	bool             dormant        = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
@@ -154,8 +215,15 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	uint64_t              tick_accessed_last = 0;
+	// Counted in presented frames, not queue submissions.
+	uint64_t              frame_accessed_last = 0;
+	uint64_t              frame_touched_last  = 0;
+	size_t                lru_id              = 0;
+	uint64_t              alias_stamp_epoch   = 0;
+	uint64_t              alias_content_epoch = 0;
+	ImageId               depth_twin {};
+	std::vector<uint64_t> layer_content;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 
@@ -168,13 +236,21 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext&   m_graphics;
-	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash  = 0;
-	bool              m_cpu_dirty       = false;
-	bool              m_maybe_cpu_dirty = false;
-	bool              m_gpu_modified    = false;
-	bool              m_buffer_modified = false;
+	GraphicContext&                            m_graphics;
+	CommandScheduler&                          m_scheduler;
+	uint64_t                                   m_maybe_cpu_hash     = 0;
+	bool                                       m_cpu_dirty          = false;
+	bool                                       m_maybe_cpu_dirty    = false;
+	uint64_t                                   m_gpu_write_serial   = 0;
+	uint64_t                                   m_gpu_write_epoch    = 0;
+	uint64_t                                   m_buffer_write_epoch = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> m_superseded;
+	// Exact, never widened: the ranges of m_superseded written after m_gpu_write_epoch.
+	std::vector<std::pair<uint64_t, uint64_t>> m_superseded_since_gpu_write;
+	uint64_t                                   m_superseded_epoch = 0;
+	bool                                       m_gpu_modified     = false;
+	bool                                       m_buffer_modified  = false;
+	bool                                       m_backing_failed   = false;
 };
 
 namespace ImageOps {

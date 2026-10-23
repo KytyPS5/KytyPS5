@@ -56,15 +56,30 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               bool sparse_residency)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_size(size) {
+      m_size(size), m_sparse(sparse_residency) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+
+	if (sparse_residency) {
+		EXIT_IF(!graphics.sparse_residency_buffer_enabled || usage != MemoryUsage::DeviceLocal);
+		buffer_info.flags =
+		    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) !=
+		                     vk::Result::eSuccess);
+		if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+		}
+		return;
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
@@ -77,13 +92,44 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+
+	const auto attempt = [&](bool drop_within_budget, VmaMemoryUsage memory_usage) {
+		auto info = allocation_info;
+		if (drop_within_budget) {
+			info.flags &=
+			    ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		}
+		info.usage        = memory_usage;
+		const auto result = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                    &info, &native_buffer, &m_allocation, &allocation_result));
+		if (result != vk::Result::eSuccess) {
+			native_buffer = VK_NULL_HANDLE;
+			m_allocation  = nullptr;
+		}
+		return result;
+	};
+
+	auto result = attempt(false, AllocationUsage(usage));
 	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+		// WITHIN_BUDGET makes VMA refuse an allocation the driver would still have served.
+		result = attempt(true, AllocationUsage(usage));
+		if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal) {
+			result = attempt(true, VMA_MEMORY_USAGE_AUTO);
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		const auto budget = graphics.GetMemoryBudget();
+		graphics.LogMemoryBudget();
+		EXIT("out of device memory for a buffer: size=%llu usage=%u flags=0x%llx result=%s; "
+		     "device usage=%llu budget=%llu heap=%llu (budget %s)\n",
+		     static_cast<unsigned long long>(size), static_cast<unsigned>(usage),
+		     static_cast<unsigned long long>(static_cast<vk::BufferUsageFlags::MaskType>(flags)),
+		     vk::to_string(result).c_str(), static_cast<unsigned long long>(budget.usage),
+		     static_cast<unsigned long long>(budget.budget),
+		     static_cast<unsigned long long>(budget.heap_size),
+		     budget.reported ? "reported" : "unknown");
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -95,7 +141,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
-	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_coherent     = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_device_local = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
@@ -103,7 +150,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (m_buffer != nullptr && m_sparse) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
@@ -135,28 +184,8 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 	}
 }
 
-vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
-                                        vk::AccessFlags destination) const {
-	if (Handle() == nullptr || size == 0 || offset > Size() || size > Size() - offset) {
-		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " capacity=0x%016" PRIx64 "\n",
-		     static_cast<const void*>(Handle()), offset, size, Size());
-	}
-	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask       = source;
-	barrier.dstAccessMask       = destination;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = Handle();
-	barrier.offset              = offset;
-	barrier.size                = size;
-	return barrier;
-}
-
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-                      uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
-                      vk::AccessFlags destination_before, vk::AccessFlags source_after,
-                      vk::AccessFlags destination_after) {
+                      uint64_t destination_offset, uint64_t size) {
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
 		EXIT("Buffer: invalid copy range\n");
@@ -165,58 +194,53 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
-	command.EndRendering();
-	const vk::BufferMemoryBarrier before[] = {
-	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
-	    Barrier(destination_offset, size, destination_before, vk::AccessFlagBits::eTransferWrite),
-	};
-	const auto host_access  = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
-	auto       before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_before | destination_before) & host_access)) {
-		before_stage |= vk::PipelineStageFlagBits::eHost;
-	}
-	const auto native = command.Handle();
-	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
+	const TransferRange  read {source.Handle(), source_offset, size};
+	const TransferRange  write {Handle(), destination_offset, size};
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
-	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
-	const vk::BufferMemoryBarrier after[] = {
-	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
-	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
-	};
-	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_after | destination_after) & host_access)) {
-		after_stage |= vk::PipelineStageFlagBits::eHost;
-	}
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+	command.BeginTransfer({&read, 1}, {&write, 1}).copyBuffer(source.Handle(), Handle(), 1, &copy);
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}
-	auto& command = Scheduler().Current();
-	command.EndRendering();
-	const auto before =
-	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Handle();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-	                       0, nullptr, 1, &before, 0, nullptr);
-	native.fillBuffer(Handle(), offset, size, value);
-	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
-	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	if (Handle() == nullptr || size == 0 || offset > Size() || size > Size() - offset) {
+		EXIT("Buffer: invalid fill range, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " capacity=0x%016" PRIx64 "\n",
+		     static_cast<const void*>(Handle()), offset, size, Size());
+	}
+	const TransferRange write {Handle(), offset, size};
+	Scheduler().Current().BeginTransfer({}, {&write, 1}).fillBuffer(Handle(), offset, size, value);
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+    : Buffer(graphics, scheduler, usage, 0,
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {
+	Scheduler().RegisterStreamBuffer(this);
+}
+
+StreamBuffer::~StreamBuffer() {
+	Scheduler().UnregisterStreamBuffer(this);
+}
+
+// The GPU reads a reservation from the command buffer recording its consumer, so move the charge.
+void StreamBuffer::RetagWatches(uint64_t submitted_tick, uint64_t new_tick) {
+	if (submitted_tick == 0 || new_tick <= submitted_tick) {
+		return;
+	}
+	const auto retag_run = [submitted_tick, new_tick](std::vector<Watch>& watches, size_t limit) {
+		while (limit != 0 && limit <= watches.size() && watches[limit - 1].tick == submitted_tick &&
+		       !watches[limit - 1].sealed) {
+			watches[--limit].tick = new_tick;
+		}
+	};
+	retag_run(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark.has_value()) {
+		retag_run(m_previous_watches, *m_invalidation_mark);
+	}
+}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -287,7 +311,8 @@ void StreamBuffer::Commit() {
 
 	m_offset += m_mapped_size;
 	const auto tick = Scheduler().CurrentTick();
-	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick) {
+	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick &&
+	    !m_current_watches[m_current_watch_cursor - 1].sealed) {
 		m_current_watches[m_current_watch_cursor - 1].upper_bound = m_offset;
 		return;
 	}
@@ -297,6 +322,27 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
+	watch.sealed      = m_hold_depth == 0;
+}
+
+void StreamBuffer::EndHold() {
+	EXIT_IF(m_hold_depth == 0);
+	if (--m_hold_depth != 0) {
+		return;
+	}
+	SealFloatingWatches();
+}
+
+void StreamBuffer::SealFloatingWatches() {
+	const auto seal_run = [](std::vector<Watch>& watches, size_t limit) {
+		while (limit != 0 && limit <= watches.size() && !watches[limit - 1].sealed) {
+			watches[--limit].sealed = true;
+		}
+	};
+	seal_run(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark.has_value()) {
+		seal_run(m_previous_watches, *m_invalidation_mark);
+	}
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

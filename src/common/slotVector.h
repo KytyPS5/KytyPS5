@@ -38,12 +38,26 @@ public:
 	KYTY_CLASS_NO_COPY(SlotVector);
 
 	[[nodiscard]] T& operator[](SlotId id) noexcept {
-		EXIT_IF(!is_allocated(id));
+		if (!is_allocated(id)) {
+			const auto size     = m_values.size();
+			const auto slot_gen = id.index < size ? m_values[id.index].generation : UINT32_MAX;
+			const auto has_value =
+			    id.index < size ? (m_values[id.index].value.has_value() ? 1 : 0) : -1;
+			EXIT("SlotVector: stale access index=%u gen=%u size=%zu slot_gen=%u has_value=%d\n",
+			     id.index, id.generation, size, slot_gen, has_value);
+		}
 		return *m_values[id.index].value;
 	}
 
 	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
-		EXIT_IF(!is_allocated(id));
+		if (!is_allocated(id)) {
+			const auto size     = m_values.size();
+			const auto slot_gen = id.index < size ? m_values[id.index].generation : UINT32_MAX;
+			const auto has_value =
+			    id.index < size ? (m_values[id.index].value.has_value() ? 1 : 0) : -1;
+			EXIT("SlotVector: stale access index=%u gen=%u size=%zu slot_gen=%u has_value=%d\n",
+			     id.index, id.generation, size, slot_gen, has_value);
+		}
 		return *m_values[id.index].value;
 	}
 

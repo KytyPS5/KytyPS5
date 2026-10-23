@@ -26,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
@@ -518,9 +519,40 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	}
 }
 
+// KYTY_INPUT_LOG=<file>: the player's key and gamepad button presses, one per line with the time
+// and the presented frame, to learn a route through a game from someone playing it.
+static void LogInput(const SDL_Event& event, uint64_t frame) {
+	static std::FILE* const file = [] {
+		const char* path = std::getenv("KYTY_INPUT_LOG");
+		return path != nullptr ? std::fopen(path, "a") : nullptr;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	const char* name = nullptr;
+	bool        down = false;
+	if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+	    event.key.repeat == 0) {
+		name = SDL_GetKeyName(event.key.key);
+		down = event.key.down;
+	} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	           event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+		name = SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
+		down = event.gbutton.down;
+	}
+	if (name == nullptr) {
+		return;
+	}
+	std::fprintf(file, "%llu ms frame %llu %s %s\n",
+	             static_cast<unsigned long long>(SDL_GetTicks()),
+	             static_cast<unsigned long long>(frame), name, down ? "down" : "up");
+	std::fflush(file);
+}
+
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	LogInput(*event, game.presented_frames.load(std::memory_order_relaxed));
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
 		switch (event->key.key) {

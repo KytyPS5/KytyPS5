@@ -49606,6 +49606,49 @@ void CheckPm4DeferredLabelWait(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// An interrupt-only RELEASE_MEM must not overtake a label deferred behind readbacks. That label
+// lands through a GPU-thread command, so the interrupt has to be raised the same way, after it;
+// otherwise the guest can handle the interrupt and read the label's old value.
+void CheckPm4InterruptBehindDeferredLabel(RenderContext &renderer) {
+  constexpr const char *name = "Pm4InterruptBehindDeferredLabel";
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor processor(renderer, 0);
+
+  std::array<uint32_t, 8> interrupt{};
+  interrupt[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+  interrupt[1] = 0x28u | (5u << 8u);
+  interrupt[2] = 1u << 24u; // INT_SEL 1 (interrupt only), DATA_SEL 0 (no data)
+  interrupt[7] = 0x123u;
+
+  bool deferred = false;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    // Pretend an earlier label is still waiting on a readback.
+    auto &behind = CommandProcessorTestAccess::LabelsBehindReadbacks(processor);
+    behind.fetch_add(1);
+    Pm4Execution execution;
+    deferred = processor.Process(execution, interrupt) == Pm4ProcessResult::Complete &&
+               behind.load() == 2;
+    behind.fetch_sub(1);
+  });
+  Require(name, "deferred", deferred,
+          "an interrupt-only EOP was raised ahead of a label deferred behind readbacks");
+
+  gpu.SendCommandSync([&] {
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+  });
+  // The deferred interrupt is raised by a GPU-thread command queued by the priority callback.
+  gpu.SendCommandSync([] {});
+  Require(name, "raised", CommandProcessorTestAccess::LabelsBehindReadbacks(processor).load() == 0,
+          "the deferred interrupt never ran");
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -50607,6 +50650,7 @@ int main(int argc, char **argv) {
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4DeferredLabelWait(vulkan.RuntimeRenderer());
+    CheckPm4InterruptBehindDeferredLabel(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
@@ -50910,6 +50954,7 @@ int main(int argc, char **argv) {
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4DeferredLabelWait(vulkan.RuntimeRenderer());
+  CheckPm4InterruptBehindDeferredLabel(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();

@@ -111,7 +111,8 @@ public:
 	bool QueueReadbacksBeforeLabel();
 	/// Publishes an EOP label (low `size` bytes of `value`) behind pending image readbacks.
 	/// Labels stay in order: while an earlier label is still waiting on readbacks, later labels
-	/// are deferred behind it too. @return false if the label can be written immediately.
+	/// are deferred behind it too. A null `dst` publishes only the interrupt (an interrupt-only
+	/// EOP). @return false if the label can be written immediately.
 	bool PublishLabelAfterReadbacks(void* dst, uint64_t value, uint32_t size, bool with_interrupt,
 	                                uint32_t interrupt_context_id);
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);

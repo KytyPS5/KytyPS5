@@ -1301,7 +1301,9 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 		return false;
 	}
 	m_labels_behind_readbacks->fetch_add(1, std::memory_order_acq_rel);
-	DeferredLabels()[reinterpret_cast<uint64_t>(dst)] = {value, size};
+	if (dst != nullptr) {
+		DeferredLabels()[reinterpret_cast<uint64_t>(dst)] = {value, size};
+	}
 	// The priority callback only hands the write to the GPU thread. The label's page can be
 	// tracked by the buffer cache (the GPU writes other bytes of it); a CPU write there faults
 	// into a buffer readback, which cannot run from a deferred operation. GPU-thread commands
@@ -1313,11 +1315,13 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 	                                       pending = m_labels_behind_readbacks] {
 		const bool sent = gpu.TrySendCommand([&renderer, event_id, dst, value, size,
 		                                      with_interrupt, interrupt_context_id, pending] {
-			std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
+			if (dst != nullptr) {
+				std::memcpy(dst, &value, size); // Little-endian: the low bytes are the label.
+			}
 			pending->fetch_sub(1, std::memory_order_acq_rel);
 			auto& labels = DeferredLabels();
 			if (const auto deferred = labels.find(reinterpret_cast<uint64_t>(dst));
-			    deferred != labels.end() && deferred->second.value == value &&
+			    dst != nullptr && deferred != labels.end() && deferred->second.value == value &&
 			    deferred->second.size == size) {
 				labels.erase(deferred);
 			}
@@ -1342,6 +1346,13 @@ bool CommandProcessor::PublishLabelAfterReadbacks(void* dst, uint64_t value, uin
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
+	// A label deferred behind readbacks lands later, through a GPU-thread command (see
+	// PublishLabelAfterReadbacks). Raising this interrupt from the priority callback could let the
+	// guest handle it and still read that label's old value, so send it the same way, behind them.
+	if (m_labels_behind_readbacks->load(std::memory_order_acquire) != 0 &&
+	    PublishLabelAfterReadbacks(nullptr, 0, sizeof(uint32_t), true, interrupt_context_id)) {
+		return;
+	}
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);

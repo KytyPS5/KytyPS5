@@ -49,6 +49,7 @@ public:
 	}
 
 	[[nodiscard]] constexpr bool IsHot(size_t page) const { return m_hot.Get(page); }
+	[[nodiscard]] constexpr const Bits& Hot() const { return m_hot; }
 
 	// After the caller cleared [start, end) in `dirty` for an upload in guest frame `frame`: the
 	// hot pages stay dirty. A page whose lease has ended loses its heat and stays clean; its next

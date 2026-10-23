@@ -66,10 +66,22 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+void MemoryTracker::HarvestArmedWrites() {
+	CheckNotInUploadCallback();
+	std::lock_guard lock(m_region_mutex);
+	for (const auto& manager: m_region_storage) {
+		if (manager->maybe_armed.load(std::memory_order_relaxed)) {
+			std::scoped_lock region_lock(manager->lock);
+			Harvest(manager.get());
+		}
+	}
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	return Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
+		Harvest(manager);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
 }
@@ -126,6 +138,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		manager->Disarm(manager->GetCpuAddr() + offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }

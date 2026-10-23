@@ -592,6 +592,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryTrackerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/uffdWriteWatch.cpp"
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})

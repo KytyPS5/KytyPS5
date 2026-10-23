@@ -273,6 +273,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	// An armed page the CPU wrote is a CPU write for the device-address passes too.
+	m_memory_tracker.SetArmedWriteHook([this](uint64_t vaddr, uint64_t size) { RecordGuestWrite(vaddr, size); });
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	GpuBreadcrumbs::Watch("GDS", reinterpret_cast<const uint32_t*>(m_gds_buffer.Mapped().data()),
@@ -1343,9 +1345,13 @@ void BufferCache::RecordMappingChange(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::BeginSubmission() {
 	m_guest_write_log.BeginSubmission();
+	// The open hot pages are scanned again where their dirty state is next read.
+	RegionManager::NoteSubmission();
 }
 
 bool BufferCache::TakeGuestWrites(std::vector<GuestRange>& ranges) {
+	// Device addresses can reach any buffer: every due armed page is scanned first.
+	m_memory_tracker.HarvestArmedWrites();
 	return m_guest_write_log.Take(ranges);
 }
 

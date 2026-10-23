@@ -8,6 +8,7 @@
 #include "common/trace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/uffdWriteWatch.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -107,6 +108,9 @@ GuestSpan RenderContext::MappingAt(uint64_t vaddr) const {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	if (auto* watch = UffdWriteWatch::Get(); watch != nullptr) {
+		watch->Register(vaddr, size);
+	}
 	// The next device-address pass synchronizes the buffers of the new range only: the game's
 	// allocator maps and unmaps many times per frame, and a pass over every buffer each time cost
 	// Sonic Racing CrossWorlds ~5 ms per frame.
@@ -133,6 +137,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		if (auto* watch = UffdWriteWatch::Get(); watch != nullptr) {
+			watch->Unregister(vaddr, size);
+		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_buffer_cache.RecordMappingChange(vaddr, size);

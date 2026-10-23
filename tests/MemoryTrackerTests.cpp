@@ -2,6 +2,8 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/uffdWriteWatch.h"
 
 #include <atomic>
 #include <chrono>
@@ -452,6 +454,70 @@ void TestHotPageProtectedBeforeGpuWriteUpload() {
         "the GPU-write upload did not hand the hot page to the GPU");
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size);
+  Release(memory);
+}
+
+// With the userfaultfd watch, a hot page stays open but clean (uffdWriteWatch.h): a CPU write is
+// seen at the next guest submission, without a fault, and a GPU-write upload takes it.
+void TestHotPageSeenThroughWriteWatch() {
+  auto *watch = Libs::Graphics::UffdWriteWatch::Get();
+  if (watch == nullptr) {
+    std::puts("MemoryTrackerTests: no userfaultfd write watch, skipped");
+    return;
+  }
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  watch->Register(address, page_size);
+  Check(watch->Covers(address, page_size), "the watch did not register the page");
+  std::vector<GuestRange> hooked;
+  tracker.SetArmedWriteHook(
+      [&](uint64_t vaddr, uint64_t size) { hooked.push_back({vaddr, size}); });
+  const auto read_upload = [&] {
+    uint64_t uploaded = 0;
+    tracker.ForEachUploadRange(
+        address, page_size, false,
+        [&](uint64_t, uint64_t size) noexcept { uploaded += size; }, []() noexcept {});
+    return uploaded;
+  };
+  read_upload();
+  for (int write = 0; write < 2; write++) {
+    tracker.MarkRegionAsCpuModified(address, page_size);
+    read_upload();
+  }
+  Libs::Graphics::RegionManager::NoteSubmission();
+  Check(!tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+        "a hot page under the watch was not open and clean");
+  Check(read_upload() == 0, "a clean armed page was uploaded");
+
+  memory[8] = 1;
+  Check(!tracker.IsRegionCpuModified(address, page_size),
+        "an armed page was scanned twice in one submission");
+  Libs::Graphics::RegionManager::NoteSubmission();
+  Check(tracker.IsRegionCpuModified(address, page_size),
+        "a write to an armed page was not seen at the next submission");
+  Check(hooked.size() == 1 && hooked[0].address == address &&
+            hooked[0].size == page_size,
+        "the armed-write hook did not get the written page");
+  Check(read_upload() == page_size, "the written armed page was not uploaded");
+
+  Libs::Graphics::RegionManager::NoteSubmission();
+  tracker.IsRegionCpuModified(address, page_size);
+  memory[16] = 2;
+  uint64_t uploaded = 0;
+  bool protected_during_copy = false;
+  tracker.ForEachUploadRange(
+      address, page_size, true,
+      [&](uint64_t, uint64_t size) noexcept { uploaded += size; },
+      [&]() noexcept { protected_during_copy = !IsWritable(memory); });
+  Check(uploaded == page_size && protected_during_copy,
+        "a GPU-write upload did not take and close a written armed page");
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
+  watch->Unregister(address, page_size);
   Release(memory);
 }
 
@@ -1251,6 +1317,7 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestHotPageProtectedBeforeGpuWriteUpload();
+  TestHotPageSeenThroughWriteWatch();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

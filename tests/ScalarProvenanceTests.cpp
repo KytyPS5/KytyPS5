@@ -836,6 +836,42 @@ void TestUndefinedRuntimeValueFails() {
         "undefined typed descriptor source was accepted");
 }
 
+// A zero table pointer reads as zero instead of faulting the host, in a captured
+// walk, a single evaluation and the compiled walk. Test from the PR #1528 review.
+void TestNullTablePointerReadsZero(uint32_t offset) {
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
+  const auto low = fixture.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(2))});
+  const auto high = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(3))});
+  const auto value =
+      RawRead(fixture, Address(fixture, low, high), Value(offset), memory);
+  LoadBuffer(fixture, {value, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.srt_code != nullptr, "user-data table reads were not compiled");
+
+  const std::array user_data{0u, 0u};
+  const SrtRuntime runtime{.user_data = user_data};
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  SrtReadCapture capture(runtime, ranges);
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, capture.ObservedRuntime()).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0u} && ranges.empty(),
+        "captured walk did not read a null table as zero");
+
+  uint32_t word = 1u;
+  Check(SrtWalker(plan, runtime).Evaluate(plan.srt_reads[0].value, word) &&
+            word == 0u,
+        "ordinary read did not read a null table as zero");
+
+  flat.clear();
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0u},
+        "compiled walk did not read a null table as zero");
+}
+
 } // namespace
 
 namespace Common {
@@ -877,6 +913,10 @@ int main() {
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
+    TestNullTablePointerReadsZero(0x18u);
+    TestNullTablePointerReadsZero(0x20000u);
+    TestNullTablePointerReadsZero(0x40000u);
+    TestNullTablePointerReadsZero(0x100000u);
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

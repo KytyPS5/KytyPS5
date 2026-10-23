@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -531,6 +532,513 @@ struct Ngs2SamplerFilter {
 	}
 };
 
+// I3DL2 reverb settings (Ngs2ReverbI3DL2Param), used by the custom reverb module (0x1b).
+// Levels are millibels; wet and dry are linear gains on the module's output.
+struct Ngs2ReverbI3dl2Param {
+	float    wet;
+	float    dry;
+	int32_t  room;
+	int32_t  room_hf;
+	uint32_t reflection_pattern;
+	float    decay_time;
+	float    decay_hf_ratio;
+	int32_t  reflections;
+	float    reflections_delay;
+	int32_t  reverb;
+	float    reverb_delay;
+	float    diffusion;
+	float    density;
+	float    hf_reference;
+	uint32_t reserved[8];
+};
+static_assert(sizeof(Ngs2ReverbI3dl2Param) == 88);
+
+// The NGS2 I3DL2 reverb (custom module 0x1b), ported from AnyPS5 (GPL-2.0), commit
+// e15f1644e384ab055f721347a4d31cdff02e9a47 (core/libs/prx/libSceNgs2.native/src/Reverb.cpp), which
+// follows the PS4 libSceNgs2 (firmware 11.00) and was checked against that library's output:
+// - the channels are mixed to mono with the library's fixed gains, skipping the LFE channel;
+// - a 14400-sample ring feeds four early reflection taps (from one of eight reflection patterns)
+//   and the late feed;
+// - the late feed drives sixteen damped comb filters with a pre-emphasis stage;
+// - each output channel sums a signed selection of the combs, runs it through four all-passes
+//   and a two-pole roomHF filter, and mixes it with the dry input;
+// - parameter changes crossfade over one grain.
+// The arithmetic is kept in float, in the library's order, so the output matches it closely.
+class Ngs2Reverb {
+public:
+	// Takes new settings (clamped as the library does). Settings with NaNs are ignored.
+	void Configure(const Ngs2ReverbI3dl2Param& param, uint32_t rate) {
+		if (std::isnan(param.wet) || std::isnan(param.dry) || std::isnan(param.decay_time) ||
+		    std::isnan(param.decay_hf_ratio) || std::isnan(param.reflections_delay) ||
+		    std::isnan(param.reverb_delay) || std::isnan(param.diffusion) ||
+		    std::isnan(param.density) || std::isnan(param.hf_reference)) {
+			return;
+		}
+		m_params                    = param;
+		m_params.wet                = Clamp(param.wet, 0.0f, 32.0f);
+		m_params.dry                = Clamp(param.dry, 0.0f, 32.0f);
+		m_params.reflection_pattern = param.reflection_pattern < 16 ? param.reflection_pattern : 0;
+		m_params.decay_time         = Clamp(param.decay_time, 0.1f, 20.0f);
+		m_params.decay_hf_ratio     = Clamp(param.decay_hf_ratio, 0.00999999978f, 2.0f);
+		m_params.reflections_delay  = Clamp(param.reflections_delay, 0.0f, 0.300000012f);
+		m_params.reverb_delay       = Clamp(param.reverb_delay, 0.0f, 0.100000001f);
+		m_params.diffusion          = Clamp(param.diffusion, 0.0f, 100.0f);
+		m_params.density            = Clamp(param.density, 0.0f, 100.0f);
+		m_params.hf_reference       = Clamp(param.hf_reference, 20.0f, 20000.0f);
+		if (m_rate != rate) {
+			m_rate  = rate;
+			m_reset = true;
+		}
+		m_changed    = true;
+		m_configured = true;
+	}
+
+	[[nodiscard]] bool Configured() const { return m_configured; }
+
+	// Whether the reverb must run even on silent input: its tail is still sounding, or new
+	// settings are pending (the library starts their crossfade on the next grain, sound or not).
+	[[nodiscard]] bool HasTail() const {
+		return m_tail_remaining != 0 || (m_configured && (m_reset || m_changed));
+	}
+
+	// Processes `channels` channel-major blocks of `grain` samples in place.
+	void Process(float* samples, uint32_t channels, uint32_t grain) {
+		if (!m_configured || channels == 0 || channels > MaxChannels) {
+			return;
+		}
+		const size_t total        = size_t(channels) * grain;
+		const bool   silent_input = std::all_of(samples, samples + total,
+		                                        [](float sample) { return sample == 0.0f; });
+		if (!silent_input) {
+			// The combs decay by 60 dB per decayTime; stop after 120 dB.
+			m_tail_remaining = Samples(2000.0f * m_params.decay_time + 400.0f, float(m_rate));
+		} else if (m_tail_remaining == 0 && !m_reset && !m_changed) {
+			// Nothing in flight; pending setup or settings still run, so their crossfade starts
+			// where the library's would.
+			Silence(samples, channels, grain);
+			return;
+		}
+		const float rate  = static_cast<float>(m_rate);
+		const bool  reset = m_reset;
+		if (reset) {
+			Reset();
+			m_changed = true;
+		}
+		m_input.assign(samples, samples + total);
+		m_mono.resize(grain);
+		m_early.resize(grain);
+		m_late.resize(grain);
+		MixDown(m_input.data(), channels, grain, m_mono.data());
+		if (m_changed) {
+			m_old_early.resize(grain);
+			m_old_late.resize(grain);
+			RunTaps(m_taps, m_mono.data(), grain, m_old_early.data(), m_old_late.data());
+			ApplyParams(rate);
+			RunTaps(m_taps, m_mono.data(), grain, m_early.data(), m_late.data());
+			Ramp(m_early.data(), 0.0f, 1.0f, grain, m_early.data(), false);
+			Ramp(m_early.data(), 1.0f, 0.0f, grain, m_old_early.data(), true);
+			Ramp(m_late.data(), 0.0f, 1.0f, grain, m_late.data(), false);
+			Ramp(m_late.data(), 1.0f, 0.0f, grain, m_old_late.data(), true);
+		} else {
+			RunTaps(m_taps, m_mono.data(), grain, m_early.data(), m_late.data());
+		}
+		for (uint32_t i = 0; i < grain; i++) {
+			m_ring[m_ring_cursor] = m_mono[i];
+			m_ring_cursor         = m_ring_cursor + 1 == m_ring.size() ? 0 : m_ring_cursor + 1;
+		}
+		m_combs_out.resize(size_t(Combs) * grain);
+		for (uint32_t i = 0; i < Combs; i++) {
+			RunComb(m_combs[i], m_late.data(), m_combs_out.data() + size_t(i) * grain, grain);
+		}
+		UpdateRoomFilter(rate);
+		m_tail.resize(grain);
+		for (uint32_t channel = 0; channel < channels; channel++) {
+			auto&        state = m_channels[channel];
+			float*       out   = samples + size_t(channel) * grain;
+			const float* in    = m_input.data() + size_t(channel) * grain;
+			if (channel == LfeChannel) {
+				std::copy(in, in + grain, out);
+			} else {
+				std::fill(m_tail.begin(), m_tail.end(), 0.0f);
+				uint32_t selected = 0;
+				for (uint32_t i = 0; i < Combs; i++) {
+					if ((ChannelCombs[channel] >> i & 1u) == 0) {
+						continue;
+					}
+					const float weight =
+					    (selected & 1u) != 0
+					        ? 1.0f
+					        : 1.0f / (static_cast<float>(selected) * 0.5f * 20.0f + 40.0f) *
+					                  (m_params.density + -100.0f) +
+					              1.0f;
+					const float* comb = m_combs_out.data() + size_t(i) * grain;
+					for (uint32_t n = 0; n < grain; n++) {
+						m_tail[n] += comb[n] * weight;
+					}
+					selected++;
+				}
+				for (auto& allpass: state.allpasses) {
+					RunAllpass(allpass, m_params.diffusion * 0.005f, m_tail.data(), grain);
+				}
+				for (uint32_t n = 0; n < grain; n++) {
+					out[n] = m_early[n] * m_early_gain + m_tail[n] * m_late_gain;
+				}
+				for (uint32_t n = 0; n < grain; n++) {
+					const float y = m_room_filter ? m_room_b0 * out[n] + m_room_a1 * state.y1 +
+					                                    m_room_a2 * state.y2
+					                              : out[n];
+					state.y2 = state.y1;
+					state.y1 = y;
+					out[n]   = y;
+				}
+			}
+			const float wet = channel == LfeChannel ? 0.0f : m_params.wet;
+			Ramp(out, reset ? wet : state.wet, wet, grain, out, false);
+			Ramp(out, reset ? m_params.dry : state.dry, m_params.dry, grain, in, true);
+			state.wet = wet;
+			state.dry = m_params.dry;
+		}
+		m_reset          = false;
+		m_changed        = false;
+		if (m_tail_remaining != 0) {
+			m_tail_remaining = m_tail_remaining > grain ? m_tail_remaining - grain : 0;
+			if (m_tail_remaining == 0) {
+				ClearHistory(); // the tail is 120 dB down: drop the denormal-sized leftovers
+			}
+		}
+	}
+
+private:
+	static constexpr uint32_t MaxChannels    = 8;
+	static constexpr uint32_t RingSamples    = 14400;
+	static constexpr uint32_t EarlyTaps      = 4;
+	static constexpr uint32_t Combs          = 16;
+	static constexpr uint32_t Allpasses      = 4;
+	static constexpr uint32_t LfeChannel     = 3;
+
+	// Reflection patterns: tap times (ms after reflectionsDelay) and gains.
+	static constexpr float TapTimes[8][EarlyTaps] = {
+	    {0, 11, 23, 35}, {0, 14.75f, 26.5499992f, 38.0299988f}, {0, 6, 17, 29}, {0, 8, 20, 53},
+	    {0, 11, 17, 30}, {0, 16, 30, 55},  {0, 20, 29, 40},     {0, 37, 47, 62}};
+	static constexpr float TapGains[8][EarlyTaps] = {
+	    {0.7f, 0.4f, 0.134f, 0.1f},   {0.7f, 0.4f, 0.3f, 0.1f},     {0.7f, 0.45f, -0.6f, 0.2f},
+	    {0.7f, 0.55f, -0.6f, 0.2f},   {0.7f, -0.45f, 0.6f, 0.3f},   {0.7f, 0.7f, 0.7f, 0.4f},
+	    {0.7f, 0.7f, -0.4f, 0.3f},    {0.7f, 0.7f, -0.4f, 0.4f}};
+	static constexpr float CombTimes[Combs] = {
+	    22.0100002f, 23.25f,      24.75f,      26.6000004f, 28.25f,      29.6299992f,
+	    31.0599995f, 32.4399986f, 33.6899986f, 34.9500008f, 36.2900009f, 37.6500015f,
+	    38.9900017f, 40.3499985f, 41.6699982f, 43.0499992f};
+	static constexpr float   AllpassTimes[Allpasses] = {11.5799999f, 9.18999958f, 7.0999999f,
+	                                                    4.69000006f};
+	static constexpr int32_t AllpassOffsets[8][Allpasses] = {
+	    {0, -32, -6, -11}, {-10, -5, 0, -34}, {-8, -3, -33, -5}, {-7, -9, -5, -8},
+	    {-33, -8, -8, 0},  {-11, -21, -10, -7}, {-9, -10, -27, -3}, {-6, -11, -9, -24}};
+	// Combs summed into each output channel (bit i = comb i).
+	static constexpr uint16_t ChannelCombs[8] = {0xaaaa, 0x5555, 0xcccc, 0x3333,
+	                                             0x0ff0, 0x9ab2, 0x3c3c, 0x399c};
+
+	struct Taps {
+		std::array<uint32_t, EarlyTaps + 1> delays {}; // the last tap is the late feed
+		std::array<float, EarlyTaps + 1>    gains {};
+	};
+
+	struct Comb {
+		std::vector<float> buffer;
+		uint32_t           cursor        = 0;
+		float              feedback      = 0.0f;
+		float              lowpass_in    = 0.0f;
+		float              lowpass_back  = 0.0f;
+		float              direct        = 0.0f;
+		float              filtered      = 0.0f;
+		float              emphasis      = 0.0f;
+		float              emphasis_back = 0.0f;
+		float              previous      = 0.0f;
+		float              lowpass       = 0.0f;
+	};
+
+	struct Allpass {
+		std::vector<float> buffer;
+		uint32_t           cursor = 0;
+	};
+
+	struct Channel {
+		std::array<Allpass, Allpasses> allpasses;
+		float                          y1  = 0.0f;
+		float                          y2  = 0.0f;
+		float                          wet = 0.0f;
+		float                          dry = 0.0f;
+	};
+
+	static float Millibels(float millibels) {
+		if (millibels < -10000.0f) {
+			return 0.0f;
+		}
+		return static_cast<float>(std::pow(10.0, static_cast<double>(millibels * 0.0005f)));
+	}
+
+	static float Clamp(float value, float low, float high) {
+		return value < low ? low : std::min(high, value);
+	}
+
+	static int32_t ClampMillibels(int32_t value, int32_t high) {
+		return std::max<int32_t>(-10000, std::min(value, high));
+	}
+
+	static uint32_t Samples(float milliseconds, float rate) {
+		return static_cast<uint32_t>(rate * milliseconds * 0.001f + 0.5f);
+	}
+
+	static void Ramp(float* samples, float from, float to, uint32_t grain, const float* source,
+	                 bool accumulate) {
+		const float step = (to - from) / static_cast<float>(grain);
+		float       gain = from;
+		for (uint32_t i = 0; i < grain; i++) {
+			const float value = source[i] * (from == to ? to : gain);
+			samples[i]        = accumulate ? samples[i] + value : value;
+			gain += step;
+		}
+	}
+
+	static void MixDown(const float* input, uint32_t channels, uint32_t grain, float* mono) {
+		if (channels == 1) {
+			std::copy(input, input + grain, mono);
+			return;
+		}
+		const float gain = channels == 2 ? 0.707000017f : channels == 6 ? 0.316000015f : 0.26699999f;
+		for (uint32_t i = 0; i < grain; i++) {
+			mono[i] = input[i] * gain;
+		}
+		for (uint32_t c = 1; c < channels; c++) {
+			if (c == LfeChannel) {
+				continue;
+			}
+			const float* channel = input + size_t(c) * grain;
+			for (uint32_t i = 0; i < grain; i++) {
+				mono[i] += channel[i] * gain;
+			}
+		}
+	}
+
+	// The ring holds the last RingSamples mono samples; taps reach back into it, or into this
+	// grain's input for delays shorter than the grain.
+	void RunTaps(const Taps& taps, const float* input, uint32_t grain, float* early,
+	             float* late) const {
+		const auto size = static_cast<uint32_t>(m_ring.size());
+		std::fill(early, early + grain, 0.0f);
+		std::fill(late, late + grain, 0.0f);
+		for (uint32_t tap = 0; tap <= EarlyTaps; tap++) {
+			float*         out   = tap < EarlyTaps ? early : late;
+			const float    gain  = taps.gains[tap];
+			const uint32_t delay = taps.delays[tap];
+			uint32_t       read  = (m_ring_cursor + size - delay) % size;
+			for (uint32_t i = 0; i < grain; i++) {
+				if (i < delay) {
+					out[i] += m_ring[read] * gain;
+					read = read + 1 == size ? 0 : read + 1;
+				} else {
+					out[i] += input[i - delay] * gain;
+				}
+			}
+		}
+	}
+
+	[[nodiscard]] Taps TapsFor(uint32_t size, float rate) const {
+		const auto&    params  = m_params;
+		Taps           taps;
+		const uint32_t pattern = params.reflection_pattern < 8 ? params.reflection_pattern
+		                                                       : params.reflection_pattern - 8;
+		const auto early = std::min(
+		    static_cast<uint32_t>(params.reflections_delay * rate * 1000.0f * 0.001f + 0.5f), size);
+		const auto late = std::min(
+		    static_cast<uint32_t>((params.reflections_delay + params.reverb_delay) * rate *
+		                              1000.0f * 0.001f +
+		                          0.5f),
+		    size);
+		const auto last =
+		    static_cast<uint32_t>(rate * TapTimes[pattern][EarlyTaps - 1] * 0.001f + 0.5f);
+		// Patterns 0-7 squeeze the reflections in before the late feed; 8-15 may run past it.
+		const uint32_t limit = params.reflection_pattern > 7 ? size : late;
+		const float    scale = early + last > limit
+		                           ? static_cast<float>(limit - early) / static_cast<float>(last)
+		                           : 1.0f;
+		taps.delays[0] = early;
+		taps.gains[0]  = TapGains[pattern][0];
+		for (uint32_t tap = 1; tap < EarlyTaps; tap++) {
+			taps.delays[tap] =
+			    static_cast<uint32_t>(scale * TapTimes[pattern][tap] * rate * 0.001f + 0.5f) +
+			    early;
+			taps.gains[tap] =
+			    taps.delays[tap] == taps.delays[tap - 1] ? 0.0f : TapGains[pattern][tap];
+		}
+		taps.delays[EarlyTaps] = std::min(
+		    early + static_cast<uint32_t>(params.reverb_delay * rate * 1000.0f * 0.001f + 0.5f),
+		    size);
+		taps.gains[EarlyTaps] = 1.0f;
+		return taps;
+	}
+
+	void SetupComb(Comb& comb, uint32_t length, float rate, bool clear) const {
+		const auto& params = m_params;
+		if (clear || comb.buffer.size() != length) {
+			comb.buffer.assign(length, 0.0f);
+			if (comb.cursor >= length) {
+				comb.cursor = 0;
+			}
+		}
+		comb.feedback =
+		    std::pow(10.0f, static_cast<float>(length) / rate / params.decay_time * -3.0f);
+		const float ratio = params.decay_hf_ratio;
+		if (ratio > 1.0f) {
+			// Highs decay slower: mix in the difference from a fixed low-pass.
+			const float high   = std::pow(10.0f, (ratio - 1.0f) * std::log10(comb.feedback));
+			comb.lowpass_in    = 0.0506209731f;
+			comb.lowpass_back  = 0.949379027f;
+			comb.direct        = 1.0f;
+			comb.filtered      = 1.0f - high;
+		} else {
+			float shaped = ratio * ratio;
+			if (0.8f > ratio) {
+				shaped = (0.8f - ratio) * -0.857142925f + 0.8f;
+				shaped *= shaped;
+			}
+			const float back = std::min(
+			    0.99977994f, std::log10(comb.feedback) * 2.30258512f * 0.25f * (1.0f - 1.0f / shaped));
+			comb.lowpass_in   = 1.0f - back;
+			comb.lowpass_back = back;
+			comb.direct       = 0.0f;
+			comb.filtered     = 1.0f;
+		}
+		const float root   = std::sqrt(ratio);
+		const float tilt   = (1.0f - root) / (root + 1.0f);
+		comb.emphasis      = tilt / (1.0f - tilt) + 1.0f;
+		comb.emphasis_back = -tilt / (1.0f - tilt);
+	}
+
+	void Reset() {
+		m_ring.assign(RingSamples, 0.0f);
+		m_ring_cursor = 0;
+		m_taps        = {};
+		m_early_gain  = 1.0f;
+		m_late_gain   = 1.0f;
+		m_density     = std::numeric_limits<float>::quiet_NaN();
+		m_combs       = {};
+		m_channels    = {};
+	}
+
+	void ClearHistory() {
+		std::ranges::fill(m_ring, 0.0f);
+		for (auto& comb: m_combs) {
+			std::ranges::fill(comb.buffer, 0.0f);
+			comb.previous = comb.lowpass = 0.0f;
+		}
+		for (auto& channel: m_channels) {
+			for (auto& allpass: channel.allpasses) {
+				std::ranges::fill(allpass.buffer, 0.0f);
+			}
+			channel.y1 = channel.y2 = 0.0f;
+		}
+	}
+
+	void ApplyParams(float rate) {
+		const auto& params = m_params;
+		m_taps             = TapsFor(static_cast<uint32_t>(m_ring.size()), rate);
+		const float room   = std::min(1.0f, Millibels(static_cast<float>(params.room)));
+		m_early_gain = Millibels(static_cast<float>(ClampMillibels(params.reflections, 1000))) * room;
+		m_late_gain =
+		    Millibels(static_cast<float>(ClampMillibels(params.reverb, 2000) - 2400)) * room;
+		const bool density_changed = !(m_density == params.density);
+		m_density                  = params.density;
+		const float density_scale  = params.density * -3.0f / 100.0f + 4.0f;
+		for (uint32_t i = 0; i < Combs; i++) {
+			auto length = static_cast<uint32_t>(rate * CombTimes[i] / density_scale * 0.001f + 0.5f);
+			length += ~length & 1u; // odd lengths
+			SetupComb(m_combs[i], length, rate, density_changed);
+		}
+		for (uint32_t channel = 0; channel < MaxChannels; channel++) {
+			for (uint32_t stage = 0; stage < Allpasses; stage++) {
+				auto&      allpass = m_channels[channel].allpasses[stage];
+				const auto length  = static_cast<uint32_t>(
+                    static_cast<int32_t>(Samples(AllpassTimes[stage], rate)) +
+                    AllpassOffsets[channel][stage]);
+				if (allpass.buffer.size() != length) {
+					allpass.buffer.assign(length, 0.0f);
+				}
+				if (allpass.cursor >= length) {
+					allpass.cursor = 0;
+				}
+			}
+		}
+	}
+
+	// Two-pole low-pass whose gain at hfReference is roomHF.
+	void UpdateRoomFilter(float rate) {
+		const auto& params  = m_params;
+		const float room_hf = Millibels(static_cast<float>(ClampMillibels(params.room_hf, 0)));
+		m_room_filter       = 1.0f > room_hf;
+		if (!m_room_filter) {
+			return;
+		}
+		const float cosine = std::cos(params.hf_reference * 6.28318548f / rate);
+		const float root   = std::sqrt((room_hf + room_hf) * (1.0f - cosine) -
+		                               room_hf * room_hf * (1.0f - cosine * cosine));
+		const float pole   = ((1.0f - room_hf * cosine) - root) / (1.0f - room_hf);
+		m_room_b0          = (1.0f - pole) * (1.0f - pole);
+		m_room_a1          = pole + pole;
+		m_room_a2          = pole * -pole;
+	}
+
+	static void RunComb(Comb& comb, const float* input, float* output, uint32_t grain) {
+		const auto length = static_cast<uint32_t>(comb.buffer.size());
+		for (uint32_t i = 0; i < grain; i++) {
+			const float emphasized = input[i] * comb.emphasis + comb.previous * comb.emphasis_back;
+			comb.previous          = input[i];
+			const float delayed    = comb.buffer[comb.cursor];
+			comb.lowpass           = delayed * comb.lowpass_in + comb.lowpass * comb.lowpass_back;
+			const float back = (delayed * comb.direct + comb.lowpass * comb.filtered) * comb.feedback;
+			comb.buffer[comb.cursor] = emphasized + back;
+			output[i]                = back;
+			comb.cursor              = comb.cursor + 1 == length ? 0 : comb.cursor + 1;
+		}
+	}
+
+	static void RunAllpass(Allpass& allpass, float gain, float* samples, uint32_t grain) {
+		const auto length = static_cast<uint32_t>(allpass.buffer.size());
+		for (uint32_t i = 0; i < grain; i++) {
+			const float delayed            = allpass.buffer[allpass.cursor];
+			const float stored             = delayed * gain + samples[i];
+			allpass.buffer[allpass.cursor] = stored;
+			samples[i]                     = delayed - gain * stored;
+			allpass.cursor                 = allpass.cursor + 1 == length ? 0 : allpass.cursor + 1;
+		}
+	}
+
+	// Silent input after the tail: wet output is silence, dry passes the (silent) input.
+	static void Silence(float* samples, uint32_t channels, uint32_t grain) {
+		std::fill(samples, samples + size_t(channels) * grain, 0.0f);
+	}
+
+	Ngs2ReverbI3dl2Param                 m_params {};
+	bool                                 m_configured     = false;
+	bool                                 m_reset          = true;
+	bool                                 m_changed        = true;
+	uint32_t                             m_rate           = 0;
+	uint32_t                             m_tail_remaining = 0;
+	std::vector<float>                   m_ring;
+	uint32_t                             m_ring_cursor = 0;
+	Taps                                 m_taps;
+	float                                m_early_gain = 0.0f;
+	float                                m_late_gain  = 0.0f;
+	float                                m_density    = std::numeric_limits<float>::quiet_NaN();
+	std::array<Comb, Combs>              m_combs;
+	std::array<Channel, MaxChannels>     m_channels;
+	bool                                 m_room_filter = false;
+	float                                m_room_b0     = 0.0f;
+	float                                m_room_a1     = 0.0f;
+	float                                m_room_a2     = 0.0f;
+	// Scratch buffers, kept to avoid allocating per grain.
+	std::vector<float> m_input, m_mono, m_early, m_late, m_old_early, m_old_late, m_combs_out, m_tail;
+};
+
 struct Ngs2VoiceInternal {
 	struct Port {
 		Ngs2VoiceInternal* dest   = nullptr;
@@ -548,6 +1056,7 @@ struct Ngs2VoiceInternal {
 		std::vector<uint8_t>     param, work, state;
 		void                     KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*) = nullptr;
 		std::array<uintptr_t, 3> user_data {};
+		std::unique_ptr<Ngs2Reverb> reverb; // module 0x1b, once the game configures it
 		uint32_t                 flags          = 1;
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
@@ -1844,12 +2353,27 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.has_samples = true;
 			}
 		}
+		// A reverb keeps sounding after its input stops; render its tail from silence.
+		if (!voice.has_samples &&
+		    std::ranges::any_of(voice.modules, [](const auto& module) {
+			    return module.reverb != nullptr && module.reverb->HasTail();
+		    })) {
+			voice.has_samples = true;
+		}
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				const auto& info   = custom.module[m];
 				auto&       module = voice.modules[m];
+				if (info.module_id == 0x1b) {
+					// Until the game configures it, the module passes audio through unchanged.
+					if (module.reverb != nullptr) {
+						module.reverb->Process(voice.Buffer(info.source_buffer_id, grain),
+						                       voice.channels, grain);
+					}
+					continue;
+				}
 				if (info.module_id != 0x19 && info.module_id != 0x1f) {
 					if (!module.render_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
@@ -2452,13 +2976,31 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id;
 				auto& module = voice->modules[index];
 				if ((param->id & 0xffffffe0u) != (0x40000000u | module_id << 8u) ||
-				    (module_id != 0x19 && module_id != 0x1f)) {
+				    (module_id != 0x19 && module_id != 0x1b && module_id != 0x1f)) {
 					if (!module.control_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
 						    param->id));
 						module.control_warned = true;
 					}
+					break;
+				}
+				if (module_id == 0x1b) {
+					// Custom reverb module: Ngs2CustomVoiceReverbParam {header, I3DL2 settings}.
+					EXIT_NOT_IMPLEMENTED(param->size !=
+					                     sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2ReverbI3dl2Param));
+					const auto& i3dl2 = *reinterpret_cast<const Ngs2ReverbI3dl2Param*>(param + 1);
+					LOGF("\t reverb: wet = %f, dry = %f, room = %d, roomHF = %d, decay = %f, "
+					     "hfRatio = %f, reflections = %d @ %f, reverb = %d @ %f, diffusion = %f, "
+					     "density = %f, hfReference = %f\n",
+					     i3dl2.wet, i3dl2.dry, i3dl2.room, i3dl2.room_hf, i3dl2.decay_time,
+					     i3dl2.decay_hf_ratio, i3dl2.reflections, i3dl2.reflections_delay,
+					     i3dl2.reverb, i3dl2.reverb_delay, i3dl2.diffusion, i3dl2.density,
+					     i3dl2.hf_reference);
+					if (module.reverb == nullptr) {
+						module.reverb = std::make_unique<Ngs2Reverb>();
+					}
+					module.reverb->Configure(i3dl2, voice->rack->ngs->option.sample_rate);
 					break;
 				}
 				if (module_id == 0x19) {

@@ -31,8 +31,10 @@ uint64_t NowNs() noexcept;
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
 
-// Starts or stops collection, writing the report to `file` (replaced if it exists). Called from
-// Config::Load and Config::Shutdown.
+// Starts or stops collection, writing the report to `file` (replaced if it exists). Stopping
+// writes the time since the last block as a final, partial block. Called from Config::Load,
+// Config::Shutdown and Config::EmergencyShutdown (the normal exit path uses quick_exit, which runs
+// only emergency shutdown).
 void Configure(bool enabled, const std::filesystem::path& file);
 
 // Timestamp for the Note* calls that take a start time, or 0 when the report is disabled.

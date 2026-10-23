@@ -19,6 +19,7 @@ namespace Common::PerfReport {
 namespace {
 
 constexpr uint64_t IntervalNs    = 5'000'000'000ull;
+constexpr uint64_t MinLastIntervalNs = 100'000'000ull;
 constexpr size_t   TopEntries    = 15;
 constexpr size_t   MaxGpuWrites  = 65536;
 constexpr size_t   MaxFaultPages = size_t {1} << 20u;
@@ -152,10 +153,11 @@ void WriteHeader(FILE* f) {
 	             static_cast<double>(IntervalNs) / 1e9);
 }
 
-void WriteInterval(State& s, uint64_t now) {
+void WriteInterval(State& s, uint64_t now, bool last = false) {
 	auto*        f       = s.file;
 	const double seconds = static_cast<double>(now - s.interval_start) / 1e9;
-	std::fprintf(f, "=== %.1f s (interval %.1f s)\n", static_cast<double>(now - s.start) / 1e9, seconds);
+	std::fprintf(f, "=== %.1f s (%sinterval %.1f s)\n", static_cast<double>(now - s.start) / 1e9,
+	             last ? "last, partial " : "", seconds);
 	std::fprintf(f, "  frames: %.1f/s\n", PerSecond(s.flips.exchange(0), seconds));
 	std::fprintf(f, "  GPU command thread: idle %.1f%%, blocked on guest waits %.1f%%\n",
 	             100.0 * static_cast<double>(s.gpu_idle_ns.exchange(0)) / 1e9 / seconds,
@@ -223,6 +225,12 @@ void Configure(bool enabled, const std::filesystem::path& file) {
 	std::scoped_lock guard {s.lock};
 	Detail::g_enabled.store(false, std::memory_order_relaxed);
 	if (s.file != nullptr) {
+		// Keep the time since the last block, so a short session still gets a report. Skip a
+		// sliver too short to give meaningful rates.
+		const auto now = Detail::NowNs();
+		if (now - s.interval_start >= MinLastIntervalNs) {
+			WriteInterval(s, now, true);
+		}
 		std::fclose(s.file);
 		s.file = nullptr;
 	}

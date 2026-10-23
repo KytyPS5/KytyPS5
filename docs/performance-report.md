@@ -22,6 +22,8 @@ frame rate with the report on was within run-to-run noise of the frame rate with
 
 The GPU command thread writes each block between commands. While it is stuck in one long
 command an interval stretches, so check the interval length printed on each block's first line.
+When the emulator exits, including on a fatal error, the time since the last block is written as
+a final block marked "last, partial", so even a session shorter than one interval gets a report.
 
 ## Reading it
 
@@ -61,7 +63,7 @@ second, so `1000 ms/s` keeps one thread fully busy. Here is an abridged block fr
 ```
 
 In this example the game presents 3.7 frames per second and the GPU command thread is almost never
-idle. Nearly every GPU wait and queue submit comes from synchronous buffer downloads, and the
+idle. Nearly every GPU wait and most queue submits come from synchronous buffer downloads, and the
 faults behind them repeat on the same pages within each interval: guest code keeps writing to
 pages that shaders also write (for example shader `0x11aabeec56222407`), so every write
 downloads the GPU's data and waits for the GPU first. Avoiding that round trip for those buffers

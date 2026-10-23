@@ -16,10 +16,13 @@ namespace Config {
 void Initialize();
 void Shutdown();
 
+void EmergencyShutdown();
+
 struct Lifecycle {
-	static constexpr const char* name       = "Config";
-	static constexpr auto        initialize = Config::Initialize;
-	static constexpr auto        shutdown   = Config::Shutdown;
+	static constexpr const char* name               = "Config";
+	static constexpr auto        initialize         = Config::Initialize;
+	static constexpr auto        shutdown           = Config::Shutdown;
+	static constexpr auto        emergency_shutdown = Config::EmergencyShutdown;
 };
 
 enum class ShaderOptimizationType { None, Size, Performance };

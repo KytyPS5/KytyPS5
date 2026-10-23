@@ -419,7 +419,8 @@ Run `kyty_emulator --help` to see the available graphics, logging, validation, p
 debugging options.
 
 To investigate a low frame rate, the [performance report](docs/performance-report.md)
-(`--perf-report`) summarizes GPU waits, queue submits, and memory-tracking faults by call site.
+(`--perf-report`) summarizes GPU waits and queue submits by call site, plus memory-tracking fault
+details.
 
 ### AI Use
 

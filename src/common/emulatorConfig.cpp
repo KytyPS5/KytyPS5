@@ -23,6 +23,12 @@ void Shutdown() {
 	g_config.reset();
 }
 
+// Exits through quick_exit (including normal game exit) and fatal errors skip Shutdown(); finish
+// the performance report so its last, partial block is not lost.
+void EmergencyShutdown() {
+	Common::PerfReport::Configure(false, {});
+}
+
 void Load(const ConfigOptions& cfg) {
 	EXIT_IF(g_config == nullptr);
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);

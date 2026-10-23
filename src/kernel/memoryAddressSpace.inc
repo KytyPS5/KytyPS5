@@ -825,7 +825,11 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		// GPU write tracking changes protection from every faulting game thread and from the GPU
+		// thread. It only reads the mapping table, and the page manager already serializes
+		// changes to the same pages, so these calls can run concurrently. Mapping changes and
+		// guest protection changes still take the lock exclusively.
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 

@@ -14,6 +14,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -822,45 +823,79 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
-	void CollectScalarRead(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return;
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
-			Fail(use_pc, "cyclic typed planning value without a phi");
+	// Iterative post-order walk: linked leaf bodies make dependency chains thousands of values deep.
+	// Same order and checks as a recursive walk: an instruction is entered (cycle check, then its
+	// descriptor source is built) before its operands, and finished (scalar read recorded) after.
+	// m_srt_visiting is the path from the root; the sets make membership tests O(1).
+	void CollectScalarRead(Value root, uint32_t root_pc) {
+		struct Frame {
+			Inst* inst;
+			bool memory;
+			std::vector<std::pair<Value, uint32_t>> children;
+			size_t next = 0;
+		};
+		std::vector<Frame> stack;
+		// Pre-order step: returns without pushing a frame for immediates, finished values and
+		// back edges through a phi (a cycle without a phi is an error).
+		const auto enter = [&](Value value, uint32_t use_pc) {
+			value = value.Resolve();
+			if (value.IsImmediate()) return;
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+			if (m_srt_visiting_set.contains(inst)) {
+				const auto cycle = std::ranges::find(m_srt_visiting, inst);
+				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
+					return value->GetOpcode() == ValueOpcode::Phi;
+				})) return;
+				Fail(use_pc, "cyclic typed planning value without a phi");
+			}
+			if (m_srt_visited_set.contains(inst)) return;
+			m_srt_visiting.push_back(inst);
+			m_srt_visiting_set.insert(inst);
+			uint32_t memory_index = 0;
+			const auto* memory = ScalarReadMemory(*inst, memory_index);
+			// A scalar read depends on its descriptor words (attributed to the read's own pc) and
+			// its offset operands; any other value depends on all of its operands.
+			Frame frame {inst, memory != nullptr, {}};
+			if (memory != nullptr) {
+				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+				if (handle == nullptr || handle->GetOpcode() !=
+				        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
+					Fail(use_pc, "scalar read has an invalid resource handle");
+				DescriptorSource source;
+				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
+				           inst->Flags<MemoryFlags>().pc);
+				for (uint32_t word = 0; word < width; ++word)
+					frame.children.emplace_back(source.dwords[word], inst->Flags<MemoryFlags>().pc);
+				for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
+					frame.children.emplace_back(inst->Arg(arg), use_pc);
+			} else {
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+					frame.children.emplace_back(inst->Arg(arg), use_pc);
+			}
+			stack.push_back(std::move(frame));
+		};
+		enter(root, root_pc);
+		while (!stack.empty()) {
+			auto& top = stack.back();
+			if (top.next < top.children.size()) {
+				const auto [child, pc] = top.children[top.next++];
+				enter(child, pc); // may reallocate `stack`; `top` is not used afterwards
+				continue;
+			}
+			// Post-order step: all operands done.
+			auto* inst = top.inst;
+			const bool memory = top.memory;
+			stack.pop_back();
+			m_srt_visiting.pop_back();
+			m_srt_visiting_set.erase(inst);
+			m_srt_visited_set.insert(inst);
+			if (!memory) continue;
+			const auto offset = inst->Arg(1).Resolve();
+			if (!offset.IsImmediate() || offset.GetType() != Type::U32) continue;
+			m_scalar_reads.push_back(inst);
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
-		m_srt_visiting.push_back(inst);
-		uint32_t memory_index = 0;
-		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
-		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		m_scalar_reads.push_back(inst);
 	}
 
 	void PlanScalarReads() {
@@ -4088,7 +4123,8 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>            m_srt_visiting_set;
+	std::unordered_set<const Inst*>            m_srt_visited_set;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

@@ -1710,21 +1710,29 @@ Graph Structurize(const Graph& graph) {
 	return GotoStructurizer(graph).Run();
 }
 
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
-	// Vector comparisons and carry results can write a scalar pair in wave64.
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, bool wave64) {
+	// Vector comparisons and carry results write a scalar lane mask: a register pair in wave64,
+	// one register in wave32. Lane reads always write exactly one scalar register.
 	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
 	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
 	    inst.family == Decoder::Family::VOP3P) {
+		// V_READLANE/V_READFIRSTLANE return one lane's value; compares and carries return a lane
+		// mask, as wide as the wave.
+		const bool lane_read = inst.opcode == Opcode::V_READLANE_B32 ||
+		                       inst.opcode == Opcode::V_READFIRSTLANE_B32;
+		const uint32_t width = lane_read || !wave64 ? 1u : 2u;
 		uint32_t destination = 0;
 		for (const auto* operand: {&inst.dst, &inst.dst2})
-			if (ScalarOperandCode(*operand, destination) && code >= destination && code <= destination + 1u)
+			if (ScalarOperandCode(*operand, destination) && code >= destination &&
+			    code < destination + width)
 				return true;
 	}
 	return InstructionWritesScalarCode(inst, code);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, std::vector<uint32_t>& crossed_calls) {
+std::vector<uint32_t> FindScalarDefinitions(const Decoder::Program& program, const Graph& graph,
+                                            uint32_t before, uint32_t code,
+                                            std::vector<uint32_t>& crossed_calls, bool wave64) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1732,7 +1740,10 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 	EXIT_IF(found == graph.blocks.end());
 	std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, before}};
 	std::set<std::pair<uint32_t, uint32_t>> visited;
-	std::optional<uint32_t> definition;
+	// Several writes can reach one use, e.g. a callee address loaded before a loop and
+	// reloaded on the back edge after the call clobbered it. Callers decide whether the
+	// candidates agree.
+	std::vector<uint32_t> definitions;
 	while (!pending.empty()) {
 		const auto point = pending.back();
 		pending.pop_back();
@@ -1743,15 +1754,14 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		for (uint32_t i = point.second; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
 			if (inst.opcode == Opcode::S_SWAPPC_B64) {
-				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code));
+				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code, wave64));
 				crossed_calls.push_back(i);
 				continue;
 			}
-			if (MayWriteScalarRegister(inst, code)) { index = i; break; }
+			if (MayWriteScalarRegister(inst, code, wave64)) { index = i; break; }
 		}
 		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			EXIT_IF(definition && *definition != index);
-			definition = index;
+			definitions.push_back(index);
 			continue;
 		}
 		EXIT_IF(block->predecessors.empty());
@@ -1759,8 +1769,14 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 			pending.emplace_back(predecessor, graph.blocks[predecessor].inst_end);
 		}
 	}
-	EXIT_IF(!definition);
-	return *definition;
+	// Every path ended at a write or at the entry block. The same write can be reached along
+	// several paths, so deduplicate; callers rely on the sorted order for stable candidates.
+	EXIT_IF(definitions.empty());
+	std::ranges::sort(definitions);
+	definitions.erase(std::unique(definitions.begin(), definitions.end()), definitions.end());
+	std::ranges::sort(crossed_calls);
+	crossed_calls.erase(std::unique(crossed_calls.begin(), crossed_calls.end()), crossed_calls.end());
+	return definitions;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

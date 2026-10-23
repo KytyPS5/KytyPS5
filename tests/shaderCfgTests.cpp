@@ -10842,6 +10842,163 @@ void TestGraphicsComputeGetreg() {
 #endif
 }
 
+// A function table read at a lane-selected entry (a waterfall over a per-lane index):
+// every distinct entry is linked and a compare chain on the target pair selects the callee.
+void TestFunctionTableLeafCall() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0080000ull;
+  constexpr uint64_t callee_a = base + 0x100, callee_b = base + 0x140;
+  // v_readfirstlane_b32 s4, v0 ; s_lshl_b32 s4, s4, 4
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+    uint64_t end = base + 0x14c;
+  } memory;
+  const auto set_entry = [&](uint32_t entry, uint64_t target) {
+    memory.words[entry * 4u] = static_cast<uint32_t>(target);
+    memory.words[entry * 4u + 1u] = static_cast<uint32_t>(target >> 32u);
+  };
+  set_entry(0, callee_a);
+  set_entry(1, callee_b | 1u); // SWAPPC ignores the low two bits; the chain compares the raw pair.
+  set_entry(2, callee_a);      // duplicate
+  set_entry(3, 0);             // empty slot
+  // Each callee: s_mov_b32 s5, literal ; s_setpc_b64 s[14:15] (NULL-destination SWAPPC).
+  memory.words[0x40] = EncodeSMovB32(5, 255);
+  memory.words[0x41] = 0x11111111u;
+  memory.words[0x42] = EncodeSop1(0x21, 125, 14);
+  memory.words[0x50] = EncodeSMovB32(5, 255);
+  memory.words[0x51] = 0x22222222u;
+  memory.words[0x52] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (address < base || address > m.end || out.size_bytes() > m.end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u); // stride 0: records are bytes
+  user_data[2] = 64;                                 // four 16-byte entries
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == UINT32_MAX && source.calls.size() == 1 &&
+            source.calls[0].table && source.calls[0].table->stride == 16 &&
+            source.calls[0].table->low_offset == 0,
+        "lane-selected function table was not recognized");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 &&
+            source.calls[0].table_targets == std::vector<uint64_t>{callee_a, callee_b | 1u} &&
+            source.linked->callees == std::vector<uint64_t>{callee_a, callee_b},
+        "function table entries were not deduplicated into callees");
+  const auto& native = linked.instructions[source.calls[0].instruction];
+  Check(native.opcode == Decoder::Opcode::S_BRANCH && native.branch_target == 24u,
+        "native table call did not jump to the dispatcher");
+  uint32_t calls = 0;
+  for (const auto& inst : linked.instructions) {
+    if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+    ++calls;
+    const auto body = std::ranges::find(linked.instructions, inst.branch_target, &Decoder::Instruction::pc);
+    Check(body != linked.instructions.end() && body->opcode == Decoder::Opcode::S_MOV_B32,
+          "dispatcher call does not reach a callee body");
+    const auto ret = std::find_if(body, linked.instructions.end(), [](const auto& i) {
+      return i.opcode == Decoder::Opcode::S_BRANCH;
+    });
+    Check(ret != linked.instructions.end() && ret->branch_target == inst.pc + 4u,
+          "callee body does not return to its dispatcher entry");
+  }
+  Check(calls == 2, "dispatcher did not link one call per distinct target");
+  Check(std::ranges::is_sorted(linked.instructions, {}, &Decoder::Instruction::pc),
+        "linked instructions are not in pc order");
+  (void)TranslateProgram(linked, options);
+
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "unchanged function table relinked");
+  set_entry(1, callee_a);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->callees == std::vector<uint64_t>{callee_a},
+        "changed function table kept stale callees");
+  memory.words[0x41] = 0x33333333u;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 3, "changed callee code kept stale source");
+}
+
+// A table larger than one 1 MiB read chunk, with a stride that does not divide the chunk and the
+// target pair at +16: entry 21845 starts before the 1 MiB boundary but its pair starts after it,
+// so the scan must still find it. Also checks that a call target computed from GPU data without
+// a table read takes the dispatch-skip fallback instead of aborting.
+void TestFunctionTableChunkBoundary() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0100000ull;
+  constexpr uint32_t stride = 48, low_offset = 16, entries = 21847;
+  constexpr uint32_t straddling = 21845; // starts at 0xffff0, pair at 0x100000
+  constexpr uint64_t table_bytes = uint64_t{stride} * entries;
+  constexpr uint64_t callee_a = base + 0x110000, callee_b = base + 0x110040;
+  static_assert(straddling * stride < 0x100000u && straddling * stride + low_offset >= 0x100000u);
+  // v_readfirstlane_b32 s4, v0 ; s_mul_i32 s4, s4, 48
+  // s_buffer_load_dwordx2 s[14:15], s[0:3], s4 offset:16 ; s_swappc_b64 s[14:15], s[14:15] ; s_endpgm
+  const uint32_t shader[] = {EncodeVop1(0x02, 4, 256), EncodeSop2(0x26, 4, 4, 128 + stride),
+      EncodeSmem0(0x09, 14, 0), (4u << 25u) | low_offset, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  struct Memory {
+    std::vector<uint32_t> words = std::vector<uint32_t>(0x110080 / 4);
+  } memory;
+  const auto set_entry = [&](uint32_t entry, uint64_t target) {
+    const auto word = (entry * stride + low_offset) / 4u;
+    memory.words[word] = static_cast<uint32_t>(target);
+    memory.words[word + 1u] = static_cast<uint32_t>(target >> 32u);
+  };
+  set_entry(0, callee_a);
+  set_entry(straddling, callee_b);
+  for (const auto callee : {callee_a, callee_b}) {
+    const auto word = (callee - base) / 4u;
+    memory.words[word] = EncodeSMovB32(5, 255);
+    memory.words[word + 1u] = static_cast<uint32_t>(callee);
+    memory.words[word + 2u] = EncodeSop1(0x21, 125, 14);
+  }
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const auto end = base + m.words.size() * sizeof(uint32_t);
+    if (address < base || address > end || out.size_bytes() > end - address) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u); // stride 0: records are bytes
+  user_data[2] = static_cast<uint32_t>(table_bytes);
+  user_data[3] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.function_table_calls = true;
+  options.user_data = user_data;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.unsupported_call_pc == UINT32_MAX && source.calls.size() == 1 &&
+            source.calls[0].table && source.calls[0].table->stride == stride &&
+            source.calls[0].table->low_offset == low_offset,
+        "multiplied function-table index was not recognized");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.calls[0].table_targets == std::vector<uint64_t>{callee_a, callee_b},
+        "function-table entry whose pair starts in the next read chunk was skipped");
+
+  // v_readfirstlane_b32 s14, v0 ; v_readfirstlane_b32 s15, v1 ; s_swappc_b64 s[14:15], s[14:15]
+  const uint32_t lane_target[] = {EncodeVop1(0x02, 14, 256), EncodeVop1(0x02, 15, 257),
+      EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  const auto skipped = PrepareShaderSource(lane_target, options);
+  Check(skipped.unsupported_call_pc == 8u && skipped.calls.empty(),
+        "GPU-computed call target without a table did not take the dispatch-skip fallback");
+}
+
 void TestMemoryFedScalarLeafCall() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -16878,6 +17035,8 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestFunctionTableLeafCall();
+  TestFunctionTableChunkBoundary();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

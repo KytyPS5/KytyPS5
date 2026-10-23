@@ -14,9 +14,16 @@
 #include <ctime>
 #endif
 
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <thread>
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <climits> // PTHREAD_STACK_MIN on some libcs
+#include <pthread.h>
+#include <unistd.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -376,6 +383,57 @@ void CondVar::SignalAll() {
 int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
+}
+
+void RunWithStack(size_t stack_bytes, thread_func_t func, void* arg) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	struct Context {
+		thread_func_t func;
+		void*         arg;
+	} context {func, arg};
+	// std::thread cannot choose a stack size. STACK_SIZE_PARAM_IS_A_RESERVATION reserves address
+	// space only; pages are committed as the stack grows, so a large value costs little.
+	// The caller blocks until the work is done, so `context` can live on its stack.
+	auto* handle = ::CreateThread(
+	    nullptr, stack_bytes,
+	    [](LPVOID param) -> DWORD {
+		    auto* context = static_cast<Context*>(param);
+		    context->func(context->arg);
+		    return 0;
+	    },
+	    &context, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+	EXIT_IF(handle == nullptr);
+	::WaitForSingleObject(handle, INFINITE);
+	::CloseHandle(handle);
+#else
+	// Default secondary-thread stacks vary: 8 MB on Linux (from RLIMIT_STACK) but only 512 KB
+	// on macOS, so always ask for the size explicitly. The size must be a multiple of the page
+	// size on macOS and at least PTHREAD_STACK_MIN everywhere.
+	struct Context {
+		thread_func_t func;
+		void*         arg;
+	} context {func, arg};
+	const auto page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+	size_t     size = std::max<size_t>(stack_bytes, PTHREAD_STACK_MIN);
+	size            = (size + page - 1u) / page * page;
+	pthread_attr_t attr;
+	EXIT_IF(::pthread_attr_init(&attr) != 0);
+	EXIT_IF(::pthread_attr_setstacksize(&attr, size) != 0);
+	pthread_t thread {};
+	// Linux and macOS map thread stacks lazily, so a large size reserves address space only.
+	const int result = ::pthread_create(
+	    &thread, &attr,
+	    [](void* param) -> void* {
+		    auto* context = static_cast<Context*>(param);
+		    context->func(context->arg);
+		    return nullptr;
+	    },
+	    &context);
+	::pthread_attr_destroy(&attr);
+	EXIT_IF(result != 0);
+	// The caller blocks until the work is done, so `context` can live on its stack.
+	EXIT_IF(::pthread_join(thread, nullptr) != 0);
+#endif
 }
 
 } // namespace Common

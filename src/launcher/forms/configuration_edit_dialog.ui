@@ -505,6 +505,12 @@
             <property name="text"><string>Accurate texture synchronization</string></property>
            </widget>
           </item>
+          <item>
+           <widget class="QCheckBox" name="checkBox_function_table_calls">
+            <property name="toolTip"><string>Experimental. Runs compute shaders that call functions through a table in GPU memory instead of skipping them (Ratchet &amp; Clank: Rift Apart). Not working yet: it currently stops the game, because these shaders select textures in a way that is not supported.</string></property>
+            <property name="text"><string>Function-table shader calls (experimental)</string></property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>

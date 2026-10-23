@@ -13,6 +13,10 @@ void InitializeThreads();
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 
+// Runs func(arg) to completion on a temporary thread with at least stack_bytes of stack.
+// For deeply recursive work (e.g. large linked shaders) that would overflow a default thread stack.
+void RunWithStack(size_t stack_bytes, thread_func_t func, void* arg);
+
 struct ThreadPrivate;
 struct MutexPrivate;
 struct CondVarPrivate;

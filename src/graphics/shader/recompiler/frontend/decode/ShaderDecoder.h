@@ -880,6 +880,8 @@ struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
+	// Byte size of the native shader when leaf bodies were linked after it; 0 when every pc is native.
+	uint32_t                 native_bytes = 0;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "libs/controller.h"
 
 #include <algorithm>
@@ -131,15 +132,32 @@ struct Binding {
 	std::size_t control      = INVALID_CONTROL;
 };
 
-constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
-constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
-constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
-constexpr std::string_view TOUCH_PARTICLE_SKIN    = "TouchParticleSkin=";
+constexpr uint64_t MOUSE_POLL_INTERVAL_NS = 8 * SDL_NS_PER_MS;
+// A mouse reporting at 125 Hz leaves some polls empty while it is still moving.
+constexpr uint64_t MOUSE_IDLE_NS     = 24 * SDL_NS_PER_MS;
+constexpr double   MOUSE_SMOOTHING_S = 0.02;
+// Mouse speed, in counts per second at sensitivity 1, that pushes the stick all the way.
+constexpr double           MOUSE_FULL_SPEED    = 2000.0;
+constexpr uint64_t         CURSOR_IDLE_HIDE_MS = 2000;
+constexpr std::string_view TOUCH_PARTICLE_SKIN = "TouchParticleSkin=";
+
+struct MouseSettings {
+	float sensitivity_x = 1.0f;
+	float sensitivity_y = 1.0f;
+	// Smallest stick deflection the mouse produces, so slow movement clears the game's deadzone.
+	float deadzone     = 0.2f;
+	bool  invert_y     = false;
+	bool  auto_capture = false;
+};
 
 struct MouseJoystickState {
-	bool     enabled   = false;
-	bool     output    = false;
-	uint64_t next_poll = 0;
+	bool     enabled     = false;
+	bool     captured    = false;
+	bool     output      = false;
+	uint64_t last_poll   = 0;
+	uint64_t last_motion = 0;
+	double   velocity_x  = 0.0;
+	double   velocity_y  = 0.0;
 };
 
 MouseJoystickState g_mouse;
@@ -208,6 +226,31 @@ uint8_t MouseButtonFromName(std::string_view name) {
 	return button != buttons.end() ? button->second : 0;
 }
 
+float ParseFloat(std::string_view value, float fallback, float min, float max) {
+	const float result = std::strtof(std::string(value).c_str(), nullptr);
+	return std::clamp(std::isfinite(result) ? result : fallback, min, max);
+}
+
+// Returns false when the entry is not a mouse setting.
+bool ParseMouseSetting(std::string_view name, std::string_view value, MouseSettings& settings,
+                       bool& has_sensitivity_y) {
+	if (name == "MouseSensitivity") {
+		settings.sensitivity_x = ParseFloat(value, 1.0f, 0.1f, 5.0f);
+	} else if (name == "MouseSensitivityY") {
+		settings.sensitivity_y = ParseFloat(value, 1.0f, 0.1f, 5.0f);
+		has_sensitivity_y      = true;
+	} else if (name == "MouseDeadzone") {
+		settings.deadzone = ParseFloat(value, 0.2f, 0.0f, 0.9f);
+	} else if (name == "MouseInvertY") {
+		settings.invert_y = value == "1" || value == "true";
+	} else if (name == "MouseAutoCapture") {
+		settings.auto_capture = value == "1" || value == "true";
+	} else {
+		return false;
+	}
+	return true;
+}
+
 bool Conflicts(const Binding& first, const Binding& second) {
 	return first.control == second.control ||
 	       (first.key != SDLK_UNKNOWN && first.key == second.key) ||
@@ -217,6 +260,7 @@ bool Conflicts(const Binding& first, const Binding& second) {
 class InputMap {
 public:
 	InputMap() {
+		bool has_sensitivity_y = false;
 		for (const auto& value: Config::GetKeymap()) {
 			const std::string_view entry = value;
 			if (entry == "Keyboard=Disabled") {
@@ -227,13 +271,6 @@ public:
 				m_custom_pad = true;
 				continue;
 			}
-			if (entry.starts_with(MOUSE_SENSITIVITY)) {
-				const float sensitivity =
-				    std::strtof(value.c_str() + MOUSE_SENSITIVITY.size(), nullptr);
-				m_mouse_sensitivity =
-				    std::clamp(std::isfinite(sensitivity) ? sensitivity : 1.0f, 0.1f, 5.0f);
-				continue;
-			}
 			if (entry.starts_with(TOUCH_PARTICLE_SKIN) || entry.starts_with("TouchCursorImage=")) {
 				continue;
 			}
@@ -242,6 +279,11 @@ public:
 				continue;
 			}
 			const auto split = entry.find('=');
+			if (split != std::string_view::npos &&
+			    ParseMouseSetting(entry.substr(0, split), entry.substr(split + 1), m_mouse,
+			                      has_sensitivity_y)) {
+				continue;
+			}
 
 			Binding binding;
 			if (split != std::string_view::npos) {
@@ -267,9 +309,12 @@ public:
 				AssignPad(ControlFromName(item.control), SourceFromName(item.source));
 			}
 		}
+		if (!has_sensitivity_y) {
+			m_mouse.sensitivity_y = m_mouse.sensitivity_x;
+		}
 	}
-	[[nodiscard]] bool  Custom() const { return m_custom; }
-	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
+	[[nodiscard]] bool                 Custom() const { return m_custom; }
+	[[nodiscard]] const MouseSettings& Mouse() const { return m_mouse; }
 
 	[[nodiscard]] std::size_t PadControl(std::size_t source) const {
 		return source < m_pad_controls.size() ? m_pad_controls[source] : INVALID_CONTROL;
@@ -350,7 +395,7 @@ private:
 	bool                                     m_custom = false;
 	bool                                     m_custom_pad = false;
 	std::size_t                              m_size              = 0;
-	float                                    m_mouse_sensitivity = 1.0f;
+	MouseSettings                            m_mouse;
 };
 
 const InputMap& GetInputMap() {
@@ -550,15 +595,84 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	}
 }
 
-void MouseToJoystick(float delta_x, float delta_y) {
-	const double distance = std::hypot(delta_x, delta_y);
-	const double scale =
-	    std::clamp(distance * GetInputMap().MouseSensitivity() + 16.0, 64.0, 128.0) / distance;
-	const auto map_axis = [scale](float delta) {
-		return std::clamp(128 + static_cast<int>(std::lround(delta * scale)), 0, 255);
-	};
-	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(delta_x),
-	                          map_axis(delta_y));
+// With the mouse on the right stick the right hand leaves the keyboard, so the default layout
+// moves what it needs under the left hand and onto the mouse buttons.
+bool MouseLayoutKeyboardInput(int key_code, bool down) {
+	uint32_t button = 0;
+	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
+		case SDLK_SPACE: button = Controller::PAD_BUTTON_CROSS; break;
+		case SDLK_C:
+		case SDLK_LCTRL: button = Controller::PAD_BUTTON_CIRCLE; break;
+		case SDLK_R: button = Controller::PAD_BUTTON_SQUARE; break;
+		case SDLK_F: button = Controller::PAD_BUTTON_TRIANGLE; break;
+		case SDLK_V: button = Controller::PAD_BUTTON_R3; break;
+		case SDLK_1: button = Controller::PAD_BUTTON_UP; break;
+		case SDLK_2: button = Controller::PAD_BUTTON_RIGHT; break;
+		case SDLK_3: button = Controller::PAD_BUTTON_DOWN; break;
+		case SDLK_4: button = Controller::PAD_BUTTON_LEFT; break;
+		case SDLK_ESCAPE: button = Controller::PAD_BUTTON_OPTIONS; break;
+		default: return false;
+	}
+	SetButton(button, down);
+	return true;
+}
+
+uint32_t MouseLayoutButton(uint8_t mouse_button) {
+	switch (mouse_button) {
+		case SDL_BUTTON_LEFT: return Controller::PAD_BUTTON_R2;
+		case SDL_BUTTON_RIGHT: return Controller::PAD_BUTTON_L2;
+		case SDL_BUTTON_MIDDLE: return Controller::PAD_BUTTON_R3;
+		default: return 0;
+	}
+}
+
+void DispatchKey(int key_code, bool down) {
+	const auto& map = GetInputMap();
+	if (map.Custom()) {
+		SetControl(map.FindKey(key_code), down);
+	} else if (!g_mouse.enabled || !MouseLayoutKeyboardInput(key_code, down)) {
+		DefaultKeyboardInput(key_code, down);
+	}
+}
+
+void DispatchMouseButton(uint8_t mouse_button, bool down) {
+	const auto& map = GetInputMap();
+	if (mouse_button == 0) {
+		return;
+	}
+	if (map.Custom()) {
+		SetControl(map.FindMouseButton(mouse_button), down);
+	} else if (g_mouse.enabled) {
+		SetButton(MouseLayoutButton(mouse_button), down);
+	}
+}
+
+// Releases everything held through the layout it was pressed in, so a layout switch cannot
+// leave a pad button stuck down.
+void ReleaseHeldInputs() {
+	int         count = 0;
+	const bool* keys  = SDL_GetKeyboardState(&count);
+	for (int scancode = 0; scancode < count; scancode++) {
+		if (keys[scancode]) {
+			DispatchKey(static_cast<int>(SDL_GetKeyFromScancode(static_cast<SDL_Scancode>(scancode),
+			                                                    SDL_KMOD_NONE, true)),
+			            false);
+		}
+	}
+	const SDL_MouseButtonFlags buttons = SDL_GetMouseState(nullptr, nullptr);
+	for (uint8_t button = SDL_BUTTON_LEFT; button <= SDL_BUTTON_X2; button++) {
+		if ((buttons & SDL_BUTTON_MASK(button)) != 0) {
+			DispatchMouseButton(button, false);
+		}
+	}
+}
+
+void SetMouseEnabled(bool enabled) {
+	if (enabled == g_mouse.enabled) {
+		return;
+	}
+	ReleaseHeldInputs();
+	g_mouse.enabled = enabled;
 }
 
 void CenterMouseStick() {
@@ -569,6 +683,33 @@ void CenterMouseStick() {
 	g_mouse.output = false;
 }
 
+void ResetMouseMotion() {
+	g_mouse.last_poll   = 0;
+	g_mouse.last_motion = 0;
+	g_mouse.velocity_x  = 0.0;
+	g_mouse.velocity_y  = 0.0;
+	CenterMouseStick();
+}
+
+// The stick sets the camera's turn rate, so it follows the mouse speed: the deadzone floor plus
+// a share of the remaining throw that grows linearly up to MOUSE_FULL_SPEED.
+void MouseToJoystick(double velocity_x, double velocity_y) {
+	const double speed = std::hypot(velocity_x, velocity_y);
+	if (speed == 0.0) {
+		CenterMouseStick();
+		return;
+	}
+	const double deadzone = GetInputMap().Mouse().deadzone;
+	const double scale =
+	    (deadzone + (1.0 - deadzone) * std::min(speed / MOUSE_FULL_SPEED, 1.0)) * 127.0 / speed;
+	const auto map_axis = [scale](double velocity) {
+		return std::clamp(128 + static_cast<int>(std::lround(velocity * scale)), 0, 255);
+	};
+	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(velocity_x),
+	                          map_axis(velocity_y));
+	g_mouse.output = true;
+}
+
 bool SetRelativeMouseMode(bool enabled) {
 	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
 		return true;
@@ -577,22 +718,55 @@ bool SetRelativeMouseMode(bool enabled) {
 	return false;
 }
 
-int PollMouse(uint64_t now_ms) {
-	if (now_ms < g_mouse.next_poll) {
-		return static_cast<int>(g_mouse.next_poll - now_ms);
+// The system overlay draws its own cursor, so the mouse is released while it owns input.
+void UpdateMouseCapture() {
+	const bool capture = g_mouse.enabled && !SystemOverlayInputActive();
+	if (capture == g_mouse.captured) {
+		return;
 	}
-	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
+	if (!SetRelativeMouseMode(capture) && capture) {
+		SetMouseEnabled(false);
+		return;
+	}
+	g_mouse.captured = capture;
+	ResetMouseMotion();
+}
+
+int PollMouse(uint64_t now_ns) {
+	if (g_mouse.last_poll == 0) {
+		SDL_GetRelativeMouseState(nullptr, nullptr);
+		g_mouse.last_poll = now_ns;
+	}
+	const uint64_t next_poll = g_mouse.last_poll + MOUSE_POLL_INTERVAL_NS;
+	if (now_ns < next_poll) {
+		return static_cast<int>((next_poll - now_ns + SDL_NS_PER_MS - 1) / SDL_NS_PER_MS);
+	}
+	const double elapsed_s =
+	    std::min(static_cast<double>(now_ns - g_mouse.last_poll) / SDL_NS_PER_SECOND, 0.1);
+	g_mouse.last_poll = now_ns;
 
 	float delta_x = 0;
 	float delta_y = 0;
 	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (delta_x == 0 && delta_y == 0) {
+	if (delta_x != 0 || delta_y != 0) {
+		g_mouse.last_motion = now_ns;
+	}
+
+	if (now_ns - g_mouse.last_motion >= MOUSE_IDLE_NS) {
+		g_mouse.velocity_x = 0.0;
+		g_mouse.velocity_y = 0.0;
 		CenterMouseStick();
 	} else {
-		MouseToJoystick(delta_x, delta_y);
-		g_mouse.output = true;
+		const auto&  settings = GetInputMap().Mouse();
+		const double blend    = 1.0 - std::exp(-elapsed_s / MOUSE_SMOOTHING_S);
+		const double target_x = delta_x * settings.sensitivity_x / elapsed_s;
+		const double target_y =
+		    (settings.invert_y ? -delta_y : delta_y) * settings.sensitivity_y / elapsed_s;
+		g_mouse.velocity_x += blend * (target_x - g_mouse.velocity_x);
+		g_mouse.velocity_y += blend * (target_y - g_mouse.velocity_y);
+		MouseToJoystick(g_mouse.velocity_x, g_mouse.velocity_y);
 	}
-	return MOUSE_POLL_INTERVAL_MS;
+	return static_cast<int>(MOUSE_POLL_INTERVAL_NS / SDL_NS_PER_MS);
 }
 
 bool IsCursorActivity(const SDL_Event& event) {
@@ -741,10 +915,13 @@ void HostInputDisconnectGamepad(int id) {
 }
 
 void HostInputInit(SDL_Window* window) {
-	GetInputMap();
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
+	}
+	if (GetInputMap().Mouse().auto_capture) {
+		g_mouse.enabled = true;
+		LOGF("Mouse to right stick: enabled at start (F7 to release)\n");
 	}
 }
 
@@ -759,11 +936,11 @@ void HostInputShutdown() {
 	if (gamepad_touch_id >= 0) {
 		HostInputDisconnectGamepadTouchPad(gamepad_touch_id);
 	}
-	if (g_mouse.enabled) {
+	if (g_mouse.captured) {
 		SetRelativeMouseMode(false);
-		CenterMouseStick();
-		g_mouse = {};
 	}
+	CenterMouseStick();
+	g_mouse          = {};
 	g_mouse_window   = nullptr;
 	g_cursor_hide_at = 0;
 	if (Config::HideCursorEnabled()) {
@@ -772,19 +949,11 @@ void HostInputShutdown() {
 }
 
 void HostInputKey(int key_code, bool down) {
-	const auto& map = GetInputMap();
-	if (map.Custom()) {
-		SetControl(map.FindKey(key_code), down);
-	} else {
-		DefaultKeyboardInput(key_code, down);
-	}
+	DispatchKey(key_code, down);
 }
 
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
-	const auto& map = GetInputMap();
-	if (map.Custom() && mouse_button != 0) {
-		SetControl(map.FindMouseButton(mouse_button), down);
-	}
+	DispatchMouseButton(mouse_button, down);
 }
 
 void HostInputMouseTouchPad(bool down, float x, float y) {
@@ -814,6 +983,11 @@ void HostInputMouseMotion(float x, float y) {
 }
 
 void HostInputSetTouchPadMode(bool enabled) {
+	if (enabled && g_mouse.enabled) {
+		SetMouseEnabled(false);
+		UpdateMouseCapture();
+		LOGF("Mouse to right stick: disabled for touchpad mode\n");
+	}
 	if (enabled) {
 		int gamepad_id = -1;
 		{
@@ -1001,32 +1175,22 @@ HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
 }
 
 void HostInputToggleMouseToJoystick() {
-	if (g_mouse.enabled) {
-		SetRelativeMouseMode(false);
-		CenterMouseStick();
-		g_mouse = {};
-		LOGF("Mouse to right stick: disabled\n");
-		return;
+	if (!g_mouse.enabled) {
+		// Touchpad mode draws with the cursor position, which relative mode takes away.
+		HostInputSetTouchPadMode(false);
 	}
-
-	if (!SetRelativeMouseMode(true)) {
-		return;
-	}
-	g_mouse.enabled = true;
-	LOGF("Mouse to right stick: enabled (F7 to release)\n");
+	SetMouseEnabled(!g_mouse.enabled);
+	LOGF("Mouse to right stick: %s\n", g_mouse.enabled ? "enabled (F7 to release)" : "disabled");
+	UpdateMouseCapture();
 }
 
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
+	UpdateMouseCapture();
 	int timeout = -1;
-	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
-		g_mouse.next_poll = 0;
-		CenterMouseStick();
+	if (!g_mouse.captured || SDL_GetKeyboardFocus() != g_mouse_window) {
+		ResetMouseMotion();
 	} else {
-		if (g_mouse.next_poll == 0) {
-			SDL_GetRelativeMouseState(nullptr, nullptr);
-			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
-		}
-		timeout = PollMouse(SDL_GetTicks());
+		timeout = PollMouse(SDL_GetTicksNS());
 	}
 
 	if (g_cursor_hide_at != 0 && !TouchPadModeActive()) {
@@ -1043,7 +1207,7 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 
 	if (Config::HideCursorEnabled() && !TouchPadModeActive()) {
 		const auto now_ms = SDL_GetTicks();
-		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
+		if (has_event && !g_mouse.captured && IsCursorActivity(*event) &&
 		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
 			SDL_ShowCursor();
 			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
@@ -1055,8 +1219,7 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 
 	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
 	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
-		g_mouse.next_poll = 0;
-		CenterMouseStick();
+		ResetMouseMotion();
 	}
 	return has_event;
 }

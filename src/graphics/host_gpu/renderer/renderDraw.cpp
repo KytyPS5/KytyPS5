@@ -1674,10 +1674,13 @@ bool RenderExecutor::FrontWorkerEnabled() {
 
 // Neither a metadata/decompression mode, a resolve, nor a depth or stencil copy: nothing the
 // draw does is recorded before its program lookups (ConsumeMetadataColorOperation,
-// DepthStencilCopy, ResolveColorTargets act only in these modes).
+// DepthStencilCopy, ResolveColorTargets act only in these modes). Depth-only draws (color
+// disabled) are ordinary too.
 static bool OrdinaryDrawMode(const HW::Context& ctx) {
 	const auto& override = ctx.GetDepthRenderOverride();
-	return ctx.GetColorControl().mode == static_cast<uint8_t>(CbColorMode::Normal) &&
+	const auto  mode     = ctx.GetColorControl().mode;
+	return (mode == static_cast<uint8_t>(CbColorMode::Normal) ||
+	        mode == static_cast<uint8_t>(CbColorMode::Disable)) &&
 	       !override.force_z_dirty && !override.force_stencil_dirty;
 }
 
@@ -1700,7 +1703,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(host_args && args.offset_source != DrawOffsetSource::IndirectArgs);
 	// An ordinary draw records nothing before its program lookups, so they can run on the front
 	// worker while the draw before it is recorded. Any other draw records in order.
-	const bool pipelined = FrontWorkerEnabled() && !host_args &&
+	const bool pipelined = FrontWorkerEnabled() &&
 	                       static_cast<Prospero::IndexType>(args.index_type_and_size) !=
 	                           Prospero::IndexType::kIndex8 &&
 	                       OrdinaryDrawMode(buffer.GetRegisters());
@@ -1710,6 +1713,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (host_args &&
 	    (!HostReadsIndirectArgs(buffer) || args.index_count == 0 ||
 	     static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex8)) {
+		// The caller reads the arguments on the CPU, after the work before them.
+		FlushPendingWork();
 		return false;
 	}
 	if (args.index_count == 0 || (!host_args && args.instance_count == 0)) {
@@ -1847,14 +1852,17 @@ void RenderExecutor::FinishDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // A draw or dispatch waiting to be recorded: what DrawIndex or DispatchDirect knew of it, with a
 // copy of its registers.
+enum class PendingKind : uint8_t { DrawIndex, DrawAuto, Dispatch };
+
 struct PendingWork {
-	bool                          dispatch  = false;
+	PendingKind                   kind      = PendingKind::DrawIndex;
 	uint64_t                      submit_id = 0;
 	HW::Context                   registers;
 	HW::UserConfig                user_config;
 	HW::Shader                    shaders;
-	// A draw.
+	// A draw: an indexed draw's arguments, or an automatic draw's.
 	DrawIndexArgs                 args {};
+	DrawAutoArgs                  auto_args {};
 	DrawCallInfo                  draw {};
 	vk::PrimitiveTopology         topology = vk::PrimitiveTopology::ePointList;
 	DrawIndexBufferSource         index_source {};
@@ -1903,7 +1911,7 @@ void FrontPipelineDeleter::operator()(FrontPipeline* pipeline) const {
 }
 
 static void RunLookups(PendingWork& work, PipelineCache& pipeline_cache) {
-	if (work.dispatch) {
+	if (work.kind == PendingKind::Dispatch) {
 		work.compute_info    = work.dispatch_input;
 		work.compute_program = pipeline_cache.GetComputeProgram(
 		    work.shaders.GetCs(), work.registers.GetShaderRegisters(), work.compute_info, 0,
@@ -1960,7 +1968,7 @@ void RenderExecutor::PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer
                                        const DrawIndexBufferSource& index_source,
                                        bool                         primitive_restart) {
 	auto& next             = NextPendingWork(buffer, submit_id);
-	next.dispatch          = false;
+	next.kind              = PendingKind::DrawIndex;
 	next.args              = args;
 	next.draw              = draw;
 	next.topology          = topology;
@@ -1972,11 +1980,25 @@ void RenderExecutor::PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer
 	QueuePendingWork(buffer, next);
 }
 
+void RenderExecutor::PipelineDrawAuto(uint64_t submit_id, CommandBuffer& buffer,
+                                      const DrawAutoArgs& args, const DrawCallInfo& draw,
+                                      vk::PrimitiveTopology topology) {
+	auto& next             = NextPendingWork(buffer, submit_id);
+	next.kind              = PendingKind::DrawAuto;
+	next.auto_args         = args;
+	next.draw              = draw;
+	next.topology          = topology;
+	next.state             = {};
+	next.state.resources   = &next.resources;
+	next.color_output_mask = PrepareDrawShaderState(next.registers, next.shaders, next.state);
+	QueuePendingWork(buffer, next);
+}
+
 void RenderExecutor::PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                             const std::array<uint32_t, 3>& groups, uint32_t mode,
                                             const ShaderComputeInputInfo& input_info) {
 	auto& next           = NextPendingWork(buffer, submit_id);
-	next.dispatch        = true;
+	next.kind            = PendingKind::Dispatch;
 	next.dispatch_groups = groups;
 	next.dispatch_mode   = mode;
 	next.dispatch_input  = input_info;
@@ -1985,7 +2007,9 @@ void RenderExecutor::PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& b
 
 void RenderExecutor::SettlePendingLookups(PendingWork& pending) {
 	auto&      pipeline = *m_front_pipeline;
-	const auto service  = [this] { m_context.GetGpu().ServiceCommands(); };
+	const auto service  = [this] {
+		if (m_context.HasGpu()) m_context.GetGpu().ServiceCommands();
+	};
 	const bool aborted  = pipeline.worker.Wait(pending.ticket, service);
 	if (!aborted) {
 		// What the GPU wrote since the lookups were queued, where they read.
@@ -2000,7 +2024,7 @@ void RenderExecutor::SettlePendingLookups(PendingWork& pending) {
 	// What the worker read has changed, or it stopped: the lookups again, here, once the worker
 	// is idle (they may change the program cache).
 	pipeline.worker.WaitIdle(service);
-	if (!pending.dispatch) {
+	if (pending.kind != PendingKind::Dispatch) {
 		pending.state             = {};
 		pending.state.resources   = &pending.resources;
 		pending.color_output_mask =
@@ -2014,7 +2038,7 @@ void RenderExecutor::RecordPendingWork(PendingWork& pending, CommandBuffer& buff
 	auto& user_config = buffer.GetUserConfig();
 	auto& shaders     = buffer.GetShaders();
 	buffer.Bind(pending.registers, pending.user_config, pending.shaders);
-	if (pending.dispatch) {
+	if (pending.kind == PendingKind::Dispatch) {
 		const auto& groups = pending.dispatch_groups;
 		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect),
 		                    pending.submit_id, groups[0], groups[1], groups[2],
@@ -2023,15 +2047,107 @@ void RenderExecutor::RecordPendingWork(PendingWork& pending, CommandBuffer& buff
 			FinishDispatchDirect(pending.submit_id, buffer, groups, pending.dispatch_mode,
 			                     pending.compute_info, pending.compute_program);
 		}
+	} else if (pending.kind == PendingKind::DrawAuto) {
+		const auto& args = pending.auto_args;
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto),
+		                    pending.submit_id, args.vertex_count, 0, args.first_vertex,
+		                    args.instance_count, args.first_instance);
+		RecordPendingDrawAuto(pending, buffer);
 	} else {
 		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex),
 		                    pending.submit_id, pending.args.index_count, 0, 1,
 		                    pending.args.instance_count,
 		                    reinterpret_cast<uint64_t>(pending.args.index_addr));
-		FinishDrawIndex(pending.submit_id, buffer, pending.args, pending.draw, pending.topology,
-		                pending.index_source, pending.primitive_restart, pending.state, true);
+		RecordPendingDrawIndex(pending, buffer);
 	}
 	buffer.Bind(registers, user_config, shaders);
+}
+
+// A draw whose arguments the host GPU was to read can turn out, once its programs are known, to
+// need them on the CPU (HostReadsIndirectArgs): they are read now, after the work recorded
+// before the draw, as CommandProcessor::DrawIndirectMulti reads them.
+template <typename Command>
+static bool ReadIndirectArgs(RenderContext& context, uint64_t address, Command& command) {
+	context.GetBufferCache().ReadMemory(address, sizeof(Command));
+	return LibKernel::Memory::TryReadBacking(address, &command, sizeof(Command));
+}
+
+void RenderExecutor::RecordPendingDrawIndex(PendingWork& pending, CommandBuffer& buffer) {
+	auto& args = pending.args;
+	if (args.indirect_args_address == 0) {
+		FinishDrawIndex(pending.submit_id, buffer, args, pending.draw, pending.topology,
+		                pending.index_source, pending.primitive_restart, pending.state, true);
+		return;
+	}
+	if (!PrepareDrawTargets(buffer, pending.draw, args.render_target_slice_offset, pending.state)) {
+		ResetBindings();
+		return;
+	}
+	if (HostReadsIndirectArgs(pending.state)) {
+		FinishDrawIndex(pending.submit_id, buffer, args, pending.draw, pending.topology,
+		                pending.index_source, pending.primitive_restart, pending.state, false);
+		return;
+	}
+	vk::DrawIndexedIndirectCommand command {};
+	if (!ReadIndirectArgs(m_context, args.indirect_args_address, command)) {
+		EXIT("indirect draw arguments at 0x%016" PRIx64 " are not readable\n",
+		     args.indirect_args_address);
+	}
+	// index_count is the size of the index buffer in indices here.
+	DrawIndexArgs cpu  = args;
+	cpu.index_count    = std::min(command.indexCount, args.index_count);
+	cpu.index_addr     = static_cast<const uint8_t*>(args.index_addr) +
+	                 uint64_t {command.firstIndex} * pending.index_source.guest_element_size;
+	cpu.instance_count = command.instanceCount;
+	cpu.base_vertex    = command.vertexOffset;
+	cpu.first_instance = command.firstInstance;
+	cpu.indirect_args_address = 0;
+	if (cpu.index_count == 0 || cpu.instance_count == 0) {
+		ResetBindings();
+		return;
+	}
+	auto index_source    = pending.index_source;
+	index_source.address = reinterpret_cast<uint64_t>(cpu.index_addr);
+	index_source.size    = uint64_t {cpu.index_count} * index_source.guest_element_size;
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, cpu.index_count, cpu.instance_count,
+	                         cpu.first_instance};
+	FinishDrawIndex(pending.submit_id, buffer, cpu, draw, pending.topology, index_source,
+	                ResolvePrimitiveRestart(buffer, index_source), pending.state, false);
+}
+
+void RenderExecutor::RecordPendingDrawAuto(PendingWork& pending, CommandBuffer& buffer) {
+	auto& args = pending.auto_args;
+	if (!PrepareDrawTargets(buffer, pending.draw, args.render_target_slice_offset, pending.state)) {
+		ResetBindings();
+		return;
+	}
+	if (args.indirect_args_address == 0 || HostReadsIndirectArgs(pending.state)) {
+		FinishDrawAuto(pending.submit_id, buffer, args, pending.draw, pending.topology,
+		               pending.state);
+		return;
+	}
+	vk::DrawIndirectCommand command {};
+	if (!ReadIndirectArgs(m_context, args.indirect_args_address, command)) {
+		EXIT("indirect draw arguments at 0x%016" PRIx64 " are not readable\n",
+		     args.indirect_args_address);
+	}
+	DrawAutoArgs cpu   = args;
+	cpu.vertex_count   = command.vertexCount;
+	cpu.instance_count = command.instanceCount;
+	cpu.first_vertex   = command.firstVertex;
+	cpu.first_instance = command.firstInstance;
+	cpu.indirect_args_address = 0;
+	if (cpu.vertex_count == 0 || cpu.instance_count == 0) {
+		ResetBindings();
+		return;
+	}
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, cpu.vertex_count,
+	                         cpu.instance_count, cpu.first_instance};
+	FinishDrawAuto(pending.submit_id, buffer, cpu, draw, pending.topology, pending.state);
+}
+
+bool RenderExecutor::HasPendingWork() const {
+	return m_front_pipeline && m_front_pipeline->first != m_front_pipeline->next;
 }
 
 void RenderExecutor::FlushPendingWork() {
@@ -2195,7 +2311,13 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	Common::LockGuard lock(m_context.GetMutex());
 	const bool        host_args = args.indirect_args_address != 0;
 	EXIT_IF(host_args && args.offset_source != DrawOffsetSource::IndirectArgs);
+	// As DrawIndex: an ordinary draw's program lookups run on the front worker.
+	const bool pipelined = FrontWorkerEnabled() && OrdinaryDrawMode(buffer.GetRegisters());
+	if (!pipelined) {
+		FlushPendingWork();
+	}
 	if (host_args && !HostReadsIndirectArgs(buffer)) {
+		FlushPendingWork();
 		return false;
 	}
 	if (!host_args && (args.vertex_count == 0 || args.instance_count == 0)) {
@@ -2238,6 +2360,10 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return true;
 	}
+	if (pipelined) {
+		PipelineDrawAuto(submit_id, buffer, args, draw, topology);
+		return true;
+	}
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -2247,7 +2373,15 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return false;
 	}
+	FinishDrawAuto(submit_id, buffer, args, draw, topology, state);
+	return true;
+}
 
+void RenderExecutor::FinishDrawAuto(uint64_t submit_id, CommandBuffer& buffer,
+                                    const DrawAutoArgs& args, const DrawCallInfo& draw,
+                                    vk::PrimitiveTopology topology, DrawRenderState& state) {
+	auto&      ucfg      = buffer.GetUserConfig();
+	auto&      sh_ctx    = buffer.GetShaders();
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
 	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
@@ -2259,7 +2393,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
 		ResetBindings();
-		return true;
+		return;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
@@ -2279,7 +2413,6 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 	ResetBindings();
-	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

@@ -812,6 +812,13 @@ static bool KeepsWorkPending(const uint32_t* packet) {
 		case Pm4::IT_WRITE_CONST_RAM:
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		// The draws record in order: one whose arguments the CPU reads records the work before
+		// it first (CommandProcessor::DrawIndirectMulti).
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
 		case Pm4::IT_DISPATCH_DIRECT:
 		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return true;
 		case Pm4::IT_NOP: {
@@ -1104,8 +1111,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto args_size =
 		    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 		// Memory outside the tracked guest range (a test's host buffer) is never GPU-written.
+		// Work not recorded yet may write the arguments, and its writes are not tracked until it
+		// is: the host GPU reads them then too.
+		auto& executor = m_renderer.GetRenderExecutor();
 		if (GuestRange {args_address, args_size}.Valid() &&
-		    m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size)) {
+		    (executor.HasPendingWork() ||
+		     m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size))) {
 			const bool drawn =
 			    indexed ? DrawIndex({.index_count = m_index_buffer_size,
 			                         .index_addr  = reinterpret_cast<const void*>(m_index_base_addr),
@@ -1121,6 +1132,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// The CPU reads the count and the arguments: after the work before them is recorded.
+	m_renderer.GetRenderExecutor().FlushPendingWork();
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		draw_count = *count_addr;

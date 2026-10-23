@@ -194,6 +194,8 @@ public:
 	// recorded or guest memory written: the command processor calls it for every packet but
 	// register writes, draws and dispatches.
 	void FlushPendingWork();
+	// Draws or dispatches wait to be recorded (FlushPendingWork records them).
+	[[nodiscard]] bool HasPendingWork() const;
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
@@ -243,12 +245,19 @@ private:
 	                     const DrawCallInfo& draw, vk::PrimitiveTopology topology,
 	                     const DrawIndexBufferSource& index_source, bool primitive_restart,
 	                     DrawRenderState& state, bool prepare_targets);
+	// DrawAuto from its prepared state on (targets included): the recording.
+	void FinishDrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args,
+	                    const DrawCallInfo& draw, vk::PrimitiveTopology topology,
+	                    DrawRenderState& state);
 	// KYTY_FRONT_WORKER=0 keeps the program lookups on the GPU thread.
 	[[nodiscard]] static bool FrontWorkerEnabled();
 	// DrawIndex of an ordinary draw with a front worker: see FlushPendingWork.
 	void PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
 	                       const DrawCallInfo& draw, vk::PrimitiveTopology topology,
 	                       const DrawIndexBufferSource& index_source, bool primitive_restart);
+	// DrawAuto of an ordinary draw with a front worker.
+	void PipelineDrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args,
+	                      const DrawCallInfo& draw, vk::PrimitiveTopology topology);
 	// DispatchDirect with a front worker, from its input before the program lookup.
 	void PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                            const std::array<uint32_t, 3>& groups, uint32_t mode,
@@ -268,6 +277,8 @@ private:
 	// The front worker's job for the pending work is done and still holds, or redone here.
 	void SettlePendingLookups(PendingWork& pending);
 	void RecordPendingWork(PendingWork& pending, CommandBuffer& buffer);
+	void RecordPendingDrawIndex(PendingWork& pending, CommandBuffer& buffer);
+	void RecordPendingDrawAuto(PendingWork& pending, CommandBuffer& buffer);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,

@@ -460,7 +460,9 @@ struct RenderExecutorTestAccess {
 
   static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
-    return executor.DrawAuto(0, command, args);
+    const bool drawn = executor.DrawAuto(0, command, args);
+    executor.FlushPendingWork();
+    return drawn;
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,

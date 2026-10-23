@@ -40,6 +40,8 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	// The guest GPU runs (InitializeGpu): a renderer driven without one (the tests) has none.
+	[[nodiscard]] bool                      HasGpu() const noexcept { return m_gpu != nullptr; }
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 	// End-of-pipe labels the host GPU has not completed (pendingLabels.h). Completion
 	// callbacks keep them alive past the guest GPU.

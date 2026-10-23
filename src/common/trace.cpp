@@ -627,7 +627,7 @@ std::string KeyedText() {
 } // namespace
 
 void AddKeyed(const char* table, uint64_t key, uint64_t value) {
-	if (!Enabled()) {
+	if (!ProfEnabled()) {
 		return;
 	}
 	std::lock_guard lock(g_keyed_mutex);

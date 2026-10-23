@@ -150,7 +150,8 @@ private:
 };
 
 // Adds `value` (and one call) to `key` of `table`: keyed.csv lists the largest keys of each table.
-// `table` is a string literal.
+// `table` is a string literal. Profile data: off with KYTY_TRACE_NO_PROF, as the uploads call it
+// often and each call takes a lock.
 void AddKeyed(const char* table, uint64_t key, uint64_t value);
 
 // Times its scope and adds it to table "wait_stack" under a hash of the caller's stack; the first

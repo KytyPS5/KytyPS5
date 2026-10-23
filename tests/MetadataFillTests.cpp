@@ -105,6 +105,21 @@ void TestUnwatchEndsTheWatchAndReusesTheId() {
 	Check(set.Generation(b) != fresh, "a write to the new range does");
 }
 
+// Two readers watch the same range (a fill record and a check of its slices): the first to end
+// its watch must not end the other's.
+void TestSharedWatchEndsWithItsLastWatcher() {
+	WriteWatchSet set;
+	const auto    a = set.Watch(0x1000, 0x1000);
+	const auto    b = set.Watch(0x1000, 0x1000);
+	Check(a == b, "the same range shares its watch");
+	set.Unwatch(a);
+	const auto g = set.Generation(b);
+	set.NotifyWrite(0x1800, 8);
+	Check(set.Generation(b) != g, "a shared watch still sees writes after one watcher ends it");
+	set.Unwatch(b);
+	Check(set.Watch(0x9000, 0x1000) == a, "the id is free once its last watcher ends it");
+}
+
 } // namespace
 
 int main() {
@@ -115,6 +130,7 @@ int main() {
 	TestOverlappingWatchesBothChange();
 	TestGenerationNeverRepeats();
 	TestLongWatchFoundFromFarWrite();
+	TestSharedWatchEndsWithItsLastWatcher();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

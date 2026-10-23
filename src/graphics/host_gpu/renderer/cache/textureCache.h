@@ -92,7 +92,8 @@ public:
 	// metadata code, the next colour clear resolution for that range uses it instead of reading the
 	// bytes back from the GPU. Call after the dispatch is recorded, so its own write is counted.
 	void RecordColorMetadataFill(uint64_t address, uint64_t size, uint32_t value);
-	// Voids every record: a GPU write is coming that no write watch will see.
+	// Voids every record, and every check of slices without a clear: a GPU write is coming that
+	// no write watch will see.
 	void DropColorMetadataFills();
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -226,6 +227,51 @@ private:
 	using ColorMetadataFillMap                    = std::map<uint64_t, ColorMetadataFill>;
 	ColorMetadataFillMap::iterator DropColorMetadataFill(ColorMetadataFillMap::iterator fill);
 	void                           DropColorMetadataFillsLocked();
+	// Colour metadata slices whose bytes held no clear for an image, by metadata block range.
+	// While nothing writes the range (the write generation is unchanged and every CPU write would
+	// fault), binding the image again finds the same, and MaterializeColorClear returns early.
+	struct ColorMetadataChecked {
+		ImageId           image;
+		uint64_t          size         = 0;
+		uint32_t          first        = 0;
+		uint32_t          count        = 0;
+		// What DecodeColorClear reads of the description.
+		vk::Format        format               = vk::Format::eUndefined;
+		uint64_t          clear_word           = 0;
+		ImageMetadataKind kind                 = ImageMetadataKind::None;
+		BindingType       type                 = BindingType::Texture;
+		bool              clear_register_valid = false;
+		bool              dcc_alpha_msb        = false;
+		WriteWatchSet::Id watch                = 0;
+		uint64_t          generation           = 0;
+		// A check from an earlier epoch is void (DropColorMetadataFills); its watch is kept.
+		uint64_t          epoch                = 0;
+
+		[[nodiscard]] bool SameSlices(const ColorMetadataChecked& other) const noexcept {
+			return image == other.image && size == other.size && first == other.first &&
+			       count == other.count && format == other.format &&
+			       clear_word == other.clear_word && kind == other.kind && type == other.type &&
+			       clear_register_valid == other.clear_register_valid &&
+			       dcc_alpha_msb == other.dcc_alpha_msb;
+		}
+	};
+	// Images can share a metadata block address with other sizes or descriptions: one record each.
+	struct ColorMetadataCheckedKey {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		ImageId  image;
+		bool     operator==(const ColorMetadataCheckedKey&) const = default;
+	};
+	struct ColorMetadataCheckedHash {
+		size_t operator()(const ColorMetadataCheckedKey& key) const noexcept {
+			return std::hash<uint64_t> {}(key.address ^ (key.size << 20u)) ^
+			       (std::hash<ImageId> {}(key.image) * 0x9e3779b97f4a7c15ull);
+		}
+	};
+	std::unordered_map<ColorMetadataCheckedKey, ColorMetadataChecked, ColorMetadataCheckedHash>
+	    m_color_metadata_checked;
+	uint64_t                                           m_color_metadata_checked_epoch = 1;
+	static constexpr size_t MaxColorMetadataChecked = 4096;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

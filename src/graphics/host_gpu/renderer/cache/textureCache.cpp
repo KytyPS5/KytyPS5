@@ -53,12 +53,16 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; });
 }
 
+// The format a metadata clear code decodes to.
+[[nodiscard]] vk::Format ColorClearFormat(const TextureCache::ImageDesc& desc) {
+	return desc.info.IsDepth() ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
+	                           : desc.view_info.format;
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.info.IsDepth()
-	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
-	                           : desc.view_info.format;
+	const auto  format   = ColorClearFormat(desc);
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
@@ -1128,6 +1132,42 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	// The slices held no clear when their bytes were last read for this image, and nothing wrote
+	// them since: GPU writes, replacements and downloads change the watch's generation, and a CPU
+	// write faults, and so changes it, unless the CPU owns the page already (it is CPU dirty).
+	auto&                watches = m_buffer_cache.WriteWatches();
+	ColorMetadataChecked check {.image                = id,
+	                            .size                 = range.size,
+	                            .first                = first,
+	                            .count                = count,
+	                            .format               = ColorClearFormat(desc),
+	                            .clear_word           = desc.info.metadata.clear_word,
+	                            .kind                 = desc.info.metadata.kind,
+	                            .type                 = desc.type,
+	                            .clear_register_valid = desc.info.metadata.clear_register_valid,
+	                            .dcc_alpha_msb        = desc.info.metadata.dcc_alpha_msb};
+	bool watched   = false;
+	bool unchanged = false;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto       checked = m_color_metadata_checked.find({range.address, range.size, id});
+		if (checked != m_color_metadata_checked.end()) {
+			watched     = true;
+			check.watch = checked->second.watch;
+			unchanged   = checked->second.epoch == m_color_metadata_checked_epoch &&
+			            checked->second.SameSlices(check) &&
+			            watches.Generation(check.watch) == checked->second.generation;
+		}
+	}
+	if (unchanged && !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+		return;
+	}
+	if (!watched) {
+		check.watch = watches.Watch(range.address, range.size);
+	}
+	// Before the bytes are read: a write after this is seen at the next binding.
+	check.generation = watches.Generation(check.watch);
+	bool cleared     = false;
 	// The guest wrote the whole block with one code in a fill dispatch the renderer recognized:
 	// the code is known without reading the bytes back. Any write since then voids the record.
 	std::optional<ColorMetadataFill> known;
@@ -1196,6 +1236,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			            view.base_level, view.level_count,
 			            image_first + batch->first, batch->count}, clear);
 		}
+		cleared = true;
 		batch.reset();
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
@@ -1291,6 +1332,30 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		slice++;
 	}
+	std::scoped_lock lock {m_lock};
+	const ColorMetadataCheckedKey key {range.address, range.size, id};
+	auto                          checked = m_color_metadata_checked.find(key);
+	if (cleared ||
+	    (checked != m_color_metadata_checked.end() && checked->second.watch != check.watch)) {
+		// The clears changed the bytes; or another thread recorded the range meanwhile.
+		if (!watched) {
+			watches.Unwatch(check.watch);
+		}
+		if (cleared && checked != m_color_metadata_checked.end()) {
+			checked->second.epoch = 0;
+		}
+		return;
+	}
+	if (checked == m_color_metadata_checked.end() &&
+	    m_color_metadata_checked.size() >= MaxColorMetadataChecked) {
+		// A cache: emptied when the guest binds more metadata ranges than any frame needs.
+		for (const auto& [address, entry]: m_color_metadata_checked) {
+			watches.Unwatch(entry.watch);
+		}
+		m_color_metadata_checked.clear();
+	}
+	check.epoch                   = m_color_metadata_checked_epoch;
+	m_color_metadata_checked[key] = check;
 }
 
 void TextureCache::RefreshImage(ImageId id) {
@@ -2247,6 +2312,7 @@ void TextureCache::RecordColorMetadataFill(uint64_t address, uint64_t size, uint
 void TextureCache::DropColorMetadataFills() {
 	std::scoped_lock lock {m_lock};
 	DropColorMetadataFillsLocked();
+	m_color_metadata_checked_epoch++;
 }
 
 void TextureCache::DropColorMetadataFillsLocked() {

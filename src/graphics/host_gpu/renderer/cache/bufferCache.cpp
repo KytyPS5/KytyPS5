@@ -273,8 +273,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
-	// An armed page the CPU wrote is a CPU write for the device-address passes too.
-	m_memory_tracker.SetArmedWriteHook([this](uint64_t vaddr, uint64_t size) { RecordGuestWrite(vaddr, size); });
+	// Writes to open hot pages fault nowhere: a scan finds them (UffdWriteWatch). They are CPU
+	// writes for the write watches and the device-address passes like the faulting ones.
+	m_memory_tracker.SetArmedWriteHook([this](uint64_t vaddr, uint64_t size) {
+		m_write_watches.NotifyWrite(vaddr, size);
+		RecordGuestWrite(vaddr, size);
+	});
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	GpuBreadcrumbs::Watch("GDS", reinterpret_cast<const uint32_t*>(m_gds_buffer.Mapped().data()),

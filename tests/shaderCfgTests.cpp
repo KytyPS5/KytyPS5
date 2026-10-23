@@ -7500,9 +7500,10 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
   options.user_data = user_data;
   result = RecompileForTest(shader, options);
-  Check((DisassembleSpirvBinary(result.spirv).find("PackHalf2x16") !=
-         std::string::npos),
-        "formatted half-float store did not convert F32 to F16");
+  const auto half_source = DisassembleSpirvBinary(result.spirv);
+  Check(half_source.find("PackHalf2x16") == std::string::npos &&
+            half_source.find("%uint_31744") != std::string::npos,
+        "formatted half-float store did not encode F32 as F16");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

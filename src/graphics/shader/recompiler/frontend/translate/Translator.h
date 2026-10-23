@@ -1,9 +1,11 @@
 #pragma once
 
+#include "graphics/shader/recompiler/frontend/translate/LaunchedMasks.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -15,6 +17,9 @@ public:
 	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
+	// Wave64 programs follow mask provenance from the block entry state.
+	void SetLaunchedMasks(const LaunchedMasks& masks, bool whole_quads);
+	void SkipInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
@@ -250,6 +255,15 @@ private:
 	void EmitInterpolation(const Decoder::Instruction& inst);
 	void EmitMemory(const Decoder::Instruction& inst);
 	static void FailMissingTranslation(const Decoder::Instruction& inst);
+	void        TranslateDecoded(const Decoder::Instruction& inst);
+	void        TrackWaveOrScan(const Decoder::Instruction& inst, const LaunchedMasks& before);
+
+	struct WaveOrScan {
+		uint32_t x    = 0;
+		uint32_t t    = 0;
+		uint32_t step = 0;
+		IR::U32  leaf;
+	};
 
 	IR::Program&    program;
 	IR::IREmitter   ir;
@@ -259,6 +273,10 @@ private:
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
 	bool            graphics_compute;
+	bool                      track_masks = false;
+	bool                      whole_quads = false;
+	LaunchedMasks             launched_masks;
+	std::optional<WaveOrScan> wave_or_scan;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

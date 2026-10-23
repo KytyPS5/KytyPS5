@@ -534,6 +534,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.subgroup_local_invocation_id = true;
 			break;
 		}
+		case ValueOpcode::WaveOrPatternU32:
+		case ValueOpcode::WaveOrPatternLaneU32:
+			info.subgroup_arithmetic          = true;
+			info.subgroup_local_invocation_id = true;
+			break;
 		case ValueOpcode::SwizzleU32:
 			info.uses_swizzle = true;
 			[[fallthrough]];
@@ -580,6 +585,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	info.subgroup_arithmetic = false;
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

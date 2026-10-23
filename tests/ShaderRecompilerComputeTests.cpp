@@ -27687,6 +27687,145 @@ TestCase VectorReadlaneFromInactiveWrittenLane() {
   return test;
 }
 
+// Two whole-wave OR reductions as emitted for wave64 pixel shaders: a masked
+// leaf, DPP row_shr 1/2/4/8, permlanex16 of lane 15 of the other row and
+// v_readlane of lanes 31 and 63, the second region opened from the restored
+// EXEC. Lanes the dispatch does not launch still run the reduction on hardware
+// with a zero leaf, so every read lane and every launched lane is defined.
+enum class WaveOrReductionVariant { Exact, LiteralMask, BrokenChain, PartialExec };
+
+TestCase VectorWholeWaveOrReduction(u32 threads, WaveOrReductionVariant variant =
+                                                     WaveOrReductionVariant::Exact) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 6, 1);
+  code.push_back(EncodeVop2(0x1a, 6, Vgpr(0), 6)); // v6 = 1 << (lane & 31)
+  AppendVMovLiteral(&code, 1, 0x80000000u);
+  code.push_back(EncodeVop2(0x16, 1, Vgpr(0), 1)); // v1 = 1u << 31 >> (lane & 31)
+  code.push_back(0xbec8047eu);                     // s_mov_b64 s[72:73], exec
+  if (variant == WaveOrReductionVariant::LiteralMask) {
+    code.push_back(EncodeSop1(0x04, 34, 193)); // s_mov_b64 s[34:35], -1
+  } else {
+    code.push_back(0x87a2487eu); // s_and_b64 s[34:35], exec, s[72:73]
+  }
+  code.push_back(0x87ac487eu); // s_and_b64 s[44:45], exec, s[72:73]
+  if (variant == WaveOrReductionVariant::PartialExec) {
+    code.push_back(EncodeSop1(0x04, 106, 126)); // s_mov_b64 vcc, exec
+  } else {
+    code.push_back(0xbeea287eu); // s_orn2_saveexec_b64 vcc, exec
+  }
+  code.push_back(0xd5010007u); // v_cndmask_b32_e64 v7, 0, v6, s[34:35]
+  code.push_back(0x008a0c80u);
+  for (const u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(0x380e0efau); // v_or_b32_dpp v7, v7, v7 row_shr:shift
+    code.push_back(0xff010007u | ((0x10u + shift) << 8u));
+    if (variant == WaveOrReductionVariant::BrokenChain && shift == 2u)
+      code.push_back(EncodeVop1(0x01, 7, Vgpr(7)));
+  }
+  code.push_back(0xd7781006u); // v_permlanex16_b32 v6, v7, -1, -1 op_sel:[0,1]
+  code.push_back(0x03058307u);
+  code.push_back(0x380e0d07u); // v_or_b32 v7, v7, v6
+  code.push_back(0xbefe046au); // s_mov_b64 exec, vcc
+  code.push_back(0xbf800000u); // s_nop 0
+  code.push_back(0xbeea286au); // s_orn2_saveexec_b64 vcc, vcc
+  code.push_back(0xd5010006u); // v_cndmask_b32_e64 v6, 0, v1, s[44:45]
+  code.push_back(0x00b20280u);
+  code.push_back(0xd760002eu); // v_readlane_b32 s46, v7, 31
+  code.push_back(0x00013f07u);
+  code.push_back(0xd760002fu); // v_readlane_b32 s47, v7, 63
+  code.push_back(0x00017f07u);
+  for (const u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(0x380c0cfau); // v_or_b32_dpp v6, v6, v6 row_shr:shift
+    code.push_back(0xff010006u | ((0x10u + shift) << 8u));
+    if (shift == 1u) {
+      code.push_back(0x88222f2eu); // s_or_b32 s34, s46, s47
+      code.push_back(0xd7610021u); // v_writelane_b32 v33, s34, 21
+      code.push_back(0x00012a22u);
+    }
+    if (shift == 8u) {
+      code.push_back(0xd7600008u); // v_readlane_b32 s8, v33, 21
+      code.push_back(0x00012b21u);
+    }
+  }
+  code.push_back(0xd7781001u); // v_permlanex16_b32 v1, v6, -1, -1 op_sel:[0,1]
+  code.push_back(0x03058306u);
+  code.push_back(0x380c0306u); // v_or_b32 v6, v6, v1
+  code.push_back(0xbefe046au); // s_mov_b64 exec, vcc
+  code.push_back(0xd7600022u); // v_readlane_b32 s34, v6, 31
+  code.push_back(0x00013f06u);
+  code.push_back(0xd7600023u); // v_readlane_b32 s35, v6, 63
+  code.push_back(0x00017f06u);
+  code.push_back(0xd7600009u); // v_readlane_b32 s9, v7, 15
+  code.push_back(0x00011f07u);
+  code.push_back(0xd760000au); // v_readlane_b32 s10, v7, 47
+  code.push_back(0x00015f07u);
+  AppendStoreSgpr(&code, 46, 0);
+  AppendStoreSgpr(&code, 47, 1);
+  AppendStoreSgpr(&code, 8, 2);
+  AppendStoreSgpr(&code, 9, 5 + 192);
+  AppendStoreSgpr(&code, 10, 5 + 193);
+  AppendStoreSgpr(&code, 34, 3);
+  AppendStoreSgpr(&code, 35, 4);
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 5);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 5 + 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 5 + 128);
+  AppendEnd(&code);
+
+  const auto leaf = [&](u32 lane, bool first) -> u32 {
+    if (lane >= threads) return 0;
+    return first ? 1u << (lane & 31u) : 0x80000000u >> (lane & 31u);
+  };
+  const auto reduce = [&](bool first, auto &&in_set) {
+    u32 value = 0;
+    for (u32 lane = 0; lane < 64; ++lane)
+      if (in_set(lane)) value |= leaf(lane, first);
+    return value;
+  };
+  const auto opposite = [&](u32 lane, bool first) {
+    return reduce(first, [&](u32 j) { return j / 16 == ((lane / 16) ^ 1u); });
+  };
+  const auto scan = [&](u32 lane, bool first) {
+    return reduce(first, [&](u32 j) {
+             return j / 32 == lane / 32 && j <= lane;
+           }) |
+           ((lane & 16u) == 0 ? opposite(lane, first) : 0u);
+  };
+  TestCase test;
+  static std::string names[4][65];
+  const char *suffix[] = {"", "LiteralMask", "BrokenChain", "PartialExec"};
+  auto &name = names[static_cast<int>(variant)][threads];
+  name = "VectorWholeWaveOrReduction" + std::to_string(threads) +
+         suffix[static_cast<int>(variant)];
+  test.name = name.c_str();
+  test.code = std::move(code);
+  test.expected = {scan(31, true), scan(63, true),
+                   scan(31, true) | scan(63, true), scan(31, false),
+                   scan(63, false)};
+  test.expected.resize(5 + 3 * 64 + 2, 0);
+  test.expected[5 + 192] = scan(15, true);
+  test.expected[5 + 193] = scan(47, true);
+  for (u32 lane = 0; lane < threads; ++lane) {
+    test.expected[5 + lane] = scan(lane, true);
+    test.expected[5 + 64 + lane] = scan(lane, false);
+    test.expected[5 + 128 + lane] = opposite(lane, false);
+  }
+  test.ir_counts = {
+      {"WaveOrPatternLaneU32", variant == WaveOrReductionVariant::Exact ? 6u : 2u}};
+  test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,       O::V_LSHRREV_B32,
+                  O::S_MOV_B64,          O::S_AND_B64,           O::S_ORN2_SAVEEXEC_B64,
+                  O::V_CNDMASK_B32,      O::V_OR_B32,            O::V_PERMLANEX16_B32,
+                  O::V_READLANE_B32,     O::V_WRITELANE_B32,     O::S_OR_B32,
+                  O::S_NOP,              O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorLaneWave32RuntimeSelectorWraps() {
   using O = ShaderOpcode;
 
@@ -43895,6 +44034,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
+  for (const u32 threads : {4u, 20u, 32u, 40u, 64u})
+    cases.push_back(VectorWholeWaveOrReduction(threads));
+  cases.push_back(VectorWholeWaveOrReduction(64, WaveOrReductionVariant::LiteralMask));
+  cases.push_back(VectorWholeWaveOrReduction(64, WaveOrReductionVariant::BrokenChain));
+  cases.push_back(VectorWholeWaveOrReduction(64, WaveOrReductionVariant::PartialExec));
   cases.push_back(VectorDpp8Captured(false));
   for (const u32 wave_size : {32u, 64u})
     for (const bool fi : {false, true})
@@ -50091,6 +50235,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--whole-wave-reduction-only") == 0) {
+    VulkanHarness vulkan;
+    for (const u32 threads : {4u, 20u, 32u, 40u, 64u})
+      RunCase(&vulkan, VectorWholeWaveOrReduction(threads));
+    RunCase(&vulkan, VectorWholeWaveOrReduction(64, WaveOrReductionVariant::LiteralMask));
+    RunCase(&vulkan, VectorWholeWaveOrReduction(64, WaveOrReductionVariant::BrokenChain));
+    RunCase(&vulkan, VectorWholeWaveOrReduction(64, WaveOrReductionVariant::PartialExec));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {

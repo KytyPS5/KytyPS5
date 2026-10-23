@@ -1380,7 +1380,7 @@ void TestRebasedTextureMipViews() {
     case 1: view.resources.levels = 2; break;
     case 2: view.resources.layers = 2; break;
     case 3: view.type = Prospero::ImageType::kColor3D; break;
-    case 4: view.tile_mode = Prospero::TileMode::kStandard64KB; break;
+    case 4: view.tile_mode = Prospero::TileMode::kPrt; break;
     case 5: view.metadata.kind = ImageMetadataKind::Dcc; break;
     case 6: view.data = {0x5032b23800, 0x1000}; break;
     case 7:
@@ -1435,6 +1435,77 @@ void TestRebasedTextureMipViews() {
   sparse.data.address -= 0x100;
   Check(sparse.MipOf(sparse_chain) == -1,
         "sparse view accepted a different mip-tail origin");
+}
+
+void TestStandard64KBTextureViews() {
+  const ShaderTextureResource descriptor{{
+      0x11800023u, 0xc3800000u, 0x0003c003u, 0xd0900facu,
+      0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u}};
+  ImageInfo view{};
+  view.data.address = descriptor.Base40();
+  view.guest_format = descriptor.Format();
+  view.pixel_format = vk::Format::eR8G8B8A8Unorm;
+  view.extent = {descriptor.Width5() + 1u, descriptor.Height5() + 1u, 1};
+  view.tile_mode = descriptor.TileMode();
+  view.tile_swizzle = descriptor.TileSwizzle();
+  view.UpdateSize();
+  Check(view.data.address == 0x1180002300ull && view.tile_swizzle == 0 &&
+            view.extent == vk::Extent3D{16, 16, 1} &&
+            view.data.size == 0x400 && view.mip_layout[0].size == 0x400 &&
+            view.DataAlignment() == 0x100 &&
+            view.data.address % view.DataAlignment() == 0 &&
+            view.tiling.block.block_size == 0x10000 &&
+            view.tiled_slice_stride == 0x10000 && view.pitch == 128 &&
+            view.mip_layout[0].pitch == 128 && view.LinearSize() == 0x2000,
+        "captured Standard64KB texture lost its base, footprint, or tiling");
+  view.UpdateSize();
+  const auto copies = view.BufferCopies();
+  Check(view.data.size == 0x400 && view.DataAlignment() == 0x100 &&
+            copies.size() == 1 && copies[0].bufferOffset == 0 &&
+            copies[0].bufferRowLength == 128 &&
+            copies[0].imageExtent == vk::Extent3D{16, 16, 1},
+        "resizing a compact Standard64KB texture changed its Vulkan transfer");
+
+  const auto captured = view;
+  for (uint32_t variant = 0; variant < 9; ++variant) {
+    view = captured;
+    view.data.size = view.pitch = 0;
+    switch (variant) {
+    case 0: view.data.address += 0x10; break;
+    case 1: view.data.address = 0x118000fd00ull; break;
+    case 2: view.resources.levels = 2; break;
+    case 3: view.resources.layers = 2; break;
+    case 4: view.type = Prospero::ImageType::kColor3D; break;
+    case 5: view.metadata.kind = ImageMetadataKind::Dcc; break;
+    case 6: view.tile_mode = Prospero::TileMode::kPrt; break;
+    case 7: view.extent.width = 15; break;
+    case 8: view.data.size = 0x10000; break;
+    }
+    view.UpdateSize();
+    Check(view.data.size >= 0x10000 && view.DataAlignment() == 0x10000,
+          "unsupported Standard64KB texture received a compact footprint");
+  }
+  view = captured;
+  view.data = {0x118000fc00ull, 0};
+  view.UpdateSize();
+  Check(view.data.size == 0x400 && view.DataAlignment() == 0x100,
+        "compact Standard64KB texture could not end at a block boundary");
+
+  auto chain = captured;
+  chain.data = {0x1180000000ull, 0};
+  chain.extent = {64, 64, 1};
+  chain.resources = {7, 2};
+  chain.pitch = 0;
+  chain.UpdateSize();
+  view = captured;
+  view.data = {chain.data.address + chain.tiled_slice_stride + 0x2000, 0};
+  view.UpdateSize();
+  Check(chain.DataAlignment() == 0x10000 && view.MipOf(chain) == 2 &&
+            view.SliceOf(chain, 2) == 1,
+        "compact Standard64KB texture did not match its parent tail and layer");
+  view.data.address += 0x100;
+  Check(view.MipOf(chain) == -1,
+        "compact Standard64KB texture matched a different parent tail origin");
 }
 
 void TestShaderFeatureCollection() {
@@ -16729,6 +16800,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestStandard64KBTextureViews();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();

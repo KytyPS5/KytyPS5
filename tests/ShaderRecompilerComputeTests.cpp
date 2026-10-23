@@ -15189,6 +15189,44 @@ public:
       scheduler.Finish();
     }
 
+    {
+      constexpr uint64_t texture_address = base + 0x2300;
+      constexpr uint32_t texel = 0x7f3f1fffu;
+      std::fill_n(reinterpret_cast<uint32_t *>(texture_address), 0x400 / 4, texel);
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      value.dwords = {static_cast<uint32_t>(texture_address >> 8u),
+                      0xc3800000u, 0x0003c003u, 0xd0900facu, 0, 0, 0, 0};
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      auto &cache = context.GetTextureCache();
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(
+          context.GetRenderExecutor(), resource, value);
+      Require(name, "compact sampled descriptor",
+              binding.image_id &&
+                  binding.desc.info.data.address == texture_address &&
+                  binding.desc.info.data.size == 0x400 &&
+                  cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+              "the captured sampled texture did not preserve its compact range");
+      Require(name, "compact sampled upload",
+              ReadCachedTexel(name, context, binding.image_id, {}, {16, 16, 1}) ==
+                  std::vector<uint32_t>(16 * 16, texel),
+              "the captured sampled texture did not upload its RGBA8 texels");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "standard-tiled color mapping release failed");
@@ -22098,34 +22136,57 @@ public:
       check_round_trip("odd multi-mip", total.size, layout);
     }
 
-    for (const bool sparse : {false, true}) {
-      const auto format = sparse ? Prospero::BufferFormat::k32_32_32_32UInt
-                                 : Prospero::BufferFormat::k16_16_16_16Float;
-      constexpr auto tile = Prospero::TileMode::kStandard4KB;
-      const uint32_t extent = sparse ? 2 : 16;
-      auto view = MakeTilingImage(format, extent, extent, 1, 1, tile, 0, false);
-      view.data.address = sparse ? 0x50322e3500 : 0x5032b23800;
+    struct CompactCase {
+      Prospero::BufferFormat format;
+      Prospero::TileMode tile;
+      uint32_t extent;
+      uint64_t address;
+      uint64_t size;
+      uint32_t alignment;
+      uint32_t pitch;
+      uint32_t height;
+      uint64_t stride;
+      size_t canary_bytes;
+      uint32_t source_offset;
+    };
+    for (const auto &compact : {
+             CompactCase{Prospero::BufferFormat::k16_16_16_16Float,
+                         Prospero::TileMode::kStandard4KB, 16, 0x5032b23800ull,
+                         0x800, 0x800, 32, 16, 0x1000, 0x1000, 0x800},
+             CompactCase{Prospero::BufferFormat::k32_32_32_32UInt,
+                         Prospero::TileMode::kStandard4KB, 2, 0x50322e3500ull,
+                         0x60, 0x100, 16, 16, 0x1000, 0x1000, 0x800},
+             CompactCase{Prospero::BufferFormat::k8_8_8_8UNorm,
+                         Prospero::TileMode::kStandard64KB, 16, 0x1180002300ull,
+                         0x400, 0x100, 128, 128, 0x10000, 0x500, 0x2300},
+         }) {
+      auto view = MakeTilingImage(compact.format, compact.extent,
+                                  compact.extent, 1, 1, compact.tile, 0, false);
+      view.data.address = compact.address;
       view.UpdateSize();
       Require(name, "rebased mip footprint",
-              view.data.size == (sparse ? 0x60 : 0x800) &&
-                  view.DataAlignment() == (sparse ? 0x100 : 0x800) &&
-                  view.mip_layout[0].pitch == (sparse ? 16 : 32) &&
-                  view.mip_layout[0].height == 16 &&
-                  view.tiled_slice_stride == 0x1000,
+              view.data.size == compact.size &&
+                  view.DataAlignment() == compact.alignment &&
+                  view.mip_layout[0].pitch == compact.pitch &&
+                  view.mip_layout[0].height == compact.height &&
+                  view.tiled_slice_stride == compact.stride,
               "a compact view changed its allocation geometry");
       check_round_trip("rebased mip exact range", view.data.size, view);
-      check_round_trip("rebased mip adjacent canary", 0x1000, view);
+      if (compact.tile == Prospero::TileMode::kStandard4KB) {
+        check_round_trip("rebased mip adjacent canary", compact.canary_bytes,
+                         view);
+      }
 
       std::vector<uint8_t> linear(view.LinearSize());
       fill(&linear, ++case_index);
-      std::vector<uint8_t> expected(0x1000, 0xab), observed;
+      std::vector<uint8_t> expected(compact.canary_bytes, 0xab), observed;
       convert_reference(true, &expected, linear, view);
-      gpu_tile(linear, &observed, 0x1000, linear.size(), view, nullptr, 0,
-               0x100, 0x800);
+      gpu_tile(linear, &observed, expected.size(), linear.size(), view, nullptr,
+               0, 0x100, compact.source_offset);
       compare("rebased mip prefix and neighboring mip", expected, observed);
       std::vector<uint8_t> round_trip;
       gpu_detile(observed, &round_trip, observed.size(), linear.size(), view,
-                 nullptr, 0x800);
+                 nullptr, compact.source_offset);
       std::vector<uint8_t> expected_linear(linear.size(), 0);
       convert_reference(false, &expected_linear, expected, view);
       compare("rebased mip nonzero source", expected_linear, round_trip);
@@ -53247,6 +53308,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {

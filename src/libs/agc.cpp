@@ -4110,9 +4110,28 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
+// The flips (AgcDcbSetFlip) of a submitted command buffer are pending from its submission, as on
+// the console: a game that refills a command buffer once fewer flips are queued (Minecraft) would
+// otherwise overwrite one the command processor has not read yet.
+static void note_submitted_flips(const uint32_t* dcb, uint32_t size_in_dwords) {
+	constexpr uint32_t FlipHeader = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
+	for (uint32_t i = 0; i < size_in_dwords;) {
+		const auto header = dcb[i];
+		const auto size   = header == 0x80000000u ? 1u : Pm4::PacketSizeDw(header);
+		if (size > size_in_dwords - i) {
+			break;
+		}
+		if (header == FlipHeader) {
+			g_renderer->GetVideoOut().NoteGpuFlipSubmitted(static_cast<int>(dcb[i + 1]));
+		}
+		i += size;
+	}
+}
+
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
+	note_submitted_flips(dcb, size_in_dwords);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
 

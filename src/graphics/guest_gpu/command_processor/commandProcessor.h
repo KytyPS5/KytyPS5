@@ -101,7 +101,8 @@ public:
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint64_t value,
 	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0);
-	void Flip();
+	// interrupt: the queue's end-of-pipe interrupt is raised when the flip completes.
+	void Flip(bool interrupt = false);
 	void Flip(void* dst_gpu_addr, uint32_t value);
 	void FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action, void* dst_gpu_addr,
 	                       uint32_t value);
@@ -172,6 +173,7 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void CompleteFlipInOrder(uint64_t request, bool interrupt);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 

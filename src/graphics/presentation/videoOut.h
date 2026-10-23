@@ -37,8 +37,12 @@ public:
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
-	void WaitForSubmitSlot(int handle);
-	void WaitFlipDone(int handle, int index);
+	// A command buffer with a flip of `handle` was submitted: the flip is pending and queued on the
+	// GPU from now on (VideoOutFlipStatus), before the command processor reaches it.
+	void NoteGpuFlipSubmitted(int handle);
+	// micros: at most this long (0: until done). True when done.
+	bool WaitForSubmitSlot(int handle, uint32_t micros = 0);
+	bool WaitFlipDone(int handle, int index, uint32_t micros = 0);
 
 	[[nodiscard]] Impl& State() noexcept;
 

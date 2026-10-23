@@ -1810,7 +1810,9 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
 
 	cp.SetFlip(f);
-	cp.Flip();
+	// A Gen5 flip (AgcDcbSetFlip) raises the end-of-pipe interrupt: Minecraft waits for it on
+	// its graphics event queue while a flip is pending.
+	cp.Flip(true);
 	return 5;
 }
 

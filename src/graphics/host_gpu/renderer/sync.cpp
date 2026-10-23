@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -66,9 +67,15 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
-		// The slots free up when earlier flips complete: those must be submitted.
+		// The slots free up when earlier flips complete: those must be submitted, and the GPU thread
+		// completes them with its labels (CommandProcessor::CompleteFlipInOrder).
 		buffer.GetContext().GetCommandScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Wait);
-		video_out.WaitForSubmitSlot(handle);
+		constexpr uint32_t ServiceMicros = 1000;
+		while (!video_out.WaitForSubmitSlot(handle, ServiceMicros)) {
+			if (GuestGpu::IsGpuThread()) {
+				buffer.GetContext().GetGpu().ServiceLabels();
+			}
+		}
 	}
 }
 

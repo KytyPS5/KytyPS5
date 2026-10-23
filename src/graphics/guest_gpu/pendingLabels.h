@@ -23,8 +23,8 @@ namespace Libs::Graphics {
 // The GPU thread records a label (Add); the host GPU's completion of it marks it completed
 // (Complete, any thread) and wakes the GPU thread, which takes the completed labels in the order
 // they were recorded (TakeCompleted), writes them to guest memory with their interrupts, and
-// retires them (Retire). A label without bytes is an interrupt alone, kept in order with the
-// labels.
+// retires them (Retire). A label without bytes is an interrupt or an action alone, kept in order
+// with the labels.
 //
 // GPU commands recorded after a label read it too: the buffer cache writes the pending labels
 // over the bytes a command reads (PendingForGpu), in GPU order, until a GPU write recorded
@@ -40,6 +40,9 @@ public:
 		uint32_t interrupt_context = 0;
 		uint64_t serial            = 0;
 		bool     replaced_on_gpu   = false; // a GPU write recorded after it covers its bytes
+		// Run by the GPU thread when the label is written, before its interrupt (a flip's
+		// completion).
+		std::function<void()> action;
 	};
 
 	// GPU thread. Returns the label's serial.

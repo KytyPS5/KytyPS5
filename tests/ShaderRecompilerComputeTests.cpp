@@ -193,6 +193,14 @@ struct BufferCacheTestAccess {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
 
+  // ReadMemory without the GPU-thread hop, for tests that record on their own thread.
+  static void Download(BufferCache &cache, uint64_t address, uint64_t size) {
+    auto &buffer = cache.m_slot_buffers[cache.FindBuffer(address, size)];
+    if (cache.DownloadBufferMemory<false>(buffer, address, size)) {
+      cache.m_memory_tracker.UnmarkRegionAsGpuModified(address, size);
+    }
+  }
+
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
         address >> BufferCache::PageTable::kPageBits);
@@ -18968,6 +18976,48 @@ public:
         check("auto embedded fetch", fetch_vs, false, 4);
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, 6);
+
+        // Past INDEX_BUFFER_SIZE the hardware reads index 0, not the stale 1 that follows: for
+        // GPU-read records, and for the CPU path's draws from a first index.
+        if (m_index_buffer_range_supported) {
+          constexpr uint64_t range_args = args_address + 8 * stride;
+          constexpr uint64_t range_indices = args_address + 0x400;
+          auto &buffers = context.GetBufferCache();
+          const auto write_gpu = [&](uint64_t address, std::span<const uint32_t> words) {
+            for (uint32_t i = 0; i < words.size(); i++) {
+              auto [buffer, offset] = buffers.ObtainBuffer(address + i * 4u, 4, true);
+              buffer->Fill(offset, 4, words[i]);
+            }
+          };
+          write_gpu(range_args, std::array<u32, 5>{3, 1, 1, 0, 0});
+          write_gpu(range_indices, std::array<u32, 4>{0, 1, 2, 1});
+          const auto range_check = [&](const char *step, const DrawIndexArgs &args) {
+            shaders.SetEsShaderBase(vertex_address);
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+            const bool drawn =
+                RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(), args);
+            const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+            for (size_t component = 0; component < pixels.size(); component++) {
+              Require("GpuIndirectDraw", step,
+                      drawn && pixels[component] ==
+                                   (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                      "indices past INDEX_BUFFER_SIZE did not read as zero");
+            }
+          };
+          // Start index 1 of INDEX_BUFFER_SIZE 3: indices 1, 2, then 0.
+          range_check("GPU-read indices past INDEX_BUFFER_SIZE",
+                      {.index_count = 3,
+                       .index_addr = reinterpret_cast<const void *>(range_indices),
+                       .index_type_and_size = 1, .indirect = {range_args, 1, stride}});
+          range_check("CPU path indices past INDEX_BUFFER_SIZE",
+                      {.index_count = 3,
+                       .index_addr = reinterpret_cast<const void *>(range_indices + 4),
+                       .instance_count = 1, .index_type_and_size = 1,
+                       .offset_source = DrawOffsetSource::IndirectArgs, .index_limit = 2});
+          BufferCacheTestAccess::Download(buffers, range_args, 0x500);
+        }
       }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
@@ -20765,6 +20815,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_index_buffer_range_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20800,6 +20851,7 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
+    m_runtime_context.index_buffer_range_enabled = m_index_buffer_range_supported;
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
@@ -20956,9 +21008,25 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
+    // Sized index buffer bindings, as in production (maintenance5 and robustBufferAccess2).
+    const auto available_extensions = m_physical_device.enumerateDeviceExtensionProperties().value;
+    const bool maintenance5_extension =
+        std::ranges::any_of(available_extensions, [](const vk::ExtensionProperties &extension) {
+          return std::strcmp(extension.extensionName.data(),
+                             VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+        });
+    vk::PhysicalDeviceMaintenance5FeaturesKHR available_maintenance5{};
+    if (maintenance5_extension) {
+      available_maintenance5.pNext = available_features2.pNext;
+      available_features2.pNext = &available_maintenance5;
+    }
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    m_index_buffer_range_supported = maintenance5_extension &&
+                                     available_maintenance5.maintenance5 &&
+                                     available_robustness2.robustBufferAccess2 &&
+                                     available_features.robustBufferAccess;
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -21090,7 +21158,15 @@ private:
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
     device_info.pNext = &conditional_rendering;
+    vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5{};
+    if (m_index_buffer_range_supported) {
+      robustness2.robustBufferAccess2 = true;
+      maintenance5.maintenance5 = true;
+      maintenance5.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &maintenance5;
+    }
     vk::PhysicalDeviceFeatures device_features{};
+    device_features.robustBufferAccess = m_index_buffer_range_supported;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
@@ -21121,6 +21197,9 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_index_buffer_range_supported) {
+      device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());

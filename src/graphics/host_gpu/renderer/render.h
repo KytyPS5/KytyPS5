@@ -66,6 +66,8 @@ struct DrawIndexArgs {
 	uint32_t         render_target_slice_offset = 0;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
+	// Indices readable from index_addr (INDEX_BUFFER_SIZE); later ones read as zero.
+	uint32_t index_limit = UINT32_MAX;
 };
 
 struct DrawAutoArgs {

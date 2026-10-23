@@ -644,12 +644,16 @@ struct DrawIndexBufferSource {
 	uint64_t      size      = 0;
 	vk::IndexType type      = vk::IndexType::eUint16;
 	uint32_t      guest_element_size = 0;
+	// Bound with its size: fetches past it read zero (index_buffer_range_enabled).
+	bool sized = false;
 };
 
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
+	vk::DeviceSize size   = 0;
 	vk::IndexType  type   = vk::IndexType::eUint16;
+	bool           sized  = false;
 };
 
 static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
@@ -975,7 +979,9 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	if (source.size == 0) {
 		return prepared;
 	}
-	prepared.type = source.type;
+	prepared.type  = source.type;
+	prepared.size  = source.size;
+	prepared.sized = source.sized;
 	if (source.host_data != nullptr) {
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
@@ -1003,6 +1009,11 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 
 static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
+		return;
+	}
+	if (prepared.sized) {
+		vk_buffer.bindIndexBuffer2KHR(prepared.buffer, prepared.offset, prepared.size,
+		                              prepared.type);
 		return;
 	}
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
@@ -1405,23 +1416,30 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 			break;
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
-	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	// Indices past INDEX_BUFFER_SIZE read as zero, as on the hardware: a sized binding or the
+	// host copy returns them. Without either, the draw stops at the limit.
+	const auto readable = std::min(args.index_count, args.index_limit);
+	index_source.size   = static_cast<uint64_t>(readable) * index_source.guest_element_size;
+	index_source.sized  = m_context.GetGraphics().index_buffer_range_enabled &&
+	                      (args.indirect.address != 0 || readable < args.index_count);
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
+	auto       index_count =
+	    index_source.sized || index_source.guest_element_size == 1 ? args.index_count : readable;
 
 	std::vector<uint16_t> expanded_indices;
 	if (index_source.guest_element_size == 1) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
-		expanded_indices.resize(args.index_count);
-		for (uint32_t i = 0; i < args.index_count; i++) {
+		expanded_indices.resize(index_count);
+		for (uint32_t i = 0; i < readable; i++) {
 			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
 		index_source.host_data = expanded_indices.data();
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	DrawCallInfo    draw {CommandBufferDebugOp::DrawIndex, index_count, args.instance_count,
+	                      args.first_instance};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -1432,6 +1450,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                     args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
+	// Mesh shaders fetch the indices themselves, from guest memory: they stop at the limit.
+	if (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+		draw.index_count = std::min(draw.index_count, readable);
+	}
 	if (emit) {
 		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, *emit, index_source,
 		                    primitive_restart);

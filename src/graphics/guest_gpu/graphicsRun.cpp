@@ -928,7 +928,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		return;
 	}
 
-	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
 		if (!indexed) {
@@ -946,14 +945,20 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex);
+		// Indices past INDEX_BUFFER_SIZE read as zero; a size of 0 leaves them unbounded.
+		const auto first       = args.firstIndex;
+		const auto index_limit = m_index_buffer_size == 0      ? UINT32_MAX
+		                         : first < m_index_buffer_size ? m_index_buffer_size - first
+		                                                       : 0u;
 		executor.DrawIndex(m_submit_id, CurrentBuffer(),
-		                   {.index_count         = std::min(args.indexCount, max_indices),
+		                   {.index_count         = args.indexCount,
 		                    .index_addr          = IndexAddress(args.firstIndex),
 		                    .instance_count      = args.instanceCount,
 		                    .index_type_and_size = m_index_type_and_size,
 		                    .base_vertex         = args.vertexOffset,
 		                    .first_instance      = args.firstInstance,
-		                    .offset_source       = DrawOffsetSource::IndirectArgs});
+		                    .offset_source       = DrawOffsetSource::IndirectArgs,
+		                    .index_limit         = index_limit});
 	}
 }
 

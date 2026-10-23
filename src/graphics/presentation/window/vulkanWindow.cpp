@@ -495,6 +495,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
+	const bool maintenance5_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5 {};
+	if (maintenance5_extension) {
+		maintenance5.pNext        = supported_features2.pNext;
+		supported_features2.pNext = &maintenance5;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -657,6 +664,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;
+	graphics.index_buffer_range_enabled = maintenance5_extension && maintenance5.maintenance5 &&
+	                                      supported_robustness2.robustBufferAccess2;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = &robustness2;
@@ -690,6 +699,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.index_buffer_range_enabled) {
+		maintenance5.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext  = &maintenance5;
 	}
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
@@ -1064,6 +1077,9 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,

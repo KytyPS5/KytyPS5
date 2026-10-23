@@ -34,6 +34,13 @@ bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint
 	return true;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>>*
+SrtReadCapture::DirectRanges(const SrtRuntime& runtime) {
+	if (runtime.read_memory != ReadOrdinary) return nullptr;
+	auto& capture = *static_cast<SrtReadCapture*>(runtime.userdata);
+	return capture.m_source.read_memory == nullptr ? &capture.m_ranges : nullptr;
+}
+
 bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
@@ -366,10 +373,162 @@ private:
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
+bool IsUserDataWord(const ResourcePlan& program, const Inst& inst) {
+	return inst.GetOpcode() == ValueOpcode::GetUserData && inst.NumArgs() == 1 &&
+	       inst.Arg(0).GetType() == Type::ScalarReg &&
+	       RegIndex(inst.Arg(0).ScalarRegister()) >= program.user_data_base;
+}
 
-} // namespace
+bool IsCompiledRead(const ResourcePlan& program, const Inst& inst, uint32_t depth = 0);
 
-void CompileSrtWalker(ResourcePlan& program) {
+// User data or a compiled read: a handle word or a constant-buffer index.
+bool IsCompiledWord(const ResourcePlan& program, Value value, uint32_t depth) {
+	const auto* inst = value.Resolve().TryInstruction();
+	return inst != nullptr &&
+	       (IsUserDataWord(program, *inst) || IsCompiledRead(program, *inst, depth + 1));
+}
+
+// A scalar-address read with a constant offset, or a constant-buffer read at a constant or
+// shifted-index offset, whose handle words are compiled words. Clean reads keep the strict
+// reader of the clean evaluator; a negative buffer immediate fails in the walker.
+bool IsCompiledRead(const ResourcePlan& program, const Inst& inst, uint32_t depth) {
+	const auto op = inst.GetOpcode();
+	if (depth > 16 || (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) ||
+	    inst.NumArgs() < 2 || !IsRawRead(program, inst) || inst.Flags<SrtReadFlags>().clean != 0u)
+		return false;
+	const auto  offset    = inst.Arg(1).Resolve();
+	const auto* handle    = inst.Arg(0).Resolve().TryInstruction();
+	const bool  buffer    = op == ValueOpcode::ReadConstBuffer;
+	const auto  immediate = [](Value value) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32;
+	};
+	const auto* shift = offset.TryInstruction();
+	const bool  index = buffer && shift != nullptr &&
+	                    shift->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+	                    shift->NumArgs() == 2 && immediate(shift->Arg(1)) &&
+	                    IsCompiledWord(program, shift->Arg(0), depth);
+	if ((!immediate(offset) && !index) || handle == nullptr ||
+	    handle->GetOpcode() !=
+	        (buffer ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource) ||
+	    handle->NumArgs() != (buffer ? 4u : 2u) ||
+	    (buffer &&
+	     static_cast<int32_t>(program.memory_info[inst.Flags<SrtReadFlags>().index].offset) < 0))
+		return false;
+	for (size_t word = 0; word < handle->NumArgs(); ++word) {
+		if (!IsCompiledWord(program, handle->Arg(word), depth)) return false;
+	}
+	return true;
+}
+
+// Compiles the SRT slots of plans the whole-plan walker rejects (block conditions, captured
+// reads) and the descriptors whose DWORDs are all such reads, user data or immediates: one entry
+// per slot or descriptor, one memoized table read per read. Others stay interpreted.
+void CompileSrtReads(ResourcePlan& program, bool compile_slots) {
+	if (!program.resource_tracking_complete || !program.srt_plan_complete) return;
+	std::vector<const Inst*> slots(compile_slots ? program.srt_reads.size() : 0u, nullptr);
+	bool                     any = false;
+	for (uint32_t slot = 0; slot < slots.size(); ++slot) {
+		const auto& read = program.srt_reads[slot];
+		const auto* inst = read.value.Resolve().TryInstruction();
+		if (inst != nullptr && read.flat_offset < program.srt_reads.size() &&
+		    IsCompiledRead(program, *inst)) {
+			slots[slot] = inst;
+			any         = true;
+		}
+	}
+	const auto compiled_dword = [&](Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return value.GetType() == Type::U32;
+		const auto* inst = value.TryInstruction();
+		return inst != nullptr &&
+		       (IsUserDataWord(program, *inst) || IsCompiledRead(program, *inst));
+	};
+	std::vector<bool> descriptors(program.descriptor_sources.size(), false);
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		const auto& descriptor = program.descriptor_sources[source];
+		const auto  dwords =
+		    std::span(descriptor.dwords)
+		        .first(std::min<size_t>(descriptor.dword_count, descriptor.dwords.size()));
+		descriptors[source] = descriptor.dword_count != 0u &&
+		                      descriptor.dword_count <= descriptor.dwords.size() &&
+		                      std::ranges::all_of(dwords, compiled_dword);
+		any |= descriptors[source];
+	}
+	program.srt_read_entries.assign(program.srt_reads.size(), UINT32_MAX);
+	program.srt_descriptor_entries.assign(program.descriptor_sources.size(), UINT32_MAX);
+	if (!any) return;
+
+	using Table            = ResourcePlan::SrtReadTable;
+	program.srt_read_table = std::make_unique<Table>();
+	auto& table            = *program.srt_read_table;
+	// Read indices by instruction.
+	std::unordered_map<const Inst*, uint32_t> indices;
+	// A read follows the reads of its handle and index words, so one pass runs them in order.
+	const auto read = [&](auto&& self, const Inst* inst) -> uint32_t {
+		if (const auto found = indices.find(inst); found != indices.end()) return found->second;
+		const auto word = [&](Value value) {
+			const auto* source = value.Resolve().TryInstruction();
+			return IsUserDataWord(program, *source)
+			           ? Table::UserData |
+			                 (RegIndex(source->Arg(0).ScalarRegister()) - program.user_data_base)
+			           : self(self, source);
+		};
+		const auto* handle    = inst->Arg(0).Resolve().TryInstruction();
+		const auto& memory    = program.memory_info[inst->Flags<SrtReadFlags>().index];
+		const auto  immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
+		Table::Read entry;
+		entry.buffer = handle->NumArgs() == 4u;
+		for (size_t index = 0; index < handle->NumArgs(); ++index) {
+			entry.words[index] = word(handle->Arg(index));
+			// Constant buffers read the offset after base and stride, as the walker does.
+			if (entry.buffer && index == 1u) {
+				const auto offset = inst->Arg(1).Resolve();
+				if (offset.IsImmediate()) {
+					entry.offset = offset.U32() & ~3u;
+				} else {
+					const auto* shift = offset.TryInstruction();
+					entry.offset      = word(shift->Arg(0));
+					entry.shift = static_cast<uint8_t>((shift->Arg(1).Resolve().U32() & 31u) + 1u);
+				}
+			}
+		}
+		entry.relative =
+		    entry.buffer ? static_cast<int64_t>(static_cast<uint64_t>(immediate) & ~uint64_t {3})
+		                 : (immediate & ~int64_t {3}) +
+		                       static_cast<int64_t>(inst->Arg(1).Resolve().U32() & ~3u);
+		entry.memo = inst->EvaluationIndex(program.evaluation_value_count);
+		table.reads.push_back(entry);
+		const auto index = static_cast<uint32_t>(table.reads.size() - 1u);
+		indices.emplace(inst, index);
+		return index;
+	};
+	for (uint32_t slot = 0; slot < slots.size(); ++slot) {
+		if (slots[slot] != nullptr) program.srt_read_entries[slot] = read(read, slots[slot]);
+	}
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		if (!descriptors[source]) continue;
+		program.srt_descriptor_entries[source] = static_cast<uint32_t>(table.words.size());
+
+		const auto& descriptor = program.descriptor_sources[source];
+		for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+			const auto value = descriptor.dwords[index].Resolve();
+			if (value.IsImmediate()) {
+				table.words.push_back(Table::Immediate);
+				table.words.push_back(value.U32());
+				continue;
+			}
+			const auto* inst = value.TryInstruction();
+			table.words.push_back(IsUserDataWord(program, *inst)
+			                          ? Table::UserData | (RegIndex(inst->Arg(0).ScalarRegister()) -
+			                                               program.user_data_base)
+			                          : read(read, inst));
+		}
+	}
+	program.srt_read_addresses.resize(table.reads.size());
+}
+
+void CompileTreeWalker(ResourcePlan& program) {
 	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
 	    program.capture_specialization_reads || !program.control_flow.empty() ||
 	    program.srt_reads.empty()) return;
@@ -494,11 +653,24 @@ void CompileSrtWalker(ResourcePlan& program) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
+} // namespace
+
+void CompileSrtWalker(ResourcePlan& program) {
+	CompileTreeWalker(program);
+	CompileSrtReads(program, program.srt_code == nullptr);
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_session(this),
-      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {}
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator), m_session(this),
+      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {
+	// Compiled reads use mapped memory directly, as the ordinary reader of a capture does.
+	// Child walkers carry an EXEC mask and keep the interpreted reads.
+	m_captured_ranges = SrtReadCapture::DirectRanges(m_runtime);
+	m_compiled_reads  = m_program.srt_read_table &&
+	                    (m_runtime.read_memory == nullptr || m_captured_ranges != nullptr);
+	if (m_compiled_reads) m_context.values.resize(m_program.evaluation_value_count);
+}
 
 SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
                      SrtWalker* clean_evaluator)
@@ -1123,6 +1295,90 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	}
 	return false;
 }
+
+bool SrtWalker::CallCompiledRead(uint32_t entry, std::span<uint32_t> out, bool descriptor) {
+	if (!m_compiled_reads) return false;
+	using Table           = ResourcePlan::SrtReadTable;
+	const auto& table     = *m_program.srt_read_table;
+	auto* const addresses = m_program.srt_read_addresses.data();
+	m_cursor              = addresses;
+	bool ok               = true;
+	if (!descriptor) {
+		ok = CompiledRead(entry, out[0]);
+	} else {
+		// DWORDs are filled in order, as the interpreter does.
+		for (auto word = table.words.begin() + entry; ok && !out.empty(); out = out.subspan(1)) {
+			if (*word == Table::Immediate) {
+				out[0] = word[1];
+				word += 2;
+			} else {
+				ok = CompiledWord(*word++, out[0]);
+			}
+		}
+	}
+	if (m_captured_ranges != nullptr) {
+		for (const auto* address = addresses; address != m_cursor; ++address) {
+			m_captured_ranges->emplace_back(*address, sizeof(uint32_t));
+		}
+	}
+	return ok;
+}
+
+bool SrtWalker::CompiledWord(uint32_t word, uint32_t& value) {
+	using Table = ResourcePlan::SrtReadTable;
+	if ((word & Table::UserData) == 0u) return CompiledRead(word, value);
+	const auto index = word & ~Table::UserData;
+	if (index >= m_runtime.user_data.size()) return false;
+	value = m_runtime.user_data[index];
+	return true;
+}
+
+// One memoized DWORD, read and recorded as EvaluateRawRead does. Words are evaluated in the
+// walker's order: base, stride, offset, records, word 3.
+bool SrtWalker::CompiledRead(uint32_t index, uint32_t& value) {
+	const auto& read = m_program.srt_read_table->reads[index];
+	if (const auto& memo = m_context.values[read.memo]; memo.generation == m_context.generation) {
+		value = static_cast<uint32_t>(memo.value);
+		return true;
+	}
+	std::array<uint32_t, 4> words {};
+	if (!CompiledWord(read.words[0], words[0]) || !CompiledWord(read.words[1], words[1])) {
+		return false;
+	}
+	uint64_t address = (uint64_t {words[1]} << 32u | words[0]) & AddressMask & ~uint64_t {3};
+	if (read.buffer) {
+		uint32_t offset = read.offset;
+		if (read.shift != 0u) {
+			if (!CompiledWord(read.offset, offset)) return false;
+			offset = (offset << (read.shift - 1u)) & ~3u;
+		}
+		if (!CompiledWord(read.words[2], words[2]) || !CompiledWord(read.words[3], words[3])) {
+			return false;
+		}
+		// The DWORD must fit in records, or stride * records bytes.
+		const uint64_t stride = (words[1] >> 16u) & 0x3fffu;
+		const uint64_t size   = stride != 0u ? uint64_t {words[2]} * stride : words[2];
+		const uint64_t at     = offset + static_cast<uint64_t>(read.relative);
+		if (size < sizeof(uint32_t) || size - sizeof(uint32_t) < at) return false;
+		address += at;
+	} else if (read.relative < 0) {
+		const auto magnitude = static_cast<uint64_t>(-read.relative);
+		if (address < magnitude) return false;
+		address -= magnitude;
+	} else if (read.relative > 0) {
+		if (address > AddressMask - static_cast<uint64_t>(read.relative)) return false;
+		address += static_cast<uint64_t>(read.relative);
+	}
+	*m_cursor++     = address;
+	uint32_t loaded = 0;
+	std::memcpy(&loaded, reinterpret_cast<const void*>(address), sizeof(loaded));
+	auto& memo      = m_context.values[read.memo];
+	memo.value      = loaded;
+	memo.generation = m_context.generation;
+	value           = loaded;
+	return true;
+}
+
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
@@ -1130,6 +1386,14 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result = {};
 	result.dword_count = descriptor.dword_count;
+	// A failed compiled read is evaluated again below, with the walker's own result.
+	if (source < m_program.srt_descriptor_entries.size() &&
+	    m_program.srt_descriptor_entries[source] != UINT32_MAX &&
+	    CallCompiledRead(m_program.srt_descriptor_entries[source],
+	                     std::span(result.dwords).first(descriptor.dword_count), true)) {
+		return true;
+	}
+	result.dwords = {};
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
@@ -1151,6 +1415,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
+		// A failed compiled read is evaluated again below, with the walker's own result.
+		if (slot < m_program.srt_read_entries.size() &&
+		    m_program.srt_read_entries[slot] != UINT32_MAX &&
+		    CallCompiledRead(m_program.srt_read_entries[slot],
+		                     std::span(flat).subspan(m_program.srt_reads[slot].flat_offset, 1)))
+			return true;
 		const auto& read = m_program.srt_reads[slot];
 		const auto* inst = read.value.ResolveInstruction();
 		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;

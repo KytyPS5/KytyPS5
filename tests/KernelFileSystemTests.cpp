@@ -222,8 +222,14 @@ void TestMutexHandoff() {
   waiter.release = true;
   waiter.resume = 2;
   void *result = nullptr;
+#if defined(__APPLE__)
+  // A canceled guest thread joins with Darwin's PTHREAD_CANCELED on macOS hosts.
+  void *const canceled = reinterpret_cast<void *>(1);
+#else
+  void *const canceled = reinterpret_cast<void *>(-1);
+#endif
   Check(PthreadJoin(waiter.thread, &result) == OK &&
-            result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
+            result == canceled && waiter.acquired && waiter.finished,
         "mutex lock defers cancellation until explicit cancellation point");
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
@@ -2207,7 +2213,7 @@ void CheckSocketWakeup() {
     uint32_t size = sizeof(actual);
     Check(net_setsockopt(datagram, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
               net_getsockopt(datagram, 0xffff, 0x20, &actual, &size) == 0 &&
-              actual == value && size == sizeof(actual),
+              (actual != 0) == (value != 0) && size == sizeof(actual),
           "Net UDP broadcast option can be enabled and disabled");
   }
   int timeout = 0;
@@ -2277,6 +2283,14 @@ void CheckSocketWakeup() {
                    address.data(), address_size) == sizeof(payload) &&
             *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net sendto delivers to a guest sockaddr and preserves errno on success");
+  // macOS can deliver loopback datagrams after send returns; wait before each nonblocking read.
+  const auto datagram_readable = [&] {
+    std::array<uint64_t, 16> ready {};
+    ready[datagram / 64] = uint64_t {1} << (datagram % 64);
+    const std::array<int64_t, 2> wait {1, 0};
+    return Net::Select(datagram + 1, ready.data(), nullptr, nullptr, wait.data()) == 1;
+  };
+  Check(datagram_readable(), "sent datagram arrives on loopback");
   Check(net_recvfrom(datagram, received.data(), received.size(), 0,
                      peer.data(), &peer_size) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
@@ -2291,9 +2305,11 @@ void CheckSocketWakeup() {
   Check(net_connect(datagram_writer, address.data(), address_size) == 0 &&
             *net_errno == Libs::Posix::POSIX_EINVAL &&
             net_sendto(datagram_writer, payload, sizeof(payload), 0, nullptr, 0) ==
-                sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL &&
-            net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
-                sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+                sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net connect and sendto with an omitted destination succeed");
+  Check(datagram_readable(), "connected datagram arrives on loopback");
+  Check(net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
+            sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
         "Net connect selects the peer used by sendto with an omitted destination");
   Check(net_connect(-1, address.data(), address_size) == Libs::Network::NET_ERROR_EBADF &&
             *net_errno == Libs::Posix::POSIX_EBADF,

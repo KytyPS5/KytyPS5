@@ -81,8 +81,30 @@ struct TextureDecodeKeyHash {
 		for (const auto dword: key.value.dwords) {
 			hash = Common::Fnv64Step(hash, dword);
 		}
-		hash = Common::Fnv64Step(hash, key.resource.source);
-		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(key.resource.written));
+		// Every field the keys are compared by: one texture that many shaders read (each its
+		// own first use, descriptor index) would otherwise fill a single bucket.
+		const auto& r = key.resource;
+		hash = Common::Fnv64Step(hash, r.source);
+		hash = Common::Fnv64Step(hash, r.descriptor_index);
+		hash = Common::Fnv64Step(hash, r.first_use_pc);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(r.resource_class) |
+		                                   static_cast<uint32_t>(r.numeric_class) << 8u |
+		                                   static_cast<uint32_t>(r.dimension) << 16u |
+		                                   static_cast<uint32_t>(r.mip_mode) << 24u);
+		hash = Common::Fnv64Step(hash, r.mip_count);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(r.conversion_format));
+		hash = Common::Fnv64Step(hash, r.shader_swizzle);
+		hash = Common::Fnv64Step(hash, uint32_t {r.read} | uint32_t {r.written} << 1u |
+		                                   uint32_t {r.atomic} << 2u | uint32_t {r.atomic64} << 3u |
+		                                   uint32_t {r.unfiltered_access_only} << 4u |
+		                                   uint32_t {r.depth_compare} << 5u |
+		                                   uint32_t {r.cube} << 6u | uint32_t {r.r128} << 7u);
+		hash = Common::Fnv64Step(hash, r.indirect_root);
+		hash = Common::Fnv64Step(hash, r.indirect_mapping_offset);
+		hash = Common::Fnv64Step(hash, r.indirect_search_iterations);
+		for (const auto index: r.indirect_resources) {
+			hash = Common::Fnv64Step(hash, index);
+		}
 		return static_cast<size_t>(hash);
 	}
 };

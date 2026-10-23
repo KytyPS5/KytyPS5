@@ -40,28 +40,27 @@ int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver);
 int KYTY_SYSV_ABI   AgcCreateShader(Shader** dst, void* header, const volatile void* code);
-int KYTY_SYSV_ABI   AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
-                                                 const Shader* back);
+int KYTY_SYSV_ABI   AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front, const Shader* back);
 int KYTY_SYSV_ABI   AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
-                                               const Shader* back, void* scratch_mem);
-int KYTY_SYSV_ABI   AgcFuseShaderHalves(Shader* fused_result, const Shader* front,
-                                          const Shader* back, void* scratch_mem);
-int KYTY_SYSV_ABI   AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
-                                                       const volatile ShaderRegister* regs);
-int KYTY_SYSV_ABI   AgcSetShRegIndirectPatchSetAddress(uint32_t*                      cmd,
-                                                       const volatile ShaderRegister* regs);
-int KYTY_SYSV_ABI   AgcSetUcRegIndirectPatchSetAddress(uint32_t*                      cmd,
-                                                       const volatile ShaderRegister* regs);
-int KYTY_SYSV_ABI   AgcSetCxRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs);
-int KYTY_SYSV_ABI   AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs);
-int KYTY_SYSV_ABI   AgcSetUcRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs);
-int KYTY_SYSV_ABI   AgcSetCxRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs);
-int KYTY_SYSV_ABI   AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs);
-int KYTY_SYSV_ABI   AgcSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs);
-int KYTY_SYSV_ABI   AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
-                                       const Shader* hs, const Shader* gs, uint32_t prim_type);
-int KYTY_SYSV_ABI   AgcUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
-                                       uint32_t prim_type);
+                                             const Shader* back, void* scratch_mem);
+int KYTY_SYSV_ABI AgcFuseShaderHalves(Shader* fused_result, const Shader* front, const Shader* back,
+                                      void* scratch_mem);
+int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
+                                                     const volatile ShaderRegister* regs);
+int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                      cmd,
+                                                     const volatile ShaderRegister* regs);
+int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetAddress(uint32_t*                      cmd,
+                                                     const volatile ShaderRegister* regs);
+int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs);
+int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs);
+int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs);
+int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs);
+int KYTY_SYSV_ABI AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs);
+int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs);
+int KYTY_SYSV_ABI AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
+                                     const Shader* hs, const Shader* gs, uint32_t prim_type);
+int KYTY_SYSV_ABI AgcUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
+                                     uint32_t prim_type);
 int KYTY_SYSV_ABI AgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, uint32_t budget,
                                            float factor);
 int KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
@@ -101,10 +100,10 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
                                     const volatile uint32_t* buffer1, uint32_t size_in_dwords1,
                                     uint8_t cache_policy2, const volatile uint32_t* buffer2,
                                     uint32_t size_in_dwords2);
-uint64_t KYTY_SYSV_ABI AgcCbBranchGetSize();
-int KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_policy,
-                                               const volatile uint32_t* target,
-                                               uint32_t size_in_dwords);
+uint64_t KYTY_SYSV_ABI  AgcCbBranchGetSize();
+int KYTY_SYSV_ABI       AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_policy,
+                                                    const volatile uint32_t* target,
+                                                    uint32_t                 size_in_dwords);
 uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32_t offset,
                                                       const uint32_t* values, uint32_t num_values);
 uint32_t KYTY_SYSV_ABI  AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values);
@@ -138,11 +137,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegi
 uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs);
-uint64_t KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirectGetSize();
+uint64_t KYTY_SYSV_ABI  AgcDcbSetCxRegistersIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs);
-uint64_t KYTY_SYSV_ABI AgcDcbSetShRegistersIndirectGetSize();
+uint64_t KYTY_SYSV_ABI  AgcDcbSetShRegistersIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs);
@@ -162,8 +161,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
                                                       uint32_t instance_count, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexMultiInstancedGetSize();
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
-                                       const volatile uint32_t* target, uint32_t size_in_dwords,
-                                       uint64_t arg4, uint64_t arg5);
+                                             const volatile uint32_t* target,
+                                             uint32_t size_in_dwords, uint64_t arg4, uint64_t arg5);
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
                                             uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexAutoGetSize();
@@ -175,8 +174,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndirectGetSize();
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
-                                                uint32_t             data_offset_in_bytes,
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint32_t             count_indirect,
                                                 uint32_t             max_count_or_count,
                                                 const volatile void* count_addr,
@@ -194,7 +192,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 uint32_t KYTY_SYSV_ABI  AgcDcbDispatchIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address);
-uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type);
+uint64_t KYTY_SYSV_ABI  AgcDcbEventWriteGetSize(uint8_t event_type);
 uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles);
@@ -208,8 +206,8 @@ uint32_t KYTY_SYSV_ABI  AgcAcbAcquireMemGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbCondExecGetSize();
-uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
-                                   const uint32_t* target, uint32_t size_in_dwords);
+uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy, const uint32_t* target,
+                                   uint32_t size_in_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbJumpGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload);
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
@@ -261,7 +259,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t conditi
                                              uint8_t wait_op, const volatile void* address,
                                              uint32_t count_in_dwords);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
-                                             uint32_t arg3);
+                                                uint32_t arg3);
 int KYTY_SYSV_ABI       AgcDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
                                                              uint64_t  dst_address_or_offset);
 int KYTY_SYSV_ABI       AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(

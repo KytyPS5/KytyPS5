@@ -48826,24 +48826,46 @@ void CheckAgcSystemTable(RenderContext &renderer) {
       0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
       0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e};
   LibKernel::Memory::InstallGpuResources(&renderer);
-  Require(name, "driver module startup", Gen5Driver::Initialize() == 0,
-          "driver module startup failed before guest initialization");
-  const auto direct_memory_size = LibKernel::Memory::KernelGetDirectMemorySize();
-  int64_t available_offset = -1;
-  size_t available_size = 0;
-  Require(name, "remaining direct pool",
-          LibKernel::Memory::KernelAvailableDirectMemorySize(
-              0, direct_memory_size, 0, &available_offset, &available_size) == 0 &&
-              available_size == direct_memory_size - 0x200000,
-          "driver startup did not reserve its backing in the reported direct pool");
-  int64_t guest_allocation = -1;
-  Require(name, "guest consumes remaining direct pool",
+  const auto direct_size = LibKernel::Memory::KernelGetDirectMemorySize();
+  Require(name, "early driver reservation", Gen5Driver::Initialize() == 0,
+          "driver memory was not reserved before guest allocation");
+  Require(name, "guest budget excludes driver",
+          LibKernel::Memory::KernelGetDirectMemorySize() == direct_size - (direct_size % 0x200000) - 0x200000,
+          "guest memory size still includes the reserved driver block");
+  std::vector<std::pair<int64_t, size_t>> guest_allocations;
+  for (size_t i = 0; i < 64; ++i) {
+    int64_t physical = -1;
+    size_t available = 0;
+    if (LibKernel::Memory::KernelAvailableDirectMemorySize(
+            0, LibKernel::Memory::KernelGetDirectMemorySize(), 0x4000,
+            &physical, &available) != 0) {
+      break;
+    }
+    int64_t allocated = -1;
+    Require(name, "guest claims remaining memory",
+            available != 0 && LibKernel::Memory::KernelAllocateDirectMemory(
+                physical, physical + available, available, 0x4000, 12, &allocated) == 0,
+            "could not reproduce the guest's direct-memory claims");
+    guest_allocations.emplace_back(allocated, available);
+  }
+  int64_t unavailable = -1;
+  Require(name, "direct memory exhausted",
           LibKernel::Memory::KernelAllocateDirectMemory(
-              0, direct_memory_size, available_size, 0x4000, 0, &guest_allocation) == 0,
-          "guest could not allocate all remaining direct memory");
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), 0x200000,
+              0x200000, 12, &unavailable) == LibKernel::KERNEL_ERROR_EAGAIN,
+          "test did not exhaust the driver-sized allocation pool");
+  Require(name, "main allocation respects guest budget",
+          LibKernel::Memory::KernelAllocateMainDirectMemory(
+              0x4000, 0x4000, 12, &unavailable) == LibKernel::KERNEL_ERROR_EAGAIN,
+          "main direct-memory allocation reached the hidden alignment tail");
   uint32_t state = 0xabcdef01u;
   Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
-          "Agc startup required free guest memory or changed its ignored public state pointer");
+          "Agc startup failed or changed its ignored public state pointer");
+  for (const auto& [physical, size] : guest_allocations) {
+    Require(name, "release guest claims",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "test allocation was not released");
+  }
   LibKernel::Memory::VirtualQueryInfo mapping{};
   Require(name, "shared driver backing",
           LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void *>(driver_base), 0,
@@ -48875,9 +48897,6 @@ void CheckAgcSystemTable(RenderContext &renderer) {
               *instrumentation == 0x12340000u,
           "repeat Agc initialization reset existing system state");
   *instrumentation = 0;
-  Require(name, "release guest allocation",
-          LibKernel::Memory::KernelCheckedReleaseDirectMemory(guest_allocation, available_size) == 0,
-          "guest allocation release failed");
   LibKernel::Memory::InstallGpuResources(nullptr);
   std::printf("[host]    %-32s ok\n", name);
 }
@@ -49988,6 +50007,9 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--agc-unaligned-pool-only") == 0) {
+    Libs::LibKernel::Memory::SetFlexibleMemorySize((1ull << 30) + 0x4000);
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
@@ -50651,6 +50673,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--agc-unaligned-pool-only") == 0) {
+    VulkanHarness vulkan;
+    CheckAgcSystemTable(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--agc-system-table-only") == 0) {
+    VulkanHarness vulkan;
+    CheckAgcSystemTable(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {

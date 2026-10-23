@@ -14,8 +14,54 @@
 #include <vector>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// The profile runtime writes its counters only at a normal exit, but the run scripts may stop the
+// emulator with TerminateProcess. With KYTY_PGO_FILE=<file.profraw>, a thread writes them every
+// KYTY_PGO_DUMP_SECONDS (default 20) to <file>.tmp and renames that over <file>, so the file always
+// holds the last complete dump.
+static void StartPgoDumps() {
+	const char* file = std::getenv("KYTY_PGO_FILE");
+	if (file == nullptr || *file == '\0') {
+		::printf("PGO: instrumented build without KYTY_PGO_FILE: no profile is written\n");
+		return;
+	}
+	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds =
+	    (seconds_text != nullptr && std::atoi(seconds_text) > 0) ? std::atoi(seconds_text) : 20;
+	static const std::string target = file;
+	static const std::string temp   = target + ".tmp";
+	::printf("PGO: writing the profile to %s every %d s\n", target.c_str(), seconds);
+	std::thread([seconds]() {
+		for (uint32_t dump = 1;; dump++) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			__llvm_profile_set_filename(temp.c_str());
+			const int       written = __llvm_profile_write_file();
+			std::error_code error;
+			if (written == 0) {
+				std::filesystem::rename(temp, target, error);
+			}
+			::printf("PGO: dump %u %s\n", dump,
+			         written != 0 ? "failed to write" : (error ? "failed to rename" : "written"));
+			::fflush(stdout);
+		}
+	}).detach();
+}
+#endif
 
 static void PrintUsage() {
 	::printf("%s, %s, ver = %s, git = %s, date = %s\n",
@@ -480,6 +526,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 static int Main(int argc, char* argv[]) {
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	// After the address-space reservations: the thread's stack must not land in the guest range.
+	StartPgoDumps();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;

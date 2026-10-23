@@ -820,13 +820,18 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// Write-tracking protection changes (via ProtectGuestHostMemory) land here.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
+		const auto      lock_start = ::Common::PerfReport::Now();
 		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		const auto      call_start = ::Common::PerfReport::Now();
+		const bool      result     = ProtectMappedUnlocked(vaddr, size, mode);
+		::Common::PerfReport::NoteProtect(lock_start, call_start);
+		return result;
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,

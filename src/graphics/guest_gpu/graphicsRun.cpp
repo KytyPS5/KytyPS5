@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfReport.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -402,18 +403,32 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 
 	for (;;) {
+		Common::PerfReport::MaybeWrite();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
+		bool                         idle_timeout   = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				const auto idle_start = Common::PerfReport::Now();
+				if (Common::PerfReport::Enabled()) {
+					// Wake up periodically so an idle GPU thread still writes the report on time.
+					idle_timeout = !gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100'000);
+				} else {
+					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				}
+				Common::PerfReport::NoteGpuIdle(idle_start);
+				if (idle_timeout) {
+					break;
+				}
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (idle_timeout) {
+				// Nothing to take: check the report (at the top of the loop) outside the lock.
+			} else if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
@@ -435,7 +450,9 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
+						const auto blocked_start = Common::PerfReport::Now();
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						Common::PerfReport::NoteGpuBlocked(blocked_start);
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -452,6 +469,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = true;
 				has_submission    = true;
 			}
+		}
+		if (idle_timeout) {
+			continue;
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();

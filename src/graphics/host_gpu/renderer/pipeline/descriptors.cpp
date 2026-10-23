@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfReport.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -775,6 +776,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
+			if (metadata.written) {
+				Common::PerfReport::NoteGpuWrite(address, size, program.shader_hash);
+			}
 		}
 	}
 }

@@ -16,10 +16,13 @@ namespace Config {
 void Initialize();
 void Shutdown();
 
+void EmergencyShutdown();
+
 struct Lifecycle {
-	static constexpr const char* name       = "Config";
-	static constexpr auto        initialize = Config::Initialize;
-	static constexpr auto        shutdown   = Config::Shutdown;
+	static constexpr const char* name               = "Config";
+	static constexpr auto        initialize         = Config::Initialize;
+	static constexpr auto        shutdown           = Config::Shutdown;
+	static constexpr auto        emergency_shutdown = Config::EmergencyShutdown;
 };
 
 enum class ShaderOptimizationType { None, Size, Performance };
@@ -81,6 +84,8 @@ struct ConfigOptions {
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
+	bool                   perf_report_enabled         = false;
+	std::filesystem::path  perf_report_file            = "_kyty_perf.txt";
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -145,6 +150,8 @@ LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
 
 bool ProfilerEnabled();
+bool PerfReportEnabled();
+std::filesystem::path PerfReportFile();
 
 bool SpirvDebugPrintfEnabled();
 

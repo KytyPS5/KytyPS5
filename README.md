@@ -428,6 +428,10 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 
+To investigate a low frame rate, the [performance report](docs/performance-report.md)
+(`--perf-report`) summarizes GPU waits and queue submits by call site, plus memory-tracking fault
+details.
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors

@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfReport.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1694,6 +1695,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	Common::PerfReport::NoteFlip();
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 

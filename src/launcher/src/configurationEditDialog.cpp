@@ -162,6 +162,14 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
+	connect(m_ui->checkBox_perf_report, &QCheckBox::toggled, this, [this](bool flag) {
+		auto* file = m_ui->lineEdit_perf_report_file;
+		file->setEnabled(flag);
+		// Enabling the report with no file set fills in the default instead of an empty field.
+		if (flag && file->text().trimmed().isEmpty()) {
+			file->setText(QString::fromLatin1(Configuration::DEFAULT_PERF_REPORT_FILE));
+		}
+	});
 	connect(m_ui->comboBox_printf_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
@@ -327,6 +335,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
+	m_ui->checkBox_perf_report->setChecked(info.perf_report_enabled);
+	m_ui->lineEdit_perf_report_file->setText(info.perf_report_file);
+	m_ui->lineEdit_perf_report_file->setEnabled(info.perf_report_enabled);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -510,11 +521,17 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
 	info.printf_output_file = ui.lineEdit_printf_file->text();
 	info.profiler_enabled = ui.checkBox_profiler->isChecked();
+	info.perf_report_enabled = ui.checkBox_perf_report->isChecked();
+	// A blank file name (spaces included) would make the enabled report write nothing.
+	const auto perf_report_file = ui.lineEdit_perf_report_file->text();
+	info.perf_report_file       = info.perf_report_enabled && perf_report_file.trimmed().isEmpty()
+	                                  ? QString::fromLatin1(Configuration::DEFAULT_PERF_REPORT_FILE)
+	                                  : perf_report_file;
 }
 
 void ConfigurationEditDialog::save() {
 	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
-	                   m_ui->lineEdit_cmd_dump_folder}) {
+	                   m_ui->lineEdit_cmd_dump_folder, m_ui->lineEdit_perf_report_file}) {
 		if (field->isEnabled() && field->text().isEmpty()) {
 			m_ui->settings_tabs->setCurrentWidget(m_ui->debug_tab);
 			field->setFocus();

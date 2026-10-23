@@ -300,6 +300,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
+	AddFlag(args, info.perf_report_enabled, "--perf-report");
+	args << "--perf-report-file" << info.perf_report_file;
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 #if defined(_WIN32)
 	AddFlag(args, info.red_zone_protection_enabled, "--redzone");

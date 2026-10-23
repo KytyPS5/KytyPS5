@@ -584,7 +584,9 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	// mappings take the full copy.
 	if (!LibKernel::Memory::TryReadBacking(vaddr, destination, size) &&
 	    !LibKernel::Memory::CopySparseMemory(vaddr, destination, size)) {
-		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+		EXIT("BufferCache: failed to read sparse guest buffer memory at 0x%" PRIx64 " size 0x%" PRIx64
+		     "\n",
+		     vaddr, size);
 	}
 }
 

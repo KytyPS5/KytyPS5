@@ -554,8 +554,12 @@ void TestImageHeapKinds() {
             ImageHeapResource(root, 0u) == ImageHeapResource(other, 0u),
         "heap kind resources lost their type or kept root identity");
   root.depth_compare = true;
-  Check(kind_of(Format::k32UInt, Type::kColor2DArray) == 0u,
-        "depth comparison accepted an integer heap entry");
+  // A k32UInt compare reads the texel bits as float depth (CompareFormat);
+  // other integers stay null.
+  Check(kind_of(Format::k32SInt, Type::kColor2DArray) == 0u &&
+            kind_of(Format::k32UInt, Type::kColor2DArray) == float_kind,
+        "depth comparison accepted an integer heap entry or refused k32UInt as "
+        "float depth");
 }
 
 void TestBoundedImageViewEligibility() {

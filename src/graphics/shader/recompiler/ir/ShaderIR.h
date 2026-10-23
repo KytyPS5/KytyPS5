@@ -195,6 +195,16 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 	return image.conversion_format == Prospero::BufferFormat::k16UInt;
 }
 
+// A depth compare through a k32UInt T# (Assassin's Creed Black Flag Resynced binds a 4x4 k32UInt
+// texture to a shadow compare) samples the texel bits as a 32-bit float depth: the host compares
+// against a D32Sfloat copy of the same memory, like a k32Float T#.
+[[nodiscard]] constexpr Prospero::BufferFormat CompareFormat(const ImageResource&   image,
+                                                             Prospero::BufferFormat format) {
+	return image.depth_compare && format == Prospero::BufferFormat::k32UInt
+	           ? Prospero::BufferFormat::k32Float
+	           : format;
+}
+
 struct SamplerResource {
 	static constexpr uint32_t NoIndirectSampler = UINT32_MAX;
 

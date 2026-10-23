@@ -13694,6 +13694,93 @@ public:
     check_layout(false, DstSel(4, 4, 4, 4));
     check_layout(false, DstSel(4, 4, 4, 1));
     check_layout(true, DstSel(4, 0, 0, 1));
+    // Assassin's Creed Black Flag Resynced compares against a k32UInt T# (its
+    // words 1-3: 4x4 2D, 64 KiB tiling): the texel bits are compared as a float
+    // depth through a D32 copy. Every word of the tiled block holds the bits of
+    // 0.4f, so the result does not depend on the swizzle.
+    {
+      constexpr float stored = 0.4f;
+      std::memset(mapped, 0, allocation_size);
+      const auto bits = std::bit_cast<uint32_t>(stored);
+      for (uint32_t offset = 0; offset < 0x10000u; offset += sizeof(bits)) {
+        std::memcpy(static_cast<uint8_t *>(mapped) + offset, &bits,
+                    sizeof(bits));
+      }
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+                                        0xc1400000u, 0x0000c000u, 0x90900004u,
+                                        0, 0x00700000u, 0, 0}};
+      ShaderSamplerResource sampler_descriptor{{1u << 12u, 0, 1u << 24u, 0}};
+      TestCase test;
+      test.name = name;
+      test.has_user_data = true;
+      test.image_descriptor_swizzle = descriptor.DstSelXYZW();
+      std::copy_n(descriptor.fields, 8, test.user_data.begin());
+      std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
+      std::vector<float> compared(references.begin(), references.end());
+      compared.push_back(stored); // equal: the LESS compare fails
+      test.user_data[50] = compared.size() * sizeof(uint32_t);
+      test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      test.required_spirv = {"OpImageSampleDrefExplicitLod"};
+      for (const auto reference : compared) {
+        AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(reference));
+        AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&test.code, 22, std::bit_cast<uint32_t>(0.5f));
+        test.code.push_back(EncodeMimg0(0x2f, 1, 0, false, 1));
+        test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+        AppendStoreVgpr(&test.code, 0,
+                        static_cast<uint32_t>(test.expected.size()));
+        test.expected.push_back(reference < stored ? 0x3f800000u : 0u);
+      }
+      AppendEnd(&test.code);
+      const auto compiled = CompileCase(test, SubgroupSize());
+      Require(
+          name, "k32UInt comparison resource",
+          compiled.program.info.images.size() == 1 &&
+              compiled.program.info.images[0].depth_compare &&
+              compiled.program.info.images[0].numeric_class ==
+                  Prospero::TextureNumericClass::Float,
+          "a k32UInt comparison was not specialized as a float depth compare");
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images[0], value);
+      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = cache.GetImage(binding.image_id);
+      Require(
+          name, "k32UInt depth backing",
+          view != nullptr &&
+              image.info.pixel_format == vk::Format::eD32Sfloat &&
+              image.info.guest_format == Prospero::BufferFormat::k32Float,
+          "a k32UInt comparison texture did not get a D32 copy of its bits");
+      scheduler.Finish();
+      auto output = CreateStorageBuffer(name, {}, test.expected.size());
+      const auto sampler = context.GetSamplerCache().GetSampler(
+          sampler_descriptor, compiled.program.info.samplers[0].integer_border);
+      Image sampled;
+      sampled.view = view;
+      sampled.layout = image.backing.state.layout;
+      Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr,
+               sampler);
+      Require(name, "k32UInt comparisons",
+              ReadBuffer(name, output, test.expected.size()) == test.expected,
+              "a k32UInt comparison did not compare the texel bits as a float "
+              "depth");
+      DestroyBuffer(&output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
     for (const u32 wave : {32u, 64u}) {
       TestCase test;
       test.name = wave == 32u ? "ImageGatherCompareLod32" : "ImageGatherCompareLod64";

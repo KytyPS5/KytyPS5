@@ -970,7 +970,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
 		image.numeric_class = Prospero::SampledTextureNumericClass(
-		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
+		    depth_bits ? Prospero::BufferFormat::k16UNorm
+		               : Prospero::RemapTextureFormat(CompareFormat(base, format)));
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
 			if (image.indirect_root != ImageResource::NoIndirectImage) {
 				return SpecializationFail("packed UNorm sampling requires a direct image");
@@ -1781,8 +1782,8 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 	// entries that need shader-side conversion, read as null instead of failing the draw.
 	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
 	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
-	const auto numeric_class =
-	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	const auto numeric_class = Prospero::SampledTextureNumericClass(
+	    Prospero::RemapTextureFormat(CompareFormat(root, format)));
 	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
 	    DescriptorDimension(value, root.dimension) != root.dimension ||
 	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||

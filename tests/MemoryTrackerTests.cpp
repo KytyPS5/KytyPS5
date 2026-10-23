@@ -485,6 +485,74 @@ void TestBdaSyncConcurrentDrain() {
   Release(memory);
 }
 
+void TestBdaSyncDeferredEvents() {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, 2 * page, false,
+                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  (void)tracker.TakeBdaSync();
+
+  // A game-thread write releases its page at once but holds its BDA event back until the
+  // command processor promotes it.
+  tracker.InvalidateRegion(address + 7, 1, [] {}, true);
+  Check(tracker.IsRegionCpuModified(address, page) && IsWritable(memory),
+        "deferred invalidation did not release its page");
+  Check(tracker.TakeBdaSync().Empty(), "deferred BDA event was visible before promotion");
+  tracker.InvalidateRegion(address + page + 7, 1, [] {});
+  auto pending = tracker.TakeBdaSync();
+  Check(pending.Contains(address + page, page) && !pending.Intersects(address, page),
+        "immediate BDA event waited for, or released, a deferred one");
+  tracker.PromoteBdaSync();
+  pending = tracker.TakeBdaSync();
+  Check(pending.Contains(address, page) && !pending.Intersects(address + page, page),
+        "promotion lost or widened a deferred BDA event");
+  tracker.PromoteBdaSync();
+  Check(tracker.TakeBdaSync().Empty(), "promotion replayed an already promoted event");
+  tracker.QueueBdaSync(address, page, true);
+  tracker.QueueBdaSync(address + page, page);
+  tracker.PromoteBdaSync();
+  Check(tracker.TakeBdaSync().Contains(address, 2 * page),
+        "promotion did not merge with pending immediate events");
+  tracker.UntrackMemory(address, 2 * page);
+  Release(memory);
+}
+
+void TestCpuModifiedRangeQuery() {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, 4 * page, false,
+                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.MarkRegionAsCpuModified(address + page + 5, 1);
+  tracker.MarkRegionAsCpuModified(address + 3 * page, 1);
+  const auto query = [&](uint64_t start, uint64_t size) {
+    std::vector<std::pair<uint64_t, uint64_t>> runs;
+    tracker.ForEachCpuModifiedRange(start, size, [&](uint64_t run, uint64_t bytes) {
+      runs.emplace_back(run, bytes);
+    });
+    return runs;
+  };
+  const std::vector<std::pair<uint64_t, uint64_t>> expected{
+      {address + page, page}, {address + 3 * page, page}};
+  Check(query(address, 4 * page) == expected, "CPU-modified runs were wrong");
+  // The query only reports: it neither clears dirtiness nor re-arms protection.
+  Check(query(address, 4 * page) == expected && IsWritable(memory + page) &&
+            IsWritable(memory + 3 * page) && !IsWritable(memory) &&
+            !IsWritable(memory + 2 * page),
+        "CPU-modified query changed tracking state");
+  Check(query(address + 2 * page, page).empty() &&
+            query(address + page + 16, 32) ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{address + page, page}},
+        "CPU-modified query was not limited to the requested pages");
+  tracker.UntrackMemory(address, 4 * page);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1282,6 +1350,8 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestBdaSyncDirtiness();
   TestBdaSyncConcurrentDrain();
+  TestBdaSyncDeferredEvents();
+  TestCpuModifiedRangeQuery();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

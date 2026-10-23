@@ -5587,9 +5587,16 @@ public:
     snapshot(0, 0);
     snapshot(2 * page, 1);
 
+    // This thread is not the GPU thread, so the write is queued like a game thread's: BDA
+    // synchronization skips it until the command processor starts or resumes a submission.
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
     words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.PrepareBda();
+    Require(name, "deferred game-thread write",
+            cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a game-thread write reached BDA synchronization before promotion");
+    cache.PromoteBdaSync();
     context.PrepareBda();
     snapshot(16, 2);
     snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
@@ -5628,6 +5635,173 @@ public:
     DestroyBuffer(&readback);
     Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 3 * page),
             "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckBdaSyncBatchesBuffers() {
+    constexpr const char *name = "BdaSyncBatchesBuffers";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr auto tracker_page = TRACKER_PAGE_SIZE;
+    EnsureRuntimeContext();
+    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, 4 * page, Common::VirtualMemory::Mode::ReadWrite, "bda_sync_batches");
+    Require(name, "allocation", base != 0, "guest allocation failed");
+    auto *words = reinterpret_cast<u32 *>(base);
+    std::fill_n(words, 4 * page / sizeof(u32), 0x11111111u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, 4 * page);
+    // Two buffers with a gap, so one synchronization has to upload into both.
+    const auto first_id = cache.FindBuffer(base, page);
+    const auto second_id = cache.FindBuffer(base + 2 * page, 2 * page);
+    Require(name, "separate buffers",
+            first_id != second_id &&
+                cache.GetBuffer(first_id).CpuAddress() == base &&
+                cache.GetBuffer(second_id).CpuAddress() == base + 2 * page,
+            "the test buffers were merged");
+    context.PrepareBda();
+    Require(name, "initial upload",
+            !cache.IsRegionCpuModified(base, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, 2 * page),
+            "registration did not upload both buffers");
+
+    // Dirty one page of the first buffer and two separated pages of the second.
+    const uint64_t dirty[] = {base + tracker_page, base + 2 * page,
+                              base + 4 * page - tracker_page};
+    u32 value = 0x22222222u;
+    for (const auto address : dirty) {
+      cache.InvalidateMemory(address + 4, 1);
+      std::fill_n(reinterpret_cast<u32 *>(address), tracker_page / sizeof(u32), value);
+      value += 0x11111111u;
+    }
+    cache.PromoteBdaSync();
+    context.PrepareBda();
+    Require(name, "consumed",
+            !cache.IsRegionCpuModified(base, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, 2 * page),
+            "BDA synchronization left a dirty page in one of the buffers");
+
+    auto readback = CreateHostBuffer(name, 8 * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](BufferId id, uint64_t address, uint32_t index) {
+      auto &buffer = cache.GetBuffer(id);
+      const vk::BufferCopy copy{buffer.Offset(address), index * sizeof(u32), sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+    };
+    snapshot(first_id, base, 0);
+    snapshot(first_id, dirty[0], 1);
+    snapshot(first_id, dirty[0] + tracker_page - sizeof(u32), 2);
+    snapshot(second_id, dirty[1], 3);
+    snapshot(second_id, dirty[1] + tracker_page, 4);
+    snapshot(second_id, dirty[2], 5);
+    snapshot(second_id, dirty[2] + tracker_page - sizeof(u32), 6);
+    snapshot(second_id, base + 3 * page, 7);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "GPU contents", ReadBuffer(name, readback, 8) ==
+        std::vector<u32>{0x11111111u, 0x22222222u, 0x22222222u, 0x33333333u,
+                        0x11111111u, 0x44444444u, 0x44444444u, 0x11111111u},
+        "a batched upload landed in the wrong buffer or at the wrong offset");
+    context.UnmapMemory(base, 4 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 4 * page),
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckBufferCacheReleasesUnboundBuffers() {
+    constexpr const char *name = "BufferCacheReleasesUnboundBuffers";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    // Direct memory: unmapping the GPU-written buffer publishes it to the direct backing.
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 8 * page;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    // Unmapping the GPU-written buffer at the end reads it back through the GPU thread.
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 8 * page);
+    // No memory pressure: only the unbound-buffer release may retire anything.
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(
+        cache, std::numeric_limits<uint64_t>::max(),
+        std::numeric_limits<uint64_t>::max());
+    const auto run_gc = [&](uint32_t ticks) {
+      for (uint32_t tick = 0; tick < ticks; ++tick) {
+        cache.RunGarbageCollector();
+      }
+    };
+
+    const auto unbound = cache.FindBuffer(base, page);
+    const auto pinned = cache.FindBuffer(base + 2 * page, page);
+    cache.PinBda(pinned);
+    (void)cache.ObtainBuffer(base + 4 * page, 16, true);
+    run_gc(200);
+    const auto recent = cache.FindBuffer(base + 6 * page, page);
+    run_gc(110);
+    Require(name, "unbound release",
+            !cache.IsRegionRegistered(base, page) &&
+                !BufferCacheTestAccess::PageOwner(cache, base) &&
+                cache.IsRegionCpuModified(base, page),
+            "a clean buffer nothing bound for 300 ticks stayed registered or tracked");
+    Require(name, "retained owners",
+            static_cast<bool>(unbound) &&
+                BufferCacheTestAccess::PageOwner(cache, base + 2 * page) == pinned &&
+                cache.IsRegionRegistered(base + 4 * page, 16) &&
+                cache.IsRegionGpuModified(base + 4 * page, 16) &&
+                BufferCacheTestAccess::PageOwner(cache, base + 6 * page) == recent,
+            "a BDA-pinned, GPU-written or recently registered buffer was released");
+
+    // A buffer that absorbs a pinned one stays pinned.
+    const auto joined = cache.FindBuffer(base + 2 * page, 2 * page);
+    run_gc(310);
+    Require(name, "pinned join",
+            BufferCacheTestAccess::PageOwner(cache, base + 3 * page) == joined &&
+                cache.IsRegionRegistered(base + 2 * page, 2 * page) &&
+                !cache.IsRegionRegistered(base + 6 * page, page),
+            "joining a pinned buffer dropped its pin, or an aged buffer was kept");
+
+    context.UnmapMemory(base, 8 * page);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -50947,6 +51121,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckBdaSyncBatchesBuffers();
+    vulkan.CheckBufferCacheReleasesUnboundBuffers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -51182,6 +51358,8 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckBdaSyncBatchesBuffers();
+  vulkan.CheckBufferCacheReleasesUnboundBuffers();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

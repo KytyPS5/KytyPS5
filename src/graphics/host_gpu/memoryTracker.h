@@ -30,12 +30,17 @@ public:
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Queue after changing ownership; a concurrent drain must not consume an event
-	// before the dirty pages it describes become visible.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	// before the dirty pages it describes become visible. A deferred event (a game-thread write)
+	// is held back until PromoteBdaSync().
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size, bool deferred = false);
 	[[nodiscard]] RangeSet TakeBdaSync();
-	// Removes protection from a range and flushes GPU-owned data when required.
+	// Makes deferred events visible to TakeBdaSync().
+	void PromoteBdaSync();
+	// Removes protection from a range and flushes GPU-owned data when required. defer_bda
+	// queues the BDA synchronization event as deferred.
 	template <typename Flush>
-	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
+	                      bool defer_bda = false) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
 
@@ -55,7 +60,7 @@ public:
 				on_flush();
 			}
 		});
-		QueueBdaSync(vaddr, size);
+		QueueBdaSync(vaddr, size, defer_bda);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -78,6 +83,19 @@ public:
 			if constexpr (clear) {
 				manager->template ChangeState<DirtySource::Gpu, false>(address, bytes);
 			}
+		});
+	}
+
+	// Calls func(address, size) for each CPU-modified run of pages in [vaddr, vaddr + size)
+	// without changing any dirty state. Memory not tracked yet counts as CPU-modified, as in
+	// IsRegionCpuModified, so this creates its tracking regions.
+	template <typename Func>
+	void ForEachCpuModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->template ForEachModifiedRange<DirtySource::Cpu, false>(
+			    manager->GetCpuAddr() + offset, bytes, func);
 		});
 	}
 
@@ -156,6 +174,7 @@ private:
 	std::mutex                                     m_region_mutex;
 	std::mutex                                     m_bda_sync_mutex;
 	RangeSet                                       m_bda_sync;
+	RangeSet                                       m_bda_sync_deferred;
 	PageManager&                                   m_page_manager;
 };
 

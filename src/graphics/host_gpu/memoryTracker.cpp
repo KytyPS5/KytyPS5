@@ -66,11 +66,18 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
-void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size, bool deferred) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
+	(deferred ? m_bda_sync_deferred : m_bda_sync).Add(begin, end - begin);
+}
+
+void MemoryTracker::PromoteBdaSync() {
+	std::lock_guard lock(m_bda_sync_mutex);
+	m_bda_sync_deferred.ForEach(
+	    [this](uint64_t begin, uint64_t end) { m_bda_sync.Add(begin, end - begin); });
+	m_bda_sync_deferred = RangeSet {};
 }
 
 RangeSet MemoryTracker::TakeBdaSync() {

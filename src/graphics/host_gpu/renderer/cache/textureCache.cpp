@@ -37,6 +37,21 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
+[[nodiscard]] bool SameMipPlacement(const ImageMipInfo& left, const ImageMipInfo& right) {
+	return left.offset == right.offset && left.size == right.size && left.pitch == right.pitch &&
+	       left.height == right.height && left.tail_x == right.tail_x &&
+	       left.tail_y == right.tail_y && left.surface_z == right.surface_z;
+}
+
+// Guest mip chains run backwards, so a texture with fewer levels keeps its base level at a
+// different offset than one with a longer chain at the same address. Every level both layouts
+// have must be placed identically for one image to serve the other.
+[[nodiscard]] bool SharedLevelsMatch(const ImageInfo& left, const ImageInfo& right) {
+	const auto shared = std::min(left.resources.levels, right.resources.levels);
+	return std::equal(left.mip_layout.begin(), left.mip_layout.begin() + shared,
+	                  right.mip_layout.begin(), SameMipPlacement);
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -810,18 +825,21 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
+		// The mip count matters too: if any level both layouts have is placed differently, the
+		// cached image cannot serve the request.
+		const bool shared_levels_differ =
+		    requested.resources.levels != cached.info.resources.levels &&
+		    !SharedLevelsMatch(requested, cached.info);
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
-		                 cached.info.mip_layout.begin(),
-		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
-			                 return left.offset == right.offset && left.size == right.size &&
-			                        left.pitch == right.pitch && left.height == right.height &&
-			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-			                        left.surface_z == right.surface_z;
-		                 }))) {
+		                 cached.info.mip_layout.begin(), SameMipPlacement)) ||
+		    shared_levels_differ) {
+			// The request becomes a separate image. An idle cached image is retired; GPU-written
+			// contents are published to the buffer cache first, so the new image uploads them and
+			// no stale copy is left for range lookups or texture GC to download later.
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				BcAlias::Resolve(*this, cached_id, merged_id);
 			}
 			return {merged_id};
 		}
@@ -1291,7 +1309,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = id;
 				break;
 			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			// Equal size and a longer chain are not enough: the levels the request uses must sit
+			// where the cached image keeps them.
+			if (SameBacking(image.info, desc.info, exact_format) &&
+			    (image.info.resources.levels == desc.info.resources.levels ||
+			     SharedLevelsMatch(image.info, desc.info))) {
 				result = id;
 			} else if (image.SafeToDownload() &&
 			           BcAlias::Matches(desc.info, image.info)) {

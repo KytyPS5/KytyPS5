@@ -1,5 +1,5 @@
 
-find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
@@ -21,7 +21,8 @@ add_executable(launcher WIN32
 )
 
 
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
+	LibAtrac9 kyty_git_version common)
 if(LINUX)
 	find_package(Qt6 COMPONENTS DBus REQUIRED)
 	target_link_libraries(launcher Qt6::DBus)
@@ -35,6 +36,16 @@ target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+
+add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
+	src/gameContent.cpp
+	src/launcherTheme.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
+target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
@@ -76,7 +87,7 @@ if(WIN32)
 	)
 endif()
 
-set(launcher_name "launcher")
+set(launcher_name "kyty_launcher")
 if(APPLE)
 	set(launcher_name "KytyPS5")
 endif()
@@ -100,6 +111,15 @@ endif()
 install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
+
+if(NOT APPLE)
+	# Older releases require the previous executable name when validating updates.
+	install(CODE "
+		file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
+			TYPE PROGRAM RENAME \"launcher${CMAKE_EXECUTABLE_SUFFIX}\"
+			FILES \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}${CMAKE_EXECUTABLE_SUFFIX}\")
+	")
+endif()
 
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")

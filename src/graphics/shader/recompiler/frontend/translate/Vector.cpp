@@ -6,6 +6,8 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
 	switch (inst.opcode) {
 		case O::V_NOP: return;
+		case O::V_INTERP_P1LL_F16:
+		case O::V_INTERP_P2_F16: return EmitInterpolation(inst);
 		case O::V_ADD_I32: ADD_U32(inst, true, false); return;
 		case O::V_ADDC_U32: ADD_U32(inst, true, true); return;
 		case O::V_SUB_I32: SUB_U32(inst, true, false); return;

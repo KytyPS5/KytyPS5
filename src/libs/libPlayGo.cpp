@@ -221,10 +221,16 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	if (out_entries == nullptr) {
 		return PLAYGO_ERROR_BAD_POINTER;
 	}
-	if (number_of_entries != 0 && out_chunk_id_list == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+	if (out_chunk_id_list != nullptr && number_of_entries == 0) {
+		return PLAYGO_ERROR_BAD_SIZE;
 	}
 	ensure_chunks_loaded();
+
+	// A null output buffer asks for the total chunk count.
+	if (out_chunk_id_list == nullptr) {
+		*out_entries = g_chunks_num;
+		return OK;
+	}
 
 	const uint32_t entries = std::min(number_of_entries, g_chunks_num);
 	for (uint32_t i = 0; i < entries; i++) {

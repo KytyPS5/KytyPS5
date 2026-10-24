@@ -40,7 +40,7 @@ int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver);
 int KYTY_SYSV_ABI   AgcCreateShader(Shader** dst, void* header, const volatile void* code);
-int KYTY_SYSV_ABI   AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* front,
+int KYTY_SYSV_ABI   AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
                                                  const Shader* back);
 int KYTY_SYSV_ABI   AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
                                                const Shader* back, void* scratch_mem);

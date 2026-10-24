@@ -15,17 +15,6 @@
 
 namespace Libs::Graphics {
 
-namespace ShaderError {
-
-[[nodiscard]] inline bool Fail(std::string* error, std::string_view message) {
-	if (error != nullptr) {
-		error->assign(message.data(), message.size());
-	}
-	return false;
-}
-
-} // namespace ShaderError
-
 namespace HW {
 struct VertexShaderInfo;
 struct PixelShaderInfo;
@@ -49,9 +38,12 @@ namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
+struct ShaderProgram;
+
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	const ShaderProgram*                            handle    = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
 		return program != nullptr && resources != nullptr;
@@ -130,6 +122,8 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_control_points = 0;
 	uint32_t ls_stride             = 0;
 	uint32_t hs_stride             = 0;
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
@@ -149,7 +143,11 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
+	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
+	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
+	uint32_t                user_clip_planes     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
@@ -191,11 +189,14 @@ struct ShaderPixelInputInfo {
 	// CB round mode per converted export: zero adds half an LSB, one truncates.
 	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
+	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;
+	bool                                           ps_front_face_all_bits       = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;

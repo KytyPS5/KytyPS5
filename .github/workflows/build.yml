@@ -407,12 +407,12 @@ jobs:
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/linux/install/launcher
+          file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
           test -x _Build/linux/install/kyty_updater
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
-          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
           while IFS= read -r -d '' binary; do
             while read -r dependency; do
               test -e "_Build/linux/install/lib/$dependency"
@@ -421,8 +421,8 @@ jobs:
                 sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
             )
           done < <(
-            find _Build/linux/install/launcher _Build/linux/install/plugins \
-              -type f \( -name launcher -o -name '*.so' \) -print0
+            find _Build/linux/install/kyty_launcher _Build/linux/install/plugins \
+              -type f \( -name kyty_launcher -o -name '*.so' \) -print0
           )
           _Build/linux/install/kyty_emulator --help > /dev/null
 
@@ -497,7 +497,7 @@ jobs:
           linux_dir="artifacts/KytyPS5-Linux-x86_64"
           test -d "$linux_dir"
           chmod a+x \
-            "$linux_dir/launcher" \
+            "$linux_dir/kyty_launcher" \
             "$linux_dir/kyty_emulator" \
             "$linux_dir/kyty_updater"
           tar -C "$linux_dir" -czf \

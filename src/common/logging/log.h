@@ -51,20 +51,26 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 
 } // namespace Color
 
+// Out of line, so callers on small guest stacks (fibers) do not reserve the formatting frame.
+template <typename... Args>
+[[gnu::noinline]] void Printf(fmt::text_style style, const char* format, const Args&... args) {
+	Write(style, fmt::sprintf(format, args...));
+}
+
 } // namespace Log
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LOGF(...)                                                                                  \
 	do {                                                                                           \
 		if (!::Log::IsSilent()) {                                                                  \
-			::Log::Write(::fmt::sprintf(__VA_ARGS__));                                             \
+			::Log::Printf({}, __VA_ARGS__);                                                        \
 		}                                                                                          \
 	} while (false)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LOGF_COLOR(style, ...)                                                                     \
 	do {                                                                                           \
 		if (!::Log::IsSilent()) {                                                                  \
-			::Log::Write((style), ::fmt::sprintf(__VA_ARGS__));                                    \
+			::Log::Printf((style), __VA_ARGS__);                                                   \
 		}                                                                                          \
 	} while (false)
 

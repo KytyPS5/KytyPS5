@@ -18,6 +18,7 @@ namespace AudioOut {
 
 struct AudioOutOutputParam;
 struct AudioOutPortState;
+struct AudioOutSystemState;
 
 int KYTY_SYSV_ABI AudioOutInit();
 int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
@@ -27,6 +28,7 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num);
 int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr);
 int KYTY_SYSV_ABI AudioOutClose(int handle);
 int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state);
+int KYTY_SYSV_ABI AudioOutGetSystemState(AudioOutSystemState* state);
 
 } // namespace AudioOut
 

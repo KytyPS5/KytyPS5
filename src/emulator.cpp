@@ -89,42 +89,6 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
 }
 
-static bool ClearDirectoryContents(const std::filesystem::path& dir) {
-	bool ok = true;
-
-	for (const auto& entry: Common::File::GetDirEntries(dir)) {
-		if (entry.name == "." || entry.name == "..") {
-			continue;
-		}
-
-		auto path = dir / entry.name;
-
-		if (entry.is_file) {
-			Common::File::RemoveReadonly(path);
-			ok = Common::File::DeleteFile(path) && ok;
-		} else {
-			ok = ClearDirectoryContents(path) && ok;
-			ok = Common::File::DeleteDirectory(path) && ok;
-		}
-	}
-
-	return ok;
-}
-
-static void ClearDebugTextureFolder() {
-	const std::string debug_texture_folder = "_Textures";
-
-	if (!Common::File::IsDirectoryExisting(debug_texture_folder)) {
-		Common::File::CreateDirectories(debug_texture_folder);
-		return;
-	}
-
-	if (!ClearDirectoryContents(debug_texture_folder)) {
-		LOGF_COLOR(Log::Color::BrightYellow, "TextureDump: failed to completely clear %s\n",
-		           debug_texture_folder.c_str());
-	}
-}
-
 static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& param_json,
                  Common::Subsystems& subsystems) {
 	EXIT_IF(!Common::Thread::IsMainThread());
@@ -197,8 +161,6 @@ void Run(const RunOptions& options) {
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
-
-	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
 	std::string title_id;

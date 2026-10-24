@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/gpuKeepWarm.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -384,6 +385,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
+	GpuKeepWarm::NoteActivity(); // KYTY_GPU_KEEPWARM: resumes a paused spin; a relaxed load when off
 }
 
 void GuestGpu::WaitForIdle() {

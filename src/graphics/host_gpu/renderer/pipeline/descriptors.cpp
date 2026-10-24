@@ -722,6 +722,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
+	// Before the descriptor buffers: a buffer created here may absorb them.
+	for (const auto* stage: stages) {
+		EXIT_IF(stage->runtime == nullptr || !*stage->runtime);
+		for (const auto& [address, size]: stage->runtime->resources->address_ranges) {
+			m_context.MakeAddressRangeResident(address, size);
+		}
+	}
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);

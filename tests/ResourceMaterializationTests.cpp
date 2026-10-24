@@ -1336,7 +1336,119 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   }
 }
 
+// GoW Ragnarok's Bink DC prediction loads a bitmask table at a user-data base, offset by
+// ((row >> 5) + 8) << 4 under the EXEC guard row < height, where row = step - lane wraps.
+void TestAddressRangesFollowAccessGuards() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  constexpr uint64_t base = 0x0000001234560000ull;
+  const auto plan_for = [](bool guarded, bool scaled, bool buffered = false) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Global;
+    memory.offset = 0x10;
+    program.memory_info.push_back(memory);
+    const auto user = [&](uint32_t reg) {
+      return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                        {Value(static_cast<ScalarReg>(reg))}));
+    };
+    const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+      return Value(&block.AppendNewInst(opcode, args));
+    };
+    const auto low = user(0);
+    const auto high = user(1);
+    auto limit = user(2);
+    if (buffered) {
+      DescriptorSource source;
+      source.dword_count = 4;
+      source.dwords = {Value(0x1000u), Value(4u << 16u), Value(1u), Value(0x16204u)};
+      program.descriptor_sources.push_back(source);
+      program.info.buffers.push_back({.source = 0, .read = true});
+      program.memory_info.push_back({.kind = ResourceKind::Buffer});
+      const auto buffer = emit(ValueOpcode::GetBufferResource,
+                               {source.dwords[0], source.dwords[1], source.dwords[2],
+                                source.dwords[3]});
+      limit = emit(ValueOpcode::LoadBufferU32,
+                   {buffer, Value(0u), Value(0u), Value(0u), Value(true)});
+      limit.Instruction()->SetFlags(MemoryFlags{.index = 1});
+    }
+    const auto row = emit(ValueOpcode::ISub32, {user(3), emit(ValueOpcode::LaneId, {})});
+    const auto inside = emit(ValueOpcode::ULessThan32, {row, limit});
+    const auto offset =
+        scaled ? emit(ValueOpcode::IMul32, {row, Value(0x10000u)})
+               : emit(ValueOpcode::ShiftLeftLogical32,
+                      {emit(ValueOpcode::IAdd32,
+                            {emit(ValueOpcode::ShiftRightLogical32, {row, Value(5u)}),
+                             Value(8u)}),
+                       Value(4u)});
+    const auto predicate = guarded ? inside : Value(true);
+    // As in the game, inactive lanes keep a value the guard does not bound.
+    const auto selected = emit(ValueOpcode::SelectU32, {predicate, offset, row});
+    const auto handle = emit(ValueOpcode::GetAddressResource, {low, high});
+    auto &load = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                     {handle, selected, Value(0u), predicate});
+    load.SetFlags(MemoryFlags{.index = 0, .pc = 0x1b8});
+    return ExtractResourcePlan(program);
+  };
+  const auto ranges = [](const ResourcePlan &plan, uint32_t limit) {
+    const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(base),
+                                            static_cast<uint32_t>(base >> 32u), limit, 40u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization),
+          "address range materialization failed");
+    return snapshot.address_ranges;
+  };
+  const auto guarded = plan_for(true, false);
+  Check(guarded.address_ranges.size() == 1u, "a guarded GLOBAL_LOAD offset had no range");
+  // row <= 99: ((99 >> 5) + 8) << 4 = 0xb0, plus the immediate and a DWORD pair.
+  Check(ranges(guarded, 100u) ==
+            std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x10u, 0xb0u + 8u}},
+        "the EXEC guard did not bound the wrapped row");
+  // row <= 0xfffffffe still fits: the offset cannot wrap.
+  Check(ranges(guarded, 0xffffffffu) ==
+            std::vector<std::pair<uint64_t, uint64_t>>{
+                {base + 0x10u, ((0xfffffffeull >> 5u) + 8u) * 16u + 8u}},
+        "the widest guarded offset was not kept");
+  Check(plan_for(false, false).address_ranges.empty(),
+        "an unguarded wrapped row produced a range");
+  const auto scaled = plan_for(true, true);
+  Check(ranges(scaled, 100u) ==
+            std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x10u, 99u * 0x10000u + 8u}},
+        "a scaled guarded offset had the wrong range");
+  Check(ranges(scaled, 0x20000u).empty(), "an offset that may wrap kept a range");
+  // A limit read from a buffer only bounds the range: it must not make the shader depend on
+  // specialization memory or capture reads.
+  const auto buffered = plan_for(true, false, true);
+  Check(buffered.address_ranges.size() == 1u && !buffered.requires_specialization_memory &&
+            !buffered.capture_specialization_reads,
+        "a buffered range limit changed the specialization requirements");
+  Check(ranges(buffered, 0u).empty(), "a range used a limit no strict reader could read");
+  const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(base),
+                                          static_cast<uint32_t>(base >> 32u), 0u, 40u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(
+            buffered,
+            {.user_data = user_data,
+             .read_specialization_memory =
+                 +[](void *, uint64_t address, std::span<uint32_t> words) {
+                   if (address != 0x1000u || words.size() != 1u) return false;
+                   words[0] = 100u;
+                   return true;
+                 }},
+            snapshot, specialization) &&
+            snapshot.address_ranges ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{base + 0x10u, 0xb0u + 8u}},
+        "a strict reader did not bound the range with the buffered limit");
+  Check(snapshot.specialization_reads.empty(), "a range limit read was captured");
+}
+
 } // namespace
+
 
 namespace Common {
 
@@ -1374,6 +1486,7 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestAddressRangesFollowAccessGuards();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

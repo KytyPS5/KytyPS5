@@ -13,6 +13,9 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
+#include <span>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1341,6 +1344,294 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+namespace {
+
+// Bounds the guest bytes of address accesses whose base the host evaluates. A per-lane offset
+// is bounded by its operations, or by an unsigned comparison that the access predicate requires
+// (the guest's EXEC guard); any other offset has no range and stays on the fault route.
+class AddressRangePlanner {
+public:
+	AddressRangePlanner(const Program& program, const std::function<Value(Value)>& clone)
+	    : m_program(program), m_clone(clone) {}
+
+	std::vector<AddressRangePlan> Run() {
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				Visit(inst);
+			}
+		}
+		return std::move(m_ranges);
+	}
+
+private:
+	using Op   = AddressRangePlan::Op;
+	using Node = AddressRangePlan::Node;
+
+	struct Fact {
+		Value value;
+		Value limit;
+		bool  strict = false;
+	};
+
+	struct Key {
+		Value low;
+		Value high;
+		Value offset;
+		Value predicate;
+		bool  scalar = false;
+
+		bool operator==(const Key&) const = default;
+	};
+
+	void Visit(const Inst& inst) {
+		if (AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::None) return;
+		const auto index = inst.Flags<MemoryFlags>().index;
+		if (index >= m_program.memory_info.size()) return;
+		const auto& memory = m_program.memory_info[index];
+		if (memory.planning_only || memory.address_is_full ||
+		    (memory.kind != ResourceKind::Global && memory.kind != ResourceKind::Flat &&
+		     memory.kind != ResourceKind::ScalarAddress)) {
+			return;
+		}
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2 || !IsRuntime(handle->Arg(0)) || !IsRuntime(handle->Arg(1))) {
+			return;
+		}
+		const bool scalar    = memory.kind == ResourceKind::ScalarAddress;
+		auto       immediate = static_cast<int32_t>(memory.offset);
+		if (scalar) {
+			immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
+		}
+		const Key key {handle->Arg(0).Resolve(), handle->Arg(1).Resolve(), inst.Arg(1).Resolve(),
+		               inst.Arg(inst.NumArgs() - 1).Resolve(), scalar};
+		// The touched DWORD pair covers sub-DWORD and unaligned DWORD accesses.
+		const int64_t first = immediate;
+		const int64_t last  = int64_t {immediate} + 8;
+		if (const auto found = std::ranges::find(m_keys, key); found != m_keys.end()) {
+			auto& range        = m_ranges[found - m_keys.begin()];
+			range.first_offset = std::min(range.first_offset, first);
+			range.last_offset  = std::max(range.last_offset, last);
+			return;
+		}
+		m_facts.clear();
+		m_true.clear();
+		m_false.clear();
+		m_memo.clear();
+		Assume(key.predicate, true, 0);
+		std::vector<Node> nodes;
+		if (!Bound(key.offset, nodes, 0)) return;
+		m_keys.push_back(key);
+		m_ranges.push_back({.base_low     = m_clone(key.low),
+		                    .base_high    = m_clone(key.high),
+		                    .scalar       = scalar,
+		                    .first_offset = first,
+		                    .last_offset  = last,
+		                    .offset_bound = std::move(nodes)});
+	}
+
+	bool IsRuntime(Value value) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return value.IsImmediate();
+		const auto [found, inserted] = m_runtime.try_emplace(inst, false);
+		if (inserted) {
+			found->second = ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer);
+		}
+		return found->second;
+	}
+
+	static uint32_t Push(std::vector<Node>& nodes, const Node& node) {
+		nodes.push_back(node);
+		return static_cast<uint32_t>(nodes.size() - 1u);
+	}
+
+	void Assume(Value condition, bool holds, uint32_t depth) {
+		condition        = condition.Resolve();
+		const auto* inst = condition.TryInstruction();
+		if (depth > 32u || inst == nullptr || condition.GetType() != Type::U1) return;
+		(holds ? m_true : m_false).insert(inst);
+		const auto less_equal = [&](size_t value, size_t limit, bool strict) {
+			m_facts.push_back({inst->Arg(value).Resolve(), inst->Arg(limit).Resolve(), strict});
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ConditionRef: Assume(inst->Arg(0), holds, depth + 1u); break;
+			case ValueOpcode::LogicalNot: Assume(inst->Arg(0), !holds, depth + 1u); break;
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+				if (holds == (inst->GetOpcode() == ValueOpcode::LogicalAnd)) {
+					Assume(inst->Arg(0), holds, depth + 1u);
+					Assume(inst->Arg(1), holds, depth + 1u);
+				}
+				break;
+			case ValueOpcode::ULessThan32:
+				holds ? less_equal(0, 1, true) : less_equal(1, 0, false);
+				break;
+			case ValueOpcode::UGreaterThan32:
+				holds ? less_equal(1, 0, true) : less_equal(0, 1, false);
+				break;
+			case ValueOpcode::ULessThanEqual32:
+				holds ? less_equal(0, 1, false) : less_equal(1, 0, true);
+				break;
+			case ValueOpcode::UGreaterThanEqual32:
+				holds ? less_equal(1, 0, false) : less_equal(0, 1, true);
+				break;
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+				if (holds == (inst->GetOpcode() == ValueOpcode::IEqual32)) {
+					less_equal(0, 1, false);
+					less_equal(1, 0, false);
+				}
+				break;
+			default: break;
+		}
+	}
+
+	bool Holds(Value condition, bool value) const {
+		condition = condition.Resolve();
+		if (condition.IsImmediate())
+			return condition.GetType() == Type::U1 && condition.U1() == value;
+		const auto* inst = condition.TryInstruction();
+		if (inst == nullptr) return false;
+		if ((value ? m_true : m_false).contains(inst)) return true;
+		if (inst->GetOpcode() == ValueOpcode::LogicalNot) return Holds(inst->Arg(0), !value);
+		return inst->GetOpcode() == ValueOpcode::ConditionRef && Holds(inst->Arg(0), value);
+	}
+
+	std::optional<uint32_t> Bound(Value value, std::vector<Node>& nodes, uint32_t depth) {
+		value = value.Resolve();
+		if (depth > 32u || value.GetType() != Type::U32) return {};
+		if (value.IsImmediate()) return Push(nodes, {.op = Op::Constant, .constant = value.U32()});
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return {};
+		if (const auto found = m_memo.find(inst); found != m_memo.end()) return found->second;
+		m_memo.emplace(inst, std::nullopt);
+		std::optional<uint32_t> result;
+		if (IsRuntime(value)) {
+			result = Push(nodes, {.op = Op::Runtime, .value = m_clone(value)});
+		} else {
+			result = Structural(*inst, nodes, depth);
+			for (size_t index = 0; index < m_facts.size(); ++index) {
+				if (!(m_facts[index].value == value)) continue;
+				const auto fact  = m_facts[index];
+				auto       limit = Bound(fact.limit, nodes, depth + 1u);
+				if (!limit) continue;
+				if (fact.strict) limit = Push(nodes, {.op = Op::Decrement, .left = *limit});
+				result =
+				    result ? Push(nodes, {.op = Op::Min, .left = *result, .right = *limit}) : limit;
+			}
+		}
+		m_memo[inst] = result;
+		return result;
+	}
+
+	std::optional<uint32_t> Structural(const Inst& inst, std::vector<Node>& nodes, uint32_t depth) {
+		const auto arg  = [&](size_t index) { return Bound(inst.Arg(index), nodes, depth + 1u); };
+		const auto both = [&](Op op, size_t left_index,
+		                      size_t right_index) -> std::optional<uint32_t> {
+			const auto left = arg(left_index);
+			if (!left) return {};
+			const auto right = arg(right_index);
+			if (!right) return {};
+			return Push(nodes, {.op = op, .left = *left, .right = *right});
+		};
+		const auto shift = [&]() -> std::optional<uint32_t> {
+			const auto amount = inst.Arg(1).Resolve();
+			if (!amount.IsImmediate() || amount.GetType() != Type::U32 || amount.U32() >= 32u)
+				return {};
+			return amount.U32();
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::SelectU32:
+				if (Holds(inst.Arg(0), true)) return arg(1);
+				if (Holds(inst.Arg(0), false)) return arg(2);
+				return both(Op::Max, 1, 2);
+			case ValueOpcode::IAdd32: return both(Op::Add, 0, 1);
+			// x | y <= x + y for unsigned values.
+			case ValueOpcode::BitwiseOr32: return both(Op::Add, 0, 1);
+			case ValueOpcode::IMul32: return both(Op::Mul, 0, 1);
+			case ValueOpcode::UMax32: return both(Op::Max, 0, 1);
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::UMin32: {
+				const auto left  = arg(0);
+				const auto right = arg(1);
+				if (left && right)
+					return Push(nodes, {.op = Op::Min, .left = *left, .right = *right});
+				return left ? left : right;
+			}
+			case ValueOpcode::ShiftLeftLogical32: {
+				const auto amount = shift();
+				const auto left   = amount ? arg(0) : std::nullopt;
+				if (!left) return {};
+				return Push(nodes, {.op = Op::ShiftLeft, .left = *left, .constant = *amount});
+			}
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto left   = arg(0);
+				const auto amount = shift();
+				if (!left || !amount) return left;
+				return Push(nodes, {.op = Op::ShiftRight, .left = *left, .constant = *amount});
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto width = inst.Arg(2).Resolve();
+				if (!width.IsImmediate() || width.GetType() != Type::U32 || width.U32() >= 32u)
+					return {};
+				return Push(nodes,
+				            {.op = Op::Constant, .constant = (uint64_t {1} << width.U32()) - 1u});
+			}
+			case ValueOpcode::ConvertU32U8:
+				return Push(nodes, {.op = Op::Constant, .constant = 0xffu});
+			case ValueOpcode::ConvertU32U16:
+				return Push(nodes, {.op = Op::Constant, .constant = 0xffffu});
+			case ValueOpcode::LaneId: return Push(nodes, {.op = Op::Constant, .constant = 63u});
+			default: return {};
+		}
+	}
+
+	const Program&                                           m_program;
+	const std::function<Value(Value)>&                       m_clone;
+	std::vector<AddressRangePlan>                            m_ranges;
+	std::vector<Key>                                         m_keys;
+	std::vector<Fact>                                        m_facts;
+	std::unordered_set<const Inst*>                          m_true;
+	std::unordered_set<const Inst*>                          m_false;
+	std::unordered_map<const Inst*, std::optional<uint32_t>> m_memo;
+	std::unordered_map<const Inst*, bool>                    m_runtime;
+};
+
+std::optional<uint64_t> EvaluateAddressBound(std::span<const AddressRangePlan::Node> nodes,
+                                             SrtWalker&                              walker) {
+	using Op = AddressRangePlan::Op;
+	std::vector<uint64_t> values(nodes.size());
+	for (size_t index = 0; index < nodes.size(); ++index) {
+		const auto& node  = nodes[index];
+		uint64_t    value = 0;
+		switch (node.op) {
+			case Op::Constant: value = node.constant; break;
+			case Op::Runtime: {
+				uint32_t runtime = 0;
+				if (!walker.Evaluate(node.value, runtime)) return {};
+				value = runtime;
+				break;
+			}
+			case Op::Add: value = values[node.left] + values[node.right]; break;
+			case Op::Mul: value = values[node.left] * values[node.right]; break;
+			case Op::ShiftLeft: value = values[node.left] << node.constant; break;
+			case Op::ShiftRight: value = values[node.left] >> node.constant; break;
+			case Op::Min: value = std::min(values[node.left], values[node.right]); break;
+			case Op::Max: value = std::max(values[node.left], values[node.right]); break;
+			case Op::Decrement:
+				value = values[node.left] == 0u ? 0u : values[node.left] - 1u;
+				break;
+		}
+		if (value > UINT32_MAX) return {};
+		values[index] = value;
+	}
+	if (values.empty()) return {};
+	return values.back();
+}
+
+} // namespace
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1562,6 +1853,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	// Ranges are best effort and read through their own strict walker: their raw reads
+	// neither require specialization memory nor get captured.
+	const auto requires_memory          = plan.requires_specialization_memory;
+	const auto capture_reads            = plan.capture_specialization_reads;
+	plan.address_ranges                 = AddressRangePlanner(program, Clone).Run();
+	plan.requires_specialization_memory = requires_memory;
+	plan.capture_specialization_reads   = capture_reads;
 	CompileSrtWalker(plan);
 	return plan;
 }
@@ -1773,6 +2071,27 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	snapshot.address_ranges.clear();
+	if (!program.address_ranges.empty()) {
+		// Residency only: these reads do not specialize the shader, so they are not captured. The
+		// strict reader also covers reads of branches the shader may not take.
+		SrtWalker ranges(program, CleanRuntime(runtime));
+		for (const auto& range: program.address_ranges) {
+			uint32_t   low    = 0;
+			uint32_t   high   = 0;
+			const auto offset = EvaluateAddressBound(range.offset_bound, ranges);
+			if (!offset || !ranges.Evaluate(range.base_low, low) ||
+			    !ranges.Evaluate(range.base_high, high)) {
+				continue;
+			}
+			const auto base  = (uint64_t {high} << 32u) | (range.scalar ? low & ~3u : low);
+			const auto first = base + static_cast<uint64_t>(range.first_offset);
+			const auto last  = base + *offset + static_cast<uint64_t>(range.last_offset);
+			if (first < last) {
+				snapshot.address_ranges.emplace_back(first, last - first);
+			}
+		}
+	}
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 

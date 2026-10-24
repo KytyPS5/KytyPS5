@@ -4,6 +4,7 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -301,6 +302,19 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
+// The largest frame this decoder hands out: rows aligned to 256 samples, the luma plane and the
+// interleaved chroma after it, two bytes per sample in a 10-bit profile (P010). Without a maximum
+// size in the configuration, the largest picture Videodec2 decodes (4096x2160).
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo* config) {
+	const auto width =
+	    static_cast<size_t>(config->max_frame_width > 0 ? config->max_frame_width : 4096);
+	const auto height =
+	    static_cast<size_t>(config->max_frame_height > 0 ? config->max_frame_height : 2160);
+	const auto sample = Decoder::HighBitDepthProfile(config->codec_type, config->profile) ? 2u : 1u;
+	const auto pitch  = ((width + 255u) & ~size_t {255}) * sample;
+	return std::max(VIDEODEC2_MIN_MEMORY_SIZE, pitch * (height + (height + 1u) / 2u));
+}
+
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
                                                     Videodec2DecoderMemoryInfo*       memory_info) {
 	PRINT_NAME();
@@ -325,7 +339,7 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 

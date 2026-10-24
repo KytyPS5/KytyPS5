@@ -1390,6 +1390,7 @@ struct GraphicsCase {
   u32 pixel_custom_interpolation_mask = 0;
   u32 width = 1;
   std::vector<u32> object_ids;
+  std::vector<u32> gds_initial;
 };
 
 struct CompiledShader {
@@ -19653,8 +19654,63 @@ public:
       push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
     }
 
+    using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+    const bool uses_gds = fragment_bind.descriptor_counts[static_cast<size_t>(Kind::Gds)] != 0;
+    Require(test.name, "graphics",
+            uses_gds == !test.gds_initial.empty() &&
+                (!uses_gds || fragment_bind.descriptor_mask == 1u << static_cast<u32>(Kind::Gds)),
+            "a graphics case binds GDS only, and only with initial GDS data");
+    Buffer gds_buffer;
+    vk::DescriptorBufferInfo gds_info{};
+    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    vk::DescriptorPool descriptor_pool = nullptr;
+    vk::DescriptorSet descriptor_set = nullptr;
+    if (uses_gds) {
+      gds_buffer = CreateStorageBuffer(test.name, test.gds_initial, test.gds_initial.size());
+      gds_info = {gds_buffer.buffer, 0, gds_buffer.size};
+      vk::DescriptorSetLayoutBinding binding{};
+      binding.binding = ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds);
+      binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+      binding.descriptorCount = 1;
+      binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+      vk::DescriptorSetLayoutCreateInfo layout_info{};
+      layout_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+      layout_info.bindingCount = 1;
+      layout_info.pBindings = &binding;
+      RequireVk(test.name, "graphics",
+                m_device.createDescriptorSetLayout(&layout_info, nullptr, &descriptor_layout),
+                "vkCreateDescriptorSetLayout");
+      vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 1};
+      vk::DescriptorPoolCreateInfo pool_info{};
+      pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
+      pool_info.maxSets = 1;
+      pool_info.poolSizeCount = 1;
+      pool_info.pPoolSizes = &pool_size;
+      RequireVk(test.name, "graphics",
+                m_device.createDescriptorPool(&pool_info, nullptr, &descriptor_pool),
+                "vkCreateDescriptorPool");
+      vk::DescriptorSetAllocateInfo set_info{};
+      set_info.sType = vk::StructureType::eDescriptorSetAllocateInfo;
+      set_info.descriptorPool = descriptor_pool;
+      set_info.descriptorSetCount = 1;
+      set_info.pSetLayouts = &descriptor_layout;
+      RequireVk(test.name, "graphics",
+                m_device.allocateDescriptorSets(&set_info, &descriptor_set),
+                "vkAllocateDescriptorSets");
+      vk::WriteDescriptorSet write{};
+      write.sType = vk::StructureType::eWriteDescriptorSet;
+      write.dstSet = descriptor_set;
+      write.dstBinding = binding.binding;
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &gds_info;
+      m_device.updateDescriptorSets(1, &write, 0, nullptr);
+    }
+
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    pipeline_layout_info.setLayoutCount = uses_gds ? 1u : 0u;
+    pipeline_layout_info.pSetLayouts = uses_gds ? &descriptor_layout : nullptr;
     pipeline_layout_info.pushConstantRangeCount =
         push_constant_range.size != 0 ? 1u : 0u;
     pipeline_layout_info.pPushConstantRanges =
@@ -19811,6 +19867,10 @@ public:
       }
       cmd.beginRendering(rendering);
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      if (uses_gds) {
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1,
+                               &descriptor_set, 0, nullptr);
+      }
       if (push_constant_range.size != 0) {
         ShaderRecompiler::IR::PushData push_data;
         if (object_id) {
@@ -19838,6 +19898,11 @@ public:
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    if (uses_gds) {
+      m_device.destroyDescriptorPool(descriptor_pool, nullptr);
+      m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+      DestroyBuffer(&gds_buffer);
+    }
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
@@ -21372,6 +21437,7 @@ private:
                                 available_features.drawIndirectFirstInstance &&
                                 available_features.multiDrawIndirect &&
                                 available_features.depthBounds &&
+                                available_features.fragmentStoresAndAtomics &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_color_write.colorWriteEnable &&
@@ -21470,6 +21536,7 @@ private:
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+    device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -43629,6 +43696,52 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
            O::DS_READ_ADDTID_B32, O::EXP, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsDsAppendSkipsHelperLanes(bool consume) {
+  using O = ShaderOpcode;
+
+  // Only pixel 1 is covered, so the rest of its quad can run as helpers, and the host may count
+  // them in the entry EXEC. Whichever lane updates the counter for the wave, the update must reach
+  // GDS: the first value returned is the initial counter, and the second differs from it by the
+  // lanes in EXEC. The shader reads an interpolant (zero here), as ASTRO BOT's list builder does;
+  // on RADV that alone puts the helpers into the entry EXEC (#1574).
+  const u32 op = consume ? 0x3d : 0x3e;
+  std::vector<u32> code;
+  code.push_back(EncodeVintrp(0x00, 7, 0, 0, 0));
+  code.push_back(EncodeVintrp(0x01, 7, 0, 0, 1));
+  AppendSMovLiteral(&code, 124, 0x100);
+  code.push_back(EncodeDs0(op, 20, true));
+  code.push_back(EncodeDs1(1, 0, 0));
+  code.push_back(EncodeDs0(op, 20, true));
+  code.push_back(EncodeDs1(2, 0, 0));
+  code.push_back(EncodeSop1(0x10, 0, 126));
+  code.push_back(EncodeVop2(0x26, 3, Vgpr(consume ? 1 : 2), consume ? 2 : 1));
+  code.push_back(EncodeVop2(0x27, 3, 0, 3));
+  code.push_back(EncodeVop1(0x06, 4, Vgpr(1)));
+  code.push_back(EncodeVop1(0x05, 5, Vgpr(3)));
+  code.push_back(EncodeVop1(0x01, 6, 242));
+  code.push_back(EncodeVop2(0x03, 6, Vgpr(7), 6));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(4, 5, 6, 6));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = consume ? "GraphicsDsConsumeSkipsHelperLanes" : "GraphicsDsAppendSkipsHelperLanes";
+  test.fragment_code = std::move(code);
+  test.width = 2;
+  test.vertices = {0x00000000u, 0xbf800000u, 0, 0, 0, 0,
+                   0x40400000u, 0xbf800000u, 0, 0, 0, 0,
+                   0x00000000u, 0x40400000u, 0, 0, 0, 0};
+  test.gds_initial.assign(6, 0);
+  test.gds_initial[5] = 10;
+  test.expected_pixel = {0, 0, 0, 0, 0x41200000u, 0, 0x3f800000u, 0x3f800000u};
+  test.opcodes = {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32,  O::S_MOV_B32,
+                  consume ? O::DS_CONSUME : O::DS_APPEND, O::S_BCNT1_I32_B64, O::V_SUB_NC_U32,
+                  O::V_SUBREV_NC_U32, O::V_CVT_F32_U32,    O::V_CVT_F32_I32,
+                  O::V_MOV_B32,       O::V_ADD_F32,        O::EXP,
+                  O::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
   using O = ShaderOpcode;
 
@@ -44493,6 +44606,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsFrontFaceBits(true, true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
+      GraphicsDsAppendSkipsHelperLanes(false),
+      GraphicsDsAppendSkipsHelperLanes(true),
       GraphicsDirectSgprPushConstantExport(),
       GraphicsInlineSrtScalarPromotionExport(),
       GraphicsNullVmExportDiscardsInactiveExec(),
@@ -50776,6 +50891,12 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-append-helper-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes(false));
+    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

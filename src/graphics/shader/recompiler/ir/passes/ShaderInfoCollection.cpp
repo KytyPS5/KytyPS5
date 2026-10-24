@@ -369,6 +369,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.subgroup_ballot = true;
 				info.subgroup_shuffle = true;
 				info.subgroup_local_invocation_id = true;
+				info.helper_invocation |= program.stage == ShaderType::Pixel;
 			}
 		}
 	}
@@ -576,7 +577,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
 	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
-	    info.subgroup_shuffle = info.subgroup_arithmetic =
+	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;

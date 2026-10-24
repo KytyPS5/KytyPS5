@@ -84,6 +84,13 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
+	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// Lock-free: grows with every change of the dirty bits, made under the lock. Equal values
+	// mean no change in between (see MemoryTracker::ForEachUploadRange).
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(offset, size);
@@ -98,7 +105,8 @@ public:
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
-		auto&      bits = GetBits<source>();
+		Bump();
+		auto&      bits    = GetBits<source>();
 		RegionBits changed = enable ? RegionBits(~bits, start, end) : RegionBits(bits, start, end);
 		if constexpr (enable) {
 			bits.SetRange(start, end);
@@ -115,12 +123,13 @@ public:
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(offset, size);
-		auto&      bits         = GetBits<source>();
+		auto& bits              = GetBits<source>();
 		if (!bits.Any(start, end)) {
 			return;
 		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			Bump();
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>(mask);
@@ -136,6 +145,8 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	void Bump() noexcept { m_generation.fetch_add(1, std::memory_order_release); }
+
 	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched.
 	template <bool track, bool is_read>
 	void UpdateProtection(RegionBits& changed) {
@@ -171,6 +182,8 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	// Starts at 1: a sum of existing regions' generations is never 0.
+	std::atomic<uint64_t> m_generation {1};
 };
 
 } // namespace Libs::Graphics

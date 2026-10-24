@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -19,16 +21,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
-struct RenderColorInfo;
-struct RenderDepthInfo;
 class CommandBuffer;
-
-namespace HW {
-class Context;
-class Shader;
-class UserConfig;
-struct ComputeShaderInfo;
-} // namespace HW
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
@@ -105,6 +98,24 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
+struct DrawRenderState {
+	RenderDepthInfo                      depth_info;
+	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t                             color_count                              = 0;
+	// Color targets the pixel program writes.
+	uint32_t                             mrt_mask                                 = 0;
+	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
+	bool                                 primitive_restart_enable                 = false;
+	bool                                 ps_active                                = false;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	ShaderPixelInputInfo                 ps_input_info;
+
+	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
+		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
+	}
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -121,32 +132,14 @@ public:
 		bool                    uses_image_heap       = false;
 	};
 
-	struct GraphicsPrograms {
-		std::array<ShaderProgram, 3> vertex;
-		ShaderProgram pixel;
-
-		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
-	};
-
-	GraphicsPrograms
-	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
-	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                    const HW::Context& context, const HW::UserConfig& user_config,
-	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	// Reads the shaders and registers bound in `command` into the state's shader stages.
+	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// An empty program skips the dispatch.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
-	                              const RenderDepthInfo&                 depth,
-	                              std::span<const ShaderVertexInputInfo> vertex_info,
-	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
-	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
-	                             const ShaderProgram&          compute_program);
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
 	struct ProgramCache;
@@ -182,9 +175,8 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
-	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
-	                                                        m_graphics_pipelines;
-	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
+	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
@@ -192,13 +184,11 @@ private:
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&          rendering,
-                            const PipelineVertexInputState&        vertex_input,
-                            std::span<const ShaderVertexInputInfo> vertex_info,
-                            const ShaderPixelInputInfo*            ps_input_info,
-                            const PipelineCache::GraphicsPrograms& programs,
-                            const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            const PipelineRenderingState&   rendering,
+                            const PipelineVertexInputState& vertex_input,
+                            const DrawRenderState&          state,
+                            const PipelineStaticParameters& static_params,
+                            vk::PipelineCache               driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

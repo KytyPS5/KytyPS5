@@ -14,7 +14,6 @@
 
 #include <array>
 #include <bit>
-#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -27,8 +26,6 @@ class CodeGenerator;
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-
-class SrtWalker;
 
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
@@ -663,19 +660,6 @@ struct ResourcePlan {
 		bool                  resolved = false;
 	};
 
-	struct EvaluationContext {
-		struct Entry {
-			uint64_t value      = 0;
-			uint64_t generation = 0;
-		};
-
-		std::vector<Entry> values;
-		uint64_t           generation = 0;
-		const SrtWalker*    session = nullptr;
-		Value              active_mask;
-		uint8_t            read_policy = 0;
-	};
-
 	ResourcePlan();
 	~ResourcePlan();
 
@@ -695,21 +679,18 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
-	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint8_t>            reachable_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
+	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
+	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
+	// GPU-thread scratch for walker results and material keys.
+	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
 };

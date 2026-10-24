@@ -57,9 +57,10 @@ private:
 	struct Element {
 		DescriptorValue value;
 		TextureBinding  binding;
-		uint32_t        kind  = 0;
-		uint32_t        refs  = 0; // Slots of the owning view that select it.
-		bool            stale = false;
+		uint32_t        kind   = 0;
+		uint32_t        refs   = 0; // Slots of the owning view that select it.
+		bool            stale  = false;
+		uint64_t        serial = 0; // Image::serial of binding.image_id.
 	};
 
 	struct Memory;
@@ -109,6 +110,7 @@ private:
 	uint32_t Intern(View& view, uint32_t kind, const DescriptorValue& value);
 	void     Release(View& view, uint32_t entry);
 	void     Unreference(Element& element);
+	Image*   ImageOf(const Element& element) const;
 	uint32_t Allocate();
 	void     Retire(View& view);
 	void     WriteDescriptors();

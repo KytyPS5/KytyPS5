@@ -350,10 +350,15 @@ void ImageHeap::Release(View& view, uint32_t entry) {
 }
 
 void ImageHeap::Unreference(Element& element) {
-	if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(element.binding.image_id)) {
+	if (auto* image = ImageOf(element)) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
 		image->tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
 	}
+}
+
+Image* ImageHeap::ImageOf(const Element& element) const {
+	auto* image = m_context.GetTextureCache().m_slot_images.try_get(element.binding.image_id);
+	return image != nullptr && image->serial == element.serial ? image : nullptr;
 }
 
 uint32_t ImageHeap::Allocate() {
@@ -393,7 +398,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			for (const auto& [value, index]: view->elements) {
 				const auto& binding = m_elements[index].binding;
 				if (!binding.image_id) continue;
-				const auto* image = textures.m_slot_images.try_get(binding.image_id);
+				const auto* image = ImageOf(m_elements[index]);
 				if (image == nullptr || !image->registered || image->depth_id ||
 				    image->binding.needs_rebind) {
 					mark(index);
@@ -434,6 +439,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			if (binding.image_id) {
 				auto& image = textures.GetImage(binding.image_id);
 				image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+				m_elements[index].serial = image.serial;
 				binding.layout     = image.ReadLayout();
 				binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 				if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
@@ -471,8 +477,7 @@ void ImageHeap::WriteDescriptors() {
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();
-	auto&      textures = m_context.GetTextureCache();
-	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
+	const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
 		if (view->dirty_begin != view->dirty_end) {
 			const auto slots = std::span(view->slots).subspan(view->dirty_begin,
@@ -493,7 +498,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		// this draw's discovery replaced lives until the tick ends, and its slots still select it.
 		std::erase_if(view->away, [&](uint32_t index) {
 			const auto& element = m_elements[index];
-			auto*       image   = textures.m_slot_images.try_get(element.binding.image_id);
+			auto*       image   = ImageOf(element);
 			if (element.refs == 0u || image == nullptr) return true;
 			if (image->binding.is_target || image->binding.shader_write ||
 			    image->binding.force_general) {

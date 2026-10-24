@@ -139,14 +139,17 @@ public:
 	}
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
+	static inline std::atomic<uint64_t> serials {0};
 
+	// Unique per image, unlike ImageId: freed slots are reused.
+	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
-	mutable uint32_t query_epoch    = 0;
+	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};

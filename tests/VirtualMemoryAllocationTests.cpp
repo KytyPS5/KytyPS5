@@ -720,6 +720,44 @@ void TestBackingReadExcludesWritesAndUnmap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestTrackerProtectSharesBackingReads() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "TrackerProtectSharesBackingReads";
+	const auto  base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
+	                                    "tracker_protect_shares_reads");
+	std::counting_semaphore<2> entered {0};
+	std::counting_semaphore<2> resume {0};
+	g_backing_reads_entered  = &entered;
+	g_continue_backing_reads = &resume;
+	TestSetBackingReadCallback(ParkBackingRead);
+	uint64_t    value = 0;
+	std::thread reader([&] { CopySparseMemory(base, &value, sizeof(value)); });
+	const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
+	std::counting_semaphore<2> done {0};
+	bool                       tracker_ok   = false;
+	int                        guest_result = OK;
+	std::thread                protector([&] {
+		tracker_ok = ProtectGuestHostMemory(base, SceKernelPageSize,
+		                                    Common::VirtualMemory::Mode::ReadWrite);
+		done.release();
+		guest_result =
+		    KernelMprotect(reinterpret_cast<void*>(base), SceKernelPageSize, SceKernelProtCpuRw);
+		done.release();
+	});
+	const bool shared   = done.try_acquire_for(std::chrono::seconds(5));
+	const bool excluded = !done.try_acquire_for(std::chrono::milliseconds(100));
+	resume.release();
+	reader.join();
+	protector.join();
+	TestSetBackingReadCallback(nullptr);
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	Check(test, reader_parked && shared && tracker_ok,
+	      "tracker protection waited for a backing read");
+	Check(test, excluded && guest_result == OK,
+	      "guest mprotect completed while a backing read held its lock");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -4894,6 +4932,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
+		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -4953,6 +4992,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
+	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);

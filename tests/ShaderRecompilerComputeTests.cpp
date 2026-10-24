@@ -60,6 +60,7 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
+#include "SrtWalkerTestMemory.h"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -192,6 +193,8 @@ struct BufferCacheTestAccess {
                                          uint64_t address, uint64_t size) {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
+
+  static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_bda_sync_mutex; }
 
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
@@ -326,32 +329,6 @@ struct TextureCacheTestAccess {
       count += owners != nullptr && owners->Contains(id) ? 1 : 0;
     }
     return count;
-  }
-
-  static void AddPageOwner(TextureCache &cache, uint64_t address, ImageId id) {
-    std::lock_guard lock(cache.m_lock);
-    cache
-        .m_image_page_table[static_cast<size_t>(
-            address >> TextureCache::ImagePageTable::kPageBits)]
-        .push_back(id);
-  }
-
-  static bool RemovePageOwner(TextureCache &cache, uint64_t address,
-                              ImageId id) {
-    std::lock_guard lock(cache.m_lock);
-    auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
-        address >> TextureCache::ImagePageTable::kPageBits));
-    return owners != nullptr && owners->Erase(id);
-  }
-
-  static void SetQueryEpoch(TextureCache &cache, uint32_t epoch) {
-    std::lock_guard lock(cache.m_lock);
-    cache.m_image_query_epoch = epoch;
-  }
-
-  static uint32_t QueryEpoch(TextureCache &cache) {
-    std::lock_guard lock(cache.m_lock);
-    return cache.m_image_query_epoch;
   }
 
   static ImageId InsertImage(TextureCache &cache, const ImageInfo &info) {
@@ -1722,15 +1699,17 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
-      .read_memory = ReadTestMemory,
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
       .workgroup_counts = workgroup_counts,
   };
-  Require(test.name, "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "translated resources could not be materialized");
+  {
+    FakeGuestMemory fake(ReadTestMemory, runtime.userdata);
+    Require(test.name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(
+                resource_plan, runtime, resources, specialization),
+            "translated resources could not be materialized");
+  }
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -4338,15 +4317,6 @@ public:
                   BufferCacheTestAccess::PageOwner(
                       cache, index_begin + 2 * index_page) == index_bridge,
               "bridging acquisition did not publish its merged Buffer range");
-      scheduler.Finish();
-      constexpr uint64_t recycled_offset = index_offset + 4 * index_page;
-      const auto recycled = cache.FindBuffer(base + recycled_offset + 0x100,
-                                             sizeof(uint32_t));
-      Require(name, "slot generation reuse",
-              (recycled.index == index_left.index && recycled != index_left) ||
-                  (recycled.index == index_right.index &&
-                   recycled != index_right),
-              "retired Buffer slot was not reused with a new generation");
       const auto [resolved_left, resolved_left_offset] = cache.ObtainBuffer(
           index_begin + 0x100, sizeof(uint32_t), true, false, index_left);
       const auto [resolved_right, resolved_right_offset] =
@@ -4357,6 +4327,12 @@ public:
                   resolved_right == resolved_left &&
                   resolved_left_offset != resolved_right_offset,
               "saved descriptor IDs did not resolve through the merged owner");
+      scheduler.Finish();
+      constexpr uint64_t recycled_offset = index_offset + 4 * index_page;
+      const auto recycled = cache.FindBuffer(base + recycled_offset + 0x100,
+                                             sizeof(uint32_t));
+      Require(name, "slot reuse", recycled == index_left || recycled == index_right,
+              "retired Buffer slot was not reused");
 
       constexpr uint64_t stream_page = BufferCache::CACHING_PAGESIZE;
       constexpr uint64_t stream_leap = stream_page * 128;
@@ -5460,6 +5436,28 @@ public:
       Require(name, "unmapped descriptor", !textures.IsRegionRegistered(texture(23), 0x1000u),
               "a descriptor over unmapped memory was resolved");
 
+      // An idle view keeps the element of a freed image. Once a new image takes its slot,
+      // reactivating the view must resolve the descriptor again.
+      write(30, descriptor(30, Format::k8_8_8_8UNorm));
+      Require(name, "idle element", acquire(unfiltered), "the view was declined");
+      draw();
+      const auto erased = ImageHeapTestAccess::ImageOf(heap, idle.slots[240]);
+      textures.UnmapMemory(texture(30), 0x1000u);
+      Require(name, "replacement", acquire(sampled), "the view was declined");
+      draw();
+      write(31, descriptor(31, Format::k8_8_8_8UNorm));
+      Require(name, "slot reuse", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "reused slot",
+              erased && ImageHeapTestAccess::ImageOf(heap, filtered.slots[248]) == erased,
+              "the next image did not take the freed image's slot");
+      Require(name, "reactivated idle view", acquire(unfiltered), "the view was declined");
+      draw();
+      Require(name, "reused slot element",
+              ImageHeapTestAccess::ImageOf(heap, idle.slots[240]) ==
+                  ImageHeapTestAccess::ImageOf(heap, filtered.slots[240]),
+              "a reactivated view kept an element whose image slot holds a new image");
+
       heap.UnmapMemory(table, table_size);
       Require(name, "unmapped table",
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
@@ -5596,10 +5594,18 @@ public:
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
     EnsureRuntimeContext();
-    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
-        0, 3 * page, Common::VirtualMemory::Mode::ReadWrite, "bda_sync_uploads");
-    Require(name, "allocation", base != 0, "guest allocation failed");
-    auto *words = reinterpret_cast<u32 *>(base);
+    // Direct memory, so readbacks can publish GPU-dirty bytes.
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 3 * page, page, 0, &direct) ==
+                    0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 3 * page, 0x3, 0, direct, page) ==
+                    0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto *words = static_cast<u32 *>(mapped);
     std::fill_n(words, 3 * page / sizeof(u32), 0x12345678u);
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -5608,6 +5614,7 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
     context.MapMemory(base, page);
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
@@ -5650,6 +5657,34 @@ public:
     context.PrepareBda();
     snapshot(2 * page, 5);
 
+    // A write fault on GPU-dirty memory flushes it on the GPU thread, which must queue the page
+    // itself: the faulting thread can resume only after later commands.
+    (void)cache.ObtainBuffer(base + 20, sizeof(u32), true, false);
+    std::unique_lock queue_lock(BufferCacheTestAccess::BdaSyncMutex(cache));
+    std::jthread fault([&] { cache.InvalidateMemory(base + 20, sizeof(u32)); });
+    while (!cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE)) {
+      std::this_thread::yield();
+    }
+    std::binary_semaphore later_command{0};
+    context.GetGpu().SendCommand([&] { later_command.release(); });
+    Require(name, "flush queue order",
+            !later_command.try_acquire_for(std::chrono::milliseconds(100)),
+            "a GPU command ran before the write-fault flush queued its page");
+    queue_lock.unlock();
+    fault.join();
+    later_command.acquire();
+
+    // Garbage collection untracks a clean buffer; its replacement queues the range on Register.
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(
+        cache, 0, std::numeric_limits<uint64_t>::max());
+    cache.RunGarbageCollector();
+    Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
+            "garbage collection kept the clean buffer");
+    (void)cache.FindBuffer(base, 3 * page);
+    context.PrepareBda();
+    Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
+            "a buffer replacing an evicted one did not upload its untracked pages");
+
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
     barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
@@ -5666,7 +5701,9 @@ public:
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
-    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 3 * page),
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, 3 * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, 3 * page) == 0,
             "guest allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
@@ -6016,23 +6053,6 @@ public:
                   large_owner) == 0,
               "large image unregister left coarse memberships behind");
 
-      const ImageId stale{first.index, first.generation + 1};
-      TextureCacheTestAccess::AddPageOwner(texture_cache, base, stale);
-      const auto stale_filtered = TextureCacheTestAccess::FindImages(
-          texture_cache, base, sizeof(initial), false);
-      Require(name, "stale page owner filtering",
-              IsOnlyImage(stale_filtered, first) &&
-                  TextureCacheTestAccess::RemovePageOwner(texture_cache, base,
-                                                          stale),
-              "a stale generation escaped the direct page-owner lookup");
-
-      TextureCacheTestAccess::SetQueryEpoch(texture_cache, UINT32_MAX);
-      const auto wrap_results = TextureCacheTestAccess::FindImages(
-          texture_cache, base, sizeof(initial), false);
-      Require(name, "page-owner query epoch wrap",
-              IsOnlyImage(wrap_results, first) &&
-                  TextureCacheTestAccess::QueryEpoch(texture_cache) == 1,
-              "query deduplication failed while wrapping its epoch");
 
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;
@@ -10963,7 +10983,7 @@ public:
             shaders.SetCsUserSgpr(12 + i, output.fields[i]);
           ShaderComputeInputInfo input{};
           (void)context.GetPipelineCache().GetComputeProgram(
-              shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+              shaders.GetCs(), input);
           PreparedBindings bindings;
           executor.PrepareBindings(input.stage, bindings);
           executor.RebindImages(bindings);
@@ -11078,7 +11098,7 @@ public:
         }
         ShaderComputeInputInfo input{};
         const auto program = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            shaders.GetCs(), input);
         if (original_id == 0) original_id = program.id;
         Require(name, "exact function identity",
                 (program.id == original_id) == (test.value == 41),
@@ -11170,7 +11190,7 @@ public:
             LibKernel::Memory::WriteBacking(output, actual.data(), wave_size * 4);
             ShaderComputeInputInfo input{};
             const auto program = context.GetPipelineCache().GetComputeProgram(
-                shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+                shaders.GetCs(), input);
             if (phase == 1) original_vector_id = program.id;
             if (phase >= 2)
               Require(name, "ordered helper identity", (program.id == original_vector_id) == (phase == 3),
@@ -11194,7 +11214,7 @@ public:
               };
               const ShaderRecompiler::IR::SrtRuntime runtime{
                   .user_data = user_data, .shader_base = reinterpret_cast<uint64_t>(caller.data()),
-                  .read_memory = read, .read_specialization_memory = read};
+                  .read_specialization_memory = read};
               auto source = ShaderRecompiler::PrepareShaderSource(caller, options);
               auto translated = ShaderRecompiler::TranslateProgram(
                   ShaderRecompiler::RefreshShaderSource(source, runtime), options);
@@ -11713,7 +11733,7 @@ public:
         const auto clean_tick = scheduler.CurrentTick();
         ShaderComputeInputInfo input{};
         const auto program = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            shaders.GetCs(), input);
         if (previous_program.id != 0) {
           Require(name, "count permutation reuse", program.id == previous_program.id,
                   "a changing GPU count compiled a new shader permutation");
@@ -11795,7 +11815,7 @@ public:
         input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
         input.workgroup_counts[2] = test.groups;
         const auto program = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            shaders.GetCs(), input);
         Require(name, "workgroup table refresh and coalescing",
                 input.workgroup_counts[2] == test.groups &&
                     input.stage.program->info.images.size() == 1 &&
@@ -11813,7 +11833,7 @@ public:
         const auto *image_storage = snapshot->images.data();
         const auto flattened_capacity = snapshot->flattened_srt.capacity();
         const auto repeated = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            shaders.GetCs(), input);
         Require(name, "workgroup table cache-hit storage reuse",
                 repeated.id == program.id && input.stage.resources == snapshot &&
                     snapshot->images.data() == image_storage &&
@@ -12052,7 +12072,7 @@ public:
         input.workgroup_counts[0] = material_groups;
         input.workgroup_counts[1] = input.workgroup_counts[2] = 1u;
         (void)context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            shaders.GetCs(), input);
         const auto &info = input.stage.program->info;
         const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
           return buffer.indirect_resources.size() == material_rows;
@@ -16965,9 +16985,7 @@ public:
       scheduler.EndRendering();
       RenderExecutorTestAccess::ResetBindings(executor);
       Require(name, "draw-scoped target reset",
-              TextureCacheTestAccess::Owner(texture_cache,
-                                            target_subresource_id) == nullptr &&
-                  !texture_cache.GetImage(target_parent_id).binding.is_target &&
+              !texture_cache.GetImage(target_parent_id).binding.is_target &&
                   !texture_cache.GetImage(depth_id).binding.is_target,
               "RenderExecutor retained target binding state after reset");
 
@@ -17117,12 +17135,7 @@ public:
       stencil_compute.stage.resources = &stencil_snapshot;
       Require(name, "stencil fill materialization",
           ShaderRecompiler::IR::MaterializeResources(stencil_plan,
-              {.user_data = stencil_userdata, .userdata = &stencil_byte,
-               .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
-                 if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
-                 words[0] = *static_cast<uint32_t *>(data);
-                 return true;
-               }}, stencil_snapshot, stencil_specialization),
+              {.user_data = stencil_userdata}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
       ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
@@ -18352,10 +18365,12 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
-          std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
-          topology, false,
-          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+      DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
+                            .topology = topology, .ps_active = true,
+                            .vertex_info = {vertex}, .ps_input_info = pixel};
+      state.vertex_info[0].stage.handle = &vertex_shader;
+      state.ps_input_info.stage.handle = &pixel_shader;
+      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
@@ -18706,17 +18721,50 @@ public:
       ShaderMapUserData(pixel_address,
           {.type = Prospero::ShaderBinaryType::kPs,
            .code_size_bytes = static_cast<uint32_t>(native_pixel.size() * sizeof(u32))});
-      HW::VertexShaderInfo native_vertex_regs{};
-      native_vertex_regs.es_regs.data_addr = vertex_address;
-      HW::PixelShaderInfo native_pixel_regs{};
-      native_pixel_regs.ps_regs.data_addr = pixel_address;
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
       const auto owned_vertex_shader = vertex_shader;
       const auto owned_pixel_shader = pixel_shader;
       depth.stencil_test_enable = false;
       registers.SetViewportTransformControl(0x300);
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
-      std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
-      std::array<ShaderVertexInputInfo, 3> native_vertex_info{};
+      // The cache reads the bound shaders, the color outputs and the export mapping itself.
+      const auto refresh = [&] {
+        DrawRenderState state{};
+        context.GetPipelineCache().GetGraphicsPrograms(scheduler.Current(), state);
+        return state;
+      };
+      const auto native_programs = [&] {
+        const auto native = refresh();
+        vertex = native.vertex_info[0];
+        pixel = native.ps_input_info;
+        vertex_shader = *vertex.stage.handle;
+        pixel_shader = *pixel.stage.handle;
+      };
+      const auto silent = refresh();
+      registers.SetDepthShaderControl({.shader_kill_enable = true});
+      const auto killing = refresh();
+      registers.SetDepthShaderControl({.shader_z_export_enable = true});
+      const auto depth_writing = refresh();
+      registers.SetDepthShaderControl({});
+      registers.SetTargetOutputMode(0, 4);
+      const auto writing = refresh();
+      // Slot 1 takes color output, but the pixel program exports only MRT0.
+      registers.SetRenderTargetMask(0xff);
+      registers.SetShaderMask(0xff);
+      registers.SetTargetOutputMode(1, 4);
+      const auto partial = refresh();
+      registers.SetTargetOutputMode(1, 0);
+      registers.SetShaderMask(0xf);
+      registers.SetRenderTargetMask(0xf);
+      Require(name, "pixel stage activity",
+              !silent.ps_active && !silent.ps_input_info.stage && silent.mrt_mask == 0 &&
+                  killing.ps_active && killing.ps_input_info.stage && killing.mrt_mask == 0 &&
+                  depth_writing.ps_active && depth_writing.mrt_mask == 0 &&
+                  writing.ps_active && writing.mrt_mask == 1u && partial.mrt_mask == 1u &&
+                  writing.VertexStages().size() == 1 &&
+                  writing.vertex_info[0].stage.handle != nullptr,
+              "pixel activity or its MRT mask ignored the color outputs or depth side effects");
       std::array<uint64_t, 2> wave_ids{};
       std::array<std::vector<u32>, 2> wave_keys;
       struct PixelWaveCase { uint32_t control, width, color; };
@@ -18724,9 +18772,7 @@ public:
                               PixelWaveCase{0x8008, 32, 0x3e800000},
                               PixelWaveCase{0x0008, 64, 0}}) {
         registers.SetPsInControl(wave.control);
-        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
-            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        native_programs();
         Require(name, "pixel wave metadata propagation",
                 pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
                 "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
@@ -18735,14 +18781,11 @@ public:
         BuildStageStaticKey(pixel, key);
         if (wave_ids[index] != 0) {
           Require(name, "pixel wave cache reuse",
-                  programs.pixel.id == wave_ids[index] && key == wave_keys[index],
+                  pixel_shader.id == wave_ids[index] && key == wave_keys[index],
                   "restoring wave64 did not reuse its original program");
         }
-        wave_ids[index] = programs.pixel.id;
+        wave_ids[index] = pixel_shader.id;
         wave_keys[index] = std::move(key);
-        vertex_shader = programs.vertex[0];
-        pixel_shader = programs.pixel;
-        vertex = native_vertex_info[0];
         draw(pipeline(true, 2, 2));
         const auto wave_pixels = read_color();
         for (size_t component = 0; component < wave_pixels.size(); component++) {
@@ -18778,8 +18821,8 @@ public:
         *(position + 1) = EncodeExp1(3, 4, 0, 9);
         return code;
       }();
-      native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(waterfall_vertex.data());
-      ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
+      shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(waterfall_vertex.data()));
+      ShaderMapUserData(shaders.GetVs().es_regs.data_addr,
           {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
            .code_size_bytes = static_cast<u32>(waterfall_vertex.size() * sizeof(u32))});
       registers.SetPsInControl(0x8008);
@@ -18787,12 +18830,7 @@ public:
       for (const u32 wave : {32u, 64u}) {
         registers.SetShaderStages((saved_stages & ~0x00400000u) |
                                    (wave == 32u ? 0x00400000u : 0u));
-        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
-            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
-        vertex_shader = programs.vertex[0];
-        pixel_shader = programs.pixel;
-        vertex = native_vertex_info[0];
+        native_programs();
         Require(name, "native NGG waterfall wave",
                 vertex.stage.program->stage == ShaderType::Vertex &&
                     vertex.stage.program->wave_size == wave,
@@ -18807,7 +18845,7 @@ public:
         }
       }
       registers.SetShaderStages(saved_stages);
-      native_vertex_regs.es_regs.data_addr = vertex_address;
+      shaders.SetEsShaderBase(vertex_address);
 
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
       // zero or unit source factor for separate alpha attenuation or accumulation.
@@ -18822,8 +18860,8 @@ public:
         AppendEnd(&code);
         return code;
       }();
-      native_pixel_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(blend_pixel.data());
-      ShaderMapUserData(native_pixel_regs.ps_regs.data_addr,
+      shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(blend_pixel.data()));
+      ShaderMapUserData(shaders.GetPs().ps_regs.data_addr,
           {.type = Prospero::ShaderBinaryType::kPs,
            .code_size_bytes = static_cast<uint32_t>(blend_pixel.size() * sizeof(u32))});
       const auto saved_blend = registers.GetBlendControl(0);
@@ -18832,8 +18870,13 @@ public:
       registers.SetTargetOutputMode(0, 4);
       auto blend_target_info = saved_target_info;
       blend_target_info.blend_bypass = false;
+      // A reversed RGBA32F target exports through the ABGR mapping.
+      blend_target_info.format = Prospero::ChannelLayout::k32_32_32_32;
+      blend_target_info.channel_type = Prospero::ChannelType::kFloat;
+      blend_target_info.channel_order = Prospero::ChannelOrder::kReversed;
       registers.SetColorInfo(0, blend_target_info);
-      export_mapping[0] = color.export_mapping = Prospero::ColorMappingAbgr;
+      registers.SetColorBase(0, {.addr = depth_address + 0x10000});
+      color.export_mapping = Prospero::ColorMappingAbgr;
       HW::BlendControl alpha_blend{};
       alpha_blend.enable = true;
       alpha_blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha);
@@ -18856,22 +18899,18 @@ public:
         alpha_blend.separate_alpha_blend = test.separate;
         alpha_blend.alpha_srcblend = static_cast<uint8_t>(test.alpha_source);
         registers.SetBlendControl(0, alpha_blend);
-        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
-            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        native_programs();
         Require(name, "logical alpha blend program", pixel.alpha_blend_source == test.mode &&
-                    pixel.dual_source_blending,
+                    pixel.dual_source_blending &&
+                    pixel.target_export_mapping[0] == Prospero::ColorMappingAbgr,
                 "the separate alpha equation did not reach the compiled pixel program");
-        vertex_shader = programs.vertex[0];
-        pixel_shader = programs.pixel;
-        vertex = native_vertex_info[0];
         auto &selected = pipeline(true, 2, 2);
         if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
           Require(name, "equal blend equation cache reuse",
-                  broadcast_program == 0 || (programs.pixel.id == broadcast_program &&
+                  broadcast_program == 0 || (pixel_shader.id == broadcast_program &&
                                               selected.pipeline == broadcast_pipeline),
                   "equivalent separate alpha state created another shader or pipeline");
-          broadcast_program = programs.pixel.id;
+          broadcast_program = pixel_shader.id;
           broadcast_pipeline = selected.pipeline;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
@@ -18885,9 +18924,10 @@ public:
                   "reversed blending changed logical RGB or the separate alpha equation");
         }
       }
-      native_pixel_regs.ps_regs.data_addr = pixel_address;
-      export_mapping[0] = color.export_mapping = {};
+      shaders.SetPsShaderBase(pixel_address);
+      color.export_mapping = {};
       registers.SetBlendControl(0, saved_blend);
+      registers.SetColorBase(0, {});
       registers.SetColorInfo(0, saved_target_info);
       registers.SetTargetOutputMode(0, saved_output_mode);
 
@@ -18926,17 +18966,12 @@ public:
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriStrip);
       for (size_t i = 0; i < position_shaders.size(); i++) {
         const auto &code = position_shaders[i];
-        native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
-        ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
+        shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(code.data()));
+        ShaderMapUserData(shaders.GetVs().es_regs.data_addr,
             {.type = Prospero::ShaderBinaryType::kGs,
              .user_data = &native_user_data,
              .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
-        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
-            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
-        vertex_shader = programs.vertex[0];
-        pixel_shader = programs.pixel;
-        vertex = native_vertex_info[0];
+        native_programs();
         draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4);
         const auto pixels = read_color();
         bool second_triangle = false;
@@ -19473,11 +19508,7 @@ public:
         shaders.SetGsShaderResource2({});
         shaders.SetPsShaderBase(ps_address);
         user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
-        native_vertex_regs.es_regs.data_addr = vertex_address;
-        native_pixel_regs.ps_regs.data_addr = ps_address;
-        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
-            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        native_programs();
         Require(name, "packed format follows export ordinal",
                 pixel.target_output_mode[2] == 9 && pixel.wave_size == test.wave &&
                     pixel.target_packed_unorm_mask == 4u &&
@@ -19485,9 +19516,9 @@ public:
                 "packed conversion or rounding contaminated another MRT or followed a physical slot");
         if (test.slot == 2) {
           auto &id = test.truncate ? truncate_program : half_up_program;
-          Require(name, "packed rounding program reuse", id == 0 || id == programs.pixel.id,
+          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.id,
                   "restoring half-up rounding failed to reuse its program");
-          id = programs.pixel.id;
+          id = pixel_shader.id;
         }
         RenderColorInfo packed_target{}, float_target{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -39482,25 +39513,25 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   options.input_info.compute = &test.compute_info;
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto plan = ExtractResourcePlan(translated.program);
-  struct CountMemory { u32 value = 72; u32 reads = 0; bool clean = true; } memory;
-  SrtRuntime runtime{.user_data = test.user_data, .userdata = &memory};
+  struct CountMemory { u32 value = 72; u32 reads = 0; bool readable = true; } memory;
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Require(test.name, "strict reader required",
-          !MaterializeResources(plan, runtime, snapshot, specialization),
-          "vector descriptor input bypassed the clean-memory reader");
-  runtime.read_specialization_memory = [](void *data, uint64_t address, std::span<u32> words) {
-    auto &memory = *static_cast<CountMemory *>(data);
-    ++memory.reads;
-    if (!memory.clean || address != count_address || words.size() != 1) return false;
-    words[0] = memory.value;
-    return true;
+  const auto materialize = [&] {
+    FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<u32> words) {
+      auto &memory = *static_cast<CountMemory *>(data);
+      ++memory.reads;
+      if (!memory.readable || address != count_address) return false;
+      words[0] = memory.value;
+      return true;
+    }, &memory);
+    return MaterializeResources(plan, {.user_data = test.user_data}, snapshot, specialization);
   };
-  memory.clean = false;
-  Require(test.name, "dirty input rejected",
-          !MaterializeResources(plan, runtime, snapshot, specialization),
-          "GPU-dirty count was accepted for host descriptor evaluation");
-  memory.clean = true;
+  // An unreadable count reads as zero, which leaves no records.
+  memory.readable = false;
+  Require(test.name, "unreadable input",
+          materialize() && memory.reads == 1 && snapshot.buffers[2].dwords[2] == 0,
+          "unreadable count did not read as zero");
+  memory.readable = true;
   ResourceSpecialization initial_specialization;
   // Reuse the same resource plan and compiled shader as the count and coverage change.
   for (const u32 count : {0u, 72u, 512u, 8192u, 262144u}) {
@@ -39509,7 +39540,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
     const u32 chunk = count < 512 ? 64 : count < 8192 ? 128 : count < 262144 ? 256 : 512;
     const u32 records = (count + chunk - 1) / chunk;
     Require(test.name, "cached descriptor refresh",
-            MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 1 &&
+            materialize() && memory.reads == 1 &&
                 snapshot.buffers[2].dwords[2] == records &&
                 snapshot.specialization_reads ==
                     std::vector<std::pair<uint64_t, uint64_t>>{{count_address, 4}},
@@ -44505,13 +44536,13 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
                            uint16_t{112}, uint16_t{128}, uint16_t{128}}) {
     regs.cs_regs.lds_size = units;
     ShaderComputeInputInfo input{};
-    const auto program = cache.GetComputeProgram(regs, {}, input);
+    const auto program = cache.GetComputeProgram(regs, input);
     Require(name, "guest allocation and device backing",
             input.lds_size_dwords == units * 128u &&
                 input.lds_storage == (units > limit_units),
             "compute LDS was truncated or chose backing that exceeds the device limit");
     Require(name, "pipeline creation",
-            cache.GetComputePipeline(input, program).pipeline != nullptr,
+            cache.GetComputePipeline(input).pipeline != nullptr,
             "full-size LDS shader did not create a Vulkan compute pipeline");
     if (previous.id != 0) {
       Require(name, "guest-size cache identity",
@@ -44557,7 +44588,6 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   compute.thread_ids_num = 1;
   compute.workgroup_register = 8;
   u32 scalar_clear = 0x40404040u;
-  bool clean_scalar = false;
 
   const auto Compile = [&](const std::vector<u32> &code) {
     ShaderRecompiler::CompileOptions options;
@@ -44575,13 +44605,6 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     const ShaderRecompiler::IR::SrtRuntime runtime{
         .user_data = options.user_data,
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
-        .userdata = &scalar_clear,
-        .read_specialization_memory = clean_scalar
-            ? +[](void *data, uint64_t address, std::span<uint32_t> words) {
-                if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
-                words[0] = *static_cast<uint32_t *>(data);
-                return true;
-              } : nullptr,
     };
     Require("Ps5GameExampleImageClear", "resource materialization",
             ShaderRecompiler::IR::MaterializeResources(
@@ -44739,7 +44762,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   scalar_code.push_back(EncodeMubuf0(0x04u, 0, true, false));
   scalar_code.push_back(EncodeMubuf1(1, 0, 0));
   AppendEnd(&scalar_code);
-  clean_scalar = true;
+  // The scalar input is a walker load, so it needs no specialization memory reader.
   auto loaded = Compile(scalar_code);
   runtime_resources = loaded;
   Require("Ps5GameExampleImageClear", "scalar-loaded fill",
@@ -44747,12 +44770,6 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                    packed_clear, size) &&
               packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
           "GTA3's scalar input was confused with its destination");
-  clean_scalar = false;
-  runtime_resources = Compile(scalar_code);
-  Require("Ps5GameExampleImageClear", "unavailable clean scalar",
-          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
-                                    packed_clear, size),
-          "a scalar without a clean reader was replaced by a fill");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
@@ -47219,8 +47236,9 @@ void CheckImageSamplerSpecialization() {
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
-                             .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                             .read_specialization_memory = ReadTestMemory};
+    FakeGuestMemory fake(ReadTestMemory, &memory);
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -47310,10 +47328,8 @@ void CheckResourcePlanHandoff() {
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const SrtRuntime runtime{.user_data = user_data,
-                             .read_memory = ReadTestMemory,
-                             .userdata = &memory,
-                             .read_specialization_memory = ReadTestMemory};
+    const SrtRuntime runtime{.user_data = user_data};
+    FakeGuestMemory fake(ReadTestMemory, &memory);
     Require(name, "initial descriptors",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == 0x1000u,
@@ -48104,37 +48120,6 @@ void CheckDepthTargetFootprints() {
                                 htile, depth),
           "invalid HTile extent was silently admitted");
   std::printf("[host]    %-32s ok\n", "DepthTargetFootprints");
-}
-
-struct SlotLifetimeProbe {
-  explicit SlotLifetimeProbe(bool *destroyed) : destroyed(destroyed) {
-    if (destroyed == nullptr || *destroyed) {
-      EXIT("fence-lifetime probe has invalid construction state\n");
-    }
-  }
-  ~SlotLifetimeProbe() { *destroyed = true; }
-
-  bool *destroyed = nullptr;
-};
-
-void CheckSlotVectorLifetime() {
-  bool destroyed = false;
-  Common::SlotVector<SlotLifetimeProbe> slots;
-  const auto first = slots.insert(&destroyed);
-  Require("SlotVectorLifetime", "inserted",
-          slots.is_allocated(first) && slots.try_get(first) != nullptr &&
-              !destroyed,
-          "slot insertion did not expose its cache-owned object");
-  slots.erase(first);
-  const bool first_destroyed = destroyed;
-  destroyed = false;
-  const auto second = slots.insert(&destroyed);
-  Require("SlotVectorLifetime", "generation",
-          first_destroyed && !destroyed && first.index == second.index &&
-              first != second && !slots.is_allocated(first) &&
-              slots.is_allocated(second),
-          "reused slot accepted a stale cache resource id");
-  std::printf("[host]    %-32s ok\n", "SlotVectorLifetime");
 }
 
 void CheckEmbeddedFetchLaneSpill() {
@@ -51273,7 +51258,6 @@ int main(int argc, char **argv) {
   CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();
   CheckDepthTargetFootprints();
-  CheckSlotVectorLifetime();
 #else
   if (argc != 1) {
     std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);

@@ -223,7 +223,8 @@ static size_t FrameSize(const ConfigInfo& config) {
 	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
 	const auto pitch  = (static_cast<size_t>(config.max_width) + 255u) & ~size_t {255};
 	const auto height = (static_cast<size_t>(config.max_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
+	const auto sample = Decoder::HighBitDepthProfile(config.codec_type, config.profile) ? 2u : 1u;
+	return pitch * sample * height * 3 / 2 + 4096;
 }
 
 static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(ComputeMemoryInfo* memory) {
@@ -301,7 +302,8 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const ConfigInfo* config, const Memor
 		return Fail(Error::MemoryPointer);
 	auto* decoder = Decoder::Create(
 	    {config->codec_type, config->max_width, config->max_height,
-	     std::max(2u, static_cast<uint32_t>(config->max_dpb_frames) + config->extra_dpb_frames)});
+	     std::max(2u, static_cast<uint32_t>(config->max_dpb_frames) + config->extra_dpb_frames),
+	     Decoder::HighBitDepthProfile(config->codec_type, config->profile)});
 	if (decoder == nullptr) return Fail(Error::ApiFail);
 	auto* state = new (memory->cpu_memory) State {*config, decoder};
 	++config->compute_queue->decoders;
@@ -397,7 +399,7 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(State* handle, OutputInfo* outp
 	           decoded.buffer,
 	           decoded.buffer_size,
 	           0,
-	           decoded.pitch};
+	           decoded.pitch_in_bytes};
 	state->output_buffer.reset();
 	return 0;
 }

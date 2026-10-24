@@ -200,7 +200,7 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	output_info->frame_buffer_size = decoded.buffer_size;
 	if (output_info->this_size == sizeof(Videodec2OutputInfo)) {
 		output_info->frame_format         = VIDEODEC2_FRAME_FORMAT_DEFAULT;
-		output_info->frame_pitch_in_bytes = decoded.pitch;
+		output_info->frame_pitch_in_bytes = decoded.pitch_in_bytes;
 	}
 }
 
@@ -364,7 +364,8 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	}
 
 	auto* state =
-	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height});
+	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height, 2u,
+	                     Decoder::HighBitDepthProfile(config->codec_type, config->profile)});
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_API_FAIL;
 	}

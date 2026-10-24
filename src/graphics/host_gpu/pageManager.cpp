@@ -279,6 +279,23 @@ struct PageManager::Impl {
 		}
 	}
 
+	bool IsWatched(uint64_t vaddr, uint64_t size) const {
+		ValidateRange(vaddr, size);
+		const auto end = Common::AlignUp(vaddr + size, PAGE_SIZE);
+		for (auto page = Common::AlignDown(vaddr, PAGE_SIZE); page < end; page += PAGE_SIZE) {
+			auto* region = FindRegion(page);
+			if (region == nullptr) {
+				return false;
+			}
+			SpinGuard  lock(region->lock);
+			const auto state = region->pages[(page % REGION_SIZE) / PAGE_SIZE];
+			if (state.write_watchers == 0 && state.access_watchers == 0) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
@@ -297,6 +314,10 @@ uint64_t PageManager::GetPageSize() const {
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+}
+
+bool PageManager::IsWatched(uint64_t vaddr, uint64_t size) const {
+	return m_impl->IsWatched(vaddr, size);
 }
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);

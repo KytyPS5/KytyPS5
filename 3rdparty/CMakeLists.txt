@@ -42,6 +42,49 @@ if(NOT KYTY_CLANG_CL)
 endif()
 install(FILES "${openxr_SOURCE_DIR}/LICENSE" DESTINATION "licenses/openxr")
 
+# Noto Sans (SIL Open Font License 1.1), which libFont uses in place of the console's system fonts.
+# Only the hinted Regular, Bold, Italic and Bold Italic of release v2.015 are needed, so they are
+# downloaded individually from the Noto project's font distribution (notofonts.github.io) rather
+# than with the release's 117 MB archive, along with the distribution's licence.
+set(KYTY_NOTO_SANS_REPOSITORY "https://raw.githubusercontent.com/notofonts/notofonts.github.io")
+set(KYTY_NOTO_SANS_COMMIT 42af67ccd12bc0e31ed85384bf73e39248265374)
+set(KYTY_NOTO_SANS_BASE_URL "${KYTY_NOTO_SANS_REPOSITORY}/${KYTY_NOTO_SANS_COMMIT}/fonts")
+
+# Checksums of the files at that commit.
+set(KYTY_NOTO_SANS_LICENSE_SHA256 f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8)
+set(KYTY_NOTO_SANS_REGULAR_SHA256 478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823)
+set(KYTY_NOTO_SANS_BOLD_SHA256 1df075a380fc7cb898acf64c1f7b3b4dd780de3caa860178bf929de35817a913)
+set(KYTY_NOTO_SANS_ITALIC_SHA256 467e3f89eeca4108bb8710a2b9e0cf2281ac56d5b0609211a83776d0505eecb5)
+set(KYTY_NOTO_SANS_BOLD_ITALIC_SHA256
+	1b602a9d6353be42c91df097a4857b69fa2696f26703d7a33b54a15d87c2622c)
+
+# All the files go to one folder. Sharing it is safe only because of DOWNLOAD_NO_EXTRACT: an extract
+# step empties SOURCE_DIR first, which would delete the other files.
+set(KYTY_NOTO_SANS_DIR "${FETCHCONTENT_BASE_DIR}/noto-sans")
+
+# Downloads the file at `path` (relative to KYTY_NOTO_SANS_BASE_URL) as the dependency `name`.
+function(kyty_fetch_noto_sans name path sha256)
+	FetchContent_Declare(${name}
+		URL "${KYTY_NOTO_SANS_BASE_URL}/${path}"
+		URL_HASH SHA256=${sha256}
+		DOWNLOAD_NO_EXTRACT TRUE
+		SOURCE_DIR "${KYTY_NOTO_SANS_DIR}"
+		TLS_VERIFY TRUE)
+	FetchContent_MakeAvailable(${name})
+endfunction()
+
+kyty_fetch_noto_sans(noto_sans_license LICENSE ${KYTY_NOTO_SANS_LICENSE_SHA256})
+kyty_fetch_noto_sans(noto_sans_regular NotoSans/hinted/ttf/NotoSans-Regular.ttf
+	${KYTY_NOTO_SANS_REGULAR_SHA256})
+kyty_fetch_noto_sans(noto_sans_bold NotoSans/hinted/ttf/NotoSans-Bold.ttf
+	${KYTY_NOTO_SANS_BOLD_SHA256})
+kyty_fetch_noto_sans(noto_sans_italic NotoSans/hinted/ttf/NotoSans-Italic.ttf
+	${KYTY_NOTO_SANS_ITALIC_SHA256})
+kyty_fetch_noto_sans(noto_sans_bold_italic NotoSans/hinted/ttf/NotoSans-BoldItalic.ttf
+	${KYTY_NOTO_SANS_BOLD_ITALIC_SHA256})
+
+set(KYTY_NOTO_SANS_DIR "${KYTY_NOTO_SANS_DIR}" PARENT_SCOPE)
+
 # The guest instruction patcher needs a decoder/encoder and a small
 # trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)

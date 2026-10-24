@@ -43696,24 +43696,25 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
            O::DS_READ_ADDTID_B32, O::EXP, O::S_ENDPGM}};
 }
 
-GraphicsCase GraphicsDsAppendSkipsHelperLanes() {
+GraphicsCase GraphicsDsAppendSkipsHelperLanes(bool consume) {
   using O = ShaderOpcode;
 
   // Only pixel 1 is covered, so the rest of its quad can run as helpers, and the host may count
-  // them in the entry EXEC. Whichever lane adds the wave's count, the add must reach GDS: the
-  // first base is the initial counter, and the second is that plus the lanes in EXEC. The shader
-  // reads an interpolant (zero here), as ASTRO BOT's list builder does; on RADV that alone puts
-  // the helpers into the entry EXEC (#1574).
+  // them in the entry EXEC. Whichever lane updates the counter for the wave, the update must reach
+  // GDS: the first value returned is the initial counter, and the second differs from it by the
+  // lanes in EXEC. The shader reads an interpolant (zero here), as ASTRO BOT's list builder does;
+  // on RADV that alone puts the helpers into the entry EXEC (#1574).
+  const u32 op = consume ? 0x3d : 0x3e;
   std::vector<u32> code;
   code.push_back(EncodeVintrp(0x00, 7, 0, 0, 0));
   code.push_back(EncodeVintrp(0x01, 7, 0, 0, 1));
   AppendSMovLiteral(&code, 124, 0x100);
-  code.push_back(EncodeDs0(0x3e, 20, true));
+  code.push_back(EncodeDs0(op, 20, true));
   code.push_back(EncodeDs1(1, 0, 0));
-  code.push_back(EncodeDs0(0x3e, 20, true));
+  code.push_back(EncodeDs0(op, 20, true));
   code.push_back(EncodeDs1(2, 0, 0));
   code.push_back(EncodeSop1(0x10, 0, 126));
-  code.push_back(EncodeVop2(0x26, 3, Vgpr(2), 1));
+  code.push_back(EncodeVop2(0x26, 3, Vgpr(consume ? 1 : 2), consume ? 2 : 1));
   code.push_back(EncodeVop2(0x27, 3, 0, 3));
   code.push_back(EncodeVop1(0x06, 4, Vgpr(1)));
   code.push_back(EncodeVop1(0x05, 5, Vgpr(3)));
@@ -43724,7 +43725,7 @@ GraphicsCase GraphicsDsAppendSkipsHelperLanes() {
   AppendEnd(&code);
 
   GraphicsCase test;
-  test.name = "GraphicsDsAppendSkipsHelperLanes";
+  test.name = consume ? "GraphicsDsConsumeSkipsHelperLanes" : "GraphicsDsAppendSkipsHelperLanes";
   test.fragment_code = std::move(code);
   test.width = 2;
   test.vertices = {0x00000000u, 0xbf800000u, 0, 0, 0, 0,
@@ -43734,7 +43735,7 @@ GraphicsCase GraphicsDsAppendSkipsHelperLanes() {
   test.gds_initial[5] = 10;
   test.expected_pixel = {0, 0, 0, 0, 0x41200000u, 0, 0x3f800000u, 0x3f800000u};
   test.opcodes = {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32,  O::S_MOV_B32,
-                  O::DS_APPEND,       O::S_BCNT1_I32_B64,  O::V_SUB_NC_U32,
+                  consume ? O::DS_CONSUME : O::DS_APPEND, O::S_BCNT1_I32_B64, O::V_SUB_NC_U32,
                   O::V_SUBREV_NC_U32, O::V_CVT_F32_U32,    O::V_CVT_F32_I32,
                   O::V_MOV_B32,       O::V_ADD_F32,        O::EXP,
                   O::S_ENDPGM};
@@ -44605,7 +44606,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsFrontFaceBits(true, true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
-      GraphicsDsAppendSkipsHelperLanes(),
+      GraphicsDsAppendSkipsHelperLanes(false),
+      GraphicsDsAppendSkipsHelperLanes(true),
       GraphicsDirectSgprPushConstantExport(),
       GraphicsInlineSrtScalarPromotionExport(),
       GraphicsNullVmExportDiscardsInactiveExec(),
@@ -50893,7 +50895,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-append-helper-only") == 0) {
     VulkanHarness vulkan;
-    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes());
+    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes(false));
+    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

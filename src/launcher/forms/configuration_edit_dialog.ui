@@ -66,7 +66,6 @@
             <item row="1" column="1">
              <widget class="QSpinBox" name="spinBox_user_id">
               <property name="toolTip"><string>Local user ID exposed to games</string></property>
-              <property name="maximum"><number>2147483647</number></property>
              </widget>
             </item>
             <item row="2" column="0">
@@ -169,18 +168,24 @@
              </widget>
             </item>
             <item row="6" column="1">
+             <widget class="QCheckBox" name="checkBox_readback_tiled">
+              <property name="toolTip"><string>Read back small writable tiled images</string></property>
+              <property name="text"><string>Enable tiled readback</string></property>
+             </widget>
+            </item>
+            <item row="7" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
               <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
               <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
-            <item row="7" column="1">
-             <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
-              <property name="toolTip"><string>Can fix missing textures and incorrect transparency in some games. May reduce performance.</string></property>
-              <property name="text"><string>Accurate texture synchronization</string></property>
+            <item row="8" column="1">
+             <widget class="QCheckBox" name="checkBox_occlusion_queries">
+              <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
+              <property name="text"><string>Enable occlusion queries</string></property>
              </widget>
             </item>
-            <item row="8" column="1">
+            <item row="9" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
@@ -241,6 +246,12 @@
              <widget class="QCheckBox" name="checkBox_hide_cursor">
               <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
               <property name="text"><string>Auto-hide cursor</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_perf_overlay">
+              <property name="toolTip"><string>Show FPS, frame times, CPU/GPU usage, RAM and memory pressure in the game window. Press F2 (Cmd+P on macOS) to toggle it, and add Shift for the detailed view.</string></property>
+              <property name="text"><string>Show performance panel</string></property>
              </widget>
             </item>
             <item>
@@ -346,6 +357,16 @@
              </widget>
             </item>
            </layout>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="label_keyboard_player">
+            <property name="text"><string>Keyboard player:</string></property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QComboBox" name="comboBox_keyboard_player">
+            <property name="toolTip"><string>Gamepads fill the remaining players in connection order. Every player uses the same input mapping.</string></property>
+           </widget>
           </item>
          </layout>
         </widget>
@@ -463,6 +484,25 @@
            <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
             <property name="toolTip"><string>Specify directory to dump command buffers</string></property>
             <property name="clearButtonEnabled"><bool>true</bool></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="rendering_compatibility_group">
+         <property name="title"><string>Rendering compatibility</string></property>
+         <layout class="QVBoxLayout" name="renderingCompatibilityLayout">
+          <item>
+           <widget class="QLabel" name="label_rendering_compatibility">
+            <property name="text"><string>These settings may help with rendering bugs at a slight performance cost.</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
+            <property name="toolTip"><string>Can fix missing textures and incorrect transparency (Resident Evil 2).</string></property>
+            <property name="text"><string>Accurate texture synchronization</string></property>
            </widget>
           </item>
          </layout>

@@ -54,38 +54,10 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
-constexpr uint32_t GcrGl0VectorInvalidate   = 1u << 2u;
-constexpr uint32_t GcrGl1Invalidate         = 1u << 3u;
-constexpr uint32_t GcrGl2Unshared           = 1u << 4u;
-constexpr uint32_t GcrGl2Invalidate         = 1u << 8u;
-constexpr uint32_t GcrGl2Writeback          = 1u << 9u;
-constexpr uint32_t GcrOrder012              = 1u << 10u;
-constexpr uint32_t GcrOrder210              = 2u << 10u;
-constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate |
-                                              GcrGl1Invalidate | GcrGl2Unshared | GcrGl2Invalidate |
-                                              GcrGl2Writeback | GcrOrder012 | GcrOrder210;
-constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
+constexpr uint32_t RegisterSelectorMask = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
-}
-
-bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
-	return eop_event_type != 0x28u ||
-	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
-	                    GcrGl2Invalidate | GcrGl2Writeback)) != 0;
-}
-
-uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
-	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
-}
-
-void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
-	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
-	if (unknown != 0) {
-		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
-	}
 }
 
 } // namespace
@@ -289,12 +261,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
                                       [[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
-}
-
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreVtxControl([[maybe_unused]] uint32_t value) {}
@@ -434,16 +400,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetPointState) {
 
 	for (uint32_t i = 0; i < num_values; i++) {
 		HwCtxIgnorePointState(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAlphaToMaskRegister(buffer[i]);
 	}
 
 	return num_values;
@@ -1090,9 +1046,8 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i]);
 	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1107,9 +1062,8 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i]);
 	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1124,7 +1078,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
 	}
 
 	// [vb-diag] bounded: snapshot the VS vertex-buffer (V#) table at command-parse time so it can
@@ -1172,9 +1126,8 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i]);
 	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1762,24 +1715,6 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 	return packet_size_dw - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0038300);
-
-	auto  offset = buffer[0];
-	auto  dw_num = buffer[1];
-	auto* dst = reinterpret_cast<uint32_t*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
-
-	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
-	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
-	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
-
-	cp.DumpConstRam(dst, offset, dw_num);
-
-	return 4;
-}
-
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1800,88 +1735,14 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	return packet_size_dw - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0044700);
-
-	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
-	uint32_t event_write_dest   = ((buffer[0] >> 23u) & 0x10u) | ((buffer[2] >> 16u) & 0x01u);
-	uint32_t eop_event_type     = (buffer[0]) & 0x3fu;
-	uint32_t cache_action       = (buffer[0] >> 12u) & 0x3fu;
-	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
-	uint32_t event_write_source = ((buffer[2] >> 29u) & 0x7u);
-	uint32_t interrupt_selector = (buffer[2] >> 24u) & 0x7u;
-	auto*    dst_gpu_addr =
-	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
-	uint64_t value = (buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
-
-	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
-	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
-
-	return 5;
-}
-
-KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0034802);
-
-	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
-	uint32_t event_write_dest   = 0;
-	uint32_t eop_event_type     = (buffer[0]) & 0x3fu;
-	uint32_t cache_action       = (buffer[0] >> 12u) & 0x3fu;
-	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
-	uint32_t event_write_source = ((buffer[2] >> 29u) & 0x7u);
-	uint32_t interrupt_selector = (buffer[2] >> 24u) & 0x7u;
-
-	auto* dst_gpu_addr =
-	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
-	uint32_t value = buffer[3];
-
-	cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
-	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
-
-	return 4;
-}
-
 KYTY_CP_OP_PARSER(CpOpFlip) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
 
-	CommandProcessor::FlipInfo f;
-
-	f.handle    = static_cast<int>(buffer[0]);
-	f.index     = static_cast<int>(buffer[1]);
-	f.flip_mode = static_cast<int>(buffer[2]);
-	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
-
-	cp.SetFlip(f);
-	cp.Flip();
+	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
+	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
 	return 5;
-}
-
-KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008400);
-	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
-
-	cp.IncrementCe();
-
-	return 1;
-}
-
-KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008500);
-	EXIT_NOT_IMPLEMENTED(buffer[0] != 0);
-
-	cp.IncrementDe();
-
-	return 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpIndexType) {
@@ -2191,50 +2052,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpMarker) {
-	KYTY_PROFILER_FUNCTION();
-
-	uint32_t len_dw = ((cmd_id >> 16u) & 0x3fffu);
-
-	switch (buffer[0]) {
-		case 0x68750004: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
-		case 0x6875000d: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
-		case 0x68750777: {
-			cp.Flip();
-			break;
-		}
-		case 0x68750778: {
-			auto* addr =
-			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-			uint32_t value = buffer[3];
-			cp.Flip(addr, value);
-			break;
-		}
-		case 0x68750781: {
-			auto* addr =
-			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-			uint32_t value          = buffer[3];
-			uint32_t eop_event_type = buffer[4];
-			uint32_t cache_action   = buffer[5];
-			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
-			break;
-		}
-		// NOP payloads are caller-owned data; only complete known marker tags execute.
-		default: break;
-	}
-
-	return len_dw + 1;
-}
-
 KYTY_CP_OP_PARSER(CpOpNop) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto r = KYTY_PM4_R(cmd_id);
 
 	if (r == Pm4::R_ZERO) {
-		if ((buffer[0] & 0xffff0000u) == 0x68750000u) {
-			return CpOpMarker(cp, cmd_id, buffer, dw, num_dw);
-		}
 		return KYTY_PM4_LEN(cmd_id) - 1;
 	}
 
@@ -2290,124 +2113,14 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
 
-	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
-	uint32_t eop_event_type     = buffer[0] & 0x3fu;
-	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
-	uint32_t gcr_cntl           = (buffer[0] >> 12u) & 0xfffu;
-	uint32_t release_dst        = (buffer[1] >> 16u) & 0x3u;
-	uint32_t event_write_dest   = 0;
-	uint32_t data_sel           = (buffer[1] >> 29u) & 0x7u;
-	uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
-	auto*    dst_gpu_addr =
-	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
-	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
-	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
-
-	constexpr uint32_t ReleaseMemDstMemory = 0;
-	constexpr uint32_t ReleaseMemDstTcL2   = 1;
-	EXIT_NOT_IMPLEMENTED(release_dst != ReleaseMemDstMemory && release_dst != ReleaseMemDstTcL2);
-	EXIT_NOT_IMPLEMENTED(data_sel != 0 && data_sel != 1 && data_sel != 2 && data_sel != 3 &&
-	                     data_sel != 5);
-
-	LogUnknownReleaseMemGcr(gcr_cntl);
-
-	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
-
-	auto trigger_interrupt = [&]() {
-		switch (interrupt_selector) {
-			case 0x00:
-			case 0x03: break;
-			case 0x01:
-			case 0x02:
-			case 0x04:
-				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				cp.BufferFlush();
-				break;
-			default: EXIT("unknown release_mem interrupt selector\n");
-		}
-	};
-
-	if (data_sel == 0 || interrupt_selector == 4) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
-		trigger_interrupt();
-
-		return 7;
-	}
-
-	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
-		trigger_interrupt();
-
-		return 7;
-	}
-
-	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
-		cp.EmitGlobalBarrier();
-	}
-
-	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
-	cache_policy      = 0;
-
-	if (data_sel == 1) {
-		eop_event_type    = 0x2f;
-		event_index       = 6;
-		auto event_source = 2u;
-
-		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
-		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
-		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
-			cp.BufferFlush();
-		}
-
-		return 7;
-	}
-
-	if (data_sel == 5) {
-		if (gl2_writeback) {
-			cache_action = 0;
-		}
-
-		eop_event_type    = 0x2f;
-		event_index       = 6;
-		auto event_source = 1u;
-
-		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
-		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
-		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01) {
-			cp.BufferFlush();
-		}
-
-		return 7;
-	}
-
-	const bool keep_native_event_index =
-	    (eop_event_type == 0x04 && cache_action == 0x00) ||
-	    (eop_event_type == 0x2f && event_index == 0x06 && cache_action == 0x38);
-
-	if (data_sel == 2) {
-		if (!keep_native_event_index) {
-			event_index = 0;
-		}
-	} else {
-		EXIT_IF(data_sel != 3);
-		if (!keep_native_event_index) {
-			event_index = 0;
-		}
-		data_sel = 4;
-	}
-
-	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
-	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
+	// The event type, cache actions and destination cache only order GPU work, which the renderer's
+	// resource barriers already order.
+	cp.ReleaseMem(
+	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
+	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
+	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
 
 	return 7;
 }
@@ -2626,42 +2339,6 @@ KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
 	KYTY_PROFILER_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);
-}
-
-KYTY_CP_OP_PARSER(CpOpWaitOnCeCounter) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008600);
-	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
-
-	cp.WaitCe();
-
-	return 1;
-}
-
-KYTY_CP_OP_PARSER(CpOpWaitOnDeCounterDiff) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008800);
-
-	cp.WaitDeDiff(buffer[0]);
-
-	return 1;
-}
-
-KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
-	KYTY_PROFILER_FUNCTION();
-
-	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
-	auto offset = buffer[0];
-
-	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
-	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
-	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
-
-	cp.WriteConstRam(offset, buffer + 1, dw_num);
-
-	return 1 + dw_num;
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {
@@ -2965,7 +2642,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			cp.GetCtx().SetUserClipPlane(cmd_offset - Pm4::PA_CL_UCP_0_X, value);
 		};
 	}
 
@@ -3557,7 +3234,8 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] =
 	    [](KYTY_HW_CTX_INDIRECT_ARGS) { HwCtxIgnorePaScExtendedControl(cmd_offset, value); };
 	g_hw_ctx_indirect_func[Pm4::DB_ALPHA_TO_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAlphaToMaskRegister(value);
+		cp.GetCtx().SetAlphaToMaskEnable(
+		    KYTY_PM4_GET(value, DB_ALPHA_TO_MASK, ALPHA_TO_MASK_ENABLE) != 0);
 	};
 	g_hw_ctx_indirect_func[Pm4::CB_COLOR_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetColorControl(DecodeColorControl(value));
@@ -3622,9 +3300,7 @@ void GraphicsInitJmpTablesShIndirect() {
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			auto sgpr = cmd_offset - Pm4::COMPUTE_USER_DATA_0;
-			cp.GetShCtx().SetCsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			cp.GetShCtx().SetCsUserSgpr(cmd_offset - Pm4::COMPUTE_USER_DATA_0, value);
 		};
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
@@ -3635,21 +3311,15 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t slot = 0; slot < 32; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
-			    cp.GetShCtx().SetPsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			    cp.GetShCtx().SetPsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0, value);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
-			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			    cp.GetShCtx().SetGsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, value);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
-			    cp.GetShCtx().SetHsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			    cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
 		    };
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {

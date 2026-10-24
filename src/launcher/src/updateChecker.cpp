@@ -4,6 +4,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDesktopServices>
 #include <QDir>
@@ -96,7 +97,27 @@ bool UpdateChecker::IsSupported() {
 
 void UpdateChecker::ShowPreviousResult(QWidget* parent) {
 	const auto directory = InstallDirectory();
-	QFile      result(QDir(directory).filePath(QStringLiteral(".kyty-update-result")));
+	if (!directory.isEmpty()) {
+		// The helper cannot delete its own executable on Windows, so its workspace is
+		// removed by the next launcher start.
+		const QDir install(directory);
+		for (const auto& name:
+		     install.entryList({QStringLiteral(".kyty-update-??????")},
+		                       QDir::Dirs | QDir::Hidden | QDir::NoSymLinks | QDir::NoDotAndDotDot)) {
+			QDir       workspace(install.filePath(name));
+			QDateTime  newest = QFileInfo(workspace.path()).lastModified();
+			for (const auto& entry: workspace.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden |
+			                                                QDir::NoDotAndDotDot)) {
+				newest = qMax(newest, entry.lastModified());
+			}
+			// A workspace touched recently may belong to a running download or helper. Windows
+			// lists a file still being downloaded with a stale time, so allow a generous margin.
+			if (newest.secsTo(QDateTime::currentDateTime()) > 60 * 60) {
+				workspace.removeRecursively();
+			}
+		}
+	}
+	QFile result(QDir(directory).filePath(QStringLiteral(".kyty-update-result")));
 	if (directory.isEmpty() || !result.open(QIODevice::ReadOnly)) {
 		return;
 	}

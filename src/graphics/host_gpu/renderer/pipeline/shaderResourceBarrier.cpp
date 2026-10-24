@@ -52,6 +52,7 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
+	                        vk::AccessFlagBits::eIndirectCommandRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
 	                        vk::AccessFlagBits::eColorAttachmentWrite;
@@ -92,7 +93,8 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	const auto& program   = *runtime.program;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
-	bool has_writes = false;
+	// Address writes reach memory outside the bound buffer descriptors.
+	bool has_writes = program.has_address_writes;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;

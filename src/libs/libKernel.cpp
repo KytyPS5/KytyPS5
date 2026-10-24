@@ -11,6 +11,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/module.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
@@ -65,7 +66,6 @@ LIB_DEFINE(InitLibKernel_1_Apr);
 
 namespace LibKernel {
 
-using KernelModule                   = int32_t;
 using get_thread_atexit_count_func_t = KYTY_SYSV_ABI int (*)(KernelModule);
 using thread_atexit_report_func_t    = KYTY_SYSV_ABI void (*)(KernelModule);
 
@@ -1201,9 +1201,9 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	return OK;
 }
 
-static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_name, size_t args,
-                                                        const void* argp, uint32_t flags,
-                                                        const KernelLoadModuleOpt* opt, int* res) {
+KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, size_t args,
+                                                 const void* argp, uint32_t flags,
+                                                 const KernelLoadModuleOpt* opt, int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -1255,9 +1255,9 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 	return static_cast<KernelModule>(handle);
 }
 
-static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
-                                                uint32_t flags, const KernelUnloadModuleOpt* opt,
-                                                int* res) {
+int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
+                                        uint32_t flags, const KernelUnloadModuleOpt* opt,
+                                        int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -1338,14 +1338,6 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	*mode    = 2; // PS5 Base
 	*submode = 0; // None
 	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
-	return OK;
-}
-
-static int KYTY_SYSV_ABI KernelFsync(int fd) {
-	PRINT_NAME();
-
-	LOGF("\t fd = %d\n", fd);
-
 	return OK;
 }
 
@@ -1986,6 +1978,12 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
+int KYTY_SYSV_ABI fsync(int d) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(d));
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2004,6 +2002,11 @@ int KYTY_SYSV_ABI connect(int s, const void* addr, uint32_t addrlen) {
 int KYTY_SYSV_ABI listen(int s, int backlog) {
 	PRINT_NAME();
 	return Network::Net::Listen(s, backlog);
+}
+
+int KYTY_SYSV_ABI shutdown(int s, int how) {
+	PRINT_NAME();
+	return Network::Net::Shutdown(s, how);
 }
 
 int KYTY_SYSV_ABI accept(int s, void* addr, uint32_t* addrlen) {
@@ -2169,6 +2172,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
 	LIB_FUNC("8nY19bKoiZk", Posix::fcntl);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
@@ -2242,6 +2246,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);
 	LIB_FUNC("XVL8So3QJUk", Posix::connect);
 	LIB_FUNC("pxnCmagrtao", Posix::listen);
+	LIB_FUNC("TUuiYS2kE8s", Posix::shutdown);
 	LIB_FUNC("3e+4Iv7IJ8U", Posix::accept);
 	LIB_FUNC("RenI1lL1WFk", Posix::getsockname);
 	LIB_FUNC("6O8EwYOgH9Y", Posix::getsockopt);
@@ -3388,7 +3393,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
-	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
+	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
 	LIB_FUNC("9BcDykPmo1I", LibKernel::get_error_addr);

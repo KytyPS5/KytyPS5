@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -10,6 +11,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/openxrHeadset.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -324,6 +327,7 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
@@ -915,7 +919,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
+                                          bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -935,6 +940,12 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (headset) {
+		// The frame holds the raw display-encoded pixels the headset needs.
+		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		               vk::AccessFlagBits2::eTransferRead);
+		Vr::OpenXrQueueEyeSource(buffer, frame->image);
+	}
 	return *frame;
 }
 
@@ -1039,8 +1050,8 @@ void Presenter::Impl::Present() {
 		// present_mutex owns the prepared frames and this scheduler. Only queue submission
 		// is shared with rendering, and it has its own queue_mutex.
 		auto&      command = present_scheduler.BeginCommand();
-		const bool draw_system_overlay =
-		    overlay_visual.active && swapchain.PrepareSystemOverlay();
+		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
+		                                 swapchain.PrepareSystemOverlay();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
 		const auto tick = swapchain.Submit(present_scheduler);
@@ -1060,6 +1071,7 @@ void Presenter::Impl::Present() {
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
 }
 
 void Presenter::Discard(Frame& frame) {

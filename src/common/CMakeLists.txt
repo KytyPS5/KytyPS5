@@ -43,6 +43,10 @@ target_link_libraries(common
 		ZArchive::zarchive
 		nlohmann_json::nlohmann_json
 )
+if(APPLE)
+	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.
+	target_link_libraries(common PRIVATE "-framework CoreFoundation" "-framework IOKit")
+endif()
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)
 set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})

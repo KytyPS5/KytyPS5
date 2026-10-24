@@ -73,7 +73,6 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::DB_ALPHA_TO_MASK]                      = HwCtxSetAlphaToMask;
 	g_hw_ctx_func[Pm4::VGT_DRAW_PAYLOAD_CNTL]                 = HwCtxSetDrawPayloadControl;
 	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
 	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;
@@ -200,10 +199,9 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_INDIRECT_BUFFER]           = CpOpIndirectBuffer;
 	g_cp_op_func[Pm4::IT_COPY_DATA]                 = CpOpCopyData;
 	g_cp_op_func[Pm4::IT_EVENT_WRITE]               = CpOpEventWrite;
-	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOP]           = CpOpEventWriteEop;
-	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOS]           = CpOpEventWriteEos;
 	g_cp_op_func[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
 	g_cp_op_func[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
+	g_cp_op_func[Pm4::IT_RELEASE_MEM]               = CpOpReleaseMem;
 	g_cp_op_func[Pm4::IT_REWIND]                    = CpOpRewind;
 	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG]           = CpOpSetContextReg;
 	g_cp_op_func[Pm4::IT_SET_SH_REG]                = CpOpSetShaderReg;
@@ -212,12 +210,6 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG_INDIRECT]  = CpOpIndirectCxRegs;
 	g_cp_op_func[Pm4::IT_SET_SH_REG_INDIRECT]       = CpOpIndirectShRegs;
 	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG_INDIRECT]  = CpOpIndirectUcRegs;
-	g_cp_op_func[Pm4::IT_WRITE_CONST_RAM]           = CpOpWriteConstRam;
-	g_cp_op_func[Pm4::IT_DUMP_CONST_RAM]            = CpOpDumpConstRam;
-	g_cp_op_func[Pm4::IT_INCREMENT_CE_COUNTER]      = CpOpIncrementCeCounter;
-	g_cp_op_func[Pm4::IT_INCREMENT_DE_COUNTER]      = CpOpIncrementDeCounter;
-	g_cp_op_func[Pm4::IT_WAIT_ON_CE_COUNTER]        = CpOpWaitOnCeCounter;
-	g_cp_op_func[Pm4::IT_WAIT_ON_DE_COUNTER_DIFF]   = CpOpWaitOnDeCounterDiff;
 	g_cp_op_func[Pm4::IT_GET_LOD_STATS]             = CpOpGetLodStats;
 	g_cp_op_func[Pm4::IT_WAIT_REG_MEM_64]           = CpOpWaitRegMem64;
 
@@ -232,7 +224,6 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
 	g_cp_op_custom_func[Pm4::R_POP_MARKER]     = CpOpPopMarker;
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
-	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
 
 	return g_cp_op_custom_func;

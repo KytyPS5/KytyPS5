@@ -151,6 +151,8 @@ int LoadExec(const char* path, const char* const argv[]) {
 	CloseHandle(process.hThread);
 	CloseHandle(process.hProcess);
 	Common::QuickExit(0);
+	// Nonzero, or the launcher's "cmd /K ... && exit" closes the console the new process shares.
+	std::quick_exit(1);
 #else
 	std::ifstream            command("/proc/self/cmdline", std::ios::binary);
 	std::vector<std::string> host_arguments;

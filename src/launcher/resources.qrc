@@ -7,6 +7,8 @@
   <file alias="grid-view.svg">icons/grid-view.svg</file>
   <file alias="remove-configuration.svg">icons/remove-configuration.svg</file>
   <file alias="trophy.svg">icons/trophy.svg</file>
+  <file alias="kyty.svg">icons/kyty.svg</file>
+  <file alias="kyty-small.svg">icons/kyty-small.svg</file>
   <file alias="hidden-trophy.png">../../assets/images/hidden-trophy.png</file>
  </qresource>
  <qresource prefix="/styles">

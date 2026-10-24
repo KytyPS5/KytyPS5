@@ -18,7 +18,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("2JtWUUiYBXs", Gen5::AgcGetRegisterDefaults2);
 	LIB_FUNC("wRbq6ZjNop4", Gen5::AgcGetRegisterDefaults2Internal);
 	LIB_FUNC("f3dg2CSgRKY", Gen5::AgcCreateShader);
-	LIB_FUNC("dolOmWH+huQ", Gen5::AgcUnknownGetFusedShaderSize);
+	LIB_FUNC("dolOmWH+huQ", Gen5::AgcGetFusedShaderSize);
 	LIB_FUNC("fd5Bp5tGTgo", Gen5::AgcFuseShaderHalves_0200);
 	LIB_FUNC("nApJjpKNBl4", Gen5::AgcFuseShaderHalves);
 	LIB_FUNC("vcmNN+AAXnY", Gen5::AgcSetCxRegIndirectPatchSetAddress);

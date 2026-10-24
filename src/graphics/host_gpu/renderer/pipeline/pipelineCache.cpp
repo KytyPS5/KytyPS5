@@ -841,7 +841,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -1015,7 +1015,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return iter->second.get();
+	}
+	if (m_failed_graphics_pipelines.contains(key)) {
+		return nullptr;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1030,23 +1033,41 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	PipelineCreateResult create_result = PipelineCreateResult::ResourceFailure;
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
+		create_result = CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input,
+		                                       vertex_info, ps_input_info, programs, static_params,
+		                                       m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	if (create_result != PipelineCreateResult::Created) {
+		if (create_result == PipelineCreateResult::Rejected) {
+			// The host deterministically rejected this configuration. Remember it so
+			// later draws with the same state skip creation instead of stalling on
+			// repeated failures. Resource failures are not cached: later draws retry
+			// creation once memory is available again.
+			if (m_failed_graphics_pipelines.size() < 4096) {
+				m_failed_graphics_pipelines.insert(key);
+			} else {
+				static std::atomic_bool cap_warned = false;
+				if (!cap_warned.exchange(true, std::memory_order_relaxed)) {
+					PipelineCacheLog("Vulkan pipeline cache: too many rejected configurations; "
+					                 "further failures will retry creation");
+				}
+			}
+		}
+		return nullptr;
+	}
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
 
-	return *iter->second;
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&

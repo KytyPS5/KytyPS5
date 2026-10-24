@@ -294,16 +294,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
-		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
-		    rt.dcc_addr.addr != 0x0000000000000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
-				     " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
-				     rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
-				logged = true;
-			}
-		}
 	}
 }
 
@@ -383,10 +373,9 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 static void ClipCheck(const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
-	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
-	                     c.force_viewport_index_from_vs_enable);
+	EXIT_NOT_IMPLEMENTED(c.user_clip_plane_mode != 0 || c.vertex_kill_any ||
+	                     c.user_clip_plane_negate_y || c.user_clip_plane_cull_only ||
+	                     c.cull_on_clipping_error_disable || c.force_viewport_index_from_vs_enable);
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {

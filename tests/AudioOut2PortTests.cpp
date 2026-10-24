@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -32,6 +33,8 @@ size_t                            g_capture_bytes = 0;
 int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
+bool                              g_block_outputs = false;
+std::vector<int>                  g_blocked_output;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -187,6 +190,22 @@ void WaitForDeviceOpens(int count) {
 void ReleaseDeviceOpens() {
 	std::lock_guard lock(g_device_mutex);
 	g_block_opens = false;
+	g_device_cv.notify_all();
+}
+
+void BlockOutputs() {
+	std::lock_guard lock(g_device_mutex);
+	g_block_outputs = true;
+}
+
+void WaitForBlockedOutput() {
+	std::unique_lock lock(g_device_mutex);
+	g_device_cv.wait(lock, []() { return !g_blocked_output.empty(); });
+}
+
+void ReleaseOutputs() {
+	std::lock_guard lock(g_device_mutex);
+	g_block_outputs = false;
 	g_device_cv.notify_all();
 }
 
@@ -605,6 +624,46 @@ void TestObjectBusRouting() {
 	Check(LiveDeviceCount() == 0, "object bus device leaked");
 }
 
+void TestBlockedPushOnlyHoldsItsContext() {
+	const auto blocked      = CreateContext(4, 1);
+	const auto other        = CreateContext();
+	const auto blocked_port = CreatePort(blocked, MakeParam());
+	const auto other_port   = CreatePort(other, MakeParam());
+	auto       object_param = MakeParam(0x100);
+	object_param.port_type  = 0x100;
+	std::vector<float> pcm(512 * 2, 0.25f);
+	SetPcm(blocked_port, pcm.data());
+	SetPcm(CreatePort(blocked, object_param), pcm.data());
+	CaptureOutputPcm(pcm.size() * sizeof(float));
+
+	BlockOutputs();
+	std::thread pusher([&]() { Check(AudioOut2::AudioOut2ContextPush(blocked, 1) == OK, "blocked push failed"); });
+	WaitForBlockedOutput();
+	std::fill(pcm.begin(), pcm.end(), 0.5f);
+	SetPcm(blocked_port, pcm.data());
+	SetAttribute(blocked_port, 1, std::array {0.5f, 0.5f});
+	SetPcm(other_port, pcm.data());
+	Check(AudioOut2::AudioOut2ContextPush(other, 1) == OK, "push stalled behind another context");
+	// Give each destroyer time to close a device of the blocked output; the backend fails if it does.
+	std::thread port_destroyer([&]() { AudioOut2::AudioOut2PortDestroy(blocked_port); });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	std::thread context_destroyer([&]() { AudioOut2::AudioOut2ContextDestroy(blocked); });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	ReleaseOutputs();
+	pusher.join();
+	port_destroyer.join();
+	context_destroyer.join();
+
+	const auto output = OutputPcm();
+	Check(output.size() == 3, "pushes did not reach the backend once each");
+	CheckSamples(output[0], {0.5f}, "other context missed its PCM");
+	CheckSamples(output[1], {0.25f}, "PCM changed while its push was in flight");
+	Check(g_output_gains[0] == std::array {1.0f, 1.0f}, "gains changed while their push was in flight");
+	Check(LiveDeviceCount() == 1, "destroyed port or context kept its device");
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2ContextDestroy(other);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -625,6 +684,8 @@ int AudioOutOpen(int type, uint32_t /*samples_num*/, uint32_t /*freq*/, Format /
 void AudioOutClose(int handle) {
 	std::lock_guard lock(g_device_mutex);
 	const auto      it = std::find(g_live_devices.begin(), g_live_devices.end(), handle);
+	Check(std::find(g_blocked_output.begin(), g_blocked_output.end(), handle) == g_blocked_output.end(),
+	      "device closed during its output");
 	if (it != g_live_devices.end()) {
 		g_live_devices.erase(it);
 	}
@@ -642,8 +703,16 @@ bool AudioOutHasDevice(int handle) {
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
-	std::lock_guard lock(g_device_mutex);
+	std::unique_lock lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	if (g_block_outputs && g_blocked_output.empty()) {
+		for (uint32_t i = 0; i < num; i++) {
+			g_blocked_output.push_back(params[i].handle);
+		}
+		g_device_cv.notify_all();
+		g_device_cv.wait(lock, []() { return !g_block_outputs; });
+		g_blocked_output.clear();
+	}
 	g_output_gains.clear();
 	if (g_capture_bytes != 0) {
 		for (uint32_t i = 0; i < num; i++) {
@@ -683,6 +752,7 @@ int main() {
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
+	TestBlockedPushOnlyHoldsItsContext();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

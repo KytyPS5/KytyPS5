@@ -688,7 +688,8 @@ public:
 	bool Find(uint64_t phys_addr, bool next, PhysicalMemory::AllocatedBlock* out);
 	bool CanMapDirect(uint64_t phys_addr, size_t len);
 	bool ReleasePoolExpansion(uint64_t phys_addr, size_t len);
-	bool GetAllocatedSpan(uint64_t phys_addr, size_t len, std::vector<AllocatedBlock>* blocks);
+	bool GetAllocatedSpan(uint64_t phys_addr, size_t len, bool skip_gaps,
+	                      std::vector<AllocatedBlock>* blocks);
 	std::vector<AllocatedBlock> FindMappings(uint64_t phys_addr, size_t len);
 	void ProtectMapping(uint64_t vaddr, uint64_t size, int prot, VirtualMemory::Mode mode,
 	                    GpuAccessMode gpu_mode);
@@ -1353,87 +1354,31 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
                          int memory_type) {
 	Common::LockGuard lock(m_mutex);
 
-	if (len == 0 || UINT64_MAX - phys_addr < len) {
+	if (!CanMapDirect(phys_addr, len)) {
 		return false;
 	}
 
-	auto current = phys_addr;
-	auto next    = m_physical.upper_bound(current);
-	if (next == m_physical.begin()) {
-		return false;
-	}
-	auto first = std::prev(next);
-	bool has_automatic = false;
-	while (current < phys_addr + len) {
-		auto block = m_physical.upper_bound(current);
-		if (block == m_physical.begin()) {
-			return false;
-		}
-		--block;
-		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
-		    current >= block_end) {
-			return false;
-		}
-		has_automatic |= block->second.kind == AllocationKind::Automatic;
-		current = std::min<uint64_t>(phys_addr + len, block_end);
-		if (current < phys_addr + len) {
-			const auto following = std::next(block);
-			if (following == m_physical.end() || following->second.start_addr != current) {
-				return false;
-			}
-		}
-	}
-
-	AllocatedBlock mapping = first->second;
-	mapping.start_addr     = phys_addr;
-	mapping.size           = len;
-	mapping.map_vaddr      = vaddr;
-	mapping.map_size       = len;
-	mapping.host_vaddr     = vaddr;
-	mapping.host_size      = len;
-	mapping.prot           = prot;
-	mapping.mode           = mode;
-	mapping.gpu_mode       = gpu_mode;
-	mapping.memory_type    = memory_type;
+	AllocatedBlock mapping {};
+	mapping.start_addr  = phys_addr;
+	mapping.size        = len;
+	mapping.map_vaddr   = vaddr;
+	mapping.map_size    = len;
+	mapping.host_vaddr  = vaddr;
+	mapping.host_size   = len;
+	mapping.prot        = prot;
+	mapping.mode        = mode;
+	mapping.gpu_mode    = gpu_mode;
+	mapping.memory_type = memory_type;
 	CopyVirtualRangeName(mapping.name, name);
 	m_mappings.push_back(mapping);
-	if (has_automatic) {
-		RemoveFreeRange(m_automatic_free, phys_addr, len);
-	}
+	RemoveFreeRange(m_automatic_free, phys_addr, len);
 
 	return true;
 }
 
 bool PhysicalMemory::CanMapDirect(uint64_t phys_addr, size_t len) {
-	Common::LockGuard lock(m_mutex);
-
-	if (len == 0 || UINT64_MAX - phys_addr < len) {
-		return false;
-	}
-
-	const auto end     = phys_addr + len;
-	auto       current = phys_addr;
-	while (current < end) {
-		auto block = m_physical.upper_bound(current);
-		if (block == m_physical.begin()) {
-			return false;
-		}
-		--block;
-		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
-		    current >= block_end) {
-			return false;
-		}
-		current = std::min(end, block_end);
-		if (current < end) {
-			const auto following = std::next(block);
-			if (following == m_physical.end() || following->second.start_addr != current) {
-				return false;
-			}
-		}
-	}
-	return true;
+	std::vector<AllocatedBlock> blocks;
+	return GetAllocatedSpan(phys_addr, len, false, &blocks);
 }
 
 bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {
@@ -1448,7 +1393,7 @@ bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {
 	return true;
 }
 
-bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len,
+bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len, bool skip_gaps,
                                       std::vector<AllocatedBlock>* blocks) {
 	EXIT_IF(blocks == nullptr);
 	blocks->clear();
@@ -1459,34 +1404,26 @@ bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len,
 	Common::LockGuard lock(m_mutex);
 	const auto        end     = phys_addr + len;
 	auto              current = phys_addr;
-	while (current < end) {
-		auto block = m_physical.upper_bound(current);
-		if (block == m_physical.begin()) {
-			blocks->clear();
-			return false;
-		}
+	auto              block   = m_physical.upper_bound(phys_addr);
+	if (block != m_physical.begin()) {
 		--block;
+	}
+	for (; block != m_physical.end() && block->second.start_addr < end; ++block) {
 		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
-		    current >= block_end) {
-			blocks->clear();
+		if (block_end <= current) {
+			continue;
+		}
+		if (block->second.kind == AllocationKind::Pooled ||
+		    (!skip_gaps && current < block->second.start_addr)) {
 			return false;
 		}
-
 		auto part       = block->second;
-		part.start_addr = current;
-		part.size       = std::min(end, block_end) - current;
+		part.start_addr = std::max(current, part.start_addr);
+		current         = std::min(end, block_end);
+		part.size       = current - part.start_addr;
 		blocks->push_back(part);
-		current += part.size;
-		if (current < end) {
-			const auto following = std::next(block);
-			if (following == m_physical.end() || following->second.start_addr != current) {
-				blocks->clear();
-				return false;
-			}
-		}
 	}
-	return true;
+	return skip_gaps || current == end;
 }
 
 bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mode,
@@ -2855,7 +2792,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 	                                  alignment, memory_type, phys_addr_out);
 }
 
-static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
+static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool skip_gaps) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	if (g_pooled_memory->ReleaseExpansion(static_cast<uint64_t>(start), len)) {
@@ -2866,7 +2803,8 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 	}
 
 	std::vector<PhysicalMemory::AllocatedBlock> allocated_span;
-	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, &allocated_span)) {
+	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, skip_gaps,
+	                                         &allocated_span)) {
 		return KERNEL_ERROR_EACCES;
 	}
 
@@ -2965,7 +2903,8 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 		return validation;
 	}
 	if (len != 0) {
-		(void)ReleaseDirectMemoryInternal(start, len);
+		// An unchecked release frees the allocated parts and skips the unallocated ones.
+		(void)ReleaseDirectMemoryInternal(start, len, true);
 	}
 	return OK;
 }
@@ -2982,7 +2921,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 		return validation;
 	}
 
-	const int result = ReleaseDirectMemoryInternal(start, len);
+	const int result = ReleaseDirectMemoryInternal(start, len, false);
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 

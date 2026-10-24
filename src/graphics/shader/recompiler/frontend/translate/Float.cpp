@@ -222,13 +222,10 @@ void Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 			break;
 		case 1u: result = select_face(SelectF32(x_neg, z, nz), x, SelectF32(z_neg, nx, x)); break;
 		case 2u: result = select_face(ny, SelectF32(y_neg, nz, z), ny); break;
-		case 3u: {
-			const auto two = IR::F32(IR::Value::F32(2.0f));
-			result         = select_face(IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {x, two})),
-			                             IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {y, two})),
-			                             IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {z, two})));
+		case 3u:
+			result = IR::F32(
+			    ir.Emit(IR::ValueOpcode::FPMul32, {select_face(x, y, z), IR::Value::F32(2.0f)}));
 			break;
-		}
 		default: EXIT("invalid cube result kind");
 	}
 	WriteOperand(DestinationOperand(inst), result);

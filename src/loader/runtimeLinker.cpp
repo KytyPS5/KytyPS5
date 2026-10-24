@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -670,6 +671,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			return true;
+		}
+		if (const auto length =
+		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
 	}

@@ -6,13 +6,14 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 struct MemoryOpcodeInfo {
-	uint32_t encoding    = 0;
-	Opcode   decoded     = Opcode::UNSUPPORTED;
-	uint32_t data_dwords = 1;
-	uint32_t data_bits   = 32;
-	bool     data_signed = false;
-	bool     typed       = false;
-	bool     formatted   = false;
+	uint32_t encoding        = 0;
+	Opcode   decoded         = Opcode::UNSUPPORTED;
+	uint32_t data_dwords     = 1;
+	uint32_t data_bits       = 32;
+	bool     data_signed     = false;
+	bool     typed           = false;
+	bool     formatted       = false;
+	uint32_t data_components = 0; // D16 formats pack two components per dword
 };
 
 constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
@@ -70,10 +71,16 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
+    {0x71u, Opcode::BUFFER_GL0_INV, 0, 0},
+    {0x72u, Opcode::BUFFER_GL1_INV, 0, 0},
     {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true},
+    {0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
     {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true},
+    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -156,13 +163,16 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 		inst.opcode = Opcode::UNSUPPORTED;
 		return;
 	}
-	inst.opcode      = info->decoded;
-	inst.data_dwords = info->data_dwords;
-	inst.data_bits   = info->data_bits;
-	inst.data_signed = info->data_signed;
-	inst.typed       = info->typed;
-	inst.formatted   = info->formatted;
+	inst.opcode          = info->decoded;
+	inst.data_dwords     = info->data_dwords;
+	inst.data_bits       = info->data_bits;
+	inst.data_signed     = info->data_signed;
+	inst.typed           = info->typed;
+	inst.formatted       = info->formatted;
+	inst.data_components = info->data_components;
 }
+
+} // namespace
 
 bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -181,6 +191,8 @@ bool IsDsWriteOpcode(Opcode opcode) {
 		default: return false;
 	}
 }
+
+namespace {
 
 bool IsDsAtomicOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -312,14 +324,12 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
+	if (inst.opcode == Opcode::BUFFER_GL0_INV || inst.opcode == Opcode::BUFFER_GL1_INV) {
+		return;
+	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZW ||
-	    inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_XYZW) {
-		inst.data_components = 4u;
-	}
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X ||
-	    inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
+	if (inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
 		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ? 5u : 4u;

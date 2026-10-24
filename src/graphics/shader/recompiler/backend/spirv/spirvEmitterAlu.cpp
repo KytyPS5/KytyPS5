@@ -92,6 +92,59 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t value) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
+uint32_t EmitF32ToF16RneBits(EmitterState& state, uint32_t value) {
+	// V_CVT_F16_F32 and f16 ALU results round to nearest even. PackHalf2x16 rounds toward zero on
+	// AMD drivers, so use integer conversion like EmitF32ToF16RtzBits.
+	const auto bits = EmitBitcastF32ToU32(state, value);
+	const auto abs  = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign = EmitAndConstant(
+	    state,
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, ConstantU32(state, 16)),
+	    0x8000u);
+	const auto exp =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs, ConstantU32(state, 23));
+	const auto truncated =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs, ConstantU32(state, 13));
+
+	// Round by adding half an ULP minus one plus the parity of the kept bits. Shifts stay < 32.
+	const auto shift =
+	    EmitUMin32(state, Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 126), exp),
+	               ConstantU32(state, 31));
+	const auto full =
+	    EmitOrU32(state, EmitAndConstant(state, abs, 0x007fffffu), ConstantU32(state, 0x00800000u));
+	const auto half =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1), shift),
+	           ConstantU32(state, 1));
+	const auto sub_bias = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpISub, TypeU32(state), half, ConstantU32(state, 1)),
+	    EmitAndConstant(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), full, shift),
+	                    1u));
+	const auto sub = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                        Binary(state, spv::OpIAdd, TypeU32(state), full, sub_bias), shift);
+
+	// Rebias the exponent; finite values from 65520 up round to infinity.
+	const auto rounded =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	           Binary(state, spv::OpIAdd, TypeU32(state), abs,
+	                  Binary(state, spv::OpIAdd, TypeU32(state), ConstantU32(state, 0x0fffu),
+	                         EmitAndConstant(state, truncated, 1u))),
+	           ConstantU32(state, 13));
+	const auto normal = EmitUMin32(
+	    state, Binary(state, spv::OpISub, TypeU32(state), rounded, ConstantU32(state, 0x1c000u)),
+	    ConstantU32(state, 0x7c00u));
+	const auto finite =
+	    Select(state, TypeU32(state),
+	           EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u), sub, normal);
+	const auto nan =
+	    EmitOrU32(state, EmitAndConstant(state, truncated, 0x03ffu), ConstantU32(state, 0x7e00u));
+	const auto magnitude =
+	    Select(state, TypeU32(state),
+	           EmitCompareU32Constant(state, spv::OpUGreaterThan, abs, 0x7f800000u), nan, finite);
+	return EmitOrU32(state, sign, magnitude);
+}
+
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	// Clamping first keeps the truncating conversion defined; NaN and values past the largest
 	// float below the integer limit are selected afterwards.
@@ -144,10 +197,7 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
-	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
-	                          ConstantF32(state, 0));
-	return EmitPackHalf2x16(state, pair);
+	return EmitF32ToF16RneBits(state, arg0);
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {

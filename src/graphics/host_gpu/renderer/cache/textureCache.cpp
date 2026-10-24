@@ -1219,7 +1219,10 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data == stencil &&
+		// PPSA23566
+		// Small depth and stencil planes are one 64 KiB block each, so another depth surface can
+		// occupy this exact range. Adopting it would orphan its own stencil associations.
+		if (owner != nullptr && !owner->info.IsDepth() && owner->info.data == stencil &&
 		    owner->info.extent == depth.info.extent) {
 			association = id;
 		}

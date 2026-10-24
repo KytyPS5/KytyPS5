@@ -9050,6 +9050,69 @@ public:
       texture_cache.UnmapMemory(reused_stencil_color.info.data.address,
                                 reused_stencil_color.info.data.size);
 
+      // PPSA23566: small tiled depth and stencil planes are each one 64 KiB
+      // block, so a pooled depth surface can occupy exactly the range of
+      // another target's stencil plane.
+      TileSizeAlign pooled_depth_size{};
+      TileSizeAlign pooled_stencil_size{};
+      TileSizeAlign pooled_htile_size{};
+      Require(name, "pooled depth/stencil footprint",
+              TileGetDepthSize(32, 32, 0, Prospero::DepthFormat::kZ32F,
+                               Prospero::StencilFormat::k8UInt, true,
+                               pooled_stencil_size, pooled_htile_size,
+                               pooled_depth_size, 0) &&
+                  pooled_depth_size.size == 0x10000 &&
+                  pooled_stencil_size.size == 0x10000,
+              "small depth and stencil planes no longer share a footprint");
+      auto pooled_depth = reused_stencil_depth;
+      pooled_depth.info.data.address = base + 0x2200000;
+      pooled_depth.info.stencil = {base + 0x2210000, 0x10000};
+      const auto pooled_depth_id = texture_cache.FindImage(pooled_depth);
+      TextureCacheTestAccess::AssociateStencil(texture_cache, pooled_depth_id,
+                                               pooled_depth.info.stencil);
+      const auto pooled_stencil = texture_cache.FindImageFromRange(
+          pooled_depth.info.stencil.address, pooled_depth.info.stencil.size,
+          false);
+      auto reusing_depth = reused_stencil_depth;
+      reusing_depth.info.data.address = base + 0x2220000;
+      reusing_depth.info.stencil = pooled_depth.info.data;
+      const auto reusing_depth_id = texture_cache.FindImage(reusing_depth);
+      TextureCacheTestAccess::AssociateStencil(texture_cache, reusing_depth_id,
+                                               reusing_depth.info.stencil);
+      Require(name, "stencil plane over a pooled depth surface",
+              pooled_stencil &&
+                  texture_cache.GetImage(pooled_stencil).depth_id ==
+                      pooled_depth_id &&
+                  !texture_cache.GetImage(pooled_depth_id).depth_id &&
+                  texture_cache.GetImage(pooled_depth_id).info.IsDepth() &&
+                  texture_cache.GetImage(pooled_depth_id).stencil_ids ==
+                      std::vector{pooled_stencil},
+              "a depth image was adopted as another target's stencil "
+              "association");
+      const auto &reusing_stencils =
+          texture_cache.GetImage(reusing_depth_id).stencil_ids;
+      Require(name, "separate stencil association over a pooled depth surface",
+              reusing_stencils.size() == 1 &&
+                  reusing_stencils[0] != pooled_depth_id &&
+                  texture_cache.GetImage(reusing_stencils[0]).depth_id ==
+                      reusing_depth_id &&
+                  texture_cache.GetImage(reusing_stencils[0]).info.data ==
+                      reusing_depth.info.stencil,
+              "the reusing depth target has no stencil association of its own");
+      texture_cache.UnmapMemory(pooled_depth.info.data.address,
+                                pooled_depth.info.data.size);
+      scheduler.Finish();
+      // Deleting an orphaned association indexes its erased depth owner.
+      texture_cache.UnmapMemory(pooled_depth.info.stencil.address,
+                                pooled_depth.info.stencil.size);
+      Require(
+          name, "pooled depth retires its stencil association",
+          !TextureCacheTestAccess::Contains(texture_cache, pooled_stencil) &&
+              TextureCacheTestAccess::Contains(texture_cache, reusing_depth_id),
+          "the pooled depth surface left its stencil association behind");
+      texture_cache.UnmapMemory(reusing_depth.info.data.address,
+                                reusing_depth.info.data.size);
+
       constexpr uint64_t exact_image_offset = 0x334100;
       constexpr uint64_t dirty_sibling_offset = 0x334200;
       constexpr uint32_t dirty_sibling_value = 0xc001d00du;

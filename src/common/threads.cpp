@@ -417,11 +417,15 @@ ThreadWithStack::ThreadWithStack(thread_func_t func, void* arg, size_t stack_siz
 	                   m_thread.get(), STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
 	EXIT_IF(m_thread->handle == nullptr);
 #else
+	// The calls stay outside EXIT_IF, which does not evaluate its argument in KYTY_FINAL builds.
 	pthread_attr_t attr;
-	EXIT_IF(pthread_attr_init(&attr) != 0);
-	EXIT_IF(pthread_attr_setstacksize(&attr, stack_size) != 0);
-	EXIT_IF(pthread_create(&m_thread->thread, &attr, ThreadWithStackPrivate::Run, m_thread.get()) !=
-	        0);
+	const int      init = pthread_attr_init(&attr);
+	EXIT_IF(init != 0);
+	const int stack = pthread_attr_setstacksize(&attr, stack_size);
+	EXIT_IF(stack != 0);
+	const int created =
+	    pthread_create(&m_thread->thread, &attr, ThreadWithStackPrivate::Run, m_thread.get());
+	EXIT_IF(created != 0);
 	pthread_attr_destroy(&attr);
 #endif
 }
@@ -434,10 +438,12 @@ void ThreadWithStack::Join() {
 	if (m_thread->joined) return;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	EXIT_IF(GetThreadId(m_thread->handle) == GetCurrentThreadId());
-	EXIT_IF(WaitForSingleObject(m_thread->handle, INFINITE) != WAIT_OBJECT_0);
+	const auto waited = WaitForSingleObject(m_thread->handle, INFINITE);
+	EXIT_IF(waited != WAIT_OBJECT_0);
 	CloseHandle(m_thread->handle);
 #else
-	EXIT_IF(pthread_join(m_thread->thread, nullptr) != 0);
+	const int error = pthread_join(m_thread->thread, nullptr);
+	EXIT_IF(error != 0);
 #endif
 	m_thread->joined = true;
 }

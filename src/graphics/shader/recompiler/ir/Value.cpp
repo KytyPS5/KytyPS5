@@ -208,10 +208,14 @@ const std::vector<Use>& Inst::Uses() const {
 }
 
 void Inst::SetParent(Block* block) {
+	if (parent != nullptr && parent != block) {
+		NoteIrMutation();
+	}
 	parent = block;
 }
 
 void Inst::SetArg(size_t index, Value value) {
+	NoteIrMutation();
 	const auto old = Arg(index);
 	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
@@ -230,6 +234,7 @@ void Inst::SetArg(size_t index, Value value) {
 
 void Inst::AddPhiOperand(Block* predecessor, Value value) {
 	EXIT_IF(opcode != ValueOpcode::Phi);
+	NoteIrMutation();
 	const auto index = phi_args.size();
 	phi_args.emplace_back(predecessor, value);
 	if (auto* value_inst = value.TryInstruction(); value_inst != nullptr) {
@@ -244,6 +249,7 @@ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
 	}
 	Invalidate();
 	if (preserve) {
+		NoteIrMutation();
 		opcode = ValueOpcode::Identity;
 		num_args = 1;
 		SetArg(0, replacement);
@@ -251,6 +257,7 @@ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
 }
 
 void Inst::Invalidate() {
+	NoteIrMutation();
 	ClearArgs();
 	opcode = ValueOpcode::Void;
 }
@@ -270,6 +277,7 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
 }
 
 void Inst::ClearArgs() {
+	NoteIrMutation();
 	for (size_t index = 0; index < NumArgs(); index++) {
 		if (auto* value_inst = Arg(index).TryInstruction(); value_inst != nullptr) {
 			RemoveUse(value_inst, index);

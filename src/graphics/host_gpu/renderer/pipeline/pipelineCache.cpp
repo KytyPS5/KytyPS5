@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/polygonMode.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -50,28 +51,6 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 		case Prospero::BlendFactor::kOneMinusSrcAlpha:
 			return static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
 		default: return factor;
-	}
-}
-
-vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
-	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
-	if (mode.poly_mode == 0) {
-		return vk::PolygonMode::eFill;
-	}
-	EXIT_NOT_IMPLEMENTED(mode.poly_mode != 1);
-	if (cull_front && cull_back) {
-		return vk::PolygonMode::eFill;
-	}
-	if (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype) {
-		EXIT("Pipeline: different polygon modes for two visible faces are unsupported\n");
-	}
-	// Vulkan has one polygon mode. A culled face does not constrain that mode.
-	const auto polygon_mode = cull_front ? mode.polymode_back_ptype : mode.polymode_front_ptype;
-	switch (polygon_mode) {
-		case 0: return vk::PolygonMode::ePoint;
-		case 1: return vk::PolygonMode::eLine;
-		case 2: return vk::PolygonMode::eFill;
-		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
 	}
 }
 
@@ -989,7 +968,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.face       = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back,
+	                       m_graphics.fill_mode_non_solid_enabled);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||

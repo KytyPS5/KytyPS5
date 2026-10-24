@@ -11461,6 +11461,120 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckOrderedAppendRanks() {
+    constexpr const char *name = "OrderedAppendRanks";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t args = base + 0x8000;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    // Each wave stores its TG_SIZE ordered-append term at the slot
+    // DS_ORDERED_COUNT returns, so slot i must hold i: the term is the
+    // dispatch-order rank and waves are served in that order, whether or not
+    // the dispatch is split per workgroup.
+    std::vector<u32> code{EncodeSop2(0x27, 5, 4, 255),
+                          0x000b0006u,
+                          EncodeSMovB32(124, 5),
+                          EncodeSop1(0x04, 126, InlineU32(1)),
+                          EncodeVop1(0x01, 2, InlineU32(1)),
+                          EncodeDs0(0x3f, 0x300, true),
+                          EncodeDs1(3, 0, 2),
+                          EncodeSopp(0x0c, 0),
+                          EncodeVop2(0x1a, 1, InlineU32(2), 3),
+                          EncodeVop1(0x01, 4, 5),
+                          EncodeMubuf0(0x1c),
+                          EncodeMubuf1(4, 0, 1)};
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "ordered-append rank allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "ordered-append rank mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      for (u32 wave_size : {32u, 64u}) {
+        for (const auto groups :
+             {std::array{3u, 1u, 1u}, std::array{2u, 2u, 2u},
+              std::array{3u, 2u, 1u}}) {
+          // Direct dispatches of one-wave groups are split per workgroup.
+          for (bool indirect : {false, true}) {
+            const u32 count = groups[0] * groups[1] * groups[2];
+            cache.FillBuffer(base, 64 * sizeof(u32), sentinel, false);
+            cache.FillBuffer(0, sizeof(u32), 0, true);
+            shaders.SetCsShader(
+                {.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                 .num_thread_x = wave_size,
+                 .num_thread_y = 1,
+                 .num_thread_z = 1,
+                 .wave_size = static_cast<uint8_t>(wave_size),
+                 .user_sgpr = 4,
+                 .tg_size_en = true});
+            ShaderBufferResource output{};
+            output.UpdateAddress48(base);
+            output.fields[2] = 64 * sizeof(u32);
+            output.fields[3] =
+                DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+            for (u32 i = 0; i < 4; ++i)
+              shaders.SetCsUserSgpr(i, output.fields[i],
+                                    HW::UserSgprType::Unknown);
+            const u32 mode = wave_size == 32 ? 0x8049u : 0x49u;
+            if (indirect) {
+              LibKernel::Memory::WriteBacking(args, groups.data(),
+                                              sizeof(groups));
+              processor.DispatchIndirect(args, mode);
+            } else {
+              processor.DispatchDirect(groups[0], groups[1], groups[2], mode);
+            }
+            cache.CopyBuffer(base + 63 * sizeof(u32), 0, sizeof(u32), false,
+                             true);
+            cache.ReadMemory(base, 64 * sizeof(u32));
+            std::array<u32, 64> actual{}, expected;
+            expected.fill(sentinel);
+            for (u32 rank = 0; rank < count; ++rank)
+              expected[rank] = rank;
+            expected[63] = count;
+            Require(name, "readback",
+                    LibKernel::Memory::TryReadBacking(base, actual.data(),
+                                                      sizeof(actual)),
+                    "ordered-append rank output could not be read back");
+            Require(name, "dispatch-order ranks", actual == expected,
+                    "ordered-append terms or service order did not follow "
+                    "the dispatch order");
+          }
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "ordered-append rank unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "ordered-append rank release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -37997,6 +38111,139 @@ TestCase DsOrderedCountAddressAndExec(u32 wave_size, bool pixel_counter) {
   return test;
 }
 
+template <bool two_d> TestCase DsOrderedCountFollowsWaveLaunchOrder() {
+  using O = ShaderOpcode;
+  TestCase test;
+  // The 2D variant ranks waves by y * 4 + x, from the host's group counts.
+  test.name = two_d ? "DsOrderedCountFollowsWaveLaunchOrder2D"
+                    : "DsOrderedCountFollowsWaveLaunchOrder";
+  auto &code = test.code;
+  constexpr u32 waves = 16;
+  // s0 (and s1 in 2D) = group id, then TG_SIZE whose bits [16:6] hold the
+  // ordered-append term.
+  code.push_back(EncodeSop2(0x27, 2, two_d ? 2 : 1, 255));
+  code.push_back(0x000b0006u);
+  // Earlier waves spin longer, so an unordered counter would serve them last.
+  // v5 counts the iterations and is stored, so the delay cannot be optimized
+  // away.
+  AppendVMovU32(&code, 5, 0);
+  code.push_back(EncodeSop2(0x03, 3, InlineU32(waves), 2));
+  code.push_back(EncodeSop2(0x1e, 3, 3, InlineU32(10)));
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 5));
+  code.push_back(EncodeSop2(0x03, 3, 3, InlineU32(1)));
+  code.push_back(EncodeSopc(0x07, 3, InlineU32(0)));
+  code.push_back(EncodeSopp(0x05, 0xfffcu));
+  // M0 = term; the counter sits at GDS address 0. Every wave adds one and
+  // releases.
+  code.push_back(EncodeSMovB32(124, 2));
+  AppendVMovU32(&code, 2, 1);
+  code.push_back(EncodeDs0(0x3f, 3u << 8u, true));
+  code.push_back(EncodeDs1(3, 0, 2));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 4, 2));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 4, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, waves);
+  AppendEnd(&code);
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back(wave);
+  }
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back((waves - wave) << 10u);
+  }
+  test.initial.assign(waves * 2u, 0xdeadbeefu);
+  // The host stores the dispatch's group counts next to the release counter.
+  test.gds_initial.assign(ShaderRecompiler::IR::OrderedAppendGroupCounts + 2u,
+                          0);
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts] =
+      two_d ? 4 : waves;
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts + 1u] =
+      two_d ? waves / 4 : 1;
+  // Every wave adds one at address 0 and releases its slot once.
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[0] = waves;
+  test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
+  test.dispatch_x = two_d ? 4 : waves;
+  test.dispatch_y = two_d ? waves / 4 : 1;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.group_id[1] = two_d;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.tg_size_en = true;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpLoopMerge"};
+  test.opcodes = {O::S_BFE_U32,     O::S_SUB_I32,          O::S_LSHL_B32,
+                  O::S_CMP_LG_U32,  O::S_CBRANCH_SCC1,     O::S_MOV_B32,
+                  O::V_MOV_B32,     O::DS_ORDERED_COUNT,   O::S_WAITCNT,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM,
+                  O::V_ADD_NC_U32};
+  return test;
+}
+
+TestCase DsOrderedCountRanksPastElevenBits() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsOrderedCountRanksPastElevenBits";
+  auto &code = test.code;
+  // Wave 2048 shares the 11-bit term of wave 0; only wave 0 is delayed, so a
+  // wait on the term alone would serve wave 2048 first.
+  constexpr u32 waves = 2049;
+  code.push_back(EncodeSop2(0x27, 2, 1, 255));
+  code.push_back(0x000b0006u);
+  AppendVMovU32(&code, 5, 0);
+  code.push_back(EncodeSopc(0x06, 0, InlineU32(0)));
+  code.push_back(EncodeSop2(0x0a, 3, 255, InlineU32(1)));
+  code.push_back(0x40000u);
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 5));
+  code.push_back(EncodeSop2(0x03, 3, 3, InlineU32(1)));
+  code.push_back(EncodeSopc(0x07, 3, InlineU32(0)));
+  code.push_back(EncodeSopp(0x05, 0xfffcu));
+  code.push_back(EncodeSMovB32(124, 2));
+  AppendVMovU32(&code, 2, 1);
+  code.push_back(EncodeDs0(0x3f, 3u << 8u, true));
+  code.push_back(EncodeDs1(3, 0, 2));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 4, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 4, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, waves);
+  AppendEnd(&code);
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back(wave);
+  }
+  for (u32 wave = 0; wave < waves; ++wave) {
+    test.expected.push_back(wave == 0 ? 0x40000u : 1u);
+  }
+  test.initial.assign(waves * 2u, 0xdeadbeefu);
+  test.gds_initial.assign(ShaderRecompiler::IR::OrderedAppendGroupCounts + 2u,
+                          0);
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts] = waves;
+  test.gds_initial[ShaderRecompiler::IR::OrderedAppendGroupCounts + 1u] = 1;
+  // Every wave adds one at address 0 and releases its slot once.
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[0] = waves;
+  test.expected_gds[ShaderRecompiler::IR::OrderedAppendReleaseCounter] = waves;
+  test.dispatch_x = waves;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.tg_size_en = true;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpLoopMerge"};
+  test.opcodes = {O::S_BFE_U32, O::S_CMP_EQ_U32,  O::S_CSELECT_B32,
+                  O::S_SUB_I32, O::S_CMP_LG_U32,  O::S_CBRANCH_SCC1,
+                  O::S_MOV_B32, O::V_MOV_B32,     O::DS_ORDERED_COUNT,
+                  O::S_WAITCNT, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM,  O::V_ADD_NC_U32};
+  return test;
+}
+
 TestCase DsAppendConsumeGdsRegionBounds() {
   using O = ShaderOpcode;
   struct Access {
@@ -44289,6 +44536,9 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(DsOrderedCountAddressAndExec(wave_size, true));
   }
   AddCase(DsAppendConsumeGdsRegionBounds);
+  AddCase(DsOrderedCountFollowsWaveLaunchOrder<false>);
+  AddCase(DsOrderedCountFollowsWaveLaunchOrder<true>);
+  AddCase(DsOrderedCountRanksPastElevenBits);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
   AddCase(DsWideReadSnapshotsOverlappingAddress);
@@ -50791,6 +51041,9 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
       RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder<false>());
+    RunCase(&vulkan, DsOrderedCountFollowsWaveLaunchOrder<true>());
+    RunCase(&vulkan, DsOrderedCountRanksPastElevenBits());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {
@@ -51091,6 +51344,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--ordered-dispatch-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckOrderedDispatch();
+    vulkan.CheckOrderedAppendRanks();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--zero-stride-binding-only") == 0) {
@@ -51352,6 +51606,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
+  vulkan.CheckOrderedAppendRanks();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();

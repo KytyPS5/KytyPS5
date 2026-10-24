@@ -243,6 +243,27 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// Every dispatch starts its ordered-append wave numbering from zero, and ranks its workgroups
+// with the counts of the whole dispatch.
+constexpr uint64_t OrderedAppendCounterOffset =
+    ShaderRecompiler::IR::OrderedAppendReleaseCounter * sizeof(uint32_t);
+constexpr uint64_t OrderedAppendCountsOffset =
+    ShaderRecompiler::IR::OrderedAppendGroupCounts * sizeof(uint32_t);
+
+void RenderExecutor::ResetOrderedAppendCounters(uint32_t groups_x, uint32_t groups_y) {
+	auto& cache = m_context.GetBufferCache();
+	cache.FillBuffer(OrderedAppendCounterOffset, sizeof(uint32_t), 0u, true);
+	cache.FillBuffer(OrderedAppendCountsOffset, sizeof(uint32_t), groups_x, true);
+	cache.FillBuffer(OrderedAppendCountsOffset + sizeof(uint32_t), sizeof(uint32_t), groups_y,
+	                 true);
+}
+
+void RenderExecutor::ResetOrderedAppendCountersIndirect(uint64_t args_addr) {
+	auto& cache = m_context.GetBufferCache();
+	cache.FillBuffer(OrderedAppendCounterOffset, sizeof(uint32_t), 0u, true);
+	cache.CopyBuffer(OrderedAppendCountsOffset, args_addr, 2 * sizeof(uint32_t), true, false);
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -450,28 +471,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
-	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
-	                                   std::max(input_info.threads_num[1], 1u) *
-	                                   std::max(input_info.threads_num[2], 1u);
-	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
-	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
-		// A single guest wave per group can run in launch order without a device-wide
-		// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
-		for (uint32_t z = 0; z < thread_group_z; ++z) {
-			for (uint32_t y = 0; y < thread_group_y; ++y) {
-				for (uint32_t x = 0; x < thread_group_x; ++x) {
-					if ((x | y | z) != 0u) {
-						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-					}
-					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
-				}
-			}
-		}
-	} else {
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (program.info.uses_ordered_append) {
+		ResetOrderedAppendCounters(thread_group_x, thread_group_y);
 	}
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -520,6 +524,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
+	if (program.info.uses_ordered_append) {
+		ResetOrderedAppendCountersIndirect(args_addr);
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);

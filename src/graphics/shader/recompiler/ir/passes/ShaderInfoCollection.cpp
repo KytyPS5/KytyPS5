@@ -283,6 +283,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
+	info.uses_gds |= op == ValueOpcode::OrderedAppendGroupIndex;
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||
@@ -464,6 +465,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					break;
 				case StageInputKind::TessCoord:
 				case StageInputKind::WorkgroupId:
+				case StageInputKind::NumWorkgroups:
 				case StageInputKind::LocalInvocationId:
 				case StageInputKind::GlobalInvocationId:
 					if (component >= 3u) {

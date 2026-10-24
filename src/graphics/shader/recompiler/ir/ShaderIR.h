@@ -531,6 +531,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	bool                             uses_ordered_append           = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -555,9 +556,21 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// Waves per workgroup and wave size used to rebuild a wave's dispatch-order rank.
+	uint32_t ordered_append_waves     = 0;
+	uint32_t ordered_append_wave_size = 0;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
+
+// Release counter (GDS dword index) that emulates the ordered-append unit: the number of waves
+// that released their slot. It lives past the 64 KiB the guest can address and is zeroed
+// before every dispatch.
+inline constexpr uint32_t OrderedAppendReleaseCounter = 0x4001u;
+// The dispatch's workgroup counts in X and Y, written by the host next to the counter:
+// NumWorkgroups only covers one group when a dispatch is split per workgroup.
+inline constexpr uint32_t OrderedAppendGroupCounts = 0x4002u;
+inline constexpr uint32_t OrderedAppendWaveIdMask  = 0x7ffu;
 
 struct DescriptorSource {
 	struct IndirectDescriptor {

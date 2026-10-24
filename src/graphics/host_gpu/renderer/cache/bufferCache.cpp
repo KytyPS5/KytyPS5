@@ -26,7 +26,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
-constexpr uint64_t GdsBufferSize = 64 * 1024;
+// 64 KiB of guest GDS plus the ordered-append counter and group counts (see ShaderIR.h).
+constexpr uint64_t GdsBufferSize = 64 * 1024 + 16;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,

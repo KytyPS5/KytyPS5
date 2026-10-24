@@ -1934,8 +1934,18 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
 		const auto& output = buffer_info[voice->output_id];
 		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
-		EXIT_NOT_IMPLEMENTED((output.waveform_type != 0x12 && output.waveform_type != 0x18) ||
-		                     output.num_channels != voice->channels);
+		// A mastering voice whose channel count differs from its output (PROJECT ZERO: Maiden
+		// of Black Water, PPSA04333) is mixed through its matrix, or channel to channel without
+		// one; an output format this mixer cannot write is skipped instead of ending the title.
+		if (output.waveform_type != 0x12 && output.waveform_type != 0x18) {
+			static std::atomic_bool reported {false};
+			if (!reported.exchange(true)) {
+				Log::WriteToConsoleAndLog(fmt::sprintf(
+				    "NGS2: mastering output waveform type 0x%x is not mixed (skipped)\n",
+				    output.waveform_type));
+			}
+			continue;
+		}
 		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
 		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
 		                                                                             : sizeof(float)));
@@ -1951,7 +1961,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
 			for (uint32_t src = 0; src < voice->channels; ++src) {
-				const float level = voice->output_matrix.empty()
+				const bool matrix =
+				    voice->output_matrix.size() >= size_t(voice->channels) * output.num_channels;
+				const float level = !matrix
 				                        ? (src == dst ? 1.0f : 0.0f)
 				                        : voice->output_matrix.at(src * output.num_channels + dst);
 				for (uint32_t i = 0; i < grain; ++i) {
@@ -2674,7 +2686,18 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			const auto configured_size =
 			    voice->rack->option.custom_sampler.custom_rack_option.state_size;
 			EXIT_NOT_IMPLEMENTED(configured_size < sizeof(Ngs2CustomSamplerVoiceState));
-			EXIT_NOT_IMPLEMENTED(state_size != configured_size);
+			// Titles may query with a buffer sized for another of their custom sampler racks
+			// (PROJECT ZERO: Maiden of Black Water passes one size for racks of 2 and 4 modules):
+			// the module states past the sampler state read as zero.
+			EXIT_NOT_IMPLEMENTED(state_size < sizeof(Ngs2CustomSamplerVoiceState));
+			if (state_size != configured_size) {
+				static std::atomic<int> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+					LOGF("\t warning: custom sampler state_size = 0x%016" PRIx64
+					     ", rack state_size = 0x%016" PRIx64 "\n",
+					     static_cast<uint64_t>(state_size), static_cast<uint64_t>(configured_size));
+				}
+			}
 			std::memset(state, 0, state_size);
 			auto* sampler = reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state);
 			Ngs2FillSamplerState(*voice, *sampler);

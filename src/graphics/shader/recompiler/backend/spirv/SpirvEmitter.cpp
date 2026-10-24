@@ -161,6 +161,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
 		}
+		if (image.heap) continue;
 		if (image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			Fail(program, "native shader plan has an invalid image mip descriptor count");
@@ -204,7 +205,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 } // namespace
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword, bool maintenance8_enabled,
+                                  uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info) {
 	using namespace Emitter;
 
@@ -220,12 +221,13 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	}
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
-	EmitterState state(program, input_info, maintenance8_enabled);
+	EmitterState state(program, input_info, profile);
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",
 		              program.shader_hash);
 		state.debug_source = state.builder.AddString(name);
+		state.builder.EnableNames();
 	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
@@ -233,8 +235,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
-	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
-	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
+	ValidateNativeProgram(program,
+	                      program.stage == ShaderType::Compute && input_info.compute->lds_storage);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);

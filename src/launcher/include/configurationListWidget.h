@@ -68,6 +68,7 @@ protected slots:
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
 	void open_game_folder();
 	void remove_save_data();
+	void compress_game();
 	void filter_configurations(const QString& text);
 
 private:

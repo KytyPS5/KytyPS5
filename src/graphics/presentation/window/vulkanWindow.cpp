@@ -1,6 +1,3 @@
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -14,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -23,7 +21,10 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -65,6 +66,9 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+	features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+	features.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+	features.descriptorBindingPartiallyBound              = VK_TRUE;
 	return features;
 }
 
@@ -170,6 +174,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
 			     Config::GetGpuIndex());
 		}
+	} else if (vk::PhysicalDevice headset; Vr::OpenXrPhysicalDevice(instance, headset)) {
+		devices = {headset}; // The headset runtime renders on this GPU.
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;
@@ -266,7 +272,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #endif
 #if !defined(__APPLE__)
 		check_feature(device_features2.features.depthClamp, "depthClamp");
-		check_feature(fragment_barycentric.fragmentShaderBarycentric, "fragmentShaderBarycentric");
 #endif
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
@@ -294,6 +299,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.shaderStorageBufferArrayNonUniformIndexing,
 		              "shaderStorageBufferArrayNonUniformIndexing",
 		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
+		check_feature(features12.descriptorBindingSampledImageUpdateAfterBind,
+		              "descriptorBindingSampledImageUpdateAfterBind",
+		              required_features12.descriptorBindingSampledImageUpdateAfterBind);
+		check_feature(features12.descriptorBindingUpdateUnusedWhilePending,
+		              "descriptorBindingUpdateUnusedWhilePending",
+		              required_features12.descriptorBindingUpdateUnusedWhilePending);
+		check_feature(features12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound",
+		              required_features12.descriptorBindingPartiallyBound);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
@@ -327,6 +340,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
+		check_feature(device_features2.features.drawIndirectFirstInstance,
+		              "drawIndirectFirstInstance");
+		check_feature(device_features2.features.multiDrawIndirect, "multiDrawIndirect");
 
 		if (!skip_device) {
 			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
@@ -491,6 +507,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
+	const bool shader_clock_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	if (shader_clock_extension) {
+		shader_clock.pNext = supported_features2.pNext;
+		supported_features2.pNext = &shader_clock;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -498,7 +521,28 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (conditional_rendering_extension) {
+		conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &conditional_rendering;
+	}
+	const bool barycentric_extension =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_barycentric {};
+	if (barycentric_extension) {
+		supported_barycentric.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_barycentric;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	const bool barycentric_supported =
+	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
+	if (!barycentric_supported) {
+		Log::WriteToConsoleAndLog(
+		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
+		    "Some games may render incorrectly or crash.\n");
+	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
@@ -557,6 +601,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	// The device clock ticks at timestampPeriod nanoseconds.
+	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
+		graphics.device_clock_period_ps = static_cast<uint32_t>(
+		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
+	}
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -582,10 +633,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	device_features.shaderStorageImageMultisample        =
+	    supported_features2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
+	device_features.drawIndirectFirstInstance            = VK_TRUE;
+	device_features.multiDrawIndirect                    = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
@@ -594,7 +649,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	// Storage image sample counts beyond 1x require the feature.
+	if (!device_features.shaderStorageImageMultisample) {
+		graphics.physical_device_properties.limits.storageImageSampleCounts =
+		    vk::SampleCountFlagBits::e1;
+	}
 	graphics.sample_rate_shading_enabled                 = true;
+	// Occlusion queries reset their queries from the host and count samples exactly where they can.
+	graphics.occlusion_queries_enabled =
+	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;
+	graphics.occlusion_query_precise_enabled =
+	    graphics.occlusion_queries_enabled && supported_features2.features.occlusionQueryPrecise;
+	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
+	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
+	     graphics.occlusion_queries_enabled ? "true" : "false",
+	     graphics.occlusion_query_precise_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
@@ -610,9 +680,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.pNext = &features12;
 #else
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
-	fragment_barycentric.pNext                     = &features12;
-	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
-	robustness2.pNext                              = &fragment_barycentric;
+	if (barycentric_supported) {
+		fragment_barycentric.pNext                     = &features12;
+		fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
+		robustness2.pNext                              = &fragment_barycentric;
+	} else {
+		robustness2.pNext = &features12;
+	}
 #endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -650,6 +724,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.device_clock_period_ps != 0u) {
+		shader_clock.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &shader_clock;
+	}
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &conditional_rendering;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -859,8 +941,11 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
+	Vr::OpenXrInit();
+
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
+	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -966,7 +1051,6 @@ void WindowContext::CreateVulkan() {
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
@@ -1020,11 +1104,14 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
@@ -1034,6 +1121,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1051,6 +1139,7 @@ void WindowContext::CreateVulkan() {
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
+	Vr::OpenXrStartSession(graphic_ctx);
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {
@@ -1073,6 +1162,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	Vr::OpenXrShutdown();
 	ShutdownSystemOverlayInput();
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);

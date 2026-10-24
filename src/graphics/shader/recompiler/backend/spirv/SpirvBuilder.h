@@ -67,6 +67,7 @@ public:
 	}
 
 	uint32_t AddString(const char* text);
+	void EnableNames() { m_emit_names = true; }
 	void AddName(uint32_t target, const char* name);
 	template <typename... Args>
 	void AddAnnotation(spv::Op opcode, const Args&... operands) {
@@ -159,6 +160,7 @@ private:
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
 	size_t                                    m_unpatched_phi_incomings = 0;
+	bool                                      m_emit_names              = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

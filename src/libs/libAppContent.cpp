@@ -22,13 +22,16 @@
 
 namespace Libs {
 
+namespace AprShared {
+void InvalidateFailedResolves();
+}
+
 LIB_VERSION("AppContent", 1, "AppContentUtil", 1, 1);
 
 namespace AppContent {
 
 constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL = 3;
 constexpr int      APP_CONTENT_ERROR_PARAMETER        = -2133262334; /* 0x80D90002 */
-constexpr int      APP_CONTENT_ERROR_BUSY             = -2133262333; /* 0x80D90003 */
 constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED      = -2133262332; /* 0x80D90004 */
 constexpr int      APP_CONTENT_ERROR_NOT_FOUND        = -2133262331; /* 0x80D90005 */
 constexpr int      APP_CONTENT_ERROR_MOUNT_FULL       = -2133262330; /* 0x80D90006 */
@@ -207,7 +210,10 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 
 	for (const auto& m: g_addcont_mounts) {
 		if (m.label == entry->entitlement_label) {
-			return APP_CONTENT_ERROR_BUSY;
+			const auto guest_point = m.point.substr(0, m.point.size() - 1);
+			std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
+			LOGF("\t already mounted %s\n", guest_point.c_str());
+			return OK;
 		}
 	}
 
@@ -232,7 +238,15 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	LOGF("\t mounted %s -> %s\n", mount.point.c_str(),
 	     Common::PathToString(entry->mount_dir).c_str());
 
-	std::strncpy(mount_point->data, mount.point.c_str(), sizeof(mount_point->data) - 1);
+	AprShared::InvalidateFailedResolves();
+
+	// Titles scan /download0/pdlc for downloaded content; it must exist even when empty.
+	if (const auto pdlc = LibKernel::FileSystem::GetRealFilename("/download0/pdlc"); !pdlc.empty()) {
+		std::filesystem::create_directories(pdlc, ec);
+	}
+
+	const auto guest_point = mount.point.substr(0, mount.point.size() - 1);
+	std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
 	g_addcont_mounts.push_back(std::move(mount));
 
 	return OK;
@@ -251,8 +265,8 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
 
-	const std::string point(mount_point->data,
-	                        strnlen(mount_point->data, sizeof(mount_point->data)));
+	const std::string point = Common::FixDirectorySlash(
+	    std::string_view(mount_point->data, strnlen(mount_point->data, sizeof(mount_point->data))));
 
 	std::lock_guard lock(g_addcont_mutex);
 
@@ -263,6 +277,7 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	}
 	LibKernel::FileSystem::Umount(point);
 	g_addcont_mounts.erase(it);
+	AprShared::InvalidateFailedResolves();
 
 	return OK;
 }

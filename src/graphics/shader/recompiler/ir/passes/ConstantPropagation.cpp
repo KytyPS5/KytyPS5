@@ -51,11 +51,13 @@ public:
 	}
 
 	void QueueUsers(const std::vector<Use>& users) {
-		++generation;
-		affected.clear();
 		for (const auto& use: users) affected.push_back(use.user);
+	}
+
+	void FlushUsers() {
+		++generation;
 		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit consumers once per change, including cyclic Phi edges.
+		// stay dynamic. Visit their union once per drain, including cyclic Phi edges.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
 			const auto found = locations.find(inst);
@@ -64,6 +66,7 @@ public:
 			Queue(inst);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
+		affected.clear();
 	}
 
 	Block::iterator Prepend(Block& block, Block::iterator before, ValueOpcode opcode,
@@ -240,17 +243,6 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	if (producer != nullptr && producer->GetOpcode() == construct) {
 		Replace(inst, producer->Arg(component));
 		return true;
-	}
-	if (component < 2u && producer != nullptr &&
-	    producer->GetOpcode() == ValueOpcode::IAddCarry32) {
-		const auto lhs = producer->Arg(0).Resolve();
-		const auto rhs = producer->Arg(1).Resolve();
-		if (IsImmediate(lhs, Type::U32) && IsImmediate(rhs, Type::U32)) {
-			const auto sum = static_cast<uint64_t>(lhs.U32()) + rhs.U32();
-			Replace(inst, Value(component == 0u ? static_cast<uint32_t>(sum)
-			                                    : static_cast<uint32_t>(sum >> 32u)));
-			return true;
-		}
 	}
 	return false;
 }
@@ -508,11 +500,6 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				ReplaceBinaryIdentity(inst, Type::U32, 1u);
 			}
 			return;
-		case ValueOpcode::IMul64:
-			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a * b; })) {
-				ReplaceBinaryIdentity(inst, Type::U64, 1u);
-			}
-			return;
 		case ValueOpcode::WqmU64: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U64)) {
@@ -664,17 +651,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		}
-		case ValueOpcode::BitCount32: {
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindILsb32: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U32)) {
-				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U32()))));
-			}
-			return;
-		}
-		case ValueOpcode::BitCount64: {
-			const auto value = Arg(inst, 0);
-			if (IsImmediate(value, Type::U64)) {
-				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U64()))));
+				const auto bits = value.U32();
+				Replace(inst, Value(static_cast<uint32_t>(
+				    inst.GetOpcode() == ValueOpcode::BitCount32 ? std::popcount(bits)
+				    : bits == 0u                                ? -1
+				                                                : std::countr_zero(bits))));
 			}
 			return;
 		}
@@ -687,7 +672,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::UMin32:
-			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); });
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); })) {
+				ReplaceBinaryIdentity(inst, Type::U32, ~0u);
+			}
 			return;
 		case ValueOpcode::UMax32:
 			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
@@ -977,27 +964,30 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::vector<Use> users;
 	std::vector<Value> operands;
 	const auto drain = [&] {
-		for (size_t i = 0; i < worklist.pending.size(); ++i) {
-			auto* inst = worklist.pending[i];
-			auto& location = worklist.locations.at(inst);
-			location.queued = false;
-			const auto opcode = inst->GetOpcode();
-			if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
-			const auto where = location.instruction;
-			users.assign(inst->Uses().begin(), inst->Uses().end());
-			operands.clear();
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
-			mask_projection.Fold(*inst, wave_size);
-			FoldInstruction(*inst->Parent(), where, worklist);
-			bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
-			for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
-				changed = operands[arg] != inst->Arg(arg);
-			if (changed) {
-				worklist.QueueUsers(users);
-				worklist.Queue(inst);
+		do {
+			for (size_t i = 0; i < worklist.pending.size(); ++i) {
+				auto* inst = worklist.pending[i];
+				auto& location = worklist.locations.at(inst);
+				location.queued = false;
+				const auto opcode = inst->GetOpcode();
+				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
+				const auto where = location.instruction;
+				users.assign(inst->Uses().begin(), inst->Uses().end());
+				operands.clear();
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
+				mask_projection.Fold(*inst, wave_size);
+				FoldInstruction(*inst->Parent(), where, worklist);
+				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
+				for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
+					changed = operands[arg] != inst->Arg(arg);
+				if (changed) {
+					worklist.QueueUsers(users);
+					worklist.Queue(inst);
+				}
 			}
-		}
-		worklist.pending.clear();
+			worklist.pending.clear();
+			worklist.FlushUsers();
+		} while (!worklist.pending.empty());
 	};
 	drain();
 	// Normalize retained PHI/select values only after every supported field read has
@@ -1023,6 +1013,19 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		}
 		drain();
 	} while (normalized);
+	// Repeated register reads share a bitcast only within the same SSA block.
+	std::unordered_map<const Inst*, Inst*> bitcasts;
+	for (auto* block: blocks) {
+		bitcasts.clear();
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::BitCastF32U32 &&
+			    inst.GetOpcode() != ValueOpcode::BitCastU32F32) continue;
+			const auto* source = Arg(inst, 0).TryInstruction();
+			if (source == nullptr) continue;
+			const auto [entry, inserted] = bitcasts.try_emplace(source, &inst);
+			if (!inserted) Replace(inst, Value(entry->second));
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

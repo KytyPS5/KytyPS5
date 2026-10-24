@@ -739,6 +739,15 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("yigr4V0-HTM", Http::HttpSetRecvTimeOut);
 	LIB_FUNC("T-mGo9f3Pu4", Http::HttpSetAutoRedirect);
 	LIB_FUNC("qFg2SuyTJJY", Http::HttpSetAuthEnabled);
+	LIB_FUNC("h9wmFZX4i-4", Http::HttpSetRedirectCallback);
+	LIB_FUNC("Kh6bS2HQKbo", Http::HttpSetCookieRecvCallback);
+	LIB_FUNC("vO4B-42ef-k", Http::HttpSetRequestStatusCallback);
+	LIB_FUNC("i9mhafzkEi8", Http::HttpSetInflateGZIPEnabled);
+	LIB_FUNC("PDxS48xGQLs", Http::HttpSetChunkedTransferEnabled);
+	LIB_FUNC("DK+GoXCNT04", Http::HttpsLoadCert);
+	LIB_FUNC("zXqcE0fizz0", Http::HttpsUnloadCert);
+	LIB_FUNC("JBN6N-EY+3M", Http::HttpsGetSslError);
+	LIB_FUNC("0onIrKx9NIE", Http::HttpGetLastErrno);
 	LIB_FUNC("IWalAn-guFs", LibHttp::HttpUriParse);
 	LIB_FUNC("YuOW3dDAKYc", LibHttp::HttpUriEscape);
 	LIB_FUNC("5LZA+KPISVA", LibHttp::HttpUriBuild);

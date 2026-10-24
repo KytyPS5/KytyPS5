@@ -209,10 +209,19 @@ static void ListInit(QComboBox* combo, T value) {
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
+	m_ui->spinBox_user_id->setMaximum(Config::MAX_USER_ID);
 	m_ui->spinBox_user_id->setValue(info.user_id);
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
 	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
 	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
+	auto* keyboard_player = m_ui->comboBox_keyboard_player;
+	keyboard_player->clear();
+	keyboard_player->addItem(tr("Shared with player 1 (default)"), 0);
+	for (int player = 1; player <= Config::MAX_PLAYERS; player++) {
+		keyboard_player->addItem(tr("Player %1").arg(player), player);
+	}
+	keyboard_player->setCurrentIndex(
+	    qMax(0, keyboard_player->findData(info.controller.keyboard_player)));
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -277,12 +286,15 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
+	m_ui->checkBox_readback_tiled->setChecked(info.readback_tiled_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
+	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -458,6 +470,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
 		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
 		info.controller.speaker_volume      = ui.slider_controller_volume->value();
+		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
 	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
@@ -468,12 +481,15 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
+	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
+	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();

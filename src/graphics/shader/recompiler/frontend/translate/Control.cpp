@@ -82,19 +82,17 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 }
 
 void Translator::ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in) {
-	const auto zero     = IR::U32(IR::Value(0u));
-	const auto lhs      = ReadU32(inst.src0);
-	const auto rhs      = ReadU32(inst.src1);
-	const auto carry_in = !use_carry_in ? zero
-	                      : vector      ? ConditionBit(inst.src2)
-	                                    : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc));
-	const auto add0     = ir.Emit(IR::ValueOpcode::IAddCarry32, {lhs, rhs});
-	const auto partial  = ir.CompositeExtract(add0, 0);
-	const auto carry0   = ir.CompositeExtract(add0, 1);
-	const auto add1     = ir.Emit(IR::ValueOpcode::IAddCarry32, {partial, carry_in});
-	const auto result   = ir.CompositeExtract(add1, 0);
-	const auto carry1   = ir.CompositeExtract(add1, 1);
-	const auto carry    = ir.INotEqual(ir.BitwiseOr(carry0, carry1), zero);
+	const auto lhs     = ReadU32(inst.src0);
+	const auto rhs     = ReadU32(inst.src1);
+	const auto partial = ir.IAdd(lhs, rhs);
+	auto       result  = partial;
+	auto       carry   = ir.ULessThan(partial, lhs);
+	if (use_carry_in) {
+		// The carry-in is 0 or 1, so the second add carries out only when it wraps to zero.
+		result = ir.IAdd(partial, vector ? ConditionBit(inst.src2)
+		                                 : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc)));
+		carry  = ir.LogicalOr(carry, ir.ULessThan(result, partial));
+	}
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
 		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
@@ -142,29 +140,25 @@ void Translator::S_ABSDIFF_I32(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_ADD_SUB_I32(const Decoder::Instruction& inst, bool subtract) {
-	const auto lhs      = ReadU32(inst.src0);
-	const auto rhs      = ReadU32(inst.src1);
-	const auto result   = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
-	const auto shift    = IR::U32(IR::Value(31u));
-	const auto lhs_sign = ir.ShiftRightLogical(lhs, shift);
-	const auto rhs_sign = ir.ShiftRightLogical(rhs, shift);
-	const auto out_sign = ir.ShiftRightLogical(result, shift);
-	const auto inputs = subtract ? ir.INotEqual(lhs_sign, rhs_sign) : ir.IEqual(lhs_sign, rhs_sign);
-	const auto changed = ir.INotEqual(lhs_sign, out_sign);
+	const auto lhs    = ReadU32(inst.src0);
+	const auto rhs    = ReadU32(inst.src1);
+	const auto result = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
+	// Signed overflow moves the result past lhs the wrong way for the sign of rhs.
+	const auto ge = [&](IR::Value a, IR::Value b) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::SGreaterThanEqual32, {a, b}));
+	};
+	const auto moved = subtract ? ge(lhs, result) : ge(result, lhs);
 	WriteOperand(DestinationOperand(inst), result);
-	ir.SetScc(ir.LogicalAnd(inputs, changed));
+	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {moved, ge(rhs, IR::Value(0u))})));
 }
 
 void Translator::S_LSHL_ADD_U32(const Decoder::Instruction& inst, uint32_t shift_amount) {
-	const auto lhs           = ReadU32(inst.src0);
-	const auto shift         = IR::U32(IR::Value(shift_amount));
-	const auto rhs           = ReadU32(inst.src1);
-	const auto shifted       = ir.ShiftLeftLogical(lhs, shift);
-	const auto result        = ir.IAdd(shifted, rhs);
-	const auto add_carry     = ir.ULessThan(result, shifted);
-	const auto inverse_shift = ir.ISub(IR::U32(IR::Value(32u)), shift);
-	const auto shifted_out   = ir.ShiftRightLogical(lhs, inverse_shift);
-	const auto shift_carry   = ir.INotEqual(shifted_out, IR::U32(IR::Value(0u)));
+	const auto lhs         = ReadU32(inst.src0);
+	const auto rhs         = ReadU32(inst.src1);
+	const auto shifted     = ir.ShiftLeftLogical(lhs, IR::U32(IR::Value(shift_amount)));
+	const auto result      = ir.IAdd(shifted, rhs);
+	const auto add_carry   = ir.ULessThan(result, shifted);
+	const auto shift_carry = ir.UGreaterThan(lhs, IR::U32(IR::Value(~0u >> shift_amount)));
 	WriteOperand(DestinationOperand(inst), result);
 	ir.SetScc(ir.LogicalOr(add_carry, shift_carry));
 }

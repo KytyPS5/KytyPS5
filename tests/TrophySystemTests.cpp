@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -140,6 +141,30 @@ void WritePackage(const std::filesystem::path &path,
   Check(written == bytes.size(), "write package fixture");
 }
 
+using Properties = std::map<std::string, Trophies::UdsInteger>;
+
+// Evaluates an event against fresh stats, as if nothing was posted before.
+std::vector<int> FindUdsTrophies(const Trophies::Package &package,
+                                 std::string_view event,
+                                 const Properties &properties) {
+  Trophies::UnlockData unlocks;
+  bool changed = false;
+  return Trophies::ApplyUdsEvent(package, event, properties, unlocks, changed);
+}
+
+// Posts an event into persistent stats and records the unlocks it earns.
+std::vector<int> Post(const Trophies::Package &package,
+                      Trophies::UnlockData &unlocks, std::string_view event,
+                      const Properties &properties, bool *changed = nullptr) {
+  bool stats_changed = false;
+  const auto ids = Trophies::ApplyUdsEvent(package, event, properties, unlocks,
+                                           stats_changed);
+  unlocks.unlocked.insert(ids.begin(), ids.end());
+  if (changed != nullptr)
+    *changed = stats_changed;
+  return ids;
+}
+
 Trophies::Package MakePackage(const std::filesystem::path &directory) {
   const auto path = directory / "trophy00.ucp";
   WritePackage(
@@ -168,7 +193,7 @@ void TestEventExtraction(const std::filesystem::path &directory) {
         "non-progressive trophy retains its stat target");
   Check(!package.trophies.at(4).target,
         "negative target is not converted to unsigned");
-  Check(Trophies::FindUdsTrophies(package, "FIND_ALL_COINS",
+  Check(FindUdsTrophies(package, "FIND_ALL_COINS",
                                   {{"counter", uint64_t{100}}})
             .empty(),
         "missing mapping never guesses from trophy text");
@@ -195,59 +220,62 @@ void TestEventExtraction(const std::filesystem::path &directory) {
 			{"bad":1}
 		]})"}});
   package.event_rules = Trophies::LoadUdsRules(path);
-  Check(package.event_rules.size() == 2,
-        "skip unsupported extraction and aggregation");
-  Check(Trophies::FindUdsTrophies(
+  Check(package.event_rules.size() == 5 &&
+            !package.event_rules.contains("FILTERED") &&
+            !package.event_rules.contains("NESTED") &&
+            !package.event_rules.contains("BOUNDED"),
+        "skip filtered, nested and bounded extraction");
+  Check(FindUdsTrophies(
             package, "COLLECT",
             {{"counter", uint64_t{9}}, {"counterBase", uint64_t{100}}})
             .empty(),
         "do not add independent counters or treat gt as ge");
-  Check(Trophies::FindUdsTrophies(
+  Check(FindUdsTrophies(
             package, "COLLECT",
             {{"counter", uint64_t{10}}, {"counterBase", uint64_t{100}}}) ==
             std::vector<int>{1},
         "each stat reads its configured property");
-  Check(Trophies::FindUdsTrophies(
+  Check(FindUdsTrophies(
             package, "COLLECT",
             {{"counter", uint64_t{0}}, {"counterBase", uint64_t{101}}}) ==
             std::vector<int>{2},
         "strict comparison requires greater value");
-  Check(Trophies::FindUdsTrophies(
+  Check(FindUdsTrophies(
             package, "COLLECT",
             {{"counter", uint64_t{10}}, {"counterBase", uint64_t{101}}}) ==
             std::vector<int>({1, 2}),
         "one event can unlock multiple mapped trophies");
-  Check(Trophies::FindUdsTrophies(
+  Check(FindUdsTrophies(
             package, "TIME", {{"seconds", uint32_t{5}}}) == std::vector<int>{3},
         "less-equal condition accepts its boundary");
-  Check(Trophies::FindUdsTrophies(package, "TIME", {{"seconds", uint32_t{6}}})
+  Check(FindUdsTrophies(package, "TIME", {{"seconds", uint32_t{6}}})
             .empty(),
         "less-equal condition rejects larger input");
-  Check(Trophies::FindUdsTrophies(package, "TIME", {{"counter", uint64_t{0}}})
+  Check(FindUdsTrophies(package, "TIME", {{"counter", uint64_t{0}}})
             .empty(),
         "missing property is not zero");
   package.trophies.at(3).comparison = Trophies::Comparison::Less;
-  Check(Trophies::FindUdsTrophies(package, "TIME", {{"seconds", uint32_t{5}}})
+  Check(FindUdsTrophies(package, "TIME", {{"seconds", uint32_t{5}}})
             .empty(),
         "strict less rejects its boundary");
-  Check(Trophies::FindUdsTrophies(
+  Check(FindUdsTrophies(
             package, "TIME", {{"seconds", uint32_t{4}}}) == std::vector<int>{3},
         "strict less accepts lower input");
   package.trophies.at(3).comparison = Trophies::Comparison::GreaterEqual;
-  Check(Trophies::FindUdsTrophies(package, "TIME",
+  Check(FindUdsTrophies(package, "TIME",
                                   {{"seconds", uint64_t{UINT32_MAX} + 1}})
             .empty(),
         "uint64 input cannot update a uint32 stat");
   Check(
-      Trophies::FindUdsTrophies(package, "COLLECT", {{"counter", int32_t{100}}})
+      FindUdsTrophies(package, "COLLECT", {{"counter", int32_t{100}}})
           .empty(),
       "signed inputs cannot update unsigned stats");
-  Check(Trophies::FindUdsTrophies(package, "COLLECT",
+  Check(FindUdsTrophies(package, "COLLECT",
                                   {{"counter", uint32_t{100}}})
             .empty(),
         "unsigned input width must match the stat");
   package.trophies.at(1).comparison = Trophies::Comparison::None;
-  Check(Trophies::FindUdsTrophies(package, "COLLECT",
+  Check(FindUdsTrophies(package, "COLLECT",
                                   {{"counter", uint64_t{100}}})
             .empty(),
         "unknown comparator cannot unlock");
@@ -256,6 +284,125 @@ void TestEventExtraction(const std::filesystem::path &directory) {
         "missing stat definitions cannot infer aggregation");
   Check(Trophies::LoadUdsRules(directory / "missing.ucp").empty(),
         "missing UDS package has no rules");
+}
+
+// Prince of Persia: The Lost Crown (PPSA10067) reports kill counters as int64
+// "newValue" properties feeding max-aggregated stats (trophy 0030 Deadly
+// Trap: UpdateNbSpikesKills -> stat 113, ge 5, progressive).
+void TestAggregatedStats(const std::filesystem::path &directory) {
+  const auto trophy_path = directory / "trophy01.ucp";
+  WritePackage(
+      trophy_path,
+      {{"tropconf.json", R"({"defaultLanguage":"en-US","trophies":[
+			{"id":"0","grade":"P"},
+			{"id":"1","grade":"B","unlockCondition":{"udsStatId":"113","comparator":"ge","targetValue":"5","progressive":true}},
+			{"id":"2","grade":"B","unlockCondition":{"udsStatId":"200","comparator":"ge","targetValue":"3","progressive":false}},
+			{"id":"3","grade":"B","unlockCondition":{"udsStatId":"300","comparator":"gt","targetValue":"10","progressive":false}},
+			{"id":"4","grade":"B","unlockCondition":{"udsStatId":"400","comparator":"le","targetValue":"10","progressive":false}}
+		]})"},
+       {"tropmeta_en-US.json",
+        R"({"metadata":{"titleMetadata":{"name":"Stats"},"trophyMetadata":[]}})"}});
+  auto package = Trophies::LoadPackage(trophy_path, 1);
+  const auto uds_path = directory / "uds01.ucp";
+  WritePackage(uds_path, {{"stats_definition.json", R"({"statDefinitionArray":[
+			{"statId":113,"dataType":"int64","aggregation":"max"},
+			{"statId":200,"dataType":"uint64","aggregation":"count"},
+			{"statId":300,"dataType":"int32","aggregation":"sum","minValue":-2147483648},
+			{"statId":400,"dataType":"uint32","aggregation":"min","maxValue":4294967295}
+		]})"},
+                          {"stats_extraction.json", R"({"statsExtractionRuleArray":[
+			{"condition":{"eventName":"UpdateNbSpikesKills"},"action":{"input":"$.newValue","output":{"statId":113}}},
+			{"condition":{"eventName":"KILL"},"action":{"output":{"statId":200}}},
+			{"condition":{"eventName":"SCORE"},"action":{"input":"$.delta","output":{"statId":300}}},
+			{"condition":{"eventName":"LAP"},"action":{"input":"$.seconds","output":{"statId":400}}}
+		]})"}});
+  package.event_rules = Trophies::LoadUdsRules(uds_path);
+  Check(package.trophies.size() == 5 && package.event_rules.size() == 4,
+        "load signed and aggregated stats");
+
+  Trophies::UnlockData unlocks;
+  bool changed = false;
+  const auto &deadly_trap = package.trophies.at(1);
+  Check(Post(package, unlocks, "UpdateNbSpikesKills",
+             {{"newValue", int64_t{3}}})
+            .empty(),
+        "int64 stat below target does not unlock");
+  Check(Trophies::StatProgress(deadly_trap, unlocks.stats) == 3,
+        "progressive trophy reports its stat value");
+  Check(Post(package, unlocks, "UpdateNbSpikesKills",
+             {{"newValue", int64_t{2}}}, &changed)
+                .empty() &&
+            !changed,
+        "max aggregation keeps the larger value");
+  Check(Post(package, unlocks, "UpdateNbSpikesKills",
+             {{"newValue", uint64_t{9}}})
+            .empty(),
+        "input type must match the int64 stat");
+  Check(Post(package, unlocks, "UpdateNbSpikesKills",
+             {{"newValue", int64_t{5}}}) == std::vector<int>{1},
+        "int64 max stat unlocks at its target");
+  Check(Post(package, unlocks, "UpdateNbSpikesKills",
+             {{"newValue", int64_t{7}}}, &changed)
+                .empty() &&
+            !changed && std::get<int64_t>(unlocks.stats.at(113)) == 5,
+        "stats of unlocked trophies stop updating");
+
+  Check(Post(package, unlocks, "KILL", {}).empty() &&
+            Post(package, unlocks, "KILL", {{"unrelated", int32_t{1}}}).empty(),
+        "count stat tallies events without input");
+  Check(Post(package, unlocks, "KILL", {}) == std::vector<int>{2},
+        "count stat unlocks on the third event");
+
+  Check(Post(package, unlocks, "SCORE", {{"delta", int32_t{6}}}).empty() &&
+            Post(package, unlocks, "SCORE", {{"delta", int32_t{-3}}}).empty() &&
+            Post(package, unlocks, "SCORE", {{"delta", int32_t{7}}}).empty(),
+        "signed sum accumulates negative input");
+  Check(std::get<int64_t>(unlocks.stats.at(300)) == 10,
+        "strict comparison waits past the boundary");
+  Check(Post(package, unlocks, "SCORE", {{"delta", int32_t{1}}}) ==
+            std::vector<int>{3},
+        "signed sum unlocks above target");
+
+  Trophies::UnlockData saturated;
+  saturated.stats.emplace(300, int64_t{INT32_MAX - 1});
+  Check(Post(package, saturated, "SCORE", {{"delta", int32_t{5}}}) ==
+                std::vector<int>{3} &&
+            std::get<int64_t>(saturated.stats.at(300)) == INT32_MAX,
+        "int32 sum saturates at the type range");
+
+  Check(Post(package, unlocks, "LAP", {{"seconds", uint32_t{30}}}).empty() &&
+            Post(package, unlocks, "LAP", {{"seconds", uint32_t{12}}}).empty(),
+        "min stat above le target does not unlock");
+  Check(Post(package, unlocks, "LAP", {{"seconds", uint32_t{40}}}, &changed)
+                .empty() &&
+            !changed,
+        "min aggregation keeps the smaller value");
+  Check(!Trophies::StatProgress(package.trophies.at(4), unlocks.stats),
+        "le trophies report no progress value");
+  Check(Post(package, unlocks, "LAP", {{"seconds", uint32_t{10}}}) ==
+            std::vector<int>{4},
+        "min stat unlocks at le boundary");
+
+  unlocks.stats.emplace(999, int64_t{-7});
+  const auto path = Trophies::UnlocksPath(directory, "PPSA10067", 1000, 1);
+  Check(Trophies::SaveUnlockData(path, unlocks), "save stats");
+  const auto loaded = Trophies::LoadUnlockData(path);
+  Check(loaded.unlocked == unlocks.unlocked &&
+            std::get<int64_t>(loaded.stats.at(999)) == -7 &&
+            std::get<uint64_t>(loaded.stats.at(200)) == 3 &&
+            loaded.stats.size() == unlocks.stats.size(),
+        "persist signed and unsigned stat values");
+
+  // JSON cannot tell int64 from uint64 for non-negative values.
+  Trophies::UnlockData resumed;
+  resumed.stats = {{113, uint64_t{4}}};
+  Check(Post(package, resumed, "UpdateNbSpikesKills",
+             {{"newValue", int64_t{1}}})
+            .empty(),
+        "reloaded stat keeps its saved maximum");
+  Check(Post(package, resumed, "UpdateNbSpikesKills",
+             {{"newValue", int64_t{5}}}) == std::vector<int>{1},
+        "reloaded stat continues aggregation");
 }
 
 void TestProgress(const std::filesystem::path &directory) {
@@ -316,6 +463,7 @@ int main() {
   TestLocalization();
   TempDirectory directory;
   TestEventExtraction(directory.Path());
+  TestAggregatedStats(directory.Path());
   TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
   std::printf("TrophySystemTests: all cases passed\n");

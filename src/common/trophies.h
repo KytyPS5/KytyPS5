@@ -37,14 +37,21 @@ struct Trophy {
 	bool                    has_reward = false;
 };
 
+using UdsInteger = std::variant<int32_t, uint32_t, int64_t, uint64_t>;
+// Aggregated stat value: signed stats hold int64_t, unsigned ones uint64_t.
+using UdsValue = std::variant<int64_t, uint64_t>;
+
+enum class Aggregation { Latest, Max, Min, Sum, Count };
+
 struct UdsRule {
 	uint64_t    stat_id;
-	std::string input;
-	bool        is_uint32;
+	std::string input; // Event property name; empty for count stats.
+	size_t      type;  // UdsInteger alternative index the event property must match.
+	Aggregation aggregation;
 };
 
-using UdsRules   = std::map<std::string, std::vector<UdsRule>>;
-using UdsInteger = std::variant<int32_t, uint32_t, uint64_t>;
+using UdsRules = std::map<std::string, std::vector<UdsRule>>;
+using UdsStats = std::map<uint64_t, UdsValue>;
 
 struct Package {
 	std::string                title;
@@ -56,6 +63,7 @@ struct Package {
 struct UnlockData {
 	std::set<int>           unlocked;
 	std::map<int, uint64_t> timestamps;
+	UdsStats                stats;
 };
 
 struct Progress {
@@ -74,12 +82,16 @@ struct Progress {
 [[nodiscard]] std::filesystem::path PackagePath(uint32_t service_label);
 [[nodiscard]] std::filesystem::path UdsPackagePath(uint32_t service_label);
 [[nodiscard]] UdsRules              LoadUdsRules(const std::filesystem::path& path);
-[[nodiscard]] std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
-                                               const std::map<std::string, UdsInteger>& properties);
-[[nodiscard]] std::filesystem::path UnlocksPath(const std::filesystem::path& root,
-                                                std::string_view title_id, int user_id,
-                                                uint32_t service_label);
-[[nodiscard]] UnlockData            LoadUnlockData(const std::filesystem::path& path);
+// Folds the event into the stats it feeds and returns trophies whose condition now holds.
+// Only stats of still-locked trophies are updated; `changed` reports whether `stats` was modified.
+[[nodiscard]] std::vector<int> ApplyUdsEvent(const Package& package, std::string_view event_name,
+                                             const std::map<std::string, UdsInteger>& properties,
+                                             UnlockData& unlocks, bool& changed);
+[[nodiscard]] std::optional<uint64_t> StatProgress(const Trophy& trophy, const UdsStats& stats);
+[[nodiscard]] std::filesystem::path   UnlocksPath(const std::filesystem::path& root,
+                                                  std::string_view title_id, int user_id,
+                                                  uint32_t service_label);
+[[nodiscard]] UnlockData              LoadUnlockData(const std::filesystem::path& path);
 [[nodiscard]] bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks);
 
 } // namespace Common::Trophies

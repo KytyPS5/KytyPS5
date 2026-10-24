@@ -14214,6 +14214,162 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Verify native S8 attachment and alias transfers; report optional-format absence to CTest.
+  bool CheckStencilOnlyTarget() {
+    constexpr const char *name = "StencilOnlyTarget";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t alignment = 0x10000;
+    EnsureRuntimeContext();
+    vk::ImageFormatProperties properties{};
+    const auto support = m_runtime_context.GetImageFormatProperties(
+        vk::Format::eS8Uint, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+        DepthTargetImageUsage(), {}, &properties);
+    if (support == vk::Result::eErrorFormatNotSupported ||
+        (support == vk::Result::eSuccess &&
+         !(properties.sampleCounts & vk::SampleCountFlagBits::e1))) {
+      std::printf("[host]    %-32s skipped: host lacks single-sample S8 attachment usage\n", name);
+      return false;
+    }
+    RequireVk(name, "S8 attachment support", support, "vkGetPhysicalDeviceImageFormatProperties");
+    int64_t offset = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+        alignment, 0, &offset) == 0, "stencil-only allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, offset, alignment) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "stencil-only mapping failed");
+    std::memset(mapped, 0x35, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      HW::DepthRenderTarget target{};
+      target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      target.stencil_read_base_addr = base;
+      target.stencil_write_base_addr = base;
+      target.size = {255, 255, true};
+      registers.SetDepthRenderTarget(target);
+      registers.SetDepthControl(HW::DepthControl{.stencil_enable = true});
+      registers.SetStencilControl({});
+      registers.SetStencilMask({});
+      RenderDepthInfo stencil{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), stencil);
+      Require(name, "discovery", stencil.image_id &&
+          stencil.desc.info.data == GuestRange{base, alignment} &&
+          stencil.desc.info.pixel_format == vk::Format::eS8Uint &&
+          !stencil.desc.info.HasStencil() && !stencil.depth_test_enable &&
+          stencil.stencil_test_enable &&
+          stencil.desc.info.BufferCopies()[0].imageSubresource.aspectMask ==
+              vk::ImageAspectFlagBits::eStencil,
+          "stencil-only discovery invented a depth plane");
+      RenderColorInfo no_color{};
+      const auto state = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, stencil);
+      Require(name, "attachment", !state.depth_stencil_attachment.has_depth &&
+          state.depth_stencil_attachment.has_stencil && state.width == 256 &&
+          state.height == 256 && state.depth_stencil_attachment.image_layout ==
+              vk::ImageLayout::eStencilReadOnlyOptimal,
+          "stencil-only acquisition did not use a stencil attachment");
+
+      auto &image = cache.GetImage(stencil.image_id);
+      auto readback = CreateHostBuffer(name, alignment,
+          vk::BufferUsageFlagBits::eTransferDst, {});
+      const auto copies = image.info.BufferCopies();
+      image.Download(copies, readback.buffer, 0, alignment);
+      scheduler.Finish();
+      const auto uploaded = ReadBuffer(name, readback, alignment / sizeof(uint32_t));
+      Require(name, "upload", std::ranges::all_of(uploaded,
+          [](uint32_t value) { return value == 0x35353535u; }),
+          "stencil-only upload lost the guest stencil contents");
+      DestroyBuffer(&readback);
+
+      vk::ClearValue clear{};
+      clear.depthStencil.stencil = 0x7a;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), stencil.image_id,
+          {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, clear);
+      Require(name, "download", TextureCacheTestAccess::TryDownload(cache, stencil.image_id),
+          "stencil-only GPU contents could not be downloaded");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      const auto *bytes = reinterpret_cast<const uint8_t *>(base);
+      Require(name, "readback", std::all_of(bytes, bytes + alignment,
+          [](uint8_t value) { return value == 0x7a; }),
+          "stencil-only readback lost GPU writes");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      auto sampled = stencil.desc;
+      sampled.type = TextureCache::BindingType::Texture;
+      sampled.info.pixel_format = vk::Format::eR8Uint;
+      sampled.view_info.format = vk::Format::eR8Uint;
+      sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto sampled_id = cache.FindImage(sampled);
+      Require(name, "sampled alias", sampled_id == stencil.image_id &&
+          cache.FindTexture(sampled_id, sampled) != nullptr,
+          "an R8 sampled alias did not retain the S8 stencil image");
+      auto storage = sampled;
+      storage.type = TextureCache::BindingType::Storage;
+      storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto storage_id = cache.FindImage(storage);
+      Require(name, "storage alias", storage_id != sampled_id &&
+          cache.FindTexture(storage_id, storage) != nullptr,
+          "an R8 storage alias did not convert the S8 backing");
+      // Guest memory still contains 0x7a: only a GPU-owned alias transfer can yield 0x4c.
+      vk::ClearValue storage_clear{};
+      storage_clear.color.uint32[0] = 0x4c;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), storage_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, storage_clear);
+      RenderDepthInfo restored{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), restored);
+      (void)cache.FindDepthTarget(restored.image_id, restored.desc);
+      Require(name, "storage round trip", restored.image_id != storage_id &&
+          TextureCacheTestAccess::TryDownload(cache, restored.image_id),
+          "stencil rediscovery failed after a storage alias");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "storage round trip contents", std::all_of(bytes, bytes + alignment,
+          [](uint8_t value) { return value == 0x4c; }),
+          "storage alias conversion lost stencil contents");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      // TopSpin 2K25 PPSA06899 menu: no depth plane, uncompressed S8 at 4K.
+      target.stencil_read_base_addr = base + 0x100000;
+      target.stencil_write_base_addr = target.stencil_read_base_addr;
+      target.size = {3839, 2159, true};
+      registers.SetDepthRenderTarget(target);
+      RenderDepthInfo menu{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), menu);
+      TileSizeAlign depth_size{}, stencil_size{}, htile_size{};
+      Require(name, "4K footprint", TileGetDepthSize(3840, 2160, 0,
+          Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::k8UInt, false,
+          stencil_size, htile_size, depth_size) &&
+          menu.desc.info.data.size == stencil_size.size &&
+          menu.desc.info.data.address == target.stencil_read_base_addr,
+          "4K stencil-only footprint differs from the existing stencil plane");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+        "stencil-only unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(offset, allocation_size) == 0,
+        "stencil-only release failed");
+    std::printf("[host]    %-32s ok\n", name);
+    return true;
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -51093,6 +51249,10 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-only") == 0) {
+    VulkanHarness vulkan;
+    return vulkan.CheckStencilOnlyTarget() ? 0 : 77;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     VulkanHarness vulkan;

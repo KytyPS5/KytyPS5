@@ -111,7 +111,7 @@ public:
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -125,10 +125,10 @@ public:
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
-	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] uint64_t        HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+		return info.IsDepthStencil() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		                             : vk::ImageLayout::eShaderReadOnlyOptimal;
 	}
 	// Resident image heaps sample an image without rediscovering it until one changes its
 	// contents, tracking, identity or layout.
@@ -142,23 +142,23 @@ public:
 	static inline std::atomic<uint64_t> serials {0};
 
 	// Unique per image, unlike ImageId: freed slots are reused.
-	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
-	ImageInfo        info;
-	VulkanImage      backing;
+	const uint64_t               serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
-	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
-	uint64_t         track_addr     = 0;
-	uint64_t         track_addr_end = 0;
-	ImageId          depth_id {};
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered = false;
+	mutable bool                 picked = false; // Set only while FindImagesInRegion collects it.
+	uint64_t                     track_addr     = 0;
+	uint64_t                     track_addr_end = 0;
+	ImageId                      depth_id {};
 	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	uint64_t              tick_accessed_last = 0;
+	size_t                lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

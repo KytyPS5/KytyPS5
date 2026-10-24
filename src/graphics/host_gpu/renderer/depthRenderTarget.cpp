@@ -131,16 +131,87 @@ static vk::StencilOpState ConvertStencilState(
 	return vk::Format::eUndefined;
 }
 
-static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
-                                                  const HW::DepthRenderTarget& z,
-                                                  bool write_buffer = false) {
-	const bool has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+// A guest stencil-only surface owns one byte per texel and no depth backing.
+// Keep it as a native S8 image so uploads and readbacks use the stencil plane directly.
+static TextureCache::ImageDesc MakeStencilTargetDesc(const CommandBuffer&         buffer,
+                                                     const HW::DepthRenderTarget& z,
+                                                     bool                         write_buffer) {
+	const auto& dc      = buffer.GetRegisters().GetDepthControl();
+	const auto& rc      = buffer.GetRegisters().GetRenderControl();
+	const auto  address = write_buffer ? z.stencil_write_base_addr : z.stencil_read_base_addr;
+	if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || dc.z_enable ||
+	    dc.z_write_enable || dc.depth_bounds_enable || rc.depth_clear_enable ||
+	    rc.copy_depth_to_color || z.z_read_base_addr != 0 || z.z_write_base_addr != 0 ||
+	    z.z_info.num_samples != 0 || z.z_info.htile_acceleration || z.htile_data_base_addr != 0 ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
+	    z.shading_rate_encoding != 0 || address == 0 || (address & 0xffffu) != 0) {
+		DepthFatal("unsupported stencil-only attachment state");
+	}
+	if (!z.size.valid) {
+		DepthFatal("missing stencil-only extent");
+	}
+	const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
+	const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
+	const auto     view   = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
+	if (view.type == TargetViewType::Unsupported || width > 16384 || height > 16384) {
+		DepthFatal("invalid stencil-only view or extent");
+	}
+	const auto    pitch = TileGetDepthPitch(width, 1, 0);
+	TileSizeAlign slice {};
+	if (!TileGetRenderTargetSize(width, height, pitch, 1, slice, 0) || slice.align != 65536 ||
+	    slice.size == 0 || slice.size > UINT64_MAX / view.image_layers) {
+		DepthFatal("unsupported stencil-only footprint");
+	}
+	const GuestRange backing {address, static_cast<uint64_t>(slice.size) * view.image_layers};
+	if (!backing.Valid()) {
+		DepthFatal("invalid stencil-only backing range");
+	}
+	constexpr auto            format = vk::Format::eS8Uint;
+	vk::ImageFormatProperties properties {};
+	if (buffer.GetGraphics().GetImageFormatProperties(
+	        format, vk::ImageType::e2D, vk::ImageTiling::eOptimal, DepthTargetImageUsage(),
+	        vk::ImageCreateFlags {}, &properties) != vk::Result::eSuccess ||
+	    !(properties.sampleCounts & vk::SampleCountFlagBits::e1)) {
+		DepthFatal("host does not support an S8 stencil-only attachment");
+	}
+	TextureCache::ImageDesc desc {};
+	desc.type                 = TextureCache::BindingType::DepthTarget;
+	desc.info.data            = backing;
+	desc.info.pixel_format    = format;
+	desc.info.guest_format    = Prospero::BufferFormat::k8UInt;
+	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.extent          = {width, height, 1};
+	desc.info.resources       = {1, view.image_layers};
+	desc.info.pitch           = pitch;
+	desc.info.bytes_per_block = 1;
+	desc.info.tile_mode       = Prospero::TileMode::kDepth;
+	desc.info.UpdateSize();
+	desc.view_info.format = format;
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	desc.view_info.aspect      = vk::ImageAspectFlagBits::eStencil;
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer  = view.base_layer;
+	desc.view_info.layer_count = view.layer_count;
+	desc.view_info.usage       = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	return desc;
+}
+
+static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer&         buffer,
+                                                   const HW::DepthRenderTarget& z,
+                                                   bool write_buffer = false) {
+	const bool has_stencil   = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
 	const auto depth_address = write_buffer ? z.z_write_base_addr : z.z_read_base_addr;
 	const auto stencil_address =
 	    write_buffer ? z.stencil_write_base_addr : z.stencil_read_base_addr;
 	if (!z.z_info.HasValidTextureCompatibility() ||
 	    !z.stencil_info.HasValidTextureCompatibility()) {
 		DepthFatal("invalid PS5 depth texture-compatibility encoding");
+	}
+	if (z.z_info.format == Prospero::DepthFormat::kInvalid && has_stencil) {
+		return MakeStencilTargetDesc(buffer, z, write_buffer);
 	}
 	const bool has_htile = z.z_info.htile_acceleration;
 	const bool unsupported_shading_rate_encoding =

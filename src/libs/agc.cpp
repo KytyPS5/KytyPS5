@@ -847,6 +847,25 @@ static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
 	return (type == RegIndirectPacket::Uc && is_trinity_mode() ? 1u : 0u);
 }
 
+// [DIAG cbsync] TEMPORARY: report a guest-side command-buffer write that lands in the stream the
+// GPU thread is currently parsing. The indirect-register patch helpers below are the only guest
+// writes we knowingly make inside command buffers. Diagnostic-only, read-only.
+static void cbdiag_note_cmd_write(const uint32_t* cmd, uint32_t first_word, uint32_t word_count) {
+	if (cmd == nullptr || word_count == 0) {
+		return;
+	}
+	const auto addr = reinterpret_cast<uint64_t>(cmd + first_word);
+	if (!GpuDiagWriteOverlapsActiveParse(addr, static_cast<uint64_t>(word_count) * 4u)) {
+		return;
+	}
+	static std::atomic<uint32_t> count {0};
+	if (count.fetch_add(1, std::memory_order_relaxed) < 512u) {
+		LOGF("[DIAG cbsync] WRITE-INTO-PARSED-CB addr=0x%016" PRIx64 " words=%" PRIu32
+		     " cmd=0x%016" PRIx64 "\n",
+		     addr, word_count, reinterpret_cast<uint64_t>(cmd));
+	}
+}
+
 static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t num_regs,
                                       RegIndirectPacket type) {
 	cmd[0] = KYTY_PM4(RegIndirectPacketSizeDw, reg_indirect_native_op(type), reg_indirect_pm4_r(type));
@@ -854,6 +873,7 @@ static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t nu
 	cmd[2] = static_cast<uint32_t>(vaddr >> 32u);
 	cmd[3] = 0x80000000u;
 	cmd[4] = num_regs & 0x3fffu;
+	cbdiag_note_cmd_write(cmd, 0, RegIndirectPacketSizeDw);
 }
 
 static int reg_indirect_patch_set_address(uint32_t* cmd, uint64_t vaddr, RegIndirectPacket type) {
@@ -862,6 +882,7 @@ static int reg_indirect_patch_set_address(uint32_t* cmd, uint64_t vaddr, RegIndi
 	if (is_native_reg_indirect_packet(cmd, type)) {
 		cmd[1] = (cmd[1] & 0x3u) | (static_cast<uint32_t>(vaddr) & 0xfffffffcu);
 		cmd[2] = static_cast<uint32_t>(vaddr >> 32u);
+		cbdiag_note_cmd_write(cmd, 1, 2);
 		return OK;
 	}
 
@@ -874,6 +895,7 @@ static int reg_indirect_patch_set_num_registers(uint32_t* cmd, uint32_t num_regs
 
 	if (is_native_reg_indirect_packet(cmd, type)) {
 		cmd[4] = (cmd[4] & ~0x3fffu) | (num_regs & 0x3fffu);
+		cbdiag_note_cmd_write(cmd, 4, 1);
 		return OK;
 	}
 
@@ -887,6 +909,7 @@ static int reg_indirect_patch_add_registers(uint32_t* cmd, uint32_t num_regs,
 	if (is_native_reg_indirect_packet(cmd, type)) {
 		auto new_num_regs = ((cmd[4] & 0x3fffu) + num_regs) & 0x3fffu;
 		cmd[4]            = (cmd[4] & ~0x3fffu) | new_num_regs;
+		cbdiag_note_cmd_write(cmd, 4, 1);
 		return OK;
 	}
 

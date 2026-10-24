@@ -6,6 +6,16 @@
 
 // IWYU pragma: no_include <pthread.h>
 
+// MinGW's winpthreads <pthread.h> defines those two names as function-like macros
+// (the functions are unimplemented on Windows), which would mangle the guest-side
+// declarations below. Drop the macros so they parse as ordinary function names.
+#ifdef pthread_attr_getguardsize
+#undef pthread_attr_getguardsize
+#endif
+#ifdef pthread_attr_setguardsize
+#undef pthread_attr_setguardsize
+#endif
+
 extern "C" {
 struct sched_param;
 }

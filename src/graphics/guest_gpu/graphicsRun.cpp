@@ -58,6 +58,125 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
+// [DIAG cbsync] TEMPORARY command-buffer mutation instrumentation.
+// FNV-1a 64 bit over every dword of the stream plus a wrapping checksum and the first/last
+// dwords, so a change is detected even if the hash collides and can be localised to an end.
+// Reads only, exactly like the PM4 parser does; it never writes to the stream.
+static CbDiagFingerprint CbDiagFingerprintSpan(std::span<const uint32_t> commands) {
+	CbDiagFingerprint fp;
+	if (commands.empty()) {
+		return fp;
+	}
+	uint64_t hash = 0xcbf29ce484222325ull;
+	uint64_t sum  = 0;
+	for (const auto dw: commands) {
+		sum += dw;
+		for (uint32_t byte = 0; byte < 4; byte++) {
+			hash ^= static_cast<uint64_t>((dw >> (byte * 8u)) & 0xffu);
+			hash *= 0x00000100000001b3ull;
+		}
+	}
+	fp.hash   = hash;
+	fp.sum    = sum;
+	fp.first  = commands.front();
+	fp.last   = commands.back();
+	fp.num_dw = static_cast<uint32_t>(commands.size());
+	return fp;
+}
+
+static bool CbDiagFingerprintsMatch(const CbDiagFingerprint& a, const CbDiagFingerprint& b) {
+	return a.num_dw == b.num_dw && a.hash == b.hash && a.sum == b.sum && a.first == b.first &&
+	       a.last == b.last;
+}
+
+// [DIAG cbsync] TEMPORARY: the command stream the GPU thread is currently parsing (the
+// emulator-owned copy) together with the original borrowed guest span that was submitted.
+// `GuestGpu::Process` sets it immediately before `CommandProcessor::Process` and clears it right
+// after. `ProcessPm4` uses it to detect that the guest changed the memory it handed over while the
+// owned copy was being parsed; the AGC patch helpers use it to attribute writes. Only the GPU
+// thread mutates it; the read from the guest thread in `GpuDiagWriteOverlapsActiveParse` is a
+// benign diagnostic race. Read-only.
+static const uint32_t* g_cb_diag_guest        = nullptr;
+static const uint32_t* g_cb_diag_owned        = nullptr;
+static uint32_t        g_cb_diag_num_dw       = 0;
+static uint64_t        g_cb_diag_id           = 0;
+static bool            g_cb_diag_header_logged = false;
+
+static void CbDiagBeginParse(uint64_t id, std::span<const uint32_t> guest,
+                             const std::vector<uint32_t>& owned) {
+	if (guest.empty() || guest.size() != owned.size()) {
+		g_cb_diag_guest         = nullptr;
+		g_cb_diag_owned         = nullptr;
+		g_cb_diag_num_dw        = 0;
+		g_cb_diag_id            = 0;
+		g_cb_diag_header_logged = false;
+		return;
+	}
+	g_cb_diag_guest         = guest.data();
+	g_cb_diag_owned         = owned.data();
+	g_cb_diag_num_dw        = static_cast<uint32_t>(guest.size());
+	g_cb_diag_id            = id;
+	g_cb_diag_header_logged = false;
+}
+
+static void CbDiagEndParse() {
+	g_cb_diag_guest         = nullptr;
+	g_cb_diag_owned         = nullptr;
+	g_cb_diag_num_dw        = 0;
+	g_cb_diag_id            = 0;
+	g_cb_diag_header_logged = false;
+}
+
+bool GpuDiagWriteOverlapsActiveParse(uint64_t address, uint64_t size) {
+	const auto* guest = g_cb_diag_guest;
+	if (guest == nullptr || size == 0 || g_cb_diag_num_dw == 0) {
+		return false;
+	}
+	const uint64_t begin = reinterpret_cast<uint64_t>(guest);
+	const uint64_t end   = begin + static_cast<uint64_t>(g_cb_diag_num_dw) * 4u;
+	return address < end && begin < address + size;
+}
+
+// [DIAG cbsync] TEMPORARY: compare the original guest memory (`live`) against the emulator-owned
+// copy (`reference`) and log the first/last differing dword, how many differ and a short bounded
+// sample. Logs only when a difference is present; read-only. Both must hold `num_dw` dwords.
+static void CbDiagLogDiff(uint64_t id, const char* phase, const char* stream, const uint32_t* live,
+                          const uint32_t* reference, uint32_t num_dw, uint64_t base_address) {
+	if (live == nullptr || reference == nullptr || num_dw == 0) {
+		return;
+	}
+	uint32_t first_diff = num_dw;
+	uint32_t last_diff  = 0;
+	uint32_t count      = 0;
+	for (uint32_t i = 0; i < num_dw; i++) {
+		if (live[i] != reference[i]) {
+			if (first_diff == num_dw) {
+				first_diff = i;
+			}
+			last_diff = i;
+			count++;
+		}
+	}
+	if (count == 0) {
+		return;
+	}
+	LOGF("[DIAG cbsync] DIFF id=%" PRIu64 " phase=%s stream=%s base=0x%016" PRIx64 " dw=%" PRIu32
+	     " first_diff=0x%05" PRIx32 " first_addr=0x%016" PRIx64 " last_diff=0x%05" PRIx32
+	     " count=%" PRIu32 " expected=0x%08" PRIx32 " actual=0x%08" PRIx32 "\n",
+	     id, phase, stream, base_address, num_dw, first_diff,
+	     base_address + static_cast<uint64_t>(first_diff) * 4u, last_diff, count,
+	     reference[first_diff], live[first_diff]);
+	uint32_t shown = 0;
+	for (uint32_t i = first_diff; i <= last_diff && shown < 16u; i++) {
+		if (live[i] != reference[i]) {
+			LOGF("[DIAG cbsync] DIFF   off=0x%05" PRIx32 " addr=0x%016" PRIx64
+			     " expected=0x%08" PRIx32 " actual=0x%08" PRIx32 "\n",
+			     i, base_address + static_cast<uint64_t>(i) * 4u, reference[i], live[i]);
+			shown++;
+		}
+	}
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -422,10 +541,162 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	                        dst_gds, src_gds);
 }
 
+// [vb-diag] TEMPORARY: snapshot, at submit time, the vertex-buffer (V#) tables that a later draw
+// will dereference through inline VS user-SGPR writes (SET_SH_REG covering GS slots 12/13). The
+// draw path reads those tables from live guest memory, potentially long after the guest has
+// recycled the memory; capturing the contents here - on the submitting thread, the last moment
+// they are guaranteed to still be the state the stream was built against - shows whether the
+// table was valid when the stream was handed over. Read-only, bounded to kMaxLogs tables.
+static void VbDiagSnapshotSubmitTables(std::span<const uint32_t> stream, uint64_t diag_id) {
+	constexpr uint32_t kMaxLogs = 256u;
+	static std::atomic<uint32_t> logged {0};
+	size_t i = 0;
+	while (i < stream.size()) {
+		const uint32_t header = stream[i];
+		const uint32_t len    = (header == 0x80000000u) ? 1u : Pm4::PacketSizeDw(header);
+		if (len == 0 || i + static_cast<size_t>(len) > stream.size()) {
+			break;
+		}
+		const uint32_t opcode = (header >> 8u) & 0xffu;
+		if (opcode == Pm4::IT_SET_SH_REG && len >= 4u) {
+			const uint32_t cmd_offset = stream[i + 1];
+			if (cmd_offset >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
+			    cmd_offset <= Pm4::SPI_SHADER_USER_DATA_GS_0 + 31u) {
+				const uint32_t slot       = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
+				const uint32_t payload_dw = len - 2u;
+				if (slot <= 12u && slot + payload_dw >= 14u) {
+					const uint64_t ptr =
+					    static_cast<uint64_t>(stream[i + 2 + (12u - slot)]) |
+					    (static_cast<uint64_t>(stream[i + 2 + (13u - slot)]) << 32u);
+					const uint32_t index = logged.fetch_add(1, std::memory_order_relaxed);
+					if (index < kMaxLogs && ptr != 0u) {
+						std::array<uint32_t, 16> words {};
+						const bool ok = Libs::LibKernel::Memory::TryReadGuestMemory(
+						    ptr, words.data(), static_cast<uint64_t>(words.size()) * sizeof(uint32_t));
+						LOGF("[vb-diag] submit id=%" PRIu64 " off=0x%" PRIxPTR
+						     " vsharp_ptr=0x%016" PRIx64 " readable=%s\n",
+						    diag_id, static_cast<uintptr_t>(i * 4u), ptr, ok ? "yes" : "no");
+						if (ok) {
+							LOGF("[vb-diag] submit table:");
+							for (const auto w: words) {
+								LOGF(" %08" PRIx32, w);
+							}
+							LOGF("\n");
+						}
+					}
+				}
+			}
+		}
+		i += len;
+	}
+}
+
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	// Take ownership of the submitted command streams. The spans handed in point at guest memory,
+	// which the guest may rewrite at any time; because parsing is deferred to the GPU thread, the
+	// parser must read emulator-owned memory instead. The copies are made before the queue lock and
+	// are never resized afterwards, so the re-pointed spans stay valid for the submission's life.
+	// [DIAG cbsync] Remember the original borrowed spans so the diagnostic can still observe the
+	// guest mutating them while the owned copy is parsed.
+	submission.diag_guest_cmd   = submission.commands;
+	submission.diag_guest_const = submission.constant_commands;
+	submission.command_store.assign(submission.commands.begin(), submission.commands.end());
+	submission.constant_command_store.assign(submission.constant_commands.begin(),
+	                                         submission.constant_commands.end());
+	submission.commands          = submission.command_store;
+	submission.constant_commands = submission.constant_command_store;
+	// Take submit-time ownership of every guest region the parser will dereference (the
+	// IT_SET_*_REG_INDIRECT pair arrays and nested command buffers). This runs on the submitting
+	// thread, before the submission is published to the GPU queue, which is the last moment the
+	// referenced memory is guaranteed to still hold the submit-time contents: the guest cannot be
+	// rewriting the buffer it has just handed over through this submit call. The reads go through
+	// the bounds- and protection-checked Memory::TryReadGuestMemory so a stale, unmapped or
+	// unreadable reference can never fault the emulator.
+	//
+	// A capture sequence number identifies this submit's capture independently of
+	// submission.diag_id, which is only assigned later, under the queue lock.
+	static std::atomic<uint64_t> capture_sequence {0};
+	const uint64_t               capture_seq = ++capture_sequence;
+	const Pm4GuestReader         guest_reader = [](uint64_t address, void* dst, uint64_t size) {
+		if (Libs::LibKernel::Memory::TryReadGuestMemory(address, dst, size)) {
+			return true;
+		}
+		// Immediate, bounded report of a rejected read. The caller records the referencing packet
+		// details; this line proves the capture actually attempted the read and where it failed.
+		constexpr uint32_t kMaxReadFailureLogs = 16u;
+		static std::atomic<uint32_t> logged {0};
+		const uint32_t index = logged.fetch_add(1, std::memory_order_relaxed);
+		if (index < kMaxReadFailureLogs) {
+			LOGF_COLOR(Log::Color::BrightRed,
+			           "[pm4-ownership] guest read failed: addr=0x%016" PRIx64 " size=%" PRIu64
+			           "\n",
+			           address, size);
+		}
+		return false;
+	};
+	submission.command_execution.CaptureGuestRanges(submission.commands, guest_reader);
+	submission.constant_execution.CaptureGuestRanges(submission.constant_commands, guest_reader);
+	// A miss means a referenced guest range could not be read at submit time. The later parse will
+	// then fail loudly for that reference instead of reading memory the guest may have rewritten, so
+	// surface it here too, where the cause (a stale or malformed submit) is still visible. The
+	// per-reference detail (address, count, referencing packet header and offset, reason) is
+	// bounded by Pm4Ownership.
+	if (submission.command_execution.OwnedGuestRangeMisses() != 0u ||
+	    submission.constant_execution.OwnedGuestRangeMisses() != 0u ||
+	    submission.command_execution.OwnedGuestRangeMalformed() != 0u ||
+	    submission.constant_execution.OwnedGuestRangeMalformed() != 0u) {
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "[pm4-ownership] submit capture incomplete: seq=%" PRIu64
+		           " root=0x%016" PRIx64 " root_dw=%zu root_first=0x%08" PRIx32
+		           " cmd(miss=%" PRIu32 ",malformed=%" PRIu32 ",ranges=%" PRIuPTR
+		           ") const(miss=%" PRIu32 ",malformed=%" PRIu32 ",ranges=%" PRIuPTR ")\n",
+		           capture_seq, reinterpret_cast<uint64_t>(submission.commands.data()),
+		           submission.commands.size(),
+		           submission.commands.empty() ? 0u : submission.commands.front(),
+		           submission.command_execution.OwnedGuestRangeMisses(),
+		           submission.command_execution.OwnedGuestRangeMalformed(),
+		           submission.command_execution.OwnedGuestRangeCount(),
+		           submission.constant_execution.OwnedGuestRangeMisses(),
+		           submission.constant_execution.OwnedGuestRangeMalformed(),
+		           submission.constant_execution.OwnedGuestRangeCount());
+		const auto cmd_misses = submission.command_execution.DescribeOwnedGuestRangeMisses();
+		if (!cmd_misses.empty()) {
+			LOGF_COLOR(Log::Color::BrightRed, "[pm4-ownership] cmd %s\n", cmd_misses.c_str());
+		}
+		const auto const_misses = submission.constant_execution.DescribeOwnedGuestRangeMisses();
+		if (!const_misses.empty()) {
+			LOGF_COLOR(Log::Color::BrightRed, "[pm4-ownership] const %s\n", const_misses.c_str());
+		}
+	}
+	// [DIAG cbsync] Fingerprint the borrowed guest memory as submitted; every later check compares
+	// the guest memory against this.
+	submission.diag_submit_cmd   = CbDiagFingerprintSpan(submission.diag_guest_cmd);
+	submission.diag_submit_const = CbDiagFingerprintSpan(submission.diag_guest_const);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	// [DIAG cbsync] Identity and enqueue order are attached to the submission object itself.
+	submission.diag_id           = ++m_diag_submission_id;
+	submission.diag_enqueue_seq  = ++m_diag_enqueue_seq;
+	submission.diag_submit_depth = m_submission_count;
+	submission.diag_submit_frame = m_done_num.load(std::memory_order_relaxed);
+	if (submission.diag_submit_cmd.num_dw != 0 || submission.diag_submit_const.num_dw != 0) {
+		LOGF("[DIAG cbsync] submit id=%" PRIu64 " seq=%" PRIu64 " kind=%s qid=%" PRIu32
+		     " cmd=0x%016" PRIx64 " dw=%" PRIu32 " first=0x%08" PRIx32 " last=0x%08" PRIx32
+		     " hash=0x%016" PRIx64 " sum=0x%016" PRIx64 " const=0x%016" PRIx64
+		     " const_dw=%" PRIu32 " qdepth=%" PRIu32 " frame=%d\n",
+		     submission.diag_id, submission.diag_enqueue_seq, submission.DiagKind(),
+		     submission.queue_id, reinterpret_cast<uint64_t>(submission.diag_guest_cmd.data()),
+		     submission.diag_submit_cmd.num_dw, submission.diag_submit_cmd.first,
+		     submission.diag_submit_cmd.last, submission.diag_submit_cmd.hash,
+		     submission.diag_submit_cmd.sum,
+		     reinterpret_cast<uint64_t>(submission.diag_guest_const.data()),
+		     submission.diag_submit_const.num_dw, submission.diag_submit_depth,
+		     submission.diag_submit_frame);
+	}
+	// [vb-diag] TEMPORARY: capture the submit-time state of every VS vertex-buffer table this
+	// stream references (bounded), before the submission is published to the GPU queue.
+	VbDiagSnapshotSubmitTables(submission.commands, submission.diag_id);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -543,8 +814,85 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
+		submission.diag_parse_seq = cp.GetSubmitId(); // [DIAG cbsync]
 		cp.ResetDeCe();
 		cp.SetFlip({});
+	}
+
+	// [DIAG cbsync] TEMPORARY: re-fingerprint the borrowed guest memory and compare it with the
+	// fingerprint taken at submit time. Runs on the first slice and again on every resumption of a
+	// suspended stream. This detects that the guest rewrote the memory it handed over; the parser
+	// itself now reads the emulator-owned copy, so this no longer affects parsing. Read-only.
+	if (submission.diag_submit_cmd.num_dw != 0 || submission.diag_submit_const.num_dw != 0) {
+		const auto now_cmd     = CbDiagFingerprintSpan(submission.diag_guest_cmd);
+		const auto now_const   = CbDiagFingerprintSpan(submission.diag_guest_const);
+		const bool cmd_match   = CbDiagFingerprintsMatch(now_cmd, submission.diag_submit_cmd);
+		const bool const_match = CbDiagFingerprintsMatch(now_const, submission.diag_submit_const);
+		uint32_t   queue_depth = 0;
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			queue_depth = m_submission_count;
+		}
+		submission.diag_check_count++;
+		const char* phase = first_slice ? "first" : "resume";
+		LOGF("[DIAG cbsync] parse-%s id=%" PRIu64 " seq=%" PRIu64 " parse_seq=%" PRIu64
+		     " kind=%s qid=%" PRIu32 " cmd=0x%016" PRIx64 " dw=%" PRIu32 " first=0x%08" PRIx32
+		     " last=0x%08" PRIx32 " hash=0x%016" PRIx64 " sum=0x%016" PRIx64
+		     " match=%s const_match=%s const=0x%016" PRIx64 " const_dw=%" PRIu32
+		     " check=%" PRIu64 " qdepth=%" PRIu32 " frame=%d pending=%" PRIu32 "\n",
+		     phase, submission.diag_id, submission.diag_enqueue_seq, submission.diag_parse_seq,
+		     submission.DiagKind(), submission.queue_id,
+		     reinterpret_cast<uint64_t>(submission.diag_guest_cmd.data()), now_cmd.num_dw,
+		     now_cmd.first, now_cmd.last, now_cmd.hash, now_cmd.sum, cmd_match ? "yes" : "no",
+		     const_match ? "yes" : "no",
+		     reinterpret_cast<uint64_t>(submission.diag_guest_const.data()), now_const.num_dw,
+		     submission.diag_check_count, queue_depth,
+		     m_done_num.load(std::memory_order_relaxed),
+		     m_pending_commands.load(std::memory_order_relaxed));
+		if (!cmd_match) {
+			LOGF("[DIAG cbsync] MISMATCH id=%" PRIu64 " phase=%s stream=cmd"
+			     " submit_dw=%" PRIu32 " submit_first=0x%08" PRIx32 " submit_last=0x%08" PRIx32
+			     " submit_hash=0x%016" PRIx64 " submit_sum=0x%016" PRIx64 " now_dw=%" PRIu32
+			     " now_first=0x%08" PRIx32 " now_last=0x%08" PRIx32 " now_hash=0x%016" PRIx64
+			     " now_sum=0x%016" PRIx64 "\n",
+			     submission.diag_id, phase, submission.diag_submit_cmd.num_dw,
+			     submission.diag_submit_cmd.first, submission.diag_submit_cmd.last,
+			     submission.diag_submit_cmd.hash, submission.diag_submit_cmd.sum, now_cmd.num_dw,
+			     now_cmd.first, now_cmd.last, now_cmd.hash, now_cmd.sum);
+			CbDiagLogDiff(submission.diag_id, phase, "cmd", submission.diag_guest_cmd.data(),
+			              submission.command_store.data(),
+			              static_cast<uint32_t>(submission.command_store.size()),
+			              reinterpret_cast<uint64_t>(submission.diag_guest_cmd.data()));
+		}
+		if (!const_match) {
+			LOGF("[DIAG cbsync] MISMATCH id=%" PRIu64 " phase=%s stream=const"
+			     " submit_dw=%" PRIu32 " submit_first=0x%08" PRIx32 " submit_last=0x%08" PRIx32
+			     " submit_hash=0x%016" PRIx64 " submit_sum=0x%016" PRIx64 " now_dw=%" PRIu32
+			     " now_first=0x%08" PRIx32 " now_last=0x%08" PRIx32 " now_hash=0x%016" PRIx64
+			     " now_sum=0x%016" PRIx64 "\n",
+			     submission.diag_id, phase, submission.diag_submit_const.num_dw,
+			     submission.diag_submit_const.first, submission.diag_submit_const.last,
+			     submission.diag_submit_const.hash, submission.diag_submit_const.sum,
+			     now_const.num_dw, now_const.first, now_const.last, now_const.hash, now_const.sum);
+			CbDiagLogDiff(submission.diag_id, phase, "const", submission.diag_guest_const.data(),
+			              submission.constant_command_store.data(),
+			              static_cast<uint32_t>(submission.constant_command_store.size()),
+			              reinterpret_cast<uint64_t>(submission.diag_guest_const.data()));
+		}
+	} else if (first_slice) {
+		// No command buffer (flip preparation / suspend point): still record when it is consumed,
+		// so the pacing of the flip/suspend-point pipeline is visible next to the submissions.
+		uint32_t queue_depth = 0;
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			queue_depth = m_submission_count;
+		}
+		LOGF("[DIAG cbsync] parse-first id=%" PRIu64 " seq=%" PRIu64 " parse_seq=%" PRIu64
+		     " kind=%s qid=%" PRIu32 " qdepth=%" PRIu32 " frame=%d pending=%" PRIu32 " no-cmd\n",
+		     submission.diag_id, submission.diag_enqueue_seq, submission.diag_parse_seq,
+		     submission.DiagKind(), submission.queue_id, queue_depth,
+		     m_done_num.load(std::memory_order_relaxed),
+		     m_pending_commands.load(std::memory_order_relaxed));
 	}
 
 	cp.BufferInit();
@@ -557,16 +905,22 @@ bool GuestGpu::Process(Submission& submission) {
 			for (;;) {
 				bool round_progress = false;
 				if (!submission.constant_complete) {
+					CbDiagBeginParse(submission.diag_id, submission.diag_guest_const,
+					                 submission.constant_command_store);
 					submission.constant_complete =
 					    cp.Process(submission.constant_execution, submission.constant_commands) ==
 					    Pm4ProcessResult::Complete;
+					CbDiagEndParse();
 					round_progress |= submission.constant_execution.MadeProgress();
 				}
 				cp.SetCeComplete(submission.constant_complete);
 				if (!submission.command_complete) {
+					CbDiagBeginParse(submission.diag_id, submission.diag_guest_cmd,
+					                 submission.command_store);
 					submission.command_complete =
 					    cp.Process(submission.command_execution, submission.commands) ==
 					    Pm4ProcessResult::Complete;
+					CbDiagEndParse();
 					round_progress |= submission.command_execution.MadeProgress();
 				}
 				progressed |= round_progress;
@@ -594,8 +948,11 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
+			CbDiagBeginParse(submission.diag_id, submission.diag_guest_cmd,
+			                 submission.command_store);
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			CbDiagEndParse();
 			if (submission.command_execution.MadeProgress()) {
 				cp.BufferFlush();
 			}
@@ -652,8 +1009,31 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
-	g_current_execution->m_next_buffer = commands;
+	// `commands` is the submit-time owned snapshot looked up by address (see FindOwnedGuestRange);
+	// it is not guest memory. It is copied once into the execution's buffer deque so that appending
+	// later nested buffers never relocates this one, which keeps the spans held by BufferCursor
+	// entries valid.
+	g_current_execution->m_owned_buffers.emplace_back(commands.begin(), commands.end());
+	g_current_execution->m_next_buffer = g_current_execution->m_owned_buffers.back();
 	g_current_execution->m_chain       = chain;
+}
+
+std::span<const uint32_t> CommandProcessor::FindOwnedGuestRange(uint64_t address,
+                                                                uint32_t num_dw) const {
+	EXIT_IF(g_current_execution == nullptr);
+	return g_current_execution->m_guest_ranges.Find(address, num_dw);
+}
+
+std::span<const uint32_t> FindOwnedGuestRangeForCurrentSubmit(uint64_t address, uint32_t num_dw) {
+	if (g_current_execution == nullptr) {
+		return {};
+	}
+	return g_current_execution->FindOwnedGuestRange(address, num_dw);
+}
+
+std::string CommandProcessor::DescribeOwnedGuestRangeMisses() const {
+	EXIT_IF(g_current_execution == nullptr);
+	return g_current_execution->DescribeOwnedGuestRangeMisses();
 }
 
 void CommandProcessor::SuspendPm4() {
@@ -679,6 +1059,26 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+
+		// [DIAG cbsync] TEMPORARY: when walking the emulator-owned root stream, compare the dword
+		// being decoded against the guest memory it was copied from. The parser reads the owned copy,
+		// so this reports a guest rewrite of memory that is still nominally in flight, without
+		// affecting parsing. Reported once per stream slice. Read-only.
+		if (!g_cb_diag_header_logged && g_cb_diag_guest != nullptr &&
+		    cursor.commands.data() == g_cb_diag_owned && cursor.offset_dw < g_cb_diag_num_dw) {
+			const uint32_t guest_now = g_cb_diag_guest[cursor.offset_dw];
+			if (guest_now != packet_header) {
+				g_cb_diag_header_logged = true;
+				LOGF("[DIAG cbsync] HEADER-CHANGED id=%" PRIu64 " offset=0x%05" PRIx32
+				     " addr=0x%016" PRIx64 " parsed=0x%08" PRIx32 " guest_now=0x%08" PRIx32
+				     " guest_base=0x%016" PRIx64 " dw=%" PRIu32 "\n",
+				     g_cb_diag_id, cursor.offset_dw,
+				     reinterpret_cast<uint64_t>(g_cb_diag_guest) +
+				         static_cast<uint64_t>(cursor.offset_dw) * 4u,
+				     packet_header, guest_now, reinterpret_cast<uint64_t>(g_cb_diag_guest),
+				     g_cb_diag_num_dw);
+			}
+		}
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;
@@ -734,6 +1134,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			auto* const base       = packet - offset;
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
+			}
+			// [DIAG cbsync] TEMPORARY: at the failure point, compare the guest memory with the
+			// emulator-owned copy to localise the change. Read-only.
+			if (g_cb_diag_guest != nullptr && base == g_cb_diag_owned) {
+				CbDiagLogDiff(g_cb_diag_id, "crash", "cmd", g_cb_diag_guest, g_cb_diag_owned,
+				              g_cb_diag_num_dw, reinterpret_cast<uint64_t>(g_cb_diag_guest));
+			} else {
+				LOGF("[DIAG cbsync] DIFF-SKIP reason=sub-buffer base=0x%016" PRIx64
+				     " owned=0x%016" PRIx64 "\n",
+				     reinterpret_cast<uint64_t>(base),
+				     reinterpret_cast<uint64_t>(g_cb_diag_owned));
 			}
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
 			     total_dw - remaining_dw, packet_header);

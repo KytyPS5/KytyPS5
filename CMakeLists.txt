@@ -201,6 +201,29 @@ config_compiler_and_linker()
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
+if(MINGW)
+	# cpuinfo's Windows backend is C code that relies on the min/max macros provided
+	# by <windows.h>. The project-wide NOMINMAX (see above) would turn them into
+	# undeclared functions and fail the link with "undefined reference to 'max'", so
+	# re-enable the macros for this target only. -U is emitted after the -D above.
+	target_compile_options(cpuinfo PRIVATE -UNOMINMAX)
+endif()
+
+# MinGW links a MinGW-built FFmpeg prebuilt (see 3rdparty/ffmpeg-core). Unlike the
+# MSVC one, GNU ld resolves its archives left-to-right, so the Windows system
+# libraries it needs must be requested after the FFmpeg archives; wrapping
+# FFmpeg::ffmpeg guarantees that order. onecore additionally resolves the Windows 10
+# memory APIs (VirtualAlloc2, MapViewOfFile3, UnmapViewOfFile2) used by the guest
+# address space.
+if(MINGW)
+	add_library(kyty_ffmpeg INTERFACE)
+	target_link_libraries(kyty_ffmpeg INTERFACE
+		FFmpeg::ffmpeg onecore ws2_32 bcrypt ole32 oleaut32 user32 shlwapi psapi strmiids uuid)
+	set(KYTY_FFMPEG_TARGET kyty_ffmpeg)
+else()
+	set(KYTY_FFMPEG_TARGET FFmpeg::ffmpeg)
+endif()
+
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/libs/*.cpp"
 	"${KYTY_SOURCE_DIR}/libs/*.h"
@@ -336,7 +359,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash ${KYTY_FFMPEG_TARGET} fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
 # Linux system libraries.
 if(LINUX)
@@ -413,6 +436,13 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(pm4_ownership_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Pm4OwnershipTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/pm4Ownership.cpp"
+)
+target_link_libraries(pm4_ownership_tests common)
+target_include_directories(pm4_ownership_tests PRIVATE ${inc_headers})
+
 add_executable(archive_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
 )
@@ -429,7 +459,7 @@ add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
-target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
+target_link_libraries(avplayer_file_tests common ${KYTY_FFMPEG_TARGET} ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
 
 add_executable(vdecsw_tests EXCLUDE_FROM_ALL
@@ -437,7 +467,7 @@ add_executable(vdecsw_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/videoDec2Decoder.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
-target_link_libraries(vdecsw_tests common FFmpeg::ffmpeg)
+target_link_libraries(vdecsw_tests common ${KYTY_FFMPEG_TARGET})
 target_include_directories(vdecsw_tests PRIVATE ${inc_headers})
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
@@ -631,6 +661,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME pm4_ownership COMMAND $<TARGET_FILE:pm4_ownership_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
@@ -709,6 +740,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		pm4_ownership_tests
 		archive_file_tests
 		trophy_system_tests
 		avplayer_file_tests
@@ -780,6 +812,11 @@ if (WIN32)
 	target_link_libraries(kyty_emulator iphlpapi)
 	target_link_libraries(kyty_emulator setupapi)
 	target_link_libraries(kyty_emulator ws2_32)
+endif()
+if(MINGW)
+	# main.cpp provides wmain on Windows. GNU ld defaults to the narrow startup object
+	# and fails with an undefined reference to `main', so request the Unicode one.
+	target_link_options(kyty_emulator PRIVATE -municode)
 endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)

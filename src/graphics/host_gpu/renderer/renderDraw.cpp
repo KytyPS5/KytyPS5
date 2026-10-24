@@ -730,6 +730,37 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
 
+	// [vb-diag] bounded vertex-buffer descriptor/range trace for the acquire path.
+	if (graphics_debug_dump_enabled()) {
+		static std::atomic<uint32_t> vb_diag_count = 0;
+		if (vb_diag_count.fetch_add(1) < 4096) {
+			LOGF("[vb-diag] buffers=%d resources=%d ranges=%u\n", vs_input_info.buffers_num,
+			     vs_input_info.resources_num, merged_count);
+			for (int i = 0; i < vs_input_info.resources_num; i++) {
+				const auto& r  = vs_input_info.resources[i];
+				const auto& rd = vs_input_info.resources_dst[i];
+				LOGF("[vb-diag] res[%d] reg=%d regs=%d attr=%d fetch=%u buf=%d base=0x%016" PRIx64
+				     " stride=%u records=%u fmt=%u oob=%u w=%08" PRIx32 " %08" PRIx32
+				     " %08" PRIx32 " %08" PRIx32 "\n",
+				     i, rd.register_start, rd.registers_num, rd.attr_id, rd.fetch_index,
+				     rd.buffer_index, r.Base48(), r.Stride(), r.NumRecords(), r.RawFormat(),
+				     r.OutOfBounds(), r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
+			}
+			for (int i = 0; i < vs_input_info.buffers_num; i++) {
+				const auto& b = vs_input_info.buffers[i];
+				LOGF("[vb-diag] buf[%d] addr=0x%016" PRIx64 " stride=%u records=%u fetch=%u"
+				     " size=0x%016" PRIx64 "\n",
+				     i, b.addr, b.stride, b.num_records, b.fetch_index, sizes[i]);
+			}
+			for (uint32_t i = 0; i < merged_count; i++) {
+				LOGF("[vb-diag] range[%u] base=0x%016" PRIx64 " end=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n",
+				     i, merged_ranges[i].base_address, merged_ranges[i].requested_end,
+				     merged_ranges[i].RequestedSize());
+			}
+		}
+	}
+
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];

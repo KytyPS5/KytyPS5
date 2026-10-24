@@ -16,10 +16,28 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
 class RenderContext;
+
+// [DIAG cbsync] TEMPORARY command-buffer mutation instrumentation.
+// Holds a fingerprint of a borrowed guest command stream so it can be re-checked when that
+// stream is actually parsed. Remove this struct, the `diag_*` members of `Submission` and the
+// two GuestGpu counters together with every other "[DIAG cbsync]" marker.
+struct CbDiagFingerprint {
+	uint64_t hash   = 0; // FNV-1a 64 over every dword of the stream
+	uint64_t sum    = 0; // wrapping checksum of every dword
+	uint32_t first  = 0;
+	uint32_t last   = 0;
+	uint32_t num_dw = 0;
+};
+
+// [DIAG cbsync] TEMPORARY: true when the guest byte range [address, address + size) overlaps the
+// command stream the GPU thread is currently parsing. Used by the AGC command-buffer patch
+// helpers to attribute writes that corrupt an in-flight parse. Diagnostic-only, read-only.
+bool GpuDiagWriteOverlapsActiveParse(uint64_t address, uint64_t size);
 
 class GuestGpu final {
 public:
@@ -59,6 +77,14 @@ private:
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		std::span<const uint32_t> constant_commands;
+		// Emulator-owned copies of the submitted command streams. The guest that handed over this
+		// borrowed memory can rewrite it at any time (it only paces itself against its own frame
+		// boundaries), but Kyty parses asynchronously on the GPU thread, so parsing must not read
+		// guest memory. `commands` / `constant_commands` are re-pointed at these copies in
+		// Enqueue(); the vectors are never resized afterwards, so their backing buffers stay valid
+		// while the submission is moved between queues.
+		std::vector<uint32_t> command_store;
+		std::vector<uint32_t> constant_command_store;
 		Pm4Execution              command_execution;
 		Pm4Execution              constant_execution;
 		bool                      started           = false;
@@ -66,6 +92,34 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+
+		// [DIAG cbsync] TEMPORARY instrumentation state. It lives on the submission object, not
+		// in a table keyed by guest pointer, so a buffer address reused by another submission
+		// cannot alias this record.
+		uint64_t          diag_id           = 0; // unique, stable for the lifetime of this submission
+		uint64_t          diag_enqueue_seq  = 0; // order in which Enqueue() accepted this submission
+		uint64_t          diag_parse_seq    = 0; // global submission id assigned when parsing starts
+		uint64_t          diag_check_count  = 0; // number of parse-time fingerprint re-checks
+		uint32_t          diag_submit_depth = 0; // m_submission_count at Enqueue() time
+		int               diag_submit_frame = 0; // m_done_num at Enqueue() time
+		CbDiagFingerprint diag_submit_cmd {};    // fingerprint of `commands` at submit time
+		CbDiagFingerprint diag_submit_const {};  // fingerprint of `constant_commands` at submit time
+		// [DIAG cbsync] The original borrowed guest spans, kept only so the diagnostic can still
+		// observe the guest mutating them while the emulator-owned copies above are parsed. Never
+		// executed; the parse source is `commands` / `constant_commands` (the copies).
+		std::span<const uint32_t> diag_guest_cmd;
+		std::span<const uint32_t> diag_guest_const;
+
+		// [DIAG cbsync] readable kind for the diagnostic log.
+		[[nodiscard]] const char* DiagKind() const {
+			switch (type) {
+				case SubmissionType::Graphics: return "dcb";
+				case SubmissionType::Compute: return "acb";
+				case SubmissionType::FlipPreparation: return "flip-prep";
+				case SubmissionType::SuspendPoint: return "suspend-point";
+			}
+			return "unknown";
+		}
 	};
 
 	void              Enqueue(Submission submission);
@@ -99,8 +153,20 @@ private:
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
 
+	// [DIAG cbsync] TEMPORARY instrumentation counters (guarded by m_queue_mutex).
+	uint64_t m_diag_submission_id = 0;
+	uint64_t m_diag_enqueue_seq   = 0;
+
 	friend class CommandProcessor;
 };
+
+// Submit-time owned dwords for the guest range starting at `address` in the submission the GPU
+// thread is currently parsing, or an empty span when the range was not captured at submit time (or
+// this is not the parsing thread). The deferred *draw* path uses this to read the vertex-input
+// descriptor tables it reaches through GS/HS user-data pointers: those tables live in guest memory
+// the guest may have recycled since the submission was queued, so they must be read from the same
+// submit-time capture as the command stream.
+std::span<const uint32_t> FindOwnedGuestRangeForCurrentSubmit(uint64_t address, uint32_t num_dw);
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

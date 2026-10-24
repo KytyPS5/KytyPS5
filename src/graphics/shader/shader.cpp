@@ -154,8 +154,13 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t size = in.size_in_elements;
 
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			// [vb-diag] pristine attribute decode: raw va dword, descriptor index and fields.
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 " semantic=%u attrib=0x%08" PRIx32
+			     " idx=%u fmt=0x%03" PRIx32 " off=%u fetch=%u attrib_ptr=%p buffer_ptr=%p\n",
+			     reg, size, i, attrib[in.semantic], in.semantic, attrib[in.semantic],
+			     attrib[in.semantic] & 0x1fu, (attrib[in.semantic] >> 5u) & 0x1ffu,
+			     (attrib[in.semantic] >> 14u) & 0xfffu, (attrib[in.semantic] >> 26u) & 0x1u,
+			     static_cast<const void*>(attrib), static_cast<const void*>(buffer));
 		}
 
 		size_t index = attrib[in.semantic] & 0x1fu;
@@ -180,6 +185,13 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[1]       = sharp[1];
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
+		if (debug_dump) {
+			// [vb-diag] raw V# descriptor before any offset/format rewrite.
+			LOGF("V#raw[%u]: semantic=%u idx=%u desc=%08" PRIx32 " %08" PRIx32 " %08" PRIx32
+			     " %08" PRIx32 "\n",
+			     i, in.semantic, static_cast<unsigned>(index), sharp[0], sharp[1], sharp[2],
+			     sharp[3]);
+		}
 		EXIT_NOT_IMPLEMENTED(r.AddTid());
 		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
@@ -257,6 +269,40 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
+// The vertex-input descriptor tables (the V# buffer table and the attribute table) are reached
+// through 64-bit pointers stored in the GS/HS user-data registers. The user-data *values* already
+// come from the submit-time command snapshot, but the tables they point at live in guest memory
+// that the guest is free to recycle once the frame is over. Because draws are emitted from the
+// deferred parse - up to a frame after the submission was queued - reading those tables straight
+// out of guest memory can observe a later frame's rewrite (this is exactly the observed crash: a
+// correct V# table pointer whose contents had been replaced). Resolve them through the same
+// submit-time capture that owns the command stream, so the draw sees the tables the submission was
+// issued against.
+static const uint32_t* ResolveVertexInputTable(uint64_t address, uint64_t shader_addr,
+                                               const char* name) {
+	if (address == 0) {
+		return nullptr;
+	}
+	const auto owned =
+	    FindOwnedGuestRangeForCurrentSubmit(address, Pm4Ownership::kUserDataTableDwords);
+	if (!owned.empty()) {
+		return owned.data();
+	}
+	// No matching GS/HS user-data write was captured for this submission. Keep the historical
+	// behaviour of reading guest memory directly (this covers a path that binds the table without
+	// a user-data packet), but make the uncovered reference visible instead of silently reading
+	// memory the guest may have recycled.
+	static int uncovered_table_count = 0;
+	if (uncovered_table_count < 8) {
+		uncovered_table_count++;
+		LOGF("ShaderGetVertexInputInfo(): %s table 0x%016" PRIx64
+		     " was not captured at submit time; reading live guest memory"
+		     " shader=0x%016" PRIx64 "\n",
+		     name, address, shader_addr);
+	}
+	return reinterpret_cast<const uint32_t*>(address);
+}
+
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data,
@@ -289,17 +335,48 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		info.fetch_attrib_reg = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg = metadata.vertex_buffer_reg;
 
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
+		// 64-bit pointers, taken from the submit-time stream. The tables they name are resolved
+		// through the submit-time capture (see ResolveVertexInputTable), not live guest memory.
+		const uint64_t attrib_addr =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u);
+		const uint64_t buffer_addr =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u);
+
+		const auto* attrib = ResolveVertexInputTable(attrib_addr, shader_addr, "attrib");
+		const auto* buffer = ResolveVertexInputTable(buffer_addr, shader_addr, "buffer");
 
 		if (attrib == nullptr || buffer == nullptr) {
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;
+		}
+		{
+			// [vb-diag] bounded dump of the VS table registers and raw tables.
+			static int table_diag_count = 0;
+			if (Config::GraphicsDebugDumpEnabled() && table_diag_count < 64) {
+				table_diag_count++;
+				LOGF("VS tables[%d]: shader=0x%016" PRIx64 " attrib_reg=%d buffer_reg=%d"
+				     " attrib_ptr=0x%016" PRIx64 " buffer_ptr=0x%016" PRIx64
+				     " user_sgpr_num=%u sem=%u\n",
+				     table_diag_count, shader_addr, metadata.vertex_attrib_reg,
+				     metadata.vertex_buffer_reg, attrib_addr, buffer_addr, user_sgpr_num,
+				     static_cast<uint32_t>(metadata.input_semantics.size()));
+				LOGF("VS user_sgpr:");
+				for (uint32_t s = 0; s < user_sgpr_num && s < HW::UserSgprInfo::SGPRS_MAX; s++) {
+					LOGF(" [%u]=%08" PRIx32, s, user_sgpr.value[s]);
+				}
+				LOGF("\nVS attrib[0..7]:");
+				for (int k = 0; k < 8; k++) {
+					LOGF(" %08" PRIx32, attrib[k]);
+				}
+				LOGF("\nVS buffer[0..15]:");
+				for (int k = 0; k < 16; k++) {
+					LOGF(" %08" PRIx32, buffer[k]);
+				}
+				LOGF("\n");
+			}
 		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);

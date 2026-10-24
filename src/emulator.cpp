@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/quickExit.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
@@ -182,7 +183,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
-	std::quick_exit(0);
+	Common::QuickExit(0);
 }
 
 void Run(const RunOptions& options) {
@@ -218,7 +219,7 @@ void Run(const RunOptions& options) {
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
 	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
-	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
+	ok = Common::AtQuickExit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");

@@ -23,6 +23,9 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	bool                        maintenance8_enabled       = false;
+	// Legacy default (true): assume fragment barycentrics so existing callers keep
+	// emitting the VK_KHR_fragment_shader_barycentric interface.
+	bool                        fragment_barycentric_enabled = true;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

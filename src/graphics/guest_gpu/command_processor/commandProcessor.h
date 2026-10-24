@@ -2,12 +2,15 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/pm4Ownership.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <deque>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -33,6 +36,27 @@ class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
 
+	// Take submit-time ownership of every guest-memory region reachable from this stream that the
+	// PM4 parser will dereference (IT_SET_*_REG_INDIRECT pair arrays and nested command buffers).
+	// Called once, on the submitting thread, before the submission is published to the GPU queue.
+	void CaptureGuestRanges(std::span<const uint32_t> root, const Pm4GuestReader& reader) {
+		m_guest_ranges = Pm4Ownership(reader);
+		m_guest_ranges.Capture(root);
+	}
+
+	// Submit-time owned dwords for a guest range, or an empty span if it was not captured.
+	[[nodiscard]] std::span<const uint32_t> FindOwnedGuestRange(uint64_t address,
+	                                                            uint32_t num_dw) const {
+		return m_guest_ranges.Find(address, num_dw);
+	}
+
+	[[nodiscard]] size_t   OwnedGuestRangeCount() const { return m_guest_ranges.RangeCount(); }
+	[[nodiscard]] uint32_t OwnedGuestRangeMisses() const { return m_guest_ranges.MissCount(); }
+	[[nodiscard]] uint32_t OwnedGuestRangeMalformed() const { return m_guest_ranges.MalformedCount(); }
+	[[nodiscard]] std::string DescribeOwnedGuestRangeMisses() const {
+		return m_guest_ranges.DescribeMisses();
+	}
+
 private:
 	friend class CommandProcessor;
 
@@ -43,6 +67,13 @@ private:
 
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
+	// Emulator-owned copies of nested command streams (IT_INDIRECT_BUFFER). The submit-time
+	// snapshot in m_guest_ranges is the authority for nested streams; each one is copied once more
+	// here so that a std::deque holds it: appending never relocates stored buffers, which keeps the
+	// spans held by BufferCursor entries valid for the life of the execution.
+	std::deque<std::vector<uint32_t>> m_owned_buffers;
+	// Submit-time owned copies of every guest region the parser dereferences (see Pm4Ownership).
+	Pm4Ownership              m_guest_ranges;
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
@@ -140,6 +171,17 @@ public:
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
+
+	// Look up a guest range captured at submit time (see Pm4Execution::CaptureGuestRanges). An empty
+	// span means the range was not captured: the parser must fail loudly instead of reading the
+	// live guest memory, which the guest may already have rewritten.
+	[[nodiscard]] std::span<const uint32_t> FindOwnedGuestRange(uint64_t address,
+	                                                            uint32_t num_dw) const;
+
+	// Human-readable summary of the missed PM4 guest references for the execution currently being
+	// parsed. Used to make the "was not captured" failures below self-explanatory. Empty when there
+	// were no misses.
+	[[nodiscard]] std::string DescribeOwnedGuestRangeMisses() const;
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
 

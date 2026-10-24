@@ -1126,6 +1126,37 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+
+	// [vb-diag] bounded: snapshot the VS vertex-buffer (V#) table at command-parse time so it can
+	// be compared with the value read later at draw-emit time. Read-only.
+	if (slot <= 13u && slot + write_num >= 13u) {
+		static int parse_diag_count = 0;
+		if (parse_diag_count < 64) {
+			parse_diag_count++;
+			const auto& sg = cp.GetShCtx().GetVs().gs_user_sgpr;
+			const auto  ptr = static_cast<uint64_t>(sg.value[12]) |
+			                  (static_cast<uint64_t>(sg.value[13]) << 32u);
+			std::array<uint32_t, 16> words {};
+			const bool ok = Libs::LibKernel::Memory::TryReadGuestMemory(
+			    ptr, words.data(), static_cast<uint64_t>(words.size()) * sizeof(uint32_t));
+			LOGF("[vb-diag] parse-time stream=0x%016" PRIx64 " dw=%" PRIu32
+			     " slot=%u write_num=%u vsharp_ptr=0x%016" PRIx64 " readable=%s\n",
+			     reinterpret_cast<uint64_t>(buffer), dw, slot, write_num, ptr, ok ? "yes" : "no");
+			LOGF("[vb-diag] parse-time payload:");
+			for (uint32_t i = 0; i < write_num && i < 32u; i++) {
+				LOGF(" %08" PRIx32, buffer[i]);
+			}
+			LOGF("\n");
+			if (ok) {
+				LOGF("[vb-diag] parse-time table:");
+				for (const auto w: words) {
+					LOGF(" %08" PRIx32, w);
+				}
+				LOGF("\n");
+			}
+		}
+	}
+
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
@@ -1443,34 +1474,43 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	EXIT_NOT_IMPLEMENTED(payload_dw != 13);
 
-	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
+	auto*    compare_addr = reinterpret_cast<const volatile uint64_t*>(
 	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
 	uint64_t mask        = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;
 	uint32_t function    = (buffer[0] >> 8u) & 0x7u;
-	auto*    then_buffer = reinterpret_cast<const uint32_t*>(
-	    (buffer[7] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[8]) << 32u));
-	uint32_t then_num_dw = buffer[9] & 0xfffffu;
-	auto*    else_buffer = reinterpret_cast<const uint32_t*>(
-	    (buffer[10] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[11]) << 32u));
-	uint32_t else_num_dw = buffer[12] & 0xfffffu;
+	const auto then_address = (buffer[7] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[8]) << 32u);
+	uint32_t   then_num_dw  = buffer[9] & 0xfffffu;
+	const auto else_address = (buffer[10] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[11]) << 32u);
+	uint32_t   else_num_dw  = buffer[12] & 0xfffffu;
 
 	EXIT_NOT_IMPLEMENTED(compare_addr == nullptr);
 	EXIT_NOT_IMPLEMENTED(mode != 1 && mode != 2);
 	EXIT_NOT_IMPLEMENTED(function > 6);
-	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
+	EXIT_NOT_IMPLEMENTED(then_address == 0 || then_num_dw == 0);
 
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
-	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
-	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
+	     take_then ? 1u : 0u, then_address, then_num_dw, else_address, else_num_dw);
 
 	if (take_then) {
-		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
+		const auto then_owned = cp.FindOwnedGuestRange(then_address, then_num_dw);
+		if (then_owned.size() < then_num_dw) {
+			EXIT("branch then-buffer at 0x%016" PRIx64 " (num_dw = %" PRIu32
+			     ") was not captured at submit time\n",
+			     then_address, then_num_dw);
+		}
+		cp.ProcessIndirectBuffer(then_owned, true);
 	} else if (mode == 2 && else_num_dw != 0) {
-		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
+		EXIT_NOT_IMPLEMENTED(else_address == 0);
+		const auto else_owned = cp.FindOwnedGuestRange(else_address, else_num_dw);
+		if (else_owned.size() < else_num_dw) {
+			EXIT("branch else-buffer at 0x%016" PRIx64 " (num_dw = %" PRIu32
+			     ") was not captured at submit time\n",
+			     else_address, else_num_dw);
+		}
+		cp.ProcessIndirectBuffer(else_owned, true);
 	}
 
 	return payload_dw;
@@ -1918,22 +1958,28 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     control_flags);
 	}
 
-	auto* indirect_buffer =
-	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
+	const auto indirect_address = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
 	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {
 		return 3;
 	}
-	if (indirect_buffer == nullptr) {
+	if (indirect_address == 0) {
 		EXIT("indirect command buffer has null address, num_dw = %" PRIu32
 		     ", control = 0x%08" PRIx32 "\n",
 		     indirect_num_dw, buffer[2]);
 	}
 
-	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	const auto indirect_owned = cp.FindOwnedGuestRange(indirect_address, indirect_num_dw);
+	if (indirect_owned.size() < indirect_num_dw) {
+		EXIT("indirect command buffer at 0x%016" PRIx64 " (num_dw = %" PRIu32
+		     ", control = 0x%08" PRIx32 ") was not captured at submit time\n",
+		     indirect_address, indirect_num_dw, buffer[2]);
+	}
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
+	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_owned.data());
+
+	cp.ProcessIndirectBuffer(indirect_owned, (control & (1u << 20u)) != 0);
 
 	return 3;
 }
@@ -1944,23 +1990,30 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
-	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
+	const auto indirect_address = (static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                              (static_cast<uint64_t>(buffer[1]) << 32u);
+	const uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
-	if (indirect_buffer == nullptr) {
+	if (indirect_address == 0) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
+	const auto regs = cp.FindOwnedGuestRange(indirect_address, indirect_num_dw * 2u);
+	if (regs.size() < indirect_num_dw * 2u) {
+		LOGF_COLOR(Log::Color::BrightRed, "[pm4-ownership] CX %s\n",
+		           cp.DescribeOwnedGuestRangeMisses().c_str());
+		EXIT("indirect CX register array at 0x%016" PRIx64 " (%" PRIu32
+		     " regs) was not captured at submit time\n",
+		     indirect_address, indirect_num_dw);
+	}
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
-		auto raw_cmd_offset = indirect_buffer[0];
+		auto raw_cmd_offset = regs[i * 2u];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = regs[i * 2u + 1u];
 
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
 			continue;
@@ -2014,23 +2067,29 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
-	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
+	const auto indirect_address = (static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                              (static_cast<uint64_t>(buffer[1]) << 32u);
+	const uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
-	if (indirect_buffer == nullptr) {
+	if (indirect_address == 0) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto regs = cp.FindOwnedGuestRange(indirect_address, indirect_num_dw * 2u);
+	if (regs.size() < indirect_num_dw * 2u) {
+		LOGF_COLOR(Log::Color::BrightRed, "[pm4-ownership] SH %s\n",
+		           cp.DescribeOwnedGuestRangeMisses().c_str());
+		EXIT("indirect SH register array at 0x%016" PRIx64 " (%" PRIu32
+		     " regs) was not captured at submit time\n",
+		     indirect_address, indirect_num_dw);
+	}
 
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = regs[i * 2u];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = regs[i * 2u + 1u];
 
 		// Not sure if this is correct
 		// if (raw_cmd_offset != cmd_offset) {
@@ -2057,7 +2116,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
 			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
+			auto* dump_regs = regs.data();
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
@@ -2077,21 +2136,28 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
-	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
-	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
+	const auto indirect_address = (static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                              (static_cast<uint64_t>(buffer[1]) << 32u);
+	const uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
-	if (indirect_buffer == nullptr) {
+	if (indirect_address == 0) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	const auto regs = cp.FindOwnedGuestRange(indirect_address, indirect_num_dw * 2u);
+	if (regs.size() < indirect_num_dw * 2u) {
+		LOGF_COLOR(Log::Color::BrightRed, "[pm4-ownership] UC %s\n",
+		           cp.DescribeOwnedGuestRangeMisses().c_str());
+		EXIT("indirect UC register array at 0x%016" PRIx64 " (%" PRIu32
+		     " regs) was not captured at submit time\n",
+		     indirect_address, indirect_num_dw);
+	}
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = regs[i * 2u];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = regs[i * 2u + 1u];
 
 		// Not sure if this is correct
 		// if (raw_cmd_offset != cmd_offset) {
@@ -2112,7 +2178,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
+			auto* dump_regs = regs.data();
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);

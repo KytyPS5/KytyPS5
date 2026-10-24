@@ -392,6 +392,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.maintenance8_enabled = graphics.maintenance8_enabled;
+		options.fragment_barycentric_enabled = graphics.fragment_barycentric_enabled;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;

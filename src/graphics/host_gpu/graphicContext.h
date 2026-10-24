@@ -34,6 +34,9 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// Set when VK_KHR_fragment_shader_barycentric is available; otherwise the SPIR-V
+	// emitter omits the barycentric interface and uses plain parameter interpolation.
+	bool                               fragment_barycentric_enabled          = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

@@ -1226,6 +1226,85 @@ void TestCopySparseMemoryMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Regression test for Libs::LibKernel::Memory::TryReadGuestMemory, the strict reader used by the
+// PM4 submit-time capture. The capture must be able to read committed private guest memory
+// (program images and runtime allocations) that the backing store cannot resolve, while still
+// refusing unmapped or non-readable memory rather than faulting or falling back to live guest
+// memory. A failed read must never leave a partially valid snapshot behind.
+void TestTryReadGuestMemory() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "TryReadGuestMemory";
+
+	// Committed private memory is not visible through the backing store...
+	constexpr uint64_t private_size = SceKernelPageSize * 2;
+	const auto         private_base = AllocateRuntimeMemory(
+	    0, private_size, Common::VirtualMemory::Mode::ReadWrite, "try_read_private");
+	Check(test, private_base != 0, "runtime allocation failed");
+	constexpr std::array<uint8_t, 5> pattern {0x11, 0x22, 0x33, 0x44, 0x55};
+	std::memcpy(reinterpret_cast<void*>(private_base), pattern.data(), pattern.size());
+	uint64_t backing_probe = 0;
+	Check(test, !TryReadBacking(private_base, &backing_probe, sizeof(backing_probe)),
+	      "backing store unexpectedly resolved committed private memory");
+
+	// ...but TryReadGuestMemory reads it, which is what the PM4 capture needs.
+	std::array<uint8_t, 5> read {};
+	Check(test, TryReadGuestMemory(private_base, read.data(), read.size()),
+	      "TryReadGuestMemory rejected committed private memory");
+	Check(test, read == pattern, "TryReadGuestMemory returned the wrong private bytes");
+
+	// An address that is not mapped at all is rejected, and the destination is left untouched.
+	std::array<uint8_t, 5> untouched {0xaa, 0xbb, 0xcc, 0xdd, 0xee};
+	Check(test, !TryReadGuestMemory(0x10000, untouched.data(), untouched.size()),
+	      "TryReadGuestMemory accepted an unmapped range");
+	Check(test, untouched == std::array<uint8_t, 5> {0xaa, 0xbb, 0xcc, 0xdd, 0xee},
+	      "failed TryReadGuestMemory modified its destination");
+
+	// A range that runs past the committed allocation is rejected as a whole.
+	Check(test, !TryReadGuestMemory(private_base + private_size - 4, read.data(), 8),
+	      "TryReadGuestMemory accepted a range leaving the committed allocation");
+
+	// A committed but non-readable page must be rejected rather than fault a raw dereference, and
+	// no partially valid snapshot may be produced.
+	Check(test,
+	      ProtectGuestMemory(private_base, SceKernelPageSize, Common::VirtualMemory::Mode::NoAccess),
+	      "failed to make a private page non-readable");
+	Check(test, QueryResult(private_base) == OK,
+	      "the non-readable page is still mapped, so the rejection is about readability");
+	std::array<uint8_t, 5> canary {0x5a, 0x5a, 0x5a, 0x5a, 0x5a};
+	Check(test, !TryReadGuestMemory(private_base, canary.data(), SceKernelPageSize),
+	      "TryReadGuestMemory accepted a NoAccess private page");
+	Check(test, canary == std::array<uint8_t, 5> {0x5a, 0x5a, 0x5a, 0x5a, 0x5a},
+	      "failed TryReadGuestMemory left a partially valid snapshot behind");
+	// The still-readable second page remains usable on its own.
+	Check(test, TryReadGuestMemory(private_base + SceKernelPageSize, read.data(), sizeof(uint64_t)),
+	      "TryReadGuestMemory rejected a readable page next to a NoAccess page");
+	Check(test,
+	      ProtectGuestMemory(private_base, SceKernelPageSize, Common::VirtualMemory::Mode::ReadWrite),
+	      "failed to restore private page protection");
+	Check(test, FreeGuestMemory(private_base, private_size), "runtime free failed");
+
+	// Backing (flexible) memory is read through the backing store's always-readable alias, so it
+	// resolves even when the guest's own view of the page is NoAccess: the GPU reads the backing
+	// content, not the CPU view, and the alias is what the copy is taken from.
+	const auto flexible =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "try_read_flexible");
+	constexpr uint64_t flex_value = 0x544553544c455846ull; // "FLEXTEST"
+	std::memcpy(reinterpret_cast<void*>(flexible), &flex_value, sizeof(flex_value));
+	uint64_t flex_read = 0;
+	Check(test, TryReadGuestMemory(flexible, &flex_read, sizeof(flex_read)) && flex_read == flex_value,
+	      "TryReadGuestMemory rejected readable flexible memory");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(flexible),
+	                                                SceKernelPageSize, 0),
+	        "KernelMprotect(flexible, NoAccess)");
+	Check(test, TryReadGuestMemory(flexible, &flex_read, sizeof(flex_read)) && flex_read == flex_value,
+	      "TryReadGuestMemory did not read backing memory through its alias");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(flexible, SceKernelPageSize),
+	        "KernelMunmap(flexible)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleMapQueryAndWholeMunmap() {
 	const char* test     = "FlexibleMapQueryAndWholeMunmap";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -4801,6 +4880,7 @@ int main(int argc, char** argv) {
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
+		RunTest(TestTryReadGuestMemory);
 		RunTest(TestSparseReadDuringDirectCommit);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
@@ -4855,6 +4935,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
+	RunTest(TestTryReadGuestMemory);
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);

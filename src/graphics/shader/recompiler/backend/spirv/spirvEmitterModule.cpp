@@ -474,7 +474,25 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 void DefineInputs(EmitterState& state) {
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
+		if (!state.fragment_barycentric_enabled &&
+		    (input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		     input.kind == IR::StageInputKind::BaryCoordSmoothSample ||
+		     input.kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+		     input.kind == IR::StageInputKind::BaryCoordNoPerspective)) {
+			// Without VK_KHR_fragment_shader_barycentric there is no barycentric builtin
+			// to declare; reads of these inputs degrade to a constant (0, 0) weight.
+			continue;
+		}
 		state.inputs.push_back({input});
+	}
+	if (!state.fragment_barycentric_enabled) {
+		for (auto& input: state.inputs) {
+			if (input.kind == IR::StageInputKind::Parameter) {
+				// Per-vertex parameter arrays require the KHR barycentric interface;
+				// clearing the flag makes parameters use ordinary hardware interpolation.
+				input.per_vertex = false;
+			}
+		}
 	}
 	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 	                             const char* name) {
@@ -800,7 +818,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
 	}
 	const bool fragment_barycentric =
-	    state.program.stage == ShaderType::Pixel &&
+	    state.fragment_barycentric_enabled && state.program.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
 		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;

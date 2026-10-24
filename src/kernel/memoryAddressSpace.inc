@@ -28,6 +28,94 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Verifies that every byte of [vaddr, vaddr + size) can actually be read by the host at that
+// address. Mapping coverage alone is not enough: a committed region can be re-protected NoAccess
+// or execute-only by the guest (KernelMprotect -> Protect -> VirtualMemory::Protect), and a raw
+// dereference of such a page would fault the emulator. The probe itself never faults; it reports
+// false for any part of the range the host cannot read. Mirrors the established precedent
+// RuntimeLinker::IsReadableRange (src/loader/runtimeLinker.cpp).
+static bool HostRangeIsReadable(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+
+	const uint64_t end = vaddr + size;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t current = vaddr;
+	while (current < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT) {
+			return false;
+		}
+		// PAGE_GUARD must be rejected before masking off the protection modifiers below.
+		if ((info.Protect & PAGE_GUARD) != 0) {
+			return false;
+		}
+		// Allow-list rather than a deny-list: PAGE_NOACCESS and the execute-only PAGE_EXECUTE must
+		// both fail, while every read-capable protection passes.
+		const DWORD protection = info.Protect & 0xffu;
+		const bool  readable   = protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+		                         protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+		                         protection == PAGE_EXECUTE_READWRITE ||
+		                         protection == PAGE_EXECUTE_WRITECOPY;
+		if (!readable) {
+			return false;
+		}
+		const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		if (region_end <= current) {
+			return false;
+		}
+		current = std::min(region_end, end);
+	}
+#elif defined(__APPLE__)
+	// Walk the Mach regions covering the range and require read permission.
+	uint64_t current = vaddr;
+	while (current < end) {
+		mach_vm_address_t              region_addr = current;
+		mach_vm_size_t                 region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t                    object_name = MACH_PORT_NULL;
+		if (mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+		                   reinterpret_cast<vm_region_info_t>(&info), &count,
+		                   &object_name) != KERN_SUCCESS ||
+		    region_addr > current || (info.protection & VM_PROT_READ) == 0) {
+			return false;
+		}
+		current = region_addr + region_size;
+	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// Probe one byte per page with process_vm_readv, which fails cleanly instead of faulting.
+	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+	if (page_size == 0) {
+		return false;
+	}
+
+	for (uint64_t current = vaddr; current < end;) {
+		uint8_t probe = 0;
+
+		iovec local {&probe, sizeof(probe)};
+		iovec remote {reinterpret_cast<void*>(current), sizeof(probe)};
+
+		if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
+		    static_cast<ssize_t>(sizeof(probe))) {
+			return false;
+		}
+
+		const uint64_t next = (current & ~(page_size - 1)) + page_size;
+		if (next <= current) { // wrapped at the top of the address space
+			break;
+		}
+		current = next;
+	}
+#else
+	(void)end;
+#endif
+	return true;
+}
+
 template <typename Regions, typename Source, typename Gap>
 static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, uint64_t size,
                             Source&& source, Gap&& gap) {
@@ -781,6 +869,69 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	// Strict guest-memory read: copies `size` bytes at the guest virtual address `vaddr` into
+	// `data`, but only when the whole range is mapped, host-readable guest memory. Unlike
+	// TryReadBacking, which only sees the direct-memory backing store, this also covers committed
+	// (Private) memory - program images, runtime allocations, stacks - which is what the PM4
+	// capture dereferences. Returns false, without writing anything to `data`, if any part of the
+	// range is not mapped or not readable; there is no fallback to live guest memory.
+	//
+	// Safety: the address-space lock is held for the whole call, and every mutation path (Commit,
+	// ReleaseCommitted, MapBacking, UnmapBacking, Protect/ProtectTransient) takes the same lock
+	// exclusively across its OS calls, so neither the mapping nor the host protection of the range
+	// can change while it is being validated and copied. The complete range is validated before the
+	// first byte is written, so a failure can never leave a partially valid snapshot behind; and
+	// because the lock is still held between validation and copy, the copy itself cannot fail.
+	bool TryReadGuestMemory(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+
+		std::shared_lock lock(m_mutex);
+
+		const auto end = vaddr + size;
+
+		// Pass 1: every byte must be covered by a committed mapping, and every Private span must be
+		// host-readable. Backing spans are read through the always-readable backing alias below, so
+		// for them coverage is enough. Nothing is written to `data` until the whole range passes.
+		for (uint64_t current = vaddr; current < end;) {
+			const auto it = FindMappedContainingUnlocked(current);
+			if (it == m_mapped.end()) {
+				return false;
+			}
+			const auto& region   = it->second;
+			const auto  span_end = std::min(end, region.vaddr + region.size);
+			if (region.type == MappingType::Private &&
+			    !HostRangeIsReadable(current, span_end - current)) {
+				return false;
+			}
+			current = span_end;
+		}
+
+		// Pass 2: copy. Coverage and protection were verified under the lock held since pass 1 and
+		// cannot change, so neither branch below can fail.
+		auto* destination = static_cast<uint8_t*>(data);
+		for (uint64_t current = vaddr; current < end;) {
+			const auto  it       = FindMappedContainingUnlocked(current);
+			const auto& region   = it->second;
+			const auto  span_end = std::min(end, region.vaddr + region.size);
+			const auto  bytes    = span_end - current;
+			if (region.type == MappingType::Backing) {
+				// Read through the backing store's alias, which is mapped read/write and never
+				// re-protected; the guest view itself may be NoAccess. Coverage was checked above.
+				EXIT_IF(!m_backing->TryReadBacking(current, destination + (current - vaddr), bytes));
+			} else {
+				// Guest virtual address == host address (enforced by Commit/MapFixed), and pass 1
+				// proved this span readable.
+				std::memcpy(destination + (current - vaddr),
+				            reinterpret_cast<const void*>(current), bytes);
+			}
+			current = span_end;
+		}
+
+		return true;
 	}
 
 	template <bool copy_private>

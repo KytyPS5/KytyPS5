@@ -67,6 +67,9 @@
 #ifdef pthread_attr_getguardsize
 #undef pthread_attr_getguardsize
 #endif
+#ifdef pthread_attr_setguardsize
+#undef pthread_attr_setguardsize
+#endif
 
 namespace Libs {
 

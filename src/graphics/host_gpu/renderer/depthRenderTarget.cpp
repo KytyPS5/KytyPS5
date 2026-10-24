@@ -22,8 +22,10 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
+#include <inttypes.h>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -163,7 +165,15 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (z.z_info.max_mip_level != 0 ||
 	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal(
+		    "unsupported depth register state [MakeDepthTargetDesc]: max_mip=%u "
+		    "cur_mip=%u sr_enc=%u has_htile=%d unsupported_sr=%d depth_addr=0x%016" PRIx64
+		    " write_buffer=%d",
+		    static_cast<unsigned>(z.z_info.max_mip_level),
+		    static_cast<unsigned>(z.depth_view.current_mip_level),
+		    static_cast<unsigned>(z.shading_rate_encoding),
+		    static_cast<int>(has_htile), static_cast<int>(unsupported_shading_rate_encoding),
+		    depth_address, static_cast<int>(write_buffer));
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
@@ -300,7 +310,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal(
+		    "unsupported depth register state [ResolveRenderDepthTarget]: "
+		    "copy_stencil_to_color=%d zfunc=%u depth_wd=%d z_write=0x%016" PRIx64
+		    " z_read=0x%016" PRIx64 " has_stencil=%d stencil_wd=%d s_write=0x%016" PRIx64
+		    " s_read=0x%016" PRIx64,
+		    static_cast<int>(rc.copy_stencil_to_color), static_cast<unsigned>(dc.zfunc),
+		    static_cast<int>(z.depth_view.depth_write_disable), z.z_write_base_addr,
+		    z.z_read_base_addr, static_cast<int>(has_stencil),
+		    static_cast<int>(z.depth_view.stencil_write_disable),
+		    z.stencil_write_base_addr, z.stencil_read_base_addr);
 	}
 	if (rc.copy_depth_to_color &&
 	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||

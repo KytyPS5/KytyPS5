@@ -1,5 +1,6 @@
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/quickExit.h"
 #include "emulator.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
@@ -149,7 +150,7 @@ int LoadExec(const char* path, const char* const argv[]) {
 	}
 	CloseHandle(process.hThread);
 	CloseHandle(process.hProcess);
-	std::quick_exit(0);
+	Common::QuickExit(0);
 #else
 	std::ifstream            command("/proc/self/cmdline", std::ios::binary);
 	std::vector<std::string> host_arguments;

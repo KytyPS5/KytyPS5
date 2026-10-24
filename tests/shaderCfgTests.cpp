@@ -6759,6 +6759,100 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestFragmentBarycentricFallback() {
+  // GPUs without VK_KHR_fragment_shader_barycentric (Pascal and older) must still get
+  // valid SPIR-V: the emitter drops the KHR barycentric interface and interpolates
+  // parameters with ordinary hardware interpolation instead.
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1),      EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12),        0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  ps_info.ps_system_input_base = 2;
+  ps_info.custom_interpolation_mask = 1;
+  ps_info.ps_perspective_center_vgpr = 0;
+  SetIdentityInterpolatorSettings(&ps_info);
+  ps_info.interpolator_settings[0] = 0x00000420u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+
+  // Capable device: the per-vertex parameter array and the BaryCoordKHR builtin are
+  // emitted exactly as before the optional-extension change.
+  const auto capable = RecompileForTest(shader, options);
+  Check(SpirvContainsCapability(capable.spirv, 5284u),
+        "barycentric-capable device did not enable FragmentBarycentricKHR");
+  Check(SpirvHasDecorationValue(capable.spirv, 11u, 5286u),
+        "capable device did not declare the BaryCoordKHR builtin");
+  Check(SpirvHasDecorationValueWithDecoration(capable.spirv, 30u, 0u, 5285u),
+        "capable device did not mark the parameter per-vertex");
+  const auto capable_source = DisassembleSpirvBinary(capable.spirv);
+  Check(SpirvSourceHasInstructionUsing(capable_source, "OpAccessChain",
+                                       "in_param_0"),
+        "capable device did not read the per-vertex parameter array");
+  CheckSpirvBinaryValidates(capable.spirv);
+
+  options.fragment_barycentric_enabled = false;
+  const auto fallback = RecompileForTest(shader, options);
+  Check(!SpirvContainsCapability(fallback.spirv, 5284u),
+        "fallback unexpectedly enabled FragmentBarycentricKHR");
+  Check(!SpirvHasDecorationValue(fallback.spirv, 11u, 5286u),
+        "fallback unexpectedly declared the BaryCoordKHR builtin");
+  Check(!SpirvHasDecorationValue(fallback.spirv, 11u, 5287u),
+        "fallback unexpectedly declared the BaryCoordNoPerspKHR builtin");
+  Check(SpirvHasDecorationValue(fallback.spirv, 30u, 0u),
+        "fallback dropped the parameter input instead of interpolating it");
+  Check(!SpirvHasDecorationValueWithDecoration(fallback.spirv, 30u, 0u, 5285u),
+        "fallback unexpectedly emitted PerVertexKHR");
+  Check(!SpirvHasDecorationValueWithDecoration(fallback.spirv, 30u, 0u, 14u),
+        "fallback made a smooth parameter flat");
+  const auto source = DisassembleSpirvBinary(fallback.spirv);
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "in_param_0"),
+        "fallback kept the per-vertex parameter array");
+  Check(source.find("gl_BaryCoordKHR") == std::string::npos,
+        "fallback unexpectedly declared BaryCoordKHR");
+  Check(source.find("gl_BaryCoordNoPerspKHR") == std::string::npos,
+        "fallback unexpectedly declared BaryCoordNoPerspKHR");
+  CheckSpirvBinaryValidates(fallback.spirv);
+
+  // No-perspective parameters select the second barycentric builtin. This mirrors the
+  // mixed fixture in TestCustomVintrpMovTranslation: a V_INTERP_P2_F32 marks the
+  // attribute as used while the MOV mode requests per-vertex interpolation.
+  const uint32_t mixed_shader[] = {
+      EncodeVintrp(0, 12, 0, 3, 0), EncodeVintrp(1, 12, 0, 3, 0),
+      EncodeVintrp(2, 13, 0, 3, 2), EncodeVop2(0x03, 14, 12 + 256, 13),
+      EncodeExp0(0x00, 0x1),        EncodeExp1(14, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo linear_info{};
+  linear_info.input_num = 1;
+  linear_info.ps_no_perspective = true;
+  options.input_info.pixel = &linear_info;
+  options.fragment_barycentric_enabled = true;
+  const auto np_capable = RecompileForTest(mixed_shader, options);
+  Check(SpirvHasDecorationValue(np_capable.spirv, 11u, 5287u),
+        "capable no-perspective device did not declare BaryCoordNoPerspKHR");
+  Check(SpirvHasDecorationValueWithDecoration(np_capable.spirv, 30u, 0u, 5285u),
+        "capable no-perspective parameter was not per-vertex");
+  CheckSpirvBinaryValidates(np_capable.spirv);
+
+  options.fragment_barycentric_enabled = false;
+  const auto np_fallback = RecompileForTest(mixed_shader, options);
+  Check(!SpirvHasDecorationValue(np_fallback.spirv, 11u, 5287u),
+        "fallback unexpectedly declared BaryCoordNoPerspKHR");
+  Check(DisassembleSpirvBinary(np_fallback.spirv)
+                .find("gl_BaryCoordNoPerspKHR") == std::string::npos,
+        "fallback unexpectedly declared BaryCoordNoPerspKHR");
+  Check(!SpirvHasDecorationValueWithDecoration(np_fallback.spirv, 30u, 0u, 5285u),
+        "fallback no-perspective parameter kept PerVertexKHR");
+  Check(SpirvHasDecorationValueWithDecoration(np_fallback.spirv, 30u, 0u, 13u),
+        "fallback no-perspective parameter lost ordinary NoPerspective interpolation");
+  CheckSpirvBinaryValidates(np_fallback.spirv);
+}
+
 void TestPerspectiveCentroidInputs() {
   constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
                              std::array{5u, UINT32_MAX, 2u},
@@ -16492,6 +16586,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestFragmentBarycentricFallback();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();

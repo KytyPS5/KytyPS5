@@ -14214,12 +14214,24 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckStencilOnlyTarget() {
+  // Verify native S8 attachment and alias transfers; report optional-format absence to CTest.
+  bool CheckStencilOnlyTarget() {
     constexpr const char *name = "StencilOnlyTarget";
     constexpr uintptr_t base = 0x0000000205000000ull;
     constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t alignment = 0x10000;
     EnsureRuntimeContext();
+    vk::ImageFormatProperties properties{};
+    const auto support = m_runtime_context.GetImageFormatProperties(
+        vk::Format::eS8Uint, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+        DepthTargetImageUsage(), {}, &properties);
+    if (support == vk::Result::eErrorFormatNotSupported ||
+        (support == vk::Result::eSuccess &&
+         !(properties.sampleCounts & vk::SampleCountFlagBits::e1))) {
+      std::printf("[host]    %-32s skipped: host lacks single-sample S8 attachment usage\n", name);
+      return false;
+    }
+    RequireVk(name, "S8 attachment support", support, "vkGetPhysicalDeviceImageFormatProperties");
     int64_t offset = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
         0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
@@ -14312,6 +14324,11 @@ public:
       Require(name, "storage alias", storage_id != sampled_id &&
           cache.FindTexture(storage_id, storage) != nullptr,
           "an R8 storage alias did not convert the S8 backing");
+      // Guest memory still contains 0x7a: only a GPU-owned alias transfer can yield 0x4c.
+      vk::ClearValue storage_clear{};
+      storage_clear.color.uint32[0] = 0x4c;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), storage_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, storage_clear);
       RenderDepthInfo restored{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), restored);
@@ -14322,7 +14339,7 @@ public:
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       Require(name, "storage round trip contents", std::all_of(bytes, bytes + alignment,
-          [](uint8_t value) { return value == 0x7a; }),
+          [](uint8_t value) { return value == 0x4c; }),
           "storage alias conversion lost stencil contents");
       RenderExecutorTestAccess::ResetBindings(executor);
 
@@ -14350,6 +14367,7 @@ public:
     Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(offset, allocation_size) == 0,
         "stencil-only release failed");
     std::printf("[host]    %-32s ok\n", name);
+    return true;
   }
 
   void CheckRenderExecutorStencilBindingDiscovery() {
@@ -51234,8 +51252,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--stencil-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckStencilOnlyTarget();
-    return 0;
+    return vulkan.CheckStencilOnlyTarget() ? 0 : 77;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     VulkanHarness vulkan;

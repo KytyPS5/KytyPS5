@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/deviceLossReport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -535,7 +536,27 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	const bool device_fault_extension =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (device_fault_extension) {
+		device_fault.pNext        = supported_features2.pNext;
+		supported_features2.pNext = &device_fault;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault;
+	graphics.device_checkpoints_enabled =
+	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+	LOGF("Vulkan device loss reporting: device_fault=%s checkpoints=%s\n",
+	     graphics.device_fault_enabled ? "true" : "false",
+	     graphics.device_checkpoints_enabled ? "true" : "false");
+	if (DeviceLossCheckpointsRequested()) {
+		Log::WriteToConsoleAndLog(
+		    graphics.device_checkpoints_enabled
+		        ? "GPU checkpoints: enabled (KYTY_GPU_CHECKPOINTS)\n"
+		        : "GPU checkpoints: requested, but the device does not support "
+		          "VK_NV_device_diagnostic_checkpoints\n");
+	}
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
@@ -732,6 +753,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
+	}
+	if (graphics.device_fault_enabled) {
+		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
+		device_fault.deviceFaultVendorBinary = VK_FALSE;
+		create_info.pNext                    = &device_fault;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1115,6 +1141,15 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		// Checkpoints cost a command per draw and dispatch, so they are opt-in.
+		if (DeviceLossCheckpointsRequested() &&
+		    HasExtension(available_extensions,
+		                 VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

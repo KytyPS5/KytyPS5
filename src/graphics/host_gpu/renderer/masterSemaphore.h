@@ -32,6 +32,8 @@ public:
 	void Wait(uint64_t tick);
 
 private:
+	void ReportFailure(const char* what, vk::Result result, uint64_t tick);
+
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};

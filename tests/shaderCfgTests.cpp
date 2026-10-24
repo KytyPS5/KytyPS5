@@ -16709,6 +16709,62 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
+void TestLegacyMadStageRounding() {
+  using namespace ShaderRecompiler;
+  struct MadCounts {
+    uint32_t fmul;
+    uint32_t fadd;
+    uint32_t fma;
+    uint32_t no_contraction;
+  };
+  const auto count = [](const CompileOptions &options, bool with_mad) {
+    const uint32_t shader[] = {EncodeSopp(0x01)};
+    auto result = RecompileForTest(shader, options);
+    if (with_mad) {
+      IR::IREmitter ir(result.program.blocks.front());
+      ir.Emit(IR::ValueOpcode::FPMad32,
+              {IR::Value::F32(1.000244140625f), IR::Value::F32(1.000244140625f),
+               IR::Value::F32(-1.00048828125f)});
+    }
+    const auto binary = Spirv::EmitProgram(result.program, options.input_info);
+    CheckSpirvBinaryValidates(binary);
+    return MadCounts{SpirvInstructionOpcodeCount(binary, spv::OpFMul),
+                     SpirvInstructionOpcodeCount(binary, spv::OpFAdd),
+                     SpirvExtInstCount(binary, GLSLstd450Fma),
+                     CountSourceOccurrences(DisassembleSpirvBinary(binary),
+                                            "NoContraction")};
+  };
+  const auto check = [&](const CompileOptions &options, bool fused,
+                         const char *text) {
+    const auto base = count(options, false);
+    const auto mad = count(options, true);
+    const bool ok =
+        mad.fmul - base.fmul == (fused ? 0u : 1u) &&
+        mad.fadd - base.fadd == (fused ? 0u : 1u) &&
+        mad.fma - base.fma == (fused ? 1u : 0u) &&
+        mad.no_contraction - base.no_contraction == (fused ? 0u : 2u);
+    Check(ok, text);
+  };
+
+#if defined(__APPLE__)
+  constexpr bool kFused = true;
+#else
+  constexpr bool kFused = false;
+#endif
+  check(MakeCompileOptions(ShaderType::Compute), kFused,
+        "compute shader MAD used the wrong rounding");
+  check(MakeCompileOptions(ShaderType::Pixel), kFused,
+        "pixel shader MAD used the wrong rounding");
+  check(MakeCompileOptions(ShaderType::Vertex), false,
+        "vertex shader MAD must keep separate rounding");
+  ShaderPixelInputInfo depth_export{};
+  depth_export.ps_depth_export_enable = true;
+  auto depth_options = MakeCompileOptions(ShaderType::Pixel);
+  depth_options.input_info.pixel = &depth_export;
+  check(depth_options, false,
+        "depth-exporting pixel shader MAD must keep separate rounding");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -16732,6 +16788,7 @@ int main() {
   TestSpirvConditionVotes();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
+  TestLegacyMadStageRounding();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();

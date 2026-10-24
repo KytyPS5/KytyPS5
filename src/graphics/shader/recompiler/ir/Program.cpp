@@ -487,7 +487,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				const auto access = BufferAccessOf(inst.GetOpcode());
 				const bool packed_formatted =
 				    (access == BufferAccess::Read || access == BufferAccess::Write) && memory.formatted &&
-				    memory.data_bits == 16u && memory.component_count == 4u && buffer_components == 2u;
+				    memory.data_bits == 16u && (memory.component_count + 1u) / 2u == buffer_components;
 				if (buffer_components > 1u &&
 				    (!vector_buffer || (memory.data_bits != 32u && !packed_formatted) ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {

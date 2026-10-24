@@ -131,6 +131,7 @@ LIB_DEFINE(InitAudio_1_AudioOut) {
 	LIB_FUNC("QOQtbeDqsT4", AudioOut::AudioOutOutput);
 	LIB_FUNC("s1--uE9mBFw", AudioOut::AudioOutClose);
 	LIB_FUNC("GrQ9s4IrNaQ", AudioOut::AudioOutGetPortState);
+	LIB_FUNC("R5hemoKKID8", AudioOut::AudioOutGetSystemState);
 }
 
 } // namespace LibAudioOut

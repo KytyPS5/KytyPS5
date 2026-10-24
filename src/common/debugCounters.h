@@ -29,6 +29,9 @@ enum class Counter {
 	TextureUploadBytes,
 	TextureDownloadBytes,
 	TextureEvictions,
+	ColorMetadataReadbacks, // CPU blocked reading back GPU-written DCC/CMASK metadata.
+	ColorMetadataReadbackNs,
+	ColorMetadataChecks, // GPU clear-key checks of DCC/CMASK metadata.
 	BufferUploadBytes,
 	BufferDownloadBytes,
 	BufferEvictions,

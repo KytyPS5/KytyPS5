@@ -121,14 +121,6 @@ std::optional<Reduction> ReductionOf(const Inst& inst) {
 			return Reduction {inst.GetOpcode(), 0x7fffffffu, inst.Arg(0), inst.Arg(1)};
 		case ValueOpcode::SMax32:
 			return Reduction {inst.GetOpcode(), 0x80000000u, inst.Arg(0), inst.Arg(1)};
-		case ValueOpcode::CompositeExtractU32x2: {
-			const auto* sum = inst.Arg(0).Resolve().TryInstruction();
-			if (inst.Arg(1).Resolve() != Value(0u) || sum == nullptr ||
-			    sum->GetOpcode() != ValueOpcode::IAddCarry32) {
-				return std::nullopt;
-			}
-			return Reduction {ValueOpcode::IAdd32, 0u, sum->Arg(0), sum->Arg(1)};
-		}
 		default: return std::nullopt;
 	}
 }

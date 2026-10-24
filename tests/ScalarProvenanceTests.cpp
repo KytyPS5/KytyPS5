@@ -636,7 +636,7 @@ void TestCompleteWaveReduction() {
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
     Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation,
-    CarryAdd, CarryIndex, CarrySource, ShapeEndpoints
+    CarryAdd, ShapeEndpoints
   };
   struct Fold {
     ValueOpcode operation;
@@ -658,8 +658,8 @@ void TestCompleteWaveReduction() {
        Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
        Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation,
-       Case::CarryAdd, Case::CarryIndex, Case::CarrySource, Case::ShapeEndpoints}) {
-    const bool carry = test == Case::CarryAdd || test == Case::CarryIndex || test == Case::CarrySource;
+       Case::CarryAdd, Case::ShapeEndpoints}) {
+    const bool carry = test == Case::CarryAdd;
     if (carry && fold.operation != ValueOpcode::IAdd32) continue;
     const uint32_t row_control = butterfly ? 0x160u : 0x110u;
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
@@ -733,13 +733,12 @@ void TestCompleteWaveReduction() {
     Value result;
     Value carried;
     if (carry) {
-      const auto sum = fixture.Emit(test == Case::CarrySource ? ValueOpcode::CompositeConstructU32x2
-                                                              : ValueOpcode::IAddCarry32,
-                                    {high, low}, 0, result_block);
-      const auto partial = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
-          {sum, Value(test == Case::CarryIndex ? 1u : 0u)}, 0, result_block);
-      carried = fixture.Emit(ValueOpcode::IAddCarry32, {partial, Value(0u)}, 0, result_block);
-      result = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {carried, Value(0u)}, 0, result_block);
+      // V_ADD_CO_U32 as translated: an IAdd32 sum whose carry is a compare of it, then an add
+      // of the zero carry-in. The compare is one more use of the sum.
+      const auto sum = fixture.Emit(ValueOpcode::IAdd32, {high, low}, 0, result_block);
+      fixture.Emit(ValueOpcode::ULessThan32, {sum, high}, 0, result_block);
+      carried = fixture.Emit(ValueOpcode::IAdd32, {sum, Value(0u)}, 0, result_block);
+      result = carried;
     } else {
       result = fixture.Emit(fold.operation, {high, low}, 0, result_block);
     }

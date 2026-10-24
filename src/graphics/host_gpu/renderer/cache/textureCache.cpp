@@ -570,6 +570,77 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	return true;
 }
 
+bool TextureCache::CopyDepthPrecision(Image& destination, Image& source) {
+	// CopyD16 handles a D16 depth plane aliased as a 16-bit color view (e.g. for a compute
+	// readback of a depth buffer). This handles a different case: two real depth images of the
+	// same guest data at different bit depths (D16Unorm vs D24UnormS8Uint/D32Sfloat), which the
+	// game switches between at the same address. Neither side is a color view, and the plain
+	// buffer copy path (CopyImageWithBuffer) requires equal bytes-per-texel, so it can't do this
+	// conversion; reuse the same GPU D16<->D24/D32 conversion pipeline CopyD16 uses instead.
+	if (!source.info.IsDepth() || !destination.info.IsDepth()) {
+		return false;
+	}
+	const auto source_format      = DepthAspectTransferFormat(source.backing.format);
+	const auto destination_format = DepthAspectTransferFormat(destination.backing.format);
+	if (source_format == destination_format) {
+		return false;
+	}
+	const auto source_bytes      = DepthAspectTransferBytes(source.backing.format);
+	const auto destination_bytes = DepthAspectTransferBytes(destination.backing.format);
+	const bool promote = source_bytes == sizeof(uint16_t);
+	const bool demote  = destination_bytes == sizeof(uint16_t);
+	// Only a D16 <-> {D24, D32} conversion is supported; anything else (e.g. D24 <-> D32) falls
+	// through to the caller's existing fallback.
+	if (source_bytes == 0 || destination_bytes == 0 || (!promote && !demote) ||
+	    source.backing.samples != 1 || destination.backing.samples != 1) {
+		return false;
+	}
+	EXIT_IF(source.info.resources.levels != 1 || destination.info.resources.levels != 1 ||
+	        source.info.extent != destination.info.extent ||
+	        source.info.resources.layers != destination.info.resources.layers);
+
+	const auto     layers = source.info.resources.layers;
+	const uint64_t source_slice =
+	    static_cast<uint64_t>(source.info.pitch) * source.info.extent.height * source_bytes;
+	const uint64_t destination_slice = static_cast<uint64_t>(destination.info.pitch) *
+	                                   destination.info.extent.height * destination_bytes;
+	EXIT_IF(layers == 0 || source_slice > UINT64_MAX / layers ||
+	        destination_slice > UINT64_MAX / layers);
+	const auto source_size      = source_slice * layers;
+	const auto destination_size = destination_slice * layers;
+
+	const std::array source_copies {
+	    vk::BufferImageCopy {0, source.info.pitch, source.info.extent.height,
+	                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers}, {}, source.info.extent}};
+	const std::array destination_copies {
+	    vk::BufferImageCopy {0, destination.info.pitch, destination.info.extent.height,
+	                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers}, {},
+	                         destination.info.extent}};
+
+	auto source_buffer      = m_tiler.GetScratchBuffer(source_size);
+	auto destination_buffer = m_tiler.GetScratchBuffer(destination_size, source_buffer.buffer);
+	const TileManager::D16Layout layout {
+	    .width               = source.info.extent.width,
+	    .height              = source.info.extent.height,
+	    .layers              = layers,
+	    .source_row_stride   = static_cast<uint64_t>(source.info.pitch) * source_bytes,
+	    .target_row_stride   = static_cast<uint64_t>(destination.info.pitch) * destination_bytes,
+	    .source_slice_stride = source_slice,
+	    .target_slice_stride = destination_slice,
+	};
+	// The wide (D24/D32) side picks which specialized pipeline to use; promote reads it from the
+	// destination, demote reads it from the source.
+	const bool d32 = (promote ? destination_format : source_format) == vk::Format::eD32Sfloat;
+
+	source.Download(source_copies, source_buffer.buffer, source_buffer.offset, source_buffer.size);
+	m_tiler.ConvertD16(source_buffer, destination_buffer,
+	                   promote ? TileManager::D16Direction::Promote : TileManager::D16Direction::Demote,
+	                   d32, layout);
+	destination.Upload(destination_copies, destination_buffer.buffer, destination_buffer.offset,
+	                   destination_buffer.size);
+	return true;
+}
+
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
@@ -597,7 +668,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
 	if (direct_copy) {
 		destination.CopyImage(source);
-	} else if (!CopyD16(destination, source)) {
+	} else if (!CopyD16(destination, source) && !CopyDepthPrecision(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}

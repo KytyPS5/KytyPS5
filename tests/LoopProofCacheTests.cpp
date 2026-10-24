@@ -13,7 +13,96 @@ struct LoopProofTestAccess {
     if (!condition) throw std::runtime_error(message);
   }
 
+  static void CheckDceInvalidation(bool guarded, bool take_true) {
+    Program program;
+    program.user_data_count = 1;
+    const auto block = [&]() {
+      program.block_storage.push_back(std::make_unique<Block>());
+      auto* result = program.block_storage.back().get();
+      program.blocks.push_back(result);
+      result->id = static_cast<uint32_t>(program.blocks.size() - 1);
+      return result;
+    };
+    auto* entry = block();
+    auto* header = block();
+    auto* split = block();
+    auto* detour = block();
+    auto* body = block();
+    auto* exit = block();
+    entry->AddBranch(header);
+    header->AddBranch(split);
+    header->AddBranch(exit);
+    split->AddBranch(body);
+    split->AddBranch(detour);
+    detour->AddBranch(body);
+    body->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = split, .false_block = exit, .loop_header = true};
+    split->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = take_true ? body : detour,
+                         .false_block = take_true ? detour : body};
+    detour->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    auto& input = entry->AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    auto& phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto& increment = body->AppendNewInst(ValueOpcode::IAdd32, {Value(&phi), Value(1u)});
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(body, Value(&increment));
+    auto& compare = header->AppendNewInst(ValueOpcode::ULessThan32, {Value(&phi), Value(4u)});
+    auto& condition = header->AppendNewInst(ValueOpcode::IEqual32, {Value(&input), Value(0u)});
+    // Retain every instruction without a Reference in split masking the missing notification.
+    auto& bound_reference = header->AppendNewInst(ValueOpcode::Reference, {Value(&compare)});
+    auto& condition_reference = header->AppendNewInst(ValueOpcode::Reference, {Value(&condition)});
+    header->condition = guarded ? Value(&compare) : Value(true);
+    split->condition = Value(&condition);
+    ValidateProgram(program, true);
+    Decoder::Program decoded;
+    CFG::Graph cfg;
+    Tracker tracker(program, decoded, cfg, {});
+    const auto query = [&] { return tracker.IncrementGuarded(phi, compare, body); };
+    const auto key = std::tuple{&phi, &compare, static_cast<const Block*>(body)};
+    Check(query() == guarded && query() == guarded, "DCE fixture did not cache expected verdict");
+    const auto old_epoch = g_ir_mutation_epoch;
+    Check(tracker.m_increment_guards.at(key).epoch == old_epoch, "DCE fixture cache epoch mismatch");
+    const auto instructions = [&] {
+      std::vector<const Inst*> result;
+      for (const auto* current : program.blocks)
+        for (const auto& inst : *current) result.push_back(&inst);
+      return result;
+    };
+    const auto edges = [&] {
+      std::vector<std::pair<const Block*, const Block*>> result;
+      for (const auto* current : program.blocks) {
+        for (const auto* next : current->ImmSuccessors()) result.emplace_back(current, next);
+        for (const auto* previous : current->ImmPredecessors()) result.emplace_back(previous, current);
+      }
+      return result;
+    };
+    const auto old_instructions = instructions();
+    const auto old_edges = edges();
+    EliminateDeadCode(program.blocks);
+    Check(split->condition == Value(take_true), "DCE fixture did not fold the intended branch");
+    Check(instructions() == old_instructions, "DCE fixture deleted an instruction");
+    Check(bound_reference.Arg(0) == Value(&compare) && condition_reference.Arg(0) == Value(&condition),
+          "DCE fixture rewrote a retaining Reference");
+    Check(edges() == old_edges, "DCE changed CFG edges");
+    ValidateProgram(program, true);
+    Check(g_ir_mutation_epoch != old_epoch, "DCE branch fold did not advance IR mutation epoch");
+    Check(tracker.m_increment_guards.at(key).epoch == old_epoch, "DCE unexpectedly refreshed cache");
+    const bool fresh = tracker.ComputeIncrementGuard(phi, compare, body);
+    Check(query() == fresh && fresh == guarded, "post-DCE cached and fresh verdicts differ");
+    Check(tracker.m_increment_guards.at(key).epoch == g_ir_mutation_epoch,
+          "post-DCE query retained an obsolete cache entry");
+    const auto refreshed_epoch = g_ir_mutation_epoch;
+    Check(query() == fresh, "post-DCE cache reuse changed the verdict");
+    EliminateDeadCode(program.blocks);
+    Check(g_ir_mutation_epoch == refreshed_epoch, "no-op DCE invalidated cached proofs");
+  }
+
   static void Run() {
+    for (const bool guarded : {true, false})
+      for (const bool take_true : {true, false}) CheckDceInvalidation(guarded, take_true);
     Program program;
     program.user_data_count = 6;
     const auto block = [&]() {

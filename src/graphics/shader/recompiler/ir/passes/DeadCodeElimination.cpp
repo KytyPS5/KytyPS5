@@ -80,6 +80,7 @@ void EliminateDeadCode(const BlockList& blocks) {
 					    inst.Arg(0).Resolve() == block->condition.Resolve())
 						inst.SetArg(0, Value(take_true));
 				}
+				NoteIrMutation();
 				block->condition = Value(take_true);
 				changed = true;
 				break;

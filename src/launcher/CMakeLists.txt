@@ -1,5 +1,5 @@
 
-find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
@@ -36,6 +36,16 @@ target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+
+add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
+	src/gameContent.cpp
+	src/launcherTheme.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
+target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")

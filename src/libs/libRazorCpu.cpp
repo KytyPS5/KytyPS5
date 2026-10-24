@@ -24,10 +24,15 @@ static int KYTY_SYSV_ABI RazorCpuPushMarker(const char*, uint32_t, uint32_t) {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI RazorCpuNamedSync(const char*) {
+	return 0;
+}
+
 LIB_DEFINE(InitRazorCpu_1) {
 	LIB_FUNC("EboejOQvLL4", LibRazorCpu::RazorCpuIsCapturing);
 	LIB_FUNC("YpkGsMXP3ew", LibRazorCpu::RazorCpuPopMarker);
 	LIB_FUNC("zw+celG7zSI", LibRazorCpu::RazorCpuPushMarker);
+	LIB_FUNC("XCuZoBSVFG8", LibRazorCpu::RazorCpuNamedSync);
 }
 
 } // namespace LibRazorCpu

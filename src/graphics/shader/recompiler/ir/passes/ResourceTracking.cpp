@@ -56,6 +56,17 @@ uint32_t PossibleU32Bits(Value value, const auto& normalize) {
 				}
 				break;
 			}
+			case ValueOpcode::BitFieldInsert: {
+				const auto offset = inst->Arg(2).Resolve();
+				const auto count  = inst->Arg(3).Resolve();
+				if (offset.IsImmediate() && count.IsImmediate() && offset.U32() < 32u &&
+				    count.U32() <= 32u - offset.U32()) {
+					const auto field = (count.U32() == 32u ? UINT32_MAX : (1u << count.U32()) - 1u)
+					                   << offset.U32();
+					bits = (arg(0) & ~field) | ((arg(1) << offset.U32()) & field);
+				}
+				break;
+			}
 			default: break;
 		}
 		return bits;
@@ -362,8 +373,7 @@ class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
 	        ShaderStageInputInfo input)
-	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
-	      m_workgroup(program.stage == ShaderType::Compute ? input.compute : nullptr),
+	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg), m_input(input),
 	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
@@ -1558,14 +1568,55 @@ private:
 		return read;
 	}
 
+	const Inst* IndexedMaterialRead(const Inst* read, Value active,
+	                               DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+		if (read == nullptr) return nullptr;
+		uint32_t lane = 0;
+		const auto op = read->GetOpcode();
+		if (op == ValueOpcode::CompositeExtractU32x2 || op == ValueOpcode::CompositeExtractU32x3) {
+			const bool x3 = op == ValueOpcode::CompositeExtractU32x3;
+			if (!ImmediateU32(read->Arg(1), lane) || lane >= (x3 ? 3u : 2u)) return nullptr;
+			read = read->Arg(0).Resolve().TryInstruction();
+			if (read == nullptr ||
+			    read->GetOpcode() != (x3 ? ValueOpcode::LoadBufferU32x3 : ValueOpcode::LoadBufferU32x2))
+				return nullptr;
+		} else if (op != ValueOpcode::LoadBufferU32) {
+			return nullptr;
+		}
+		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
+		    read->Arg(2).Resolve() != Value(0u) || read->Arg(3).Resolve() != Value(0u) ||
+		    !EquivalentValue(m_program, active, read->Arg(4))) return nullptr;
+		selector.offset = memory.offset + lane * 4u;
+		return read;
+	}
+
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
-	                                DescriptorSource& material_source) {
+	                                DescriptorSource& material_source, bool indexed) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
 		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
+		if (indexed) {
+			read = IndexedMaterialRead(read, active, selector);
+			// Bounded heaps fall back when the material aliases a written buffer; pointer
+			// tables rely on the renderer's specialization-read alias check. Other stages
+			// and unbounded/image writes keep the original domain.
+			if (read == nullptr || m_program.stage != ShaderType::Compute ||
+			    std::ranges::any_of(m_program.blocks, [](const Block* block) {
+				    return std::ranges::any_of(*block, [](const Inst& inst) {
+					    const auto op = inst.GetOpcode();
+					    return ImageOpcodeInfoOf(op).resource_class == ImageResourceClass::Storage ||
+					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
+				    });
+			    }) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			selector.source = InternSource(material_source);
+			indirect.selector = std::move(selector);
+			return true;
+		}
 		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
 		    read->NumArgs() != 4u || !Implies(active, read->Arg(3)))
 			return false;
@@ -1818,7 +1869,7 @@ private:
 			    if (inst->GetOpcode() == ValueOpcode::GetBuiltin &&
 			        inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)) &&
 			        ImmediateU32(inst->Arg(1), axis) && axis < 3u &&
-			        m_workgroup->threads_num[axis] <= (uint64_t {1} << bits)) return axis + 1u;
+			        m_input.compute->threads_num[axis] <= (uint64_t {1} << bits)) return axis + 1u;
 			    if (!allow_induction || inst->GetOpcode() != ValueOpcode::Phi ||
 			        (!induction.IsEmpty() && induction != at)) return {};
 			    induction = at;
@@ -1829,20 +1880,20 @@ private:
 	bool LinearLocalIndex(const std::array<uint64_t, 5>& index) const {
 		uint64_t stride = 1u;
 		for (uint32_t axis = 0; axis < 3u; ++axis) {
-			if (m_workgroup->threads_num[axis] != 1u && index[axis + 1u] != stride) return false;
-			stride *= m_workgroup->threads_num[axis];
+			if (m_input.compute->threads_num[axis] != 1u && index[axis + 1u] != stride) return false;
+			stride *= m_input.compute->threads_num[axis];
 		}
 		return index[0] == 0u;
 	}
 
 	void ForwardPrivateLds() {
-		if (m_workgroup == nullptr) return;
+		if (m_program.stage != ShaderType::Compute) return;
 		uint64_t bytes = 4u;
-		for (const auto size: m_workgroup->threads_num) {
+		for (const auto size: m_input.compute->threads_num) {
 			if (size == 0u || size > 1024u) return;
 			bytes *= size;
 		}
-		if (bytes > uint64_t {m_workgroup->lds_size_dwords} * 4u) return;
+		if (bytes > uint64_t {m_input.compute->lds_size_dwords} * 4u) return;
 		struct Access { Inst* inst; uint32_t offset; };
 		std::vector<Access> reads, writes;
 		Value address;
@@ -1858,7 +1909,7 @@ private:
 				if ((op != ValueOpcode::LoadSharedU32 && op != ValueOpcode::WriteSharedU32) ||
 				    memory.data_bits != 32u || memory.secondary_offset != 0u ||
 				    (memory.offset & 3u) != 0u ||
-				    uint64_t {memory.offset} + bytes > uint64_t {m_workgroup->lds_size_dwords} * 4u)
+				    uint64_t {memory.offset} + bytes > uint64_t {m_input.compute->lds_size_dwords} * 4u)
 					return;
 				if (address.IsEmpty()) address = inst.Arg(0).Resolve();
 				else if (!EquivalentValue(m_program, address, inst.Arg(0))) return;
@@ -2004,16 +2055,16 @@ private:
 	Value SharedLoadBound(Value value, Value active) {
 		const auto* read = ActiveValue(value, active).TryInstruction();
 		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadSharedU32 ||
-		    m_workgroup == nullptr || m_program.stage != ShaderType::Compute ||
+		    m_program.stage != ShaderType::Compute ||
 		    read->Arg(1).Resolve() != Value(true)) return {};
 		uint64_t group_size = 1u;
-		for (const auto dimension: m_workgroup->threads_num) {
-			if (dimension == 0u || dimension > m_workgroup->wave_size) return {};
+		for (const auto dimension: m_input.compute->threads_num) {
+			if (dimension == 0u || dimension > m_input.compute->wave_size) return {};
 			group_size *= dimension;
 		}
 		// Indexed LDS operations within one native wave execute in order. Multiwave
 		// append lists require a separate workgroup synchronization proof.
-		if (group_size != m_workgroup->wave_size || group_size != m_program.wave_size ||
+		if (group_size != m_input.compute->wave_size || group_size != m_program.wave_size ||
 		    (group_size != 32u && group_size != 64u)) return {};
 		const auto memory = [&](const Inst& inst) -> const MemoryInfo* {
 			const auto index = inst.Flags<MemoryFlags>().index;
@@ -2066,7 +2117,7 @@ private:
 					if (op != ValueOpcode::SharedAtomicIAdd32 ||
 					    ActiveValue(inst.Arg(1), guard) != Value(1u) ||
 					    !constant_address(inst, address) ||
-					    uint64_t {address} + 4u > uint64_t {m_workgroup->lds_size_dwords} * 4u ||
+					    uint64_t {address} + 4u > uint64_t {m_input.compute->lds_size_dwords} * 4u ||
 					    address >= 0x10000u ||
 					    std::ranges::any_of(appends, [&](const Append& at) { return at.counter == address; })) return {};
 					appends.push_back({.atomic = &inst, .counter = address});
@@ -2815,7 +2866,7 @@ private:
 				} else result.maximum = std::max(result.maximum, SelectorMaximum(key, {}, 0u, active));
 			}
 		}
-		if (lane != nullptr) result = SelectedFiniteDomain(*lane, handle != nullptr ? lane->Arg(1) : Value {});
+		if (lane != nullptr) result = SelectedSelectorDomain(*lane, handle != nullptr ? lane->Arg(1) : Value {});
 		else if (handle == nullptr) result.maximum = SelectorMaximum(key);
 		if (result.maximum > UINT32_MAX / 4u ||
 		    uint64_t {result.maximum} * indirect.table_stride + indirect.table_offset > UINT32_MAX)
@@ -2971,6 +3022,13 @@ private:
 			// Keep live descriptor payloads, but project descriptor-only SMEM onto
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
+		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
+		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true)) {
+			// Preserve the heap's byte-offset key so runtime geometry can choose the
+			// tighter selector domain without changing the GPU's descriptor reads.
+			indirect.table_scalar = true;
+			plan.table_read = plan.reads[0];
+			plan.retain_reads = true;
 		} else if (sampler && table_source.dword_count == 4u && !plan.table_indexed &&
 		           SetExactTableMaximum(key, indirect, &handle)) {
 			indirect.table_scalar = true;
@@ -3020,7 +3078,8 @@ private:
 				}
 			}
 			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source) &&
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, false) &&
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, true) &&
 			    !MatchReversedImageRange(key, indirect)) {
 				const auto maximum = SelectorMaximum(key);
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
@@ -3064,6 +3123,10 @@ private:
 					indirect.selector_mask = selected.selector_mask;
 					indirect.signed_count = selected.signed_count;
 					indirect.workgroup_axis = selected.workgroup_axis;
+					if (selected.table_scalar) {
+						indirect.table_scalar = true;
+						plan.table_read = plan.reads[0];
+					}
 					material_source = m_sources[selected.selector->source];
 					shared_selector = true;
 					break;
@@ -3264,26 +3327,13 @@ private:
 			if (value == nullptr || (selected != nullptr && selected != value)) return false;
 			selected = value;
 		}
-		const auto* read = selected->Arg(1).Resolve().TryInstruction();
-		uint32_t lane = 0;
-		if (read != nullptr && read->GetOpcode() == ValueOpcode::CompositeExtractU32x2) {
-			if (!ImmediateU32(read->Arg(1), lane) || lane >= 2u) return false;
-			read = read->Arg(0).Resolve().TryInstruction();
-			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x2) return false;
-		} else if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) {
-			return false;
-		}
-		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
-		uint32_t offset = 1u, scalar = 1u;
-		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
-		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
-		    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
-		    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4))) return false;
-		if (!MakeRuntimeTableSource(*read, material_source) ||
+		DescriptorSource::IndirectDescriptor::SelectorRead selector;
+		const auto* read = IndexedMaterialRead(selected->Arg(1).Resolve().TryInstruction(),
+		                                       selected->Arg(0), selector);
+		if (read == nullptr || !MakeRuntimeTableSource(*read, material_source) ||
 		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
-		indirect.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead{.source = InternSource(material_source),
-		                              .offset = memory.offset + lane * 4u});
+		selector.source = InternSource(material_source);
+		indirect.selector = std::move(selector);
 		return finish();
 	}
 
@@ -3372,10 +3422,12 @@ private:
 		return found ? SelectorDomain {maximum, counted ? count : Value {}} : SelectorDomain {};
 	}
 
-	SelectorDomain SelectedFiniteDomain(const Inst& lane, Value guard) const {
+	SelectorDomain SelectedSelectorDomain(const Inst& lane, Value guard) const {
 		if (guard.IsEmpty() ? !HasActiveLane(lane.Arg(1), lane.Parent())
 		                    : !Implies(guard, lane.Arg(1))) return {};
-		return FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
+		auto result = FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
+		if (result.maximum == UINT32_MAX) result.maximum = PossibleU32Bits(lane.Arg(0));
+		return result;
 	}
 
 	uint32_t SelectorMaximum(Value value, SelectorBounds bounds = {}, uint32_t depth = 0,
@@ -3392,7 +3444,7 @@ private:
 		};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::ReadFirstLane:
-				return SelectedFiniteDomain(*inst, guard).maximum;
+				return SelectedSelectorDomain(*inst, guard).maximum;
 			case ValueOpcode::ReadLane:
 				// ReadLane ignores EXEC; only context-free bounds on every source lane apply.
 				return PossibleU32Bits(inst->Arg(0));
@@ -3708,10 +3760,10 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
-				Merge(m_info.buffers[i], memory, op, pc);
+				Merge(m_info.buffers[i], memory, inst, pc);
 				return i;
 			}
 		}
@@ -3721,13 +3773,14 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
-		Merge(resource, memory, op, pc);
+		Merge(resource, memory, inst, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
-	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
+	static void Merge(BufferResource& resource, const MemoryInfo& memory, const Inst& inst,
 	                  uint32_t pc) {
+		const auto op            = inst.GetOpcode();
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
@@ -3735,6 +3788,13 @@ private:
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
+		if (write) {
+			// Formatted stores write the whole format; otherwise zero index, VGPR and SGPR offsets
+			// leave only the immediate offset.
+			const bool fixed = !memory.formatted && inst.Arg(1).Resolve() == Value(0u) &&
+			                   inst.Arg(2).Resolve() == Value(0u) && inst.Arg(3).Resolve() == Value(0u);
+			resource.write_extent = std::max(resource.write_extent, fixed ? ByteExtent(memory) : UINT32_MAX);
+		}
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
@@ -3904,7 +3964,7 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
-			resource = AddBuffer(source, memory, op, flags.pc);
+			resource = AddBuffer(source, memory, inst, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
 			}
@@ -4024,7 +4084,7 @@ private:
 	Program&                                   m_program;
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
-	const ShaderWorkgroupInputInfo*            m_workgroup;
+	ShaderStageInputInfo                       m_input;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
@@ -4057,8 +4117,8 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 		// Dispatch thread dimensions, valid in both wave sizes.
 		Pattern {.code_words = 38, .hash = 0xacbda1a1ccdd4198ull, .wave_size_mask = 32 | 64, .bounded = false},
 	};
-	if (program.stage != ShaderType::Compute || input.compute == nullptr ||
-	    decoded.instructions.empty() || program.user_data_base != 0 || program.user_data_count < 10 ||
+	if (program.stage != ShaderType::Compute || decoded.instructions.empty() ||
+	    program.user_data_base != 0 || program.user_data_count < 10 ||
 	    program.info.buffers.size() != 1 || !program.info.images.empty()) return {};
 	const auto& cs = *input.compute;
 	const bool matching_inputs = cs.workgroup_register == 10 && cs.thread_ids_num == 1 &&

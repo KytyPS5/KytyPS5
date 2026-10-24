@@ -31,6 +31,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		bool                          heap                       = false;
 		bool                          operator==(const Image&) const = default;
 	};
 
@@ -58,6 +59,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+
+// Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
+// null. Entries of one kind specialize identically.
+uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value);
+// The sampled resource that root resolves entries of kind as; kind 0 gives the identity of
+// root's view of a heap.
+ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

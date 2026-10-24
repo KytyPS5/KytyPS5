@@ -1288,13 +1288,11 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	// No mip statistics are collected, so report "no data yet": a zero header marks the report
+	// invalid. A valid header with zeroed entries reads as every texture wanting mip 0, which
+	// makes Astro Bot's texture streamer load and evict the same mips forever.
 	if (dst != nullptr && buffer_size != 0) {
 		memset(dst, 0, buffer_size);
-		// Hack?
-		if (buffer_size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
-		}
 	}
 
 	return 4;

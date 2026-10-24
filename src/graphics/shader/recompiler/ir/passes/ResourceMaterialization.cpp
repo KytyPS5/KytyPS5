@@ -531,6 +531,8 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		if (selector->bit_offset != 0u || selector->bit_mask != UINT32_MAX || selector->maximum != UINT32_MAX)
 			for (auto& key: keys)
 				key = std::min((key >> selector->bit_offset) & selector->bit_mask, selector->maximum);
+		if (indirect.selector_nonnegative)
+			std::erase_if(keys, [](uint32_t key) { return key >= 0x80000000u; });
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}

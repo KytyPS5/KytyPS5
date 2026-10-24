@@ -17,7 +17,6 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QIODevice>
 #include <QLabel>
 #include <QMessageBox>
 #include <QObject>
@@ -28,7 +27,6 @@
 #include <QSettings>
 #include <QStringList>
 #include <QStyleHints>
-#include <QTextStream>
 #include <QVariant>
 #include <QtCore>
 
@@ -47,23 +45,17 @@
 class QWidget;
 
 #if defined(_WIN32)
-constexpr char EMULATOR_EXE[] = "kyty_emulator.exe";
+constexpr char  EMULATOR_EXE[] = "kyty_emulator.exe";
+constexpr char  CMD_EXE[]      = "cmd.exe";
+constexpr DWORD CMD_X_CHARS    = 175;
+constexpr DWORD CMD_Y_CHARS    = 1000;
 #else
 constexpr char EMULATOR_EXE[] = "kyty_emulator";
-#endif
-
-#if defined(_WIN32)
-constexpr char CMD_EXE[] = "cmd.exe";
-#elif defined(__linux__)
-constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
-#endif
-#if defined(_WIN32)
-constexpr DWORD CMD_X_CHARS = 175;
-constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
 constexpr char SETTINGS_CHECK_UPDATES[]      = "check_updates_on_startup";
+constexpr char SETTINGS_CLOSE_TERMINAL[]     = "close_terminal";
 constexpr char SETTINGS_THEME[]              = "theme";
 
 class MainDialogPrivate: public QObject {
@@ -89,6 +81,7 @@ public:
 private:
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
+	static bool       g_close_terminal;
 	static int        g_theme;
 
 	static void ApplyTheme(int theme) {
@@ -108,13 +101,12 @@ private:
 	TitleSound      m_title_sound;
 	QString         m_interpreter;
 
-	QProcess m_process;
-
-	QPointer<ConfigurationItem> m_running_item;
+	int m_running_games = 0;
 };
 
 QByteArray MainDialogPrivate::g_last_geometry;
 bool       MainDialogPrivate::g_check_updates_on_startup = true;
+bool       MainDialogPrivate::g_close_terminal           = false;
 int        MainDialogPrivate::g_theme                    = 0;
 
 MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPrivate(this)) {
@@ -122,7 +114,6 @@ MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPriv
 }
 
 MainDialogPrivate::~MainDialogPrivate() {
-	m_process.disconnect(this);
 	delete m_ui;
 }
 
@@ -134,10 +125,14 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
+	m_ui->close_terminal->setChecked(g_close_terminal);
 	m_ui->theme_combo->setCurrentIndex(g_theme);
 	ApplyTheme(g_theme);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
+#if defined(__APPLE__)
+	m_ui->close_terminal->setVisible(false); // The emulator runs without a terminal.
+#endif
 
 	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
 
@@ -146,13 +141,12 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
 		Update();
 		const auto* item = m_ui->widget->GetSelectedItem();
-		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
-		                           ? item->GetInfo().basedir
-		                           : QString());
+		m_title_sound.SetTitle(m_running_games == 0 && item != nullptr ? item->GetInfo().basedir
+		                                                               : QString());
 	});
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
-		        if (m_process.state() == QProcess::NotRunning) {
+		        if (m_running_games == 0) {
 			        m_controller_preview.SetColor(color);
 		        }
 	        });
@@ -166,6 +160,10 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		g_check_updates_on_startup = checked;
 		m_ui->widget->WriteSettings();
 	});
+	connect(m_ui->close_terminal, &QCheckBox::toggled, this, [this](bool checked) {
+		g_close_terminal = checked;
+		m_ui->widget->WriteSettings();
+	});
 	connect(m_ui->theme_combo, &QComboBox::currentIndexChanged, this, [this](int index) {
 		g_theme = index;
 		ApplyTheme(index);
@@ -174,16 +172,6 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(main_dialog, &MainDialog::Resize, [this]() {
 		g_last_geometry = m_main_dialog->saveGeometry();
 		m_ui->widget->WriteSettings();
-	});
-
-	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
-		m_update_checker->SetGameRunning(state != QProcess::NotRunning);
-		if (state == QProcess::NotRunning) {
-			if (m_running_item != nullptr) {
-				m_running_item->SetRunning(false);
-			}
-			Update();
-		}
 	});
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
@@ -327,32 +315,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 }
 
 #ifdef __linux__
-static QString BashQuote(QString value) {
-	value.replace('\'', "'\\''");
-	return QStringLiteral("'") + value + QStringLiteral("'");
-}
-
-static bool CreateBashScript(const QString& interpreter, const QStringList& args,
-                             const QString& file_name) {
-	QFile file(file_name);
-	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-		QTextStream s(&file);
-
-		s << "#!/bin/bash\n";
-		s << BashQuote(interpreter);
-		for (const auto& arg: args) {
-			s << " " << BashQuote(arg);
-		}
-		s << "\n";
-		s << "echo Press any key...\n";
-		s << "read -n1\n";
-
-		file.close();
-
-		return file.setPermissions(file.permissions() | QFile::ExeUser | QFile::ExeOwner |
-		                           QFile::ExeGroup);
-	}
-	return false;
+// Runs the command in bash, then waits for a key (with close_on_clean_exit, only after an error).
+// The command goes in as positional parameters ("$@"), so it needs no quoting.
+static QStringList BashCommand(const QString& interpreter, const QStringList& args,
+                               bool close_on_clean_exit) {
+	const QString run = close_on_clean_exit ? "\"$@\" && exit" : "\"$@\"";
+	return QStringList {"bash", "-c", run + "; echo Press any key...; read -n1", "kyty",
+	                    interpreter} +
+	       args;
 }
 
 // Find a terminal and its command separator.
@@ -416,27 +386,22 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 #endif
 
 #if defined(_WIN32)
-// Quote one token for cmd.exe so paths with spaces survive /K parsing.
-static QString WinCmdQuote(QString value) {
-	value.replace(QLatin1Char('"'), QStringLiteral("\\\""));
-	return QLatin1Char('"') + value + QLatin1Char('"');
-}
-
-static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList& args) {
-	QString command = WinCmdQuote(QDir::toNativeSeparators(interpreter));
-	for (const auto& arg: args) {
-		command += QLatin1Char(' ');
-		command += WinCmdQuote(arg);
-	}
-	return command;
+// cmd /K arguments that keep the console open (with close_on_clean_exit, only after an error).
+// A quote is written as "" rather than \" so cmd's quote count stays even and operators inside
+// arguments stay quoted.
+static QString CmdCommand(const QString& interpreter, const QStringList& args,
+                          bool close_on_clean_exit) {
+	static const QRegularExpression quote_or_end(QStringLiteral(R"((\\*)("|\z))"));
+	// The UCRT reads 2n backslashes before a quote as n.
+	auto quoted = QStringList {interpreter} + args;
+	quoted.replaceInStrings(quote_or_end, QStringLiteral(R"(\1\1\2\2)"));
+	return QStringLiteral("/K \"\"") + quoted.join(QStringLiteral("\" \"")) +
+	       (close_on_clean_exit ? "\" && exit\"" : "\"\"");
 }
 #endif
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
+void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
 	const auto& interpreter = m_p->GetInterpreter();
-
-	QFileInfo f(interpreter);
-	auto      dir = f.absoluteDir();
 
 	auto args = CreateEmulatorArgs(info);
 	if (args.isEmpty()) {
@@ -445,40 +410,24 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		return;
 	}
 
-#ifdef __linux__
-	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
-	if (!CreateBashScript(interpreter, args, bash_file_name)) {
-		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
-		QApplication::quit();
-		return;
-	}
-
-	{
-		QString     terminal;
-		QStringList terminal_prefix;
-		// Pass the script as a file argument (not bash -c) so paths with spaces work.
-		if (FindTerminal(&terminal, &terminal_prefix)) {
-			process->setProgram(terminal);
-			process->setArguments(terminal_prefix + QStringList {"bash", bash_file_name});
-		} else {
-			// Run without a terminal as a fallback.
-			process->setProgram(QStringLiteral("bash"));
-			process->setArguments({bash_file_name});
-		}
-	}
-#elif defined(_WIN32)
-	{
-		// Use nativeArguments so Qt does not re-quote the /K command string.
-		process->setProgram(CMD_EXE);
-		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K \"") +
-		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
-	}
-#else
+	// Without a terminal, the emulator runs directly.
 	process->setProgram(interpreter);
 	process->setArguments(args);
+#ifdef __linux__
+	QString     terminal;
+	QStringList terminal_prefix;
+	if (FindTerminal(&terminal, &terminal_prefix)) {
+		process->setProgram(terminal);
+		process->setArguments(terminal_prefix + BashCommand(interpreter, args, close_terminal));
+	}
+#elif defined(_WIN32)
+	// Use nativeArguments so Qt does not re-quote the /K command string.
+	process->setProgram(CMD_EXE);
+	process->setArguments({});
+	process->setNativeArguments(
+	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
-	process->setWorkingDirectory(dir.path());
+	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
@@ -525,6 +474,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 		s.setValue(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry);
 	}
 	s.setValue(SETTINGS_CHECK_UPDATES, g_check_updates_on_startup);
+	s.setValue(SETTINGS_CLOSE_TERMINAL, g_close_terminal);
 	s.setValue(SETTINGS_THEME, g_theme);
 
 	s.endGroup();
@@ -535,6 +485,7 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 
 	g_last_geometry = s.value(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry).toByteArray();
 	g_check_updates_on_startup = s.value(SETTINGS_CHECK_UPDATES, true).toBool();
+	g_close_terminal           = s.value(SETTINGS_CLOSE_TERMINAL, false).toBool();
 	g_theme                    = s.value(SETTINGS_THEME, 0).toInt();
 	if (g_theme < 0 || g_theme > 2) {
 		g_theme = 0;
@@ -547,17 +498,30 @@ void MainDialogPrivate::Run() {
 	if (m_update_checker->IsInstalling()) {
 		return;
 	}
-	m_running_item = m_ui->widget->GetSelectedItem();
-	if (m_running_item == nullptr) {
+	QPointer<ConfigurationItem> item = m_ui->widget->GetSelectedItem();
+	if (item == nullptr) {
 		return;
 	}
 
-	m_running_item->SetRunning(true);
+	item->SetRunning(true);
+	m_running_games++;
 	m_controller_preview.SetSuspended(true);
 	m_title_sound.SetTitle({});
 
-	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
-	m_main_dialog->RunInterpreter(&m_process, *info);
+	auto* process = new QProcess(this);
+	connect(process, &QProcess::stateChanged, this,
+	        [this, process, item](QProcess::ProcessState state) {
+		        if (state == QProcess::NotRunning) {
+			        if (item != nullptr) {
+				        item->SetRunning(false);
+			        }
+			        m_running_games--;
+			        process->deleteLater();
+			        Update();
+		        }
+	        });
+	auto info = m_ui->widget->CreateConfiguration(*item);
+	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
 
 	Update();
 }
@@ -565,8 +529,7 @@ void MainDialogPrivate::Run() {
 void MainDialogPrivate::Update() {
 	const auto* item = m_ui->widget->GetSelectedItem();
 
-	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr &&
-	                    !m_update_checker->IsInstalling());
+	bool run_enabled = item != nullptr && !item->IsRunning() && !m_update_checker->IsInstalling();
 
 	if (run_enabled) {
 		const auto& info = item->GetInfo();
@@ -575,7 +538,8 @@ void MainDialogPrivate::Update() {
 	}
 
 	m_ui->widget->SetRunEnabled(run_enabled);
-	if (m_process.state() != QProcess::NotRunning) {
+	m_update_checker->SetGameRunning(m_running_games > 0);
+	if (m_running_games > 0) {
 		m_controller_preview.SetSuspended(true);
 		return;
 	}

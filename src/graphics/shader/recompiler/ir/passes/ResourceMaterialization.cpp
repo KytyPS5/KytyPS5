@@ -772,6 +772,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
 			if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) return false;
+			key_count = std::min(key_count, indirect.key_limit);
 			if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first_key))
 				return false;
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
@@ -781,10 +782,25 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			             UINT32_MAX + 1ull)) {
 				return false;
 			}
-			keys.resize(key_count);
-			std::iota(keys.begin(), keys.end(), first_key);
-			if (!keys.empty() && keys.back() < keys.front())
-				std::rotate(keys.begin(), keys.begin() + (UINT32_MAX - first_key + 1ull), keys.end());
+			keys.clear();
+			uint32_t scanned = 0;
+			if (!indirect.selector_mask.IsEmpty()) {
+				// A bit scan selects keys from the set bits of its mask only; the other
+				// slots belong to records the shader never reads.
+				if (key_count > 32u || !indirect.selector_first.IsEmpty() ||
+				    !clean.Evaluate(indirect.selector_mask, scanned))
+					return false;
+				if (key_count < 32u) scanned &= (1u << key_count) - 1u;
+				for (auto bits = scanned; bits != 0u; bits &= bits - 1u) {
+					keys.push_back(static_cast<uint32_t>(std::countr_zero(bits)));
+				}
+			} else {
+				keys.resize(key_count);
+				std::iota(keys.begin(), keys.end(), first_key);
+				if (!keys.empty() && keys.back() < keys.front())
+					std::rotate(keys.begin(), keys.begin() + (UINT32_MAX - first_key + 1ull),
+					            keys.end());
+			}
 		} else {
 			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
 			if (!selector_keys->resolved) {

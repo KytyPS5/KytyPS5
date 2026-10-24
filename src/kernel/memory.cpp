@@ -63,7 +63,7 @@ constexpr int PROT_GPU_WRITE = 0x20;
 
 enum class GpuAccessMode { NoAccess, Read, Write, ReadWrite };
 
-constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 16ull * 1024ull * 1024ull * 1024ull;
 constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);

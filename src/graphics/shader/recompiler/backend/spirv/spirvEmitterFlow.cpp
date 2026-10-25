@@ -714,8 +714,23 @@ void EmitBarrier(EmitterState& state) {
 	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
 	                        ? spv::MemorySemanticsUniformMemoryMask
 	                        : spv::MemorySemanticsWorkgroupMemoryMask;
-	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
-	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
+	auto semantics = static_cast<uint32_t>(tessellation ? spv::MemorySemanticsMaskNone
+	                                                    : spv::MemorySemanticsAcquireReleaseMask | memory);
+	// A compute shader that stores to buffers or images and reads them back in other waves after
+	// S_BARRIER needs the barrier to order those memories too: the store completion wait only
+	// releases them, nothing acquires them in the reading wave. UFC 6 (PPSA23566) builds per-pixel
+	// lists in buffers and walks them after the barrier; with workgroup memory alone a wave could
+	// read an old next pointer and walk forever (GPU hang while a fight loads).
+	if (!tessellation && state.program.stage == ShaderType::Compute) {
+		const auto& info   = state.program.info;
+		const bool  stores = state.program.has_address_writes ||
+		                    std::ranges::any_of(info.buffers, [](const auto& b) { return b.written; }) ||
+		                    std::ranges::any_of(info.images, [](const auto& i) { return i.written; });
+		if (stores) {
+			semantics |= static_cast<uint32_t>(spv::MemorySemanticsUniformMemoryMask) |
+			             static_cast<uint32_t>(spv::MemorySemanticsImageMemoryMask);
+		}
+	}
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }

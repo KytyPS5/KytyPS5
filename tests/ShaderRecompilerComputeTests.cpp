@@ -5919,6 +5919,20 @@ public:
             !unsized_consumed && !texture_cache.IsMetaCleared(unsized_meta, 0),
             "a write to metadata of unknown size was replaced by a clear");
 
+    ShaderRecompiler::IR::CompiledShaderInfo image_program{};
+    ShaderRecompiler::IR::ResourceSnapshot image_snapshot;
+    AddBuffer(scene_data, true, false, 0x10, image_program, image_snapshot);
+    AddBuffer(reused_meta, false, true, 0xa000, image_program, image_snapshot);
+    ShaderRecompiler::IR::ImageResource storage_image{};
+    storage_image.written = true;
+    image_program.info.images.push_back(storage_image);
+    image_snapshot.images.push_back({});
+    const bool image_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(image_program, image_snapshot), command);
+    Require(name, "HTile clear that also writes a storage image preserved",
+            !image_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch also writing a storage image was replaced by a clear");
+
     ShaderRecompiler::IR::CompiledShaderInfo clear_program{};
     ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;
     AddBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);

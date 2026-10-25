@@ -61,6 +61,14 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (program.info.has_bitwise_xor) {
 		return false;
 	}
+	// Consuming the dispatch skips all of it, and the metadata clear only covers buffers. A
+	// storage-image write (or image atomic) in the same shader would be lost, so such a dispatch
+	// runs normally.
+	for (const auto& image: program.info.images) {
+		if (image.written) {
+			return false;
+		}
+	}
 	// A metadata clear writes constant values into metadata surfaces and nothing else. Metadata
 	// entries outlive the memory they describe when a game frees a depth target and reuses its
 	// HTILE for something else, so the target address alone does not identify a clear. A dispatch

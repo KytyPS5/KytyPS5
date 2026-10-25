@@ -628,15 +628,27 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
-void TestCompleteUMinReduction() {
+void TestCompleteWaveReduction() {
   enum class Case {
     Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
     UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
-    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation
+    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation,
+    CarryAdd, ShapeEndpoints
   };
+  struct Fold {
+    ValueOpcode operation;
+    uint32_t identity;
+  };
+  static constexpr std::array<Fold, 8> folds{{
+      {ValueOpcode::UMin32, UINT32_MAX}, {ValueOpcode::UMax32, 0u},
+      {ValueOpcode::SMin32, 0x7fffffffu}, {ValueOpcode::SMax32, 0x80000000u},
+      {ValueOpcode::IAdd32, 0u}, {ValueOpcode::BitwiseAnd32, UINT32_MAX},
+      {ValueOpcode::BitwiseOr32, 0u}, {ValueOpcode::BitwiseXor32, 0u}}};
+  for (const auto fold : folds) {
+  for (const bool butterfly : {false, true}) {
   for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
        Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
        Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
@@ -645,7 +657,11 @@ void TestCompleteUMinReduction() {
        Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
        Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
-       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation}) {
+       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation,
+       Case::CarryAdd, Case::ShapeEndpoints}) {
+    const bool carry = test == Case::CarryAdd;
+    if (carry && fold.operation != ValueOpcode::IAdd32) continue;
+    const uint32_t row_control = butterfly ? 0x160u : 0x110u;
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
     const auto source = fixture.Emit(ValueOpcode::LaneId);
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
@@ -657,19 +673,20 @@ void TestCompleteUMinReduction() {
     auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
     if (test == Case::Subset)
       seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
+    const uint32_t wrong_identity = fold.identity == 0u ? UINT32_MAX : 0u;
     const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
         fixture.Emit(ValueOpcode::SelectU32,
-            {seed_mask, source, Value(test == Case::WrongNeutral ? 0u : UINT32_MAX)});
+            {seed_mask, source, Value(test == Case::WrongNeutral ? wrong_identity : fold.identity)});
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
-    const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseOr32 :
-                                                        ValueOpcode::UMin32;
+    const auto step_operation = test != Case::WrongOperation ? fold.operation :
+        fold.operation == ValueOpcode::IAdd32 ? ValueOpcode::UMax32 : ValueOpcode::IAdd32;
     for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
-      DppMoveFlags flags{.control = 0x110u + shift};
+      DppMoveFlags flags{.control = row_control + shift};
       if (shift == 2) {
         if (test == Case::RowMask) flags.row_mask = 7;
         if (test == Case::BankMask) flags.bank_mask = 7;
-        if (test == Case::Shift) flags.control = 0x113;
+        if (test == Case::Shift) flags.control = row_control + 3u;
         if (test == Case::FetchInactive) flags.fetch_inactive = true;
         if (test == Case::BoundControl) flags.bound_control = true;
         if (test == Case::Dpp8) flags.dpp8 = true;
@@ -678,7 +695,7 @@ void TestCompleteUMinReduction() {
           {test == Case::DppSource ? source : prefix,
            test == Case::MoveExec ? mask : test == Case::LiteralMove ? Value(true) : enabled});
       move.Instruction()->SetFlags(flags);
-      const auto combined = fixture.Emit(operation, {move, prefix});
+      const auto combined = fixture.Emit(step_operation, {move, prefix});
       const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
           {combined, test == Case::Previous ? source : prefix,
            test == Case::UpdateExec ? mask : enabled});
@@ -700,15 +717,32 @@ void TestCompleteUMinReduction() {
         .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
         .bound_control = test != Case::CrossBound});
     const auto cross_write = fixture.Emit(ValueOpcode::SelectU32, {enabled, cross, source});
-    const auto combined = fixture.Emit(operation, {prefix, cross_write});
+    const auto combined = fixture.Emit(fold.operation, {prefix, cross_write});
     const auto final = fixture.Emit(ValueOpcode::SelectU32,
         {test == Case::FinalExec ? mask : enabled, combined, prefix});
     const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
-    const auto low = fixture.Emit(ValueOpcode::ReadLane,
-        {final, Value(test == Case::Endpoint ? 30u : 31u)}, 0, result_block);
+    uint32_t low_lane = butterfly ? 5u : 31u;
+    uint32_t high_lane = butterfly ? 40u : 63u;
+    if (test == Case::Endpoint) low_lane = butterfly ? 33u : 30u;
+    if (test == Case::ShapeEndpoints) {
+      low_lane = butterfly ? 31u : 0u;
+      high_lane = butterfly ? 63u : 32u;
+    }
+    const auto low = fixture.Emit(ValueOpcode::ReadLane, {final, Value(low_lane)}, 0, result_block);
     const auto high = fixture.Emit(ValueOpcode::ReadLane,
-        {test == Case::EndpointSource ? prefix : final, Value(63u)}, 0, result_block);
-    const auto result = fixture.Emit(operation, {high, low}, 0, result_block);
+        {test == Case::EndpointSource ? prefix : final, Value(high_lane)}, 0, result_block);
+    Value result;
+    Value carried;
+    if (carry) {
+      // V_ADD_CO_U32 as translated: an IAdd32 sum whose carry is a compare of it, then an add
+      // of the zero carry-in. The compare is one more use of the sum.
+      const auto sum = fixture.Emit(ValueOpcode::IAdd32, {high, low}, 0, result_block);
+      fixture.Emit(ValueOpcode::ULessThan32, {sum, high}, 0, result_block);
+      carried = fixture.Emit(ValueOpcode::IAdd32, {sum, Value(0u)}, 0, result_block);
+      result = carried;
+    } else {
+      result = fixture.Emit(fold.operation, {high, low}, 0, result_block);
+    }
     const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
     using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
     fixture.BlockAt(result_block).terminator.kind = Terminator::Return;
@@ -720,14 +754,20 @@ void TestCompleteUMinReduction() {
     ValidateProgram(fixture.program, true);
     const auto stats = EliminateReadLane(fixture.program, test == Case::Wave32 ? 32u : 64u);
     const bool matches = test == Case::Masked || test == Case::Subset ||
-        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove;
+        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove ||
+        test == Case::CarryAdd || (test == Case::ShapeEndpoints && butterfly);
+    const auto label = " (operation " + std::to_string(static_cast<unsigned>(fold.operation)) +
+                       (butterfly ? ", row_xmask" : ", row_shr") + ", case " +
+                       std::to_string(static_cast<unsigned>(test)) + ")";
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
-          ("UMin reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
+          ("wave reduction proof failed" + label).c_str());
     if (matches) {
-      const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
-      Check(reduction->GetOpcode() == ValueOpcode::SubgroupUMinU32 &&
+      const auto consumer = test == Case::CarryAdd ? carried : use;
+      const auto *reduction = consumer.Instruction()->Arg(0).ResolveInstruction();
+      Check(reduction->GetOpcode() == ValueOpcode::SubgroupReduceU32 &&
+                reduction->Flags<ValueOpcode>() == fold.operation &&
                 reduction->Arg(0).Resolve() == seed.Resolve(),
-            "UMin reduction changed the neutral-masked input");
+            ("wave reduction changed the neutral-masked input" + label).c_str());
       RemoveIdentities(fixture.program);
       EliminateDeadCode(fixture.program.blocks);
       uint32_t updates = 0;
@@ -735,15 +775,17 @@ void TestCompleteUMinReduction() {
         updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
         Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
                   inst.GetOpcode() != ValueOpcode::Permlane16U32,
-              "UMin reduction retained unused endpoint or cross-row operations");
+              ("wave reduction retained unused endpoint or cross-row operations" + label).c_str());
       }
       Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
-            "UMin reduction destroyed an independently consumed prefix or kept its dead suffix");
+            ("wave reduction destroyed an independently consumed prefix or kept its dead suffix" + label).c_str());
       ValidateProgram(fixture.program, true);
     } else {
       Check(use.Instruction()->Arg(0).Resolve() == result,
-            "rejected UMin proof changed its original result");
+            ("rejected wave reduction proof changed its original result" + label).c_str());
     }
+  }
+  }
   }
 }
 
@@ -884,7 +926,7 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
-    TestCompleteUMinReduction();
+    TestCompleteWaveReduction();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

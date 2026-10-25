@@ -416,6 +416,20 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
 		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
 		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
+		// Narrow targets hold their channels in the low bits of the first word. UFC 6 (PPSA23566)
+		// fast-clears an R8_UINT map through CMASK every frame and then writes only part of it;
+		// without these the clear was dropped and old contents piled up.
+		case vk::Format::eR8Uint: next.uint32[0] = packed & 0xffu; break;
+		case vk::Format::eR8Unorm: next.float32[0] = unorm8(packed); break;
+		case vk::Format::eR8G8Uint:
+			next.uint32[0] = packed & 0xffu;
+			next.uint32[1] = (packed >> 8u) & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			next.float32[0] = unorm8(packed);
+			next.float32[1] = unorm8(packed >> 8u);
+			break;
+		case vk::Format::eR16Uint: next.uint32[0] = packed & 0xffffu; break;
 		case vk::Format::eR8G8B8A8Srgb:
 			next.float32[0] = srgb8(packed);
 			next.float32[1] = srgb8(packed >> 8u);
@@ -462,8 +476,14 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm ||
+	     format == vk::Format::eR16Uint || format == vk::Format::eR8G8Unorm ||
+	     format == vk::Format::eR8G8Uint) &&
 	    (packed & 0xffffu) != (packed >> 16u)) {
+		return false;
+	}
+	if ((format == vk::Format::eR8Unorm || format == vk::Format::eR8Uint) &&
+	    packed != (packed & 0xffu) * 0x01010101u) {
 		return false;
 	}
 	if (format == vk::Format::eR16G16B16A16Sfloat) {

@@ -12274,6 +12274,8 @@ public:
         PackedCase{vk::Format::eR16G16Unorm, 0x0000ffffu, {1.0f, 0.0f}},
         PackedCase{vk::Format::eR16G16Unorm, 0x80000001u,
                    {1.0f / 65535.0f, 32768.0f / 65535.0f}},
+        PackedCase{vk::Format::eR8Unorm, 0xffffff80u, {128.0f / 255.0f}},
+        PackedCase{vk::Format::eR8G8Unorm, 0xffff40ffu, {1.0f, 64.0f / 255.0f}},
     };
     for (const auto &test : packed_cases) {
       vk::ClearColorValue clear{};
@@ -12300,6 +12302,29 @@ public:
                   DecodeColorDwordFill(format, 0x3c003c00u, clear),
               "alternating R16 pixels were treated as a uniform clear");
     }
+    struct UintCase {
+      vk::Format format;
+      uint64_t word;
+      std::array<uint32_t, 4> channels;
+    };
+    for (const auto &test : {UintCase{vk::Format::eR8Uint, 0xffffff05u, {5u}},
+                             UintCase{vk::Format::eR8G8Uint, 0xffff0a05u, {5u, 10u}},
+                             UintCase{vk::Format::eR16Uint, 0xffff1234u, {0x1234u}}}) {
+      Require(name, "packed unsigned color clear",
+              DecodePackedColorClear(test.format, test.word, clear) &&
+                  std::bit_cast<std::array<uint32_t, 4>>(clear.uint32) == test.channels,
+              "narrow unsigned clear lost a channel or kept bits of the next one");
+    }
+    Require(name, "R8 DWORD fill",
+            !DecodeColorDwordFill(vk::Format::eR8Uint, 0x01020304u, clear) &&
+                DecodeColorDwordFill(vk::Format::eR8Uint, 0x07070707u, clear) &&
+                clear.uint32[0] == 7u,
+            "differing R8 pixels were treated as a uniform clear");
+    Require(name, "RG8 DWORD fill",
+            !DecodeColorDwordFill(vk::Format::eR8G8Unorm, 0x00ff00feu, clear) &&
+                DecodeColorDwordFill(vk::Format::eR8G8Unorm, 0x00ff00ffu, clear) &&
+                clear.float32[0] == 1.0f && clear.float32[1] == 0.0f,
+            "alternating RG8 pixels were treated as a uniform clear");
     Require(name, "RG32 DWORD fill",
             DecodeColorDwordFill(vk::Format::eR32G32Sfloat, 0x3f800000u, clear) &&
                 clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,

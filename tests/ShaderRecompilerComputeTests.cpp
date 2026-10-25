@@ -5846,8 +5846,9 @@ public:
     // Adds a buffer binding of `records` 16-byte elements at `address` to the shader metadata
     // and its descriptor to the resource snapshot.
     const auto AddBuffer = [](uint64_t address, bool read, bool written, uint32_t records,
-                              ShaderRecompiler::IR::CompiledShaderInfo &program,
+                              ShaderModule &module,
                               ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+      auto &program = module.info;
       program.stage = ShaderType::Compute;
       ShaderRecompiler::IR::BufferResource resource{};
       resource.read = read;
@@ -5868,10 +5869,10 @@ public:
       snapshot.buffers.push_back(value);
     };
     // Wraps a shader and its bound resources as compute dispatch input.
-    const auto MakeDispatch = [](ShaderRecompiler::IR::CompiledShaderInfo &program,
+    const auto MakeDispatch = [](ShaderModule &module,
                                  ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
       ShaderComputeInputInfo input{};
-      input.stage.program = &program;
+      input.stage.module = &module;
       input.stage.resources = &snapshot;
       return input;
     };
@@ -5879,7 +5880,7 @@ public:
     constexpr uint64_t scene_data = 0x0000000204300000ull;
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, reused_meta, 0xa0000);
 
-    ShaderRecompiler::IR::CompiledShaderInfo copy_program{};
+    ShaderModule copy_program;
     ShaderRecompiler::IR::ResourceSnapshot copy_snapshot;
     AddBuffer(scene_data, true, false, 0x2400, copy_program, copy_snapshot);
     AddBuffer(reused_meta, false, true, 0x9000, copy_program, copy_snapshot);
@@ -5889,7 +5890,7 @@ public:
             !copy_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
             "a dispatch copying data into reused HTile memory was replaced by a clear");
 
-    ShaderRecompiler::IR::CompiledShaderInfo past_program{};
+    ShaderModule past_program;
     ShaderRecompiler::IR::ResourceSnapshot past_snapshot;
     AddBuffer(reused_meta, false, true, 0xb000, past_program, past_snapshot);
     const bool past_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
@@ -5898,7 +5899,7 @@ public:
             !past_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
             "a dispatch writing past the HTile surface was replaced by a clear");
 
-    ShaderRecompiler::IR::CompiledShaderInfo mixed_program{};
+    ShaderModule mixed_program;
     ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
     AddBuffer(reused_meta, false, true, 0x100, mixed_program, mixed_snapshot);
     AddBuffer(scene_data, false, true, 0x100, mixed_program, mixed_snapshot);
@@ -5910,7 +5911,7 @@ public:
 
     constexpr uint64_t unsized_meta = 0x0000000204280000ull;
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, unsized_meta);
-    ShaderRecompiler::IR::CompiledShaderInfo unsized_program{};
+    ShaderModule unsized_program;
     ShaderRecompiler::IR::ResourceSnapshot unsized_snapshot;
     AddBuffer(unsized_meta, false, true, 0x10, unsized_program, unsized_snapshot);
     const bool unsized_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
@@ -5919,13 +5920,13 @@ public:
             !unsized_consumed && !texture_cache.IsMetaCleared(unsized_meta, 0),
             "a write to metadata of unknown size was replaced by a clear");
 
-    ShaderRecompiler::IR::CompiledShaderInfo image_program{};
+    ShaderModule image_program;
     ShaderRecompiler::IR::ResourceSnapshot image_snapshot;
     AddBuffer(scene_data, true, false, 0x10, image_program, image_snapshot);
     AddBuffer(reused_meta, false, true, 0xa000, image_program, image_snapshot);
     ShaderRecompiler::IR::ImageResource storage_image{};
     storage_image.written = true;
-    image_program.info.images.push_back(storage_image);
+    image_program.info.info.images.push_back(storage_image);
     image_snapshot.images.push_back({});
     const bool image_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(image_program, image_snapshot), command);
@@ -5933,7 +5934,7 @@ public:
             !image_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
             "a dispatch also writing a storage image was replaced by a clear");
 
-    ShaderRecompiler::IR::CompiledShaderInfo clear_program{};
+    ShaderModule clear_program;
     ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;
     AddBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);
     AddBuffer(reused_meta, false, true, 0xa000, clear_program, clear_snapshot);

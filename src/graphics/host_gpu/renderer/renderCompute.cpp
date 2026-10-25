@@ -58,17 +58,6 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
-	auto& cache = buffer.GetContext().GetTextureCache();
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& resource   = program.info.buffers[i];
-		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
-		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
-		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
-			return false;
-		}
-	}
-
 	if (program.info.has_bitwise_xor) {
 		return false;
 	}
@@ -79,26 +68,29 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	// PPSA09809: the scene-buffer resize and upload landed on a stale HTILE address after battles
 	// and were dropped, so models vanished.
 	constexpr uint64_t MaxClearConstantsBytes = 4096;
+	auto&              cache                  = buffer.GetContext().GetTextureCache();
+	bool               any_meta               = false;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if (!resource.read || descriptor.Base48() == 0) {
-			continue;
-		}
-		if (descriptor.NumRecords() == UINT32_MAX ||
-		    descriptor.GetSize() > MaxClearConstantsBytes) {
+		const auto  address    = descriptor.Base48();
+		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
+		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
+		if ((!resource.written || resource.read) && cache.IsMeta(address)) {
 			return false;
 		}
-	}
-	bool any_meta = false;
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& resource   = program.info.buffers[i];
-		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if (!resource.written || descriptor.Base48() == 0) {
+		if (address == 0) {
+			continue;
+		}
+		if (resource.read && (descriptor.NumRecords() == UINT32_MAX ||
+		                      descriptor.GetSize() > MaxClearConstantsBytes)) {
+			return false;
+		}
+		if (!resource.written) {
 			continue;
 		}
 		uint64_t meta_size = 0;
-		if (!cache.FindMeta(descriptor.Base48(), meta_size) || meta_size == 0) {
+		if (!cache.FindMeta(address, meta_size) || meta_size == 0) {
 			return false;
 		}
 		// An unbounded descriptor (NumRecords = 0xffffffff) is how clear shaders commonly address

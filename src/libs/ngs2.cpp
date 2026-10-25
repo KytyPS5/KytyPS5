@@ -1786,6 +1786,9 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	if (voice.rendered) {
 		return;
 	}
+	// A voice renders silence unless it plays below, including one left without channels by a
+	// deferred sampler setup.
+	voice.peak_height = 0.0f;
 	if (voice.channels == 0) {
 		voice.has_samples = false;
 		voice.rendered    = true;
@@ -1795,7 +1798,6 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	voice.rendering = true;
 	voice.ClearSamples(grain);
 	voice.has_samples = false;
-	voice.peak_height = 0.0f; // a voice that is not playing renders silence
 	if (voice.state == Ngs2VoicePlayState::Playing) {
 		if (voice.rack->type == Ngs2RackType::Sampler ||
 		    voice.rack->type == Ngs2RackType::CustomSampler) {

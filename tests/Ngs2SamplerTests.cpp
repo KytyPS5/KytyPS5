@@ -853,6 +853,12 @@ void TestPeakMeter() {
 	      "peak meter control failed");
 	f.Render(2);
 	Check(f.State().peak_height == 0.125f, "peak height is not the largest sample of the render");
+	// A deferred sampler setup can leave the voice without channels, so it renders nothing.
+	const auto channels = f.voice.channels;
+	f.voice.channels    = 0;
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "peak height kept while the voice rendered nothing");
+	f.voice.channels = channels;
 	f.Render(2);
 	Check(f.State().peak_height == 0.0625f, "peak height kept a sample from an earlier render");
 	f.Render(2);

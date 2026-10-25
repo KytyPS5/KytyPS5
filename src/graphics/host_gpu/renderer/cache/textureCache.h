@@ -81,6 +81,10 @@ public:
 	/// enrolled; entries that can never be downloaded are dropped.
 	/// @return true if at least one copy was queued (its guest write lands as a priority op).
 	bool ProcessDownloadImages();
+	/// @return true if image readbacks are enabled at all. Fixed at construction: needs no lock.
+	[[nodiscard]] bool ReadbacksEnabled() const noexcept {
+		return m_readback_linear_images || m_readback_tiled_images;
+	}
 	/// @return true while a queued readback has not yet been written to guest memory.
 	[[nodiscard]] bool HasReadbacksInFlight() const noexcept {
 		return m_readbacks_in_flight.load(std::memory_order_acquire) != 0;

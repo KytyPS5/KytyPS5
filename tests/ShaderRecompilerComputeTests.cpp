@@ -167,8 +167,8 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct CommandProcessorTestAccess {
-  static std::atomic<uint32_t> &LabelsBehindReadbacks(CommandProcessor &processor) {
-    return *processor.m_labels_behind_readbacks;
+  static std::atomic<uint32_t> &PendingSignals(CommandProcessor &processor) {
+    return *processor.m_pending_signals;
   }
 };
 
@@ -50516,7 +50516,7 @@ void CheckPm4DeferredLabelWait(RenderContext &renderer) {
   gpu.SendCommandSync([&] {
     processor.BufferInit();
     // Pretend an earlier label is still waiting on a readback, so this one is deferred too.
-    auto &behind = CommandProcessorTestAccess::LabelsBehindReadbacks(processor);
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
     behind.fetch_add(1);
     const auto tick = scheduler.CurrentTick();
     Pm4Execution release_execution;
@@ -50589,7 +50589,7 @@ void CheckPm4InterruptBehindDeferredLabel(RenderContext &renderer) {
   gpu.SendCommandSync([&] {
     processor.BufferInit();
     // Pretend an earlier label is still waiting on a readback.
-    auto &behind = CommandProcessorTestAccess::LabelsBehindReadbacks(processor);
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
     behind.fetch_add(1);
     Pm4Execution execution;
     deferred = processor.Process(execution, interrupt) == Pm4ProcessResult::Complete &&
@@ -50605,7 +50605,7 @@ void CheckPm4InterruptBehindDeferredLabel(RenderContext &renderer) {
   });
   // The deferred interrupt is raised by a GPU-thread command queued by the priority callback.
   gpu.SendCommandSync([] {});
-  Require(name, "raised", CommandProcessorTestAccess::LabelsBehindReadbacks(processor).load() == 0,
+  Require(name, "raised", CommandProcessorTestAccess::PendingSignals(processor).load() == 0,
           "the deferred interrupt never ran");
   renderer.ShutdownGpu();
   std::printf("[host]    %-32s ok\n", name);

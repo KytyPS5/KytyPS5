@@ -89,15 +89,11 @@ public:
 	                uint32_t interrupt_context_id);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
-	/// Queues pending GPU-to-guest image readbacks before an end-of-pipe label or interrupt.
-	/// @return true if readbacks were queued and the signal must be deferred behind them.
-	bool QueueReadbacksBeforeLabel();
-	/// Publishes an end-of-pipe label (low `size` bytes of `value`) behind pending image
-	/// readbacks. Labels stay in order: while an earlier label is still waiting on readbacks,
-	/// later labels are deferred behind it too. A null `dst` publishes only the interrupt.
-	/// @return false if the label can be written immediately.
-	bool PublishLabelAfterReadbacks(void* dst, uint64_t value, uint32_t size, bool with_interrupt,
-	                                uint32_t interrupt_context_id);
+	/// Writes an end-of-pipe label (the low `size` bytes of `value`; none if `label` is null) and
+	/// raises its interrupt if `interrupt` is set, behind any pending image readbacks, so the
+	/// guest never sees the signal before the data it announces has landed.
+	void SignalBehindReadbacks(void* label, uint64_t value, uint32_t size, bool interrupt,
+	                           uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
@@ -128,8 +124,8 @@ public:
 private:
 	friend struct CommandProcessorTestAccess;
 
-	// Raises an end-of-pipe interrupt behind any label still deferred behind readbacks.
-	void RaiseInterruptBehindLabels(uint32_t interrupt_context_id);
+	// Queues pending GPU-to-guest image readbacks. Returns true if any were queued.
+	bool QueueReadbacksBeforeLabel();
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	uint32_t            NumInstances();
@@ -138,8 +134,9 @@ private:
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext& m_renderer;
-	// Labels deferred behind readbacks that have not been written to guest memory yet.
-	std::shared_ptr<std::atomic<uint32_t>> m_labels_behind_readbacks =
+	// Signals deferred behind readbacks that have not landed yet. Shared with the deferred
+	// signals, which may land after this processor is gone.
+	std::shared_ptr<std::atomic<uint32_t>> m_pending_signals =
 	    std::make_shared<std::atomic<uint32_t>>(0);
 	HW::Context    m_ctx;
 	HW::Context    m_saved_ctx;

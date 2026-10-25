@@ -833,6 +833,30 @@ uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		value = EmitUMax32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMax, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
+	return result;
+}
+
+uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		value = EmitBitwiseOr32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBitwiseOr, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);
+	return result;
+}
+
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();

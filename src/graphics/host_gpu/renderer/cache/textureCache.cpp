@@ -147,6 +147,7 @@ TextureCache::~TextureCache() {
 	});
 }
 
+/// Check native backing compatibility, including the original rebased guest mip chain.
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
                                bool exact_format) {
 	if (cached.data.address != requested.data.address) {
@@ -156,6 +157,13 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 		return false;
 	}
 	if (cached.extent != requested.extent) {
+		return false;
+	}
+	// Extra guest mips can share the same host extent and allocation while
+	// referring to different texels. Preserve their original chain identity.
+	if (cached.guest_base_mip != requested.guest_base_mip ||
+	    cached.guest_mip_levels != requested.guest_mip_levels ||
+	    cached.guest_mip_extent != requested.guest_mip_extent) {
 		return false;
 	}
 	if (cached.resources.levels < requested.resources.levels ||

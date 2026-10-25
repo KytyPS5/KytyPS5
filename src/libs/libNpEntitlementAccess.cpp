@@ -513,4 +513,26 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 
 } // namespace LibNpEntitlementAccess
 
+namespace LibNpEntitlementAccessPft {
+
+LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
+
+// Unknown function; return state 2 for the FC27 investigation.
+static int KYTY_SYSV_ABI NpEntitlementAccessPftUnknowneDXKe9FndlE(uint32_t* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return LibNpEntitlementAccess::NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	*state = 2;
+	return 0;
+}
+
+LIB_DEFINE(InitNet_1_NpEntitlementAccessPft) {
+	LIB_FUNC("eDXKe9FndlE", NpEntitlementAccessPftUnknowneDXKe9FndlE);
+}
+
+} // namespace LibNpEntitlementAccessPft
+
 } // namespace Libs

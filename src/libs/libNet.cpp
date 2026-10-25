@@ -21,6 +21,9 @@ namespace Libs {
 namespace LibNpEntitlementAccess {
 void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase* s);
 }
+namespace LibNpEntitlementAccessPft {
+void InitNet_1_NpEntitlementAccessPft(Loader::SymbolDatabase* s);
+}
 namespace LibNpTrophy2 {
 void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
 }
@@ -2846,6 +2849,7 @@ LIB_DEFINE(InitNet_1) {
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
+	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);
 	LibNpAuth::InitNet_1_NpAuth(s);
 	LibNpTrophy2::InitNet_1_NpTrophy2(s);
 	LibNpUniversalDataSystem::InitNet_1_NpUniversalDataSystem(s);

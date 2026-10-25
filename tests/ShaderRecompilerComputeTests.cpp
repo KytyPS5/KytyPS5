@@ -14343,6 +14343,19 @@ public:
     // Packed format channels start at the least significant bit.
     // PPSA24515's blue, white, and masked black exposed the 5551 reversal.
     constexpr std::array cases{
+        FormatCase{Prospero::BufferFormat::k8UNorm,
+                   {0x4000, 0xff80, 0, 0},
+                   {{{0, 0, 0, 0}, {64, 64, 64, 64}, {128, 128, 128, 128}, {255, 255, 255, 255}}},
+                   {255, 255, 255, 255}},
+        FormatCase{Prospero::BufferFormat::k16UNorm,
+                   {0, 0x4000, 0x8000, 0xffff},
+                   {{{0, 0, 0, 0}, {16384, 16384, 16384, 16384},
+                     {32768, 32768, 32768, 32768}, {65535, 65535, 65535, 65535}}},
+                   {65535, 65535, 65535, 65535}},
+        FormatCase{Prospero::BufferFormat::k8_8UNorm,
+                   {0xff00, 0x8040, 0x4080, 0x00ff},
+                   {{{0, 255, 0, 255}, {64, 128, 64, 128}, {128, 64, 128, 64}, {255, 0, 255, 0}}},
+                   {255, 255, 255, 255}},
         FormatCase{Prospero::BufferFormat::k5_5_5_1UNorm,
                    {0x7c00, 0x7fff, 0x8000, 0x8c41},
                    {{{0, 0, 31, 0}, {31, 31, 31, 0}, {0, 0, 0, 1}, {1, 2, 3, 1}}},
@@ -14405,7 +14418,7 @@ public:
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
-      for (const auto swizzle : {DstSel(4, 5, 6, 7), DstSel(7, 1, 4, 0)}) {
+      for (const auto swizzle : {DstSel(4, 5, 6, 7), DstSel(7, 1, 4, 0), DstSel(1, 1, 1, 7)}) {
         ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
             (static_cast<uint32_t>(format.format) << 20u) | (3u << 30u), 0,
             swizzle | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
@@ -52922,6 +52935,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckDepthBitsCopy();
     RunCase(&vulkan, ImageLoadDepthBits());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-components-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPackedTextureComponents();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {

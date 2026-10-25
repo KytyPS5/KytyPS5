@@ -37,6 +37,7 @@
 #include <limits>
 #include <span>
 #include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 
 #ifdef min
 #undef min
@@ -372,7 +373,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.mapping =
 	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
-	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage,
+	                                     vk::componentCount(format));
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;

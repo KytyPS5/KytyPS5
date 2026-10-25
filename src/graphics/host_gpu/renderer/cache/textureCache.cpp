@@ -2048,13 +2048,13 @@ bool TextureCache::ProcessDownloadImages() {
 		const auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered || !owner->IsGpuModified() ||
 		    owner->depth_id || !CanDownload(*owner)) {
-			// Gone, already current, or never downloadable: nothing to retry.
+			// Gone, already current, or never downloadable, so there is nothing to retry.
 			it = m_download_images.erase(it);
 		} else if (DownloadImageMemory(id)) {
 			queued = true;
 			it     = m_download_images.erase(it);
 		} else {
-			// Transient failure (e.g. not safe to download yet): retry at the next signal.
+			// A transient failure (e.g. not safe to download yet). Retry at the next signal.
 			++it;
 		}
 	}

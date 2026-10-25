@@ -266,8 +266,8 @@ namespace {
 
 // Labels deferred behind readbacks that have not landed yet, by address, with the latest value
 // deferred for each. One table serves every command processor, since a label signalled on a
-// compute queue can be waited on from the graphics queue. Used only on the GPU thread: it defers
-// labels while processing PM4, and they land through GPU-thread commands.
+// compute queue can be waited on from the graphics queue. Only the GPU thread uses it, since it
+// defers labels while processing PM4 and they land through GPU-thread commands.
 struct DeferredLabel {
 	uint64_t value;
 	uint32_t size;
@@ -302,7 +302,7 @@ struct DeferredSignal {
 	// buffer readback.
 	void Land() const {
 		if (label != nullptr) {
-			std::memcpy(label, &value, size); // Little-endian: the low bytes are the label.
+			std::memcpy(label, &value, size); // The low bytes are the label (little-endian).
 			ForgetDeferredLabel(reinterpret_cast<uint64_t>(label), value, size);
 		}
 		pending->fetch_sub(1, std::memory_order_acq_rel);
@@ -343,9 +343,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 	// A label deferred behind readbacks is kept out of memory so guest CPU code cannot read the
 	// readback destination before its data lands. A wait in the command stream does not need
-	// that: everything recorded after it runs after the work the label signals on the host
-	// queue. Blocking until the label lands drains the host GPU instead, several times a frame
-	// in some games.
+	// that, because everything recorded after it runs after the work the label signals on the
+	// host queue. Blocking until the label lands would drain the host GPU instead, several times
+	// a frame in some games.
 	const auto& labels   = DeferredLabels();
 	const auto  deferred = labels.find(reinterpret_cast<uint64_t>(addr));
 	if (deferred != labels.end() && deferred->second.size == sizeof(T) &&
@@ -1056,8 +1056,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 5: {
 			(void)QueueReadbacksBeforeLabel();
 			GetScheduler().Finish();
-			// Finish() waits for the GPU but not for priority callbacks: wait for readback copies
-			// and deferred signals queued by this or earlier signals.
+			// Finish() waits for the GPU but not for priority callbacks, so also wait for the
+			// readback copies and deferred signals queued by this or earlier signals.
 			GetScheduler().DrainPriorityOperations();
 			// Deferred signals land through GPU-thread commands; run them so they land before
 			// this label.
@@ -1076,6 +1076,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 }
 
+// Queues the pending GPU-to-guest image readbacks, so they land before the signal that follows.
+// Returns true if any were queued.
 bool CommandProcessor::QueueReadbacksBeforeLabel() {
 	auto& textures = m_renderer.GetTextureCache();
 	// Readbacks are off by default; skip the renderer lock then.
@@ -1086,22 +1088,25 @@ bool CommandProcessor::QueueReadbacksBeforeLabel() {
 	return textures.ProcessDownloadImages();
 }
 
+// Writes an end-of-pipe label and raises its interrupt, holding both back behind any pending
+// image readbacks so the guest never sees the signal before the data it announces.
 void CommandProcessor::SignalBehindReadbacks(void* label, uint64_t value, uint32_t size,
                                              bool interrupt, uint32_t interrupt_context_id) {
 	EXIT_IF(label != nullptr && size != sizeof(uint32_t) && size != sizeof(uint64_t));
 	const bool queued = QueueReadbacksBeforeLabel();
 
 	// Defer while an earlier signal is still deferred, so signals stay in order. A label also
-	// waits for readbacks queued now or still in flight: written now, the guest could read the
-	// readback destination before the data lands. An interrupt alone does not need to: its
-	// priority callback runs after the readbacks' callbacks, as priority operations run in order.
+	// waits for readbacks queued now or still in flight, since the guest could otherwise read the
+	// readback destination before the data lands. An interrupt alone does not need to wait,
+	// because its priority callback runs after the readbacks' callbacks (priority operations run
+	// in order).
 	const bool defer =
 	    m_pending_signals->load(std::memory_order_acquire) != 0 ||
 	    (label != nullptr && (queued || m_renderer.GetTextureCache().HasReadbacksInFlight()));
 
 	if (!defer) {
 		if (label != nullptr) {
-			std::memcpy(label, &value, size); // Little-endian: the low bytes are the label.
+			std::memcpy(label, &value, size); // The low bytes are the label (little-endian).
 		}
 		if (interrupt) {
 			// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
@@ -1119,8 +1124,8 @@ void CommandProcessor::SignalBehindReadbacks(void* label, uint64_t value, uint32
 		const DeferredSignal signal {&m_renderer, label, value, size, interrupt,
 		                             m_interrupt_event_id, interrupt_context_id, m_pending_signals};
 		// The priority callback, which runs once the readbacks have landed, only hands the signal
-		// to the GPU thread: see DeferredSignal::Land. GPU-thread commands run in order between
-		// PM4 packets, so signals stay ordered.
+		// to the GPU thread (DeferredSignal::Land explains why). GPU-thread commands run in order
+		// between PM4 packets, so signals stay ordered.
 		GetScheduler().DeferPriorityOperation([&gpu = m_renderer.GetGpu(), signal] {
 			if (!gpu.TrySendCommand([signal] { signal.Land(); })) {
 				// The GPU is shutting down; nothing waits on the signal any more.

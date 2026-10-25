@@ -123,6 +123,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (!any_meta) {
 		return false;
 	}
+	// Clear only after every buffer has passed, in a separate pass. Clearing inside the loop
+	// above would mark a surface cleared before a later buffer rejects the dispatch; the dispatch
+	// then runs and writes real data, while the texture cache treats that HTILE as cleared.
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (program.info.buffers[i].written) {
 			const auto descriptor =

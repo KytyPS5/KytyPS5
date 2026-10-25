@@ -3378,6 +3378,29 @@ void GraphicsInitJmpTablesShIndirect() {
 		cp.GetShCtx().SetLsShaderBase(base);
 	};
 
+	// Legacy (unmerged) tessellation pipelines set these; hardware tessellation is not
+	// emulated, so the values aren't consumed. Logged once so a game relying on them is still
+	// visible without crashing or spamming the log every draw.
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		static bool logged = false;
+		if (!logged) {
+			LOGF("SPI_SHADER_PGM_RSRC1_LS: temporary: ignoring legacy tessellation LS "
+			     "resource descriptor, value=0x%08" PRIx32 "\n",
+			     value);
+			logged = true;
+		}
+	};
+
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		static bool logged = false;
+		if (!logged) {
+			LOGF("SPI_SHADER_PGM_RSRC2_LS: temporary: ignoring legacy tessellation LS "
+			     "resource descriptor, value=0x%08" PRIx32 "\n",
+			     value);
+			logged = true;
+		}
+	};
+
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().es_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;

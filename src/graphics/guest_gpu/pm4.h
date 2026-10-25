@@ -878,6 +878,12 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_0                   = 0x132;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_3                   = 0x135;
 constexpr uint32_t SPI_SHADER_PGM_LO_LS                           = 0x148;
 constexpr uint32_t SPI_SHADER_PGM_HI_LS                           = 0x149;
+// Unmerged (legacy, non-NGG) tessellation pipelines program the LS stage's own resource
+// descriptors here; the merged pipeline instead folds the LS VGPR component count into
+// SPI_SHADER_PGM_RSRC1_HS (see LS_VGPR_COMP_CNT above). Hardware tessellation itself is not
+// emulated, so these are only tracked to avoid treating them as unknown registers.
+constexpr uint32_t SPI_SHADER_PGM_RSRC1_LS                        = 0x14A;
+constexpr uint32_t SPI_SHADER_PGM_RSRC2_LS                        = 0x14B;
 constexpr uint32_t COMPUTE_START_X                                = 0x204;
 constexpr uint32_t COMPUTE_START_Y                                = 0x205;
 constexpr uint32_t COMPUTE_START_Z                                = 0x206;

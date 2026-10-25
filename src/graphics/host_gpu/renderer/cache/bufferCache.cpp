@@ -48,6 +48,16 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	return {buffer, 0};
 }
 
+void PublishDownloadCopies(Buffer& download, uint64_t dst_offset, uint64_t total_size,
+                           uint64_t buffer_address, std::span<const vk::BufferCopy> copies) {
+	download.Invalidate(dst_offset, total_size);
+	const auto* mapped = download.Mapped().data();
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+		                                      mapped + copy.dstOffset, copy.size);
+	}
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -147,54 +157,51 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 	}
 }
 
-void BufferCache::DeleteBuffer(BufferId id) {
-	if (IsBufferInvalid(id)) {
+void BufferCache::InvalidateStagedDownloads(uint64_t vaddr, uint64_t size) {
+	if (m_staged_downloads.empty() || size == 0) {
 		return;
 	}
-	Unregister(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
-	} else {
-		m_slot_buffers.erase(id);
-	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	std::erase_if(m_staged_downloads, [&](StagedDownload& entry) {
+		if (entry.page_vaddr + entry.page_size <= page_begin || page_end <= entry.page_vaddr) {
+			return false;
+		}
+		if (m_scheduler.Active() && !m_scheduler.IsFree(entry.tick)) {
+			m_scheduler.DeferOperation(
+			    [owner = std::move(entry.download)]() mutable { owner.reset(); });
+		}
+		return true;
+	});
 }
 
-template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+uint64_t BufferCache::CollectDownloadCopies(uint64_t vaddr, uint64_t size,
+                                            uint64_t buffer_address, bool consume_ranges,
+                                            const char*                  operation,
+                                            std::vector<vk::BufferCopy>& copies) {
+	uint64_t total_size = 0;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-		                                           "buffer download");
+		                                           operation);
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
-		    ForgetColorMetadataChecks(address, bytes);
+		    if (consume_ranges) {
+			    InvalidateStagedDownloads(address, bytes);
+			    m_gpu_modified_ranges.Subtract(address, bytes);
+			    ForgetColorMetadataChecks(address, bytes);
+		    }
 	    });
-	if (copies.empty()) {
-		return false;
-	}
+	return total_size;
+}
+
+void BufferCache::RecordDownloadCopy(const Buffer& buffer, const Buffer& download,
+                                     uint64_t dst_offset, uint64_t total_size,
+                                     std::span<const vk::BufferCopy> copies) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
-
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
-	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
-	} else {
-		m_download_buffer.Commit();
-	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
-	for (auto& copy: copies) {
-		copy.dstOffset += offset;
-	}
-
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();
@@ -216,19 +223,53 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	after.buffer        = download.Handle();
-	after.offset        = offset;
+	after.offset        = dst_offset;
 	after.size          = total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
+	                       vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+	                       nullptr);
+}
+
+void BufferCache::DeleteBuffer(BufferId id) {
+	if (IsBufferInvalid(id)) {
+		return;
+	}
+	Unregister(id);
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+	} else {
+		m_slot_buffers.erase(id);
+	}
+}
+
+template <bool async>
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	const auto                  buffer_address = buffer.CpuAddress();
+	const auto                  total_size     = CollectDownloadCopies(
+	    vaddr, size, buffer_address, true, "buffer download", copies);
+	if (copies.empty()) {
+		return false;
+	}
+
+	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	std::unique_ptr<Buffer> temporary;
+	if (mapped == nullptr) {
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
+	} else {
+		m_download_buffer.Commit();
+	}
+	const auto& download = temporary ? *temporary : m_download_buffer;
+	for (auto& copy: copies) {
+		copy.dstOffset += offset;
+	}
+
+	RecordDownloadCopy(buffer, download, offset, total_size, copies);
+	auto publish = [this, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
-		}
+		PublishDownloadCopies(owner ? *owner : m_download_buffer, offset, total_size,
+		                      buffer_address, copies);
 	};
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
@@ -300,6 +341,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
+}
+
+void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	InvalidateMemory(vaddr, size);
+	InvalidateStagedDownloads(vaddr, size);
+	m_memory_tracker.UntrackMemory(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -521,6 +568,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		InvalidateStagedDownloads(vaddr, size);
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
@@ -547,8 +595,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
-			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+			EXIT("BufferCache: failed to read sparse guest image memory, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n", vaddr, size);
 		}
 	});
 }
@@ -652,6 +701,77 @@ void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+uint64_t BufferCache::StageDownload(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid staged-download range\n");
+	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto page_size  = page_end - page_begin;
+	if (!IsRegionGpuModified(page_begin, page_size)) {
+		return 0;
+	}
+	for (const auto& entry: m_staged_downloads) {
+		if (entry.page_vaddr <= page_begin &&
+		    page_end <= entry.page_vaddr + entry.page_size) {
+			return entry.tick;
+		}
+	}
+	InvalidateStagedDownloads(page_begin, page_size);
+
+	auto&                       buffer         = m_slot_buffers[FindBuffer(page_begin, page_size)];
+	std::vector<vk::BufferCopy> copies;
+	const auto                  buffer_address = buffer.CpuAddress();
+	const auto                  total_size     = CollectDownloadCopies(
+	    page_begin, page_size, buffer_address, false, "staged buffer download", copies);
+	if (copies.empty()) {
+		return 0;
+	}
+
+	auto download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         vk::BufferUsageFlagBits::eTransferDst, total_size);
+	RecordDownloadCopy(buffer, *download, 0, total_size, copies);
+
+	const auto tick = m_scheduler.CurrentTick();
+	m_staged_downloads.push_back(StagedDownload {
+	    .page_vaddr     = page_begin,
+	    .page_size      = page_size,
+	    .tick           = tick,
+	    .buffer_address = buffer_address,
+	    .copies         = std::move(copies),
+	    .download       = std::move(download),
+	});
+	return tick;
+}
+
+bool BufferCache::CompleteStagedDownload(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid staged-download completion range\n");
+	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto it = m_staged_downloads.begin(); it != m_staged_downloads.end(); ++it) {
+		if (it->page_vaddr <= page_begin && page_end <= it->page_vaddr + it->page_size) {
+			if (!m_scheduler.IsFree(it->tick)) {
+				return false;
+			}
+			auto entry = std::move(*it);
+			m_staged_downloads.erase(it);
+			PublishDownloadCopies(*entry.download, 0, entry.download->Size(), entry.buffer_address,
+			                      entry.copies);
+			m_memory_tracker.ForEachDownloadRange<true>(
+			    entry.page_vaddr, entry.page_size, [&](uint64_t address, uint64_t bytes) noexcept {
+				    m_memory_tracker.ValidateGpuDirtyPages(
+				        m_gpu_modified_ranges, address, bytes, "staged buffer download completion");
+				    m_gpu_modified_ranges.Subtract(address, bytes);
+				    ForgetColorMetadataChecks(address, bytes);
+			    });
+			return true;
+		}
+	}
+	return false;
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

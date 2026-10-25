@@ -23,8 +23,12 @@ bool IsDepthPlane(const ImageInfo& info) {
 
 GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
 	const auto& block = info.tiling.block;
-	if (info.tile_mode != Prospero::TileMode::kStandard4KB ||
-	    block.family != TileBlockFamily::Standard4KB || info.IsVolume() || info.samples != 1 ||
+	const bool standard =
+	    (info.tile_mode == Prospero::TileMode::kStandard4KB &&
+	     block.family == TileBlockFamily::Standard4KB) ||
+	    (info.tile_mode == Prospero::TileMode::kStandard64KB &&
+	     block.family == TileBlockFamily::Standard64KB);
+	if (!standard || info.IsVolume() || info.samples != 1 ||
 	    info.HasMetadata() || level >= info.resources.levels || level >= info.mip_layout.size() ||
 	    info.tiling.texel_width == 0 || info.tiling.texel_height == 0) {
 		return {};
@@ -42,7 +46,7 @@ GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
 	    !TileGetBlockOffset(block, mip.tail_x, mip.tail_y, 0, origin)) {
 		return {};
 	}
-	// Standard4KB interleaves monotonically ordered X/Y bits, so the last
+	// Standard tiling interleaves monotonically ordered X/Y bits, so the last
 	// corner bounds every active texel. Tiling preserves any holes in this span.
 	const uint64_t size = uint64_t {last} + block.bytes_per_element;
 	if ((origin & (std::bit_ceil(size) - 1u)) != 0 || size > block.block_size - origin ||
@@ -52,19 +56,27 @@ GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
 	return {mip.offset + origin, size};
 }
 
+uint32_t CompactMipAlignment(const ImageInfo& info, uint32_t size) {
+	// Standard64KB texture bases retain their 256-byte granularity within a block.
+	return info.tile_mode == Prospero::TileMode::kStandard64KB ? 256u
+	                                                           : std::max(256u, std::bit_ceil(size));
+}
+
 uint32_t CompactMipSize(const ImageInfo& info) {
 	if (info.resources.levels != 1 || info.resources.layers != 1) {
 		return 0;
 	}
 	const auto range = TiledMipRange(info, 0);
-	if (range.size == 0 || range.size % 4 != 0 || range.address != 0) {
+	if (range.size == 0 || range.size >= info.tiling.block.block_size ||
+	    range.size % 4 != 0 || range.address != 0) {
 		return 0;
 	}
-	const auto alignment = std::max<uint64_t>(256, std::bit_ceil(range.size));
+	const auto size      = static_cast<uint32_t>(range.size);
+	const auto alignment = CompactMipAlignment(info, size);
 	const auto in_block  = info.data.address & (info.tiling.block.block_size - 1u);
 	return (info.data.address & (alignment - 1u)) == 0 &&
-	               range.size <= info.tiling.block.block_size - in_block
-	           ? static_cast<uint32_t>(range.size)
+	               size <= info.tiling.block.block_size - in_block
+	           ? size
 	           : 0;
 }
 
@@ -225,7 +237,7 @@ uint32_t ImageInfo::DataAlignment() const {
 	}
 	const auto compact_size = CompactMipSize(*this);
 	if (compact_size != 0 && data.size == compact_size && mip_layout[0].size == compact_size) {
-		return std::max(256u, std::bit_ceil(compact_size));
+		return CompactMipAlignment(*this, compact_size);
 	}
 	return tiling.block.block_size;
 }

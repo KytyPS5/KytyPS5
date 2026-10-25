@@ -53,6 +53,7 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                   UnmapMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -83,8 +84,10 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
 	// until a GPU write or download.
-	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
-	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	void                   MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
+	[[nodiscard]] bool     IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	[[nodiscard]] uint64_t StageDownload(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool     CompleteStagedDownload(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
@@ -94,6 +97,15 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+
+	struct StagedDownload {
+		uint64_t                    page_vaddr     = 0;
+		uint64_t                    page_size      = 0;
+		uint64_t                    tick           = 0;
+		uint64_t                    buffer_address = 0;
+		std::vector<vk::BufferCopy> copies;
+		std::unique_ptr<Buffer>     download;
+	};
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 
@@ -110,6 +122,13 @@ private:
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
+	void InvalidateStagedDownloads(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t CollectDownloadCopies(uint64_t vaddr, uint64_t size,
+	                                             uint64_t buffer_address, bool consume_ranges,
+	                                             const char*                  operation,
+	                                             std::vector<vk::BufferCopy>& copies);
+	void RecordDownloadCopy(const Buffer& buffer, const Buffer& download, uint64_t dst_offset,
+	                        uint64_t total_size, std::span<const vk::BufferCopy> copies);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
@@ -143,6 +162,7 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	std::vector<StagedDownload>                       m_staged_downloads;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

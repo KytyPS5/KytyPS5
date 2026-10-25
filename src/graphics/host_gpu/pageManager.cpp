@@ -96,15 +96,16 @@ struct PageManager::Impl {
 	struct PageState {
 		uint8_t write_watchers  : 7 = 0;
 		uint8_t access_watchers : 1 = 0;
+		uint8_t guest_mode          = static_cast<uint8_t>(Common::VirtualMemory::Mode::ReadWrite);
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
 				return Common::VirtualMemory::Mode::NoAccess;
 			}
-			if (write_watchers != 0) {
-				return Common::VirtualMemory::Mode::Read;
-			}
-			return Common::VirtualMemory::Mode::ReadWrite;
+			const auto mask = write_watchers != 0
+			                      ? ~static_cast<uint8_t>(Common::VirtualMemory::Mode::Write)
+			                      : 0x7u;
+			return static_cast<Common::VirtualMemory::Mode>(guest_mode & mask);
 		}
 
 		template <int delta, bool is_read>
@@ -141,7 +142,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -292,6 +293,67 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+bool PageManager::IsGuestAccessAllowed(uint64_t vaddr, PageFaultAccess access) const {
+	if (vaddr >= ADDRESS_SIZE) return false;
+	Common::VirtualMemory::Mode required;
+	switch (access) {
+		case PageFaultAccess::Read: required = Common::VirtualMemory::Mode::Read; break;
+		case PageFaultAccess::Write: required = Common::VirtualMemory::Mode::Write; break;
+		case PageFaultAccess::Execute: required = Common::VirtualMemory::Mode::Execute; break;
+		default: return false;
+	}
+	auto mode = static_cast<uint8_t>(Common::VirtualMemory::Mode::ReadWrite);
+	if (auto* region = m_impl->FindRegion(vaddr); region != nullptr) {
+		SpinGuard lock(region->lock);
+		mode = region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE].guest_mode;
+	}
+	return (mode & static_cast<uint8_t>(required)) != 0;
+}
+
+void PageManager::ProtectMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
+	ValidateRange(vaddr, size);
+	const auto end = Common::AlignUp(vaddr + size, PAGE_SIZE);
+	for (auto begin = Common::AlignDown(vaddr, PAGE_SIZE); begin < end;) {
+		const auto chunk_end = std::min(end, Common::AlignUp(begin + 1, REGION_SIZE));
+		auto* region = m_impl->GetOrCreateRegion(begin);
+		SpinGuard lock(region->lock);
+		const auto region_base = Common::AlignDown(begin, REGION_SIZE);
+		const auto first = static_cast<size_t>((begin - region_base) / PAGE_SIZE);
+		const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		for (auto page = first; page < last; ++page) {
+			region->pages[page].guest_mode = static_cast<uint8_t>(mode) & 0x7u;
+		}
+		for (auto page = first; page < last;) {
+			const auto perms = region->pages[page].Perms();
+			auto next = page + 1;
+			while (next < last && region->pages[next].Perms() == perms) ++next;
+			m_impl->Protect(region_base + page * PAGE_SIZE, (next - page) * PAGE_SIZE, perms);
+			page = next;
+		}
+		begin = chunk_end;
+	}
+}
+
+void PageManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	ValidateRange(vaddr, size);
+	const auto end = Common::AlignUp(vaddr + size, PAGE_SIZE);
+	for (auto begin = Common::AlignDown(vaddr, PAGE_SIZE); begin < end;) {
+		const auto chunk_end = std::min(end, Common::AlignUp(begin + 1, REGION_SIZE));
+		if (auto* region = m_impl->FindRegion(begin); region != nullptr) {
+			SpinGuard lock(region->lock);
+			const auto region_base = Common::AlignDown(begin, REGION_SIZE);
+			const auto first = static_cast<size_t>((begin - region_base) / PAGE_SIZE);
+			const auto last = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+			for (auto page = first; page < last; ++page) {
+				auto& state = region->pages[page];
+				// Cache owners must still be able to release their watcher counts.
+				state.guest_mode = static_cast<uint8_t>(Common::VirtualMemory::Mode::NoAccess);
+			}
+		}
+		begin = chunk_end;
+	}
 }
 
 template <bool track>

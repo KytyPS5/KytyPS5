@@ -14,6 +14,7 @@ struct ResourceSpecialization {
 		uint32_t               descriptor_swizzle              = DstSel(4, 5, 6, 7);
 		bool                   zero_stride_oob                 = false;
 		bool                   scalar_empty                    = false;
+		bool                   uses_dma                        = false;
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
 		uint32_t               indirect_mapping_offset         = 0;
 		uint32_t               indirect_search_iterations      = 0;
@@ -26,6 +27,7 @@ struct ResourceSpecialization {
 		uint32_t                      mip_count     = 1;
 		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
+		uint32_t                      software_compare_func      = UINT32_MAX;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
@@ -67,7 +69,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
 // null. Entries of one kind specialize identically.
-uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value);
+// Conversion formats set requires_materialization so the table can use ordinary descriptors.
+uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value,
+                       bool* requires_materialization = nullptr);
 // The sampled resource that root resolves entries of kind as; kind 0 gives the identity of
 // root's view of a heap.
 ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);

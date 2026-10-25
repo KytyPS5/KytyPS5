@@ -836,7 +836,8 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
-void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool counted_loop = false) {
+void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool counted_loop = false,
+                                               bool loop_test = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
   Program program;
@@ -875,7 +876,7 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   const auto count = emit(entry, ValueOpcode::LoadAddressU32,
       {address, Value(0u), Value(0u), Value(true)});
   count.Instruction()->SetFlags(MemoryFlags{.index = 0});
-  if (counted_loop) {
+  if (counted_loop || loop_test) {
     branch(entry, loop);
   } else {
     const auto rejected = emit(entry, ValueOpcode::ULessThanEqual32, {count, lane});
@@ -888,12 +889,16 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   auto &carried = loop.AppendNewInst(ValueOpcode::Phi);
   carried.SetFlags(Type::U32);
   const auto next = emit(body, ValueOpcode::IAdd32, {Value(&carried), Value(1u)});
-  carried.AddPhiOperand(&entry, counted_loop ? Value(0u) : lane);
+  carried.AddPhiOperand(&entry, counted_loop ? Value(0u) : loop_test ? initial : lane);
   carried.AddPhiOperand(&body, next);
-  const auto condition = counted_loop
-      ? emit(loop, ValueOpcode::ULessThan32, {Value(&carried), count})
-      : emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)});
-  branch(loop, counted_loop ? use : body, condition, &merge);
+  if (counted_loop) {
+    branch(loop, use, emit(loop, ValueOpcode::ULessThan32, {Value(&carried), count}), &merge);
+  } else if (loop_test) {
+    branch(loop, body, emit(loop, ValueOpcode::UGreaterThan32, {count, lane}), &merge);
+  } else {
+    branch(loop, body, emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)}),
+        &merge);
+  }
   loop.terminator.loop_header = true;
   loop.terminator.continue_block = &body;
   loop.terminator.merge_block = &merge;
@@ -904,10 +909,24 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
   } else {
     auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
     selected.SetFlags(Type::U32);
-    selected.AddPhiOperand(&entry, initial);
+    if (!loop_test) selected.AddPhiOperand(&entry, initial);
     selected.AddPhiOperand(&loop, Value(&carried));
     const auto valid = emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(UINT32_MAX)});
-    branch(merge, use, emit(merge, ValueOpcode::LogicalAnd, {active, valid}), &exit);
+    auto found = emit(merge, ValueOpcode::LogicalAnd, {active, valid});
+    if (loop_test) {
+      const auto ballot = emit(merge, ValueOpcode::Ballot, {found});
+      const auto low = emit(merge, ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+      const auto high = emit(merge, ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+      const auto first = emit(merge, ValueOpcode::SelectU32,
+          {emit(merge, ValueOpcode::INotEqual32, {low, Value(0u)}),
+           emit(merge, ValueOpcode::FindILsb32, {low}),
+           emit(merge, ValueOpcode::SelectU32,
+               {emit(merge, ValueOpcode::INotEqual32, {high, Value(0u)}),
+                emit(merge, ValueOpcode::IAdd32,
+                    {emit(merge, ValueOpcode::FindILsb32, {high}), Value(32u)}), Value(UINT32_MAX)})});
+      found = emit(merge, ValueOpcode::INotEqual32, {first, Value(UINT32_MAX)});
+    }
+    branch(merge, use, found, &exit);
     branch(use, exit);
   }
   DescriptorSource source;
@@ -971,6 +990,43 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
         Check(read == std::pair<uint64_t, uint64_t>{0x1000u, 4u},
               "empty traversal proof captured an unrelated memory range");
     }
+  }
+}
+
+void TestBallotControlAssumptions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  for (const bool empty : {false, true}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &entry = AddValueBlock(program);
+    auto &yes = AddValueBlock(program);
+    auto &no = AddValueBlock(program);
+    const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args = {}) {
+      return Value(&entry.AppendNewInst(op, args));
+    };
+    const auto active = emit(ValueOpcode::UndefU1);
+    const auto inverse = emit(ValueOpcode::LogicalNot, {active});
+    const auto predicate = empty ? emit(ValueOpcode::LogicalAnd, {active, inverse}) : inverse;
+    const auto ballot = emit(ValueOpcode::Ballot, {predicate});
+    const auto word = emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+    const auto any = emit(ValueOpcode::INotEqual32, {word, Value(0u)});
+    const auto selected = emit(ValueOpcode::LogicalAnd, {active, any});
+    const auto data = emit(ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    const auto uniform = emit(ValueOpcode::IEqual32, {data, Value(0u)});
+    entry.condition = emit(ValueOpcode::LogicalAnd, {uniform, selected});
+    entry.terminator = {.kind = TerminatorKind::ConditionalBranch, .true_block = &yes, .false_block = &no};
+    entry.AddBranch(&yes);
+    entry.AddBranch(&no);
+    auto plan = Extract(program);
+    const std::array data_words{0u};
+    uint32_t condition = 99u;
+    Check(EvaluateSrtValue(plan, {.user_data = data_words}, plan.control_flow[0].condition, condition) == empty && (!empty || condition == 0u),
+          "a local EXEC assumption escaped into a subgroup ballot");
+    Check(ReachedBlocks(plan, {.user_data = data_words}) ==
+              std::vector<uint8_t>({1u, uint8_t(!empty), 1u}),
+          "ballot reachability lost another lane or retained a proven empty mask");
   }
 }
 
@@ -1314,6 +1370,80 @@ void TestSignedStorageSpecialization() {
   }
 }
 
+void TestSharedDescriptorImageActivity() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  using Libs::Graphics::Prospero::BufferFormat;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 1u;
+  auto &entry = AddValueBlock(program);
+  auto &atomic = AddValueBlock(program);
+  auto &exit = AddValueBlock(program);
+  const auto flag = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::SLessThan32, {Value(3u), flag}));
+  entry.terminator = {.kind = TerminatorKind::ConditionalBranch,
+      .true_block = &atomic, .false_block = &exit};
+  entry.AddBranch(&atomic);
+  entry.AddBranch(&exit);
+  atomic.terminator = {.kind = TerminatorKind::Branch, .true_block = &exit};
+  atomic.AddBranch(&exit);
+  exit.terminator.kind = TerminatorKind::Return;
+  DescriptorSource source;
+  source.dword_count = 8u;
+  source.dwords.fill(Value(0u));
+  source.dwords[0] = Value(0x100u);
+  source.dwords[1] = Value(uint32_t(BufferFormat::k8_8_8_8UNorm) << 20u);
+  source.dwords[3] = Value(uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  program.descriptor_sources.push_back(source);
+  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D, .read = true});
+  auto storage = program.info.images[0];
+  storage.resource_class = ImageResourceClass::Storage;
+  storage.written = storage.atomic = storage.atomic64 = true;
+  program.info.images.push_back(storage);
+  program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 0u});
+  program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 1u});
+  const auto image = Value(&entry.AppendNewInst(ValueOpcode::GetImageResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3],
+       source.dwords[4], source.dwords[5], source.dwords[6], source.dwords[7]}));
+  const auto address = Value(&entry.AppendNewInst(ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)}));
+  entry.AppendNewInst(ValueOpcode::ImageRead, {image, address, Value(true)})
+      .SetFlags(MemoryFlags{.index = 0u});
+  atomic.AppendNewInst(ValueOpcode::ImageAtomicUMax64,
+      {image, address, Value(uint64_t{1}), Value(true)}).SetFlags(MemoryFlags{.index = 1u});
+  auto plan = Extract(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t flag : {3u, 4u, UINT32_MAX, 3u}) {
+    const std::array user_data{flag};
+    const bool active = flag == 4u;
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) == !active,
+          "shared image descriptor hid an active invalid atomic format or validated an inactive use");
+    Check(snapshot.images[0].dwords[0] == 0x100u &&
+              (snapshot.images[1].dwords[0] != 0u) == active,
+          "image activity was merged across descriptor uses or retained a stale branch result");
+  }
+  const auto known_condition = entry.condition;
+  const auto lane = Value(&entry.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)}));
+  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {lane, Value(0u)}));
+  auto unknown = Extract(program);
+  const std::array unknown_data{0u};
+  Check(!MaterializeResources(unknown, {.user_data = unknown_data}, snapshot, specialization) &&
+            snapshot.images[1].dwords[0] == 0x100u,
+        "an unknown branch skipped a potentially active atomic image or failed before image activity");
+  entry.condition = known_condition;
+  program.has_address_writes = true;
+  auto conservative = Extract(program);
+  const std::array user_data{3u};
+  Check(!MaterializeResources(conservative, {.user_data = user_data}, snapshot, specialization),
+        "address writes allowed unsafe pruning of an image use");
+}
+
 void TestIndirectImageSamplerClasses(bool mixed) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
@@ -1413,6 +1543,213 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+void TestReachableMaximumPhi() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &entry = AddValueBlock(program);
+  auto &left = AddValueBlock(program);
+  auto &right = AddValueBlock(program);
+  auto &merge = AddValueBlock(program);
+  const auto flag = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {flag, Value(0u)}));
+  entry.terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                     .true_block = &left, .false_block = &right};
+  entry.AddBranch(&left);
+  entry.AddBranch(&right);
+  for (auto *arm : {&left, &right}) {
+    arm->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = &merge};
+    arm->AddBranch(&merge);
+  }
+  merge.terminator.kind = CFG::TerminatorKind::Return;
+  auto &maximum = program.value_storage.emplace_back(ValueOpcode::Phi, uint64_t(Type::U32));
+  maximum.AddPhiOperand(nullptr, Value(255u));
+  maximum.AddPhiOperand(nullptr, Value(4095u));
+  program.maximum_phi_predecessors.emplace(&maximum, std::vector<uint32_t>{1u, 2u});
+  auto &reversed = program.value_storage.emplace_back(ValueOpcode::Phi, uint64_t(Type::U32));
+  reversed.AddPhiOperand(nullptr, Value(255u));
+  reversed.AddPhiOperand(nullptr, Value(4095u));
+  program.maximum_phi_predecessors.emplace(&reversed, std::vector<uint32_t>{2u, 1u});
+  Check(!EquivalentValue(program, Value(&maximum), Value(&reversed)),
+        "maximum Phis with different predecessor mappings became equivalent");
+  DescriptorSource source;
+  source.dword_count = 4u;
+  source.dwords = {Value(0x1000u), Value(4u << 16u), Value(&maximum), Value(0x14004u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0u, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer});
+  const auto buffer = Value(&merge.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
+  merge.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {buffer, Value(0u), Value(0u), Value(0u), Value(true)}).SetFlags(MemoryFlags{});
+  auto plan = Extract(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::array<uint32_t, 1> data{};
+  for (const auto flag_value : {0u, 1u, 0u}) {
+    data[0] = flag_value;
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == (flag_value ? 255u : 4095u),
+          "maximum Phi retained an inactive predecessor or a previous dispatch's bound");
+  }
+  const auto known_condition = plan.control_flow[0].condition;
+  plan.control_flow[0].condition = Value(&plan.value_storage.emplace_back(ValueOpcode::UndefU1));
+  CompileSrtWalker(plan);
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[2] == 4095u,
+        "unknown control flow narrowed a maximum Phi");
+  plan.control_flow[0].condition = known_condition;
+
+  auto control_flow = std::move(plan.control_flow);
+  plan.control_flow.clear();
+  CompileSrtWalker(plan);
+  for (const auto flag_value : {0u, 1u, 0u}) {
+    data[0] = flag_value;
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == 4095u,
+          "maximum Phi without control flow lost a predecessor");
+  }
+  plan.control_flow = std::move(control_flow);
+
+  const auto *phi = plan.descriptor_sources[0].dwords[2].TryInstruction();
+  const auto predecessors = plan.maximum_phi_predecessors.at(phi);
+  for (const auto &damaged : {std::vector<uint32_t>{1u},
+                               std::vector<uint32_t>{1u, 2u, 3u},
+                               std::vector<uint32_t>{1u, uint32_t(plan.control_flow.size())},
+                               std::vector<uint32_t>{UINT32_MAX, 2u}}) {
+    plan.maximum_phi_predecessors.at(phi) = damaged;
+    ResourcePlan loaded;
+    Check(!LoadResourcePlan(SaveResourcePlan(plan), loaded),
+          "damaged maximum Phi predecessors were accepted");
+  }
+  plan.maximum_phi_predecessors.at(phi) = predecessors;
+
+  auto &derived = plan.value_storage.emplace_back(ValueOpcode::IAdd32);
+  derived.SetArg(0, plan.descriptor_sources[0].dwords[2]);
+  derived.SetArg(1, Value(1u));
+  auto &condition = plan.value_storage.emplace_back(ValueOpcode::ULessThan32);
+  condition.SetArg(0, Value(&derived));
+  condition.SetArg(1, Value(512u));
+  plan.control_flow[3].condition = Value(&condition);
+  plan.control_flow[3].successors = {4u, 5u};
+  plan.control_flow.resize(6u);
+  plan.descriptor_sources[0].dwords[2] = Value(&derived);
+  for (const auto flag_value : {1u, 0u, 1u}) {
+    data[0] = flag_value;
+    const auto reached = ReachedBlocks(plan, {.user_data = data});
+    DescriptorValue descriptor;
+    Check(reached[4] == (flag_value != 0u) && reached[5] == (flag_value == 0u) &&
+              WalkedDescriptor(plan, 0u, descriptor) &&
+              descriptor.dwords[2] == (flag_value ? 256u : 4096u),
+          "a cached maximum Phi or its users retained an unreachable predecessor");
+  }
+}
+
+void TestLargeBufferResidency() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  plan.info.buffers[0].read = true;
+  plan.descriptor_sources[0].dwords[1] = Value(16u << 16u);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const std::array<uint32_t, 1> data{0x1000u};
+  for (const uint32_t records : {uint32_t(BufferResource::MaxNativeReadSize / 16u) + 1u,
+                                  UINT32_MAX}) {
+    plan.descriptor_sources[0].dwords[2] = Value(records);
+    CompileSrtWalker(plan);
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, specialization) &&
+              specialization.buffers[0].uses_dma == (records != UINT32_MAX),
+          "large finite buffers lost BDA residency or a sentinel bypassed the native range cap");
+  }
+}
+
+void TestArrayColorComparison() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+  enum class Variant { Valid, Offset, Volume, Cube, Corner, Mip, Point };
+  for (const auto variant : {Variant::Valid, Variant::Offset, Variant::Volume, Variant::Cube,
+                             Variant::Corner, Variant::Mip, Variant::Point}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource image;
+    image.dword_count = 8u;
+    image.dwords = {Value(0x100u), Value(56u << 20u), Value(1u | (1u << 14u)),
+                    Value(((variant == Variant::Cube ? 11u : variant == Variant::Volume ? 10u : 13u) << 28u) |
+                          0xfacu | (variant == Variant::Mip ? 1u << 16u : 0u)),
+                    Value(variant == Variant::Cube ? 5u : 3u | (1u << 16u)),
+                    Value(variant == Variant::Corner ? 1u << 23u : 0u), Value(0u), Value(0u)};
+    program.descriptor_sources.push_back(image);
+    DescriptorSource sampler;
+    sampler.dword_count = 4u;
+    sampler.dwords = {Value(0x1092u), Value(0u), Value(variant == Variant::Point ? 0u : 0x00500000u), Value(0u)};
+    program.descriptor_sources.push_back(sampler);
+    program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled,
+        .dimension = variant == Variant::Volume ? Dimension::Dim3D : Dimension::Dim2DArray,
+        .read = true, .depth_compare = true});
+    program.info.samplers.push_back({.source = 1u});
+    program.info.sampled_pairs.push_back({0u, 0u, 0u});
+    program.memory_info.push_back({.kind = ResourceKind::Image,
+        .image_sample_flags = Decoder::ImageSampleFlagCompare | Decoder::ImageSampleFlagLevelZero |
+                             (variant == Variant::Offset ? Decoder::ImageSampleFlagOffset : 0u)});
+    const auto plan = Extract(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization) == (variant == Variant::Valid),
+          "array color comparison accepted unsupported coordinates or rejected a valid view");
+    if (variant == Variant::Valid) {
+      Check(specialization.images[0].dimension == Dimension::Dim2DArray &&
+                specialization.images[0].software_compare_func == 1u,
+            "array color comparison lost its dimension or comparison function");
+      auto child = image;
+      child.dwords[0] = Value(0x200u);
+      program.descriptor_sources.push_back(child);
+      DescriptorSource root;
+      root.dword_count = 8u;
+      root.dwords.fill(Value(0u));
+      root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0u, 2u};
+      program.descriptor_sources.push_back(root);
+      program.info.images[0].source = 3u;
+      program.info.images[0].first_use_pc = 0x2200u;
+      for (const auto first_format : {Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm,
+                                      Libs::Graphics::Prospero::BufferFormat::k32Float}) {
+        program.descriptor_sources[0].dwords[1] = Value(static_cast<uint32_t>(first_format) << 20u);
+        for (const auto format : {Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm,
+                                  Libs::Graphics::Prospero::BufferFormat::k32Float}) {
+          program.descriptor_sources[2].dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
+          auto indirect_plan = Extract(program);
+          uint32_t reads = 0;
+          const SrtRuntime runtime{.userdata = &reads,
+              .read_specialization_memory = RejectSpecializationRead};
+          Check(MaterializeResources(indirect_plan, runtime, snapshot, specialization),
+                "indirect comparison rejected native or software candidates");
+          const auto first_compare = first_format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                                         ? 1u : UINT32_MAX;
+          const auto compare = format == Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                                   ? 1u : UINT32_MAX;
+          Check(specialization.images.size() == 2u &&
+                    specialization.images[0].software_compare_func == first_compare &&
+                    specialization.images[1].software_compare_func == compare,
+                "indirect comparison lost a candidate's comparison mode");
+          ApplyResourceSpecialization(program, specialization);
+          Check(program.info.samplers[0].depth_compare ==
+                    (first_compare == UINT32_MAX || compare == UINT32_MAX),
+                "sampler comparison did not follow the native candidates");
+          Check((DescriptorBindingForImage(program.info.images[0]) ==
+                 DescriptorBindingForImage(program.info.images[1])) == (format == first_format),
+                "comparison candidates used incorrect binding kinds");
+          program.info.images.resize(1u);
+          program.info.samplers[0].depth_compare = false;
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -1430,6 +1767,8 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestLargeBufferResidency();
+  TestArrayColorComparison();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
@@ -1444,15 +1783,19 @@ int main() {
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();
   for (const bool independent_mask : {false, true})
-    TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask);
+    for (const bool loop_test : {false, true})
+      TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask, false, loop_test);
   TestEmptyTraversalSkipsUnmappedDescriptor(false, true);
+  TestBallotControlAssumptions();
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
+  TestSharedDescriptorImageActivity();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestShaderCacheRecords();
+  TestReachableMaximumPhi();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

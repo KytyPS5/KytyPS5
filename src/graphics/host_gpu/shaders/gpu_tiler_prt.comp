@@ -9,10 +9,10 @@ uvec3 block_extent() {
 	return uvec3(width, BLOCK_BYTES / (width * ELEMENT_BYTES), 1u);
 }
 uint block_offset(uvec3 p) {
-	uvec4 s = ELEMENT_BYTES == 1 ? uvec4(7, 7, 6, 6) :
-	          ELEMENT_BYTES == 2 ? uvec4(7, 6, 6, 5) :
-	          ELEMENT_BYTES == 4 ? uvec4(6, 6, 5, 5) :
-	          ELEMENT_BYTES == 8 ? uvec4(6, 5, 5, 4) : uvec4(5, 5, 4, 4);
+	uvec4 s = uvec4(ELEMENT_BYTES <= 2 ? 7u : ELEMENT_BYTES <= 8 ? 6u : 5u,
+	                ELEMENT_BYTES == 1 ? 7u : ELEMENT_BYTES <= 4 ? 6u : 5u,
+	                ELEMENT_BYTES <= 2 ? 6u : ELEMENT_BYTES <= 8 ? 5u : 4u,
+	                ELEMENT_BYTES == 1 ? 6u : ELEMENT_BYTES <= 4 ? 5u : 4u);
 	uint delta = (((p.x >> s.x) & 1u) << 8) ^ (((p.y >> s.y) & 1u) << 9) ^
 	             (((p.x >> s.z) & 1u) << 10) ^ (((p.y >> s.w) & 1u) << 11);
 	return standard64_offset(p.xy) ^ delta;

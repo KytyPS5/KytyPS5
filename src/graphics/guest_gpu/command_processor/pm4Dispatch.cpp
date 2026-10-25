@@ -195,6 +195,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_COND_EXEC]                 = CpOpCondExec;
 	g_cp_op_func[Pm4::IT_SET_PREDICATION]           = CpOpSetPredication;
 	g_cp_op_func[Pm4::IT_WRITE_DATA]                = CpOpWriteData;
+	g_cp_op_func[Pm4::IT_MEM_SEMAPHORE]             = CpOpMemSemaphore;
 	g_cp_op_func[Pm4::IT_WAIT_REG_MEM]              = CpOpWaitRegMem32;
 	g_cp_op_func[Pm4::IT_INDIRECT_BUFFER]           = CpOpIndirectBuffer;
 	g_cp_op_func[Pm4::IT_COPY_DATA]                 = CpOpCopyData;

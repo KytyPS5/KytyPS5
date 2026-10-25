@@ -77,6 +77,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("e1DFTg+Sd8U", Gen5::AgcAcbJump);
 	LIB_FUNC("b-oySn+G2tE", Gen5::AgcAcbJumpGetSize);
 	LIB_FUNC("DwICrVxerkY", Gen5::AgcAcbRewind);
+	LIB_FUNC("q4VuU-QsLOE", Gen5::AgcAcbMemSemaphore);
 	LIB_FUNC("htn36gPnBk4", Gen5::AgcAcbWaitRegMem);
 	LIB_FUNC("idlaArvdXEs", Gen5::AgcAcbWaitOnAddressGetSize);
 	LIB_FUNC("-RnpfpxIhec", Gen5::AgcAcbDmaData);

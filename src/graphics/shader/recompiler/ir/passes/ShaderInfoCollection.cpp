@@ -151,6 +151,9 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::FrontFacing:
 			AddInput(info, kind, 0, 1, "gl_FrontFacing");
 			break;
+		case StageInputKind::HelperInvocation:
+			AddInput(info, kind, 0, 1, "gl_HelperInvocation");
+			break;
 		case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 		case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 		case StageInputKind::BaryCoordSmoothSample:
@@ -326,12 +329,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 		}
 		if (buffer_access != BufferAccess::None) {
+			info.coherent_buffers |= memory.coherent;
 			if (kind == ResourceKind::IndirectBuffer && op != ValueOpcode::ReadConstBuffer) {
 				info.subgroup_local_invocation_id = true;
 			}
+			info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 			if (kind == ResourceKind::Buffer) {
-				info.coherent_buffers |= memory.coherent;
-				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -435,6 +438,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					return Fail("packed pixel ancillary input has an unsupported live use");
 				case StageInputKind::Layer:
 				case StageInputKind::SampleId:
+				case StageInputKind::HelperInvocation:
 					if (program.stage != ShaderType::Pixel || component != 0u) {
 						return Fail("typed pixel scalar input is invalid");
 					}
@@ -510,7 +514,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
-		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
+		case ValueOpcode::DataCacheInvalidate:
+		case ValueOpcode::ScalarCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
@@ -603,6 +608,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel:
 			CollectPixelInputs(input_info.pixel, info, inputs.per_vertex, inputs.components);
+			if (info.pixel_valid_mask) {
+				AddBuiltinInput(info, StageInputKind::HelperInvocation);
+			}
 			if (input_info.pixel->object_primitive_id) {
 				if (std::ranges::any_of(info.outputs, [](const StageOutput& output) {
 					    return output.kind == StageOutputKind::Mrt && output.location == 7u;

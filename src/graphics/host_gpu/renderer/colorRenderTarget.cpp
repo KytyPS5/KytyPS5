@@ -184,11 +184,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("render-target format has no valid element size\n");
 	}
 	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
+	const auto tile_swizzle = Prospero::TileSwizzle(rt.base.addr, rt.attrib3.tile_mode);
+	const auto address = rt.base.addr & ~uint64_t {tile_swizzle};
 	TileTextureBlockLayout texture_tile_layout {};
 	if (texture_tile &&
 	    (!TileGetTextureBlockLayout(transfer_format, rt.attrib3.tile_mode, volume,
 	                                texture_tile_layout) ||
-	     (rt.base.addr & (texture_tile_layout.block.block_size - 1u)) != 0 ||
+	     (address & (texture_tile_layout.block.block_size - 1u)) != 0 ||
 	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
 	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
 	     rt.info.dcc_compression_enable || rt.cmask.addr != 0 || rt.fmask.addr != 0 ||
@@ -210,7 +212,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data            = {rt.base.addr, 0};
+	desc.info.data            = {address, 0};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
@@ -219,6 +221,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
+	desc.info.tile_swizzle    = tile_swizzle;
 	if (!volume && rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
 	    levels > std::bit_width(std::max(width, height))) {
 		EXIT("unsupported render-target mip count\n");

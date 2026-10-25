@@ -20,7 +20,8 @@ struct SurfaceFormatInfo {
 };
 
 vk::ComponentMapping   TextureGetComponentMapping(uint32_t                        swizzle,
-                                                  Prospero::ColorComponentMapping host_to_storage);
+                                                  Prospero::ColorComponentMapping host_to_storage,
+                                                  uint32_t component_count = 4);
 SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,

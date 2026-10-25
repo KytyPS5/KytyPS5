@@ -1130,6 +1130,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 		}
 		auto                 initial_exec  = IR::U1(IR::Value(true));
+		if (options.stage == ShaderType::Pixel) {
+			initial_exec = entry_ir.IEqual(builtin(IR::StageInputKind::HelperInvocation),
+			                              IR::U32(IR::Value(0u)));
+		}
 		uint32_t             total_threads = 0;
 		const auto*          workgroup = ShaderWorkgroupInput(options.stage, options.input_info);
 		if (workgroup != nullptr) {

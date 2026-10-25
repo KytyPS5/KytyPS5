@@ -46,6 +46,8 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	bool                      m_eop_pending   = false;
+	uint64_t                  m_wait_tick     = 0;
 };
 
 class CommandProcessor {
@@ -62,6 +64,7 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferWait();
+	[[nodiscard]] bool NeedsFlush() const noexcept { return m_needs_flush; }
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -97,6 +100,7 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	void MemSemaphore(uint64_t* addr, uint32_t operation, bool write_signal, bool use_mailbox);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -119,6 +123,8 @@ private:
 	void SuspendPm4();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
+	[[nodiscard]] bool  WaitForPendingEndOfPipe();
+	[[nodiscard]] bool  WaitForEndOfPipe();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -142,6 +148,7 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	bool      m_needs_flush                 = false;
 };
 
 } // namespace Libs::Graphics

@@ -168,7 +168,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.bytes_per_block != requested.bytes_per_block) {
 		return false;
 	}
-	if (cached.tile_mode != requested.tile_mode) {
+	if (cached.tile_mode != requested.tile_mode || cached.tile_swizzle != requested.tile_swizzle) {
 		return false;
 	}
 	if (cached.GetColorTransform() != requested.GetColorTransform()) {
@@ -624,7 +624,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
-	    cached.info.tile_mode != requested.tile_mode) {
+	    cached.info.tile_mode != requested.tile_mode ||
+	    cached.info.tile_swizzle != requested.tile_swizzle) {
 		return {};
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
@@ -663,7 +664,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = cached.info.resources.levels < requested.resources.levels ||
+	                cached.info.resources.layers < requested.resources.layers ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -754,24 +756,31 @@ bool Publish(TextureCache& cache, Image& image) {
 	return true;
 }
 
-void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
+bool Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id, bool retire,
+             bool allow_discard) {
 	auto& cached = cache.m_slot_images[cached_id];
 	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
 	// PS5 raw block images can span several packed BC mips. Transfer their complete
 	// guest bytes, including tail padding, before retiring the incompatible backing.
-	if (cached.SafeToDownload()) {
+	if (cached.SafeToDownload() && !cache.CanDownload(cached)) {
+		if (!retire) return true;
+		if (!allow_discard) return false;
+	} else if (cached.SafeToDownload()) {
 		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
-			return;
+			return false;
 		}
 		if (!Publish(cache, cached)) {
-			return;
+			return false;
 		}
 		if (merged) {
 			merged->MarkBufferModified();
 		}
 	}
-	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-	cache.FreeImage(cached_id);
+	if (retire) {
+		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		cache.FreeImage(cached_id);
+	}
+	return true;
 }
 
 } // namespace BcAlias
@@ -783,8 +792,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (!cached.registered) {
 		return {merged_id};
 	}
+	if (cached.IsMaybeCpuDirty()) {
+		TrackImage(cached_id);
+		(void)cached.ResolveMaybeCpuHash(cached.HashGuestEdges());
+	}
 	if (BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
-		BcAlias::Resolve(*this, cached_id, merged_id);
+		if (!BcAlias::Resolve(*this, cached_id, merged_id)) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: retaining unsupported block alias layouts\n");
+		}
 		return {merged_id};
 	}
 	const auto current_tick = m_scheduler.CurrentTick();
@@ -796,12 +812,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		// Fewer mips and more layers (or vice versa) describe separate guest layouts.
+		if ((requested.resources.levels < cached.info.resources.levels &&
+		     requested.resources.layers > cached.info.resources.layers) ||
+		    (requested.resources.levels > cached.info.resources.levels &&
+		     requested.resources.layers < cached.info.resources.layers)) {
+			if (cached.SafeToDownload() && !BcAlias::Resolve(*this, cached_id, merged_id)) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "TextureCache: retaining unsupported overlapping mip/layer layouts\n");
+			}
+			return {merged_id};
+		}
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
+		    requested.tile_swizzle != cached.info.tile_swizzle ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
 		                 cached.info.mip_layout.begin(),
@@ -811,8 +839,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
-			if (safe_to_delete) {
-				FreeImage(cached_id);
+			if ((safe_to_delete || cached.SafeToDownload()) &&
+			    !BcAlias::Resolve(*this, cached_id, merged_id, safe_to_delete, safe_to_delete)) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "TextureCache: retaining unsupported incompatible image layouts\n");
 			}
 			return {merged_id};
 		}
@@ -846,7 +876,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
 		if (requested.pixel_format == cached.info.pixel_format &&
-		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    requested.type == cached.info.type &&
+		    (requested.resources.levels > cached.info.resources.levels ||
+		     requested.resources.layers > cached.info.resources.layers) &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
 		      requested.extent == cached.info.extent &&
@@ -923,6 +955,10 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 
 bool TextureCache::CanDownload(const Image& image) const {
 	const auto& info = image.info;
+	if (image.depth_id) {
+		const auto& depth = m_slot_images[image.depth_id];
+		if (depth.info.metadata.stencil_compressed || depth.backing.samples != 1) return false;
+	}
 	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
 	    info.data.size % info.resources.layers != 0) {
 		return false;
@@ -1221,7 +1257,14 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
-	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources ||
+	    record.info.tile_swizzle != depth.info.stencil_tile_swizzle) {
+		if (record.depth_id && record.info.tile_swizzle != depth.info.stencil_tile_swizzle) {
+			if (record.SafeToDownload() && !BcAlias::Publish(*this, record)) {
+				EXIT("TextureCache: cannot preserve stencil contents before changing swizzle\n");
+			}
+			record.MarkBufferModified();
+		}
 		ImageInfo plane {};
 		plane.data         = stencil;
 		plane.pixel_format = vk::Format::eS8Uint;
@@ -1231,6 +1274,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		plane.resources    = {depth.stencil_subresources.level_count,
 		                      depth.stencil_subresources.layer_count};
 		plane.tile_mode    = depth.info.tile_mode;
+		plane.tile_swizzle = depth.info.stencil_tile_swizzle;
 		plane.pitch =
 		    plane.IsTiled() ? TileGetDepthPitch(plane.extent.width, 1, 0) : depth.info.pitch;
 		plane.bytes_per_block = 1;
@@ -1271,6 +1315,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			// the native image and the canonical guest tiling.
 			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
 			    image.depth_id && image.info.data == desc.info.data &&
+			    image.info.tile_swizzle == desc.info.tile_swizzle &&
 			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
 			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
 			    image.info.resources.levels >= desc.info.resources.levels &&
@@ -1307,7 +1352,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				const auto& owner = m_slot_images[candidate];
 				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
 				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
-					BcAlias::Resolve(*this, candidate, result);
+					if (!BcAlias::Resolve(*this, candidate, result)) {
+						LOGF_COLOR(Log::Color::BrightYellow,
+						           "TextureCache: retaining unsupported block alias layouts\n");
+					}
 				}
 			}
 		}
@@ -1316,7 +1364,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources.levels < desc.info.resources.levels ||
+			           resolved.info.resources.layers < desc.info.resources.layers) {
 				FreeImage(result);
 				result = {};
 			}
@@ -1368,7 +1417,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	}
 	std::scoped_lock lock {m_lock};
 	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
 		const auto* owner = &m_slot_images[id];
 		if (owner->info.data.address != address) {
 			continue;
@@ -1475,9 +1524,14 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             desc.info.resources.layers};
 	}
 	image.info.stencil = desc.info.stencil;
+	image.info.stencil_tile_swizzle = desc.info.stencil_tile_swizzle;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (metadata->second.size != desc.info.metadata.range.size) {
+			metadata->second.clear_mask.reset();
+		}
+		metadata->second.size           = desc.info.metadata.range.size;
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
@@ -1750,6 +1804,24 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	if (!CanDownload(image)) {
 		EXIT("TextureCache: invalid image download\n");
 	}
+	if (image.depth_id) {
+		const auto& info = image.info;
+		EXIT_IF(destination_size != info.data.size || levels != info.resources.levels);
+		auto copies = info.BufferCopies(info.IsTiled() ? 0 : destination_offset);
+		for (auto& copy: copies) {
+			copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
+		}
+		if (!info.IsTiled()) {
+			m_slot_images[image.depth_id].Download(copies, destination.Handle(), destination_offset,
+			                                       destination_size);
+			return;
+		}
+		auto linear = m_tiler.GetScratchBuffer(info.LinearSize());
+		m_slot_images[image.depth_id].Download(copies, linear.buffer, 0, linear.size);
+		m_tiler.Tile(linear.buffer, linear.offset, linear.size, destination.Handle(),
+		             destination_offset, destination_size, info);
+		return;
+	}
 	if (UploadBinding(image) == BindingType::DepthTarget) {
 		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
 		DownloadDepth(image, destination, destination_offset);
@@ -1918,10 +1990,13 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return found->second.clear_mask.test(slice);
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	if (size != 0 && found->second.size != 0 && size != found->second.size) {
 		return false;
 	}
 	found->second.clear_mask.set();

@@ -96,7 +96,12 @@ struct ShaderTextureResource {
 	[[nodiscard]] uint16_t Depth() const { return (fields[4] >> 0u) & 0x1FFFu; }
 
 	[[nodiscard]] uint64_t Base40() const {
-		return ((fields[0] | (static_cast<uint64_t>(fields[1]) << 32u)) & 0xFFFFFFFFFFu) << 8u;
+		const auto address =
+		    ((fields[0] | (static_cast<uint64_t>(fields[1]) << 32u)) & 0xFFFFFFFFFFu) << 8u;
+		return address & ~static_cast<uint64_t>(TileSwizzle());
+	}
+	[[nodiscard]] uint32_t TileSwizzle() const {
+		return Prospero::TileSwizzle(uint64_t {fields[0]} << 8u, TileMode());
 	}
 	[[nodiscard]] bool                   IsNull() const { return Base40() == 0; }
 	[[nodiscard]] Prospero::BufferFormat Format() const {

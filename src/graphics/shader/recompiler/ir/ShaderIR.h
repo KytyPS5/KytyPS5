@@ -80,7 +80,8 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
-		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
+		return (kind == ResourceKind::Buffer || kind == ResourceKind::IndirectBuffer) &&
+		       opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
 		       !typed && !formatted && data_bits == 32u;
 	}
 
@@ -117,6 +118,7 @@ struct ExportInfo {
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	static constexpr uint64_t MaxNativeReadSize = uint64_t {256} * 1024 * 1024;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
@@ -132,6 +134,7 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	bool                   uses_dma           = false;
 	bool                   live               = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
@@ -158,12 +161,14 @@ struct ImageResource {
 	uint32_t                      mip_count         = 1;
 	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
+	uint32_t                      software_compare_func = UINT32_MAX;
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
 	bool                          depth_compare     = false;
+	bool                          gather            = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
@@ -239,6 +244,7 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
+	HelperInvocation,
 	PackedAncillary,
 	Layer,
 	SampleId,
@@ -416,6 +422,10 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	return static_cast<uint32_t>(kind) - FirstImageBinding;
 }
 
+[[nodiscard]] constexpr bool UsesNativeDepthCompare(const ImageResource& image) {
+	return image.depth_compare && image.software_compare_func == UINT32_MAX;
+}
+
 [[nodiscard]] constexpr std::optional<DescriptorBindingKind>
 DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledFloatBinding = 1u;
@@ -434,7 +444,8 @@ DescriptorBindingForImage(const ImageResource& image) {
 		sampled = true;
 		switch (image.numeric_class) {
 			case Prospero::TextureNumericClass::Float:
-				base = image.depth_compare ? FirstComparisonImageBinding : SampledFloatBinding;
+				base = UsesNativeDepthCompare(image) ? FirstComparisonImageBinding
+				                                     : SampledFloatBinding;
 				break;
 			case Prospero::TextureNumericClass::Uint: base = SampledUintBinding; break;
 			case Prospero::TextureNumericClass::Sint: base = SampledSintBinding; break;
@@ -571,8 +582,14 @@ struct DescriptorSource {
 			uint32_t maximum = UINT32_MAX;
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
+			uint32_t f16_shift = UINT32_MAX;
+			uint32_t local_axis = UINT32_MAX;
+			uint32_t key_add = 0;
+			uint32_t mask_source = UINT32_MAX;
+			uint32_t mask_stride = 0;
+			uint32_t mask_offset = 0;
 			bool global = false;
-			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
+			// Bitmap words per record; set-bit ranks subtract from the last key.
 			bool bitset = false;
 			std::optional<CountedRows> rows;
 			std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
@@ -589,6 +606,7 @@ struct DescriptorSource {
 		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
+		bool table_null_sentinel = false;
 		std::optional<PointerTable> pointer_table;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
@@ -596,9 +614,11 @@ struct DescriptorSource {
 		uint32_t table_stride    = 0;
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
+		bool     table_mapped = false;
 		bool     indexed = false;
 		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		Value    workgroup_key;
 		Value    key_count;
 		// First selector index, or first descriptor key for a direct or bitmap range.
 		Value                 selector_first;
@@ -627,6 +647,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> images;
 	std::vector<uint32_t> srt_reads;
 };
 
@@ -677,6 +698,7 @@ struct ResourcePlan {
 	std::vector<uint32_t>               selector_groups;
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
+	std::unordered_map<const Inst*, std::vector<uint32_t>> maximum_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
@@ -686,6 +708,7 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	std::vector<std::unique_ptr<ResourcePlan>> workgroup_plans;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	// GPU-thread scratch for walker results and material keys.

@@ -135,9 +135,13 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
                                                   const HW::DepthRenderTarget& z,
                                                   bool write_buffer = false) {
 	const bool has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
-	const auto depth_address = write_buffer ? z.z_write_base_addr : z.z_read_base_addr;
-	const auto stencil_address =
+	const auto depth_base = write_buffer ? z.z_write_base_addr : z.z_read_base_addr;
+	const auto stencil_base =
 	    write_buffer ? z.stencil_write_base_addr : z.stencil_read_base_addr;
+	const auto depth_swizzle = Prospero::TileSwizzle(depth_base, Prospero::TileMode::kDepth);
+	const auto stencil_swizzle = Prospero::TileSwizzle(stencil_base, Prospero::TileMode::kDepth);
+	const auto depth_address = depth_base & ~uint64_t {depth_swizzle};
+	const auto stencil_address = stencil_base & ~uint64_t {stencil_swizzle};
 	if (!z.z_info.HasValidTextureCompatibility() ||
 	    !z.stencil_info.HasValidTextureCompatibility()) {
 		DepthFatal("invalid PS5 depth texture-compatibility encoding");
@@ -236,6 +240,8 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	desc.info.bytes_per_block = bytes;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = Prospero::TileMode::kDepth;
+	desc.info.tile_swizzle    = depth_swizzle;
+	desc.info.stencil_tile_swizzle = has_stencil ? stencil_swizzle : 0u;
 	desc.info.UpdateSize();
 	desc.info.metadata.range =
 	    has_htile ? GuestRange {z.htile_data_base_addr, htile_backing_size} : GuestRange {};

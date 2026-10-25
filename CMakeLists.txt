@@ -681,6 +681,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
+	add_test(NAME shader_guarded_scalar_image
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guarded-scalar-image-only)
+	add_test(NAME shader_pixel_exec
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pixel-exec-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -705,6 +709,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
+	add_test(NAME texture_components
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-components-only)
+	add_test(NAME pm4_mem_semaphore
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mem-semaphore-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
@@ -718,6 +726,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
+	add_test(NAME texture_mip_views
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-mip-views-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback
@@ -731,8 +741,12 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	add_test(NAME texture_cache_subresource_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --subresource-overlap-only)
 	add_test(NAME texture_cache_htile_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
+	add_test(NAME texture_cache_metadata_resize
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --metadata-resize-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 

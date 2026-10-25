@@ -43,8 +43,12 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	std::span<const uint32_t> workgroup_id;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	std::span<const uint32_t> local_size;
+	bool (*mapped_ranges)(void* userdata, uint64_t address, uint64_t maximum,
+	                      std::vector<std::pair<uint64_t, uint64_t>>& ranges) = nullptr;
 };
 
 class SrtReadCapture {
@@ -55,6 +59,8 @@ public:
 
 private:
 	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool MappedRanges(void* userdata, uint64_t address, uint64_t maximum,
+	                         std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
@@ -63,7 +69,8 @@ private:
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
+                          RuntimeValueType type = RuntimeValueType::Any,
+                          uint32_t workgroup_axis = UINT32_MAX);
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
@@ -78,6 +85,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

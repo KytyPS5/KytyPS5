@@ -32,7 +32,8 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+[[nodiscard]] bool Resolve(TextureCache& cache, ImageId cached, ImageId merged, bool retire = true,
+                           bool allow_discard = false);
 } // namespace BcAlias
 
 class TextureCache {
@@ -72,7 +73,7 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool ClearMeta(uint64_t address, uint64_t size = 0);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -81,6 +82,7 @@ public:
 
 private:
 	struct MetaDataInfo {
+		uint64_t          size = 0;
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
 	};
@@ -193,7 +195,7 @@ private:
 	friend class ImageHeap;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
-	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
+	friend bool BcAlias::Resolve(TextureCache&, ImageId, ImageId, bool, bool);
 };
 
 } // namespace Libs::Graphics

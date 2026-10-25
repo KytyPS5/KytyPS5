@@ -264,6 +264,92 @@ void TestSharedWatcherCounts() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestGuestProtectionPreservesWatchers() {
+  PageManager manager;
+  const auto page = manager.GetPageSize();
+  const auto region = Libs::Graphics::TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(0x20000, PAGE_READWRITE, 0x00000002003f0000ull);
+  auto *memory = allocation + 0x10000 - 2 * page;
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  Check((base + 2 * page) % region == 0, "protection fixture must cross a region boundary");
+  manager.UpdatePageWatchers<true>(base, page);
+  Libs::Graphics::RegionBits reads;
+  reads.SetRange(0, 1);
+  manager.UpdatePageWatchersForRegion<true, true>(base + 2 * page, reads);
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, 4 * page, PAGE_READWRITE, &old_protection) != 0,
+        "host permission restore failed");
+  manager.ProtectMemory(base, 4 * page, Common::VirtualMemory::Mode::ReadWrite);
+  Check(Protection(memory) == PAGE_READONLY &&
+            Protection(memory + 2 * page) == PAGE_NOACCESS,
+        "reapplying unchanged guest protection did not restore active watchers");
+  for (const auto mode : {Common::VirtualMemory::Mode::Read,
+                          Common::VirtualMemory::Mode::NoAccess,
+                          Common::VirtualMemory::Mode::ReadWrite}) {
+    manager.ProtectMemory(base, 4 * page, mode);
+    const auto ordinary = mode == Common::VirtualMemory::Mode::NoAccess ? PAGE_NOACCESS :
+        mode == Common::VirtualMemory::Mode::Read ? PAGE_READONLY : PAGE_READWRITE;
+    Check(Protection(memory) == (mode == Common::VirtualMemory::Mode::NoAccess ? PAGE_NOACCESS : PAGE_READONLY) &&
+              Protection(memory + page) == ordinary &&
+              Protection(memory + 2 * page) == PAGE_NOACCESS &&
+              Protection(memory + 3 * page) == ordinary,
+          "guest protection lost a write/access watch or changed an unwatched page");
+    for (uint64_t offset = 0; offset < 4 * page; offset += page) {
+      Check(manager.IsGuestAccessAllowed(base + offset, Libs::Graphics::PageFaultAccess::Read) ==
+                (mode != Common::VirtualMemory::Mode::NoAccess) &&
+                manager.IsGuestAccessAllowed(base + offset, Libs::Graphics::PageFaultAccess::Write) ==
+                (mode == Common::VirtualMemory::Mode::ReadWrite) &&
+                !manager.IsGuestAccessAllowed(base + offset, Libs::Graphics::PageFaultAccess::Execute) &&
+                !manager.IsGuestAccessAllowed(base + offset, Libs::Graphics::PageFaultAccess::Unknown),
+            "guest access checks confused tracking protection with guest permissions");
+    }
+  }
+  manager.ProtectMemory(base, 4 * page, Common::VirtualMemory::Mode::Read);
+  manager.UpdatePageWatchers<false>(base, page);
+  manager.UpdatePageWatchersForRegion<false, true>(base + 2 * page, reads);
+  Check(Protection(memory) == PAGE_READONLY &&
+            Protection(memory + 2 * page) == PAGE_READONLY,
+        "unwatching clobbered guest read-only protection");
+  manager.ProtectMemory(base, 4 * page, Common::VirtualMemory::Mode::ReadWrite);
+  Check(IsWritable(memory) && IsWritable(memory + 2 * page),
+        "guest protection changed watcher counts");
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestUnmapResetsGuestProtection() {
+  PageManager manager;
+  const auto page = manager.GetPageSize();
+  auto *memory = Allocate(2 * page);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  manager.ProtectMemory(address, 2 * page, Common::VirtualMemory::Mode::ReadWrite);
+  g_protection_calls = 0;
+  manager.UnmapMemory(address, page);
+  Check(g_protection_calls == 0 &&
+            !manager.IsGuestAccessAllowed(address, Libs::Graphics::PageFaultAccess::Read) &&
+            !manager.IsGuestAccessAllowed(address, Libs::Graphics::PageFaultAccess::Write) &&
+            manager.IsGuestAccessAllowed(address + page, Libs::Graphics::PageFaultAccess::Write),
+        "unmap retained guest permissions, changed a neighbor, or touched host mappings");
+  manager.ProtectMemory(address, page, Common::VirtualMemory::Mode::Read);
+  manager.UpdatePageWatchers<true>(address, page);
+  manager.UpdatePageWatchers<false>(address, page);
+  Check(Protection(memory) == PAGE_READONLY &&
+            !manager.IsGuestAccessAllowed(address, Libs::Graphics::PageFaultAccess::Write),
+        "remapping inherited writable permissions");
+  manager.ProtectMemory(address, page, Common::VirtualMemory::Mode::ReadWrite);
+  manager.UpdatePageWatchers<true>(address, page);
+  Libs::Graphics::RegionBits read;
+  const auto region_base = address & ~(Libs::Graphics::TRACKER_REGION_SIZE - 1u);
+  read.Set((address - region_base) / page);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read);
+  manager.UnmapMemory(address, page);
+  manager.UpdatePageWatchers<false>(address, page);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            !manager.IsGuestAccessAllowed(address, Libs::Graphics::PageFaultAccess::Read),
+        "retiring watchers granted access after unmap or lost their counts");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestCrossRegionRange() {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -699,6 +785,8 @@ int main(int argc, char **argv) {
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
   TestSharedWatcherCounts();
+  TestGuestProtectionPreservesWatchers();
+  TestUnmapResetsGuestProtection();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();

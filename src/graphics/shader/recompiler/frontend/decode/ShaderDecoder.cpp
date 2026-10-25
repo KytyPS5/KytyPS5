@@ -568,6 +568,7 @@ std::string InstructionToString(const Instruction& inst) {
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_barrier", inst.pc));
 		case Opcode::BUFFER_GL0_INV:
 		case Opcode::BUFFER_GL1_INV:
+		case Opcode::S_DCACHE_INV:
 			return fmt::format("0x{:08x}: {}", inst.pc, magic_enum::enum_name(inst.opcode));
 		case Opcode::V_NOP:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
@@ -681,6 +682,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
 		case Opcode::BUFFER_ATOMIC_UMIN:
+		case Opcode::BUFFER_ATOMIC_UMIN_X2:
 		case Opcode::BUFFER_ATOMIC_SMAX:
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:

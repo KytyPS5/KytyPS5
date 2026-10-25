@@ -20,7 +20,14 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.userdata = this;
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? Read : nullptr;
+	runtime.mapped_ranges = m_source.mapped_ranges != nullptr ? MappedRanges : nullptr;
 	return runtime;
+}
+
+bool SrtReadCapture::MappedRanges(void* userdata, uint64_t address, uint64_t maximum,
+                                 std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	return capture.m_source.mapped_ranges(capture.m_source.userdata, address, maximum, ranges);
 }
 
 bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -82,6 +89,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
@@ -98,6 +106,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
+		case ValueOpcode::FindILsb32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -117,6 +126,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::SLessThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::INotEqual64:
@@ -147,16 +157,20 @@ bool ImmediateBits(Value value, uint64_t& bits) {
 }
 
 // Scratch layout in bytes: per descriptor source its eight DWORDs and a known DWORD, one
-// activity byte per source, then one qword per walked value (all ones when unknown). The
-// walker's value slots, captured addresses, reachability and states follow.
+// activity byte per source and image, then one qword per walked value (all ones when unknown).
+// The walker's value slots, captured addresses, reachability and states follow.
 constexpr uint32_t DescriptorStride = 9u * sizeof(uint32_t);
 
 uint32_t ActiveOffset(const ResourcePlan& plan) {
 	return static_cast<uint32_t>(plan.descriptor_sources.size()) * DescriptorStride;
 }
 
+uint32_t ImageActiveOffset(const ResourcePlan& plan) {
+	return ActiveOffset(plan) + static_cast<uint32_t>(plan.descriptor_sources.size());
+}
+
 uint32_t OutputOffset(const ResourcePlan& plan) {
-	return (ActiveOffset(plan) + static_cast<uint32_t>(plan.descriptor_sources.size()) + 7u) & ~7u;
+	return (ImageActiveOffset(plan) + static_cast<uint32_t>(plan.info.images.size()) + 7u) & ~7u;
 }
 
 const uint8_t* Scratch(const ResourcePlan& plan) {
@@ -174,8 +188,9 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 class RuntimeValidator {
 public:
 	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
-	                          bool wave_uniform = false)
-	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
+	                          bool wave_uniform = false, uint32_t workgroup_axis = UINT32_MAX)
+	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform),
+	      m_workgroup_axis(workgroup_axis) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -236,10 +251,13 @@ private:
 				return finish(false);
 			}
 			if (m_type != RuntimeValueType::Any) {
-				const auto active_mask = m_active_mask;
-				m_active_mask          = {};
-				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
-				m_active_mask          = active_mask;
+				const auto active_mask    = m_active_mask;
+				const auto workgroup_axis = m_workgroup_axis;
+				m_active_mask             = {};
+				m_workgroup_axis          = UINT32_MAX;
+				const bool valid          = Validate(m_program.srt_reads[slot.U32()].value);
+				m_active_mask             = active_mask;
+				m_workgroup_axis          = workgroup_axis;
 				if (!valid) return finish(false);
 			}
 		}
@@ -266,19 +284,20 @@ private:
 			}
 			return finish(true);
 		}
-		if (op == ValueOpcode::GetShaderBase) {
-			if (inst->NumArgs() != 0) {
-				return finish(false);
-			}
-			return finish(true);
+		if (op == ValueOpcode::GetShaderBase || op == ValueOpcode::GetSrtResource) {
+			return finish(inst->NumArgs() == 0);
 		}
-		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
+		if ((m_wave_uniform || m_workgroup_axis < 3u) && op == ValueOpcode::GetBuiltin) {
 			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
 			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
 			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
-			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
+			              axis.IsImmediate() && axis.GetType() == Type::U32 &&
+			              (m_wave_uniform ? axis.U32() < 3u : axis.U32() == m_workgroup_axis));
 		}
 		if (op == ValueOpcode::Phi) {
+			if (m_program.maximum_phi_predecessors.contains(inst)) {
+				return finish(ValidateArguments(*inst, true));
+			}
 			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
 			}
@@ -302,12 +321,6 @@ private:
 			m_active_mask          = active_mask;
 			return finish(valid);
 		}
-		if (op == ValueOpcode::GetSrtResource) {
-			if (inst->NumArgs() != 0) {
-				return finish(false);
-			}
-			return finish(true);
-		}
 		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
 		    op == ValueOpcode::LoadBufferU32) {
 			const auto  expected = op == ValueOpcode::LoadAddressU32
@@ -318,11 +331,18 @@ private:
 			    handle->GetOpcode() != expected) {
 				return finish(false);
 			}
+			const auto workgroup_axis = m_workgroup_axis;
+			m_workgroup_axis          = UINT32_MAX;
+			bool valid                = false;
 			if (op == ValueOpcode::LoadBufferU32) {
 				const auto guard = inst->Arg(4).Resolve();
-				return finish(Validate(inst->Arg(0)) &&
-				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
+				valid            = Validate(inst->Arg(0)) &&
+				        ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard));
+			} else {
+				valid = ValidateArguments(*inst, true);
 			}
+			m_workgroup_axis = workgroup_axis;
+			return finish(valid);
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
@@ -346,8 +366,7 @@ private:
 			if (inst->NumArgs() != expected) {
 				return finish(false);
 			}
-		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
+		} else if (op != ValueOpcode::ReadConst && !IsRuntimeUniformOp(op)) {
 			return finish(false);
 		}
 		return finish(ValidateArguments(*inst, true));
@@ -356,6 +375,7 @@ private:
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
 	bool                            m_wave_uniform;
+	uint32_t                        m_workgroup_axis;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -374,7 +394,7 @@ public:
 	void Compile(std::span<const Value> values);
 
 private:
-	enum class Kind : uint8_t { Unknown, Constant, UserData, ShaderBase, Node };
+	enum class Kind : uint8_t { Unknown, Constant, UserData, ShaderBase, WorkgroupId, Node };
 	struct Operand {
 		Kind     kind  = Kind::Unknown;
 		uint64_t value = 0;
@@ -403,7 +423,7 @@ private:
 		return node.referenced || node.result == Operand {Kind::Node, index};
 	}
 	static bool MayBeUnknown(const Operand& operand) {
-		return operand.kind == Kind::Unknown || operand.kind == Kind::Node;
+		return operand.kind == Kind::Unknown || operand.kind == Kind::Node || operand.kind == Kind::WorkgroupId;
 	}
 
 	uint32_t Context(Value mask) {
@@ -440,7 +460,7 @@ private:
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
-	uint32_t m_user_data = 0, m_captures = 0;
+	uint32_t m_user_data = 0, m_captures = 0, m_workgroup_id = 0;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -474,6 +494,7 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 			add(indirect->table_source);
 			if (indirect->selector) {
 				add(indirect->selector->source);
+				add(indirect->selector->mask_source);
 				if (indirect->selector->rows) add(indirect->selector->rows->source);
 			}
 		}
@@ -535,9 +556,17 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			if (reg < m_plan.user_data_base || reg - m_plan.user_data_base >= m_plan.user_data_count) return {};
 			return {{Kind::UserData, reg - m_plan.user_data_base}};
 		}
+		case ValueOpcode::GetBuiltin: {
+			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+			if (m_plan.stage != ShaderType::Compute || inst->NumArgs() != 2u ||
+			    inst->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
+			    !axis.IsImmediate() || axis.GetType() != Type::U32 || axis.U32() >= 3u) return {};
+			return {{Kind::WorkgroupId, axis.U32()}};
+		}
 		case ValueOpcode::GetShaderBase: return {{Kind::ShaderBase}};
 		case ValueOpcode::Phi:
-			if (!m_plan.control_phi_predecessors.contains(inst)) {
+			if (!m_plan.control_phi_predecessors.contains(inst) &&
+			    !m_plan.maximum_phi_predecessors.contains(inst)) {
 				const auto invariant = ResolveInvariantPhi(m_plan, value);
 				return invariant.IsEmpty() ? Ref {} : Evaluate(invariant, context);
 			}
@@ -576,6 +605,18 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 	};
 	const auto constant = [](uint64_t value) { return Operand {Kind::Constant, value}; };
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::CompositeExtractU32x4: {
+			const auto* ballot = inst.Arg(0).Resolve().TryInstruction();
+			const auto component = inst.Arg(1).Resolve();
+			if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
+			    !component.IsImmediate() || component.GetType() != Type::U32 || component.U32() >= 2u)
+				return {};
+			const auto predicate = Evaluate(ballot->Arg(0), 0).operand;
+			if (predicate.kind == Kind::Constant) return predicate.value == 0u ? constant(0u) : Operand {};
+			if (predicate.kind == Kind::Unknown) return {};
+			node.args = {predicate};
+			return self;
+		}
 		case ValueOpcode::Phi: {
 			bool known = false;
 			for (size_t i = 0; i < inst.NumArgs(); ++i) {
@@ -597,14 +638,15 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown ? Operand {} : self;
 		}
 		case ValueOpcode::ULessThan32:
+		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::ULessThanEqual32: {
 			// No U32 is below zero and every U32 is at least zero, including an unknown loop-carried
 			// or varying lane value. args[0] is that zero-tested bound.
-			const bool less  = inst.GetOpcode() == ValueOpcode::ULessThan32;
-			const auto bound = arg(inst.Arg(less ? 1 : 0));
+			const bool less  = inst.GetOpcode() != ValueOpcode::ULessThanEqual32;
+			const auto bound = arg(inst.Arg(inst.GetOpcode() == ValueOpcode::ULessThan32 ? 1 : 0));
 			if (bound.kind == Kind::Unknown) return {};
 			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) return constant(!less);
-			node.args = {bound, arg(inst.Arg(less ? 0 : 1))};
+			node.args = {bound, arg(inst.Arg(inst.GetOpcode() == ValueOpcode::ULessThan32 ? 0 : 1))};
 			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {} : self;
 		}
 		case ValueOpcode::LogicalOr:
@@ -683,6 +725,8 @@ void WalkerCompiler::Layout() {
 	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
 	m_shader_base = offset;
 	offset += 8u;
+	m_workgroup_id = offset;
+	offset += 8u;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
 		m_nodes[index].slot = offset;
@@ -734,6 +778,9 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 	auto& c = m_code;
 	if (operand.kind == Kind::Unknown) {
 		c.jmp(unknown, Near);
+	} else if (operand.kind == Kind::WorkgroupId) {
+		c.cmp(c.qword[c.rdx + m_workgroup_id], 0);
+		c.je(unknown, Near);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
 		c.call(node.label);
@@ -751,6 +798,10 @@ void WalkerCompiler::Load(const Xbyak::Reg64& reg, const Operand& operand) {
 			c.mov(reg.cvt32(), c.dword[c.rdi + operand.value * sizeof(uint32_t)]);
 			break;
 		case Kind::ShaderBase: c.mov(reg, c.qword[c.rdx + m_shader_base]); break;
+		case Kind::WorkgroupId:
+			c.mov(reg, c.qword[c.rdx + m_workgroup_id]);
+			c.mov(reg.cvt32(), c.dword[reg + operand.value * sizeof(uint32_t)]);
+			break;
 		case Kind::Node: c.mov(reg, c.qword[c.rdx + m_nodes[operand.value].slot]); break;
 		case Kind::Unknown: break;
 	}
@@ -791,20 +842,28 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 	}
 	switch (node.inst->GetOpcode()) {
 		case ValueOpcode::Phi: {
-			// Only predecessors reached by this walk contribute, and they must agree. The state is 3
+			// Only reached predecessors contribute. The state is 3
 			// once one of them has stored the value; callers read it like 1, as unknown.
-			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
+			const bool maximum = m_plan.maximum_phi_predecessors.contains(node.inst);
+			const auto& blocks = maximum ? m_plan.maximum_phi_predecessors.at(node.inst)
+			                             : m_plan.control_phi_predecessors.at(node.inst);
 			const auto  state  = c.byte[c.rdx + node.state];
 			for (size_t i = 0; i < args.size(); ++i) {
 				Xbyak::Label next, first;
-				c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
-				c.je(next, Near);
+				if (!m_plan.control_flow.empty()) {
+					c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
+					c.je(next, Near);
+				}
 				Fetch(args[i], m_ret);
 				c.cmp(state, 1);
 				c.je(first, Near);
 				c.cmp(c.rax, c.qword[c.rdx + node.slot]);
-				c.jne(m_ret, Near);
-				c.jmp(next, Near);
+				if (maximum) {
+					c.cmovb(c.rax, c.qword[c.rdx + node.slot]);
+				} else {
+					c.jne(m_ret, Near);
+					c.jmp(next, Near);
+				}
 				c.L(first);
 				c.mov(c.qword[c.rdx + node.slot], c.rax);
 				c.mov(state, 3);
@@ -819,6 +878,12 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
 		case ValueOpcode::LoadBufferU32: EmitRead(node); return;
+		case ValueOpcode::CompositeExtractU32x4:
+			Fetch(args[0], m_ret);
+			c.test(c.rax, c.rax);
+			c.jnz(m_ret, Near);
+			Store(node);
+			return;
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
@@ -834,8 +899,9 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 			return;
 		}
 		case ValueOpcode::ULessThan32:
+		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::ULessThanEqual32: {
-			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
+			const bool less = node.inst->GetOpcode() != ValueOpcode::ULessThanEqual32;
 			Xbyak::Label bound_zero;
 			Fetch(args[0], m_ret);
 			c.test(c.eax, c.eax);
@@ -1038,6 +1104,31 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 			c.L(done);
 			break;
 		}
+		case ValueOpcode::ConvertS32F32: {
+			Xbyak::Label done;
+			c.movd(c.xmm0, c.eax);
+			c.xor_(c.eax, c.eax);
+			c.ucomiss(c.xmm0, c.xmm0);
+			c.jp(done, Near);
+			c.mov(c.ecx, 0xcf000000u);
+			c.movd(c.xmm1, c.ecx);
+			c.mov(c.eax, 0x80000000u);
+			c.ucomiss(c.xmm0, c.xmm1);
+			c.jbe(done, Near);
+			c.mov(c.ecx, 0x4f000000u);
+			c.movd(c.xmm1, c.ecx);
+			c.mov(c.eax, 0x7fffffffu);
+			c.ucomiss(c.xmm0, c.xmm1);
+			c.jae(done, Near);
+			c.cvttss2si(c.eax, c.xmm0);
+			c.L(done);
+			break;
+		}
+		case ValueOpcode::FindILsb32:
+			c.bsf(c.eax, c.eax);
+			c.mov(c.ecx, UINT32_MAX);
+			c.cmovz(c.eax, c.ecx);
+			break;
 		case ValueOpcode::FPMul32:
 			c.movd(c.xmm0, c.eax);
 			c.movd(c.xmm1, c.ecx);
@@ -1150,6 +1241,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 			c.cmp(c.eax, c.ecx);
 			Set(&Xbyak::CodeGenerator::seta);
 			break;
+		case ValueOpcode::SLessThan32:
+			c.cmp(c.eax, c.ecx);
+			Set(&Xbyak::CodeGenerator::setl);
+			break;
 		case ValueOpcode::SGreaterThanEqual32:
 			c.cmp(c.eax, c.ecx);
 			Set(&Xbyak::CodeGenerator::setge);
@@ -1196,6 +1291,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 	Xbyak::Label pass, fail, reset;
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
+	c.mov(c.qword[c.rdx + m_workgroup_id], c.r8);
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 	if (!resources) {
@@ -1207,7 +1303,9 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 			const auto& node = m_nodes[index];
 			if (node.inst->GetOpcode() != ValueOpcode::Phi || node.result != Operand {Kind::Node, index}) continue;
-			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
+			const auto& predecessors = m_plan.maximum_phi_predecessors.contains(node.inst)
+			    ? m_plan.maximum_phi_predecessors.at(node.inst) : m_plan.control_phi_predecessors.at(node.inst);
+			for (const auto block: predecessors) rechecks[block].push_back(node.state);
 		}
 		std::vector<Xbyak::Label> starts(blocks.size());
 		c.mov(c.byte[c.rdx + m_reach], 1);
@@ -1291,6 +1389,25 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				c.mov(active, 1);
 			}
 		}
+		// Image uses sharing a source can have different activity.
+		for (uint32_t source = 0; source < m_plan.info.images.size(); ++source) {
+			bool listed = false;
+			for (uint32_t block = 0; block < blocks.size(); ++block) {
+				if (std::ranges::find(blocks[block].images, source) == blocks[block].images.end()) continue;
+				if (listed) {
+					c.or_(c.al, c.byte[c.rdx + m_reach + block]);
+				} else {
+					c.mov(c.al, c.byte[c.rdx + m_reach + block]);
+				}
+				listed = true;
+			}
+			const auto active = c.byte[c.rdx + ImageActiveOffset(m_plan) + source];
+			if (listed) {
+				c.mov(active, c.al);
+			} else {
+				c.mov(active, blocks.empty() ? 1 : 0);
+			}
+		}
 		for (uint32_t source = 0; source < sources.size(); ++source) {
 			if (gates[source].empty()) continue;
 			Xbyak::Label skip;
@@ -1347,10 +1464,12 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t,
+	                                               const uint32_t*);
 	t_running_walker = plan.srt_code.get();
+	const auto* workgroup_id = runtime.workgroup_id.size() >= 3u ? runtime.workgroup_id.data() : nullptr;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	                                                plan.srt_scratch.data(), runtime.shader_base, workgroup_id);
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
@@ -1391,8 +1510,13 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source) {
 	return Scratch(plan)[ActiveOffset(plan) + source] != 0u;
 }
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
+	return Scratch(plan)[ImageActiveOffset(plan) + image] != 0u;
+}
+
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          uint32_t workgroup_axis) {
+	return RuntimeValidator(program, type, false, workgroup_axis).Run(value);
 }
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {

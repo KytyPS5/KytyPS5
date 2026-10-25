@@ -79,6 +79,8 @@ struct ImageInfo {
 	uint32_t                     bytes_per_block = 0;
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
+	uint32_t                     tile_swizzle    = 0;
+	uint32_t                     stencil_tile_swizzle = 0;
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
 	TileTextureBlockLayout       tiling;
@@ -123,6 +125,9 @@ struct ImageInfo {
 	}
 	[[nodiscard]] bool IsCompatible(const ImageInfo& other) const noexcept {
 		return pixel_format == other.pixel_format && samples == other.samples &&
+		       tile_swizzle == other.tile_swizzle &&
+		       (!HasStencil() || !other.HasStencil() ||
+		        stencil_tile_swizzle == other.stencil_tile_swizzle) &&
 		       bytes_per_block == other.bytes_per_block &&
 		       GetColorTransform() == other.GetColorTransform();
 	}

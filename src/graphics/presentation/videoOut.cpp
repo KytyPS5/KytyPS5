@@ -216,7 +216,7 @@ public:
 	bool Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
 	             uint64_t& request_id);
 	void Cancel(VideoOutConfig& cfg);
-	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
+	bool Prepare(uint64_t request_id, Graphics::CommandBuffer* buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
@@ -585,6 +585,8 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.bytes_per_block = pixel_format.bytes_per_element;
 	info.samples         = 1;
 	info.tile_mode       = tile_mode;
+	// Display surfaces use zero pipe/bank XOR; registration requires 64 KB alignment.
+	info.tile_swizzle    = 0;
 	info.bgra16          = pixel_format.bgra16;
 	info.UpdateSize();
 	if (info.data.size == 0 || info.tiling.block.block_size != 65536 ||
@@ -1047,7 +1049,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	cfg.flip_status.gcQueueNum     = 0;
 }
 
-void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+bool FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer* buffer) {
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
@@ -1067,9 +1069,17 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					EXIT("cannot prepare video-out request id=%" PRIu64 "\n", request_id);
 				}
 				cancelled->state = RequestState::Recording;
-				return;
+				return true;
 			}
-			request = m_requests.insert(m_requests.end(), *pending);
+			if (buffer == nullptr &&
+			    std::any_of(m_cpu_requests.begin(), pending, [&](const auto& earlier) {
+				    return earlier.cfg == pending->cfg;
+			    })) {
+				return false;
+			}
+			const auto next = std::find_if(m_requests.begin(), m_requests.end(),
+			                               [request_id](const auto& r) { return r.id > request_id; });
+			request = m_requests.insert(next, *pending);
 			m_cpu_requests.erase(pending);
 		}
 		if (request->state != RequestState::Reserved) {
@@ -1125,7 +1135,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		if (request != m_requests.end()) {
 			m_cancelled_requests.splice(m_cancelled_requests.end(), m_requests, request);
 		}
-		return;
+		return true;
 	}
 	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
@@ -1136,9 +1146,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
-		                                       &buffer);
+		                                       buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
+		EXIT_IF(buffer == nullptr);
+		frame = &m_presenter.PrepareFrame(*buffer, source_info, hdr, headset);
 		if (headset) {
 			g_headset_mirror = true;
 		}
@@ -1163,6 +1174,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	prepared->frame = frame;
 	prepared->premultiplied_alpha = premultiplied_alpha;
+	return true;
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1243,7 +1255,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	const uint64_t group = owner->id;
 	if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
-	                [group](const auto& r) { return r.group == group; }) ||
+	                [group, cfg = owner->cfg](const auto& r) {
+		                return r.group == group || (r.cfg == cfg && r.id < group);
+	                }) ||
 	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
 		    return r.group == group && r.state != RequestState::Ready;
 	    })) {
@@ -1666,7 +1680,12 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	if (result != OK) {
 		return result;
 	}
-	g_video_out_driver->SubmitFlipPreparation(request_id);
+	if (IsSpecialBufferIndex(index) && DriverState().GetFlipQueue().Prepare(request_id, nullptr)) {
+		// Blank CPU flips cannot depend on rendering that needs the next buffer registration.
+		DriverState().GetFlipQueue().Complete(request_id);
+	} else {
+		g_video_out_driver->SubmitFlipPreparation(request_id);
+	}
 
 	return OK;
 }
@@ -1680,7 +1699,7 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	if (result != OK) {
 		return result;
 	}
-	m_impl->GetFlipQueue().Prepare(request_id, buffer);
+	m_impl->GetFlipQueue().Prepare(request_id, &buffer);
 
 	return OK;
 }
@@ -1690,7 +1709,7 @@ void VideoOutDriver::SubmitFlipPreparation(uint64_t request_id) {
 }
 
 void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer) {
-	m_impl->GetFlipQueue().Prepare(request_id, buffer);
+	m_impl->GetFlipQueue().Prepare(request_id, &buffer);
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {

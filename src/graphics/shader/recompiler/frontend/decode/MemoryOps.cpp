@@ -22,7 +22,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
-    {0x25u, Opcode::S_MEMREALTIME, 2, 32},
+    {0x20u, Opcode::S_DCACHE_INV, 0, 0},          {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
@@ -69,6 +69,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
     {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
+    {0x56u, Opcode::BUFFER_ATOMIC_UMIN_X2, 2, 32},
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
     {0x71u, Opcode::BUFFER_GL0_INV, 0, 0},
@@ -286,6 +287,9 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
 	}
 
+	if (inst.opcode == Opcode::S_DCACHE_INV) {
+		return;
+	}
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	if (inst.opcode == Opcode::S_MEMREALTIME) {
 		inst.src_count = 0;

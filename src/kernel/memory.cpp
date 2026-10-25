@@ -67,7 +67,7 @@ constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
-constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 448ull * 1024ull * 1024ull;
 
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
@@ -85,16 +85,6 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
-static void MapGpuRange(uint64_t vaddr, uint64_t size) {
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
-#endif
-	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
-		return;
-	}
-	GetGpuResources().MapMemory(vaddr, size);
-}
-
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
@@ -103,6 +93,7 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	GetGpuResources().UnmapMemory(vaddr, size);
+	GetGpuResources().GetPageManager().UnmapMemory(vaddr, size);
 }
 
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
@@ -177,6 +168,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+static uint32_t        g_test_protection_updates_before_failure  = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
 static callback_func_t g_test_backing_read                         = nullptr;
 #endif
@@ -207,8 +199,17 @@ static bool IsCommittedRangeType(VirtualRangeType type) {
 }
 
 static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
-	return type == VirtualRangeType::Stack || type == VirtualRangeType::Code ||
-	       type == VirtualRangeType::Runtime;
+	return type == VirtualRangeType::Stack || type == VirtualRangeType::Runtime;
+}
+
+static bool IsFlexibleBackedRangeType(VirtualRangeType type) {
+	return type == VirtualRangeType::Flexible || type == VirtualRangeType::Code;
+}
+
+static VirtualMemory::Mode HostProtectionMode(VirtualRangeType type, VirtualMemory::Mode mode) {
+	if (type != VirtualRangeType::Code) return mode;
+	return VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
+	                                     : VirtualMemory::Mode::ReadWrite;
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -285,17 +286,6 @@ public:
 			return false;
 		}
 		*out = *overlap;
-		return true;
-	}
-
-	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
-		auto position = m_ranges.find(start);
-		if (position != m_ranges.end() && position->second.size == size &&
-		    IsReservedRangeType(position->second.type)) {
-			EraseUnlocked(position);
-		}
 		return true;
 	}
 
@@ -810,6 +800,30 @@ static void                               MemoryPoolSubtractCommitted(uint64_t l
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+static void MapGpuRange(uint64_t vaddr, uint64_t size) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
+#endif
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	const auto end = vaddr + size;
+	for (auto current = vaddr; current < end;) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 1, &range) || range.start >= end) break;
+		const auto begin = std::max(current, range.start);
+		current = std::min(end, range.start + range.size);
+		if (IsCommittedRangeType(range.type)) {
+			VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
+			GpuAccessMode       gpu  = GpuAccessMode::NoAccess;
+			EXIT_IF(!DecodeMemoryProtection(range.protection, &mode, &gpu));
+			mode = HostProtectionMode(range.type, mode);
+			GetGpuResources().GetPageManager().ProtectMemory(begin, current - begin, mode);
+		}
+	}
+	GetGpuResources().MapMemory(vaddr, size);
+}
+
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
@@ -905,8 +919,18 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+	if (resources != nullptr && g_virtual_ranges != nullptr) {
+		VirtualRanges::Range range {};
+		for (uint64_t current = 0; g_virtual_ranges->Query(current, 1, &range);
+		     current = range.start + range.size) {
+			if (IsCommittedRangeType(range.type) && IsGpuAddressRange(range.start, range.size)) {
+				MapGpuRange(range.start, range.size);
+			}
+		}
+	}
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
@@ -2442,11 +2466,6 @@ int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 	return OK;
 }
 
-static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
-	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
-	       g_virtual_ranges->Remove(vaddr, size);
-}
-
 static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, size_t len) {
 	if (IsReservedRangeType(range.type)) {
 		if (!g_guest_address_space->ReleaseFree(vaddr, len)) {
@@ -2454,9 +2473,6 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 		}
 		g_virtual_ranges->Remove(vaddr, len);
 		return OK;
-	}
-	if (range.type == VirtualRangeType::Code || range.type == VirtualRangeType::Runtime) {
-		return FreeGuestMemoryOwner(vaddr, len) ? OK : KERNEL_ERROR_EACCES;
 	}
 
 	GpuAccessMode gpu_mode       = GpuAccessMode::NoAccess;
@@ -2489,11 +2505,10 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 				EXIT_IF(!g_guest_address_space->MapBacking(vaddr, len, direct_offset, direct_mode));
 			}
 		}
-	} else if (range.type == VirtualRangeType::Stack) {
+	} else if (IsPrivateCommittedRangeType(range.type)) {
 		owner_unmapped = g_guest_address_space->ReleaseCommitted(vaddr, len);
 	} else {
-		uint64_t ignored_host = 0;
-		owner_unmapped        = g_flexible_memory->Unmap(vaddr, len, &gpu_mode, &ignored_host);
+		owner_unmapped = g_flexible_memory->Unmap(vaddr, len, &gpu_mode);
 	}
 	if (!owner_unmapped) {
 		return KERNEL_ERROR_EACCES;
@@ -2501,7 +2516,7 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 
 	g_virtual_ranges->Remove(vaddr, len);
 
-	if (g_free_callback != nullptr && IsCommittedRangeType(range.type)) {
+	if (g_free_callback != nullptr && range.type != VirtualRangeType::Runtime) {
 		g_free_callback(vaddr, len);
 	}
 	if (range.type == VirtualRangeType::Pooled) {
@@ -3289,7 +3304,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		    !g_guest_address_space->BackingContains(current, chunk)) {
 			return false;
 		}
-		if (range.type == VirtualRangeType::Flexible &&
+		if (IsFlexibleBackedRangeType(range.type) &&
 		    !g_flexible_memory->Snapshot(current, chunk, &replaced.flexible_blocks)) {
 			return false;
 		}
@@ -3321,7 +3336,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 					    chunk.range.protection, chunk.mode, chunk.gpu_mode, chunk.range.name,
 					    chunk.range.memory_type);
 				}
-			} else if (chunk.range.type == VirtualRangeType::Flexible && chunk.backend_unmapped) {
+			} else if (IsFlexibleBackedRangeType(chunk.range.type) && chunk.backend_unmapped) {
 				host_restored = backend_restored =
 				    g_flexible_memory->Restore(chunk.flexible_blocks);
 			} else if (IsPrivateCommittedRangeType(chunk.range.type) && chunk.host_unmapped) {
@@ -3366,7 +3381,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 				chunk.gpu_mode         = gpu_mode;
 				chunk.backend_unmapped = unmapped;
 			}
-		} else if (chunk.range.type == VirtualRangeType::Flexible) {
+		} else if (IsFlexibleBackedRangeType(chunk.range.type)) {
 			unmapped = g_flexible_memory->Unmap(chunk.range.start, chunk.range.size, &gpu_mode);
 			chunk.host_unmapped    = unmapped;
 			chunk.backend_unmapped = unmapped;
@@ -3439,7 +3454,8 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	}
 
 	for (const auto& chunk: chunks) {
-		if (g_free_callback != nullptr && IsCommittedRangeType(chunk.range.type)) {
+		if (g_free_callback != nullptr && IsCommittedRangeType(chunk.range.type) &&
+		    chunk.range.type != VirtualRangeType::Runtime) {
 			g_free_callback(chunk.range.start, chunk.range.size);
 		}
 	}
@@ -3532,6 +3548,10 @@ void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
 
 void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps) {
 	g_test_backing_store_unmaps_before_failure = successful_unmaps;
+}
+
+void TestFailGuestProtectionAfter(uint32_t successful_updates) {
+	g_test_protection_updates_before_failure = successful_updates;
 }
 
 void TestFailNextFixedReserveRangeRegistration() {
@@ -3754,20 +3774,49 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	UnmapGpuRange(vaddr, mapped_size);
-	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
+	const auto protection = ProgramProtection(mode);
+	const auto host_mode  = HostProtectionMode(type, mode);
+	const bool mapped     = type == VirtualRangeType::Code
+	                            ? g_flexible_memory->Map(vaddr, mapped_size, protection, host_mode,
+	                                                     GpuAccessMode::NoAccess, name)
+	                            : g_guest_address_space->Commit(vaddr, mapped_size, mode);
+	if (!mapped) {
 		return 0;
 	}
-	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, ProgramProtection(mode), 0, type, name)) {
-		EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
+	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, protection, 0, type, name)) {
+		GpuAccessMode gpu_mode = GpuAccessMode::NoAccess;
+		EXIT_IF(type == VirtualRangeType::Code
+		            ? !g_flexible_memory->Unmap(vaddr, mapped_size, &gpu_mode)
+		            : !g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
 		return 0;
 	}
 	MapGpuRange(vaddr, mapped_size);
+	if (type != VirtualRangeType::Runtime && g_alloc_callback != nullptr) {
+		g_alloc_callback(vaddr, mapped_size);
+	}
 	return vaddr;
 }
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
                                const char* name) {
 	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
+}
+
+static bool ProtectAddressSpaceRange(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_protection_updates_before_failure == 0) {
+		g_test_protection_updates_before_failure = UINT32_MAX;
+		return false;
+	}
+	if (g_test_protection_updates_before_failure != UINT32_MAX) {
+		g_test_protection_updates_before_failure--;
+	}
+#endif
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		GetGpuResources().GetPageManager().ProtectMemory(vaddr, size, mode);
+		return true;
+	}
+	return g_guest_address_space->Protect(vaddr, size, mode);
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -3781,10 +3830,11 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 		     vaddr, size);
 	}
 
-	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
-	                                                      : VirtualMemory::Mode::ReadWrite;
-	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
-	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
+	const auto protection = ProgramProtection(mode);
+	const auto host_mode  = HostProtectionMode(VirtualRangeType::Code, mode);
+	EXIT_IF(!ProtectAddressSpaceRange(vaddr, size, host_mode));
+	g_flexible_memory->Protect(vaddr, size, protection, host_mode, GpuAccessMode::NoAccess);
+	g_virtual_ranges->Protect(vaddr, size, protection);
 }
 
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
@@ -3795,12 +3845,7 @@ uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size, VirtualMemor
 
 uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
                                   const char* name) {
-	const auto vaddr =
-	    AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Stack, false);
-	if (vaddr != 0 && g_alloc_callback != nullptr) {
-		g_alloc_callback(vaddr, size);
-	}
-	return vaddr;
+	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Stack, false);
 }
 
 bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
@@ -3813,15 +3858,31 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	const auto aligned_addr = vaddr & ~(GuestPageSize - 1u);
 	const auto aligned_size =
 	    (size + (vaddr - aligned_addr) + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
-	const auto ranges = RequireGuestRuntimeMemory(aligned_addr, aligned_size);
+	const auto ranges     = RequireGuestRuntimeMemory(aligned_addr, aligned_size);
+	const auto protection = ProgramProtection(mode);
 	if (old_mode != nullptr) {
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
-	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
-		return false;
+	for (size_t updated = 0; updated < ranges.size(); ++updated) {
+		const auto& range = ranges[updated];
+		if (!ProtectAddressSpaceRange(range.start, range.size, HostProtectionMode(range.type, mode))) {
+			while (updated != 0) {
+				const auto& previous = ranges[--updated];
+				const auto previous_mode = static_cast<VirtualMemory::Mode>(
+				    previous.protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
+				EXIT_IF(!ProtectAddressSpaceRange(previous.start, previous.size,
+				                                  HostProtectionMode(previous.type, previous_mode)));
+			}
+			return false;
+		}
 	}
-	g_virtual_ranges->Protect(aligned_addr, aligned_size, ProgramProtection(mode));
+	for (const auto& range: ranges) {
+		const auto host_mode = HostProtectionMode(range.type, mode);
+		g_flexible_memory->Protect(range.start, range.size, protection, host_mode,
+		                           GpuAccessMode::NoAccess);
+		g_virtual_ranges->Protect(range.start, range.size, protection);
+	}
 	return true;
 }
 
@@ -3838,9 +3899,21 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
-	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
+	const auto ranges      = RequireGuestRuntimeMemory(vaddr, mapped_size);
 	UnmapGpuRange(vaddr, mapped_size);
-	return FreeGuestMemoryOwner(vaddr, mapped_size);
+	for (size_t i = 0; i < ranges.size();) {
+		const auto& range     = ranges[i];
+		const auto  run_start = range.start;
+		auto        run_end   = run_start + range.size;
+		for (++i; i < ranges.size() && ranges[i].type == range.type; ++i) {
+			run_end = ranges[i].start + ranges[i].size;
+		}
+		if (UnmapMemoryOwner(range, run_start, run_end - run_start) != OK) {
+			MapGpuRange(run_start, vaddr + mapped_size - run_start);
+			return false;
+		}
+	}
+	return true;
 }
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
@@ -3880,19 +3953,18 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
-	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
-
-	if (!ok) {
-		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " prot=0x%08x\n",
-		     aligned_addr, aligned_len, prot);
-	}
 	for (const auto& old_range: old_ranges) {
+		const auto host_mode = HostProtectionMode(old_range.type, mode);
+		if (!ProtectAddressSpaceRange(old_range.start, old_range.size, host_mode)) {
+			EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " prot=0x%08x\n",
+			     old_range.start, old_range.size, prot);
+		}
 		if (old_range.type == VirtualRangeType::Direct) {
 			g_physical_memory->ProtectMapping(old_range.start, old_range.size, prot, mode,
 			                                  gpu_mode);
-		} else if (old_range.type == VirtualRangeType::Flexible) {
-			g_flexible_memory->Protect(old_range.start, old_range.size, prot, mode, gpu_mode);
+		} else if (IsFlexibleBackedRangeType(old_range.type)) {
+			g_flexible_memory->Protect(old_range.start, old_range.size, prot, host_mode, gpu_mode);
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);

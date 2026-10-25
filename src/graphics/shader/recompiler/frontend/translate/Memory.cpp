@@ -967,6 +967,9 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
+		case Decoder::Opcode::S_DCACHE_INV:
+			ir.Emit(IR::ValueOpcode::ScalarCacheInvalidate);
+			return;
 		case Decoder::Opcode::S_MEMREALTIME:
 			return WriteU32Pair(inst.dst,
 			                    ExtractU64(IR::U64(ir.Emit(IR::ValueOpcode::ReadRealtimeClock))));
@@ -1031,6 +1034,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMIN:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin32);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin64);
 		case Decoder::Opcode::BUFFER_ATOMIC_SMAX:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMax32);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMAX:

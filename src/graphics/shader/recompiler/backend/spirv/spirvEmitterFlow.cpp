@@ -50,15 +50,17 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
-	if (kind == IR::StageInputKind::FrontFacing) {
+	if (kind == IR::StageInputKind::HelperInvocation || kind == IR::StageInputKind::FrontFacing) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
 		// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects uint masks or float +/-1.
-		const bool all_bits = state.input_info.pixel->ps_front_face_all_bits;
-		const auto front = ConstantU32(state, all_bits ? 0xffffffffu : 0x3f800000u);
-		const auto back  = ConstantU32(state, all_bits ? 0u : 0xbf800000u);
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value, front, back);
+		const bool helper   = kind == IR::StageInputKind::HelperInvocation;
+		const bool all_bits = !helper && state.input_info.pixel->ps_front_face_all_bits;
+		const auto true_bits  = helper ? 1u : (all_bits ? 0xffffffffu : 0x3f800000u);
+		const auto false_bits = helper || all_bits ? 0u : 0xbf800000u;
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value,
+		                          ConstantU32(state, true_bits), ConstantU32(state, false_bits));
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
@@ -702,6 +704,11 @@ void EmitDataCacheInvalidate(EmitterState& state) {
 	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
 	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
+}
+
+void EmitScalarCacheInvalidate(EmitterState& state) {
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask));
 }
 
 void EmitBarrier(EmitterState& state) {

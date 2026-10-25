@@ -187,7 +187,9 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	const auto tick = CurrentTick() - 1;
+	m_master.Wait(tick);
+	WaitPriorityOperations(tick);
 	BeginNext();
 	PopPendingOperations();
 }

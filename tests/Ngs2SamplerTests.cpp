@@ -740,13 +740,13 @@ bool Near(double value, double expected, double tolerance) {
 	return std::abs(value - expected) <= tolerance;
 }
 
-// The submixer compressor model (see Ngs2Compressor): static curve, knee, envelope and keying.
+// Checks the submixer compressor model (see Ngs2Compressor), its curve, knee, envelope and keying.
 void TestCompressorDsp() {
 	constexpr uint32_t Rate = 1000;
 	Ngs2Compressor     compressor;
 	Check(!compressor.Enabled(), "a reset compressor was enabled");
 
-	// Limiter (flags 0x1): 6 dB over a threshold of 1.0 with ratio 0.01 comes out 0.06 dB over.
+	// As a limiter (flags 0x1), 6 dB over a threshold of 1.0 at ratio 0.01 comes out 0.06 dB over.
 	compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 0.0f), Rate);
 	float loud[] = {2.0f};
 	compressor.Process(loud, nullptr, 1, 1);
@@ -755,13 +755,13 @@ void TestCompressorDsp() {
 	compressor.Process(quiet, nullptr, 1, 1);
 	Check(quiet[0] == 0.5f, "the limiter changed a signal under its threshold");
 
-	// Soft knee: at the threshold, a 6 dB knee gives (1 - ratio) * 3^2 / 12 dB of reduction.
+	// At the threshold, a 6 dB soft knee gives (1 - ratio) * 3^2 / 12 dB of reduction.
 	compressor.Configure(CompressorParam(0x1, 0.5f, 0.0f, 6.0f, 0.0f, 0.0f), Rate);
 	float knee[] = {0.5f};
 	compressor.Process(knee, nullptr, 1, 1);
 	Check(Near(knee[0], 0.5 * std::pow(10.0, -0.75 / 20.0), 1e-5), "the soft knee is wrong");
 
-	// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices): the RMS detector
+	// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices). The RMS detector
 	// compares power with the threshold, so a key of 0.1 (power 0.01) is 10 dB over 0.001 and
 	// reduces the signal by 10 * (1 - ratio) dB once the RMS window fills. The main signal's own
 	// level is ignored.
@@ -778,7 +778,7 @@ void TestCompressorDsp() {
 	compressor.Process(signal.data(), nullptr, 1, Rate);
 	Check(signal[Rate - 1] == 0.5f, "the compressor did not recover without a key");
 
-	// Attack and release smooth the reduction: the key takes time to duck the signal, and the
+	// Attack and release smooth the reduction, so the key takes time to duck the signal, and the
 	// signal returns gradually once the key stops.
 	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.1f, 5.0f), Rate);
 	std::fill(signal.begin(), signal.end(), 0.5f);
@@ -830,14 +830,23 @@ void TestSubmixerCompressorVoice() {
 	speech.Queue(pcm, 2, 0);
 	const std::vector<Ngs2VoiceInternal*> voices {&music.voice, &speech.voice};
 	Ngs2RenderVoice(submixer, voices, 1);
-	// The key is 250 times the threshold; above it the level rises by 0.25 per input dB.
+	// The key is 250 times the threshold, and above it the level rises by 0.25 per input dB.
 	Check(submixer.has_samples && Near(submixer.samples[0], 0.25 * std::pow(250.0, -0.75), 1e-6),
 	      "the side-chain input did not duck the submixer");
+	Ngs2SubmixerVoiceState state {};
+	Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&submixer), &state.voice_state,
+	                        sizeof(state)) == OK &&
+	          Near(state.compressor_height, std::pow(250.0, -0.75), 1e-6),
+	      "the submixer state did not report the compressor gain");
 	speech.voice.ports.clear();
 	music.voice.rendered = speech.voice.rendered = submixer.rendered = false;
 	Ngs2RenderVoice(submixer, voices, 1);
 	Check(submixer.has_samples && submixer.samples[0] == 0.25f,
 	      "the submixer stayed ducked without a key");
+	Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&submixer), &state.voice_state,
+	                        sizeof(state)) == OK &&
+	          state.compressor_height == 1.0f,
+	      "the submixer state kept a gain reduction without a key");
 }
 
 uint32_t g_side_chain_flags = 0;

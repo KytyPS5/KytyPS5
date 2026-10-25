@@ -74,29 +74,40 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		const auto  address    = descriptor.Base48();
-		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
-		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
-		if ((!resource.written || resource.read) && cache.IsMeta(address)) {
-			return false;
-		}
+		// An unbound slot has a null descriptor; the shader cannot access memory through it.
 		if (address == 0) {
 			continue;
 		}
-		if (resource.read && (descriptor.NumRecords() == UINT32_MAX ||
-		                      descriptor.GetSize() > MaxClearConstantsBytes)) {
-			return false;
-		}
+		// An unbounded descriptor (NumRecords = 0xffffffff) does not say how much memory the
+		// shader touches; the shader's own addressing decides.
+		const bool bounded   = descriptor.NumRecords() != UINT32_MAX;
+		uint64_t   meta_size = 0;
+		const bool is_meta   = cache.FindMeta(address, meta_size);
 		if (!resource.written) {
+			// A metadata surface bound without being written is input to the dispatch, so the
+			// dispatch is not a full overwrite. Execute it conservatively instead of replacing it
+			// with a coarse full-surface clear.
+			if (is_meta) {
+				return false;
+			}
+			// A clear reads only a few constants (the clear value, the surface layout). A larger
+			// or unbounded read is real data being copied or transformed, as in PPSA09809's
+			// scene-buffer upload onto reused HTILE memory.
+			if (resource.read && (!bounded || descriptor.GetSize() > MaxClearConstantsBytes)) {
+				return false;
+			}
 			continue;
 		}
-		uint64_t meta_size = 0;
-		if (!cache.FindMeta(address, meta_size) || meta_size == 0) {
-			return false;
-		}
-		// An unbounded descriptor (NumRecords = 0xffffffff) is how clear shaders commonly address
-		// a whole surface; its extent is the shader's, not the descriptor's. Such a dispatch is
-		// still held to writing only metadata from constants above.
-		if (descriptor.NumRecords() != UINT32_MAX && descriptor.GetSize() > meta_size) {
+		// A written buffer must be a metadata surface of known size that is only overwritten.
+		// Reject it when it is:
+		// - read as well: the new contents depend on the old ones, so this is not a fill;
+		// - not metadata: the dispatch writes other memory, which a clear would drop;
+		// - size unknown: nothing bounds how much memory the write may reach;
+		// - bounded and larger than the surface: the write continues into other data.
+		// An unbounded descriptor is how clear shaders commonly address a whole surface, so it is
+		// accepted; the read checks above still hold such a dispatch to constant inputs.
+		if (resource.read || !is_meta || meta_size == 0 ||
+		    (bounded && descriptor.GetSize() > meta_size)) {
 			return false;
 		}
 		any_meta = true;

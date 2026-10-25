@@ -1950,6 +1950,8 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	return true;
 }
 
+// Looks up the metadata surface registered at `address` and returns its largest registered size
+// in `size`. Returns false when no surface is registered there; `size` is then left unchanged.
 bool TextureCache::FindMeta(uint64_t address, uint64_t& size) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);

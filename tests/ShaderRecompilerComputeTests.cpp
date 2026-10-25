@@ -384,6 +384,8 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
+  // Registers an uncleared HTILE metadata surface at `address`, as a depth-target bind would.
+  // `size` is the surface's byte size; 0 leaves it unknown.
   static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
                                 uint64_t size = 0) {
     std::lock_guard lock(cache.m_lock);
@@ -5841,6 +5843,8 @@ public:
     // A game can free a depth target and reuse its HTILE memory for other data while the
     // metadata entry remains. Writing that address is then not a clear unless the dispatch
     // writes only metadata, within the surface, from constants (PPSA09809 scene-buffer copies).
+    // Adds a buffer binding of `records` 16-byte elements at `address` to the shader metadata
+    // and its descriptor to the resource snapshot.
     const auto AddBuffer = [](uint64_t address, bool read, bool written, uint32_t records,
                               ShaderRecompiler::IR::CompiledShaderInfo &program,
                               ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
@@ -5863,6 +5867,7 @@ public:
       std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
       snapshot.buffers.push_back(value);
     };
+    // Wraps a shader and its bound resources as compute dispatch input.
     const auto MakeDispatch = [](ShaderRecompiler::IR::CompiledShaderInfo &program,
                                  ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
       ShaderComputeInputInfo input{};

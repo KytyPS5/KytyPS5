@@ -444,12 +444,27 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
 		                       static_cast<uint32_t>(mesh.fast_launch)});
 	}
-	key.push_back(info.tess.input_control_points);
+	key.push_back(info.tess.input_control_points != 0 ? 1u : 0u);
 	if (info.tess.input_control_points != 0) {
+		// Only the tessellation fields a stage's translation reads: the LS writes its outputs at
+		// ls_stride; the TES reads the HS outputs and sets the domain modes; the HS uses all.
+		// A shared LS or TES paired with differently sized patches is then one program instead
+		// of one per pairing, each translated and compiled again.
 		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
-		                       tess.output_topology});
+		switch (info.logical_stage) {
+			case ShaderType::Local: key.push_back(tess.ls_stride); break;
+			case ShaderType::TessellationEvaluation:
+				key.insert(key.end(), {tess.output_control_points, tess.hs_stride, tess.patch_base,
+				                       tess.patch_size, tess.domain, tess.partitioning,
+				                       tess.output_topology});
+				break;
+			default:
+				key.insert(key.end(), {tess.input_control_points, tess.output_control_points,
+				                       tess.ls_stride, tess.hs_stride, tess.patch_base,
+				                       tess.patch_size, tess.domain, tess.partitioning,
+				                       tess.output_topology});
+				break;
+		}
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {

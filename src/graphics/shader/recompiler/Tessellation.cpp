@@ -294,9 +294,13 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 		           : value;
 	}
 	// Pure address arithmetic that stays behind EXEC selects; mul24 lowers to IMul32 of BFEs.
+	// Shifts and masks too: GT7's patch-constant addresses are shifted and masked forms of the
+	// patch ordinal, computed under a narrower EXEC than the store's.
 	const auto opcode = source->GetOpcode();
 	if (opcode != ValueOpcode::IAdd32 && opcode != ValueOpcode::ISub32 &&
-	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract)
+	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract &&
+	    opcode != ValueOpcode::ShiftLeftLogical32 && opcode != ValueOpcode::ShiftRightLogical32 &&
+	    opcode != ValueOpcode::BitwiseAnd32 && opcode != ValueOpcode::BitwiseOr32)
 		return value;
 	std::array<Value, 3> args;
 	bool                 changed = false;

@@ -2337,10 +2337,11 @@ void TestBoundedComputeImageLoop() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == material && indirect->table_offset == 0x6b0u,
           "bounded compute loop lost its image table");
-    // A constant post-tested bound limits the key statically, so samples select heap slots.
+    // A constant post-tested bound limits the key statically, so samples select heap slots. A
+    // latch on the carried key runs it through the bound.
     if (post_test)
-      Check(indirect->table_maximum == post_bound - 1u && indirect->table_scalar &&
-                indirect->key_count.IsEmpty(),
+      Check(indirect->table_maximum == (post == PostTest::Previous ? post_bound : post_bound - 1u) &&
+                indirect->table_scalar && indirect->key_count.IsEmpty(),
             "post-tested image loop did not bound its heap by the constant count");
     else
       Check(first == 0u ? indirect->key_count.Resolve() == count.Resolve()
@@ -2401,7 +2402,9 @@ void TestBoundedComputeImageLoop() {
     return make_plan(variant, false, first, Clamp::None, post, bound);
   };
   post_test_plan(PostTest::Signed, 6u, 0u, Variant::ForwardedChain);
-  for (const auto post : {PostTest::WrongPolarity, PostTest::Previous, PostTest::Bypass,
+  // DS DC cs 0xb599c995ebc4a8dd continues while the key it began with is below 15.
+  post_test_plan(PostTest::Previous, 0u);
+  for (const auto post : {PostTest::WrongPolarity, PostTest::Bypass,
                           PostTest::Variable, PostTest::AnyLane})
     CheckFatal([&] { post_test_plan(post); }, "not a valid runtime value",
                "post-tested image loop accepted an unproved carried-edge bound");
@@ -2451,6 +2454,21 @@ void TestBoundedComputeImageLoop() {
                 snapshot.images.back().dwords[0] == 0x100u + count - 1u,
             "post-tested image loop did not enumerate precisely zero through bound minus one");
     }
+  }
+  for (const auto count : {5u, 0u}) {
+    const auto post_plan = post_test_plan(PostTest::Previous, count);
+    memory.fail_address = table + (count + 1u) * 32u;
+    FakeImageHeap heap;
+    auto resident = runtime;
+    resident.image_heap = &heap;
+    Check(MaterializeResources(post_plan, resident, snapshot, specialization) &&
+              heap.requests.size() == 1u && heap.requests[0].base == table &&
+              heap.requests[0].size == (count + 1u) * 32u && heap.requests[0].count == count + 1u,
+          "post-tested image loop did not request a heap through a carried-key bound");
+    Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == count + 2u && snapshot.images[1].dwords[0] == 0x100u &&
+              snapshot.images.back().dwords[0] == 0x100u + count,
+          "post-tested image loop did not enumerate a carried-key bound through the bound");
   }
   memory.fail_address = UINT64_MAX;
   for (const uint32_t count : {2u, 3u, 2u}) {

@@ -1864,27 +1864,33 @@ private:
 		const auto [phi, step, initial_arm] = *induction;
 		const auto* incoming = phi->PhiBlock(initial_arm ^ 1u);
 		if (incoming == nullptr) return UINT32_MAX;
-		for (const auto& use: step->Uses()) {
-			const auto* compare = use.user;
-			uint32_t bound = 0;
-			if (use.operand != 0u ||
-			    (compare->GetOpcode() != ValueOpcode::SLessThan32 &&
-			     compare->GetOpcode() != ValueOpcode::ULessThan32) ||
-			    !ImmediateU32(compare->Arg(1), bound) || bound == 0u ||
-			    (compare->GetOpcode() == ValueOpcode::SLessThan32 && bound > INT32_MAX) ||
-			    !AvailableBefore(*step, *compare)) continue;
-			const auto accepts = [&](const EdgePredicate& edge) {
-				return edge.positive && edge.lanes == LaneQuantifier::All &&
-				       Implies(edge.condition, Value(const_cast<Inst*>(compare)));
-			};
-			const auto edge = ConditionalEdge(incoming, phi->Parent());
-			if ((edge && accepts(*edge)) || GuardedOnEntry(incoming, [&](const Block* block) {
-				// A guard before the increment may belong to the previous iteration.
-				return block == phi->Parent() || block == step->Parent();
-			}, accepts)) {
-				// Starting at zero, next < bound keeps the carried value in range;
-				// incrementing bound - 1 cannot overflow either accepted comparison domain.
-				return bound - 1u;
+		const auto carried = ConditionalEdge(incoming, phi->Parent());
+		const auto stops   = [&](const Block* block) {
+			// A guard before the increment may belong to the previous iteration.
+			return block == phi->Parent() || block == step->Parent();
+		};
+		// The carried edge tests either the next value or the value the iteration began with.
+		for (const auto* compared: {step, phi}) {
+			const bool next = compared == step;
+			for (const auto& use: compared->Uses()) {
+				const auto* compare = use.user;
+				uint32_t    bound   = 0;
+				if (use.operand != 0u ||
+				    (compare->GetOpcode() != ValueOpcode::SLessThan32 &&
+				     compare->GetOpcode() != ValueOpcode::ULessThan32) ||
+				    !ImmediateU32(compare->Arg(1), bound) || (next && bound == 0u) ||
+				    (compare->GetOpcode() == ValueOpcode::SLessThan32 && bound > INT32_MAX) ||
+				    (next && !AvailableBefore(*step, *compare)))
+					continue;
+				const auto accepts = [&](const EdgePredicate& edge) {
+					return edge.positive && edge.lanes == LaneQuantifier::All &&
+					       Implies(edge.condition, Value(const_cast<Inst*>(compare)));
+				};
+				if ((carried && accepts(*carried)) || GuardedOnEntry(incoming, stops, accepts)) {
+					// Starting at zero, next < bound carries at most bound - 1 and key < bound at
+					// most bound; neither increment can overflow the accepted comparison domain.
+					return next ? bound - 1u : bound;
+				}
 			}
 		}
 		return UINT32_MAX;

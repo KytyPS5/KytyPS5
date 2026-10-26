@@ -6,6 +6,7 @@
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/ngs2_reverb.h"
 
 #include <algorithm>
 #include <array>

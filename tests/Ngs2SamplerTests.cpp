@@ -836,6 +836,286 @@ void TestPitchClamps() {
 	      "pitch was not clamped to four times playback speed");
 }
 
+Ngs2ReverbI3dl2Param ReverbParam(float decay, int32_t reflections, int32_t reverb, float dry = 0.0f) {
+	Ngs2ReverbI3dl2Param param {};
+	param.wet               = 1.0f;
+	param.dry               = dry;
+	param.room              = 0;
+	param.room_hf           = 0;
+	param.decay_time        = decay;
+	param.decay_hf_ratio    = 1.0f;
+	param.reflections       = reflections;
+	param.reflections_delay = 0.0f;
+	param.reverb            = reverb;
+	param.reverb_delay      = 0.0f;
+	param.diffusion         = 100.0f;
+	param.density           = 100.0f;
+	param.hf_reference      = 5000.0f;
+	return param;
+}
+
+double WindowRms(const std::vector<float>& signal, double from, double to) {
+	const auto begin = static_cast<size_t>(from * 48000), end = static_cast<size_t>(to * 48000);
+	double     sum   = 0;
+	for (size_t i = begin; i < end; ++i) {
+		sum += double(signal[i]) * signal[i];
+	}
+	return std::sqrt(sum / double(end - begin));
+}
+
+// The custom reverb module (0x1b). The late reverb decays by 60 dB over decayTime, the tail ends
+// once it is 120 dB down, muted I3DL2 levels are inaudible, and dry passes the input through.
+void TestCustomReverbDsp() {
+	constexpr uint32_t grain = 256, channels = 2;
+	Ngs2Reverb         reverb;
+	reverb.Configure(ReverbParam(1.0f, -10000, 0), 48000);
+	std::vector<float> left;
+	std::vector<float> block(size_t(grain) * channels);
+	for (uint32_t b = 0; b < 48000 * 3 / grain; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = block[grain] = 1.0f; // An impulse on both channels, after the fade-in grain.
+		}
+		reverb.Process(block.data(), channels, grain);
+		left.insert(left.end(), block.begin(), block.begin() + grain);
+	}
+	const double early = WindowRms(left, 0.10, 0.15), late = WindowRms(left, 0.40, 0.45);
+	Check(early > 0, "reverb produced no tail for an impulse");
+	const double drop_db = 20.0 * std::log10(early / late);
+	Check(drop_db > 12.0 && drop_db < 24.0, "reverb tail does not decay at about 60 dB per decayTime");
+	Check(!reverb.HasTail() && std::ranges::all_of(left.end() - grain * 20, left.end(),
+	                                               [](float sample) { return sample == 0.0f; }),
+	      "reverb tail did not end after twice decayTime");
+
+	// -10000 mB is the library's floor (-100 dB), not silence, but what is left is inaudible.
+	Ngs2Reverb muted;
+	muted.Configure(ReverbParam(1.0f, -10000, -10000), 48000);
+	for (int b = 0; b < 40; ++b) {
+		std::ranges::fill(block, 0.5f);
+		muted.Process(block.data(), channels, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::abs(sample) < 1e-4f; }),
+		      "muted reverb with dry 0 was audible");
+	}
+	Ngs2Reverb dry;
+	dry.Configure(ReverbParam(1.0f, -10000, -10000, 1.0f), 48000);
+	std::ranges::fill(block, 0.5f);
+	dry.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return std::abs(sample - 0.5f) < 1e-4f; }),
+	      "muted reverb with dry 1 did not pass the input through");
+}
+
+// Golden outputs of the PS4 libSceNgs2 I3DL2 reverb, from AnyPS5 (GPL-2.0) commit
+// e15f1644e384ab055f721347a4d31cdff02e9a47 (core/libs/prx/libSceNgs2.native/tests/Ngs2Render.cpp).
+// Each case is an impulse (or noise) at frame 3 of a 4096-frame input, rendered in 256-sample
+// grains, with an optional settings change before one grain.
+struct ReverbFrame {
+	uint32_t           frame;
+	std::vector<float> samples;
+};
+
+struct ReverbCase {
+	uint32_t             channels;
+	float                amplitude;
+	bool                 noise;
+	Ngs2ReverbI3dl2Param params;
+	int32_t              changeGrain;
+	Ngs2ReverbI3dl2Param change;
+	std::vector<ReverbFrame> expected;
+};
+
+std::vector<float> RenderReverbCase(const ReverbCase& reverb_case) {
+	const uint32_t       channels = reverb_case.channels;
+	std::vector<int16_t> pcm(4096 * channels, 0);
+	uint32_t             seed = 1;
+	for (uint32_t i = 0; reverb_case.noise && i + 3 * channels < pcm.size(); i++) {
+		seed = seed * 1664525u + 1013904223u;
+		if (i < 3000 * channels) {
+			pcm[i + 3 * channels] =
+			    static_cast<int16_t>(static_cast<int32_t>((seed >> 16) & 0x3fff) - 0x2000);
+		}
+	}
+	for (uint32_t c = 0; !reverb_case.noise && c < channels; c++) {
+		pcm[3 * channels + c] = static_cast<int16_t>(
+		    (16384 - 4000 * static_cast<int32_t>(c)) * reverb_case.amplitude);
+	}
+	Ngs2Reverb reverb;
+	reverb.Configure(reverb_case.params, 48000);
+	std::vector<float> all;
+	std::vector<float> block(size_t(256) * channels);
+	for (uint32_t grain = 0; grain * 256 < 32256; grain++) {
+		if (static_cast<int32_t>(grain) == reverb_case.changeGrain) {
+			reverb.Configure(reverb_case.change, 48000);
+		}
+		std::ranges::fill(block, 0.0f);
+		for (uint32_t i = 0; i < 256; i++) {
+			const uint32_t frame = grain * 256 + i;
+			for (uint32_t c = 0; frame < 4096 && c < channels; c++) {
+				block[c * 256 + i] = pcm[frame * channels + c] / 32768.0f;
+			}
+		}
+		reverb.Process(block.data(), channels, 256);
+		for (uint32_t i = 0; i < 256; i++) {
+			for (uint32_t c = 0; c < channels; c++) {
+				all.push_back(block[c * 256 + i]);
+			}
+		}
+	}
+	return all;
+}
+
+// The custom reverb module (0x1b) matches the PS4 library's I3DL2 reverb. The cases cover impulse
+// and noise responses for several settings, in stereo and 5.1, with out-of-range values and with
+// settings changes.
+void TestCustomReverbMatchesLibrary() {
+	const Ngs2ReverbI3dl2Param cave{1.0f, 0.0f, -1000, 0, 0, 2.91f, 1.3f,
+	    -602, 0.015f, -302, 0.022f, 100.0f, 100.0f, 5000.0f, {}};
+	auto changed = cave;
+	changed.reflection_pattern = 5;
+	changed.decay_time = 0.7f;
+	changed.decay_hf_ratio = 0.6f;
+	changed.reflections_delay = 0.004f;
+	changed.reverb_delay = 0.03f;
+	changed.room_hf = -900;
+	changed.wet = 0.6f;
+	changed.dry = 0.4f;
+	auto denser = cave;
+	denser.density = 99.999f;
+	const Ngs2ReverbI3dl2Param small_room{1.0f, 0.0f, -500, -800, 3, 1.2f, 0.5f,
+	    -300, 0.01f, 0, 0.03f, 80.0f, 60.0f, 3000.0f, {}};
+	const Ngs2ReverbI3dl2Param surround{1.0f, 0.2f, -200, -300, 12, 1.0f, 0.9f,
+	    -100, 0.03f, -100, 0.04f, 70.0f, 90.0f, 4000.0f, {}};
+	const Ngs2ReverbI3dl2Param out_of_range{40.0f, -3.0f, 5000, 500, 20, 50.0f, 5.0f,
+	    3000, 0.9f, 5000, 0.9f, 300.0f, 300.0f, 50000.0f, {}};
+	const Ngs2ReverbI3dl2Param short_delays{1.0f, 0.3f, 0, -200, 15, 0.8f, 1.0f,
+	    0, 0.002f, -500, 0.004f, 60.0f, 80.0f, 6000.0f, {}};
+	const std::vector<ReverbCase> cases = {
+	    // The cave settings, an impulse in stereo.
+	    {2, 1.0f, false, cave, -1, {},
+	     {
+	         {100, {0, 0}},
+	         {723, {0.0687032491f, 0.0687032491f}},
+	         {1055, {0.0392590016f, 0.0392590016f}},
+	         {1417, {0.0131517649f, 0.0131517649f}},
+	         {1779, {0.0098147504f, 0.0098147504f}},
+	         {2500, {0, 0}},
+	         {4000, {1.45101382e-07f, -1.15403088e-06f}},
+	         {6000, {0.000655628915f, 3.03641864e-05f}},
+	         {9000, {0.000400578661f, -0.000684358703f}},
+	         {12000, {0.000191548112f, 0.000220489033f}},
+	         {16000, {0.000210488462f, 0.000146183695f}},
+	         {20000, {2.41150738e-05f, -0.000864534522f}},
+	         {26000, {0.000125532999f, -0.000234790568f}},
+	         {32000, {-0.000462158496f, 4.56995949e-05f}},
+	     }},
+	    // A smaller, duller room with reflection pattern 3, where the highs fade sooner.
+	    {2, 1.0f, false, small_room, -1, {},
+	     {
+	         {100, {0, 0}},
+	         {723, {0.000166983227f, 0.000166983227f}},
+	         {1055, {-3.41919585e-05f, -3.41919585e-05f}},
+	         {1417, {0, 0}},
+	         {1779, {0, 0}},
+	         {2500, {0, 1.55222626e-08f}},
+	         {4000, {-0.000106364969f, 9.90879998e-05f}},
+	         {6000, {0.00013573296f, 7.22560799e-06f}},
+	         {9000, {-7.91876082e-05f, 0.000225067721f}},
+	         {12000, {0.000150469248f, 0.00036288987f}},
+	         {16000, {-7.86288219e-05f, -0.000195921995f}},
+	         {20000, {1.01910318e-05f, 5.79599109e-05f}},
+	         {26000, {2.14232614e-06f, -2.05506512e-05f}},
+	         {32000, {-4.31467561e-06f, 2.34100444e-05f}},
+	     }},
+	    // 5.1 with reflection pattern 12, which may run past the late feed. The LFE stays dry.
+	    {6, 1.0f, false, surround, -1, {},
+	     {
+	         {6000, {-0.000167909253f, -0.000179917421f, -0.000647808949f, 0, 3.22720189e-05f, 0.000213803389f}},
+	         {9000, {8.47857882e-05f, 8.62322413e-05f, -0.000100753634f, 0, 0.000109430795f, -0.000122895101f}},
+	         {12000, {4.37544441e-05f, 3.58103216e-06f, -0.00013746327f, 0, 9.3237948e-05f, -0.00013529828f}},
+	         {16000, {8.63046807e-08f, 1.62214419e-05f, 8.89167641e-05f, 0, 1.02178528e-05f, 0.000201705057f}},
+	         {20000, {-9.6526619e-06f, -2.73812566e-05f, -1.92096536e-07f, 0, -0.000116049101f, 6.94858772e-06f}},
+	         {26000, {1.27750207e-06f, -1.59169917e-06f, 5.30674515e-05f, 0, -3.59285696e-05f, 5.16466662e-06f}},
+	         {32000, {3.5737969e-06f, 4.19655044e-06f, -2.30460955e-07f, 0, 1.16596939e-05f, 1.14889262e-05f}},
+	     }},
+	    // The cave settings, changed at grain 6 to shorter, darker settings with pattern 5.
+	    {2, 1.0f, false, cave, 6, changed,
+	     {
+	         {723, {0.0687032491f, 0.0687032491f}},
+	         {1055, {0.0392590016f, 0.0392590016f}},
+	         {1417, {0.0131517649f, 0.0131517649f}},
+	         {1779, {4.38156894e-05f, 4.38156894e-05f}},
+	         {2500, {0, 0}},
+	         {4000, {-1.60370582e-05f, -4.44955149e-05f}},
+	         {6000, {1.02755057e-05f, 8.34046841e-06f}},
+	         {9000, {1.1641363e-05f, -4.69685165e-06f}},
+	         {12000, {3.57917179e-06f, -2.34550089e-06f}},
+	         {16000, {-8.00212234e-08f, 3.19533115e-06f}},
+	         {20000, {5.66619519e-07f, 4.26969848e-07f}},
+	         {26000, {1.46052287e-07f, -2.44572629e-08f}},
+	         {32000, {-4.45668853e-08f, 1.51349102e-08f}},
+	     }},
+	    // Every setting out of range, so the library's clamps apply. A quiet impulse.
+	    {2, 0.02f, false, out_of_range, -1, {},
+	     {
+	         {14403, {0.877262115f, 0.877262115f}},
+	         {14500, {0, 0}},
+	         {15000, {0, 0}},
+	         {15500, {0, 7.50572099e-07f}},
+	         {16000, {4.95207075e-07f, 6.37215771e-06f}},
+	         {20000, {0.00482429564f, -0.00149071764f}},
+	         {26000, {-0.0096597122f, 0.00718426611f}},
+	         {32000, {0.0107425917f, -0.000738018774f}},
+	     }},
+	    // Very short delays with pattern 15.
+	    {2, 1.0f, false, short_delays, -1, {},
+	     {
+	         {60, {0, 0}},
+	         {99, {0.0947210863f, 0.0947210863f}},
+	         {100, {0.0472047739f, 0.0472047739f}},
+	         {150, {0, 0}},
+	         {200, {0, 0}},
+	         {300, {0, 0}},
+	         {2000, {-9.86956729e-06f, 7.96923473e-07f}},
+	         {3000, {-0.000152820328f, -4.59704825e-06f}},
+	         {5000, {0.000203833857f, -0.000208990226f}},
+	         {8000, {-3.69777154e-05f, -0.000259475899f}},
+	     }},
+	    // Noise through the cave settings, changed at grain 6 as above.
+	    {2, 1.0f, true, cave, 6, changed,
+	     {
+	         {1540, {0.0222691782f, 0.0242232569f}},
+	         {1600, {0.0201471522f, 0.0186609477f}},
+	         {1700, {-0.0211425349f, -0.0235042125f}},
+	         {1780, {-0.0168117173f, 0.00417749817f}},
+	         {1800, {-0.0866222829f, -0.0945812687f}},
+	         {2000, {0.0131965755f, -0.0707511827f}},
+	         {2500, {0.0942443311f, -0.100531064f}},
+	         {3500, {0.000985965831f, 0.000946713379f}},
+	         {8000, {-0.000968122098f, 0.000556072395f}},
+	         {15000, {0.000227724231f, 0.000151095577f}},
+	     }},
+	    // Noise through the cave settings, with only the density changed at grain 20.
+	    {2, 1.0f, true, cave, 20, denser,
+	     {
+	         {5200, {-0.00942458585f, -0.0064059021f}},
+	         {6000, {0.00248076022f, 0.00317249796f}},
+	         {8000, {0.00102439919f, 0.00105210941f}},
+	         {12000, {1.63059376e-05f, 6.10309735e-06f}},
+	         {20000, {-1.08853078e-06f, -2.99162899e-08f}},
+	     }},
+	};
+	for (const auto& reverb_case: cases) {
+		const auto out = RenderReverbCase(reverb_case);
+		for (const auto& expected: reverb_case.expected) {
+			for (uint32_t c = 0; c < reverb_case.channels; c++) {
+				const float value = out[size_t(expected.frame) * reverb_case.channels + c];
+				Check(std::fabs(value - expected.samples[c]) <=
+				          2e-7f + std::fabs(expected.samples[c]) * 1e-5f,
+				      "reverb output does not match the PS4 library");
+			}
+		}
+	}
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -1727,6 +2007,8 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestCustomReverbDsp();
+	TestCustomReverbMatchesLibrary();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

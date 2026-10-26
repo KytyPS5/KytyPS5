@@ -16130,6 +16130,153 @@ void TestCapturedBufferLoadUbyteD16Decode() {
         "captured BUFFER_LOAD_UBYTE_D16 lost its preserved half, address, or coherence flags");
 }
 
+void TestCapturedGlobalLoadShortD16HiDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  // Ghost of Yotei CS 0x79b0066f0cd1f3cd: global_load_short_d16_hi v16, v18, s[0:1] offset:196.
+  const uint32_t code[] = {0xdc9480c4u, 0x10000012u};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI &&
+            inst.family == Decoder::Family::FLAT && inst.word_count == 2 &&
+            inst.data_dwords == 1 && inst.data_bits == 16 && !inst.data_signed &&
+            inst.memory_segment == 2 && inst.offset == 196 && !inst.glc && !inst.slc &&
+            !inst.dlc,
+        "captured GLOBAL_LOAD_SHORT_D16_HI lost its halfword payload or address fields");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 16 &&
+            inst.dst.sdwa_sel == 5 && inst.dst.sdwa_dst_unused == 2,
+        "captured GLOBAL_LOAD_SHORT_D16_HI must write only the high half of v16");
+  Check(inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 18 &&
+            inst.src1.kind == Decoder::OperandKind::Sgpr && inst.src1.reg == 0,
+        "captured GLOBAL_LOAD_SHORT_D16_HI lost its VGPR offset or s[0:1] base");
+  Check(Decoder::InstructionToString(inst).find("FLAT_LOAD_SHORT_D16_HI") != std::string::npos,
+        "captured GLOBAL_LOAD_SHORT_D16_HI diagnostic text lost the opcode name");
+}
+
+void TestFlatLoadShortD16HiLlvmEncodingAnchor() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  // llvm/test/MC/AMDGPU/flat-gfx10.s: flat_load_short_d16_hi v1, v[3:4]
+  // encodes as [0x00,0x00,0x94,0xdc,0x03,0x00,0x7d,0x01].
+  const uint32_t code[] = {0xdc940000u, 0x017d0003u};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && inst.word_count == 2 &&
+            inst.memory_segment == 0 && inst.offset == 0 && inst.data_dwords == 1 &&
+            inst.data_bits == 16 && !inst.data_signed,
+        "LLVM flat_load_short_d16_hi encoding did not decode as a FLAT halfword load");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 1 &&
+            inst.dst.sdwa_sel == 5 && inst.dst.sdwa_dst_unused == 2 &&
+            inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 3 &&
+            inst.src1.kind == Decoder::OperandKind::Vgpr && inst.src1.reg == 4,
+        "LLVM flat_load_short_d16_hi v1, v[3:4] lost its destination half or address pair");
+}
+
+void TestFlatLoadShortD16HiCompilesAndValidates() {
+  // The captured high-half load followed by a buffer store of the merged register so that the
+  // load stays live: global_load_short_d16_hi v16, v18, s[0:1] offset:196.
+  const uint32_t shader[] = {
+      0xdc9480c4u, 0x10000012u,
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(16, 12, 0),
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("FLAT_LOAD_SHORT_D16_HI") != std::string::npos &&
+            result.decoded_dump.find("unsupported family=") == std::string::npos,
+        "GLOBAL_LOAD_SHORT_D16_HI did not reach the decoded program");
+  Check(result.ir_dump.find("LoadAddressU16") != std::string::npos &&
+            result.ir_dump.find("BitFieldInsert") != std::string::npos,
+        "GLOBAL_LOAD_SHORT_D16_HI did not become a 16-bit load merged into the old register");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestFlatLoadShortD16HiAddressFields() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  // Modifier bits of the first FLAT-family word.
+  constexpr uint32_t DlcBit = 1u << 12u;
+  constexpr uint32_t LdsBit = 1u << 13u;
+  constexpr uint32_t GlcBit = 1u << 16u;
+  constexpr uint32_t SlcBit = 1u << 17u;
+  constexpr uint32_t SegFlat = 0;
+  constexpr uint32_t SegScratch = 1;
+  constexpr uint32_t SegGlobal = 2;
+  constexpr uint32_t SegReserved = 3;
+  constexpr uint32_t SaddrOff = 0x7du;
+  const auto decode = [](uint32_t seg, uint32_t offset_field, uint32_t saddr, uint32_t flags = 0) {
+    const uint32_t code[] = {EncodeFlat0(0x25, seg, offset_field) | flags,
+                             EncodeFlat1(7, saddr, 0, 9)};
+    Decoder::Instruction inst;
+    Decoder::DecodeInstruction(code, 0, inst);
+    return inst;
+  };
+
+  struct OffsetCase {
+    uint32_t seg;
+    uint32_t field;
+    int32_t expected;
+  };
+  const OffsetCase offsets[] = {
+      // FLAT ignores OFFSET[11] and uses an unsigned 11-bit byte offset.
+      {SegFlat, 0x000, 0},
+      {SegFlat, 0x7ff, 2047},
+      {SegFlat, 0x800, 0},
+      {SegFlat, 0xfff, 2047},
+      // GLOBAL and SCRATCH sign-extend the 12-bit field.
+      {SegGlobal, 0x000, 0},
+      {SegGlobal, 0x7ff, 2047},
+      {SegGlobal, 0x800, -2048},
+      {SegGlobal, 0xfff, -1},
+      {SegScratch, 0x000, 0},
+      {SegScratch, 0x7ff, 2047},
+      {SegScratch, 0x800, -2048},
+      {SegScratch, 0xfff, -1},
+  };
+  for (const auto &test : offsets) {
+    const auto inst = decode(test.seg, test.field, SaddrOff);
+    Check(inst.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI &&
+              inst.memory_segment == test.seg &&
+              inst.offset == static_cast<uint32_t>(test.expected),
+          "FLAT-family D16 high-half load decoded the wrong byte offset for its segment");
+    Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 7 &&
+              inst.dst.sdwa_sel == 5 && inst.dst.sdwa_dst_unused == 2 &&
+              inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 9,
+          "FLAT-family D16 high-half load lost its destination half or address VGPR");
+  }
+
+  // FLAT takes a VGPR pair whatever the SADDR field says; GLOBAL takes either an SGPR base plus
+  // a VGPR offset or, with SADDR off, a VGPR pair.
+  const auto flat = decode(SegFlat, 0, 2);
+  Check(flat.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI &&
+            flat.src1.kind == Decoder::OperandKind::Vgpr && flat.src1.reg == 10,
+        "FLAT D16 high-half load must use the VGPR pair and ignore SADDR");
+  const auto global_sgpr = decode(SegGlobal, 0, 2);
+  Check(global_sgpr.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI &&
+            global_sgpr.src_count == 2 && global_sgpr.src0.kind == Decoder::OperandKind::Vgpr &&
+            global_sgpr.src0.reg == 9 && global_sgpr.src1.kind == Decoder::OperandKind::Sgpr &&
+            global_sgpr.src1.reg == 2,
+        "GLOBAL D16 high-half load with SADDR s[2:3] lost its scalar base");
+  const auto global_pair = decode(SegGlobal, 0, SaddrOff);
+  Check(global_pair.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI &&
+            global_pair.src_count == 2 && global_pair.src0.kind == Decoder::OperandKind::Vgpr &&
+            global_pair.src0.reg == 9 && global_pair.src1.kind == Decoder::OperandKind::Vgpr &&
+            global_pair.src1.reg == 10,
+        "GLOBAL D16 high-half load with SADDR off must use the VGPR pair");
+
+  // DLC is only a cache hint and stays visible; LDS, GLC and SLC on a load and the reserved
+  // segment are not implemented and must keep failing loudly.
+  const auto dlc = decode(SegGlobal, 4, 2, DlcBit);
+  Check(dlc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && dlc.dlc && !dlc.glc && !dlc.slc,
+        "GLOBAL D16 high-half load lost its DLC hint");
+  Check(decode(SegGlobal, 0, 2, LdsBit).opcode == Decoder::Opcode::UNSUPPORTED,
+        "FLAT-family D16 high-half load accepted LDS=1");
+  Check(decode(SegGlobal, 0, 2, GlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
+        "FLAT-family D16 high-half load accepted GLC=1");
+  Check(decode(SegGlobal, 0, 2, SlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
+        "FLAT-family D16 high-half load accepted SLC=1 on a load");
+  Check(decode(SegReserved, 0, 2).opcode == Decoder::Opcode::UNSUPPORTED,
+        "FLAT-family D16 high-half load accepted the reserved segment");
+}
+
 void TestCapturedBufferStoreShortD16HiDecode() {
   namespace Decoder = ShaderRecompiler::Decoder;
   const uint32_t code[] = {0xe06c6000u, 0x80010326u};
@@ -17017,6 +17164,10 @@ int main() {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestCapturedBufferLoadUbyteD16Decode();
+  TestCapturedGlobalLoadShortD16HiDecode();
+  TestFlatLoadShortD16HiLlvmEncodingAnchor();
+  TestFlatLoadShortD16HiAddressFields();
+  TestFlatLoadShortD16HiCompilesAndValidates();
   TestCapturedBufferStoreShortD16HiDecode();
   TestCapturedBufferStoreFormatD16HiXDecode();
   TestCapturedBufferLoadD16XyDecode();

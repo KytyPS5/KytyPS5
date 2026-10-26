@@ -22667,6 +22667,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::FLAT_LOAD_USHORT:
   case Opcode::FLAT_LOAD_SSHORT:
   case Opcode::FLAT_LOAD_SHORT_D16:
+  case Opcode::FLAT_LOAD_SHORT_D16_HI:
   case Opcode::FLAT_LOAD_DWORD:
   case Opcode::FLAT_LOAD_DWORDX2:
   case Opcode::FLAT_LOAD_DWORDX3:
@@ -35765,7 +35766,17 @@ TestCase FlatSubdwordLoadsApplyByteOffset() {
   return test;
 }
 
-TestCase GlobalLoadShortD16Captured(u32 wave_size) {
+// D16_HI loads move the raw halfword into bits [31:16] and keep the old low half.
+constexpr u32 MergeD16Hi(u32 old_value, u32 halfword) {
+  return (old_value & 0xffffu) | ((halfword & 0xffffu) << 16u);
+}
+
+static_assert(MergeD16Hi(0xa5a51234u, 0x0000u) == 0x00001234u &&
+              MergeD16Hi(0xa5a51234u, 0x7fffu) == 0x7fff1234u &&
+              MergeD16Hi(0xa5a51234u, 0x8000u) == 0x80001234u &&
+              MergeD16Hi(0xa5a51234u, 0xffffu) == 0xffff1234u);
+
+TestCase GlobalLoadShortD16Captured(u32 wave_size, bool high = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   constexpr u32 Marker = 0xa5a50000u;
@@ -35773,16 +35784,32 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size) {
   constexpr uint64_t ExecMask = 0xaaaaaaaa55555555ull;
   constexpr u32 Values[] = {0u, 0x7fffu, 0x8000u, 0xffffu};
   TestCase test;
-  test.name = wave_size == 32u ? "GlobalLoadShortD16CapturedWave32"
-                              : "GlobalLoadShortD16CapturedWave64";
-  test.initial.resize(2u * wave_size + wave_size / 2u);
-  test.expected.resize(2u * wave_size);
+  if (high) {
+    test.name = wave_size == 32u ? "GlobalLoadShortD16HiCapturedWave32"
+                                : "GlobalLoadShortD16HiCapturedWave64";
+  } else {
+    test.name = wave_size == 32u ? "GlobalLoadShortD16CapturedWave32"
+                                : "GlobalLoadShortD16CapturedWave64";
+  }
+  // Pass 0 runs with the full EXEC, pass 1 with a partial EXEC and pass 2 (high half only) with
+  // EXEC=0 and an unmapped address, which must neither touch memory nor change the destination.
+  // Pass 2 reads its zero EXEC from the buffer so that the guard is exercised at run time rather
+  // than folded away together with the load.
+  const u32 passes = high ? 3u : 2u;
+  const u32 zero_dword = passes * wave_size + wave_size / 2u;
+  test.initial.resize(zero_dword + (high ? 1u : 0u));
+  test.expected.resize(passes * wave_size);
   for (u32 lane = 0; lane < wave_size; ++lane) {
     const u32 value = Values[lane % std::size(Values)];
-    test.initial[2u * wave_size + lane / 2u] |= value << (16u * (lane % 2u));
-    test.expected[lane] = Marker | value;
-    test.expected[wave_size + lane] = Marker |
-        ((ExecMask & (uint64_t{1} << lane)) != 0u ? value : lane * 2u);
+    test.initial[passes * wave_size + lane / 2u] |= value << (16u * (lane % 2u));
+    for (u32 pass = 0; pass < passes; ++pass) {
+      const bool active =
+          pass == 0 || (pass == 1 && (ExecMask & (uint64_t{1} << lane)) != 0);
+      const u32 old_value = Marker | (lane * 2u);
+      test.expected[pass * wave_size + lane] =
+          !active ? old_value
+                  : (high ? MergeD16Hi(old_value, value) : Marker | value);
+    }
   }
   auto &code = test.code;
   AppendSMovLiteral(&code, 2, static_cast<u32>(ScalarBase));
@@ -35790,20 +35817,35 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size) {
   code.push_back(EncodeVop2(0x1a, 6, InlineU32(1), 0));
   AppendVMovLiteral(&code, 5, Marker);
   code.push_back(EncodeVop2(0x25, 6, Vgpr(5), 6));
-  for (bool masked : {false, true}) {
+  for (u32 pass = 0; pass < passes; ++pass) {
+    const bool masked = pass != 0;
     code.push_back(EncodeVop1(0x01, 5, Vgpr(6)));
     if (masked) {
       code.push_back(EncodeSop1(0x04, 8, 126));
-      AppendSMovLiteral(&code, 126, static_cast<u32>(ExecMask));
-      AppendSMovLiteral(&code, 127, static_cast<u32>(ExecMask >> 32u));
+      if (pass == 1) {
+        AppendSMovLiteral(&code, 126, static_cast<u32>(ExecMask));
+        AppendSMovLiteral(&code, 127, static_cast<u32>(ExecMask >> 32u));
+      } else {
+        // s[2:3] hold the scalar base, so read through the output buffer descriptor s[48:51].
+        AppendVMovU32(&code, 9, zero_dword * 4u);
+        code.push_back(EncodeMubuf0(0x0cu));
+        code.push_back(EncodeMubuf1(9, 12, 9));
+        code.push_back(EncodeVop1(0x02, 20, Vgpr(9)));
+        code.push_back(EncodeVop1(0x02, 21, Vgpr(9)));
+        code.push_back(EncodeSop1(0x04, 126, 20));
+        AppendSMovLiteral(&code, 2, 0u);
+        AppendSMovLiteral(&code, 3, 0u);
+      }
     }
-    // Captured GLOBAL_LOAD_SHORT_D16: v5 supplies the byte offset and destination.
-    code.insert(code.end(), {0xdc908070u, 0x05020005u});
+    // Captured GLOBAL_LOAD_SHORT_D16 (the high variant only switches the opcode to D16_HI):
+    // v5 supplies the byte offset and destination.
+    code.insert(code.end(), {high ? 0xdc948070u : 0xdc908070u, 0x05020005u});
     if (masked) code.push_back(EncodeSop1(0x04, 126, 8));
-    AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, masked ? wave_size : 0u);
+    AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, pass * wave_size);
   }
   AppendEnd(&code);
-  test.bda_mappings = {{GuestBase, 8u * wave_size}};
+  test.bda_mappings = {{GuestBase, 4u * passes * wave_size}};
+  if (high) test.fault_free_address = uint64_t{Marker} + 0x70u;
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -35811,13 +35853,21 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size) {
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
   test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::V_MOV_B32, O::V_LSHLREV_B32,
-                  O::V_ADD_NC_U32, O::FLAT_LOAD_SHORT_D16,
+                  O::V_ADD_NC_U32,
+                  high ? O::FLAT_LOAD_SHORT_D16_HI : O::FLAT_LOAD_SHORT_D16,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16", 2}};
+  test.decoded_counts = {
+      {high ? "FLAT_LOAD_SHORT_D16_HI" : "FLAT_LOAD_SHORT_D16", passes}};
+  if (high) {
+    test.opcodes.insert(test.opcodes.end(),
+                        {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32});
+    // Every pass, including the EXEC=0 one, must keep its load.
+    test.ir_counts = {{"LoadAddressU16", passes}};
+  }
   return test;
 }
 
-TestCase FlatLoadShortD16AddressSegments() {
+TestCase FlatLoadShortD16AddressSegments(bool high = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   std::vector<u32> code;
@@ -35825,7 +35875,8 @@ TestCase FlatLoadShortD16AddressSegments() {
   AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
   for (u32 segment : {0u, 2u}) {
     AppendVMovLiteral(&code, 3, 0x12345678u);
-    code.push_back(EncodeFlat0(0x24, segment, segment == 0u ? 0u : 0xffeu));
+    code.push_back(EncodeFlat0(high ? 0x25 : 0x24, segment,
+                               segment == 0u ? 0u : 0xffeu));
     code.push_back(EncodeFlat1(3, 0x7d, 0, 20));
     AppendStoreVgpr(&code, 3, segment == 0u ? 0u : 1u);
   }
@@ -35834,17 +35885,118 @@ TestCase FlatLoadShortD16AddressSegments() {
   code.push_back(EncodeFlat0(0x1c, 1, 0));
   code.push_back(EncodeFlat1(0, 0x7d, 3, 20));
   AppendVMovLiteral(&code, 3, 0x98761234u);
-  code.push_back(EncodeFlat0(0x24, 1, 2));
+  code.push_back(EncodeFlat0(high ? 0x25 : 0x24, 1, 2));
   code.push_back(EncodeFlat1(3, 0x7d, 0, 20));
   AppendStoreVgpr(&code, 3, 2);
   AppendEnd(&code);
-  TestCase test{"FlatLoadShortD16AddressSegments", code,
+  TestCase test{high ? "FlatLoadShortD16HiAddressSegments"
+                     : "FlatLoadShortD16AddressSegments",
+                code,
                 {0, 0, 0, 0, 0x80017fffu},
-                {0x12348001u, 0x12347fffu, 0x9876beefu},
-                {O::V_MOV_B32, O::FLAT_LOAD_SHORT_D16, O::FLAT_STORE_DWORD,
-                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+                high ? std::vector<u32>{0x80015678u, 0x7fff5678u, 0xbeef1234u}
+                     : std::vector<u32>{0x12348001u, 0x12347fffu, 0x9876beefu},
+                {O::V_MOV_B32,
+                 high ? O::FLAT_LOAD_SHORT_D16_HI : O::FLAT_LOAD_SHORT_D16,
+                 O::FLAT_STORE_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.bda_mappings = {{GuestBase, 16}};
   test.compute_info.scratch_size_dwords = 1;
+  return test;
+}
+
+TestCase GlobalLoadShortD16HiMergesOldDestination(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t ScalarBase = GuestBase - 196u;
+  constexpr u32 Values[] = {0u, 0x7fffu, 0x8000u, 0xffffu};
+  // The destination does not alias the address. Changing only the old high half must not change
+  // the result, and changing only the old low half must change only the low half of the result.
+  constexpr u32 OldValues[] = {0xa5a51234u, 0x5a5a1234u, 0xa5a5abcdu};
+  constexpr u32 Neighbor = 0x0badf00du;
+  constexpr u32 Passes = static_cast<u32>(std::size(OldValues));
+  TestCase test;
+  test.name = wave_size == 32u ? "GlobalLoadShortD16HiMergesOldDestinationWave32"
+                               : "GlobalLoadShortD16HiMergesOldDestinationWave64";
+  const u32 data_dword = (Passes + 1u) * wave_size;
+  test.initial.resize(data_dword + wave_size / 2u);
+  test.expected.resize(data_dword);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const u32 value = Values[lane % std::size(Values)];
+    test.initial[data_dword + lane / 2u] |= value << (16u * (lane % 2u));
+    for (u32 pass = 0; pass < Passes; ++pass) {
+      test.expected[pass * wave_size + lane] = MergeD16Hi(OldValues[pass], value);
+    }
+    test.expected[Passes * wave_size + lane] = Neighbor;
+  }
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 0, static_cast<u32>(ScalarBase));
+  AppendSMovLiteral(&code, 1, static_cast<u32>(ScalarBase >> 32u));
+  code.push_back(EncodeVop2(0x1a, 18, InlineU32(1), 0));
+  AppendVMovLiteral(&code, 17, Neighbor);
+  for (u32 pass = 0; pass < Passes; ++pass) {
+    AppendVMovLiteral(&code, 16, OldValues[pass]);
+    // Captured from Ghost of Yotei CS 0x79b0066f0cd1f3cd:
+    // global_load_short_d16_hi v16, v18, s[0:1] offset:196
+    code.insert(code.end(), {0xdc9480c4u, 0x10000012u});
+    AppendStoreVgprAtLaneDwordOffset(&code, 16, 0, pass * wave_size);
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 17, 0, Passes * wave_size);
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 4u * data_dword}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_MOV_B32,     O::V_MOV_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::FLAT_LOAD_SHORT_D16_HI, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16_HI", Passes}};
+  return test;
+}
+
+TestCase FlatLoadShortD16HiIntoAddressHighVgpr(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Values[] = {0u, 0x7fffu, 0x8000u, 0xffffu};
+  constexpr u32 AddressHigh = static_cast<u32>(GuestBase >> 32u);
+  TestCase test;
+  test.name = wave_size == 32u ? "FlatLoadShortD16HiIntoAddressHighVgprWave32"
+                               : "FlatLoadShortD16HiIntoAddressHighVgprWave64";
+  const u32 data_dword = 2u * wave_size;
+  test.initial.resize(data_dword + wave_size / 2u);
+  test.expected.resize(data_dword);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const u32 value = Values[lane % std::size(Values)];
+    test.initial[data_dword + lane / 2u] |= value << (16u * (lane % 2u));
+    // The 64-bit address is read before v4 is replaced, so the old high address dword supplies
+    // the preserved low half and the low address dword stays as it was.
+    test.expected[lane] = MergeD16Hi(AddressHigh, value);
+    test.expected[wave_size + lane] = static_cast<u32>(GuestBase) + lane * 2u;
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(1), 0));
+  AppendVMovLiteral(&code, 9, static_cast<u32>(GuestBase));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(9), 3));
+  AppendVMovLiteral(&code, 4, AddressHigh);
+  // flat_load_short_d16_hi v4, v[3:4]
+  code.push_back(EncodeFlat0(0x25, 0, 0));
+  code.push_back(EncodeFlat1(4, 0x7d, 0, 3));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, wave_size);
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 4u * data_dword}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32,     O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,  O::FLAT_LOAD_SHORT_D16_HI,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16_HI", 1}};
   return test;
 }
 
@@ -45002,7 +45154,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
-  AddCase(FlatLoadShortD16AddressSegments);
+  cases.push_back(GlobalLoadShortD16Captured(32, true));
+  cases.push_back(GlobalLoadShortD16Captured(64, true));
+  cases.push_back(FlatLoadShortD16AddressSegments());
+  cases.push_back(FlatLoadShortD16AddressSegments(true));
+  cases.push_back(GlobalLoadShortD16HiMergesOldDestination(32));
+  cases.push_back(GlobalLoadShortD16HiMergesOldDestination(64));
+  cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(32));
+  cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
@@ -51501,7 +51660,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatLoadDlcCaptured(64));
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
     RunCase(&vulkan, GlobalLoadShortD16Captured(64));
+    RunCase(&vulkan, GlobalLoadShortD16Captured(32, true));
+    RunCase(&vulkan, GlobalLoadShortD16Captured(64, true));
     RunCase(&vulkan, FlatLoadShortD16AddressSegments());
+    RunCase(&vulkan, FlatLoadShortD16AddressSegments(true));
+    for (const u32 wave : {32u, 64u}) {
+      RunCase(&vulkan, GlobalLoadShortD16HiMergesOldDestination(wave));
+      RunCase(&vulkan, FlatLoadShortD16HiIntoAddressHighVgpr(wave));
+    }
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());

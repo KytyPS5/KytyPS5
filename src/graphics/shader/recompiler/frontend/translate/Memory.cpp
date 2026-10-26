@@ -1146,6 +1146,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::FLAT_LOAD_USHORT:
 		case Decoder::Opcode::FLAT_LOAD_SSHORT:
 		case Decoder::Opcode::FLAT_LOAD_SHORT_D16:
+		case Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI:
 		case Decoder::Opcode::FLAT_LOAD_DWORD:
 		case Decoder::Opcode::FLAT_LOAD_DWORDX2:
 		case Decoder::Opcode::FLAT_LOAD_DWORDX3:

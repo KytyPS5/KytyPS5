@@ -701,6 +701,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::FLAT_LOAD_USHORT:
 		case Opcode::FLAT_LOAD_SSHORT:
 		case Opcode::FLAT_LOAD_SHORT_D16:
+		case Opcode::FLAT_LOAD_SHORT_D16_HI:
 		case Opcode::FLAT_LOAD_DWORD:
 		case Opcode::FLAT_LOAD_DWORDX2:
 		case Opcode::FLAT_LOAD_DWORDX3:

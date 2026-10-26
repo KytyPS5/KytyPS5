@@ -402,8 +402,11 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					    !output && (write || options.stage != ShaderType::TessellationEvaluation));
 					kind = output ? TessellationAttribute::ControlOutput
 					              : TessellationAttribute::EvaluationInput;
+					// The access's immediate offset counts: GT7's track evaluation shaders read
+					// their patch constants as base 0 + offset 144 of a 4 x 32-byte patch.
 					if (address.IsImmediate() &&
-					    address.U32() >= tess.hs_stride * tess.output_control_points) {
+					    address.U32() + memory.offset >=
+					        tess.hs_stride * tess.output_control_points) {
 						const auto begin = address.U32() + memory.offset;
 						EXIT_NOT_IMPLEMENTED(begin < tess.patch_base ||
 						                     begin + 4u * components >

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <unordered_map>
 #include <utility>
 
@@ -38,6 +39,43 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 	entry[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
+	// Bit operations are exact on a scaled control-point index (coefficient 2^k, no constant):
+	// the index, below control_points, occupies bits [k, k + index_bits).
+	const uint32_t index_bits =
+	    control_points <= 1u ? 0u : static_cast<uint32_t>(std::bit_width(control_points - 1u));
+	const auto field = [&](Address value, uint32_t& low) {
+		if (value.kind != Kind::Affine || value.constant != 0u || value.coefficient == 0u ||
+		    !std::has_single_bit(value.coefficient))
+			return false;
+		low = static_cast<uint32_t>(std::countr_zero(value.coefficient));
+		return low + index_bits <= 32u;
+	};
+	const auto is_constant = [](Address value) {
+		return value.kind == Kind::Affine && value.coefficient == 0u;
+	};
+	const auto low_mask = [](uint32_t bits) { return bits >= 32u ? ~0u : (1u << bits) - 1u; };
+	// value & bits
+	const auto mask = [&](Address value, uint32_t bits) -> Address {
+		if (is_constant(value)) return constant(value.constant & bits);
+		uint32_t low = 0;
+		if (!field(value, low)) return {};
+		const auto occupied = low_mask(index_bits) << low;
+		if ((bits & occupied) == occupied) return value;
+		if ((bits & occupied) == 0u) return constant(0u);
+		return {};
+	};
+	// (value >> offset) & low_mask(width)
+	const auto extract = [&](Address value, uint32_t offset, uint32_t width) -> Address {
+		if (offset >= 32u) return constant(0u);
+		if (is_constant(value)) return constant((value.constant >> offset) & low_mask(width));
+		uint32_t low = 0;
+		if (!field(value, low)) return {};
+		if (index_bits == 0u || offset >= low + index_bits || offset + width <= low)
+			return constant(0u);
+		if (offset <= low && offset + width >= low + index_bits)
+			return {Kind::Affine, value.coefficient >> offset, 0u};
+		return {};
+	};
 	const auto read     = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
@@ -49,9 +87,13 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		} else if (operand.kind == OperandKind::Vgpr) {
 			value = registers.at(operand.reg);
 		}
-		// The native packed HS ID's low byte is the patch ordinal. The logical
-		// interface addresses one patch, as in the frontend's v1 initialization.
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
+		// The native packed HS ID holds the patch ordinal in its low byte and the control point
+		// in bits 8-12. The logical interface addresses one patch, as in the frontend's v1
+		// initialization: the ordinal is 0 and the ID is control point * 256.
+		if (value.kind == Kind::PackedControlPoint) value = {Kind::Affine, 256u, 0u};
+		// SDWA selects: bytes 0-3, words 0-1, or the whole dword.
+		if (operand.sdwa_sel < 4u) return extract(value, 8u * operand.sdwa_sel, 8u);
+		if (operand.sdwa_sel < 6u) return extract(value, 16u * (operand.sdwa_sel - 4u), 16u);
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -84,6 +126,21 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		                   0xffffffu
 		           ? value
 		           : Address {};
+	};
+	const auto subtract = [&](Address lhs, Address rhs) {
+		return lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
+		               lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant
+		           ? affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant)
+		           : Address {};
+	};
+	// lhs | rhs: an addition when their bits cannot overlap.
+	const auto bit_or = [&](Address lhs, Address rhs) -> Address {
+		if (is_constant(lhs) && is_constant(rhs)) return constant(lhs.constant | rhs.constant);
+		if (is_constant(rhs)) std::swap(lhs, rhs);
+		if (!is_constant(lhs)) return {};
+		if (lhs.constant == 0u) return rhs;
+		uint32_t low = 0;
+		return field(rhs, low) && (lhs.constant >> low) == 0u ? add(lhs, rhs) : Address {};
 	};
 	// A branch joins its target with the fallthrough path. Definitions that differ between
 	// the paths are unknown there. Loop headers repeat the walk until back edges are stable.
@@ -148,19 +205,28 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			Address    value;
 			switch (inst.opcode) {
 				case Opcode::V_BFE_U32:
-					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
-					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
-					    third.coefficient == 0u) {
-						if (rhs.constant == 8u && third.constant == 5u)
-							value = {Kind::Affine, 1u, 0u};
-						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
-					}
+					if (is_constant(rhs) && is_constant(third))
+						value = extract(lhs, rhs.constant, third.constant);
 					break;
 				case Opcode::V_AND_B32:
-					if ((lhs.kind == Kind::PackedControlPoint && rhs == constant(0xffu)) ||
-					    (rhs.kind == Kind::PackedControlPoint && lhs == constant(0xffu)))
-						value = constant(0u);
+					if (is_constant(lhs)) {
+						value = mask(rhs, lhs.constant);
+					} else if (is_constant(rhs)) {
+						value = mask(lhs, rhs.constant);
+					}
 					break;
+				case Opcode::V_LSHRREV_B32:
+					if (is_constant(lhs) && lhs.constant < 32u)
+						value = extract(rhs, lhs.constant, 32u - lhs.constant);
+					break;
+				case Opcode::V_OR_B32: value = bit_or(lhs, rhs); break;
+				case Opcode::V_LSHL_OR_B32:
+					if (is_constant(rhs) && rhs.constant < 32u)
+						value = bit_or(multiply(lhs, constant(1u << rhs.constant)), third);
+					break;
+				case Opcode::V_MOV_B32: value = lhs; break;
+				case Opcode::V_ADD3_U32: value = add(add(lhs, rhs), third); break;
+				case Opcode::V_SUBREV_NC_U32: value = subtract(rhs, lhs); break;
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
 				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
@@ -175,12 +241,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
 						value = multiply(rhs, constant(1u << lhs.constant));
 					break;
-				case Opcode::V_SUB_NC_U32:
-					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-					    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-						value =
-						    affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
-					break;
+				case Opcode::V_SUB_NC_U32: value = subtract(lhs, rhs); break;
 				default: break;
 			}
 			if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||

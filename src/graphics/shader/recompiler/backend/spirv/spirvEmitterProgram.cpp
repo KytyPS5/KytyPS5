@@ -235,6 +235,7 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
+	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 ||
 	     op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.

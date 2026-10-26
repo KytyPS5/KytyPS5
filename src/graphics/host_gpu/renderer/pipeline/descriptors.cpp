@@ -582,6 +582,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		desc.info.UpdateSize();
 	}
+	// The existing resolver can preserve a guest chain with more levels than Vulkan
+	// permits. Represent only the selected host mips without recomputing guest offsets.
+	if (!desc.info.NormalizeMipView(view_base, view_levels)) {
+		EXIT("unsupported guest mip view: base=%u count=%u extent=%ux%ux%u\n",
+		     view_base, view_levels, width, height, volume ? depth : 1u);
+	}
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);

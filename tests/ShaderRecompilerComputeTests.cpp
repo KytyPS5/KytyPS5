@@ -245,6 +245,10 @@ struct ImageHeapTestAccess {
 };
 
 struct TextureCacheTestAccess {
+  static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested, bool exact_format) {
+    return TextureCache::SameBacking(cached, requested, exact_format);
+  }
+
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
@@ -1047,6 +1051,48 @@ void Require(const char *shader_name, const char *stage, bool value,
   if (!value) {
     Fail(shader_name, stage, message);
   }
+}
+
+/// Keep identical mip views reusable while distinguishing physically separate extra mips.
+void CheckOversizedMipCacheIdentity() {
+  constexpr const char *name = "OversizedMipCacheIdentity";
+  bool distinct = true;
+  for (const uint32_t layers : {1u, 2u}) {
+    ImageInfo physical{};
+    physical.data.address = 0x12f4f48000;
+    physical.pixel_format = vk::Format::eR32G32B32A32Uint;
+    physical.guest_format = Prospero::BufferFormat::k32_32_32_32UInt;
+    physical.extent = {64, 64, 1};
+    physical.resources = {9, layers};
+    physical.tile_mode = Prospero::TileMode::kStandard4KB;
+    physical.UpdateSize();
+    auto mip7 = physical;
+    auto mip8 = physical;
+    uint32_t base7 = 7, base8 = 8;
+    Require(name, "normalize views",
+            mip7.NormalizeMipView(base7, 1) && mip8.NormalizeMipView(base8, 1) &&
+                base7 == 0 && base8 == 0,
+            "cannot normalize the two extra guest mip views");
+    Require(name, "collision preconditions",
+            mip7.extent == vk::Extent3D{1, 1, 1} && mip8.extent == mip7.extent &&
+                mip7.data == mip8.data && mip7.resources == mip8.resources &&
+                mip7.mip_layout[0] != mip8.mip_layout[0],
+            "fixture does not represent distinct physical mips with equal host dimensions");
+    for (const bool exact_format : {false, true}) {
+      Require(name, "same-mip reuse",
+              TextureCacheTestAccess::SameBacking(mip7, mip7, exact_format) &&
+                  TextureCacheTestAccess::SameBacking(mip8, mip8, exact_format),
+              "repeated requests for one guest mip must remain reusable");
+      const bool forward = TextureCacheTestAccess::SameBacking(mip7, mip8, exact_format);
+      const bool reverse = TextureCacheTestAccess::SameBacking(mip8, mip7, exact_format);
+      std::printf("[host] layers=%u exact=%u mip7_matches_mip8=%u mip8_matches_mip7=%u\n",
+                  layers, exact_format, forward, reverse);
+      distinct &= !forward && !reverse;
+    }
+  }
+  Require(name, "distinct-mip identity", distinct,
+          "the production cache considers guest mips 7 and 8 interchangeable");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckErrorDialogLifecycle() {
@@ -5936,6 +5982,121 @@ public:
     Require(name, "release physical pages",
         LibKernel::Memory::KernelReleaseDirectMemory(direct, 3u * page) == 0,
         "sparse physical release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  /// Alternate extra mip views and verify their distinct texels through the texture cache.
+  void CheckOversizedMipCacheContents() {
+    constexpr const char *name = "OversizedMipCacheContents";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "mip-cache direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "mip-cache fixed mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &cache = context.GetTextureCache();
+      for (const uint32_t layers : {1u, 2u}) {
+        ImageInfo physical{};
+        physical.data.address = base + (layers - 1u) * 0x100000;
+        physical.pixel_format = vk::Format::eR32G32B32A32Uint;
+        physical.guest_format = Prospero::BufferFormat::k32_32_32_32UInt;
+        physical.extent = {64, 64, 1};
+        physical.resources = {9, layers};
+        physical.tile_mode = Prospero::TileMode::kStandard4KB;
+        physical.UpdateSize();
+        Require(name, "allocation bounds", physical.data.size <= 0x100000,
+                "mip fixture exceeds its guest allocation");
+        std::memset(reinterpret_cast<void *>(physical.data.address), 0,
+                    physical.data.size);
+        // Give each extra mip and array layer a different RGBA uint texel.
+        // All CPU writes precede discovery: no invalidation can hide a collision.
+        for (const uint32_t level : {7u, 8u}) {
+          const auto &mip = physical.mip_layout[level];
+          uint32_t in_block = 0;
+          Require(name, "tail texel address",
+                  TileGetBlockOffset(physical.tiling.block, mip.tail_x,
+                                     mip.tail_y, 0, in_block),
+                  "cannot locate the selected mip in its guest tile");
+          for (uint32_t layer = 0; layer < layers; ++layer) {
+            const std::array<u32, 4> texel{level, layer, 0x12345678u, 0xabcdef01u};
+            const auto offset = mip.offset + in_block +
+                                layer * physical.tiled_slice_stride;
+            Require(name, "texel bounds",
+                    offset + sizeof(texel) <= physical.data.size,
+                    "mip texel exceeds the physical chain");
+            std::memcpy(reinterpret_cast<void *>(physical.data.address + offset),
+                        texel.data(), sizeof(texel));
+          }
+        }
+        for (const uint32_t selected : {7u, 8u, 7u, 8u}) {
+          TextureCache::ImageDesc desc{};
+          desc.info = physical;
+          uint32_t base_level = selected;
+          Require(name, "normalize view", desc.info.NormalizeMipView(base_level, 1),
+                  "cannot normalize the extra mip");
+          desc.view_info.format = physical.pixel_format;
+          desc.view_info.type = layers == 1 ? vk::ImageViewType::e2D :
+                                             vk::ImageViewType::e2DArray;
+          desc.view_info.base_level = base_level;
+          desc.view_info.layer_count = layers;
+          const auto id = cache.FindImage(desc);
+          (void)cache.FindTexture(id, desc);
+          auto readback = CreateHostBuffer(name, layers * 4 * sizeof(u32),
+              vk::BufferUsageFlagBits::eTransferDst, {});
+          vk::BufferImageCopy copy{};
+          copy.imageSubresource = {vk::ImageAspectFlagBits::eColor,
+                                   desc.view_info.base_level, 0, layers};
+          copy.imageExtent = {1, 1, 1};
+          const std::array copies{copy};
+          cache.GetImage(id).Download(copies, readback.buffer, 0, readback.size);
+          vk::MemoryBarrier barrier{};
+          barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+          barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+          scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+              vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+          scheduler.Finish();
+          const auto actual = ReadBuffer(name, readback, layers * 4);
+          DestroyBuffer(&readback);
+          for (uint32_t layer = 0; layer < layers; ++layer) {
+            const std::array<u32, 4> expected{selected, layer, 0x12345678u, 0xabcdef01u};
+            std::printf("[gpu] mip=%u layer=%u returned_mip=%u\n",
+                        selected, layer, actual[layer * 4]);
+            Require(name, "cached mip texel",
+                    std::equal(expected.begin(), expected.end(), actual.begin() + layer * 4),
+                    "selecting guest mip " + std::to_string(selected) +
+                        " returned data from mip " + std::to_string(actual[layer * 4]));
+          }
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap backing",
+            LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mip-cache direct mapping release failed");
+    Require(name, "release backing",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "mip-cache direct allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -35722,6 +35883,30 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+TestCase FlatInvalidAddressDoesNotAliasMappedPage() {
+  constexpr uint64_t offset = 0x110000000ull;
+  constexpr uint64_t extended = Libs::LibKernel::Memory::kExtendedMemoryBase + offset;
+  const std::array<uint64_t, 3> addresses{
+      Libs::Graphics::LOWER_ADDRESS_SIZE + offset,
+      extended + (1ull << (32 + BufferCache::CACHING_PAGEBITS)), extended};
+  TestCase test;
+  test.name = "FlatInvalidAddressDoesNotAliasMappedPage";
+  for (u32 i = 0; i < addresses.size(); ++i) {
+    AppendVMovLiteral(&test.code, 20, static_cast<u32>(addresses[i]));
+    AppendVMovLiteral(&test.code, 21, static_cast<u32>(addresses[i] >> 32));
+    test.code.push_back(EncodeFlat0(0x0c, 0, 0));
+    test.code.push_back(EncodeFlat1(i, 0x7d, 0, 20));
+  }
+  for (u32 i = 0; i < addresses.size(); ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.initial = {0x12345678u, 0, 0};
+  test.expected = {0, 0, 0x12345678u};
+  test.bda_mappings = {{extended, 0}};
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::FLAT_LOAD_DWORD,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   using O = ShaderOpcode;
 
@@ -44494,6 +44679,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
+  AddCase(FlatInvalidAddressDoesNotAliasMappedPage);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
@@ -50568,8 +50754,18 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--oversized-mip-cache-identity-only") == 0) {
+    CheckOversizedMipCacheIdentity();
+    return 0;
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--oversized-mip-cache-only") == 0) {
+    CheckOversizedMipCacheIdentity();
+    VulkanHarness vulkan;
+    vulkan.CheckOversizedMipCacheContents();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
@@ -51549,6 +51745,12 @@ int main(int argc, char **argv) {
     CheckDepthTargetFootprints();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-address-range-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    RunCase(&vulkan, FlatInvalidAddressDoesNotAliasMappedPage());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
@@ -51789,6 +51991,8 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
+  CheckOversizedMipCacheIdentity();
+  vulkan.CheckOversizedMipCacheContents();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

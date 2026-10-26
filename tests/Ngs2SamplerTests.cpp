@@ -1116,6 +1116,57 @@ void TestCustomReverbMatchesLibrary() {
 	}
 }
 
+// Through the NGS2 API, control 0x40001b00 configures a custom submixer's reverb module, and the
+// voice keeps rendering the tail after its source stops.
+void TestCustomReverbVoice() {
+	constexpr uint32_t grain = 256;
+	Fixture            source(48000);
+	// The first grain after new settings fades the reverb in, so the impulse comes a little later.
+	const int16_t      pcm[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32767};
+	source.Queue(pcm, 17, 0);
+	Ngs2Internal      system;
+	system.option.sample_rate       = 48000;
+	system.option.num_grain_samples = grain;
+	Ngs2RackInternal  rack {};
+	rack.ngs  = &system;
+	rack.type = Ngs2RackType::CustomSubmixer;
+	auto& custom = rack.option.custom_submixer.custom_rack_option;
+	custom.num_buffers = 1;
+	custom.num_modules = 1;
+	custom.module[0].module_id = 0x1b;
+	Ngs2VoiceInternal voice;
+	voice.rack     = &rack;
+	voice.channels = 1;
+	voice.state    = Ngs2VoicePlayState::Playing;
+	voice.modules.resize(1);
+	source.voice.ports.resize(1);
+	source.voice.ports[0].dest = &voice;
+	struct ReverbControl {
+		Ngs2VoiceParamHeader header {sizeof(ReverbControl), 0, 0x40001b00};
+		Ngs2ReverbI3dl2Param i3dl2;
+	} control;
+	control.i3dl2 = ReverbParam(1.0f, -10000, 0); // Late reverb only, which starts ~30 ms later.
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &control.header) == OK &&
+	          voice.modules[0].reverb != nullptr,
+	      "reverb module control was not accepted");
+	const std::vector<Ngs2VoiceInternal*> voices {&source.voice};
+	const auto render = [&] {
+		source.voice.rendered = false;
+		voice.rendered        = false;
+		Ngs2RenderVoice(voice, voices, grain);
+	};
+	render(); // The impulse.
+	Check(voice.has_samples && voice.samples[0] == 0.0f,
+	      "reverb with dry 0 passed the direct sound through");
+	bool tail = false;
+	for (int i = 0; i < 20; ++i) { // The source is empty from here on.
+		render();
+		tail = tail || (voice.has_samples &&
+		                std::ranges::any_of(voice.samples, [](float s) { return s != 0.0f; }));
+	}
+	Check(tail, "reverb tail stopped when its input did");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -2009,6 +2060,7 @@ int main() {
 	TestPitchClamps();
 	TestCustomReverbDsp();
 	TestCustomReverbMatchesLibrary();
+	TestCustomReverbVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "libatrac9.h"
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -20,8 +21,6 @@
 #include <memory>
 #include <numbers>
 #include <vector>
-
-#include "libatrac9.h"
 
 namespace Libs::Audio {
 
@@ -549,6 +548,7 @@ struct Ngs2VoiceInternal {
 		std::vector<uint8_t>     param, work, state;
 		void                     KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*) = nullptr;
 		std::array<uintptr_t, 3> user_data {};
+		std::unique_ptr<Ngs2Reverb> reverb; // Module 0x1b, created when the game configures it.
 		uint32_t                 flags          = 1;
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
@@ -1845,12 +1845,27 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.has_samples = true;
 			}
 		}
+		// A reverb keeps sounding after its input stops, so its tail is rendered from silence.
+		if (!voice.has_samples &&
+		    std::ranges::any_of(voice.modules, [](const auto& module) {
+			    return module.reverb != nullptr && module.reverb->HasTail();
+		    })) {
+			voice.has_samples = true;
+		}
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				const auto& info   = custom.module[m];
 				auto&       module = voice.modules[m];
+				if (info.module_id == 0x1b) {
+					// Until the game configures it, the module passes audio through unchanged.
+					if (module.reverb != nullptr) {
+						module.reverb->Process(voice.Buffer(info.source_buffer_id, grain),
+						                       voice.channels, grain);
+					}
+					continue;
+				}
 				if (info.module_id != 0x19 && info.module_id != 0x1f) {
 					if (!module.render_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
@@ -2453,13 +2468,32 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id;
 				auto& module = voice->modules[index];
 				if ((param->id & 0xffffffe0u) != (0x40000000u | module_id << 8u) ||
-				    (module_id != 0x19 && module_id != 0x1f)) {
+				    (module_id != 0x19 && module_id != 0x1b && module_id != 0x1f)) {
 					if (!module.control_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
 						    param->id));
 						module.control_warned = true;
 					}
+					break;
+				}
+				if (module_id == 0x1b) {
+					// The custom reverb module. The control is Ngs2CustomVoiceReverbParam, a header
+					// followed by the I3DL2 settings.
+					EXIT_NOT_IMPLEMENTED(param->size !=
+					                     sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2ReverbI3dl2Param));
+					const auto& i3dl2 = *reinterpret_cast<const Ngs2ReverbI3dl2Param*>(param + 1);
+					LOGF("\t reverb: wet = %f, dry = %f, room = %d, roomHF = %d, decay = %f, "
+					     "hfRatio = %f, reflections = %d @ %f, reverb = %d @ %f, diffusion = %f, "
+					     "density = %f, hfReference = %f\n",
+					     i3dl2.wet, i3dl2.dry, i3dl2.room, i3dl2.room_hf, i3dl2.decay_time,
+					     i3dl2.decay_hf_ratio, i3dl2.reflections, i3dl2.reflections_delay,
+					     i3dl2.reverb, i3dl2.reverb_delay, i3dl2.diffusion, i3dl2.density,
+					     i3dl2.hf_reference);
+					if (module.reverb == nullptr) {
+						module.reverb = std::make_unique<Ngs2Reverb>();
+					}
+					module.reverb->Configure(i3dl2, voice->rack->ngs->option.sample_rate);
 					break;
 				}
 				if (module_id == 0x19) {

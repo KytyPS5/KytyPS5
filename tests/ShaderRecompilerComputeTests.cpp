@@ -8035,6 +8035,96 @@ public:
         Require(name, "undownloadable replaced image",
                 !TextureCacheTestAccess::Contains(texture_cache, multisampled_image),
                 "a replaced image that couldn't be published was left registered");
+
+        // Tiled chains use real UpdateSize() layouts. A 256x256 32-bit 64 KiB-swizzled chain
+        // with 7 or more levels keeps its mip tail in [0, 0x10000), level 1 in
+        // [0x10000, 0x20000) and its base level in [0x20000, 0x60000).
+        constexpr uint32_t tiled_extent = 256;
+        constexpr uint32_t tiled_block_width = 128;  // 64 KiB block of 32-bit texels
+        constexpr uint32_t tiled_single_level = 1;
+        constexpr uint32_t tiled_full_levels = 9;
+        constexpr uint64_t tiled_level1_start = 0x10000;
+        constexpr uint64_t tiled_base_start = 0x20000;
+        constexpr uint64_t tiled_chain_size = 0x60000;
+        constexpr uint32_t tiled_tail_value = 0x88888888u;
+        constexpr uint32_t tiled_level1_value = 0x99999999u;
+        constexpr uint32_t tiled_base_value = 0xaaaaaaaau;
+        // Builds a tiled 256x256 texture request with the given level count.
+        const auto make_tiled = [&](uint64_t offset, uint32_t levels) {
+          auto desc = MakeLinearDesc(base + offset, 0, vk::Format::eR32Uint,
+                                     Prospero::BufferFormat::k32UInt,
+                                     Prospero::ImageType::kColor2D,
+                                     {tiled_extent, tiled_extent, 1}, 1, sizeof(uint32_t), 1);
+          desc.info.tile_mode = Prospero::TileMode::kStandard64KB;
+          desc.info.resources.levels = levels;
+          // Lets UpdateSize() pick the tiled pitch instead of the linear one MakeLinearDesc set.
+          desc.info.pitch = 0;
+          desc.view_info.level_count = levels;
+          desc.info.UpdateSize();
+          return desc;
+        };
+        // Fills each region of a tiled chain with its own value, so reads show which region a
+        // texel came from whatever the swizzle order inside a region is.
+        const auto fill_tiled_chain = [&](uint64_t offset) {
+          auto* words = reinterpret_cast<uint32_t*>(memory + offset);
+          constexpr auto word_bytes = sizeof(uint32_t);
+          std::fill_n(words, tiled_level1_start / word_bytes, tiled_tail_value);
+          std::fill_n(words + tiled_level1_start / word_bytes,
+                      (tiled_base_start - tiled_level1_start) / word_bytes, tiled_level1_value);
+          std::fill_n(words + tiled_base_start / word_bytes,
+                      (tiled_chain_size - tiled_base_start) / word_bytes, tiled_base_value);
+        };
+
+        // Octopath Traveler II case. A one-level texture streamed into memory that a full tiled
+        // chain used keeps its base level at offset 0, which the chain uses for its mip tail and
+        // level 1. The first row's two 64 KiB blocks show those two regions.
+        constexpr uint64_t tiled_replace_offset = 0x2e80000;
+        fill_tiled_chain(tiled_replace_offset);
+        auto tiled_chain = make_tiled(tiled_replace_offset, tiled_full_levels);
+        const auto tiled_chain_image = texture_cache.FindImage(tiled_chain);
+        (void)texture_cache.FindTexture(tiled_chain_image, tiled_chain);
+        Require(name, "tiled chain base level",
+                tiled_chain.info.data.size == tiled_chain_size &&
+                    tiled_chain.info.mip_layout[0].offset == tiled_base_start &&
+                    ReadCachedTexel(name, context, tiled_chain_image, {},
+                                    {tiled_extent, 1, 1}) ==
+                        std::vector<u32>(tiled_extent, tiled_base_value),
+                "a tiled chain did not read its base level from the end of the chain");
+        auto tiled_one_level = make_tiled(tiled_replace_offset, tiled_single_level);
+        const auto tiled_one_level_image = texture_cache.FindImage(tiled_one_level);
+        (void)texture_cache.FindTexture(tiled_one_level_image, tiled_one_level);
+        auto expected_row = std::vector<u32>(tiled_block_width, tiled_tail_value);
+        expected_row.resize(tiled_extent, tiled_level1_value);
+        Require(name, "one-level texture over a tiled chain",
+                tiled_one_level_image != tiled_chain_image &&
+                    ReadCachedTexel(name, context, tiled_one_level_image, {},
+                                    {tiled_extent, 1, 1}) == expected_row,
+                "a one-level texture was served by a tiled chain with a different base level");
+
+        // Levels that differ only inside the mip tail leave every shared level in place, so the
+        // cached chain keeps serving the request instead of a separate image being created.
+        // Equal tiled sizes send this through FindImage's equal-backing path, not ResolveOverlap.
+        // A separate image would read the same values, so the image count and the cached level
+        // count are what show the chain was reused.
+        constexpr uint64_t tiled_tail_offset = 0x2f00000;
+        constexpr uint32_t tiled_tail_only_levels = tiled_full_levels - 1;
+        fill_tiled_chain(tiled_tail_offset);
+        auto tail_chain = make_tiled(tiled_tail_offset, tiled_full_levels);
+        const auto tail_chain_image = texture_cache.FindImage(tail_chain);
+        (void)texture_cache.FindTexture(tail_chain_image, tail_chain);
+        auto tail_only = make_tiled(tiled_tail_offset, tiled_tail_only_levels);
+        const auto tail_only_image = texture_cache.FindImage(tail_only);
+        (void)texture_cache.FindTexture(tail_only_image, tail_only);
+        Require(name, "tail-only level difference reuses the tiled chain",
+                tail_only_image == tail_chain_image &&
+                    TextureCacheTestAccess::FindImages(texture_cache, base + tiled_tail_offset,
+                                                       tiled_chain_size, false) ==
+                        std::vector<ImageId>{tail_chain_image} &&
+                    texture_cache.GetImage(tail_chain_image).info.resources.levels ==
+                        tiled_full_levels &&
+                    ReadCachedTexel(name, context, tail_only_image, {}, {tiled_extent, 1, 1}) ==
+                        std::vector<u32>(tiled_extent, tiled_base_value),
+                "a request differing only in its mip tail got a separate image");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

@@ -24,6 +24,8 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScreen>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -122,10 +124,10 @@ static QString GameDirectoryKey(const QString& dir) {
 }
 
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
-    : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
-      m_info(info) {
+    : QDialog(parent, Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint),
+      m_ui(new Ui::ConfigurationEditDialog), m_info(info) {
 	m_ui->setupUi(this);
-	setMinimumWidth(width());
+	MakeTabsScrollable();
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
@@ -170,7 +172,9 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 
 	setSizeGripEnabled(true);
 
-	restoreGeometry(g_last_geometry);
+	if (!restoreGeometry(g_last_geometry)) {
+		GrowToFitContents();
+	}
 
 	Init(info);
 }
@@ -418,8 +422,44 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
+	GrowToFitContents();
+}
+
+void ConfigurationEditDialog::MakeTabsScrollable() {
+	auto* tabs = m_ui->settings_tabs;
+	for (int i = 0; i < tabs->count(); i++) {
+		auto* page   = tabs->widget(i);
+		auto  title  = tabs->tabText(i);
+		auto* scroll = new QScrollArea;
+		scroll->setWidgetResizable(true);
+		scroll->setFrameShape(QFrame::NoFrame);
+		tabs->removeTab(i);
+		scroll->setWidget(page);
+		tabs->insertTab(i, scroll, title);
+	}
+	tabs->setCurrentIndex(0);
+}
+
+void ConfigurationEditDialog::GrowToFitContents() {
 	layout()->activate();
-	resize(size().expandedTo(minimumSizeHint()));
+	auto* tabs = m_ui->settings_tabs;
+	QSize content;
+	for (int i = 0; i < tabs->count(); i++) {
+		content = content.expandedTo(
+		    static_cast<QScrollArea*>(tabs->widget(i))->widget()->minimumSizeHint());
+	}
+	const QSize chrome = size() - tabs->currentWidget()->size();
+	resize(size().expandedTo(content + chrome).boundedTo(screen()->availableGeometry().size()));
+}
+
+void ConfigurationEditDialog::ShowTab(QWidget* page) {
+	auto* tabs = m_ui->settings_tabs;
+	for (int i = 0; i < tabs->count(); i++) {
+		if (tabs->widget(i)->isAncestorOf(page)) {
+			tabs->setCurrentIndex(i);
+			return;
+		}
+	}
 }
 
 QString ConfigurationEditDialog::GetAddonsDirectory() const {
@@ -524,7 +564,7 @@ void ConfigurationEditDialog::save() {
 	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
 	                   m_ui->lineEdit_cmd_dump_folder}) {
 		if (field->isEnabled() && field->text().isEmpty()) {
-			m_ui->settings_tabs->setCurrentWidget(m_ui->debug_tab);
+			ShowTab(m_ui->debug_tab);
 			field->setFocus();
 			break;
 		}
@@ -544,6 +584,16 @@ void ConfigurationEditDialog::save() {
 	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
 		QMessageBox::critical(this, tr("Save failed"),
 		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
+		return;
+	}
+	if (Configuration::NormalizeResolution(m_ui->comboBox_screen_resolution->currentText())
+	        .isEmpty()) {
+		ShowTab(m_ui->settings_tab);
+		m_ui->comboBox_screen_resolution->setFocus();
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("Screen resolution must be WIDTHxHEIGHT, each between %1 and %2")
+		                          .arg(Configuration::MIN_SCREEN_SIZE)
+		                          .arg(Configuration::MAX_SCREEN_SIZE));
 		return;
 	}
 
@@ -590,16 +640,6 @@ void ConfigurationEditDialog::add_game_directory() {
 	auto* tree_view = dialog.findChild<QTreeView*>(QStringLiteral("treeView"));
 	if (tree_view != nullptr) {
 		tree_view->setSelectionMode(QAbstractItemView::ExtendedSelection);
-	}
-	if (Configuration::NormalizeResolution(m_ui->comboBox_screen_resolution->currentText())
-	        .isEmpty()) {
-		m_ui->settings_tabs->setCurrentWidget(m_ui->settings_tab);
-		m_ui->comboBox_screen_resolution->setFocus();
-		QMessageBox::critical(this, tr("Save failed"),
-		                      tr("Screen resolution must be WIDTHxHEIGHT, each between %1 and %2")
-		                          .arg(Configuration::MIN_SCREEN_SIZE)
-		                          .arg(Configuration::MAX_SCREEN_SIZE));
-		return;
 	}
 
 	if (dialog.exec() != QDialog::Accepted) {

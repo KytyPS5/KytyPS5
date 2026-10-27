@@ -34,6 +34,13 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// A clean buffer that no binding has used for this many GC ticks (one per suspend point,
+	// usually once a frame) is released even without memory pressure. Releases run every
+	// STALE_RELEASE_INTERVAL_TICKS, at most STALE_RELEASE_MAX_PER_PASS at a time, so a scene
+	// change spreads its releases out.
+	static constexpr uint64_t STALE_RELEASE_AGE_TICKS      = 300;
+	static constexpr uint64_t STALE_RELEASE_INTERVAL_TICKS = 60;
+	static constexpr uint32_t STALE_RELEASE_MAX_PER_PASS   = 128;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -122,6 +129,10 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// Whether a buffer may be released without a download, meaning the GPU wrote none of it.
+	[[nodiscard]] bool IsStaleReleaseCandidate(const Buffer& buffer);
+	// Releases clean buffers that no binding has used for STALE_RELEASE_AGE_TICKS.
+	void                     ReleaseStaleBuffers(uint64_t tick);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,

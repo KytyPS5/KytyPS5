@@ -670,8 +670,39 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+bool BufferCache::IsStaleReleaseCandidate(const Buffer& buffer) {
+	return !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) &&
+	       !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size());
+}
+
+// A cached buffer keeps its pages write-protected. Once the game reuses that memory for other
+// data, every CPU write there faults and re-uploads into a buffer nothing reads any more.
+void BufferCache::ReleaseStaleBuffers(uint64_t tick) {
+	if (tick < STALE_RELEASE_AGE_TICKS || tick % STALE_RELEASE_INTERVAL_TICKS != 0) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("BufferCache::ReleaseStaleBuffers");
+	// Dropping a clean buffer without a download is safe only because shaders never write guest
+	// memory through BDA (ShaderInfoCollection rejects them), so every GPU write is tracked.
+	// Nothing in this loop may wait on the scheduler. A wait can run deferred operations that
+	// create or join buffers and change the LRU list while it is being walked.
+	uint32_t released = 0;
+	m_lru_cache.ForEachItemBelow(tick - STALE_RELEASE_AGE_TICKS, [&](BufferId id) {
+		auto& buffer = m_slot_buffers[id];
+		EXIT_IF(buffer.is_deleted);
+		if (!IsStaleReleaseCandidate(buffer)) {
+			return false;
+		}
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		DeleteBuffer(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReleases);
+		return ++released == STALE_RELEASE_MAX_PER_PASS;
+	});
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	ReleaseStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

@@ -677,22 +677,6 @@ static bool font_is_italic(const FontState* font) {
 	       font->render_effect_slant != 0.0f;
 }
 
-// Noto Sans, shipped in assets/fonts next to the emulator (see 3rdparty/CMakeLists.txt), stands in
-// for the system fonts and for font data stb_truetype cannot read.
-static const char* fallback_font_file_name(bool bold, bool italic) {
-	if (bold && italic) {
-		return "NotoSans-BoldItalic.ttf";
-	}
-	if (bold) {
-		return "NotoSans-Bold.ttf";
-	}
-	if (italic) {
-		return "NotoSans-Italic.ttf";
-	}
-	return "NotoSans-Regular.ttf";
-}
-
-// Returns the whole file, or nothing if it is missing, empty or cannot be read.
 static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file) {
@@ -714,40 +698,34 @@ static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
 	return data;
 }
 
-// Reads the Noto Sans style for bold/italic from assets/fonts beside the emulator. Logs and returns
-// nothing if the emulator's folder is unknown or the file is missing, empty or unreadable.
-static std::vector<uint8_t> load_fallback_font_data(bool bold, bool italic) {
+static std::vector<uint8_t> load_fallback_font_data(const char* file_name) {
 	const char* base_path = SDL_GetBasePath();
 	if (base_path == nullptr) {
 		LOGF("Font: SDL_GetBasePath failed: %s\n", SDL_GetError());
 		return {};
 	}
 	// SDL returns UTF-8; path(const char*) would read it in the Windows ANSI code page.
-	const auto path = Common::PathFromUtf8(base_path) / "assets" / "fonts" /
-	                  fallback_font_file_name(bold, italic);
-	auto data = read_file_bytes(path);
+	const auto path = Common::PathFromUtf8(base_path) / "assets" / "fonts" / file_name;
+	auto       data = read_file_bytes(path);
 	if (data.empty()) {
 		LOGF("Font: fallback font not found: %s\n", Common::PathToString(path).c_str());
 	}
 	return data;
 }
 
-// Returns the fallback font for the requested style. A missing style is replaced by Bold, then
-// Italic, then Regular, as far as the request allows; empty if none of those loaded. All four are loaded on
-// the first call and kept for the whole process because FontState::ttf_data points into them.
 static const std::vector<uint8_t>& fallback_font_data(bool bold, bool italic) {
-	static const auto regular     = load_fallback_font_data(false, false);
-	static const auto bold_data   = load_fallback_font_data(true, false);
-	static const auto italic_data = load_fallback_font_data(false, true);
-	static const auto bold_italic = load_fallback_font_data(true, true);
+	static const auto regular     = load_fallback_font_data("NotoSans-Regular.ttf");
+	static const auto bold_data   = load_fallback_font_data("NotoSans-Bold.ttf");
+	static const auto italic_data = load_fallback_font_data("NotoSans-Italic.ttf");
+	static const auto bold_italic = load_fallback_font_data("NotoSans-BoldItalic.ttf");
 
-	if (bold && italic && !bold_italic.empty()) {
+	if (bold && italic) {
 		return bold_italic;
 	}
-	if (bold && !bold_data.empty()) {
+	if (bold) {
 		return bold_data;
 	}
-	if (italic && !italic_data.empty()) {
+	if (italic) {
 		return italic_data;
 	}
 	return regular;

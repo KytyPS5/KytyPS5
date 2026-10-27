@@ -51,13 +51,9 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
-bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
-	const auto& program   = input.stage.module->info;
-	const auto& resources = *input.stage.resources;
-	if (resources.buffers.size() != program.info.buffers.size()) {
-		EXIT("compute runtime buffer count does not match shader metadata\n");
-	}
+// Reports whether a compute shader can be a metadata clear judging by the shader alone, before
+// any descriptor is decoded or texture cache lock taken.
+static bool IsMetaClearShaderCandidate(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
 	if (program.info.has_bitwise_xor) {
 		return false;
 	}
@@ -69,45 +65,70 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			return false;
 		}
 	}
+	// A clear writes at least one metadata buffer, so a shader that writes no buffer cannot be one.
+	return std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                   [](const auto& resource) { return resource.written; });
+}
+
+// Adds one bound buffer to a possible metadata clear's targets. Returns false when the binding
+// alone shows the dispatch is not a clear.
+static bool AddMetaClearTarget(const ShaderRecompiler::IR::BufferResource& resource,
+                               const ShaderBufferResource&                 descriptor,
+                               std::span<TextureCache::MetaClearTarget> targets, size_t& count) {
+	constexpr uint64_t MaxClearConstantsBytes = 4096;
+	const auto         address                = descriptor.Base48();
+	// An unbound slot has a null descriptor and the shader cannot access memory through it.
+	if (address == 0) {
+		return true;
+	}
+	// An unbounded descriptor (NumRecords = 0xffffffff) does not say how much memory the
+	// shader touches, so the shader's own addressing decides.
+	const bool bounded = descriptor.NumRecords() != UINT32_MAX;
+	// A clear reads only a few constants (the clear value, the surface layout). A larger or
+	// unbounded read is real data being copied or transformed, as in PPSA09809's scene-buffer
+	// upload onto reused HTILE memory.
+	if (!resource.written && resource.read &&
+	    (!bounded || descriptor.GetSize() > MaxClearConstantsBytes)) {
+		return false;
+	}
+	// A buffer that is read and written is updated from its old contents, so it is not a fill.
+	if (resource.written && resource.read) {
+		return false;
+	}
+	// Defensive bound in case the recompiler's buffer cap grows past the target array.
+	if (count == targets.size()) {
+		return false;
+	}
+	targets[count++] = {address, descriptor.GetSize(), bounded, resource.written};
+	return true;
+}
+
+bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+                                                const CommandBuffer&          buffer) {
+	const auto& program   = input.stage.module->info;
+	const auto& resources = *input.stage.resources;
+	if (resources.buffers.size() != program.info.buffers.size()) {
+		EXIT("compute runtime buffer count does not match shader metadata\n");
+	}
+	if (!IsMetaClearShaderCandidate(program)) {
+		return false;
+	}
 	// A metadata clear writes constant values into metadata surfaces and nothing else. Metadata
 	// entries outlive the memory they describe when a game frees a depth target and reuses its
 	// HTILE for something else, so the target address alone does not identify a clear. A dispatch
 	// that reads real data, writes other memory, or writes past the surface must run.
 	// PPSA09809: the scene-buffer resize and upload landed on a stale HTILE address after battles
 	// and were dropped, so models vanished.
-	constexpr uint64_t MaxClearConstantsBytes = 4096;
 	// Sized for every buffer a shader can bind, so no dispatch is turned away for its count.
 	constexpr size_t MaxMetaClearTargets = ShaderRecompiler::IR::ShaderInfo::MaxBufferRoots;
 
 	std::array<TextureCache::MetaClearTarget, MaxMetaClearTargets> targets {};
 	size_t                                                         target_count = 0;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& resource   = program.info.buffers[i];
-		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		const auto  address    = descriptor.Base48();
-		// An unbound slot has a null descriptor and the shader cannot access memory through it.
-		if (address == 0) {
-			continue;
-		}
-		// An unbounded descriptor (NumRecords = 0xffffffff) does not say how much memory the
-		// shader touches, so the shader's own addressing decides.
-		const bool bounded = descriptor.NumRecords() != UINT32_MAX;
-		// A clear reads only a few constants (the clear value, the surface layout). A larger or
-		// unbounded read is real data being copied or transformed, as in PPSA09809's scene-buffer
-		// upload onto reused HTILE memory.
-		if (!resource.written && resource.read &&
-		    (!bounded || descriptor.GetSize() > MaxClearConstantsBytes)) {
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (!AddMetaClearTarget(program.info.buffers[i], descriptor, targets, target_count)) {
 			return false;
 		}
-		// A buffer that is read and written is updated from its old contents, so it is not a fill.
-		if (resource.written && resource.read) {
-			return false;
-		}
-		// Defensive bound in case the recompiler's buffer cap grows past this array.
-		if (target_count == targets.size()) {
-			return false;
-		}
-		targets[target_count++] = {address, descriptor.GetSize(), bounded, resource.written};
 	}
 	// The texture cache checks the rest under one lock and clears only if every target passes.
 	// A read-only binding must not be a metadata surface, and a written one must be a surface of

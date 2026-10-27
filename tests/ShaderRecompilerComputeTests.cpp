@@ -5996,7 +5996,8 @@ public:
     constexpr uint32_t unbounded = UINT32_MAX;
     constexpr uint32_t clear_constants_records = 1;
     constexpr uint32_t meta_records = 0x100;
-    // Mirrors MaxClearConstantsBytes in TryConsumeComputeMetaClear, so both change together.
+    // Mirrors MaxClearConstantsBytes in AddMetaClearTarget (renderCompute.cpp), so both
+    // change together.
     constexpr uint32_t max_constants_bytes = 4096;
     constexpr uint32_t max_constants_records = max_constants_bytes / MetaClearElementBytes;
     EnsureRuntimeContext();

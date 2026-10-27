@@ -5934,15 +5934,144 @@ public:
             !image_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
             "a dispatch also writing a storage image was replaced by a clear");
 
+    // A real clear targets HTILE that still belongs to a depth target. A constant fill of
+    // reused HTILE memory is still consumed today, because a metadata entry survives while its
+    // memory stays mapped, even after a game reuses it for other data. That gap is left to a
+    // follow-up, so this case uses metadata that was never reused.
+    constexpr uint64_t cleared_meta = 0x0000000204400000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, cleared_meta, 0xa0000);
     ShaderModule clear_program;
     ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;
     AddBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);
-    AddBuffer(reused_meta, false, true, 0xa000, clear_program, clear_snapshot);
+    AddBuffer(cleared_meta, false, true, 0xa000, clear_program, clear_snapshot);
     const bool clear_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(clear_program, clear_snapshot), command);
     Require(name, "constant-driven HTile clear consumed",
-            clear_consumed && texture_cache.IsMetaCleared(reused_meta, 0),
+            clear_consumed && texture_cache.IsMetaCleared(cleared_meta, 0),
             "a full HTile clear reading only constants was not consumed");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Element size of the k32_32_32_32UInt buffers the metadata clear tests bind.
+  static constexpr uint32_t MetaClearElementBytes = 16;
+
+  // Adds a formatted buffer binding of `records` elements at `address` to a compute shader's
+  // metadata and its descriptor to the resource snapshot. A null address models an unbound
+  // slot and UINT32_MAX records an unbounded descriptor.
+  static void AddMetaClearBuffer(uint64_t address, bool read, bool written, uint32_t records,
+                                 ShaderModule &module,
+                                 ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+    auto &program = module.info;
+    program.stage = ShaderType::Compute;
+    ShaderRecompiler::IR::BufferResource resource{};
+    resource.read = read;
+    resource.written = written;
+    resource.formatted = true;
+    // The classifier doesn't read write_extent. It is set as the recompiler sets it for a real
+    // clear, whose formatted, thread-addressed writes have no static extent.
+    resource.write_extent = written ? UINT32_MAX : 0;
+    program.info.buffers.push_back(resource);
+    ShaderBufferResource descriptor{};
+    descriptor.UpdateAddress48(address);
+    descriptor.fields[1] |= MetaClearElementBytes << 16u;
+    descriptor.fields[2] = records;
+    descriptor.fields[3] =
+        DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt) << 12u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 4;
+    std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
+    snapshot.buffers.push_back(value);
+  }
+
+  // Pins which inputs keep a compute metadata clear eligible. Each case uses its own HTILE
+  // entry, so a clear consumed by one case can't satisfy another.
+  void CheckComputeMetaClearInputs() {
+    constexpr const char *name = "ComputeMetaClearInputs";
+    constexpr uint64_t meta_size = 0xa0000;
+    constexpr uint64_t meta_spacing = 0x100000;
+    constexpr uint64_t first_meta = 0x0000000204500000ull;
+    constexpr uint64_t constants = 0x0000000204300000ull;
+    constexpr uint32_t unbounded = UINT32_MAX;
+    constexpr uint32_t clear_constants_records = 1;
+    constexpr uint32_t meta_records = 0x100;
+    // Mirrors MaxClearConstantsBytes in TryConsumeComputeMetaClear, so both change together.
+    constexpr uint32_t max_constants_bytes = 4096;
+    constexpr uint32_t max_constants_records = max_constants_bytes / MetaClearElementBytes;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    auto &command = scheduler.Current();
+    uint64_t next_meta = first_meta;
+    // Registers a fresh HTILE entry for one case.
+    const auto NewMeta = [&]() {
+      const auto address = next_meta;
+      next_meta += meta_spacing;
+      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, address, meta_size);
+      return address;
+    };
+    // Builds a dispatch that reads constants of `read_records` elements and writes `writes`,
+    // then reports whether it was consumed as a metadata clear.
+    const auto Consume = [&](uint32_t read_records,
+                             std::initializer_list<std::pair<uint64_t, uint32_t>> writes) {
+      ShaderModule module;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      AddMetaClearBuffer(constants, true, false, read_records, module, snapshot);
+      for (const auto &[address, records] : writes) {
+        AddMetaClearBuffer(address, false, true, records, module, snapshot);
+      }
+      ShaderComputeInputInfo input{};
+      input.stage.module = &module;
+      input.stage.resources = &snapshot;
+      return RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, input, command);
+    };
+
+    // Clear shaders commonly address the whole surface through an unbounded descriptor and a
+    // thread-indexed write with no static extent. Such a clear must stay a logical clear, or
+    // the depth target would keep stale HTILE.
+    const auto unbounded_meta = NewMeta();
+    Require(name, "unbounded HTile clear consumed",
+            Consume(clear_constants_records, {{unbounded_meta, unbounded}}) &&
+                texture_cache.IsMetaCleared(unbounded_meta, 0),
+            "an unbounded constant-driven HTile clear was not consumed");
+
+    // An unbounded read can be any amount of real data, so the dispatch is a copy.
+    const auto unbounded_read_meta = NewMeta();
+    Require(name, "unbounded read preserved",
+            !Consume(unbounded, {{unbounded_read_meta, meta_records}}) &&
+                !texture_cache.IsMetaCleared(unbounded_read_meta, 0),
+            "a dispatch with an unbounded read was replaced by a clear");
+
+    // Constants up to the limit keep a clear eligible, and one element more does not.
+    const auto at_limit_meta = NewMeta();
+    Require(name, "constants at the read limit consumed",
+            Consume(max_constants_records, {{at_limit_meta, meta_records}}) &&
+                texture_cache.IsMetaCleared(at_limit_meta, 0),
+            "a clear reading exactly the constant limit was not consumed");
+    const auto past_limit_meta = NewMeta();
+    Require(name, "read past the constant limit preserved",
+            !Consume(max_constants_records + 1, {{past_limit_meta, meta_records}}) &&
+                !texture_cache.IsMetaCleared(past_limit_meta, 0),
+            "a dispatch reading past the constant limit was replaced by a clear");
+
+    // An unbound slot has a null descriptor and touches no memory, so it doesn't block a
+    // clear. A dispatch with nothing but unbound slots writes no metadata and is not a clear.
+    const auto null_slot_meta = NewMeta();
+    Require(name, "null slot beside an HTile clear consumed",
+            Consume(clear_constants_records,
+                    {{0, meta_records}, {null_slot_meta, meta_records}}) &&
+                texture_cache.IsMetaCleared(null_slot_meta, 0),
+            "a null descriptor slot stopped an HTile clear from being consumed");
+    Require(name, "null-only dispatch preserved",
+            !Consume(clear_constants_records, {{0, meta_records}}),
+            "a dispatch writing only unbound slots was replaced by a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -53505,6 +53634,7 @@ int main(int argc, char **argv) {
     CheckPs5GameExampleImageClearRuntimeShape();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckComputeMetaClearInputs();
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();

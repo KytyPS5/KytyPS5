@@ -8125,6 +8125,58 @@ public:
                     ReadCachedTexel(name, context, tail_only_image, {}, {tiled_extent, 1, 1}) ==
                         std::vector<u32>(tiled_extent, tiled_base_value),
                 "a request differing only in its mip tail got a separate image");
+
+        // A request with another tile mode at the same address becomes a separate image. The
+        // idle cached image is retired, and its GPU-written contents go through the buffer cache
+        // first, so the new image starts from them instead of from stale guest memory. Every
+        // cleared texel holds the same value, so the result doesn't depend on swizzle order,
+        // and reading the whole image catches a publish that only covered part of it.
+        constexpr uint64_t retile_offset = 0x2f60000;
+        // 128 texels keeps the linear pitch equal to the 64 KiB tiled one, so both layouts have
+        // the same block extent and the request reaches the tile-mode check.
+        constexpr uint32_t retile_extent = 128;
+        constexpr uint64_t retile_linear_size =
+            uint64_t{retile_extent} * retile_extent * sizeof(uint32_t);
+        constexpr uint32_t retile_stale_value = 0xbbbbbbbbu;
+        constexpr uint32_t retile_written_value = 0xccccccccu;
+        std::fill_n(reinterpret_cast<uint32_t*>(memory + retile_offset),
+                    retile_linear_size / sizeof(uint32_t), retile_stale_value);
+        auto retile_linear = MakeLinearDesc(
+            base + retile_offset, retile_linear_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {retile_extent, retile_extent, 1}, 1, sizeof(uint32_t), 1);
+        retile_linear.info.UpdateSize();
+        const auto retile_linear_image = texture_cache.FindImage(retile_linear);
+        (void)texture_cache.FindTexture(retile_linear_image, retile_linear);
+        vk::ClearValue retile_clear{};
+        std::fill_n(retile_clear.color.uint32.data(), retile_clear.color.uint32.size(),
+                    retile_written_value);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), retile_linear_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, retile_clear);
+        texture_cache.MarkGpuWritten(retile_linear_image);
+        scheduler.Flush();
+        TextureCacheTestAccess::MakeIdle(texture_cache, retile_linear_image);
+
+        auto retile_tiled = MakeLinearDesc(
+            base + retile_offset, 0, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {retile_extent, retile_extent, 1}, 1,
+            sizeof(uint32_t), 1);
+        retile_tiled.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        // Lets UpdateSize() pick the tiled pitch instead of the linear one MakeLinearDesc set.
+        retile_tiled.info.pitch = 0;
+        retile_tiled.info.UpdateSize();
+        const auto retile_tiled_image = texture_cache.FindImage(retile_tiled);
+        (void)texture_cache.FindTexture(retile_tiled_image, retile_tiled);
+        Require(name, "idle GPU-written image replaced by another tile mode",
+                retile_tiled_image != retile_linear_image &&
+                    !TextureCacheTestAccess::Contains(texture_cache, retile_linear_image) &&
+                    ReadCachedTexel(name, context, retile_tiled_image, {},
+                                    {retile_extent, retile_extent, 1}) ==
+                        std::vector<u32>(size_t{retile_extent} * retile_extent,
+                                         retile_written_value),
+                "a retired GPU-written image was kept or its contents were lost on a tile "
+                "mode change");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

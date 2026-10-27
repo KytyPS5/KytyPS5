@@ -14,6 +14,7 @@
 
 #include <bitset>
 #include <map>
+#include <span>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -74,8 +75,16 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
-	// Size of the metadata surface registered at `address`; false if there is none.
-	[[nodiscard]] bool FindMeta(uint64_t address, uint64_t& size);
+	// One buffer binding of a compute dispatch that may be a metadata clear.
+	struct MetaClearTarget {
+		uint64_t address = 0;
+		uint64_t size    = 0;     // Bytes the descriptor covers.
+		bool     bounded = true;  // An unbounded descriptor's size says nothing about the write.
+		bool     written = false; // A binding that is not written must not be a metadata surface.
+	};
+	// Checks every target and, only if all pass, marks each written metadata surface cleared.
+	// Returns false and changes nothing otherwise.
+	[[nodiscard]] bool ClearMetaSurfaces(std::span<const MetaClearTarget> targets);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);

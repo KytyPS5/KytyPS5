@@ -6076,6 +6076,71 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Pins that TextureCache::ClearMetaSurfaces clears all of a dispatch's metadata targets or
+  // none. A partial clear would mark HTILE cleared for a dispatch that then runs and writes it.
+  void CheckMetaClearSurfacesAllOrNothing() {
+    constexpr const char *name = "MetaClearSurfacesAllOrNothing";
+    using Target = TextureCache::MetaClearTarget;
+    constexpr uint64_t meta_size = 0x1000;
+    constexpr uint64_t first_meta = 0x0000000204600000ull;
+    constexpr uint64_t second_meta = 0x0000000204610000ull;
+    constexpr uint64_t unregistered = 0x0000000204620000ull;
+    constexpr uint64_t constants = 0x0000000204630000ull;
+    constexpr uint64_t constants_size = 0x10;
+    // An unbounded descriptor reports a size past the surface, which must not reject it.
+    constexpr uint64_t unbounded_size = meta_size * 2;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, first_meta, meta_size);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, second_meta, meta_size);
+    // Reports whether neither registered surface has been marked cleared.
+    const auto NoneCleared = [&]() {
+      return !texture_cache.IsMetaCleared(first_meta, 0) &&
+             !texture_cache.IsMetaCleared(second_meta, 0);
+    };
+
+    // A later target that fails must leave an earlier passing target uncleared.
+    const std::array unregistered_last{Target{first_meta, meta_size, true, true},
+                                       Target{unregistered, meta_size, true, true}};
+    Require(name, "unregistered target clears nothing",
+            !texture_cache.ClearMetaSurfaces(unregistered_last) && NoneCleared(),
+            "a dispatch with an unregistered target still cleared another surface");
+
+    const std::array oversized{Target{first_meta, meta_size, true, true},
+                               Target{second_meta, meta_size + 1, true, true}};
+    Require(name, "oversized target clears nothing",
+            !texture_cache.ClearMetaSurfaces(oversized) && NoneCleared(),
+            "a dispatch writing past a surface still cleared another surface");
+
+    const std::array meta_input{Target{first_meta, meta_size, true, true},
+                                Target{second_meta, meta_size, true, false}};
+    Require(name, "metadata read as input clears nothing",
+            !texture_cache.ClearMetaSurfaces(meta_input) && NoneCleared(),
+            "a dispatch reading a metadata surface still cleared another surface");
+
+    const std::array only_constants{Target{constants, constants_size, true, false}};
+    Require(name, "dispatch writing no surface clears nothing",
+            !texture_cache.ClearMetaSurfaces(only_constants) && NoneCleared(),
+            "a dispatch that writes no metadata surface was accepted as a clear");
+
+    const std::array both{Target{constants, constants_size, true, false},
+                          Target{first_meta, meta_size, true, true},
+                          Target{second_meta, unbounded_size, false, true}};
+    Require(name, "every passing target cleared",
+            texture_cache.ClearMetaSurfaces(both) &&
+                texture_cache.IsMetaCleared(first_meta, 0) &&
+                texture_cache.IsMetaCleared(second_meta, 0),
+            "a dispatch whose targets all passed did not clear every surface");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -53635,6 +53700,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
     vulkan.CheckComputeMetaClearInputs();
+    vulkan.CheckMetaClearSurfacesAllOrNothing();
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();

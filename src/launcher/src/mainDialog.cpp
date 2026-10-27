@@ -134,7 +134,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->close_terminal->setVisible(false); // The emulator runs without a terminal.
 #endif
 
-	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowMinMaxButtonsHint |
+	                            Qt::WindowCloseButtonHint);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);

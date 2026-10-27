@@ -1379,7 +1379,9 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	const auto condition = *reinterpret_cast<const volatile uint32_t*>(addr);
+	cp.PromoteGuestWrites();
+	if (condition == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1414,6 +1416,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	cp.PromoteGuestWrites();
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);

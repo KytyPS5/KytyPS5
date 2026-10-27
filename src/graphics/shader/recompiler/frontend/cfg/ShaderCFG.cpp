@@ -645,6 +645,51 @@ void PruneUnreachableBlocks(Graph& graph) {
 	}
 }
 
+// The sets below are sorted and unique; this keeps them so.
+void InsertSorted(std::vector<uint32_t>& values, uint32_t value) {
+	const auto at = std::lower_bound(values.begin(), values.end(), value);
+	if (at == values.end() || *at != value) {
+		values.insert(at, value);
+	}
+}
+
+// Visiting order for the iterative dominator solver: a depth-first reverse postorder over the
+// successor edges from the entry, then the blocks the walk does not reach, in index order. The
+// fixed point does not depend on the order, but in index order a shader with thousands of blocks
+// (inlined function calls) took one pass per block to converge, tens of seconds per shader.
+std::vector<uint32_t> SolverOrder(const Graph& graph) {
+	const auto            count = static_cast<uint32_t>(graph.blocks.size());
+	std::vector<uint32_t> order;
+	order.reserve(count);
+	std::vector<uint8_t>                       visited(count, 0);
+	std::vector<std::pair<uint32_t, uint32_t>> stack; // (block, next successor)
+	if (graph.entry_block < count) {
+		visited[graph.entry_block] = 1;
+		stack.emplace_back(graph.entry_block, 0u);
+	}
+	while (!stack.empty()) {
+		const auto  block      = stack.back().first;
+		const auto& successors = graph.blocks[block].successors;
+		if (stack.back().second < successors.size()) {
+			const auto succ = successors[stack.back().second++];
+			if (succ < count && visited[succ] == 0) {
+				visited[succ] = 1;
+				stack.emplace_back(succ, 0u);
+			}
+			continue;
+		}
+		order.push_back(block);
+		stack.pop_back();
+	}
+	std::reverse(order.begin(), order.end());
+	for (uint32_t id = 0; id < count; id++) {
+		if (visited[id] == 0) {
+			order.push_back(id);
+		}
+	}
+	return order;
+}
+
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
@@ -653,10 +698,13 @@ void ComputeDominators(Graph& graph) {
 		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
 	}
 
-	bool changed = true;
+	// Predecessors before successors (back edges aside).
+	const auto order   = SolverOrder(graph);
+	bool       changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
+		for (const auto id: order) {
+			auto& block = graph.blocks[id];
 			if (block.id == graph.entry_block) {
 				continue;
 			}
@@ -668,8 +716,7 @@ void ComputeDominators(Graph& graph) {
 				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
 					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
 				}
-				AddUnique(next, block.id);
-				SortUnique(next);
+				InsertSorted(next, block.id);
 			}
 			if (next != block.dominators) {
 				block.dominators = std::move(next);
@@ -918,7 +965,8 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->dominators, dominator);
+	return target != nullptr &&
+	       std::binary_search(target->dominators.begin(), target->dominators.end(), dominator);
 }
 
 namespace {

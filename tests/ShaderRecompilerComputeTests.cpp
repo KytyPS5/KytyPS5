@@ -8177,6 +8177,41 @@ public:
                                          retile_written_value),
                 "a retired GPU-written image was kept or its contents were lost on a tile "
                 "mode change");
+
+        // The depth path can hand back a cached depth image unchanged when it holds at least as
+        // many levels. A one-level depth texture at a two-level chain's address keeps its base
+        // level where the chain keeps level 1, so that result must be refused.
+        constexpr uint64_t depth_chain_offset = 0x2f70000;
+        constexpr uint32_t depth_chain_width = 64;
+        // 64 texels of 4 bytes fill exactly one 256-byte linear row.
+        constexpr uint32_t depth_chain_row = depth_chain_width * sizeof(float);
+        constexpr uint32_t depth_chain_levels = 2;
+        // Builds a linear D32 texture request at the depth chain's address.
+        const auto make_depth = [&](uint32_t levels) {
+          auto desc = MakeLinearDesc(base + depth_chain_offset, levels * depth_chain_row,
+                                     vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+                                     Prospero::ImageType::kColor2D, {depth_chain_width, 1, 1}, 1,
+                                     sizeof(float), 1);
+          desc.info.resources.levels = levels;
+          desc.view_info.level_count = levels;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+          desc.info.UpdateSize();
+          return desc;
+        };
+        auto depth_chain = make_depth(depth_chain_levels);
+        auto depth_one_level = make_depth(1);
+        Require(name, "two-level linear depth chain layout",
+                depth_chain.info.IsDepth() &&
+                    depth_chain.info.mip_layout[0].offset == depth_chain_row &&
+                    depth_one_level.info.mip_layout[0].offset == 0,
+                "the depth chain fixture no longer keeps its base level after level 1");
+        const auto depth_chain_image = texture_cache.FindImage(depth_chain);
+        (void)texture_cache.FindTexture(depth_chain_image, depth_chain);
+        const auto depth_one_level_image = texture_cache.FindImage(depth_one_level);
+        Require(name, "one-level depth texture over a longer depth chain",
+                depth_one_level_image != depth_chain_image &&
+                    texture_cache.GetImage(depth_one_level_image).info.resources.levels == 1,
+                "a cached depth image served a request with its base level in another place");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

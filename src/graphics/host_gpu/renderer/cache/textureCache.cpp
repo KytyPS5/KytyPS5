@@ -849,16 +849,21 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
-		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
-			return {depth_id};
-		}
-		// Equal pitch does not imply equal mip placement: a changed extent can move
-		// a level into or out of the mip tail. These are separate guest layouts.
-		// The mip count matters too: if any level both layouts have is placed differently, the
-		// cached image cannot serve the request.
+		// If any level both layouts have is placed differently, the cached image cannot serve
+		// the request, even when the mip counts differ.
 		const bool shared_levels_differ =
 		    requested.resources.levels != cached.info.resources.levels &&
 		    !SharedLevelsMatch(requested, cached.info);
+		// The depth path may convert the cached image into a new one, which copies its contents
+		// across. Handing back the cached image itself is only right when its levels sit where
+		// the request expects them.
+		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
+			if (depth_id != cached_id || !shared_levels_differ) {
+				return {depth_id};
+			}
+		}
+		// Equal pitch does not imply equal mip placement: a changed extent can move
+		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),

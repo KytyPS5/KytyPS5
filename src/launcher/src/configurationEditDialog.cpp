@@ -248,7 +248,11 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		                    info.audio_input_device);
 	}
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
-	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	m_ui->comboBox_screen_resolution->clear();
+	m_ui->comboBox_screen_resolution->setEditable(true);
+	m_ui->comboBox_screen_resolution->setInsertPolicy(QComboBox::NoInsert);
+	m_ui->comboBox_screen_resolution->addItems(Configuration::ResolutionPresets());
+	m_ui->comboBox_screen_resolution->setCurrentText(info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
@@ -474,7 +478,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
 	}
 	info.screen_resolution =
-	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
+	    Configuration::NormalizeResolution(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
@@ -584,6 +588,16 @@ void ConfigurationEditDialog::add_game_directory() {
 	auto* tree_view = dialog.findChild<QTreeView*>(QStringLiteral("treeView"));
 	if (tree_view != nullptr) {
 		tree_view->setSelectionMode(QAbstractItemView::ExtendedSelection);
+	}
+	if (Configuration::NormalizeResolution(m_ui->comboBox_screen_resolution->currentText())
+	        .isEmpty()) {
+		m_ui->settings_tabs->setCurrentWidget(m_ui->settings_tab);
+		m_ui->comboBox_screen_resolution->setFocus();
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("Screen resolution must be WIDTHxHEIGHT, each between %1 and %2")
+		                          .arg(Configuration::MIN_SCREEN_SIZE)
+		                          .arg(Configuration::MAX_SCREEN_SIZE));
+		return;
 	}
 
 	if (dialog.exec() != QDialog::Accepted) {

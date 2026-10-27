@@ -241,7 +241,7 @@ static void AddFlag(QStringList& args, bool enabled, const char* name) {
 
 static QStringList CreateEmulatorArgs(const Configuration& info) {
 	QStringList args;
-	auto        r = EnumToText(info.screen_resolution).split('x');
+	auto        r = Configuration::NormalizeResolution(info.screen_resolution).split('x');
 
 	if (r.size() != 2) {
 		return {};

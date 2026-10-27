@@ -1,5 +1,28 @@
 #include "configuration.h"
 
+#include <QRegularExpression>
+
+QStringList Configuration::ResolutionPresets() {
+	return {"1280x720",  "1920x1080", "2560x1440", "3840x2160",
+	        "2560x1080", "3440x1440", "3840x1600", "5120x2160"};
+}
+
+QString Configuration::NormalizeResolution(const QString& text) {
+	// Older settings stored the enum key, e.g. "R1920X1080".
+	static const QRegularExpression re(QStringLiteral("^\\s*R?(\\d+)\\s*[xX]\\s*(\\d+)\\s*$"));
+	const auto match = re.match(text);
+	if (!match.hasMatch()) {
+		return {};
+	}
+	const int width  = match.captured(1).toInt();
+	const int height = match.captured(2).toInt();
+	if (width < MIN_SCREEN_SIZE || height < MIN_SCREEN_SIZE || width > MAX_SCREEN_SIZE ||
+	    height > MAX_SCREEN_SIZE) {
+		return {};
+	}
+	return QStringLiteral("%1x%2").arg(width).arg(height);
+}
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -48,7 +71,8 @@ QVariantMap Configuration::GameSettings() const {
 template <class Settings>
 void Configuration::ReadGameSettingsValues(const Settings& s) {
 #define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
-	KYTY_CFG_GET(screen_resolution);
+	const auto resolution = NormalizeResolution(s.value("screen_resolution").toString());
+	screen_resolution     = resolution.isEmpty() ? QStringLiteral("1280x720") : resolution;
 	user_name          = s.value("user_name", user_name).toString();
 	bool user_id_ok    = false;
 	auto saved_user_id = s.value("user_id", user_id).toInt(&user_id_ok);

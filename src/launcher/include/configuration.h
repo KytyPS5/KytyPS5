@@ -80,13 +80,11 @@ public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
 
-	enum class Resolution {
-		R1280X720,
-		R1920X1080,
-		R2560X1440,
-		R3840X2160,
-	};
-	Q_ENUM(Resolution)
+	static constexpr int MIN_SCREEN_SIZE = 320;
+	static constexpr int MAX_SCREEN_SIZE = 16384;
+
+	static QStringList ResolutionPresets();
+	static QString     NormalizeResolution(const QString& text);
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
@@ -117,7 +115,7 @@ public:
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
+	QString                screen_resolution           = QStringLiteral("1280x720");
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;

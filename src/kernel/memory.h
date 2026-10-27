@@ -225,6 +225,11 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
+uint64_t TestFlexibleBackingHighWater();
+uint64_t TestGuestFreeRangeVisits();
+uint64_t TestDirectMappingCount();
+uint64_t TestFlexibleMappingCount();
+uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
 #endif
 

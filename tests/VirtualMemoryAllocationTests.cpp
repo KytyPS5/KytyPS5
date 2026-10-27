@@ -47,10 +47,15 @@
 
 #if defined(__linux__)
 #include <asm/prctl.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+#include <pthread.h>
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -81,6 +86,10 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
 int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 } // namespace Libs::Fiber
+
+namespace Libs::DbgAddressSanitizer {
+void TestRegisterMemoryCallbacks();
+}
 
 namespace {
 
@@ -355,6 +364,22 @@ size_t AvailableFlexibleMemory(const char* test) {
 	const int ret  = Libs::LibKernel::Memory::KernelAvailableFlexibleMemorySize(&size);
 	CheckOk(test, ret, "KernelAvailableFlexibleMemorySize");
 	return size;
+}
+
+void ExpectHostReadOnly(const char* test, uint64_t address) {
+#if defined(__linux__)
+	uint64_t value = 0;
+	iovec    local {&value, sizeof(value)};
+	iovec    remote {reinterpret_cast<void*>(address), sizeof(value)};
+	Check(test, process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == -1,
+	      "failed unmap lost read-only host protection");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
+	          info.Protect == PAGE_READONLY,
+	      "failed unmap lost read-only host protection");
+#endif
 }
 
 size_t ConfiguredFlexibleMemory(const char* test) {
@@ -823,6 +848,160 @@ void TestGuestFreeRangeSearchDoesNotUnderflow() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFragmentedGuestFreeRangeHints() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test  = "FragmentedGuestFreeRangeHints";
+	constexpr uint64_t page  = SceKernelPageSize;
+	void*              arena = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&arena, 32 * page, 0, 4 * page), "reserve arena");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, KernelMunmap(base, 32 * page), "release arena");
+	for (const uint64_t offset: {0, 8, 24}) {
+		void* blocker = reinterpret_cast<void*>(base + offset * page);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&blocker, 4 * page, SceKernelProtCpuRw,
+		                                     SceKernelMapFixed | SceKernelMapNoOverwrite,
+		                                     "search_blocker"),
+		        "map search blocker");
+	}
+	const auto expect_hint = [&](uint64_t hint, uint64_t size, uint64_t alignment,
+	                             uint64_t expected) {
+		void* address = reinterpret_cast<void*>(base + hint * page);
+		CheckOk(test, KernelReserveVirtualRange(&address, size * page, 0, alignment * page),
+		        "reserve hinted range");
+		Check(test, reinterpret_cast<uint64_t>(address) == base + expected * page,
+		      "hinted search skipped a usable predecessor or selected an "
+		      "occupied/aligned-out range");
+		CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(address), size * page),
+		        "release hinted range");
+	};
+	expect_hint(5, 1, 1, 5);  // Inside the predecessor free interval.
+	expect_hint(4, 1, 1, 4);  // Exactly at its start.
+	expect_hint(7, 1, 1, 7);  // Exactly fills its tail.
+	expect_hint(8, 1, 1, 12); // At the interval end, inside a host mapping.
+	expect_hint(6, 2, 4, 12); // Alignment makes the first interval unusable.
+
+	// Reservations remain host placeholders. Searching repeatedly from the same
+	// hint must skip virtual reservations while retaining the containing
+	// host-free predecessor.
+	for (uint64_t i = 12; i < 24; ++i) {
+		void* address = reinterpret_cast<void*>(base + 12 * page);
+		CheckOk(test, KernelReserveVirtualRange(&address, page, 0, page), "reserve fragmented gap");
+		Check(test, reinterpret_cast<uint64_t>(address) == base + i * page,
+		      "search retries did not advance through the fragmented virtual "
+		      "reservations");
+		CheckOk(test, KernelSetVirtualRangeName(address, page, i % 2 == 0 ? "even" : "odd"),
+		        "keep neighboring reservations distinct");
+	}
+	expect_hint(12, 1, 1, 28);
+	CheckOk(test, KernelMunmap(base + 12 * page, 12 * page), "release gap reservations");
+	for (const uint64_t offset: {0, 8, 24}) {
+		CheckOk(test, KernelMunmap(base + offset * page, 4 * page), "release search blocker");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestFreeRangeSearchSkipsEarlierFragments() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test  = "GuestFreeRangeSearchSkipsEarlierFragments";
+	constexpr uint64_t page  = SceKernelPageSize;
+	constexpr uint64_t count = 256;
+	constexpr uint64_t size  = count * 4 * page;
+	void*              arena = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&arena, size, 0, page), "reserve fragmented arena");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, KernelMunmap(base, size), "release fragmented arena");
+	for (uint64_t i = 0; i < count; ++i) {
+		void* address = reinterpret_cast<void*>(base + i * 4 * page);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, page, SceKernelProtCpuRw,
+		                                     SceKernelMapFixed | SceKernelMapNoOverwrite,
+		                                     "fragmented_search"),
+		        "map fragmented search blocker");
+	}
+
+	const auto hint    = base + size - 2 * page;
+	void*      address = reinterpret_cast<void*>(hint);
+	const auto before  = TestGuestFreeRangeVisits();
+	CheckOk(test, KernelReserveVirtualRange(&address, page, 0, page),
+	        "reserve near final fragment");
+	const auto visited = TestGuestFreeRangeVisits() - before;
+	Check(test, reinterpret_cast<uint64_t>(address) == hint,
+	      "search skipped the final containing free interval");
+	Check(test, visited > 0 && visited <= 2,
+	      "hinted free search revisited unrelated lower-address fragments");
+	CheckOk(test, KernelMunmap(hint, page), "release final reservation");
+	for (uint64_t i = 0; i < count; ++i) {
+		CheckOk(test, KernelMunmap(base + i * 4 * page, page), "release fragmented search blocker");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleZeroingTracksBackingLifetime() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test          = "FlexibleZeroingTracksBackingLifetime";
+	constexpr uint64_t page          = SceKernelPageSize;
+	const auto         available     = AvailableFlexibleMemory(test);
+	const auto         backing_start = KernelGetDirectMemorySize();
+	Check(test, TestFlexibleBackingHighWater() == backing_start,
+	      "fresh-backing test must run before other flexible allocations");
+	const auto expect_zero = [&](uint64_t address, uint64_t size) {
+		const auto* bytes = reinterpret_cast<const uint8_t*>(address);
+		Check(test, std::all_of(bytes, bytes + size, [](uint8_t value) { return value == 0; }),
+		      "flexible allocation exposed stale contents");
+	};
+
+	const auto zeroed_before = TestBackingBytesZeroed();
+	const auto first = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "fresh_backing");
+	Check(test, TestBackingBytesZeroed() == zeroed_before,
+	      "first-use flexible backing was eagerly zeroed");
+	expect_zero(first, 3 * page);
+	std::memset(reinterpret_cast<void*>(first), 0xa5, 3 * page);
+	CheckOk(test, KernelMunmap(first, 3 * page), "unmap dirty backing");
+
+	const auto mixed = MapNamedFlexible(test, 5 * page, SceKernelProtCpuRw, "mixed_backing");
+	Check(test, TestBackingBytesZeroed() - zeroed_before == 3 * page,
+	      "mixed allocation did not zero exactly its previously exposed prefix");
+	Check(test, TestFlexibleBackingHighWater() == backing_start + 5 * page,
+	      "mixed allocation did not advance the backing high-water mark");
+	expect_zero(mixed, 5 * page);
+	std::memset(reinterpret_cast<void*>(mixed), 0x5a, 5 * page);
+
+	void* failed = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&failed, 3 * page, 0, page), "reserve failed map");
+	const auto failed_address = reinterpret_cast<uint64_t>(failed);
+	TestFailNextVirtualRangeReplacement();
+	CheckFailed(test,
+	            KernelMapNamedFlexibleMemory(&failed, 3 * page, SceKernelProtCpuRw,
+	                                         SceKernelMapFixed, "failed_fresh_backing"),
+	            "publish fresh flexible mapping with injected failure");
+	Check(test,
+	      TestBackingBytesZeroed() - zeroed_before == 3 * page &&
+	          TestFlexibleBackingHighWater() == backing_start + 8 * page,
+	      "failed publication zeroed pristine backing or forgot previously "
+	      "exposed backing");
+	Check(test, AvailableFlexibleMemory(test) == available - 5 * page,
+	      "failed publication leaked flexible capacity");
+	ExpectRange(test, Query(test, failed_address), failed_address, failed_address + 3 * page, 0, 0,
+	            0, 0, 0);
+	CheckOk(test,
+	        KernelMapNamedFlexibleMemory(&failed, 3 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                     "retry_backing"),
+	        "retry failed flexible mapping");
+	Check(test, TestBackingBytesZeroed() - zeroed_before == 6 * page,
+	      "retry treated previously exposed backing as pristine");
+	expect_zero(failed_address, 3 * page);
+	Check(test,
+	      *reinterpret_cast<const uint8_t*>(mixed) == 0x5a &&
+	          *reinterpret_cast<const uint8_t*>(mixed + 5 * page - 1) == 0x5a,
+	      "zeroing reused backing changed a neighboring live allocation");
+	CheckOk(test, KernelMunmap(failed_address, 3 * page), "unmap retry");
+	CheckOk(test, KernelMunmap(mixed, 5 * page), "unmap mixed backing");
+	Check(test, AvailableFlexibleMemory(test) == available,
+	      "zeroing test leaked flexible capacity");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleMemoryCapacityIsBootFixed() {
 	const char* test       = "FlexibleMemoryCapacityIsBootFixed";
 	const auto  configured = ConfiguredFlexibleMemory(test);
@@ -1133,42 +1312,104 @@ void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 }
 
 void TestFragmentedBackingUnmapRollback() {
-	const char* test     = "FragmentedBackingUnmapRollback";
-	const auto  baseline = AvailableFlexibleMemory(test);
-	const auto  left =
-	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_hole_left");
-	const auto blocker =
-	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_blocker");
-	const auto right =
-	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_hole_right");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(left, SceKernelPageSize),
-	        "KernelMunmap(left hole)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(right, SceKernelPageSize),
-	        "KernelMunmap(right hole)");
-
-	const auto fragmented =
-	    MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw, "fragmented_backing");
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "FragmentedBackingUnmapRollback";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto left    = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "backing_hole_left");
+	const auto blocker = MapNamedFlexible(test, page, SceKernelProtCpuRw, "backing_blocker");
+	const auto right   = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "backing_hole_right");
+	std::memset(reinterpret_cast<void*>(left), 0xa5, 2 * page);
+	std::memset(reinterpret_cast<void*>(right), 0x5a, 2 * page);
+	*reinterpret_cast<uint64_t*>(blocker) = 0x424c4f434b455231ull;
+	CheckOk(test, KernelMunmap(left, 2 * page), "KernelMunmap(left hole)");
+	CheckOk(test, KernelMunmap(right, 2 * page), "KernelMunmap(right hole)");
+	void* target = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&target, 4 * page, 0, page),
+	        "reserve fragmented publication target");
+	const auto fragmented = reinterpret_cast<uint64_t>(target);
+	const auto available  = AvailableFlexibleMemory(test);
+	const auto mappings   = TestFlexibleMappingCount();
+	TestFailNextVirtualRangeReplacement();
+	CheckFailed(test,
+	            KernelMapNamedFlexibleMemory(&target, 4 * page, SceKernelProtCpuRw,
+	                                         SceKernelMapFixed, "fragmented_backing"),
+	            "publish fragmented flexible mapping with injected failure");
+	ExpectRange(test, Query(test, fragmented), fragmented, fragmented + 4 * page, 0, 0, 0, 0, 0,
+	            "anon");
+	Check(test,
+	      AvailableFlexibleMemory(test) == available && TestFlexibleMappingCount() == mappings,
+	      "fragmented publication rollback retained capacity or ownership records");
+	Check(test, *reinterpret_cast<uint64_t*>(blocker) == 0x424c4f434b455231ull,
+	      "fragmented publication rollback changed the live backing gap");
+	CheckOk(test,
+	        KernelMapNamedFlexibleMemory(&target, 4 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                     "fragmented_backing"),
+	        "retry fragmented flexible publication");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(fragmented);
+	Check(test,
+	      std::all_of(bytes, bytes + 4 * page, [](uint8_t byte) { return byte == 0; }) &&
+	          *reinterpret_cast<uint64_t*>(blocker) == 0x424c4f434b455231ull,
+	      "fragmented publication retry exposed stale bytes or changed the live gap");
 	auto* first_word = reinterpret_cast<uint64_t*>(fragmented);
-	auto* last_word =
-	    reinterpret_cast<uint64_t*>(fragmented + SceKernelPageSize * 2 - sizeof(uint64_t));
-	*first_word = 0x465241474c454654ull; // "FRAGLEFT"
-	*last_word  = 0x4652414752474854ull; // "FRAGRGHT"
-
-	Libs::LibKernel::Memory::TestFailGuestBackingStoreUnmapAfter(1);
-	CheckFailed(test, Libs::LibKernel::Memory::KernelMunmap(fragmented, SceKernelPageSize * 2),
-	            "KernelMunmap(injected second-view failure)");
-	ExpectRange(test, Query(test, fragmented), fragmented, fragmented + SceKernelPageSize * 2,
-	            SceKernelProtCpuRw, 1, 0, 0, 1, "fragmented_backing");
+	auto* last_word  = reinterpret_cast<uint64_t*>(fragmented + 4 * page - sizeof(uint64_t));
+	*first_word      = 0x465241474c454654ull;
+	*last_word       = 0x4652414752474854ull;
+	CheckOk(test, KernelMprotect(target, 4 * page, SceKernelProtCpuRead),
+	        "protect fragmented backing before partial unmap");
+	TestFailGuestBackingStoreUnmapAfter(1);
+	CheckFailed(test, KernelMunmap(fragmented + page, 2 * page),
+	            "KernelMunmap(partial first view then injected second-view failure)");
+	ExpectRange(test, Query(test, fragmented), fragmented, fragmented + 4 * page,
+	            SceKernelProtCpuRead, 1, 0, 0, 1, "fragmented_backing");
 	Check(test, *first_word == 0x465241474c454654ull && *last_word == 0x4652414752474854ull,
 	      "transactional backing-unmap rollback lost mapped contents");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(fragmented, SceKernelPageSize * 2),
-	        "KernelMunmap(retry)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(blocker, SceKernelPageSize),
-	        "KernelMunmap(blocker)");
+	ExpectHostReadOnly(test, fragmented + page);
+	ExpectHostReadOnly(test, fragmented + 2 * page);
+	CheckOk(test, KernelMprotect(target, 4 * page, SceKernelProtCpuRead),
+	        "reprotect views after partial-first-view rollback");
+	for (uint64_t i = 0; i < 4; ++i)
+		ExpectHostReadOnly(test, fragmented + i * page);
+	CheckOk(test, KernelMunmap(fragmented, 4 * page), "KernelMunmap(retry)");
+	CheckOk(test, KernelMunmap(blocker, page), "KernelMunmap(blocker)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "fragmented backing rollback test leaked flexible capacity");
+	std::printf("[host]    %-48s ok\n", test);
+}
 
+void TestFlexibleReplacementRollbackPreservesMetadata() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "FlexibleReplacementRollbackPreservesMetadata";
+	constexpr uint64_t page = SceKernelPageSize;
+	const auto         base = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "flex_restore");
+	const auto         mapping_count = TestFlexibleMappingCount();
+	for (uint64_t i = 0; i < 3; ++i) {
+		*reinterpret_cast<uint64_t*>(base + i * page) = 0x12345678 + i;
+	}
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRead),
+	        "protect middle flexible page");
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page), page, "flex_middle"),
+	        "rename middle flexible page");
+	Check(test, TestFlexibleMappingCount() == mapping_count,
+	      "flexible metadata edits fragmented backing ownership records");
+	const auto zeroed_before = TestBackingBytesZeroed();
+	TestFailNextFixedReserveRangeRegistration();
+	void* replacement = reinterpret_cast<void*>(base);
+	CheckFailed(test, KernelReserveVirtualRange(&replacement, 3 * page, SceKernelMapFixed, page),
+	            "replace fragmented flexible range with injected failure");
+	Check(test, TestBackingBytesZeroed() == zeroed_before,
+	      "rollback cleared preserved flexible backing");
+	for (uint64_t i = 0; i < 3; ++i) {
+		ExpectRange(test, Query(test, base + i * page), base + i * page, base + (i + 1) * page,
+		            i == 1 ? SceKernelProtCpuRead : SceKernelProtCpuRw, 1, 0, 0, 1,
+		            i == 1 ? "flex_middle" : "flex_restore");
+		Check(test, *reinterpret_cast<const uint64_t*>(base + i * page) == 0x12345678 + i,
+		      "rollback lost flexible contents across protection boundaries");
+		Check(test, !TestPlaceholderRangeIsFree(base + i * page, page),
+		      "restored flexible range remained marked as a free placeholder");
+	}
+	CheckOk(test, KernelMunmap(base, 3 * page), "release restored flexible range");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1230,6 +1471,304 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(adjacent_reused, SceKernelPageSize),
 	      "adjacent runtime reuse cleanup failed");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+constexpr uint64_t AsanShadowPageSize = 0x10000;
+constexpr uint64_t AsanShadowCoverage = AsanShadowPageSize * 8;
+
+uint64_t AsanShadowAddress(uint64_t address) {
+	return (address >> 3) + 0x10000000000ull;
+}
+
+bool AsanShadowPresent(uint64_t address) {
+	return Common::VirtualMemory::Protect(AsanShadowAddress(address) & ~(AsanShadowPageSize - 1),
+	                                      AsanShadowPageSize,
+	                                      Common::VirtualMemory::Mode::ReadWrite);
+}
+
+uint64_t ReserveAsanCoverage(const char* test, uint64_t pages = 1) {
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&address, pages * AsanShadowCoverage,
+	                                                           0, AsanShadowCoverage),
+	        "reserve isolated shadow coverage");
+	return reinterpret_cast<uint64_t>(address);
+}
+
+void MapAsanFlexible(const char* test, uint64_t base, uint64_t size,
+                     const char* name = "asan_shadow") {
+	void* address = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &address, size, SceKernelProtCpuRw, SceKernelMapFixed, name),
+	        "map flexible shadow fixture");
+}
+
+void TestAsanShadowLifetimeAcrossRangeEdits() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AsanShadowLifetimeAcrossRangeEdits";
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t coverage = AsanShadowCoverage;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 2 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "allocate direct shadow fixture");
+	const std::array<uint64_t, 2> bases {ReserveAsanCoverage(test), ReserveAsanCoverage(test)};
+	MapAsanFlexible(test, bases[0], 2 * page);
+	void* direct = reinterpret_cast<void*>(bases[1]);
+	CheckOk(test,
+	        KernelMapDirectMemory(&direct, 2 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                              physical, page),
+	        "map direct shadow fixture");
+	for (const auto base: bases) {
+		CheckOk(test,
+		        KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRead),
+		        "split virtual protection before callback registration");
+	}
+	Libs::DbgAddressSanitizer::TestRegisterMemoryCallbacks();
+	for (const auto base: bases) {
+		Check(test, AsanShadowPresent(base), "registration did not allocate shadow memory");
+		auto* sentinel = reinterpret_cast<uint64_t*>(AsanShadowAddress(base + page));
+		*sentinel      = 0x534841444f574c49ull;
+		CheckOk(test, KernelMunmap(base, page), "unmap first page with shared shadow");
+		Check(test, AsanShadowPresent(base) && *sentinel == 0x534841444f574c49ull,
+		      "partial unmap freed or changed a surviving page's shadow");
+		CheckOk(test, KernelMunmap(base + page, page), "unmap final page with shared shadow");
+		Check(test, !AsanShadowPresent(base), "final unmap retained shadow memory");
+		CheckOk(test, KernelMunmap(base + 2 * page, coverage - 2 * page),
+		        "release isolated reservation");
+	}
+	CheckOk(test, KernelReleaseDirectMemory(physical, 2 * page), "release direct shadow fixture");
+
+	const auto merged = ReserveAsanCoverage(test);
+	MapAsanFlexible(test, merged, page);
+	MapAsanFlexible(test, merged + page, page);
+	ExpectRange(test, Query(test, merged), merged, merged + 2 * page, SceKernelProtCpuRw, 1, 0, 0,
+	            1, "asan_shadow");
+	CheckOk(test, KernelMunmap(merged, 2 * page), "unmap merged allocations with one callback");
+	Check(test, !AsanShadowPresent(merged),
+	      "merged free retained shadow from separate allocations");
+	CheckOk(test, KernelMunmap(merged + 2 * page, coverage - 2 * page),
+	        "release merged reservation");
+
+	const auto crossing = ReserveAsanCoverage(test, 2);
+	MapAsanFlexible(test, crossing + coverage - page, 2 * page);
+	auto* sentinel = reinterpret_cast<uint64_t*>(AsanShadowAddress(crossing + coverage));
+	*sentinel      = 0x43524f5353534844ull;
+	CheckOk(test, KernelMunmap(crossing + coverage - page, page),
+	        "unmap first shadow-page coverage");
+	Check(test,
+	      !AsanShadowPresent(crossing) && AsanShadowPresent(crossing + coverage) &&
+	          *sentinel == 0x43524f5353534844ull,
+	      "cross-page unmap released the wrong shadow page");
+	CheckOk(test, KernelMunmap(crossing + coverage, page), "unmap final shadow-page coverage");
+	Check(test, !AsanShadowPresent(crossing + coverage), "cross-page final unmap retained shadow");
+	CheckOk(test, KernelMunmap(crossing, coverage - page), "release crossing prefix reservation");
+	CheckOk(test, KernelMunmap(crossing + coverage + page, coverage - page),
+	        "release crossing suffix reservation");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAsanFailedUnmapPreservesShadow() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "AsanFailedUnmapPreservesShadow";
+	constexpr uint64_t page = SceKernelPageSize;
+	for (const bool direct: {false, true}) {
+		const auto base     = ReserveAsanCoverage(test);
+		void*      address  = reinterpret_cast<void*>(base);
+		int64_t    physical = -1;
+		if (direct) {
+			CheckOk(test,
+			        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 3 * page, page,
+			                                   SceKernelMtypeC, &physical),
+			        "allocate failed-unmap direct fixture");
+			CheckOk(test,
+			        KernelMapNamedDirectMemory(&address, 3 * page, SceKernelProtCpuRw,
+			                                   SceKernelMapFixed, physical, page, "asan_failure"),
+			        "map failed-unmap direct fixture");
+		} else {
+			MapAsanFlexible(test, base, 3 * page, "asan_failure");
+		}
+		for (uint64_t i = 0; i < 3; ++i)
+			*reinterpret_cast<uint64_t*>(base + i * page) = 0xabc0 + i;
+		auto* sentinel = reinterpret_cast<uint64_t*>(AsanShadowAddress(base + 2 * page));
+		*sentinel      = 0x4641494c53484457ull;
+		CheckOk(test,
+		        KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRead),
+		        "split protection after callback registration");
+		CheckOk(test, KernelMprotect(address, 3 * page, SceKernelProtCpuRead),
+		        "merge protection after callback registration");
+		CheckOk(
+		    test,
+		    KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page), page, "split_shadow"),
+		    "split name after callback registration");
+		CheckOk(test, KernelSetVirtualRangeName(address, 3 * page, "asan_failure"),
+		        "merge name after callback registration");
+		const auto check_ranges = [&](uint64_t first) {
+			for (uint64_t i = first; i < 3; ++i) {
+				ExpectRange(test, Query(test, base + i * page), base + (direct ? i : first) * page,
+				            base + (direct ? i + 1 : 3) * page, SceKernelProtCpuRead, !direct,
+				            direct, 0, 1, "asan_failure", direct ? physical + i * page : 0);
+			}
+		};
+		check_ranges(0);
+		if (direct)
+			TestFailPhysicalMemoryUnmapAfter(0);
+		else
+			TestFailGuestBackingStoreUnmapAfter(0);
+		CheckFailed(test, KernelMunmap(base, 3 * page), "reject unmap before any range completes");
+		Check(test, AsanShadowPresent(base) && *sentinel == 0x4641494c53484457ull,
+		      "failed unmap released or changed ASan shadow");
+		for (uint64_t i = 0; i < 3; ++i) {
+			Check(test, *reinterpret_cast<const uint64_t*>(base + i * page) == 0xabc0 + i,
+			      "failed unmap changed guest data");
+			// Windows recreates untouched direct neighbors with their original host mode.
+			if (!direct || i == 0 || KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS)
+				ExpectHostReadOnly(test, base + i * page);
+		}
+		CheckOk(test, KernelMprotect(address, 3 * page, SceKernelProtCpuRead),
+		        "restore complete fixture protection before partial-progress unmap");
+		CheckOk(test, KernelMprotect(address, page, SceKernelProtCpuRw), "split first unmap chunk");
+		if (direct)
+			TestFailPhysicalMemoryUnmapAfter(1);
+		else
+			TestFailGuestBackingStoreUnmapAfter(1);
+		CheckFailed(test, KernelMunmap(base, 3 * page),
+		            "reject later unmap after first range completes");
+		ExpectUnmapped(test, base);
+		check_ranges(1);
+		Check(test,
+		      AsanShadowPresent(base) && *sentinel == 0x4641494c53484457ull &&
+		          *reinterpret_cast<const uint64_t*>(base + 2 * page) == 0xabc2,
+		      "partially completed unmap damaged the remaining shadow or data");
+		ExpectHostReadOnly(test, base + page);
+		if (!direct || KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS)
+			ExpectHostReadOnly(test, base + 2 * page);
+		CheckOk(test, KernelMunmap(base + page, page), "retry first surviving page");
+		Check(test, AsanShadowPresent(base) && *sentinel == 0x4641494c53484457ull,
+		      "partial retry released shadow still covering the last page");
+		CheckOk(test, KernelMunmap(base + 2 * page, page), "retry final surviving page");
+		Check(test, !AsanShadowPresent(base),
+		      "final retry leaked shadow coverage after failed unmap");
+		CheckOk(test, KernelMunmap(base + 3 * page, AsanShadowCoverage - 3 * page),
+		        "release failure fixture reservation");
+		if (direct)
+			CheckOk(test, KernelReleaseDirectMemory(physical, 3 * page),
+			        "release failed-unmap physical memory");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAsanAliasedPhysicalRelease() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AsanAliasedPhysicalRelease";
+	constexpr uint64_t page     = SceKernelPageSize;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 4 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "allocate aliased shadow fixture");
+	const std::array<uint64_t, 2> bases {ReserveAsanCoverage(test), ReserveAsanCoverage(test)};
+	for (const auto base: bases) {
+		void* address = reinterpret_cast<void*>(base);
+		CheckOk(test,
+		        KernelMapNamedDirectMemory(&address, 4 * page, SceKernelProtCpuRw,
+		                                   SceKernelMapFixed, physical, page, "asan_alias"),
+		        "map shared physical shadow fixture");
+		*reinterpret_cast<uint64_t*>(AsanShadowAddress(base + 3 * page)) = 0x414c494153534844ull;
+	}
+	for (uint64_t i = 0; i < 4; ++i)
+		*reinterpret_cast<uint64_t*>(bases[0] + i * page) = 0xd1a0 + i;
+	CheckOk(
+	    test,
+	    KernelMprotect(reinterpret_cast<void*>(bases[0] + page), 2 * page, SceKernelProtCpuRead),
+	    "split alias protections after callback registration");
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(bases[0] + 2 * page), page,
+	                                  "alias_split"),
+	        "split alias names after callback registration");
+	TestFailPhysicalMemoryUnmapAfter(1);
+	CheckFailed(test, KernelCheckedReleaseDirectMemory(physical + page, 2 * page),
+	            "release aliased middle with injected metadata failure");
+	for (const auto base: bases) {
+		Check(test,
+		      AsanShadowPresent(base) && *reinterpret_cast<uint64_t*>(AsanShadowAddress(
+		                                     base + 3 * page)) == 0x414c494153534844ull,
+		      "failed aliased physical release changed shadow coverage");
+		for (uint64_t i = 0; i < 4; ++i)
+			Check(test, *reinterpret_cast<const uint64_t*>(base + i * page) == 0xd1a0 + i,
+			      "failed aliased physical release changed backing contents");
+	}
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical + page, 2 * page),
+	        "release aliased middle after rollback");
+	for (const auto base: bases) {
+		ExpectUnmapped(test, base + page);
+		ExpectUnmapped(test, base + 2 * page);
+		Check(test,
+		      AsanShadowPresent(base) &&
+		          *reinterpret_cast<uint64_t*>(AsanShadowAddress(base + 3 * page)) ==
+		              0x414c494153534844ull &&
+		          *reinterpret_cast<const uint64_t*>(base) == 0xd1a0 &&
+		          *reinterpret_cast<const uint64_t*>(base + 3 * page) == 0xd1a3,
+		      "split alias release damaged surviving shadow or data");
+	}
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, page), "release aliased prefix");
+	for (const auto base: bases)
+		Check(test, AsanShadowPresent(base),
+		      "aliased prefix release freed the final page's shadow");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical + 3 * page, page),
+	        "release final aliased page");
+	for (const auto base: bases) {
+		Check(test, !AsanShadowPresent(base),
+		      "final aliased physical release leaked shadow coverage");
+		CheckOk(test, KernelMunmap(base + 4 * page, AsanShadowCoverage - 4 * page),
+		        "release alias reservation");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAsanPartialFreeAcrossSharedShadowBoundary() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AsanPartialFreeAcrossSharedShadowBoundary";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         base     = ReserveAsanCoverage(test, 2);
+	const auto         boundary = base + AsanShadowCoverage;
+	const auto         left     = boundary - 3 * page;
+	const auto         right    = boundary + 2 * page;
+	MapAsanFlexible(test, boundary - 2 * page, 4 * page, "asan_crossing");
+	MapAsanFlexible(test, left, page, "asan_neighbor");
+	MapAsanFlexible(test, right, page, "asan_neighbor");
+	for (const auto neighbor: {left, right}) {
+		*reinterpret_cast<uint64_t*>(neighbor)                    = neighbor;
+		*reinterpret_cast<uint64_t*>(AsanShadowAddress(neighbor)) = neighbor;
+	}
+	const auto check_neighbors = [&] {
+		for (const auto neighbor: {left, right})
+			Check(test,
+			      AsanShadowPresent(neighbor) &&
+			          *reinterpret_cast<const uint64_t*>(AsanShadowAddress(neighbor)) == neighbor &&
+			          *reinterpret_cast<const uint64_t*>(neighbor) == neighbor,
+			      "cross-boundary partial free changed a neighbor's shadow or contents");
+	};
+	CheckOk(test, KernelMunmap(boundary - page, 2 * page),
+	        "free middle spanning exact shadow boundary");
+	check_neighbors();
+	CheckOk(test, KernelMunmap(boundary - 2 * page, page), "free crossing allocation prefix");
+	CheckOk(test, KernelMunmap(boundary + page, page), "free crossing allocation suffix");
+	check_neighbors();
+	CheckOk(test, KernelMunmap(left, page), "free final left shadow user");
+	Check(test,
+	      !AsanShadowPresent(left) && AsanShadowPresent(right) &&
+	          *reinterpret_cast<const uint64_t*>(AsanShadowAddress(right)) == right,
+	      "left final free retained its shadow or released the shared right shadow");
+	CheckOk(test, KernelMunmap(right, page), "free final right shadow user");
+	Check(test, !AsanShadowPresent(right), "right final free leaked shadow after boundary split");
+	CheckOk(test, KernelMunmap(base, AsanShadowCoverage - 3 * page),
+	        "release boundary prefix reservation");
+	CheckOk(test, KernelMunmap(boundary + 3 * page, AsanShadowCoverage - 3 * page),
+	        "release boundary suffix reservation");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1749,6 +2288,82 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectTrimmedAliasReleaseRollback() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "DirectTrimmedAliasReleaseRollback";
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t size     = 6 * page;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), size, page, SceKernelMtypeC,
+	                                   &physical),
+	        "allocate alias backing");
+	void* original = nullptr;
+	void* alias    = nullptr;
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&original, size, SceKernelProtCpuRw, 0, physical, page,
+	                                   "trim_original"),
+	        "map original");
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&alias, size, SceKernelProtCpuRw, 0, physical, page,
+	                                   "trim_alias"),
+	        "map alias");
+	const auto base          = reinterpret_cast<uint64_t>(original);
+	const auto alias_base    = reinterpret_cast<uint64_t>(alias);
+	const auto mapping_count = TestDirectMappingCount();
+	for (uint64_t i = 0; i < 6; ++i) {
+		*reinterpret_cast<uint64_t*>(alias_base + i * page) = 0x414c494153000000ull + i;
+	}
+	CheckOk(
+	    test,
+	    KernelMprotect(reinterpret_cast<void*>(base + 2 * page), 2 * page, SceKernelProtCpuRead),
+	    "protect original middle");
+	CheckOk(
+	    test,
+	    KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page), 4 * page, "trim_middle"),
+	    "rename original interior");
+	Check(test, TestDirectMappingCount() == mapping_count,
+	      "direct metadata edits fragmented backing ownership records");
+	CheckOk(test, KernelMunmap(base, page), "trim original prefix");
+	CheckOk(test, KernelMunmap(base + 5 * page, page), "trim original suffix");
+	const auto check_survivors = [&] {
+		ExpectUnmapped(test, base);
+		ExpectUnmapped(test, base + 5 * page);
+		ExpectRange(test, Query(test, base + page), base + page, base + 2 * page,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_middle", physical + page);
+		ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 4 * page,
+		            SceKernelProtCpuRead, 0, 1, 0, 1, "trim_middle", physical + 2 * page);
+		ExpectRange(test, Query(test, base + 4 * page), base + 4 * page, base + 5 * page,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_middle", physical + 4 * page);
+		ExpectRange(test, Query(test, alias_base), alias_base, alias_base + size,
+		            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_alias", physical);
+		for (uint64_t i = 0; i < 6; ++i) {
+			Check(test,
+			      *reinterpret_cast<const uint64_t*>(alias_base + i * page) ==
+			          0x414c494153000000ull + i,
+			      "trimmed mapping or rollback damaged its alias backing");
+			if (i > 0 && i < 5) {
+				Check(test,
+				      *reinterpret_cast<const uint64_t*>(base + i * page) ==
+				          0x414c494153000000ull + i,
+				      "trimmed mapping lost its physical offset after rekey or restore");
+			}
+		}
+	};
+	check_survivors();
+	TestFailPhysicalMemoryUnmapAfter(1);
+	CheckFailed(test, KernelCheckedReleaseDirectMemory(physical + 3 * page, page),
+	            "release aliases with injected second-range failure");
+	check_survivors();
+	// The failed physical release cut inside the read-only VMA. Its rollback restored a
+	// separate ownership extent there; a single semantic VMA now crosses two extents.
+	CheckOk(test, KernelMunmap(base + page, 4 * page), "unmap restored ownership fragments");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, size), "release aliases");
+	ExpectUnmapped(test, base + page);
+	ExpectUnmapped(test, alias_base);
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -3398,88 +4013,150 @@ void TestProsperoSampleMemoryPoolExpandCommit() {
 }
 
 void TestFragmentedMemoryPoolBacking() {
-	const char* test = "FragmentedMemoryPoolBacking";
-
-	int64_t    first_pool  = -1;
-	int64_t    direct_gap  = -1;
-	int64_t    second_pool = -1;
-	const auto direct_end =
-	    static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize());
+	using namespace Libs::LibKernel::Memory;
+	const char*        test       = "FragmentedMemoryPoolBacking";
+	constexpr uint64_t block      = SceKernelMemoryPoolCommitLen;
+	int64_t            first_pool = -1, direct_gap = -1, second_pool = -1;
+	const auto         direct_end = static_cast<int64_t>(KernelGetDirectMemorySize());
 	CheckOk(
 	    test,
-	    Libs::LibKernel::Memory::KernelMemoryPoolExpand(0, direct_end, SceKernelMemoryPoolCommitLen,
-	                                                    SceKernelMemoryPoolAlignment, &first_pool),
+	    KernelMemoryPoolExpand(0, direct_end, 2 * block, SceKernelMemoryPoolAlignment, &first_pool),
 	    "KernelMemoryPoolExpand(first)");
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            0, direct_end, SceKernelMemoryPoolCommitLen, SceKernelMemoryPoolAlignment,
-	            SceKernelMtypeC, &direct_gap),
+	        KernelAllocateDirectMemory(0, direct_end, block, SceKernelMemoryPoolAlignment,
+	                                   SceKernelMtypeC, &direct_gap),
 	        "KernelAllocateDirectMemory(gap)");
 	CheckOk(
 	    test,
-	    Libs::LibKernel::Memory::KernelMemoryPoolExpand(0, direct_end, SceKernelMemoryPoolCommitLen,
-	                                                    SceKernelMemoryPoolAlignment, &second_pool),
+	    KernelMemoryPoolExpand(0, direct_end, block, SceKernelMemoryPoolAlignment, &second_pool),
 	    "KernelMemoryPoolExpand(second)");
 	Check(test,
-	      first_pool + static_cast<int64_t>(SceKernelMemoryPoolCommitLen) == direct_gap &&
-	          direct_gap + static_cast<int64_t>(SceKernelMemoryPoolCommitLen) == second_pool,
+	      first_pool + static_cast<int64_t>(2 * block) == direct_gap &&
+	          direct_gap + static_cast<int64_t>(block) == second_pool,
 	      "test setup did not create nonadjacent pool expansions");
-
 	void* arena = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(nullptr, SceKernelMemoryPoolReserveLen,
-	                                                         0, 0, &arena),
+	CheckOk(test, KernelMemoryPoolReserve(nullptr, SceKernelMemoryPoolReserveLen, 0, 0, &arena),
 	        "KernelMemoryPoolReserve");
-	const auto base       = reinterpret_cast<uint64_t>(arena);
-	const auto commit_len = SceKernelMemoryPoolCommitLen * 2;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(arena, commit_len, SceKernelMtypeC,
-	                                                        SceKernelProtCpuRw, 0),
+	const auto     base       = reinterpret_cast<uint64_t>(arena);
+	constexpr auto commit_len = 3 * block;
+	CheckOk(test, KernelMemoryPoolCommit(arena, commit_len, SceKernelMtypeC, SceKernelProtCpuRw, 0),
 	        "KernelMemoryPoolCommit(fragmented)");
-
 	CheckFailed(test,
-	            Libs::LibKernel::Memory::KernelMemoryPoolCommit(
-	                reinterpret_cast<void*>(base + commit_len), SceKernelMemoryPoolCommitLen,
-	                SceKernelMtypeC, SceKernelProtCpuRw, 0),
+	            KernelMemoryPoolCommit(reinterpret_cast<void*>(base + commit_len), block,
+	                                   SceKernelMtypeC, SceKernelProtCpuRw, 0),
 	            "KernelMemoryPoolCommit(exhausted)");
 	ExpectRange(test, Query(test, base + commit_len), base + commit_len,
 	            base + SceKernelMemoryPoolReserveLen, 0, 0, 0, 1, 0);
-
-	*reinterpret_cast<uint64_t*>(base) = 0x465241474d454e54ull; // "FRAGMENT"
-	*reinterpret_cast<uint64_t*>(base + SceKernelMemoryPoolCommitLen) = 0x504f4f4c50414745ull;
-	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, commit_len, 0),
+	for (uint64_t i = 0; i < 3; ++i)
+		*reinterpret_cast<uint64_t*>(base + i * block) = 0x504f4f4c0000ull + i;
+	CheckOk(test, KernelMemoryPoolDecommit(arena, commit_len, 0),
 	        "KernelMemoryPoolDecommit(fragmented)");
-
-	Libs::LibKernel::Memory::KernelMemoryPoolBlockStats stats {};
-	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolGetBlockStats(&stats, sizeof(stats)),
-	        "KernelMemoryPoolGetBlockStats(fragmented decommit)");
-	Check(test, stats.available_flushed_blocks == 2 && stats.allocated_flushed_blocks == 0,
-	      "fragmented decommit did not restore both pool pages");
-
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(arena, commit_len, SceKernelMtypeC,
-	                                                        SceKernelProtCpuRw, 0),
+	KernelMemoryPoolBlockStats stats {};
+	CheckOk(test, KernelMemoryPoolGetBlockStats(&stats, sizeof(stats)),
+	        "query fragmented decommit budget");
+	Check(test, stats.available_flushed_blocks == 3 && stats.allocated_flushed_blocks == 0,
+	      "fragmented decommit did not restore all pool blocks");
+	CheckOk(test, KernelMemoryPoolCommit(arena, commit_len, SceKernelMtypeC, SceKernelProtCpuRw, 0),
 	        "KernelMemoryPoolCommit(fragmented recommit)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, commit_len),
-	        "KernelMunmap(fragmented commit)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMunmap(base + commit_len,
-	                                              SceKernelMemoryPoolReserveLen - commit_len),
+	CheckOk(test, KernelMprotect(arena, commit_len, SceKernelProtCpuRead),
+	        "protect fragmented pool views");
+	for (const bool partial: {true, false}) {
+		const auto address = partial ? base + block : base;
+		const auto size    = partial ? 2 * block : commit_len;
+		g_gpu_range_events.clear();
+		TestSetGpuRangeCallback(ObserveGpuRange);
+		TestFailGuestBackingStoreUnmapAfter(1);
+		const int result = KernelMunmap(address, size);
+		TestSetGpuRangeCallback(nullptr);
+		CheckFailed(test, result,
+		            partial ? "KernelMunmap(partial pooled view rollback)"
+		                    : "KernelMunmap(whole pooled range after split rollback)");
+		ExpectRange(test, Query(test, base), base, base + commit_len, SceKernelProtCpuRead, 0, 0, 1,
+		            1);
+		Check(test,
+		      g_gpu_range_events ==
+		          std::vector<GpuRangeEvent> {{false, address, size}, {true, address, size}},
+		      "failed pooled unmap did not restore the complete GPU range");
+		if (partial) {
+			CheckOk(test, KernelMprotect(arena, commit_len, SceKernelProtCpuRead),
+			        "protect whole pool range after partial-first-view rollback");
+		}
+		for (uint64_t i = 0; i < 3; ++i) {
+			Check(test,
+			      *reinterpret_cast<const uint64_t*>(base + i * block) == 0x504f4f4c0000ull + i,
+			      "pooled rollback changed a backing view's contents");
+			ExpectHostReadOnly(test, base + i * block);
+		}
+	}
+	CheckOk(test, KernelMemoryPoolGetBlockStats(&stats, sizeof(stats)),
+	        "query pooled rollback budget");
+	Check(test, stats.available_flushed_blocks == 0 && stats.allocated_flushed_blocks == 3,
+	      "failed pooled unmap changed the pool budget");
+	CheckOk(test, KernelMunmap(base, commit_len), "KernelMunmap(fragmented commit)");
+	CheckOk(test, KernelMunmap(base + commit_len, SceKernelMemoryPoolReserveLen - commit_len),
 	        "KernelMunmap(fragmented reserve remainder)");
+	CheckOk(test, KernelReleaseDirectMemory(first_pool, 2 * block), "release first pool expansion");
+	CheckOk(test, KernelReleaseDirectMemory(second_pool, block), "release second pool expansion");
+	CheckOk(test, KernelReleaseDirectMemory(direct_gap, block), "release pool expansion gap");
+	std::printf("[host]    %-48s ok\n", test);
+}
 
+void TestMemoryPoolMiddleDecommitAndReuse() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test            = "MemoryPoolMiddleDecommitAndReuse";
+	constexpr uint64_t block           = SceKernelMemoryPoolCommitLen;
+	const auto         flexible_before = AvailableFlexibleMemory(test);
+	const auto         expect_stats    = [&](int free, int allocated) {
+		KernelMemoryPoolBlockStats stats {};
+		CheckOk(test, KernelMemoryPoolGetBlockStats(&stats, sizeof(stats)), "query pool blocks");
+		Check(test,
+		      stats.available_flushed_blocks == free && stats.allocated_flushed_blocks == allocated,
+		      "middle decommit/recommit changed the wrong pool budget");
+	};
+	int64_t physical = -1;
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(first_pool,
-	                                                           SceKernelMemoryPoolCommitLen),
-	        "KernelReleaseDirectMemory(first pool)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(second_pool,
-	                                                           SceKernelMemoryPoolCommitLen),
-	        "KernelReleaseDirectMemory(second pool)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_gap,
-	                                                           SceKernelMemoryPoolCommitLen),
-	        "KernelReleaseDirectMemory(gap)");
-
+	        KernelMemoryPoolExpand(0, KernelGetDirectMemorySize(), 3 * block, block, &physical),
+	        "expand three contiguous pool blocks");
+	void* arena = nullptr;
+	CheckOk(test, KernelMemoryPoolReserve(nullptr, SceKernelMemoryPoolReserveLen, 0, 0, &arena),
+	        "reserve pool arena");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, KernelMemoryPoolCommit(arena, 3 * block, SceKernelMtypeC, SceKernelProtCpuRw, 0),
+	        "commit one contiguous mapping");
+	for (uint64_t i = 0; i < 3; ++i) {
+		*reinterpret_cast<uint64_t*>(base + i * block) = 0x4d4944444c450000ull + i;
+	}
+	void* middle = reinterpret_cast<void*>(base + block);
+	CheckOk(test, KernelMemoryPoolDecommit(middle, block, 0), "decommit middle block");
+	ExpectRange(test, Query(test, base), base, base + block, SceKernelProtCpuRw, 0, 0, 1, 1);
+	ExpectRange(test, Query(test, base + block), base + block, base + 2 * block, 0, 0, 0, 1, 0);
+	ExpectRange(test, Query(test, base + 2 * block), base + 2 * block, base + 3 * block,
+	            SceKernelProtCpuRw, 0, 0, 1, 1);
+	Check(test,
+	      *reinterpret_cast<const uint64_t*>(base) == 0x4d4944444c450000ull &&
+	          *reinterpret_cast<const uint64_t*>(base + 2 * block) == 0x4d4944444c450002ull,
+	      "middle decommit damaged a surviving neighbor");
+	uint64_t value = 0;
+	Check(test, !TryReadBacking(base + block, &value, sizeof(value)),
+	      "decommitted middle block retained its host backing view");
+	expect_stats(1, 2);
+	CheckOk(test, KernelMemoryPoolCommit(middle, block, SceKernelMtypeC, SceKernelProtCpuRead, 0),
+	        "recommit middle block read-only");
+	for (uint64_t i = 0; i < 3; ++i) {
+		ExpectRange(test, Query(test, base + i * block), base + i * block, base + (i + 1) * block,
+		            i == 1 ? SceKernelProtCpuRead : SceKernelProtCpuRw, 0, 0, 1, 1);
+		Check(test,
+		      *reinterpret_cast<const uint64_t*>(base + i * block) == 0x4d4944444c450000ull + i,
+		      "middle recommit did not reuse its own physical backing and contents");
+	}
+	expect_stats(0, 3);
+	Check(test, AvailableFlexibleMemory(test) == flexible_before,
+	      "middle pool decommit/recommit consumed flexible memory");
+	CheckOk(test, KernelMemoryPoolDecommit(arena, 3 * block, 0), "decommit all three blocks");
+	expect_stats(3, 0);
+	CheckOk(test, KernelMunmap(base, SceKernelMemoryPoolReserveLen), "release pool arena");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, 3 * block), "release pool expansion");
+	expect_stats(0, 0);
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -3560,6 +4237,84 @@ void TestMemoryPoolMultiRangeDecommit() {
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(pool_offset, expand_len),
 	        "KernelReleaseDirectMemory(pool expansion)");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+struct PoolDecommitRequest {
+	void*  address;
+	size_t size;
+	int    result = -1;
+};
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+DWORD WINAPI DecommitPoolOnSmallStack(void* argument) {
+#else
+void* DecommitPoolOnSmallStack(void* argument) {
+#endif
+	auto& request = *static_cast<PoolDecommitRequest*>(argument);
+	request.result =
+	    Libs::LibKernel::Memory::KernelMemoryPoolDecommit(request.address, request.size, 0);
+	return 0;
+}
+
+void TestFragmentedPoolDecommitOnSmallStack() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test       = "FragmentedPoolDecommitOnSmallStack";
+	constexpr uint64_t count      = 1024;
+	constexpr uint64_t block      = SceKernelMemoryPoolCommitLen;
+	constexpr uint64_t size       = count * block;
+	constexpr size_t   stack_size = 320 * 1024;
+	int64_t            physical   = -1;
+	CheckOk(test,
+	        KernelMemoryPoolExpand(0, KernelGetDirectMemorySize(), size,
+	                               SceKernelMemoryPoolAlignment, &physical),
+	        "expand fragmented pool");
+	void* arena = nullptr;
+	CheckOk(test, KernelMemoryPoolReserve(nullptr, size, 0, 0, &arena), "reserve fragmented pool");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	for (uint64_t i = 0; i < count; ++i) {
+		const auto protection = i % 2 == 0 ? SceKernelProtCpuRw : SceKernelProtCpuRead;
+		CheckOk(test,
+		        KernelMemoryPoolCommit(reinterpret_cast<void*>(base + i * block), block,
+		                               SceKernelMtypeC, protection, 0),
+		        "commit alternating-protection pool block");
+		const uint64_t sentinel = 0x504f4f4c00000000ull + i;
+		Check(test, TryWriteBacking(base + i * block, &sentinel, sizeof(sentinel)),
+		      "could not initialize committed pool backing");
+		ExpectRange(test, Query(test, base + i * block), base + i * block, base + (i + 1) * block,
+		            protection, 0, 0, 1, 1);
+	}
+
+	KernelMemoryPoolBlockStats stats {};
+	PoolDecommitRequest        request {arena, size};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE thread = CreateThread(nullptr, stack_size, DecommitPoolOnSmallStack, &request,
+	                             STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+	Check(test, thread != nullptr, "failed to create small-stack decommit thread");
+	const auto waited = WaitForSingleObject(thread, INFINITE);
+	CloseHandle(thread);
+	Check(test, waited == WAIT_OBJECT_0, "failed to join small-stack decommit thread");
+#else
+	pthread_attr_t attributes;
+	Check(test, pthread_attr_init(&attributes) == 0, "failed to initialize thread attributes");
+	const int stack_result = pthread_attr_setstacksize(&attributes, stack_size);
+	pthread_t thread {};
+	const int create_result =
+	    stack_result == 0 ? pthread_create(&thread, &attributes, DecommitPoolOnSmallStack, &request)
+		                  : stack_result;
+	pthread_attr_destroy(&attributes);
+	if (create_result != 0) {
+		Fail(test, "failed to create small-stack decommit thread");
+	}
+	Check(test, pthread_join(thread, nullptr) == 0, "failed to join small-stack decommit thread");
+#endif
+	CheckOk(test, request.result, "decommit 1000+ ranges on 320 KiB stack");
+	ExpectRange(test, Query(test, base), base, base + size, 0, 0, 0, 1, 0);
+	CheckOk(test, KernelMemoryPoolGetBlockStats(&stats, sizeof(stats)), "query decommitted pool");
+	Check(test, stats.available_flushed_blocks == count && stats.allocated_flushed_blocks == 0,
+	      "fragmented decommit leaked pool blocks");
+	CheckOk(test, KernelMunmap(base, size), "release fragmented pool reservation");
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "release fragmented pool backing");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4955,6 +5710,34 @@ void TestTlsStubsPreserveFlags() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
+		RunTest(TestFlexibleZeroingTracksBackingLifetime);
+		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+		RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
+		RunTest(TestFragmentedBackingUnmapRollback);
+		RunTest(TestSmallerFlexibleMapReusesReleasedHole);
+		RunTest(TestFragmentedGuestFreeRangeHints);
+		RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
+		RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
+		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+		RunTest(TestDirectTrimmedAliasReleaseRollback);
+		RunTest(TestDirectMappingNamesTypesAndValidation);
+		RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
+		RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
+		RunTest(TestAutomaticMemoryReuseAndAliases);
+		RunTest(TestAutomaticMemoryFragmentedMapRollback);
+		RunTest(TestFragmentedMemoryPoolBacking);
+		RunTest(TestMemoryPoolMiddleDecommitAndReuse);
+		RunTest(TestMemoryPoolMultiRangeDecommit);
+		RunTest(TestFragmentedPoolDecommitOnSmallStack);
+		// Memory callbacks remain registered for the rest of the process.
+		RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
+		RunTest(TestAsanFailedUnmapPreservesShadow);
+		RunTest(TestAsanAliasedPhysicalRelease);
+		RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
 		RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 		RunTest(TestFlexibleRangeEditsCoalesce);
@@ -4975,6 +5758,7 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
+		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
 		RunTest(TestTrackerProtectSharesBackingReads);
@@ -5019,6 +5803,7 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
+	RunTest(TestFlexibleZeroingTracksBackingLifetime);
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
 #endif
@@ -5040,6 +5825,8 @@ int main(int argc, char** argv) {
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
+	RunTest(TestFragmentedGuestFreeRangeHints);
+	RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
 	RunTest(TestFlexibleMemoryUsesSharedBacking);
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
@@ -5049,6 +5836,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);
+	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
@@ -5060,6 +5848,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+	RunTest(TestDirectTrimmedAliasReleaseRollback);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
@@ -5095,7 +5884,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);
+	RunTest(TestMemoryPoolMiddleDecommitAndReuse);
 	RunTest(TestMemoryPoolMultiRangeDecommit);
+	RunTest(TestFragmentedPoolDecommitOnSmallStack);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
@@ -5103,6 +5894,11 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif
+	// Memory callbacks remain registered for the rest of the process.
+	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
+	RunTest(TestAsanFailedUnmapPreservesShadow);
+	RunTest(TestAsanAliasedPhysicalRelease);
+	RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

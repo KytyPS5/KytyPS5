@@ -79,7 +79,8 @@ bool GuestGpu::IsStopping() {
 }
 
 void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
-	// These callers never send after Shutdown() has begun; a refused command is a bug.
+	// These callers never send after the GPU thread has stopped taking work, so a refused command
+	// is a bug.
 	EXIT_IF(!TrySendCommand(std::move(command)));
 }
 
@@ -98,9 +99,9 @@ void GuestGpu::RetryBlockedSubmissions() {
 
 // Queues `command` to run on the GPU thread between PM4 packets, in the order commands were sent,
 // or runs it at once when called on the GPU thread. Unlike SendCommand, which exits when the GPU
-// no longer accepts commands, this returns false once Shutdown() has begun and drops the command,
-// so callbacks that can run during shutdown (such as deferred end-of-pipe signals) can skip their
-// work instead.
+// no longer accepts commands, this returns false once the GPU thread has stopped taking work and
+// drops the command, so callbacks that can run during shutdown (such as deferred end-of-pipe
+// signals) can skip their work instead.
 bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
@@ -108,8 +109,7 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 		return true;
 	}
 	Common::LockGuard lock(m_queue_mutex);
-	// Shutdown() stops accepting commands before it joins the GPU thread.
-	if (!m_accepting) {
+	if (!m_accepting_commands) {
 		return false;
 	}
 	m_commands.push_back(std::move(command));
@@ -496,6 +496,9 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
+				// Under the same lock as the empty-queue check, so no command is queued and then
+				// never run.
+				gpu->m_accepting_commands = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
 			} else if (!gpu->m_commands.empty()) {

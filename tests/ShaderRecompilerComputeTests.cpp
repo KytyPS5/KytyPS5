@@ -52894,6 +52894,69 @@ void CheckPm4CrossQueueLabelOrder(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A submission can still be blocked on a deferred label when the GPU shuts down. The label lands
+// through a GPU-thread command, so shutdown has to keep running commands until the GPU thread
+// exits. Otherwise the submission never finishes and shutdown never returns.
+void CheckPm4DeferredLabelShutdown(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DeferredLabelShutdown";
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor processor(renderer, 0);
+
+  alignas(uint64_t) uint32_t label = 0;
+  uint32_t marker = 0;
+  const auto address = [](const void *value) {
+    return reinterpret_cast<uint64_t>(value);
+  };
+  const auto release = MakeLabelRelease(1, &label, 0x55u);
+  std::array<uint32_t, 12> wait{};
+  wait[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+  wait[1] = 0x10u | 3u;
+  wait[2] = static_cast<uint32_t>(address(&label));
+  wait[3] = static_cast<uint32_t>(address(&label) >> 32u);
+  wait[4] = 0x55u;
+  wait[5] = UINT32_MAX;
+  wait[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  wait[9] = static_cast<uint32_t>(address(&marker));
+  wait[10] = static_cast<uint32_t>(address(&marker) >> 32u);
+  wait[11] = 0x55u;
+
+  std::binary_semaphore priority_parked{0};
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    scheduler.Finish();
+    // Hold the priority thread, so the label cannot land before shutdown has begun.
+    scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+    // Pretend an earlier label is still waiting on a readback, so this one is deferred.
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
+    behind.fetch_add(1);
+    Pm4Execution execution;
+    (void)processor.Process(execution, release);
+    behind.fetch_sub(1);
+    scheduler.Finish();
+  });
+  gpu.Submit(wait);
+
+  std::binary_semaphore shut_down{0};
+  std::thread shutdown_thread([&] {
+    renderer.ShutdownGpu();
+    shut_down.release();
+  });
+  // The submission blocked on the label keeps the GPU alive until the label lands.
+  while (!gpu.IsStopping()) {
+    std::this_thread::yield();
+  }
+  priority_parked.release();
+  Require(name, "shut down", shut_down.try_acquire_for(std::chrono::seconds(5)),
+          "shutdown hung on a submission blocked on a deferred label");
+  shutdown_thread.join();
+  Require(name, "landed", label == 0x55u && marker == 0x55u,
+          "the deferred label, or the wait on it, did not finish before shutdown");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -53892,6 +53955,7 @@ int main(int argc, char **argv) {
     CheckPm4GdsLabelBehindDeferredLabel(vulkan.RuntimeRenderer());
     CheckPm4GdsMultiDwordLabel(vulkan.RuntimeRenderer());
     CheckPm4CrossQueueLabelOrder(vulkan.RuntimeRenderer());
+    CheckPm4DeferredLabelShutdown(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
@@ -54208,6 +54272,7 @@ int main(int argc, char **argv) {
   CheckPm4GdsLabelBehindDeferredLabel(vulkan.RuntimeRenderer());
   CheckPm4GdsMultiDwordLabel(vulkan.RuntimeRenderer());
   CheckPm4CrossQueueLabelOrder(vulkan.RuntimeRenderer());
+  CheckPm4DeferredLabelShutdown(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();

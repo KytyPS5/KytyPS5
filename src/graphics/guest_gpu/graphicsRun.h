@@ -34,7 +34,8 @@ public:
 	// Lets blocked submissions retry on the GPU thread's next pass instead of after its stall poll
 	// (100 us, or a timer tick on Windows). GPU thread only, outside the queue lock.
 	void               RetryBlockedSubmissions();
-	// Like SendCommand, but returns false instead of exiting once Shutdown() has begun.
+	// Like SendCommand, but returns false instead of exiting once the GPU thread has stopped taking
+	// work.
 	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
@@ -86,6 +87,10 @@ private:
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
+	// Commands are still accepted after m_accepting is cleared, until the GPU thread stops. A
+	// submission still running at shutdown can be blocked on a deferred label that lands through a
+	// command.
+	bool                                           m_accepting_commands = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.

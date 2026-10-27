@@ -127,8 +127,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};
-	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
-	// longer accepts external work. Use the guest GPU's state for the teardown route.
+	// While the GPU is stopping, its thread may already have stopped taking work, and
+	// SendCommandSync would then exit the process. So unmap on this thread instead. This can race
+	// with work the GPU thread is still draining, which is a known gap left for a later change.
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
 		return;

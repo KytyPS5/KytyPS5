@@ -5856,31 +5856,7 @@ public:
     // A game can free a depth target and reuse its HTILE memory for other data while the
     // metadata entry remains. Writing that address is then not a clear unless the dispatch
     // writes only metadata, within the surface, from constants (PPSA09809 scene-buffer copies).
-    // Adds a buffer binding of `records` 16-byte elements at `address` to the shader metadata
-    // and its descriptor to the resource snapshot.
-    const auto AddBuffer = [](uint64_t address, bool read, bool written, uint32_t records,
-                              ShaderModule &module,
-                              ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
-      auto &program = module.info;
-      program.stage = ShaderType::Compute;
-      ShaderRecompiler::IR::BufferResource resource{};
-      resource.read = read;
-      resource.written = written;
-      resource.formatted = true;
-      program.info.buffers.push_back(resource);
-      ShaderBufferResource descriptor{};
-      descriptor.UpdateAddress48(address);
-      descriptor.fields[1] |= 16u << 16u;
-      descriptor.fields[2] = records;
-      descriptor.fields[3] =
-          DstSel(4, 5, 6, 7) |
-          (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt)
-           << 12u);
-      ShaderRecompiler::IR::DescriptorValue value{};
-      value.dword_count = 4;
-      std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
-      snapshot.buffers.push_back(value);
-    };
+
     // Wraps a shader and its bound resources as compute dispatch input.
     const auto MakeDispatch = [](ShaderModule &module,
                                  ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
@@ -5895,8 +5871,8 @@ public:
 
     ShaderModule copy_program;
     ShaderRecompiler::IR::ResourceSnapshot copy_snapshot;
-    AddBuffer(scene_data, true, false, 0x2400, copy_program, copy_snapshot);
-    AddBuffer(reused_meta, false, true, 0x9000, copy_program, copy_snapshot);
+    AddMetaClearBuffer(scene_data, true, false, 0x2400, copy_program, copy_snapshot);
+    AddMetaClearBuffer(reused_meta, false, true, 0x9000, copy_program, copy_snapshot);
     const bool copy_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(copy_program, copy_snapshot), command);
     Require(name, "data copy into reused HTile memory preserved",
@@ -5905,7 +5881,7 @@ public:
 
     ShaderModule past_program;
     ShaderRecompiler::IR::ResourceSnapshot past_snapshot;
-    AddBuffer(reused_meta, false, true, 0xb000, past_program, past_snapshot);
+    AddMetaClearBuffer(reused_meta, false, true, 0xb000, past_program, past_snapshot);
     const bool past_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(past_program, past_snapshot), command);
     Require(name, "write past the HTile surface preserved",
@@ -5914,8 +5890,8 @@ public:
 
     ShaderModule mixed_program;
     ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
-    AddBuffer(reused_meta, false, true, 0x100, mixed_program, mixed_snapshot);
-    AddBuffer(scene_data, false, true, 0x100, mixed_program, mixed_snapshot);
+    AddMetaClearBuffer(reused_meta, false, true, 0x100, mixed_program, mixed_snapshot);
+    AddMetaClearBuffer(scene_data, false, true, 0x100, mixed_program, mixed_snapshot);
     const bool mixed_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(mixed_program, mixed_snapshot), command);
     Require(name, "write to HTile and other memory preserved",
@@ -5926,7 +5902,7 @@ public:
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, unsized_meta);
     ShaderModule unsized_program;
     ShaderRecompiler::IR::ResourceSnapshot unsized_snapshot;
-    AddBuffer(unsized_meta, false, true, 0x10, unsized_program, unsized_snapshot);
+    AddMetaClearBuffer(unsized_meta, false, true, 0x10, unsized_program, unsized_snapshot);
     const bool unsized_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(unsized_program, unsized_snapshot), command);
     Require(name, "write to metadata of unknown size preserved",
@@ -5935,8 +5911,8 @@ public:
 
     ShaderModule image_program;
     ShaderRecompiler::IR::ResourceSnapshot image_snapshot;
-    AddBuffer(scene_data, true, false, 0x10, image_program, image_snapshot);
-    AddBuffer(reused_meta, false, true, 0xa000, image_program, image_snapshot);
+    AddMetaClearBuffer(scene_data, true, false, 0x10, image_program, image_snapshot);
+    AddMetaClearBuffer(reused_meta, false, true, 0xa000, image_program, image_snapshot);
     ShaderRecompiler::IR::ImageResource storage_image{};
     storage_image.written = true;
     image_program.info.info.images.push_back(storage_image);
@@ -5955,8 +5931,8 @@ public:
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, cleared_meta, 0xa0000);
     ShaderModule clear_program;
     ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;
-    AddBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);
-    AddBuffer(cleared_meta, false, true, 0xa000, clear_program, clear_snapshot);
+    AddMetaClearBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);
+    AddMetaClearBuffer(cleared_meta, false, true, 0xa000, clear_program, clear_snapshot);
     const bool clear_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
         executor, MakeDispatch(clear_program, clear_snapshot), command);
     Require(name, "constant-driven HTile clear consumed",

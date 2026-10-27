@@ -1235,11 +1235,10 @@ bool PhysicalMemory::Release(uint64_t start, size_t len) {
 	if (block.kind == AllocationKind::Automatic) {
 		RemoveFreeRange(m_automatic_free, start, len);
 	}
-	m_physical.erase(it);
 	if (block.start_addr < start) {
-		auto left = block;
-		left.size = start - block.start_addr;
-		m_physical.emplace(left.start_addr, left);
+		it->second.size = start - block.start_addr;
+	} else {
+		m_physical.erase(it);
 	}
 	if (start + len < block.start_addr + block.size) {
 		auto right       = block;

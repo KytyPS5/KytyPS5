@@ -206,6 +206,14 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static bool IsReleaseProtected(const BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.m_release_protected.Intersects(address, size);
+  }
+
+  static size_t RecentReleaseCount(const BufferCache &cache) {
+    return cache.m_recent_releases.size();
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -4434,6 +4442,135 @@ public:
           Dc::Get(Dc::Counter::BufferReleases) - cap_releases_before - first_pass;
       Require(name, "per-pass cap", first_pass == cap && second_pass == 1,
               "a release pass ignored its cap, or left the remainder for later passes");
+
+      Dc::SetEnabled(counters_were_enabled);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A shader reading a range again after a stale release protects that range from further stale
+  // releases, through buffer merges, until the range is unmapped.
+  void CheckBufferCacheReleaseRefault() {
+    constexpr const char *name = "BufferCacheReleaseRefault";
+    constexpr uintptr_t base = 0x0000000242000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t range_size = 2 * page;
+    constexpr uint64_t refault_offset = 0;
+    constexpr uint64_t fresh_offset = 0x100000;
+    // Covers the refaulted page and its neighbours, so the cache merges them into one buffer.
+    constexpr uint64_t merged_size = 3 * page;
+    constexpr auto no_pressure = std::numeric_limits<uint64_t>::max();
+    constexpr auto age = BufferCache::STALE_RELEASE_AGE_TICKS;
+    constexpr auto interval = BufferCache::STALE_RELEASE_INTERVAL_TICKS;
+    namespace Dc = Common::DebugCounters;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      const bool counters_were_enabled = Dc::Enabled();
+      Dc::SetEnabled(true);
+      const auto registered = [&](uint64_t offset, uint64_t size) {
+        return cache.IsRegionRegistered(base + offset, size) &&
+               BufferCacheTestAccess::PageOwner(cache, base + offset);
+      };
+      // Runs garbage collection through the first release pass for a buffer used now.
+      const auto age_out = [&]() {
+        const auto now = BufferCacheTestAccess::GcTick(cache);
+        const auto last = (now + age + interval - 1) / interval * interval;
+        while (BufferCacheTestAccess::GcTick(cache) <= last) {
+          cache.RunGarbageCollector();
+        }
+      };
+
+      // (g): a refault inside a released range protects it.
+      const auto [created, created_offset] =
+          cache.ObtainBuffer(base + refault_offset, range_size, false, false);
+      Require(name, "allocation", created != nullptr && created_offset == 0,
+              "the test buffer was not cached on its own");
+      age_out();
+      Require(name, "released",
+              !registered(refault_offset, range_size) &&
+                  BufferCacheTestAccess::RecentReleaseCount(cache) == 1,
+              "the stale buffer was not released or not remembered");
+      const auto refaults_before = Dc::Get(Dc::Counter::BufferReleaseRefaults);
+      cache.RecreateFaultedRange(base + refault_offset, page);
+      Require(name, "refault",
+              Dc::Get(Dc::Counter::BufferReleaseRefaults) - refaults_before == 1 &&
+                  BufferCacheTestAccess::IsReleaseProtected(cache, base + refault_offset,
+                                                            range_size) &&
+                  BufferCacheTestAccess::RecentReleaseCount(cache) == 0 &&
+                  registered(refault_offset, page),
+              "a refault was not counted, did not protect its range, or left no buffer");
+      age_out();
+      Require(name, "protected", registered(refault_offset, page),
+              "stale release dropped a protected range");
+
+      // (h): a fault on a range that was never released is not a refault.
+      cache.RecreateFaultedRange(base + fresh_offset, page);
+      Require(name, "fresh fault",
+              Dc::Get(Dc::Counter::BufferReleaseRefaults) - refaults_before == 1 &&
+                  !BufferCacheTestAccess::IsReleaseProtected(cache, base + fresh_offset, page) &&
+                  registered(fresh_offset, page),
+              "a fault on a never-released range was counted or protected");
+
+      // (i): a buffer merged over a protected range is kept.
+      const auto merged = cache.FindBuffer(base + refault_offset, merged_size);
+      const auto owns_merged_range = [&]() {
+        return BufferCacheTestAccess::PageOwner(cache, base + refault_offset) == merged &&
+               BufferCacheTestAccess::PageOwner(cache, base + refault_offset + 2 * page) ==
+                   merged;
+      };
+      Require(name, "merge", owns_merged_range(),
+              "the wider lookup did not merge the protected page into one buffer");
+      age_out();
+      Require(name, "merged protected", owns_merged_range(),
+              "stale release dropped a merged buffer covering a protected range");
+
+      // (j): an unmap forgets the protection, so the remapped range is released again.
+      context.UnmapMemory(base + refault_offset, merged_size);
+      context.MapMemory(base + refault_offset, merged_size);
+      Require(name, "unmap forgets",
+              !BufferCacheTestAccess::IsReleaseProtected(cache, base + refault_offset,
+                                                         merged_size),
+              "an unmap kept the protection of its range");
+      age_out();
+      Require(name, "released after remap", !registered(refault_offset, page),
+              "a remapped range stayed protected from stale release");
 
       Dc::SetEnabled(counters_were_enabled);
       context.UnmapMemory(base, allocation_size);
@@ -53538,6 +53675,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheShaderReadLookup();
     vulkan.CheckBufferCacheStaleRelease();
+    vulkan.CheckBufferCacheReleaseRefault();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -53806,6 +53944,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheShaderReadLookup();
     vulkan.CheckBufferCacheStaleRelease();
+    vulkan.CheckBufferCacheReleaseRefault();
   } else {
     skipped_device_checks = true;
   }

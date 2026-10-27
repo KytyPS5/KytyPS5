@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <span>
@@ -41,6 +42,11 @@ public:
 	static constexpr uint64_t STALE_RELEASE_AGE_TICKS      = 300;
 	static constexpr uint64_t STALE_RELEASE_INTERVAL_TICKS = 60;
 	static constexpr uint32_t STALE_RELEASE_MAX_PER_PASS   = 128;
+	// Released ranges remembered to spot a shader reading one again. Older ones are forgotten,
+	// and a read of those is still handled, just not counted or protected.
+	static constexpr size_t RECENT_RELEASE_CAPACITY = 16384;
+	// Refaults logged to the console as well, so they show up with the overlay closed.
+	static constexpr uint64_t REFAULT_CONSOLE_LOG_LIMIT = 16;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -97,6 +103,12 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
+	// Creates the buffer for a range a shader read through BDA while no buffer cached it. If the
+	// range was released as stale, it is protected from stale release from then on.
+	void RecreateFaultedRange(uint64_t vaddr, uint64_t size);
+	// Drops release history and protection inside an unmapped range, which holds new data if it
+	// is mapped again.
+	void               ForgetReleasedRanges(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
@@ -133,6 +145,8 @@ private:
 	[[nodiscard]] bool IsStaleReleaseCandidate(const Buffer& buffer);
 	// Releases clean buffers that no binding has used for STALE_RELEASE_AGE_TICKS.
 	void                     ReleaseStaleBuffers(uint64_t tick);
+	// Records a stale release, so a later fault on that range counts as a refault.
+	void                     RememberReleasedRange(uint64_t begin, uint64_t end);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -167,6 +181,16 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	struct ReleasedRange {
+		uint64_t begin;
+		uint64_t end;
+	};
+	// Stale releases, oldest first, so a shader reading one again can be spotted.
+	std::deque<ReleasedRange> m_recent_releases;
+	// Ranges a shader read again after a stale release. Stale release keeps them from then on.
+	RangeSet m_release_protected;
+	// Refaults logged so far, so only the first REFAULT_CONSOLE_LOG_LIMIT reach the console.
+	uint64_t m_refaults_logged = 0;
 };
 
 } // namespace Libs::Graphics

@@ -672,7 +672,52 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsStaleReleaseCandidate(const Buffer& buffer) {
 	return !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) &&
-	       !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size());
+	       !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) &&
+	       !m_release_protected.Intersects(buffer.CpuAddress(), buffer.Size());
+}
+
+void BufferCache::RememberReleasedRange(uint64_t begin, uint64_t end) {
+	m_recent_releases.push_back({begin, end});
+	if (m_recent_releases.size() > RECENT_RELEASE_CAPACITY) {
+		m_recent_releases.pop_front();
+	}
+}
+
+void BufferCache::RecreateFaultedRange(uint64_t vaddr, uint64_t size) {
+	// A shader read zeros here, from a range stale release dropped. It is read only through BDA,
+	// where no binding marks it as used, so it would only be released again.
+	const auto end       = vaddr + size;
+	uint64_t   refaulted = 0;
+	std::erase_if(m_recent_releases, [&](const ReleasedRange& range) {
+		if (range.end <= vaddr || range.begin >= end) {
+			return false;
+		}
+		m_release_protected.Add(range.begin, range.end - range.begin);
+		refaulted++;
+		return true;
+	});
+	if (refaulted != 0) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReleaseRefaults,
+		                           refaulted);
+		const auto message = fmt::format(
+		    "GPU: a shader read a released buffer at 0x{:016x}, keeping that range cached\n",
+		    vaddr);
+		if (m_refaults_logged++ < REFAULT_CONSOLE_LOG_LIMIT) {
+			Log::WriteToConsoleAndLog(message);
+		} else {
+			LOGF("%s", message.c_str());
+		}
+	}
+	(void)FindBuffer(vaddr, size);
+}
+
+void BufferCache::ForgetReleasedRanges(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	m_release_protected.Subtract(begin, end - begin);
+	std::erase_if(m_recent_releases, [&](const ReleasedRange& range) {
+		return range.begin < end && range.end > begin;
+	});
 }
 
 // A cached buffer keeps its pages write-protected. Once the game reuses that memory for other
@@ -694,6 +739,7 @@ void BufferCache::ReleaseStaleBuffers(uint64_t tick) {
 			return false;
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		RememberReleasedRange(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size());
 		DeleteBuffer(id);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReleases);
 		return ++released == STALE_RELEASE_MAX_PER_PASS;

@@ -2057,7 +2057,7 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-bool TextureCache::ProcessDownloadImages() {
+bool TextureCache::ProcessDownloadImages(bool keep_unready) {
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return false;
 	}
@@ -2076,10 +2076,12 @@ bool TextureCache::ProcessDownloadImages() {
 		} else if (DownloadImageMemory(id)) {
 			queued = true;
 			it     = m_download_images.erase(it);
-		} else {
+		} else if (keep_unready) {
 			// It failed only for now, for example because it is not safe to download yet. Retry it
 			// at the next call.
 			++it;
+		} else {
+			it = m_download_images.erase(it);
 		}
 	}
 	return queued;

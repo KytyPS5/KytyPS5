@@ -78,11 +78,13 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
-	/// Records GPU-to-guest copies for enrolled images. Entries that fail only for now stay
-	/// enrolled and are retried at the next call, and entries that can never be downloaded are
+	/// Records GPU-to-guest copies for enrolled images. Entries that can never be downloaded are
 	/// dropped.
+	/// @param keep_unready true keeps entries that fail only for now, to retry at the next call.
+	/// false drops them, so none of them can write guest memory after the label this call comes
+	/// before.
 	/// @return true if at least one copy was queued. Its guest write lands as a priority operation.
-	bool ProcessDownloadImages();
+	bool ProcessDownloadImages(bool keep_unready = true);
 	/// @return true if image readbacks are enabled at all. It is set at construction (only tests
 	/// change it later), so it needs no lock.
 	[[nodiscard]] bool ReadbacksEnabled() const noexcept {

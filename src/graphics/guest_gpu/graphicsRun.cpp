@@ -1158,7 +1158,10 @@ bool CommandProcessor::QueueReadbacksBeforeLabel() {
 		return false;
 	}
 	Common::LockGuard lock(m_renderer.GetMutex());
-	return textures.ProcessDownloadImages();
+	// Drop images that can't be downloaded yet. A later retry would write guest memory after the
+	// signal, which the guest may already have seen.
+	constexpr bool KeepUnready = false;
+	return textures.ProcessDownloadImages(KeepUnready);
 }
 
 // Writes an end-of-pipe label and raises its interrupt, holding both back behind any pending

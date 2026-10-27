@@ -394,6 +394,19 @@ struct TextureCacheTestAccess {
     metadata.size = size;
   }
 
+  // Returns the size recorded for the metadata surface at `address`, or 0 if none is registered.
+  static uint64_t MetaSize(TextureCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_lock);
+    const auto found = cache.m_surface_metas.find(address);
+    return found == cache.m_surface_metas.end() ? 0 : found->second.size;
+  }
+
+  // Frees an image the way the cache retires one, dropping any GPU-written contents first.
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
+  }
+
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
 };
 
@@ -8815,6 +8828,35 @@ public:
               texture_cache.IsMeta(base + metadata_b) &&
               texture_cache.IsMetaCleared(base + metadata_b, 0),
           "image discovery retired aliased metadata or its live depth image");
+      // Two live depth images can share an HTILE base. The recorded size stays the larger one,
+      // so a smaller image bound later doesn't turn away the larger image's clears. Once an image
+      // using the entry is freed, the next binding records its own size.
+      constexpr uint64_t shared_meta_data_large = 0x2f80000;
+      constexpr uint64_t shared_meta_data_small = 0x2f80100;
+      constexpr uint64_t shared_meta = 0x2f81000;
+      constexpr uint64_t large_meta_size = 0x80;
+      constexpr uint64_t small_meta_size = 0x40;
+      auto shared_large = MakeMetadataDepth(shared_meta_data_large, shared_meta);
+      shared_large.info.metadata.range.size = large_meta_size;
+      auto shared_small = MakeMetadataDepth(shared_meta_data_small, shared_meta);
+      shared_small.info.metadata.range.size = small_meta_size;
+      const auto shared_large_id = texture_cache.FindImage(shared_large);
+      (void)texture_cache.FindDepthTarget(shared_large_id, shared_large);
+      const auto shared_small_id = texture_cache.FindImage(shared_small);
+      (void)texture_cache.FindDepthTarget(shared_small_id, shared_small);
+      Require(name, "shared HTile base keeps the larger size",
+              shared_small_id != shared_large_id &&
+                  TextureCacheTestAccess::MetaSize(texture_cache, base + shared_meta) ==
+                      large_meta_size,
+              "a smaller depth image shrank the size of a shared, still-live HTile entry");
+      TextureCacheTestAccess::FreeImage(texture_cache, shared_large_id);
+      const bool shared_dropped = !texture_cache.IsMeta(base + shared_meta);
+      (void)texture_cache.FindDepthTarget(shared_small_id, shared_small);
+      Require(name, "freed HTile image releases its size",
+              shared_dropped &&
+                  TextureCacheTestAccess::MetaSize(texture_cache, base + shared_meta) ==
+                      small_meta_size,
+              "a freed depth image's metadata size outlived it");
       const bool touched_metadata = texture_cache.TouchMeta(base + metadata_a, 0, false);
       WriteMetadata(context, base + metadata_a, 0x80, 0);
       Require(

@@ -95,7 +95,11 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
-		uint64_t          size = 0; // Largest metadata range registered at this address.
+		// Largest metadata range registered at this address. Two live depth images can share an
+		// HTILE base, and keeping the larger size keeps the larger image's clears eligible. The
+		// entry is dropped when any image using it is freed, even if another still uses it, and the
+		// next binding registers it again with its own size.
+		uint64_t size = 0;
 	};
 
 	struct OverlapResult {

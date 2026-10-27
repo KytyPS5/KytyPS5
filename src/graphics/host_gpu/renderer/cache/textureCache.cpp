@@ -1502,6 +1502,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		// Keep the larger size, so binding a smaller image at the same base doesn't turn away
+		// clears of a larger one that is still alive.
 		metadata->second.size = std::max(metadata->second.size, desc.info.metadata.range.size);
 	}
 	RefreshImage(id);

@@ -2460,6 +2460,14 @@ void TextureCache::RunGarbageCollector() {
 				TouchImage(*owner);
 				continue;
 			}
+			// Small render targets are the layers the game draws once and samples from then on
+			// (glyph atlases, cached UI): a few MB each, and a lost one is lost text (Wolverine's
+			// letters went missing when they were evicted under pressure). They are never
+			// evicted; freeing their memory is the guest's call.
+			if (owner->usage.render_target && owner->info.extent.width <= 1024 &&
+			    owner->info.extent.height <= 1024) {
+				continue;
+			}
 			if (owner->SafeToDownload() &&
 			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
 				continue;

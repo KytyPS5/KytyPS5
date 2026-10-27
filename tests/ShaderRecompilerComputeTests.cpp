@@ -5830,6 +5830,9 @@ public:
       std::this_thread::yield();
     }
     Require(name, "submission ran", done == done_value, "the submission did not run");
+    // The marker only shows progress. Waiting for idle orders the GPU thread's promotion before
+    // this thread's TakeBdaSync through the GPU queue mutex.
+    context.GetGpu().WaitForIdle();
     Require(name, "promotion", cache.TakeBdaSync().Contains(held_back, page),
             "starting a submission did not promote held-back BDA events");
     context.ShutdownGpu();

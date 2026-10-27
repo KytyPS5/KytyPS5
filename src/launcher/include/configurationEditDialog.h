@@ -46,6 +46,7 @@ private:
 	QLineEdit*                   m_addons_dir_edit        = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
 	bool                         m_global_settings        = false;
+	bool                         m_geometry_restored      = false;
 
 protected:
 	void Init(const Configuration& info);

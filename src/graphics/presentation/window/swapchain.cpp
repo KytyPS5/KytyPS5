@@ -818,17 +818,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
-	const vk::Rect2D game_rect =
-	    Config::StretchEnabled() ? vk::Rect2D {{0, 0}, m_extent}
-	    : source != nullptr      ? FitAspect(source->image.extent, m_extent)
-	    : draw_overlay           ? FitAspect(overlay.frame->image.extent, m_extent)
-	                             : vk::Rect2D {{0, 0}, m_extent};
-	if (source != nullptr) {
-		if (game_rect.extent != m_extent) {
-			const vk::ClearColorValue black {};
-			vk_command.clearColorImage(m_images[m_image_index],
-			                           vk::ImageLayout::eTransferDstOptimal, &black, 1,
-			                           &to_transfer.subresourceRange);
+	const auto* aspect_source = source != nullptr ? source : overlay.frame;
+	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
+	                               ? FitAspect(aspect_source->image.extent, m_extent)
+	                               : vk::Rect2D {{0, 0}, m_extent};
+	if (source == nullptr || game_rect.extent != m_extent) {
+		const vk::ClearColorValue black {};
+		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
+		                           &black, 1, &to_transfer.subresourceRange);
+		if (source != nullptr) {
 			vk::ImageMemoryBarrier after_clear = to_transfer;
 			after_clear.srcAccessMask          = vk::AccessFlagBits::eTransferWrite;
 			after_clear.oldLayout              = vk::ImageLayout::eTransferDstOptimal;
@@ -837,6 +835,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1,
 			                           &after_clear);
 		}
+	}
+	if (source != nullptr) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.srcSubresource.mipLevel       = 0;
@@ -857,10 +857,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
-	} else {
-		const vk::ClearColorValue black {};
-		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
-		                           &black, 1, &to_transfer.subresourceRange);
 	}
 
 	vk::ImageMemoryBarrier to_present {};

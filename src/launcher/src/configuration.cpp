@@ -2,11 +2,6 @@
 
 #include <QRegularExpression>
 
-QStringList Configuration::ResolutionPresets() {
-	return {"1280x720",  "1920x1080", "2560x1440", "3840x2160",
-	        "2560x1080", "3440x1440", "3840x1600", "5120x2160"};
-}
-
 QString Configuration::NormalizeResolution(const QString& text) {
 	// Older settings stored the enum key, e.g. "R1920X1080".
 	static const QRegularExpression re(QStringLiteral("^\\s*R?(\\d+)\\s*[xX]\\s*(\\d+)\\s*$"));
@@ -160,7 +155,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 		if (!it.value().isString()) {
 			return fail(tr("Game setting %1 must be a string.").arg(it.key()));
 		}
-		values.insert(it.key(), it.value().toString());
+		const auto value = it.value().toString();
+		values.insert(it.key(), it.key() == "screen_resolution" ? NormalizeResolution(value)
+		                                                       : value);
 	}
 
 	ReadGameSettingsValues(values);

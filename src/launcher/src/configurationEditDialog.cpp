@@ -172,11 +172,11 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 
 	setSizeGripEnabled(true);
 
-	if (!restoreGeometry(g_last_geometry)) {
+	Init(info);
+	m_geometry_restored = restoreGeometry(g_last_geometry);
+	if (!m_geometry_restored) {
 		GrowToFitContents();
 	}
-
-	Init(info);
 }
 
 QByteArray ConfigurationEditDialog::g_last_geometry;
@@ -252,10 +252,6 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		                    info.audio_input_device);
 	}
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
-	m_ui->comboBox_screen_resolution->clear();
-	m_ui->comboBox_screen_resolution->setEditable(true);
-	m_ui->comboBox_screen_resolution->setInsertPolicy(QComboBox::NoInsert);
-	m_ui->comboBox_screen_resolution->addItems(Configuration::ResolutionPresets());
 	m_ui->comboBox_screen_resolution->setCurrentText(info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
@@ -422,7 +418,9 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
-	GrowToFitContents();
+	if (!m_geometry_restored) {
+		GrowToFitContents();
+	}
 }
 
 void ConfigurationEditDialog::MakeTabsScrollable() {

@@ -21,10 +21,7 @@ inline QStringList EnumToList() {
 	auto        me    = QMetaEnum::fromType<T>();
 	int         count = me.keyCount();
 	for (int i = 0; i < count; i++) {
-		auto key = QString(me.key(i));
-		ret << (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit()
-		            ? key.remove('R').toLower()
-		            : key);
+		ret << QString(me.key(i));
 	}
 	return ret;
 }
@@ -32,16 +29,12 @@ inline QStringList EnumToList() {
 template <class T>
 T TextToEnum(const QString& text) {
 	auto me = QMetaEnum::fromType<T>();
-	return static_cast<T>(me.keyToValue(
-	    ((text.size() > 1 && text.at(0).isDigit()) ? 'R' + text.toUpper() : text).toUtf8().data()));
+	return static_cast<T>(me.keyToValue(text.toUtf8().constData()));
 }
 
 template <class T>
 QString EnumToText(T value) {
-	auto me  = QMetaEnum::fromType<T>();
-	auto key = QString(me.valueToKey(static_cast<int>(value)));
-	return (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit() ? key.remove('R').toLower()
-	                                                                     : key);
+	return QString(QMetaEnum::fromType<T>().valueToKey(static_cast<int>(value)));
 }
 
 struct ControllerSettings {
@@ -83,8 +76,7 @@ public:
 	static constexpr int MIN_SCREEN_SIZE = 320;
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
-	static QStringList ResolutionPresets();
-	static QString     NormalizeResolution(const QString& text);
+	static QString NormalizeResolution(const QString& text);
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)

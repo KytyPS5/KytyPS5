@@ -116,6 +116,16 @@
             <item row="0" column="1">
              <widget class="QComboBox" name="comboBox_screen_resolution">
               <property name="toolTip"><string>Window resolution as WIDTHxHEIGHT; pick a preset or type a custom size. Non-16:9 sizes such as 21:9 show the game with black bars unless Stretch to window is on.</string></property>
+              <property name="editable"><bool>true</bool></property>
+              <property name="insertPolicy"><enum>QComboBox::NoInsert</enum></property>
+              <item><property name="text"><string notr="true">1280x720</string></property></item>
+              <item><property name="text"><string notr="true">1920x1080</string></property></item>
+              <item><property name="text"><string notr="true">2560x1440</string></property></item>
+              <item><property name="text"><string notr="true">3840x2160</string></property></item>
+              <item><property name="text"><string notr="true">2560x1080</string></property></item>
+              <item><property name="text"><string notr="true">3440x1440</string></property></item>
+              <item><property name="text"><string notr="true">3840x1600</string></property></item>
+              <item><property name="text"><string notr="true">5120x2160</string></property></item>
              </widget>
             </item>
             <item row="1" column="0">

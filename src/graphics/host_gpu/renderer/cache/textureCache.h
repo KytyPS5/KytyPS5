@@ -166,7 +166,10 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Caller holds m_lock. With unlocked_copy, m_lock is released while the guest bytes are copied
+	// and the download is dropped if the image changed meanwhile, so the caller must not keep
+	// references or iterators into the cache across the call.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool unlocked_copy = false);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

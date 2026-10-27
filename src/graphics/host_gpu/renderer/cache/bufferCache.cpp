@@ -341,6 +341,14 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
+BufferId BufferCache::FindBufferForShaderRead(uint64_t vaddr, uint64_t size) {
+	const auto id = FindBuffer(vaddr, size);
+	if (!IsBufferInvalid(id)) {
+		TouchBuffer(m_slot_buffers[id]);
+	}
+	return id;
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int      StreamLeapThreshold = 16;
 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;

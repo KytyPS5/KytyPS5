@@ -4205,6 +4205,87 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A shader-read lookup counts as a use, so garbage collection keeps that buffer, while a plain
+  // FindBuffer lookup still does not.
+  void CheckBufferCacheShaderReadLookup() {
+    constexpr const char *name = "BufferCacheShaderReadLookup";
+    constexpr uintptr_t base = 0x0000000241000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint64_t lookup_offset = 0;
+    constexpr uint64_t shader_read_offset = 0x100000;
+    constexpr uint64_t range_size = 2 * BufferCache::CACHING_PAGESIZE;
+    // Past the 160-tick age of normal garbage collection, re-reading every 40 ticks.
+    constexpr uint32_t aging_ticks = 160;
+    constexpr uint32_t reread_interval = 40;
+    constexpr auto no_pressure = std::numeric_limits<uint64_t>::max();
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      const auto looked_up = cache.FindBuffer(base + lookup_offset, range_size);
+      const auto shader_read =
+          cache.FindBufferForShaderRead(base + shader_read_offset, range_size);
+      bool same_owner = true;
+      for (uint32_t tick = 0; tick <= aging_ticks; tick++) {
+        if (tick % reread_interval == 0) {
+          same_owner = same_owner &&
+                       cache.FindBufferForShaderRead(base + shader_read_offset,
+                                                     range_size) == shader_read;
+        }
+        cache.RunGarbageCollector();
+      }
+      Require(name, "shader-read owner identity", same_owner,
+              "a shader-read lookup replaced its valid Buffer owner");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, no_pressure);
+      cache.RunGarbageCollector();
+      Require(name, "shader-read residency",
+              !cache.IsRegionRegistered(base + lookup_offset, range_size) &&
+                  !BufferCacheTestAccess::PageOwner(cache, base + lookup_offset) &&
+                  cache.IsRegionRegistered(base + shader_read_offset, range_size) &&
+                  BufferCacheTestAccess::PageOwner(cache, base + shader_read_offset) ==
+                      shader_read &&
+                  looked_up != shader_read,
+              "a plain lookup kept its buffer, or a shader-read lookup did not");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -53291,6 +53372,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheShaderReadLookup();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -53557,6 +53639,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheShaderReadLookup();
   } else {
     skipped_device_checks = true;
   }

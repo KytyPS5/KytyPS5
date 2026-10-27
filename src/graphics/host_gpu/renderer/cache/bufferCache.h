@@ -56,6 +56,10 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	/// Finds or creates the buffer for a range that shaders read through BDA without a
+	/// descriptor binding, and counts that as a use so the garbage collector keeps it.
+	/// FindBuffer alone is a lookup and does not.
+	[[nodiscard]] BufferId FindBufferForShaderRead(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,

@@ -94,7 +94,8 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32 ||
 		                        opcode == ValueOpcode::LoadBufferU32x2 ||
 		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		                        opcode == ValueOpcode::LoadBufferU32x4 ||
+		                        opcode == ValueOpcode::BufferAtomicIAdd32);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;

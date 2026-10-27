@@ -35,6 +35,8 @@ enum class Counter {
 	BufferUploadBytes,
 	BufferDownloadBytes,
 	BufferEvictions,
+	BufferReleases,        // Clean buffers released after going unbound, without memory pressure.
+	BufferReleaseRefaults, // Released ranges a shader read again through BDA, now kept.
 	// Presentation.
 	FlipsRequested,
 	FlipsRejected, // Guest flip queue was full.

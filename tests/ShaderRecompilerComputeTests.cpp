@@ -9959,37 +9959,78 @@ public:
       d16_storage_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
       const auto d16_storage_image =
           texture_cache.FindImage(d16_storage_desc, true);
-      auto d16_storage_readback = CreateHostBuffer(
-          name, sizeof(d16_fallback_values),
-          vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>(2, 0));
-      auto &d16_storage_native = texture_cache.GetImage(d16_storage_image);
-      d16_storage_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
-                                 vk::AccessFlagBits2::eTransferRead, {},
-                                 scheduler.Current().Handle());
-      vk::BufferImageCopy d16_storage_copy{};
-      d16_storage_copy.bufferRowLength = 4;
-      d16_storage_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0,
-                                           0, 1};
-      d16_storage_copy.imageExtent = {4, 1, 1};
-      scheduler.Current().Handle().copyImageToBuffer(
-          d16_storage_native.backing.image,
-          vk::ImageLayout::eTransferSrcOptimal, d16_storage_readback.buffer, 1,
-          &d16_storage_copy);
-      HostReadBarrier(d16_storage_readback.buffer, d16_storage_readback.size,
-                      vk::PipelineStageFlagBits::eTransfer,
-                      vk::AccessFlagBits::eTransferWrite);
-      scheduler.Finish();
-      const auto d16_storage_words = ReadBuffer(name, d16_storage_readback, 2);
-      std::array<uint16_t, 4> d16_storage_values{};
-      std::memcpy(d16_storage_values.data(), d16_storage_words.data(),
-                  sizeof(d16_storage_values));
+      const auto read_texels = [&](ImageId id, vk::ImageAspectFlagBits aspect) {
+        auto readback = CreateHostBuffer(name, 4 * sizeof(u32),
+                                         vk::BufferUsageFlagBits::eTransferDst,
+                                         std::vector<u32>(4, 0));
+        auto &image = texture_cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                      vk::AccessFlagBits2::eTransferRead, {},
+                      scheduler.Current().Handle());
+        const vk::BufferImageCopy copy{0, 4, 0, {aspect, 0, 0, 1}, {}, {4, 1, 1}};
+        scheduler.Current().Handle().copyImageToBuffer(
+            image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+            readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        auto words = ReadBuffer(name, readback, 4);
+        DestroyBuffer(&readback);
+        return words;
+      };
+      const auto d16_storage_words =
+          read_texels(d16_storage_image, vk::ImageAspectFlagBits::eColor);
       Require(
           name, "D16 fallback depth/storage copy",
-          d16_storage_values == d16_fallback_values &&
+          std::memcmp(d16_storage_words.data(), d16_fallback_values.data(),
+                      sizeof(d16_fallback_values)) == 0 &&
               d16_storage_image != d16_depth_image &&
               texture_cache.GetImage(d16_storage_image).IsGpuModified(),
           "D16 fallback reinterpreted four-byte host depth as two-byte color");
-      DestroyBuffer(&d16_storage_readback);
+
+      // Dropping and re-adding the stencil plane keeps the D16 depth values.
+      constexpr uint64_t d16_stenciled_offset = 0x33e000;
+      constexpr std::array<uint16_t, 4> d16_stale_values{};
+      std::memcpy(memory + d16_stenciled_offset, d16_fallback_values.data(),
+                  sizeof(d16_fallback_values));
+      auto d16_stenciled_desc = d16_depth_desc;
+      d16_stenciled_desc.info.data.address = base + d16_stenciled_offset;
+      d16_stenciled_desc.info.stencil.address = base + 0x33f000;
+      const auto d16_stenciled_image =
+          texture_cache.FindImage(d16_stenciled_desc);
+      (void)texture_cache.FindDepthTarget(d16_stenciled_image,
+                                          d16_stenciled_desc);
+      texture_cache.MarkGpuWritten(d16_stenciled_image);
+      // Stale guest bytes: the values below can come only from image copies.
+      Libs::LibKernel::Memory::WriteBacking(base + d16_stenciled_offset,
+                                            d16_stale_values.data(),
+                                            sizeof(d16_stale_values));
+      auto d16_native_desc = d16_stenciled_desc;
+      d16_native_desc.info.stencil = {};
+      d16_native_desc.info.pixel_format = vk::Format::eD16Unorm;
+      d16_native_desc.view_info.format = vk::Format::eD16Unorm;
+      d16_native_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      const auto d16_native_image = texture_cache.FindImage(d16_native_desc);
+      const auto d16_native_words =
+          read_texels(d16_native_image, vk::ImageAspectFlagBits::eDepth);
+      Require(name, "D16 fallback depth/native depth copy",
+              std::memcmp(d16_native_words.data(), d16_fallback_values.data(),
+                          sizeof(d16_fallback_values)) == 0 &&
+                  texture_cache.GetImage(d16_native_image).backing.format ==
+                      vk::Format::eD16Unorm,
+              "D16 depth lost its values when its target dropped the stencil");
+      const auto d16_restenciled_image =
+          texture_cache.FindImage(d16_stenciled_desc);
+      const auto d16_restenciled_words =
+          read_texels(d16_restenciled_image, vk::ImageAspectFlagBits::eDepth);
+      bool d16_promoted = d16_restenciled_image != d16_native_image;
+      for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
+        d16_promoted &= (d16_restenciled_words[i] & 0x00ffffffu) ==
+                        EncodeD16AsD24(d16_fallback_values[i]);
+      }
+      Require(name, "D16 native depth/fallback depth copy", d16_promoted,
+              "D16 depth lost its values when its target regained the stencil");
 
       if (!texture_cache.GetImage(combined_destination_image).IsGpuModified()) {
         texture_cache.MarkGpuWritten(combined_destination_image);

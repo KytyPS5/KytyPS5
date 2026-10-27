@@ -57,6 +57,12 @@ static bool IsMetaClearShaderCandidate(const ShaderRecompiler::IR::CompiledShade
 	if (program.info.has_bitwise_xor) {
 		return false;
 	}
+	// Raw-address reads and writes, buffer access through descriptors the GPU picks at run time,
+	// and GDS access all reach memory the buffer checks never see. Consuming such a dispatch would
+	// drop them, so it runs normally.
+	if (program.has_address_writes || program.info.uses_dma || program.info.uses_gds) {
+		return false;
+	}
 	// Consuming the dispatch skips all of it, and the metadata clear only covers buffers. A
 	// storage-image write (or image atomic) in the same shader would be lost, so such a dispatch
 	// runs normally.

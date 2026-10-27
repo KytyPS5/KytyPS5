@@ -6142,6 +6142,64 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Pins that a compute shader reaching memory outside its bound buffers is never consumed as a
+  // metadata clear, since a clear would drop those accesses. Each case is otherwise the shape real
+  // clears take, one small constant read and one metadata write.
+  void CheckComputeMetaClearShaderGuards() {
+    constexpr const char *name = "ComputeMetaClearShaderGuards";
+    constexpr uint64_t meta_size = 0xa0000;
+    constexpr uint64_t meta_spacing = 0x100000;
+    constexpr uint64_t first_meta = 0x0000000204700000ull;
+    constexpr uint64_t constants = 0x0000000204300000ull;
+    constexpr uint32_t clear_constants_records = 1;
+    constexpr uint32_t meta_records =
+        static_cast<uint32_t>(meta_size / MetaClearElementBytes);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    auto &command = scheduler.Current();
+    uint64_t next_meta = first_meta;
+    // Builds a clear-shaped dispatch over a fresh HTILE entry, lets `configure` set shader flags,
+    // and reports whether it was consumed and whether the entry was marked cleared.
+    const auto Consume = [&](const auto &configure) {
+      const auto meta = next_meta;
+      next_meta += meta_spacing;
+      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, meta, meta_size);
+      ShaderModule module;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      AddMetaClearBuffer(constants, true, false, clear_constants_records, module, snapshot);
+      AddMetaClearBuffer(meta, false, true, meta_records, module, snapshot);
+      configure(module.info);
+      ShaderComputeInputInfo input{};
+      input.stage.module = &module;
+      input.stage.resources = &snapshot;
+      const bool consumed =
+          RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, input, command);
+      return consumed || texture_cache.IsMetaCleared(meta, 0);
+    };
+
+    // Without any flag the dispatch is a clear, so each rejection below comes from its flag.
+    Require(name, "plain clear consumed", Consume([](auto &) {}),
+            "a clear-shaped dispatch with no extra memory access was not consumed");
+    Require(name, "address writes preserved",
+            !Consume([](auto &program) { program.has_address_writes = true; }),
+            "a dispatch writing through raw addresses was replaced by a clear");
+    Require(name, "indirect buffer access preserved",
+            !Consume([](auto &program) { program.info.uses_dma = true; }),
+            "a dispatch reading buffers through indirect descriptors was replaced by a clear");
+    Require(name, "GDS access preserved",
+            !Consume([](auto &program) { program.info.uses_gds = true; }),
+            "a dispatch using GDS was replaced by a clear");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -53702,6 +53760,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComputeMetaClearClassification();
     vulkan.CheckComputeMetaClearInputs();
     vulkan.CheckMetaClearSurfacesAllOrNothing();
+    vulkan.CheckComputeMetaClearShaderGuards();
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();

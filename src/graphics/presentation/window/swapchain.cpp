@@ -819,9 +819,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
 	const vk::Rect2D game_rect =
-	    source != nullptr  ? FitAspect(source->image.extent, m_extent)
-	    : draw_overlay     ? FitAspect(overlay.frame->image.extent, m_extent)
-	                       : vk::Rect2D {{0, 0}, m_extent};
+	    Config::StretchEnabled() ? vk::Rect2D {{0, 0}, m_extent}
+	    : source != nullptr      ? FitAspect(source->image.extent, m_extent)
+	    : draw_overlay           ? FitAspect(overlay.frame->image.extent, m_extent)
+	                             : vk::Rect2D {{0, 0}, m_extent};
 	if (source != nullptr) {
 		if (game_rect.extent != m_extent) {
 			const vk::ClearColorValue black {};

@@ -124,6 +124,7 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
@@ -166,6 +167,7 @@ public:
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
+		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		readback_tiled_images       = other.readback_tiled_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;

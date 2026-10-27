@@ -105,6 +105,10 @@ bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
 
+bool StretchEnabled() {
+	return g_config->stretch_enabled;
+}
+
 bool VrEnabled() {
 	return g_config->vr_enabled;
 }

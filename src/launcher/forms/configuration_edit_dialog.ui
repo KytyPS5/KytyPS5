@@ -115,7 +115,7 @@
             </item>
             <item row="0" column="1">
              <widget class="QComboBox" name="comboBox_screen_resolution">
-              <property name="toolTip"><string>Window resolution as WIDTHxHEIGHT; pick a preset or type a custom size. Non-16:9 sizes such as 21:9 show the game with black bars.</string></property>
+              <property name="toolTip"><string>Window resolution as WIDTHxHEIGHT; pick a preset or type a custom size. Non-16:9 sizes such as 21:9 show the game with black bars unless Stretch to window is on.</string></property>
              </widget>
             </item>
             <item row="1" column="0">
@@ -254,6 +254,12 @@
              <widget class="QCheckBox" name="checkBox_hide_cursor">
               <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
               <property name="text"><string>Auto-hide cursor</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_stretch">
+              <property name="toolTip"><string>Stretch the game image to fill the window instead of keeping its aspect ratio with black bars</string></property>
+              <property name="text"><string>Stretch to window</string></property>
              </widget>
             </item>
             <item>

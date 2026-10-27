@@ -64,6 +64,7 @@ struct ConfigOptions {
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
@@ -125,6 +126,7 @@ int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
+bool     StretchEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();

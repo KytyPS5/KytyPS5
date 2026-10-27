@@ -70,6 +70,8 @@ static void PrintUsage() {
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf(
+	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
@@ -199,6 +201,7 @@ static constexpr Flag FLAGS[] = {
     {"--fullscreen", &ConfigOptions::fullscreen_enabled},
     {"--hdr", &ConfigOptions::hdr_enabled},
     {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
+    {"--stretch", &ConfigOptions::stretch_enabled},
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},

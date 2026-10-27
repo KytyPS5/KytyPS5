@@ -283,35 +283,64 @@ void WriteEndOfPipeLabel(RenderContext& renderer, void* label, const void* value
 	}
 }
 
-// An end-of-pipe label and/or interrupt deferred behind image readbacks.
-struct DeferredSignal {
-	RenderContext*                         renderer;
-	void*                                  label; // Null for an interrupt-only signal.
-	uint64_t                               value;
-	uint32_t                               size;
-	bool                                   interrupt;
-	int                                    event_id;
-	uint32_t                               interrupt_context_id;
-	std::shared_ptr<std::atomic<uint32_t>> pending;
-
-	// Runs on the GPU thread, where a write to a page the buffer cache tracks can fault into a
-	// buffer readback. So a deferred interrupt is raised on the GPU thread, where an immediate one
-	// is raised on the priority thread.
-	void Land() const {
-		if (label != nullptr) {
-			// The low bytes are the label (little-endian).
-			WriteEndOfPipeLabel(*renderer, label, &value, size);
-			// Submissions waiting on the label retry at once instead of after the stall poll.
-			renderer->GetGpu().RetryBlockedSubmissions();
-		}
-		pending->fetch_sub(1, std::memory_order_acq_rel);
-		if (interrupt) {
-			renderer->TriggerInterrupt(event_id, interrupt_context_id);
-		}
-	}
-};
-
 } // namespace
+
+// Runs on the GPU thread, where a write to a page the buffer cache tracks can fault into a buffer
+// readback. So a deferred interrupt is raised on the GPU thread, where an immediate one is raised
+// on the priority thread.
+void DeferredSignal::Land() const {
+	if (label != nullptr) {
+		// The low bytes are the label (little-endian).
+		WriteEndOfPipeLabel(*renderer, label, &value, size);
+		// Submissions waiting on the label retry at once instead of after the stall poll.
+		renderer->GetGpu().RetryBlockedSubmissions();
+	}
+	pending->fetch_sub(1, std::memory_order_acq_rel);
+	if (interrupt) {
+		renderer->TriggerInterrupt(event_id, interrupt_context_id);
+	}
+}
+
+void DeferredSignal::Drop() const {
+	pending->fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void GuestGpu::QueueReadySignal(const DeferredSignal& signal) {
+	{
+		Common::LockGuard lock(m_ready_mutex);
+		m_ready_signals.push_back(signal);
+	}
+	// Queued before the drain command is sent, so a drain that runs early still finds it.
+	if (TrySendCommand([this] { LandReadySignals(); })) {
+		return;
+	}
+	// The GPU thread has stopped taking work, so nothing will drain the queue any more.
+	std::deque<DeferredSignal> dropped;
+	{
+		Common::LockGuard lock(m_ready_mutex);
+		dropped.swap(m_ready_signals);
+	}
+	for (const auto& ready: dropped) {
+		ready.Drop();
+	}
+}
+
+void GuestGpu::LandReadySignals() {
+	EXIT_IF(!IsGpuThread());
+	for (;;) {
+		DeferredSignal signal;
+		{
+			Common::LockGuard lock(m_ready_mutex);
+			if (m_ready_signals.empty()) {
+				return;
+			}
+			signal = m_ready_signals.front();
+			m_ready_signals.pop_front();
+		}
+		// Outside the lock, since writing the label can fault into a buffer readback.
+		signal.Land();
+	}
+}
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
@@ -1196,14 +1225,10 @@ void CommandProcessor::DeferSignal(void* label, uint64_t value, uint32_t size, b
 	    &m_renderer,      label, value, size, interrupt, m_interrupt_event_id, interrupt_context_id,
 	    m_pending_signals};
 	// The priority callback, which runs once the readbacks have landed, only hands the signal to
-	// the GPU thread (DeferredSignal::Land explains why). GPU-thread commands run in order between
-	// PM4 packets, so signals stay ordered.
-	GetScheduler().DeferPriorityOperation([&gpu = m_renderer.GetGpu(), signal] {
-		if (!gpu.TrySendCommand([signal] { signal.Land(); })) {
-			// The GPU no longer accepts commands, so the signal is dropped.
-			signal.pending->fetch_sub(1, std::memory_order_acq_rel);
-		}
-	});
+	// the GPU thread (DeferredSignal::Land explains why). The ready queue lands signals in the
+	// order their callbacks ran, which is the order they were deferred in.
+	GetScheduler().DeferPriorityOperation(
+	    [&gpu = m_renderer.GetGpu(), signal] { gpu.QueueReadySignal(signal); });
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

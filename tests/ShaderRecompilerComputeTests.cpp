@@ -10575,6 +10575,102 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Labels held back behind readbacks land before RenderContext::UnmapMemory removes their range,
+  // never after it, where they would write memory the guest has freed or reused. Covers labels
+  // whose landing is already queued and labels whose priority callbacks have not run yet.
+  void CheckDeferredLabelBeforeUnmap() {
+    constexpr const char *name = "DeferredLabelBeforeUnmap";
+    constexpr uintptr_t base = 0x0000000240800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t first_value = 0x55u;
+    constexpr uint32_t last_value = 0x66u;
+    constexpr uint32_t reused_value = 0x77u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    CommandProcessor processor(context, 0);
+    auto *label = reinterpret_cast<uint32_t *>(base);
+
+    // Two RELEASE_MEM packets writing first_value and then last_value to the label.
+    std::array<uint32_t, 16> releases{};
+    for (const auto [index, value] : {std::pair{0u, first_value}, std::pair{1u, last_value}}) {
+      auto *packet = releases.data() + index * 8;
+      packet[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+      packet[1] = 0x28u | (5u << 8u);
+      packet[2] = 1u << 29u; // INT_SEL 0 (none), DATA_SEL 1 (32-bit value)
+      packet[3] = static_cast<uint32_t>(base);
+      packet[4] = static_cast<uint32_t>(base >> 32u);
+      packet[5] = value;
+      packet[7] = 0x123u;
+    }
+    // Releases both labels behind a faked pending signal and unmaps their range, landing the
+    // priority callbacks first if `callbacks_first` is set. Reports whether both labels were
+    // held back and whether both had landed, in order, when the unmap returned.
+    const auto release_then_unmap = [&](bool callbacks_first) {
+      bool held = false;
+      bool landed = false;
+      gpu.SendCommandSync([&] {
+        processor.BufferInit();
+        *label = 0;
+        auto &pending = CommandProcessorTestAccess::PendingSignals(processor);
+        pending.fetch_add(1);
+        Pm4Execution execution;
+        held = processor.Process(execution, releases) == Pm4ProcessResult::Complete &&
+               *label == 0 && pending.load() == 3;
+        pending.fetch_sub(1);
+        if (callbacks_first) {
+          scheduler.Finish();
+          scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+        }
+        // Each case starts the unmap in the state its name says.
+        held = held && scheduler.HasPendingPriorityOperations() != callbacks_first;
+        context.UnmapMemory(base, allocation_size);
+        landed = *label == last_value && pending.load() == 0;
+        // The guest frees the range and reuses it; nothing may write the label after this.
+        *label = reused_value;
+      });
+      // Runs any landing that was still queued behind the unmap.
+      gpu.SendCommandSync([] {});
+      return held && landed && *label == reused_value;
+    };
+
+    context.MapMemory(base, allocation_size);
+    Require(name, "landing queued", release_then_unmap(true),
+            "a label whose landing was already queued was written after its range was unmapped");
+    context.MapMemory(base, allocation_size);
+    Require(name, "callbacks pending", release_then_unmap(false),
+            "a label whose priority callback had not run was written after its range was unmapped");
+
+    scheduler.Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -54331,6 +54427,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckTextureCacheDownloadRetry();
   vulkan.CheckReadbackHoldsLabel();
+  vulkan.CheckDeferredLabelBeforeUnmap();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

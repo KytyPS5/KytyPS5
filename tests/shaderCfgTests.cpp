@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
@@ -2165,6 +2166,67 @@ void TestOrderedPsDoneEndsProgram() {
         "s_endpgm_ordered_ps_done did not end the program");
 }
 
+void TestCallTableExpansionLongBranches() {
+  // A call through a 10-row table whose targets are 4000-word functions: the returns to the
+  // caller are beyond a 16-bit branch offset (Wolverine's CS 0xe6d76d24f59f8015 has 20 such
+  // targets). They must decode as long branches, not as islands inside other bodies.
+  using namespace ShaderRecompiler::Decoder;
+  constexpr uint64_t TableAddress = 0x100000000ull;
+  constexpr uint64_t FunctionBase = 0x200000000ull;
+  constexpr uint32_t Targets = 10;
+  constexpr uint32_t FunctionWords = 4000;
+  const uint32_t shader[] = {
+      0x8f088308u,              // s_lshl_b32 s8, s8, 3
+      0xf4240100u, 0x10000000u, // s_buffer_load_dwordx2 s[4:5], s[0:3], s8
+      0xbf8cc07fu,              // s_waitcnt lgkmcnt(0)
+      0xbe862104u,              // s_swappc_b64 s[6:7], s[4:5]
+      0xbf810000u,              // s_endpgm
+  };
+  const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(TableAddress),
+                                          static_cast<uint32_t>(TableAddress >> 32u), Targets * 8u, 0u};
+  for (const bool reads_scc : {false, true}) {
+    const auto read = [&](uint64_t address, std::span<uint32_t> words) {
+      for (size_t i = 0; i < words.size(); ++i) {
+        const uint64_t at = address + i * 4u;
+        if (at >= TableAddress && at < TableAddress + Targets * 8u) {
+          const uint64_t row = (at - TableAddress) / 8u;
+          const uint64_t target = FunctionBase + row * 0x10000u;
+          words[i] = ((at - TableAddress) & 4u) != 0u ? static_cast<uint32_t>(target >> 32u)
+                                                      : static_cast<uint32_t>(target);
+        } else if (at >= FunctionBase && at < FunctionBase + Targets * 0x10000u) {
+          const uint64_t word = ((at - FunctionBase) % 0x10000u) / 4u;
+          const bool first_function = at < FunctionBase + 0x10000u;
+          words[i] = word == FunctionWords - 1u ? 0xbe802006u // s_setpc_b64 s[6:7]
+                     : word == 0u && reads_scc && first_function ? 0xbf850000u // s_cbranch_scc1 +0
+                                                                  : 0xbf800000u; // s_nop 0
+        } else {
+          return false;
+        }
+      }
+      return true;
+    };
+    ShaderFunctionExpander expander;
+    std::vector<uint32_t> expanded;
+    std::string reason;
+    const bool ok = expander.Expand(shader, 0x300000000ull, user_data, read, expanded, reason, 32u);
+    Check(ok, ("the call table did not expand: " + reason).c_str());
+    Check(!expander.LongBranches().empty(), "the far returns gave no long branches");
+    Program decoded;
+    DecodeProgram(expanded, decoded, expander.LongBranches());
+    // Every return of a body reaches the code after the inlined call (the S_ENDPGM), directly.
+    const auto end_pc = decoded.instructions.back().pc;
+    uint32_t returns = 0;
+    for (const auto& inst : decoded.instructions) {
+      if (inst.opcode != Opcode::S_BRANCH) continue;
+      Check(inst.branch_target / 4u < expanded.size(), "a branch leaves the expanded code");
+      const auto target = std::ranges::find(decoded.instructions, inst.branch_target, &Instruction::pc);
+      Check(target != decoded.instructions.end() && target->opcode != Opcode::S_BRANCH,
+            "a branch goes through an island");
+      returns += inst.branch_target == end_pc ? 1u : 0u;
+    }
+    Check(returns == expander.Bodies().size(), "a body does not return to the caller");
+  }
+}
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   // Lane-read instructions have scalar results, but their VOP3A destination is
   // encoded in VDST [7:0], not the VOP3B SDST field [14:8].
@@ -13779,6 +13841,7 @@ int main() {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+  TestCallTableExpansionLongBranches();
 
   return 0;
 }

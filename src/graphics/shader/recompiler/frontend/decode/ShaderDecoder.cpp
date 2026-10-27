@@ -386,18 +386,26 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	return result;
 }
 
-void DecodeProgram(std::span<const uint32_t> code, Program& program) {
+void DecodeProgram(std::span<const uint32_t> code, Program& program,
+                   std::span<const LongBranch> long_branches) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
 	program.has_swap_pc = false;
+	program.long_branches.assign(long_branches.begin(), long_branches.end());
 
 	std::vector<bool> branch_targets;
+	auto              long_branch = long_branches.begin();
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		const auto& inst = program.instructions.back();
+		auto& inst = program.instructions.back();
+		while (long_branch != long_branches.end() && long_branch->pc < inst.pc) ++long_branch;
+		if (long_branch != long_branches.end() && long_branch->pc == inst.pc) {
+			EXIT_IF(!IsDirectBranch(inst.opcode) || long_branch->target / sizeof(uint32_t) >= code.size());
+			inst.branch_target = long_branch->target;
+		}
 		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 

@@ -350,6 +350,10 @@ struct TextureCacheTestAccess {
     return cache.m_slot_images.try_get(id);
   }
 
+  static Image &MutableImage(TextureCache &cache, ImageId id) {
+    return cache.m_slot_images[id];
+  }
+
   static bool PendingDownload(const TextureCache &cache, ImageId id) {
     return cache.m_download_images.contains(id);
   }
@@ -10315,6 +10319,95 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "cache direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // An enrolled image that cannot be downloaded yet stays enrolled and is copied once it can be,
+  // and HasReadbacksInFlight covers the copy until its guest write has run.
+  void CheckTextureCacheDownloadRetry() {
+    constexpr const char *name = "TextureCacheDownloadRetry";
+    constexpr uintptr_t base = 0x0000000240000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t stale_value = 0x2468ace0u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      auto &command = scheduler.Current();
+      auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      desc.type = BindingType::Storage;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      Require(name, "image clear",
+              texture_cache.ClearImageFromBuffer(command, base, sizeof(uint32_t), gpu_value),
+              "failed to create GPU-current image contents");
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+      Libs::LibKernel::Memory::WriteBacking(base, &stale_value, sizeof(stale_value));
+
+      // A CPU write since the GPU one makes the image unsafe to download until it is refreshed.
+      auto &owner = TextureCacheTestAccess::MutableImage(texture_cache, image);
+      owner.MarkCpuDirty();
+      const bool kept = !texture_cache.ProcessDownloadImages() &&
+                        TextureCacheTestAccess::PendingDownload(texture_cache, image) &&
+                        !texture_cache.HasReadbacksInFlight();
+      Require(name, "kept for retry", kept,
+              "an image that could not be downloaded yet was dropped or queued");
+
+      owner.RefreshComplete();
+      const bool queued = texture_cache.ProcessDownloadImages() &&
+                          !TextureCacheTestAccess::PendingDownload(texture_cache, image) &&
+                          texture_cache.HasReadbacksInFlight();
+      Require(name, "retried", queued,
+              "a retried image was not copied, or its copy was not counted as in flight");
+
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      uint32_t landed = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base, &landed, sizeof(landed));
+      Require(name, "landed", landed == gpu_value && !texture_cache.HasReadbacksInFlight(),
+              "the retried copy did not reach guest memory, or stayed counted as in flight");
+
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -53618,6 +53711,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckTextureCacheDownloadRetry();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

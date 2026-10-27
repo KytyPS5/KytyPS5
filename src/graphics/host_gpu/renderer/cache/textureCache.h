@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <type_traits>
@@ -77,7 +78,22 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
-	void ProcessDownloadImages();
+	/// Records GPU-to-guest copies for enrolled images. Entries that fail only for now stay
+	/// enrolled and are retried at the next call, and entries that can never be downloaded are
+	/// dropped.
+	/// @return true if at least one copy was queued. Its guest write lands as a priority operation.
+	bool ProcessDownloadImages();
+	/// @return true if image readbacks are enabled at all. It is set at construction (only tests
+	/// change it later), so it needs no lock.
+	[[nodiscard]] bool ReadbacksEnabled() const noexcept {
+		return m_readback_linear_images || m_readback_tiled_images;
+	}
+	/// @return true while a queued readback has not yet been written to guest memory. This counts
+	/// the write-backs of evicted images too, even with readbacks off, since an evicted image's
+	/// data exists only in its pending write-back.
+	[[nodiscard]] bool HasReadbacksInFlight() const noexcept {
+		return m_readbacks_in_flight.load(std::memory_order_acquire) != 0;
+	}
 	void RunGarbageCollector();
 
 private:
@@ -187,6 +203,8 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	// Readbacks recorded by DownloadImageMemory() whose guest write has not run yet.
+	std::atomic<uint32_t> m_readbacks_in_flight {0};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

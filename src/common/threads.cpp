@@ -415,17 +415,24 @@ ThreadWithStack::ThreadWithStack(thread_func_t func, void* arg, size_t stack_siz
 	m_thread->handle = reinterpret_cast<HANDLE>(
 	    _beginthreadex(nullptr, static_cast<unsigned>(stack_size), ThreadWithStackPrivate::Run,
 	                   m_thread.get(), STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
-	EXIT_IF(m_thread->handle == nullptr);
+	// EXIT, not EXIT_IF: EXIT_IF is compiled out in KYTY_FINAL builds, where a failed create would
+	// leave the GPU without its thread.
+	if (m_thread->handle == nullptr) {
+		EXIT("_beginthreadex failed: %d\n", errno);
+	}
 #else
-	// The calls stay outside EXIT_IF, which does not evaluate its argument in KYTY_FINAL builds.
 	pthread_attr_t attr;
-	const int      init = pthread_attr_init(&attr);
-	EXIT_IF(init != 0);
-	const int stack = pthread_attr_setstacksize(&attr, stack_size);
-	EXIT_IF(stack != 0);
-	const int created =
-	    pthread_create(&m_thread->thread, &attr, ThreadWithStackPrivate::Run, m_thread.get());
-	EXIT_IF(created != 0);
+	if (const int result = pthread_attr_init(&attr); result != 0) {
+		EXIT("pthread_attr_init failed: %d\n", result);
+	}
+	if (const int result = pthread_attr_setstacksize(&attr, stack_size); result != 0) {
+		EXIT("pthread_attr_setstacksize(%zu) failed: %d\n", stack_size, result);
+	}
+	if (const int result =
+	        pthread_create(&m_thread->thread, &attr, ThreadWithStackPrivate::Run, m_thread.get());
+	    result != 0) {
+		EXIT("pthread_create failed: %d\n", result);
+	}
 	pthread_attr_destroy(&attr);
 #endif
 }

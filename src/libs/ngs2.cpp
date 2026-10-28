@@ -577,8 +577,11 @@ static_assert(sizeof(Ngs2SubmixerCompressorParam) == 32);
 //
 // Above the threshold the output level rises by `ratio` dB per input dB, and `knee` softens the
 // transition over that many dB. `level` is applied to the compressed signal. Attack and release
-// smooth the gain reduction exponentially, and give the time it takes to settle within 60 dB of
-// the target, as the reverb's decay time does.
+// smooth the gain reduction exponentially and are time constants. After that time about a third
+// (1/e) of the change remains, so a 4 s release brings back half the duck in about 2.8 s. This
+// matched the release in a PS5 capture of PPSA28465, where faster readings recovered too soon.
+// The attack follows the same rule, which matches the quick fade heard on hardware when a voice
+// starts but has not been measured.
 //
 // A model of the submixer's compressor. For each sample it measures how loud the detected
 // signal is and how far that is above the threshold. From that it works out how many dB to turn
@@ -619,8 +622,8 @@ public:
 		// A negative level would invert the signal. 16 (+24 dB) is a cap that keeps a bad value
 		// from blowing up the mix.
 		m_level   = std::clamp(OrDefault(param.level, 1.0f), 0.0, 16.0);
-		m_attack  = SettleCoefficient(attack_seconds, rate);
-		m_release = SettleCoefficient(release_seconds, rate);
+		m_attack  = TimeConstantCoefficient(attack_seconds, rate);
+		m_release = TimeConstantCoefficient(release_seconds, rate);
 		// The RMS detector averages the power over roughly the last 10 ms. With this coefficient
 		// a burst of power fades to about a third (1/e) of its weight 10 ms later.
 		m_rms_window = std::exp(-1.0 / (RmsWindow * rate));
@@ -685,12 +688,13 @@ private:
 	// 0.5 and 0 dB gives 1.
 	static double DbToGain(double db) { return std::pow(10.0, db / 20.0); }
 
-	// The smoothing coefficient `c` for a change that should take `seconds`. Each sample keeps
-	// `c` of the distance left to the target, so after n samples c^n of it remains. Solving
-	// c^(seconds * rate) = 1/1000 makes only a thousandth of the change (60 dB) remain when
-	// the time is up. Zero seconds gives a `c` of 0, which jumps straight to the target.
-	static double SettleCoefficient(double seconds, uint32_t rate) {
-		return seconds <= 0.0 ? 0.0 : std::exp(-std::log(1000.0) / (seconds * rate));
+	// The smoothing coefficient `c` for a time constant of `seconds`. Each sample keeps `c` of
+	// the distance left to the target, so after n samples c^n of it remains. With
+	// c = exp(-1 / (seconds * rate)) about a third (1/e) of the change remains when the time is
+	// up, and half remains after about 0.69 (ln 2) of it. Zero seconds gives a `c` of 0, which
+	// jumps straight to the target.
+	static double TimeConstantCoefficient(double seconds, uint32_t rate) {
+		return seconds <= 0.0 ? 0.0 : std::exp(-1.0 / (seconds * rate));
 	}
 
 	// How far the detected signal at sample `i` is above the threshold in dB. The result is

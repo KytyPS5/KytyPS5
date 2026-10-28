@@ -791,7 +791,7 @@ void TestCompressorDsp() {
 
 	// Attack and release smooth the reduction, so the key takes time to duck the signal, and the
 	// signal returns gradually once the key stops.
-	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.1f, 5.0f), Rate);
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.1f, 1.0f), Rate);
 	std::fill(signal.begin(), signal.end(), 0.5f);
 	std::vector<float> keyed(Rate, 0.1f);
 	compressor.Process(signal.data(), keyed.data(), 1, 2);
@@ -847,6 +847,43 @@ void TestCompressorNonFinite() {
 		Check(Near(signal[Rate - 1], 0.5 * std::pow(10.0, -7.5 / 20.0), 1e-5),
 		      "a non-finite key stopped the ducking");
 	}
+}
+
+// Attack and release times are one-pole time constants, so about a third (1/e) of the change
+// remains once the time is up and half remains after ln 2 of it. Peak detection on a side-chain
+// key (flags 0x09) gives a target with no RMS tail, so the reduction follows the curve exactly.
+void TestCompressorTimeConstant() {
+	constexpr uint32_t Rate           = 1000;
+	constexpr uint32_t ReleaseSamples = 2000; // A 2 s release.
+	const auto         reduction_db   = [](const Ngs2Compressor& compressor) {
+		return -20.0 * std::log10(double(compressor.Gain()));
+	};
+	Ngs2Compressor compressor;
+
+	// An instant attack lands on the full reduction, then the key stops.
+	compressor.Configure(CompressorParam(0x09, 0.01f, 0.5f, 0.0f, 0.0f, 2.0f), Rate);
+	float key[]    = {0.1f};
+	float sample[] = {0.5f};
+	compressor.Process(sample, key, 1, 1);
+	const double       start     = reduction_db(compressor);
+	const uint32_t     half_life = uint32_t(std::lround(ReleaseSamples * std::log(2.0)));
+	std::vector<float> signal(ReleaseSamples, 0.5f);
+	compressor.Process(signal.data(), nullptr, 1, half_life);
+	Check(Near(reduction_db(compressor), start * std::exp(-double(half_life) / ReleaseSamples),
+	           1e-5),
+	      "the release time is not a one-pole time constant");
+	compressor.Process(signal.data(), nullptr, 1, ReleaseSamples - half_life);
+	Check(Near(reduction_db(compressor), start * std::exp(-1.0), 1e-5),
+	      "the release time is not a one-pole time constant");
+
+	// A 0.1 s attack covers 1 - 1/e of the way to the target in 0.1 s.
+	compressor.Reset();
+	compressor.Configure(CompressorParam(0x09, 0.01f, 0.5f, 0.0f, 0.1f, 0.0f), Rate);
+	const double       target = 0.5 * 20.0 * std::log10(double(0.1f) / double(0.01f));
+	std::vector<float> attack_key(Rate / 10, 0.1f);
+	compressor.Process(signal.data(), attack_key.data(), 1, Rate / 10);
+	Check(Near(reduction_db(compressor), target * (1.0 - std::exp(-1.0)), 1e-5),
+	      "the attack time is not a one-pole time constant");
 }
 
 // A submixer with a side-chain compressor (peak-keyed here, so one sample settles it) ducks
@@ -1923,6 +1960,7 @@ int main() {
 	TestSubmixerSideChainInput();
 	TestCompressorDsp();
 	TestCompressorNonFinite();
+	TestCompressorTimeConstant();
 	TestSubmixerCompressorVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();

@@ -6,13 +6,14 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 struct MemoryOpcodeInfo {
-	uint32_t encoding    = 0;
-	Opcode   decoded     = Opcode::UNSUPPORTED;
-	uint32_t data_dwords = 1;
-	uint32_t data_bits   = 32;
-	bool     data_signed = false;
-	bool     typed       = false;
-	bool     formatted   = false;
+	uint32_t encoding        = 0;
+	Opcode   decoded         = Opcode::UNSUPPORTED;
+	uint32_t data_dwords     = 1;
+	uint32_t data_bits       = 32;
+	bool     data_signed     = false;
+	bool     typed           = false;
+	bool     formatted       = false;
+	uint32_t data_components = 0; // D16 formats pack two components per dword
 };
 
 constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
@@ -21,7 +22,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
-    {0x25u, Opcode::S_MEMREALTIME, 2, 32},
+    {0x20u, Opcode::S_DCACHE_INV, 0, 0},           {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
@@ -68,12 +69,19 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
     {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
+    {0x56u, Opcode::BUFFER_ATOMIC_UMIN_X2, 2, 32},
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
+    {0x71u, Opcode::BUFFER_GL0_INV, 0, 0},
+    {0x72u, Opcode::BUFFER_GL1_INV, 0, 0},
     {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true},
+    {0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
     {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true},
+    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -88,14 +96,14 @@ constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
 };
 
 constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
-    {0x08u, Opcode::FLAT_LOAD_UBYTE, 1, 8},     {0x09u, Opcode::FLAT_LOAD_SBYTE, 1, 8, true},
-    {0x0au, Opcode::FLAT_LOAD_USHORT, 1, 16},   {0x0bu, Opcode::FLAT_LOAD_SSHORT, 1, 16, true},
-    {0x0cu, Opcode::FLAT_LOAD_DWORD, 1, 32},    {0x0du, Opcode::FLAT_LOAD_DWORDX2, 2, 32},
-    {0x0eu, Opcode::FLAT_LOAD_DWORDX4, 4, 32},  {0x0fu, Opcode::FLAT_LOAD_DWORDX3, 3, 32},
-    {0x18u, Opcode::FLAT_STORE_BYTE, 1, 8},     {0x1au, Opcode::FLAT_STORE_SHORT, 1, 16},
-    {0x1cu, Opcode::FLAT_STORE_DWORD, 1, 32},   {0x1du, Opcode::FLAT_STORE_DWORDX2, 2, 32},
-    {0x1eu, Opcode::FLAT_STORE_DWORDX4, 4, 32}, {0x1fu, Opcode::FLAT_STORE_DWORDX3, 3, 32},
-    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16},
+    {0x08u, Opcode::FLAT_LOAD_UBYTE, 1, 8},      {0x09u, Opcode::FLAT_LOAD_SBYTE, 1, 8, true},
+    {0x0au, Opcode::FLAT_LOAD_USHORT, 1, 16},    {0x0bu, Opcode::FLAT_LOAD_SSHORT, 1, 16, true},
+    {0x0cu, Opcode::FLAT_LOAD_DWORD, 1, 32},     {0x0du, Opcode::FLAT_LOAD_DWORDX2, 2, 32},
+    {0x0eu, Opcode::FLAT_LOAD_DWORDX4, 4, 32},   {0x0fu, Opcode::FLAT_LOAD_DWORDX3, 3, 32},
+    {0x18u, Opcode::FLAT_STORE_BYTE, 1, 8},      {0x1au, Opcode::FLAT_STORE_SHORT, 1, 16},
+    {0x1cu, Opcode::FLAT_STORE_DWORD, 1, 32},    {0x1du, Opcode::FLAT_STORE_DWORDX2, 2, 32},
+    {0x1eu, Opcode::FLAT_STORE_DWORDX4, 4, 32},  {0x1fu, Opcode::FLAT_STORE_DWORDX3, 3, 32},
+    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16}, {0x25u, Opcode::FLAT_LOAD_SHORT_D16_HI, 1, 16},
 };
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
@@ -156,13 +164,16 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 		inst.opcode = Opcode::UNSUPPORTED;
 		return;
 	}
-	inst.opcode      = info->decoded;
-	inst.data_dwords = info->data_dwords;
-	inst.data_bits   = info->data_bits;
-	inst.data_signed = info->data_signed;
-	inst.typed       = info->typed;
-	inst.formatted   = info->formatted;
+	inst.opcode          = info->decoded;
+	inst.data_dwords     = info->data_dwords;
+	inst.data_bits       = info->data_bits;
+	inst.data_signed     = info->data_signed;
+	inst.typed           = info->typed;
+	inst.formatted       = info->formatted;
+	inst.data_components = info->data_components;
 }
+
+} // namespace
 
 bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -181,6 +192,8 @@ bool IsDsWriteOpcode(Opcode opcode) {
 		default: return false;
 	}
 }
+
+namespace {
 
 bool IsDsAtomicOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -273,6 +286,9 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
 	}
+	if (inst.opcode == Opcode::S_DCACHE_INV) {
+		return;
+	}
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	if (inst.opcode == Opcode::S_MEMREALTIME) {
@@ -312,14 +328,12 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
+	if (inst.opcode == Opcode::BUFFER_GL0_INV || inst.opcode == Opcode::BUFFER_GL1_INV) {
+		return;
+	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZW ||
-	    inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_XYZW) {
-		inst.data_components = 4u;
-	}
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X ||
-	    inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
+	if (inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
 		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ? 5u : 4u;
@@ -409,9 +423,10 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst);
-	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16) {
-		// D16 loads reuse partial destinations to preserve the untouched high half.
-		inst.dst.sdwa_sel = 4u;
+	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16 ||
+	    inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI) {
+		// D16 loads reuse partial destinations to preserve the untouched half.
+		inst.dst.sdwa_sel = inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI ? 5u : 4u;
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	inst.src_count = 1;

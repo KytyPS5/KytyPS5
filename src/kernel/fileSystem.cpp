@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hash.h"
@@ -409,6 +410,11 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 	return g_mount_points->ResolvePath(mounted_file_name);
 }
 
+bool IsOpenDescriptor(int d) {
+	const auto* file = g_files->GetFile(d);
+	return file != nullptr && file->opened;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
@@ -669,6 +675,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
 
@@ -731,6 +738,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		file->f.Seek(file->f.Size());
 	}
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -795,6 +803,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -896,6 +905,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
 		file->f.Read(buffer.iov_base, count, &bytes);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {
@@ -945,6 +955,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -1016,6 +1027,7 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 		}
 		uint32_t bytes = 0;
 		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);
 		bytes_written += bytes;
 		if (bytes < buffer.iov_len) {
 			break;
@@ -1316,6 +1328,27 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
 
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	Common::LockGuard lock(file->mutex);
+	if (file->f.IsInvalid() || !file->f.Flush()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tFsync: %s\n", Common::PathToString(file->real_name).c_str());
 	return OK;
 }
 

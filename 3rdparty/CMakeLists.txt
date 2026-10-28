@@ -25,6 +25,45 @@ FetchContent_MakeAvailable(opus)
 set(BUILD_TESTING "${kyty_build_testing_saved}")
 install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
 
+# Headsets are driven through OpenXR. Only the static loader is built; the runtime that serves it
+# (for example SteamVR, Monado or Virtual Desktop) comes from the user's system.
+set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(openxr
+	GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
+	GIT_TAG f2448a8797c85814aa892efc1ab8707900fbcc78 # release-1.1.63
+	GIT_SHALLOW FALSE)
+FetchContent_MakeAvailable(openxr)
+# Keep the loader's headers and library out of the installed package.
+set_property(DIRECTORY "${openxr_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+# The loader uses exceptions internally.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(openxr_loader PRIVATE -fexceptions)
+endif()
+install(FILES "${openxr_SOURCE_DIR}/LICENSE" DESTINATION "licenses/openxr")
+
+# Noto Sans v2.015 (SIL Open Font License 1.1) is libFont's fallback font.
+set(KYTY_NOTO_SANS_REPOSITORY "https://raw.githubusercontent.com/notofonts/notofonts.github.io")
+set(KYTY_NOTO_SANS_COMMIT 42af67ccd12bc0e31ed85384bf73e39248265374)
+set(KYTY_NOTO_SANS_BASE_URL "${KYTY_NOTO_SANS_REPOSITORY}/${KYTY_NOTO_SANS_COMMIT}/fonts")
+set(KYTY_NOTO_SANS_DIR "${FETCHCONTENT_BASE_DIR}/noto-sans")
+function(kyty_fetch_noto_sans path sha256)
+	get_filename_component(name "${path}" NAME)
+	file(DOWNLOAD "${KYTY_NOTO_SANS_BASE_URL}/${path}" "${KYTY_NOTO_SANS_DIR}/${name}"
+		EXPECTED_HASH SHA256=${sha256})
+endfunction()
+kyty_fetch_noto_sans(LICENSE f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-Regular.ttf
+	478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-Bold.ttf
+	1df075a380fc7cb898acf64c1f7b3b4dd780de3caa860178bf929de35817a913)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-Italic.ttf
+	467e3f89eeca4108bb8710a2b9e0cf2281ac56d5b0609211a83776d0505eecb5)
+kyty_fetch_noto_sans(NotoSans/hinted/ttf/NotoSans-BoldItalic.ttf
+	1b602a9d6353be42c91df097a4857b69fa2696f26703d7a33b54a15d87c2622c)
+install(FILES "${KYTY_NOTO_SANS_DIR}/LICENSE" DESTINATION "licenses/noto-sans")
+set(KYTY_NOTO_SANS_DIR "${KYTY_NOTO_SANS_DIR}" PARENT_SCOPE)
+
 # The guest instruction patcher needs a decoder/encoder and a small
 # trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)

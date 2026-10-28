@@ -172,8 +172,9 @@ MakeAddcontInfo(const Loader::AddContentEntry& entry) {
 	NpEntitlementAccessAddcontEntitlementInfo info {};
 	std::memcpy(info.entitlement_label.data, entry.entitlement_label.data(),
 	            entry.entitlement_label.size());
-	info.package_type    = 2; // Additional content with extra data.
-	info.download_status = 4; // Installed.
+	const bool extra_data = !entry.mount_dir.empty();
+	info.package_type     = extra_data ? 2 : 3; // PSAC (with extra data) or PSAL (license only).
+	info.download_status  = extra_data ? 4 : 0; // INSTALLED or NO_EXTRA_DATA.
 	return info;
 }
 
@@ -511,5 +512,27 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 }
 
 } // namespace LibNpEntitlementAccess
+
+namespace LibNpEntitlementAccessPft {
+
+LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
+
+// Unknown function; return state 2 for the FC27 investigation.
+static int KYTY_SYSV_ABI NpEntitlementAccessPftUnknowneDXKe9FndlE(uint32_t* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return LibNpEntitlementAccess::NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	*state = 2;
+	return 0;
+}
+
+LIB_DEFINE(InitNet_1_NpEntitlementAccessPft) {
+	LIB_FUNC("eDXKe9FndlE", NpEntitlementAccessPftUnknowneDXKe9FndlE);
+}
+
+} // namespace LibNpEntitlementAccessPft
 
 } // namespace Libs

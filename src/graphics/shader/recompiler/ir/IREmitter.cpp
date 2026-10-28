@@ -6,11 +6,6 @@ IREmitter::IREmitter(Block* value_block): block(value_block) {
 	EXIT_IF(block == nullptr);
 }
 
-void IREmitter::SetBlock(Block* value_block) {
-	EXIT_IF(value_block == nullptr);
-	block = value_block;
-}
-
 Value IREmitter::Emit(ValueOpcode opcode, std::initializer_list<Value> args, uint64_t flags) {
 	auto& inst = block->AppendNewInst(opcode, args, flags);
 	return TypeOf(opcode) == Type::Void ? Value {} : Value(&inst);
@@ -130,16 +125,6 @@ F32 IREmitter::BitCastF32(U32 value) {
 
 U32 IREmitter::BitCastU32(F32 value) {
 	return U32(Emit(ValueOpcode::BitCastU32F32, {value}));
-}
-
-F16 IREmitter::BitCastF16(U32 value) {
-	const auto half = U16(Emit(ValueOpcode::ConvertU16U32, {value}));
-	return F16(Emit(ValueOpcode::BitCastF16U16, {half}));
-}
-
-U32 IREmitter::BitCastU32(F16 value) {
-	const auto half = U16(Emit(ValueOpcode::BitCastU16F16, {value}));
-	return U32(Emit(ValueOpcode::ConvertU32U16, {half}));
 }
 
 U64 IREmitter::ConstructU64(U32 low, U32 high) {

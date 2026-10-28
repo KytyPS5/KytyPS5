@@ -8,7 +8,7 @@
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
 #include "gameContent.h"
-#include "gameListTreeWidget.h"
+#include "gameViews.h"
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
@@ -27,6 +27,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFutureWatcher>
 #include <QHeaderView>
 #include <QIcon>
 #include <QInputDialog>
@@ -42,6 +43,8 @@
 #include <QPalette>
 #include <QPointer>
 #include <QProcess>
+#include <QProgressDialog>
+#include <QPromise>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -50,10 +53,10 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStyle>
-#include <QStyledItemDelegate>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
+#include <QtConcurrentRun>
 #include <QtCore>
 
 #ifdef __linux__
@@ -62,6 +65,7 @@
 #include <QDBusPendingCallWatcher>
 #endif
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -75,17 +79,9 @@ constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
 constexpr char CONF_GAME_DIRS[]    = "game_dirs";
 constexpr char CONF_ADDONS_DIR[]   = "addons_dir";
+constexpr char CONF_ADDCONT[]      = "AdditionalContent";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
-
-constexpr int GAME_NAME_COLUMN             = 0;
-constexpr int GAME_SERIAL_COLUMN           = 1;
-constexpr int GAME_VERSION_COLUMN          = 2;
-constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
-constexpr int GAME_SIZE_COLUMN             = 4;
-constexpr int GAME_PATH_COLUMN             = 5;
-constexpr int GAME_STATUS_COLUMN           = 6;
-constexpr int GAME_COMMENT_COLUMN          = 7;
 
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
@@ -146,54 +142,6 @@ static QStringList SettingsStringList(const QVariant& value) {
 	return text.isEmpty() ? QStringList() : QStringList({text});
 }
 
-class GameGridDelegate: public QStyledItemDelegate {
-public:
-	using QStyledItemDelegate::QStyledItemDelegate;
-
-	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
-		return option.decorationSize + QSize(16, 24 + option.fontMetrics.lineSpacing() * 2);
-	}
-
-protected:
-	void initStyleOption(QStyleOptionViewItem* option, const QModelIndex& index) const override {
-		const auto image_size = option->decorationSize;
-		QStyledItemDelegate::initStyleOption(option, index);
-		option->decorationSize      = image_size;
-		option->decorationPosition  = QStyleOptionViewItem::Top;
-		option->decorationAlignment = Qt::AlignCenter;
-		option->displayAlignment    = Qt::AlignHCenter | Qt::AlignTop;
-		option->features |= QStyleOptionViewItem::WrapText;
-	}
-};
-
-static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
-	ui->cfgs_list->setAlternatingRowColors(false);
-	ui->cfgs_list->setAllColumnsShowFocus(true);
-	ui->cfgs_list->setIndentation(0);
-	ui->cfgs_list->setMouseTracking(false);
-	ui->cfgs_list->setSelectionBehavior(QAbstractItemView::SelectRows);
-	ui->cfgs_list->setSelectionMode(QAbstractItemView::SingleSelection);
-	ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
-	ui->cfgs_list->header()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-	ui->cfgs_list->header()->setHighlightSections(false);
-	ui->cfgs_list->header()->setStretchLastSection(true);
-
-	// Both presentations use the same items, icons and current game.
-	ui->cfgs_grid->setModel(ui->cfgs_list->model());
-	ui->cfgs_grid->setSelectionModel(ui->cfgs_list->selectionModel());
-	ui->cfgs_grid->setViewMode(QListView::IconMode);
-	ui->cfgs_grid->setMovement(QListView::Static);
-	ui->cfgs_grid->setResizeMode(QListView::Adjust);
-	ui->cfgs_grid->setSelectionMode(QAbstractItemView::SingleSelection);
-	ui->cfgs_grid->setSelectionBehavior(QAbstractItemView::SelectRows);
-	ui->cfgs_grid->setEditTriggers(QAbstractItemView::NoEditTriggers);
-	ui->cfgs_grid->setSpacing(8);
-	ui->cfgs_grid->setUniformItemSizes(true);
-	ui->cfgs_grid->setWordWrap(true);
-	ui->cfgs_grid->setItemDelegate(new GameGridDelegate(ui->cfgs_grid));
-	ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
-}
-
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
                            const QString& title_id) {
 	const auto path = QDir(root).filePath(
@@ -247,7 +195,6 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_compatibility = new CompatibilityDatabase(
 	    QCoreApplication::arguments().contains(QStringLiteral("--local")), this);
 	m_ui->setupUi(this);
-	ConfigureGameList(m_ui);
 
 	m_ui->refresh_action->setShortcuts(QKeySequence::Refresh);
 	m_ui->refresh_button->setDefaultAction(m_ui->refresh_action);
@@ -261,8 +208,9 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->edit_button->setEnabled(false);
 
 	m_ui->cfgs_list->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->cfgs_list->setAllColumnsShowFocus(true);
+	m_ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
 	m_ui->cfgs_list->setIconSize(QSize(48, 48));
-	m_ui->cfgs_list->setRootIsDecorated(false);
 	m_ui->cfgs_list->setUniformRowHeights(true);
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
@@ -274,6 +222,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
 	m_ui->cfgs_list->sortItems(GAME_NAME_COLUMN, Qt::AscendingOrder);
+	SetupGameGrid(m_ui->cfgs_list, m_ui->cfgs_grid);
+	m_ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
 
 	connect(m_ui->refresh_action, &QAction::triggered, this,
 	        &ConfigurationListWidget::ScanGameDirectory);
@@ -318,16 +268,12 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	connect(m_compatibility, &CompatibilityDatabase::Updated, this,
 	        &ConfigurationListWidget::ApplyCompatibility);
 
-	m_ui->cfgs_list->setDragDropMode(QAbstractItemView::NoDragDrop);
-
 	ReadSettings();
 	m_ui->grid_size_slider->setVisible(m_ui->grid_view_button->isChecked());
-	const auto resize_grid = [this](int width) {
-		m_ui->cfgs_grid->setIconSize(QSize(width, width * 9 / 16));
-	};
-	resize_grid(m_ui->grid_size_slider->value());
-	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this, resize_grid](int width) {
-		resize_grid(width);
+	const int grid_size = m_ui->grid_size_slider->value();
+	m_ui->cfgs_grid->setIconSize(QSize(grid_size, grid_size));
+	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this](int width) {
+		m_ui->cfgs_grid->setIconSize(QSize(width, width));
 		if (!m_ui->grid_size_slider->isSliderDown()) {
 			WriteSettings();
 		}
@@ -403,6 +349,13 @@ void ConfigurationListWidget::WriteSettings() {
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
 
+	s->remove(CONF_ADDCONT);
+	s->beginGroup(CONF_ADDCONT);
+	for (auto it = m_addcont.constBegin(); it != m_addcont.constEnd(); ++it) {
+		s->setValue(it.key(), it.value());
+	}
+	s->endGroup();
+
 	s->remove(CONF_GLOBAL);
 	s->beginGroup(CONF_GLOBAL);
 	m_global_info.WriteSettings(s.get());
@@ -448,6 +401,13 @@ void ConfigurationListWidget::ReadSettings() {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
 	m_addons_dir = NormalizeGameDirectory(s->value(CONF_ADDONS_DIR).toString());
+	s->endGroup();
+
+	m_addcont.clear();
+	s->beginGroup(CONF_ADDCONT);
+	for (const auto& title_id: s->childKeys()) {
+		m_addcont.insert(title_id, SettingsStringList(s->value(title_id)));
+	}
 	s->endGroup();
 
 	s->beginGroup(CONF_GLOBAL);
@@ -513,6 +473,7 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	}
 	info->host_input_mapping = m_global_info.host_input_mapping;
 	info->addons_dir         = m_addons_dir;
+	info->addcont            = m_addcont.value(item.GetInfo().title_id.trimmed().toUpper());
 	return info;
 }
 
@@ -1171,6 +1132,71 @@ void ConfigurationListWidget::remove_save_data() {
 	}
 }
 
+void ConfigurationListWidget::compress_game() {
+	auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->currentItem());
+	if (item == nullptr) {
+		return;
+	}
+
+	const auto base    = item->GetInfo().basedir;
+	const auto archive = base + QStringLiteral(".zar");
+	const auto title   = tr("Compress to ZAR");
+	if (QFileInfo::exists(archive)) {
+		QMessageBox::warning(this, title,
+		                     tr("%1 already exists.").arg(QDir::toNativeSeparators(archive)));
+		return;
+	}
+
+	// Cancel through a flag, not the future, so a pack that already succeeded keeps its result.
+	auto  canceled = std::make_shared<std::atomic_bool>(false);
+	auto* progress = new QProgressDialog(
+	    tr("Compressing %1...").arg(QDir::toNativeSeparators(base)), tr("Cancel"), 0, 1000, this);
+	auto* watcher  = new QFutureWatcher<bool>(this);
+	// Stay modal through finalization and fsync, which follow the last progress step.
+	progress->setAutoReset(false);
+	connect(progress, &QProgressDialog::canceled, this, [canceled] { *canceled = true; });
+	connect(watcher, &QFutureWatcher<bool>::progressValueChanged, progress,
+	        &QProgressDialog::setValue);
+	connect(watcher, &QFutureWatcher<bool>::finished, this,
+	        [this, progress, watcher, canceled, base, archive, title] {
+		        // finished can arrive inside the modal dialog's setValue event processing.
+		        progress->deleteLater();
+		        watcher->deleteLater();
+		        if (!watcher->result()) {
+			        if (!*canceled) {
+				        QMessageBox::warning(
+				            this, title,
+				            tr("Could not compress %1.").arg(QDir::toNativeSeparators(base)));
+			        }
+			        return;
+		        }
+		        if (QMessageBox::Yes ==
+		                QMessageBox::question(this, title,
+		                                      tr("Created %1.\n\nDelete the original folder %2?")
+		                                          .arg(QDir::toNativeSeparators(archive),
+		                                               QDir::toNativeSeparators(base)),
+		                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) &&
+		            !QDir(base).removeRecursively()) {
+			        QMessageBox::warning(
+			            this, title, tr("Could not remove %1.").arg(QDir::toNativeSeparators(base)));
+		        }
+		        ScanGameDirectory();
+	        });
+	progress->open();
+	watcher->setFuture(QtConcurrent::run(
+	    [directory = GameContent::ToPath(base), path = GameContent::ToPath(archive),
+	     canceled](QPromise<bool>& promise) {
+		    promise.setProgressRange(0, 1000);
+		    // A pack cancelled while queued must not touch a path a later pack may already own.
+		    promise.addResult(
+		        !*canceled &&
+		        Common::PackArchive(directory, path, [&](uint64_t done, uint64_t total) {
+			        promise.setProgressValue(static_cast<int>(done * 1000 / total));
+			        return !*canceled;
+		        }));
+	    }));
+}
+
 void ConfigurationListWidget::filter_configurations(const QString& text) {
 	const auto query              = text.trimmed();
 	const bool has_query          = !query.isEmpty();
@@ -1204,7 +1230,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	auto* item = static_cast<ConfigurationItem*>(witem);
 	if (item == nullptr) {
 		m_selected_item = nullptr;
-		m_ui->cfgs_list->SetBackgroundImage({});
+		m_ui->game_views->SetBackgroundImage({});
 		m_ui->edit_button->setEnabled(false);
 		m_ui->delete_button->setEnabled(false);
 		emit Select();
@@ -1215,7 +1241,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	m_ui->edit_button->setEnabled(!item->IsRunning());
 
 	m_selected_item = item;
-	m_ui->cfgs_list->SetBackgroundImage(item->GetInfo().basedir);
+	m_ui->game_views->SetBackgroundImage(item->GetInfo().basedir);
 
 	emit Select();
 }
@@ -1263,11 +1289,24 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	connect(action_addcont, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {
-			        auto* dialog = new AdditionalContentDialog(item->GetInfo(), m_addons_dir, this);
+			        const auto title_id = item->GetInfo().title_id.trimmed().toUpper();
+			        auto*      dialog   = new AdditionalContentDialog(
+			            item->GetInfo(), m_addons_dir, m_addcont.value(title_id),
+			            [this, title_id](const QStringList& entries) {
+				            if (entries.isEmpty()) {
+					            m_addcont.remove(title_id);
+				            } else {
+					            m_addcont.insert(title_id, entries);
+				            }
+				            WriteSettings();
+			            },
+			            this);
 			        dialog->show();
 		        }
 	        });
-	action_addcont->setEnabled(item != nullptr);
+	action_addcont->setEnabled(item != nullptr && !item->GetInfo().title_id.trimmed().isEmpty());
+	QAction* action_compress =
+	    menu.addAction(tr("Compress to ZAR..."), this, SLOT(compress_game()));
 	QAction* action_remove_save_data =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
 	                   tr("Remove save data..."), this, SLOT(remove_save_data()));
@@ -1291,6 +1330,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
+		action_compress->setDisabled(item->IsRunning() || !QDir(base).exists());
 		action_remove_save_data->setDisabled(item->IsRunning() || save_data_dirs.isEmpty());
 		action_edit->setDisabled(item->IsRunning());
 		action_delete->setDisabled(item->IsRunning() || !item->GetInfo().custom_settings);
@@ -1298,6 +1338,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		action_run->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
+		action_compress->setDisabled(true);
 		action_remove_save_data->setDisabled(true);
 		action_edit->setDisabled(true);
 		action_delete->setDisabled(true);

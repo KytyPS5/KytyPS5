@@ -30,6 +30,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -136,6 +137,7 @@ public:
 	bool HttpValidTemplate(Id tmpl_id);
 	bool HttpValidConnection(Id conn_id);
 	bool HttpValidRequest(Id req_id);
+	bool HttpValidBase(Id id);
 	Id HttpCreateConnection(Id tmpl_id, const char* server_name, const char* scheme, uint16_t port,
 	                        bool enable_keep_alive);
 	Id HttpCreateConnectionWithURL(Id tmpl_id, const char* url, bool enable_keep_alive);
@@ -410,6 +412,12 @@ bool Network::HttpValidRequest(Id req_id) {
 	        m_requests[req_id.GetId()].used);
 }
 
+bool Network::HttpValidBase(Id id) {
+	Common::LockGuard lock(m_mutex);
+
+	return FindHttpBase(id, true) != nullptr;
+}
+
 Network::HttpBase* Network::FindHttpBase(Id id, bool include_request) {
 	const auto index = id.GetId();
 
@@ -458,7 +466,7 @@ Network::Id Network::HttpCreateTemplate(Id http_ctx_id, const char* user_agent, 
 		HttpTemplate tn {};
 		tn.used               = true;
 		tn.http_ver           = http_ver;
-		tn.user_agent         = std::string(user_agent);
+		tn.user_agent         = user_agent != nullptr ? user_agent : "";
 		tn.is_auto_proxy_conf = is_auto_proxy_conf;
 		tn.http_ctx_id        = http_ctx_id.GetId();
 		tn.nonblock           = false;
@@ -2570,12 +2578,23 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
 	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
+	std::vector<std::pair<void*, int>> ready_files;
 	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
 		const bool read = GuestFdIsSet(readfds, fd);
 		const bool write = GuestFdIsSet(writefds, fd);
 		const bool except = GuestFdIsSet(exceptfds, fd);
 		if (!read && !write && !except) {
+			continue;
+		}
+		// FreeBSD polls files and devices ready to read and write at once.
+		if (!IsSocket(fd) && LibKernel::FileSystem::IsOpenDescriptor(fd)) {
+			if (read) {
+				ready_files.emplace_back(readfds, fd);
+			}
+			if (write) {
+				ready_files.emplace_back(writefds, fd);
+			}
 			continue;
 		}
 		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
@@ -2629,6 +2648,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		host_timeout.tv_usec = static_cast<decltype(host_timeout.tv_usec)>(guest_timeout->tv_usec);
 		host_timeout_ptr = &host_timeout;
 	}
+	if (!ready_files.empty()) {
+		host_timeout     = {};
+		host_timeout_ptr = &host_timeout;
+	}
 
 	int result = 0;
 #if defined(_WIN32)
@@ -2664,6 +2687,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			GuestFdSet(exceptfds, fd);
 			result++;
 		}
+	}
+	for (const auto& [fds, fd]: ready_files) {
+		GuestFdSet(fds, fd);
+		result++;
 	}
 	return result;
 }
@@ -3007,6 +3034,143 @@ int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable) {
 	     id, enable);
 
 	if (!g_net->HttpSetAuthEnabled(Network::Id(id), enable)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+static int HttpCheckBase(int id) {
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
+}
+
+int KYTY_SYSV_ABI HttpSetRedirectCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetCookieRecvCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetInflateGZIPEnabled(int id, int is_enable) {
+	PRINT_NAME();
+
+	LOGF("\t id        = %d\n"
+	     "\t is_enable = %d\n",
+	     id, is_enable);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int is_enabled) {
+	PRINT_NAME();
+
+	LOGF("\t id         = %d\n"
+	     "\t is_enabled = %d\n",
+	     id, is_enabled);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (is_enabled != 0 && is_enabled != 1) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (!g_net->HttpValidRequest(Network::Id(id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsLoadCert(int http_ctx_id, int ca_cert_num, const void** /*ca_list*/,
+                                const void* /*cert*/, const void* /*priv_key*/) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n"
+	     "\t ca_cert_num = %d\n",
+	     http_ctx_id, ca_cert_num);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsUnloadCert(int http_ctx_id) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n", http_ctx_id);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int32_t* err_num, uint32_t* detail) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t err_num    = 0x%016" PRIx64 "\n"
+	     "\t detail     = 0x%016" PRIx64 "\n",
+	     request_id, reinterpret_cast<uint64_t>(err_num), reinterpret_cast<uint64_t>(detail));
+
+	if (err_num == nullptr || detail == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	*err_num = 0;
+	*detail  = 0;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* err_num) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t err_num    = 0x%016" PRIx64 "\n",
+	     request_id, reinterpret_cast<uint64_t>(err_num));
+
+	if (err_num == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	*err_num = 0;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 

@@ -937,6 +937,110 @@ void TestCompressorVoiceEvents() {
 	}
 }
 
+// Runs one sample through a freshly configured peak compressor (flags 0x1) and returns it.
+float CompressOneSample(const Ngs2SubmixerCompressorParam& param, float sample) {
+	constexpr uint32_t Rate = 1000;
+	Ngs2Compressor     compressor;
+	compressor.Configure(param, Rate);
+	compressor.Process(&sample, nullptr, 1, 1);
+	return sample;
+}
+
+// The make-up level is applied to the output, and values a game should never send are clamped
+// or replaced by defaults instead of inverting, blowing up or silencing the signal.
+void TestCompressorLevelAndCurveLimits() {
+	constexpr float NaN = std::numeric_limits<float>::quiet_NaN();
+	// Under the threshold only the make-up level applies.
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 2.0f, 0}, 0.25f) == 0.5f,
+	      "the make-up level was not applied");
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, -1.0f, 0}, 0.25f) == 0.0f,
+	      "a negative level was not clamped to 0");
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 100.0f, 0}, 0.25f) == 4.0f,
+	      "a huge level was not capped at 16");
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, NaN, 0}, 0.25f) == 0.25f,
+	      "a NaN level did not default to 1");
+
+	// A ratio above 1 is clamped to 1 (no reduction), and one below 0 to 0 (a hard limit at the
+	// threshold).
+	Check(CompressOneSample({0x1, 0.25f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a ratio above 1 expanded or reduced the signal");
+	Check(Near(CompressOneSample({0x1, 0.25f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f), 0.25,
+	           1e-6),
+	      "a negative ratio was not clamped to 0");
+	Check(CompressOneSample({0x1, 0.25f, NaN, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a NaN ratio did not default to 1");
+
+	// A NaN threshold defaults to 1, and one of 0 or less becomes 1e-9, so a signal is still
+	// reduced by a finite amount.
+	Check(Near(CompressOneSample({0x1, NaN, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 2.0f), 1.0, 1e-6),
+	      "a NaN threshold did not default to 1");
+	// A 0.5 sample is 20 * log10(0.5 / 1e-9) dB over, and ratio 0.5 takes half of that away.
+	const double sample             = 0.5;
+	const double over_db            = 20.0 * std::log10(sample / 1e-9);
+	const double tiny_threshold_out = sample * std::pow(10.0, -(1.0 - 0.5) * over_db / 20.0);
+	for (const float threshold: {0.0f, -1.0f}) {
+		const float out = CompressOneSample({0x1, threshold, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0},
+		                                    float(sample));
+		Check(std::isfinite(out) && Near(out, tiny_threshold_out, 1e-9),
+		      "a threshold of 0 or less was not raised to 1e-9");
+	}
+
+	// At the threshold a knee of k dB gives (1 - ratio) * (k / 2)^2 / (2 * k) dB of reduction. A
+	// knee of 100 is capped at 60, so ratio 0 gives 7.5 dB. A negative knee is a hard knee.
+	Check(Near(CompressOneSample({0x1, 0.5f, 0.0f, 100.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f),
+	           0.5 * std::pow(10.0, -7.5 / 20.0), 1e-6),
+	      "a huge knee was not capped at 60 dB");
+	Check(CompressOneSample({0x1, 0.5f, 0.0f, -6.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a negative knee was not treated as a hard knee");
+	Check(CompressOneSample({0x1, 0.5f, 0.0f, NaN, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a NaN knee did not default to a hard knee");
+}
+
+// Negative times mean an instant change, and very long ones are capped (attack at 10 s, release
+// at 60 s), so the first sample moves the reduction by exactly the capped one-pole step.
+void TestCompressorTimeLimits() {
+	constexpr uint32_t Rate              = 1000;
+	constexpr double   AttackCapSeconds  = 10.0;
+	constexpr double   ReleaseCapSeconds = 60.0;
+	constexpr float    NaN               = std::numeric_limits<float>::quiet_NaN();
+	const auto         target            = 0.5 * 20.0 * std::log10(double(0.1f) / double(0.01f));
+	const auto         reduction_db      = [](const Ngs2Compressor& compressor) {
+		return -20.0 * std::log10(double(compressor.Gain()));
+	};
+	float          key[]    = {0.1f};
+	float          sample[] = {0.5f};
+	Ngs2Compressor compressor;
+
+	// A NaN time defaults to 0, which is also instant.
+	for (const float time: {-1.0f, NaN}) {
+		compressor.Reset();
+		compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, time, time, 1.0f, 0}, Rate);
+		compressor.Process(sample, key, 1, 1);
+		Check(Near(reduction_db(compressor), target, 1e-5),
+		      "a negative or NaN attack was not instant");
+		compressor.Process(sample, nullptr, 1, 1);
+		Check(compressor.Gain() == 1.0f, "a negative or NaN release was not instant");
+	}
+
+	compressor.Reset();
+	compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 1e6f, 0.0f, 1.0f, 0}, Rate);
+	compressor.Process(sample, key, 1, 1);
+	Check(Near(reduction_db(compressor),
+	           target * (1.0 - std::exp(-1.0 / (AttackCapSeconds * Rate))), 1e-6),
+	      "a long attack was not capped at 10 s");
+
+	compressor.Reset();
+	compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 0.0f, 1e6f, 1.0f, 0}, Rate);
+	compressor.Process(sample, key, 1, 1);
+	compressor.Process(sample, nullptr, 1, 1);
+	// One step of a 60 s release takes about 1.7e-4 dB off the 10 dB reduction, which the float
+	// gain still resolves.
+	Check(Near(reduction_db(compressor), target * std::exp(-1.0 / (ReleaseCapSeconds * Rate)),
+	           2e-6) &&
+	          reduction_db(compressor) < target - 2e-5,
+	      "a long release was not capped at 60 s");
+}
+
 // A submixer with a side-chain compressor (peak-keyed here, so one sample settles it) ducks
 // input 0 while input 1 has signal.
 void TestSubmixerCompressorVoice() {
@@ -2013,6 +2117,8 @@ int main() {
 	TestCompressorNonFinite();
 	TestCompressorTimeConstant();
 	TestCompressorVoiceEvents();
+	TestCompressorLevelAndCurveLimits();
+	TestCompressorTimeLimits();
 	TestSubmixerCompressorVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();

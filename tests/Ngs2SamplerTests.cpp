@@ -836,6 +836,1098 @@ void TestPitchClamps() {
 	      "pitch was not clamped to four times playback speed");
 }
 
+Ngs2ReverbI3dl2Param ReverbParam(float decay, int32_t reflections, int32_t reverb, float dry = 0.0f) {
+	Ngs2ReverbI3dl2Param param {};
+	param.wet               = 1.0f;
+	param.dry               = dry;
+	param.room              = 0;
+	param.room_hf           = 0;
+	param.decay_time        = decay;
+	param.decay_hf_ratio    = 1.0f;
+	param.reflections       = reflections;
+	param.reflections_delay = 0.0f;
+	param.reverb            = reverb;
+	param.reverb_delay      = 0.0f;
+	param.diffusion         = 100.0f;
+	param.density           = 100.0f;
+	param.hf_reference      = 5000.0f;
+	return param;
+}
+
+double WindowRms(const std::vector<float>& signal, double from, double to) {
+	const auto begin = static_cast<size_t>(from * 48000), end = static_cast<size_t>(to * 48000);
+	double     sum   = 0;
+	for (size_t i = begin; i < end; ++i) {
+		sum += double(signal[i]) * signal[i];
+	}
+	return std::sqrt(sum / double(end - begin));
+}
+
+// The custom reverb module (0x1b). The late reverb decays by 60 dB over decayTime, the tail ends
+// once nothing left in it can reach -120 dBFS, muted I3DL2 levels are inaudible, and dry passes
+// the input through.
+void TestCustomReverbDsp() {
+	constexpr uint32_t grain = 256, channels = 2;
+	Ngs2Reverb         reverb;
+	reverb.Configure(ReverbParam(1.0f, -10000, 0), 48000);
+	std::vector<float> left;
+	std::vector<float> block(size_t(grain) * channels);
+	for (uint32_t b = 0; b < 48000 * 3 / grain; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = block[grain] = 1.0f; // An impulse on both channels, after the fade-in grain.
+		}
+		reverb.Process(block.data(), channels, grain);
+		left.insert(left.end(), block.begin(), block.begin() + grain);
+	}
+	const double early = WindowRms(left, 0.10, 0.15), late = WindowRms(left, 0.40, 0.45);
+	Check(early > 0, "reverb produced no tail for an impulse");
+	const double drop_db = 20.0 * std::log10(early / late);
+	Check(drop_db > 12.0 && drop_db < 24.0, "reverb tail does not decay at about 60 dB per decayTime");
+	Check(!reverb.HasTail() && std::ranges::all_of(left.end() - grain * 20, left.end(),
+	                                               [](float sample) { return sample == 0.0f; }),
+	      "reverb tail did not end within 3 s of a 1 s decayTime");
+
+	// -10000 mB is the library's floor (-100 dB), not silence, but what is left is inaudible.
+	Ngs2Reverb muted;
+	muted.Configure(ReverbParam(1.0f, -10000, -10000), 48000);
+	for (int b = 0; b < 40; ++b) {
+		std::ranges::fill(block, 0.5f);
+		muted.Process(block.data(), channels, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::abs(sample) < 1e-4f; }),
+		      "muted reverb with dry 0 was audible");
+	}
+	Ngs2Reverb dry;
+	dry.Configure(ReverbParam(1.0f, -10000, -10000, 1.0f), 48000);
+	std::ranges::fill(block, 0.5f);
+	dry.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return std::abs(sample - 0.5f) < 1e-4f; }),
+	      "muted reverb with dry 1 did not pass the input through");
+}
+
+// Below about 7.4 kHz the per-channel all-pass offsets are longer than the shortest delays, and
+// a rate of 0 would divide by zero. Neither may crash or produce NaN.
+void TestCustomReverbLowRates() {
+	constexpr uint32_t grain = 256, channels = 8;
+	constexpr uint32_t low_rate = 4000;
+	std::vector<float> block(size_t(grain) * channels);
+	Ngs2Reverb         low;
+	low.Configure(ReverbParam(1.0f, 0, 0), low_rate);
+	bool tail = false;
+	for (int b = 0; b < 20; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = 1.0f; // An impulse after the fade-in grain.
+		}
+		low.Process(block.data(), channels, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "reverb at a low rate produced a non-finite sample");
+		tail = tail || std::ranges::any_of(block, [](float sample) { return sample != 0.0f; });
+	}
+	Check(tail, "reverb at a low rate produced no output");
+	// 46 samples is the longest all-pass at this rate, 11.58 ms with no offset.
+	constexpr uint32_t longest_allpass = 46;
+	for (uint32_t channel = 0; channel < Ngs2Reverb::MaxChannels; ++channel) {
+		for (uint32_t stage = 0; stage < Ngs2Reverb::Allpasses; ++stage) {
+			const auto length = low.AllpassLength(channel, stage);
+			Check(length >= 1 && length <= longest_allpass,
+			      "reverb at a low rate sized an all-pass line below one sample or wrapped it");
+		}
+	}
+	// Channel 1's last stage is 19 samples with a -34 offset, so it sits on the clamp.
+	Check(low.AllpassLength(1, 3) == 1, "reverb did not clamp a negative all-pass length to 1");
+
+	// A rate of 0 is refused, so the reverb stays unconfigured and the input passes through.
+	Ngs2Reverb zero;
+	zero.Configure(ReverbParam(1.0f, 0, 0), 0);
+	std::ranges::fill(block, 0.5f);
+	zero.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.5f; }) &&
+	          !zero.HasTail(),
+	      "reverb accepted a sample rate of 0");
+}
+
+// Golden outputs of the PS4 libSceNgs2 I3DL2 reverb, from AnyPS5 (GPL-2.0) commit
+// e15f1644e384ab055f721347a4d31cdff02e9a47 (core/libs/prx/libSceNgs2.native/tests/Ngs2Render.cpp).
+// Each case is an impulse (or noise) at frame 3 of a 4096-frame input, rendered in 256-sample
+// grains, with an optional settings change before one grain.
+struct ReverbFrame {
+	uint32_t           frame;
+	std::vector<float> samples;
+};
+
+struct ReverbCase {
+	uint32_t             channels;
+	float                amplitude;
+	bool                 noise;
+	Ngs2ReverbI3dl2Param params;
+	int32_t              changeGrain;
+	Ngs2ReverbI3dl2Param change;
+	std::vector<ReverbFrame> expected;
+};
+
+std::vector<float> RenderReverbCase(const ReverbCase& reverb_case) {
+	const uint32_t       channels = reverb_case.channels;
+	std::vector<int16_t> pcm(4096 * channels, 0);
+	uint32_t             seed = 1;
+	for (uint32_t i = 0; reverb_case.noise && i + 3 * channels < pcm.size(); i++) {
+		seed = seed * 1664525u + 1013904223u;
+		if (i < 3000 * channels) {
+			pcm[i + 3 * channels] =
+			    static_cast<int16_t>(static_cast<int32_t>((seed >> 16) & 0x3fff) - 0x2000);
+		}
+	}
+	for (uint32_t c = 0; !reverb_case.noise && c < channels; c++) {
+		pcm[3 * channels + c] = static_cast<int16_t>(
+		    (16384 - 4000 * static_cast<int32_t>(c)) * reverb_case.amplitude);
+	}
+	Ngs2Reverb reverb;
+	reverb.Configure(reverb_case.params, 48000);
+	std::vector<float> all;
+	std::vector<float> block(size_t(256) * channels);
+	for (uint32_t grain = 0; grain * 256 < 32256; grain++) {
+		if (static_cast<int32_t>(grain) == reverb_case.changeGrain) {
+			reverb.Configure(reverb_case.change, 48000);
+		}
+		std::ranges::fill(block, 0.0f);
+		for (uint32_t i = 0; i < 256; i++) {
+			const uint32_t frame = grain * 256 + i;
+			for (uint32_t c = 0; frame < 4096 && c < channels; c++) {
+				block[c * 256 + i] = pcm[frame * channels + c] / 32768.0f;
+			}
+		}
+		reverb.Process(block.data(), channels, 256);
+		for (uint32_t i = 0; i < 256; i++) {
+			for (uint32_t c = 0; c < channels; c++) {
+				all.push_back(block[c * 256 + i]);
+			}
+		}
+	}
+	return all;
+}
+
+// The custom reverb module (0x1b) matches the PS4 library's I3DL2 reverb. The cases cover impulse
+// and noise responses for several settings, in stereo and 5.1, with out-of-range values and with
+// settings changes.
+void TestCustomReverbMatchesLibrary() {
+	const Ngs2ReverbI3dl2Param cave{1.0f, 0.0f, -1000, 0, 0, 2.91f, 1.3f,
+	    -602, 0.015f, -302, 0.022f, 100.0f, 100.0f, 5000.0f, {}};
+	auto changed = cave;
+	changed.reflection_pattern = 5;
+	changed.decay_time = 0.7f;
+	changed.decay_hf_ratio = 0.6f;
+	changed.reflections_delay = 0.004f;
+	changed.reverb_delay = 0.03f;
+	changed.room_hf = -900;
+	changed.wet = 0.6f;
+	changed.dry = 0.4f;
+	auto denser = cave;
+	denser.density = 99.999f;
+	const Ngs2ReverbI3dl2Param small_room{1.0f, 0.0f, -500, -800, 3, 1.2f, 0.5f,
+	    -300, 0.01f, 0, 0.03f, 80.0f, 60.0f, 3000.0f, {}};
+	const Ngs2ReverbI3dl2Param surround{1.0f, 0.2f, -200, -300, 12, 1.0f, 0.9f,
+	    -100, 0.03f, -100, 0.04f, 70.0f, 90.0f, 4000.0f, {}};
+	const Ngs2ReverbI3dl2Param out_of_range{40.0f, -3.0f, 5000, 500, 20, 50.0f, 5.0f,
+	    3000, 0.9f, 5000, 0.9f, 300.0f, 300.0f, 50000.0f, {}};
+	const Ngs2ReverbI3dl2Param short_delays{1.0f, 0.3f, 0, -200, 15, 0.8f, 1.0f,
+	    0, 0.002f, -500, 0.004f, 60.0f, 80.0f, 6000.0f, {}};
+	const std::vector<ReverbCase> cases = {
+	    // The cave settings, an impulse in stereo.
+	    {2, 1.0f, false, cave, -1, {},
+	     {
+	         {100, {0, 0}},
+	         {723, {0.0687032491f, 0.0687032491f}},
+	         {1055, {0.0392590016f, 0.0392590016f}},
+	         {1417, {0.0131517649f, 0.0131517649f}},
+	         {1779, {0.0098147504f, 0.0098147504f}},
+	         {2500, {0, 0}},
+	         {4000, {1.45101382e-07f, -1.15403088e-06f}},
+	         {6000, {0.000655628915f, 3.03641864e-05f}},
+	         {9000, {0.000400578661f, -0.000684358703f}},
+	         {12000, {0.000191548112f, 0.000220489033f}},
+	         {16000, {0.000210488462f, 0.000146183695f}},
+	         {20000, {2.41150738e-05f, -0.000864534522f}},
+	         {26000, {0.000125532999f, -0.000234790568f}},
+	         {32000, {-0.000462158496f, 4.56995949e-05f}},
+	     }},
+	    // A smaller, duller room with reflection pattern 3, where the highs fade sooner.
+	    {2, 1.0f, false, small_room, -1, {},
+	     {
+	         {100, {0, 0}},
+	         {723, {0.000166983227f, 0.000166983227f}},
+	         {1055, {-3.41919585e-05f, -3.41919585e-05f}},
+	         {1417, {0, 0}},
+	         {1779, {0, 0}},
+	         {2500, {0, 1.55222626e-08f}},
+	         {4000, {-0.000106364969f, 9.90879998e-05f}},
+	         {6000, {0.00013573296f, 7.22560799e-06f}},
+	         {9000, {-7.91876082e-05f, 0.000225067721f}},
+	         {12000, {0.000150469248f, 0.00036288987f}},
+	         {16000, {-7.86288219e-05f, -0.000195921995f}},
+	         {20000, {1.01910318e-05f, 5.79599109e-05f}},
+	         {26000, {2.14232614e-06f, -2.05506512e-05f}},
+	         {32000, {-4.31467561e-06f, 2.34100444e-05f}},
+	     }},
+	    // 5.1 with reflection pattern 12, which may run past the late feed. The LFE stays dry.
+	    {6, 1.0f, false, surround, -1, {},
+	     {
+	         {6000, {-0.000167909253f, -0.000179917421f, -0.000647808949f, 0, 3.22720189e-05f, 0.000213803389f}},
+	         {9000, {8.47857882e-05f, 8.62322413e-05f, -0.000100753634f, 0, 0.000109430795f, -0.000122895101f}},
+	         {12000, {4.37544441e-05f, 3.58103216e-06f, -0.00013746327f, 0, 9.3237948e-05f, -0.00013529828f}},
+	         {16000, {8.63046807e-08f, 1.62214419e-05f, 8.89167641e-05f, 0, 1.02178528e-05f, 0.000201705057f}},
+	         {20000, {-9.6526619e-06f, -2.73812566e-05f, -1.92096536e-07f, 0, -0.000116049101f, 6.94858772e-06f}},
+	         {26000, {1.27750207e-06f, -1.59169917e-06f, 5.30674515e-05f, 0, -3.59285696e-05f, 5.16466662e-06f}},
+	         {32000, {3.5737969e-06f, 4.19655044e-06f, -2.30460955e-07f, 0, 1.16596939e-05f, 1.14889262e-05f}},
+	     }},
+	    // The cave settings, changed at grain 6 to shorter, darker settings with pattern 5.
+	    {2, 1.0f, false, cave, 6, changed,
+	     {
+	         {723, {0.0687032491f, 0.0687032491f}},
+	         {1055, {0.0392590016f, 0.0392590016f}},
+	         {1417, {0.0131517649f, 0.0131517649f}},
+	         {1779, {4.38156894e-05f, 4.38156894e-05f}},
+	         {2500, {0, 0}},
+	         {4000, {-1.60370582e-05f, -4.44955149e-05f}},
+	         {6000, {1.02755057e-05f, 8.34046841e-06f}},
+	         {9000, {1.1641363e-05f, -4.69685165e-06f}},
+	         {12000, {3.57917179e-06f, -2.34550089e-06f}},
+	         {16000, {-8.00212234e-08f, 3.19533115e-06f}},
+	         {20000, {5.66619519e-07f, 4.26969848e-07f}},
+	         {26000, {1.46052287e-07f, -2.44572629e-08f}},
+	         {32000, {-4.45668853e-08f, 1.51349102e-08f}},
+	     }},
+	    // Every setting out of range, so the library's clamps apply. A quiet impulse.
+	    {2, 0.02f, false, out_of_range, -1, {},
+	     {
+	         {14403, {0.877262115f, 0.877262115f}},
+	         {14500, {0, 0}},
+	         {15000, {0, 0}},
+	         {15500, {0, 7.50572099e-07f}},
+	         {16000, {4.95207075e-07f, 6.37215771e-06f}},
+	         {20000, {0.00482429564f, -0.00149071764f}},
+	         {26000, {-0.0096597122f, 0.00718426611f}},
+	         {32000, {0.0107425917f, -0.000738018774f}},
+	     }},
+	    // Very short delays with pattern 15.
+	    {2, 1.0f, false, short_delays, -1, {},
+	     {
+	         {60, {0, 0}},
+	         {99, {0.0947210863f, 0.0947210863f}},
+	         {100, {0.0472047739f, 0.0472047739f}},
+	         {150, {0, 0}},
+	         {200, {0, 0}},
+	         {300, {0, 0}},
+	         {2000, {-9.86956729e-06f, 7.96923473e-07f}},
+	         {3000, {-0.000152820328f, -4.59704825e-06f}},
+	         {5000, {0.000203833857f, -0.000208990226f}},
+	         {8000, {-3.69777154e-05f, -0.000259475899f}},
+	     }},
+	    // Noise through the cave settings, changed at grain 6 as above.
+	    {2, 1.0f, true, cave, 6, changed,
+	     {
+	         {1540, {0.0222691782f, 0.0242232569f}},
+	         {1600, {0.0201471522f, 0.0186609477f}},
+	         {1700, {-0.0211425349f, -0.0235042125f}},
+	         {1780, {-0.0168117173f, 0.00417749817f}},
+	         {1800, {-0.0866222829f, -0.0945812687f}},
+	         {2000, {0.0131965755f, -0.0707511827f}},
+	         {2500, {0.0942443311f, -0.100531064f}},
+	         {3500, {0.000985965831f, 0.000946713379f}},
+	         {8000, {-0.000968122098f, 0.000556072395f}},
+	         {15000, {0.000227724231f, 0.000151095577f}},
+	     }},
+	    // Noise through the cave settings, with only the density changed at grain 20.
+	    {2, 1.0f, true, cave, 20, denser,
+	     {
+	         {5200, {-0.00942458585f, -0.0064059021f}},
+	         {6000, {0.00248076022f, 0.00317249796f}},
+	         {8000, {0.00102439919f, 0.00105210941f}},
+	         {12000, {1.63059376e-05f, 6.10309735e-06f}},
+	         {20000, {-1.08853078e-06f, -2.99162899e-08f}},
+	     }},
+	};
+	for (const auto& reverb_case: cases) {
+		const auto out = RenderReverbCase(reverb_case);
+		for (const auto& expected: reverb_case.expected) {
+			for (uint32_t c = 0; c < reverb_case.channels; c++) {
+				const float value = out[size_t(expected.frame) * reverb_case.channels + c];
+				Check(std::fabs(value - expected.samples[c]) <=
+				          2e-7f + std::fabs(expected.samples[c]) * 1e-5f,
+				      "reverb output does not match the PS4 library");
+			}
+		}
+	}
+}
+
+// Through the NGS2 API, control 0x40001b00 configures a custom submixer's reverb module, and the
+// voice keeps rendering the tail after its source stops.
+void TestCustomReverbVoice() {
+	constexpr uint32_t grain = 256;
+	Fixture            source(48000);
+	// The first grain after new settings fades the reverb in, so the impulse comes a little later.
+	const int16_t      pcm[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32767};
+	source.Queue(pcm, 17, 0);
+	Ngs2Internal      system;
+	system.option.sample_rate       = 48000;
+	system.option.num_grain_samples = grain;
+	Ngs2RackInternal  rack {};
+	rack.ngs  = &system;
+	rack.type = Ngs2RackType::CustomSubmixer;
+	auto& custom = rack.option.custom_submixer.custom_rack_option;
+	custom.num_buffers = 1;
+	custom.num_modules = 1;
+	custom.module[0].module_id = 0x1b;
+	Ngs2VoiceInternal voice;
+	voice.rack     = &rack;
+	voice.channels = 1;
+	voice.state    = Ngs2VoicePlayState::Playing;
+	voice.modules.resize(1);
+	source.voice.ports.resize(1);
+	source.voice.ports[0].dest = &voice;
+	struct ReverbControl {
+		Ngs2VoiceParamHeader header {sizeof(ReverbControl), 0, 0x40001b00};
+		Ngs2ReverbI3dl2Param i3dl2;
+	} control;
+	control.i3dl2 = ReverbParam(1.0f, -10000, 0); // Late reverb only, which starts ~30 ms later.
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &control.header) == OK &&
+	          voice.modules[0].reverb != nullptr,
+	      "reverb module control was not accepted");
+	const std::vector<Ngs2VoiceInternal*> voices {&source.voice};
+	const auto render = [&] {
+		source.voice.rendered = false;
+		voice.rendered        = false;
+		Ngs2RenderVoice(voice, voices, grain);
+	};
+	// The last pcm sample, where a leaked direct sound would show. Earlier frames are silent input.
+	constexpr size_t impulse_frame = 16;
+	// Reflections at -10000 mB still pass 1e-5. With the first tap's 0.7 and the fade-in at 16/256,
+	// the impulse frame holds a -127 dB echo (about 4.4e-7). A leaked direct sound would be near
+	// 1, far above this -80 dB limit.
+	constexpr float leak_limit = 1e-4f;
+	render(); // The impulse.
+	Check(voice.has_samples && std::fabs(voice.samples[impulse_frame]) < leak_limit,
+	      "reverb with dry 0 passed the direct sound through");
+	bool tail = false;
+	for (int i = 0; i < 20; ++i) { // The source is empty from here on.
+		render();
+		tail = tail || (voice.has_samples &&
+		                std::ranges::any_of(voice.samples, [](float s) { return s != 0.0f; }));
+	}
+	Check(tail, "reverb tail stopped when its input did");
+}
+
+// Runs a fade-in grain, an impulse and four silent grains, so the reverb is left in the middle
+// of its tail. It expects 48 kHz and 256-sample grains. The last grain is 1024 to 1279 samples
+// after the impulse, where the first comb echoes land at that rate, but at many other rates the
+// echoes fall outside it and the check that a tail is sounding fails.
+void RunIntoTail(Ngs2Reverb& reverb, std::vector<float>& block, uint32_t grain) {
+	for (int b = 0; b < 6; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = 1.0f; // An impulse after the fade-in grain.
+		}
+		reverb.Process(block.data(), 1, grain);
+	}
+	Check(std::ranges::any_of(block, [](float sample) { return sample != 0.0f; }),
+	      "reverb had no tail to clear");
+}
+
+// Rates above 192 kHz are refused like 0, since they would only size huge delay lines and
+// overflow the sample counts worked out from them. 192 kHz itself still works.
+void TestCustomReverbHighRates() {
+	constexpr uint32_t grain = 256, max_rate = 192000;
+	constexpr uint32_t refused[] = {max_rate + 1, std::numeric_limits<uint32_t>::max()};
+	std::vector<float> block(grain);
+	for (const uint32_t rate: refused) {
+		Ngs2Reverb high;
+		high.Configure(ReverbParam(1.0f, 0, 0), rate);
+		std::ranges::fill(block, 0.5f);
+		high.Process(block.data(), 1, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return sample == 0.5f; }) &&
+		          !high.HasTail(),
+		      "reverb accepted a sample rate above 192 kHz");
+	}
+
+	// The early reflections are at their -100 dB floor, so only the combs can pass the -80 dB
+	// threshold. The shortest comb is 22.01 ms, 4226 samples at this rate, so its first echo
+	// lands in grain 17, counting the fade-in grain as 0 and the impulse grain as 1.
+	constexpr int   top_grains = 40, first_comb_grain = 17;
+	constexpr float audible = 1e-4f;
+	Ngs2Reverb      top;
+	top.Configure(ReverbParam(1.0f, -10000, 0), max_rate);
+	// Accepted settings are pending, so the reverb runs on the next grain.
+	Check(top.HasTail(), "reverb refused a sample rate of 192 kHz");
+	bool tail = false;
+	for (int b = 0; b < top_grains; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = 1.0f; // An impulse after the fade-in grain.
+		}
+		top.Process(block.data(), 1, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "reverb at 192 kHz produced a non-finite sample");
+		Check(b >= first_comb_grain ||
+		          std::ranges::all_of(block,
+		                              [](float sample) { return std::fabs(sample) <= audible; }),
+		      "reverb at 192 kHz sounded before its first comb echo");
+		tail = tail ||
+		       std::ranges::any_of(block, [](float sample) { return std::fabs(sample) > audible; });
+	}
+	Check(tail, "reverb at 192 kHz produced no comb tail");
+}
+
+// A rate above 192 kHz is refused even by a running reverb, which keeps its old settings and
+// rate. It keeps sounding exactly like a twin that never got the update.
+void TestCustomReverbRefusedRateKeepsState() {
+	constexpr uint32_t grain = 256, refused_rate = 384000;
+	std::vector<float> block(grain);
+	const auto         param = ReverbParam(1.0f, 0, 0);
+	Ngs2Reverb         used, twin;
+	used.Configure(param, 48000);
+	twin.Configure(param, 48000);
+	std::vector<float> expected(grain);
+	RunIntoTail(used, block, grain);
+	RunIntoTail(twin, expected, grain);
+	used.Configure(ReverbParam(5.0f, 0, 0), refused_rate);
+	for (int b = 0; b < 4; ++b) {
+		std::ranges::fill(block, 0.0f);
+		std::ranges::fill(expected, 0.0f);
+		used.Process(block.data(), 1, grain);
+		twin.Process(expected.data(), 1, grain);
+		Check(block == expected, "a refused rate changed a running reverb");
+	}
+}
+
+// Runs a silent fade-in grain and then an impulse on every channel through a fresh reverb, and
+// returns the impulse grain. A cleared reverb must sound exactly like this.
+std::vector<float> FreshImpulse(const Ngs2ReverbI3dl2Param& param, uint32_t grain,
+                                uint32_t channels = 1, uint32_t rate = 48000) {
+	Ngs2Reverb         fresh;
+	std::vector<float> block(size_t(grain) * channels, 0.0f);
+	fresh.Configure(param, rate);
+	fresh.Process(block.data(), channels, grain);
+	for (uint32_t channel = 0; channel < channels; ++channel) {
+		block[size_t(channel) * grain] = 1.0f;
+	}
+	fresh.Process(block.data(), channels, grain);
+	return block;
+}
+
+// A new setup can add channels that were never mixed, so their levels start from nothing.
+// Nothing is pending after the clear, so a silent grain is skipped, and the level restart must
+// wait for the first grain that is mixed. Every channel then starts at full wet.
+void TestCustomReverbClearTailNewChannels() {
+	constexpr uint32_t grain = 256, channels = 2;
+	const auto         param = ReverbParam(1.0f, 0, 0);
+	std::vector<float> mono(grain);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	RunIntoTail(reverb, mono, grain);
+	reverb.ClearTail();
+	std::vector<float> block(size_t(grain) * channels, 0.0f);
+	reverb.Process(block.data(), channels, grain);
+	block[0] = block[grain] = 1.0f;
+	reverb.Process(block.data(), channels, grain);
+	Check(block == FreshImpulse(param, grain, channels),
+	      "a channel added before the restart ramped in instead of starting at full wet");
+}
+
+// ClearTail empties the reverb and keeps its settings. Afterwards silence stays silent, and an
+// impulse sounds like one through a fresh reverb. Empty delay lines read the same whatever
+// their cursors, so the match is exact.
+void TestCustomReverbClearTail() {
+	constexpr uint32_t grain = 256;
+	const auto         param = ReverbParam(1.0f, 0, 0);
+	std::vector<float> block(grain);
+	Ngs2Reverb         used;
+	used.Configure(param, 48000);
+	RunIntoTail(used, block, grain);
+	used.ClearTail();
+	std::ranges::fill(block, 0.0f);
+	used.Process(block.data(), 1, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
+	          !used.HasTail(),
+	      "cleared reverb still sounded");
+	block[0] = 1.0f;
+	used.Process(block.data(), 1, grain);
+	Check(block == FreshImpulse(param, grain), "cleared reverb does not sound like a fresh one");
+
+	// A wet change made while the voice was stopped applies in full to the first sound after the
+	// clear, instead of ramping from the level before it. The settings crossfade on that grain
+	// rounds a little, hence the tolerance.
+	auto half = param;
+	half.wet  = 0.5f;
+	Ngs2Reverb changed;
+	changed.Configure(param, 48000);
+	RunIntoTail(changed, block, grain);
+	changed.Configure(half, 48000);
+	changed.ClearTail();
+	std::ranges::fill(block, 0.0f);
+	block[0] = 1.0f;
+	changed.Process(block.data(), 1, grain);
+	const auto expected = FreshImpulse(half, grain);
+	for (uint32_t i = 0; i < grain; ++i) {
+		Check(std::fabs(block[i] - expected[i]) <= 1e-6f + std::fabs(expected[i]) * 1e-5f,
+		      "cleared reverb ramped its wet level from before the clear");
+	}
+}
+
+// Feeds an impulse with NaN and inf scattered through it, the LFE included, and checks every
+// grain against a twin fed zeros in their place. With no reflections or reverb delay the NaN
+// would reach the output through the combs and all-passes well within the window.
+void CheckNonFiniteInput(float dry) {
+	constexpr uint32_t grain = 256, channels = 6, grains = 20;
+	const auto         param = ReverbParam(1.0f, 0, 0, dry);
+	Ngs2Reverb         used, twin;
+	used.Configure(param, 48000);
+	twin.Configure(param, 48000);
+	std::vector<float> block(size_t(grain) * channels), expected(block.size());
+	for (uint32_t b = 0; b < grains; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0]              = 1.0f; // An impulse after the fade-in grain.
+			block[10]             = std::numeric_limits<float>::quiet_NaN();
+			block[grain + 20]     = std::numeric_limits<float>::infinity();
+			block[2 * grain + 30] = -std::numeric_limits<float>::infinity();
+			block[3 * grain + 40] = std::numeric_limits<float>::quiet_NaN(); // The LFE.
+		}
+		expected = block;
+		std::ranges::replace_if(
+		    expected, [](float sample) { return !std::isfinite(sample); }, 0.0f);
+		used.Process(block.data(), channels, grain);
+		twin.Process(expected.data(), channels, grain);
+		// NaN never compares equal, so finiteness comes first or a mismatch could hide.
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "NaN or inf input reached the reverb's output");
+		Check(block == expected, "reverb treated NaN or inf input as anything but silence");
+	}
+}
+
+// One NaN or inf input sample must not poison the reverb, and a grain of nothing but NaN is
+// silence. Both dry levels are checked because even at dry 0 the dry path multiplies the input,
+// and NaN times zero is still NaN.
+void TestCustomReverbNonFiniteInput() {
+	CheckNonFiniteInput(0.0f);
+	CheckNonFiniteInput(1.0f);
+
+	constexpr uint32_t grain = 256, channels = 6;
+	Ngs2Reverb         idle;
+	idle.Configure(ReverbParam(1.0f, 0, 0), 48000);
+	std::vector<float> block(size_t(grain) * channels, 0.0f);
+	idle.Process(block.data(), channels, grain);
+	// Past the fade-in grain nothing is pending, so only sound can make the reverb run.
+	Check(!idle.HasTail(), "idle reverb still had its fade-in pending");
+	std::ranges::fill(block, std::numeric_limits<float>::quiet_NaN());
+	idle.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
+	          !idle.HasTail(),
+	      "a grain of NaN was treated as sound");
+}
+
+// The reverb reports NaN or inf input so the voice can warn once. Clean audio never sets the
+// flag, and once set it stays through a clear and later clean grains. A reverb that skips the
+// grain, unconfigured or with too many channels, neither cleans nor reports it.
+void TestCustomReverbReportsNonFiniteInput() {
+	constexpr uint32_t grain = 256;
+	const auto         nan   = std::numeric_limits<float>::quiet_NaN();
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(ReverbParam(1.0f, 0, 0), 48000);
+	block[0] = 1.0f;
+	reverb.Process(block.data(), 1, grain);
+	Check(!reverb.SawNonFiniteInput(), "clean input was reported as NaN or inf");
+	std::ranges::fill(block, 0.0f);
+	block[5] = nan;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteInput(), "NaN input was not reported");
+	Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+	      "reported NaN input still reached the output");
+	reverb.ClearTail();
+	std::ranges::fill(block, 0.0f);
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteInput(), "the NaN report did not stay set");
+
+	Ngs2Reverb unconfigured;
+	block[5] = nan;
+	unconfigured.Process(block.data(), 1, grain);
+	Check(!unconfigured.SawNonFiniteInput() && std::isnan(block[5]),
+	      "an unconfigured reverb touched NaN input");
+	Ngs2Reverb         too_wide;
+	std::vector<float> wide(size_t(grain) * (Ngs2Reverb::MaxChannels + 1), nan);
+	too_wide.Configure(ReverbParam(1.0f, 0, 0), 48000);
+	too_wide.Process(wide.data(), Ngs2Reverb::MaxChannels + 1, grain);
+	Check(!too_wide.SawNonFiniteInput() && std::isnan(wide[0]),
+	      "a reverb given too many channels touched NaN input");
+}
+
+// Finite but huge input can overflow. Reflections at +10 dB push a 3e38 sample past the float
+// limit in the early reflections on the same grain, and a 1e38 sample next to it stays finite
+// but huge. The reverb's whole grain is silenced and its tail dropped, so silence after it stays
+// silent and a later impulse sounds like one through a fresh reverb.
+void TestCustomReverbWetOverflow() {
+	constexpr uint32_t grain     = 256;
+	constexpr float    overflows = 3e38f, huge = 1e38f;
+	const auto         param = ReverbParam(1.0f, 1000, 0);
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	block[0] = overflows;
+	block[1] = huge;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteOutput(), "reverb overflow was not reported");
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "an overflowed reverb grain was not silenced");
+	Check(!reverb.HasTail(), "an overflowed reverb kept its tail");
+	std::ranges::fill(block, 0.0f);
+	reverb.Process(block.data(), 1, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "an overflowed reverb still sounded afterwards");
+	block[0] = 1.0f;
+	reverb.Process(block.data(), 1, grain);
+	Check(block == FreshImpulse(param, grain), "a reverb cleared by overflow does not sound fresh");
+}
+
+// Overflow in the dry path alone leaves the reverb intact. The overflowed samples are silenced
+// and reported, but the tail keeps running.
+void TestCustomReverbDryOverflow() {
+	constexpr uint32_t grain = 256;
+	constexpr float    huge  = 2e38f;
+	auto               param = ReverbParam(1.0f, 0, 0, 32.0f);
+	param.wet                = 0.0f;
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	block[0] = huge;
+	block[1] = 1.0f;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteOutput(), "dry overflow was not reported");
+	Check(block[0] == 0.0f && block[1] == 32.0f, "dry overflow was not silenced on its own");
+	Check(reverb.HasTail(), "dry overflow dropped an intact reverb tail");
+}
+
+// A reverb signal that is finite but huge can overflow only once the wet level, up to 32,
+// scales it. That is still the reverb overflowing, so the whole wet grain goes and the tail is
+// dropped, including the 1e37 sample that stays finite at 2.2e38.
+void TestCustomReverbWetLevelOverflow() {
+	constexpr uint32_t grain     = 256;
+	constexpr float    overflows = 3e38f, huge = 1e37f;
+	auto               param = ReverbParam(1.0f, 0, 0);
+	param.wet                = 32.0f;
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	block[0] = overflows;
+	block[1] = huge;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteOutput(), "wet level overflow was not reported");
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
+	          !reverb.HasTail(),
+	      "wet level overflow was not treated as the reverb overflowing");
+}
+
+// With the early reflections at their floor, a grain of huge samples only overflows once the
+// combs sum it, a comb delay after it went in. A single sample would not do, since each comb
+// returns it at a different time. Until then the output stays finite and the tail keeps running,
+// and the overflow is caught whenever it comes out.
+void TestCustomReverbDelayedOverflow() {
+	constexpr uint32_t grain = 256, max_grains = 40;
+	constexpr float    huge  = 3e38f;
+	const auto         param = ReverbParam(1.0f, -10000, 2000);
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	std::ranges::fill(block, huge);
+	reverb.Process(block.data(), 1, grain);
+	Check(!reverb.SawNonFiniteOutput(), "the combs overflowed before their delay");
+	uint32_t grains = 0;
+	while (!reverb.SawNonFiniteOutput() && grains < max_grains) {
+		std::ranges::fill(block, 0.0f);
+		reverb.Process(block.data(), 1, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "delayed overflow reached the output");
+		++grains;
+	}
+	Check(reverb.SawNonFiniteOutput() && !reverb.HasTail(),
+	      "delayed overflow was not caught and the tail dropped");
+}
+
+// One case of the tail-end grid. A positive end_by is the latest the tail may end, about a
+// quarter above where it was measured to end, so a bound that turns much stricter and keeps
+// tails running longer than needed fails. 0 means the tail is still sounding after 70 s.
+struct TailCase {
+	float  decay_hf_ratio, decay, density, wet;
+	int    room_hf;
+	double end_by;
+};
+
+// Runs an impulse and then silence through a reverb, and checks when its tail ends. A twin
+// that can never end runs alongside. It gets the same input plus a 1e-30 sample each grain,
+// which keeps it sounding, so its output is the true continuation of the tail to far below the
+// threshold. For five seconds after the end the twin must stay at or under -120 dBFS.
+void RunTail(const TailCase& tail_case) {
+	constexpr uint32_t grain = 256, rate = 48000;
+	constexpr float    threshold = 1e-6f, keep_alive = 1e-30f;
+	constexpr double   still_sounding_at = 70.0, checked_after_end = 5.0;
+	auto               param = ReverbParam(tail_case.decay, 0, 0);
+	param.decay_hf_ratio     = tail_case.decay_hf_ratio;
+	param.density            = tail_case.density;
+	param.wet                = tail_case.wet;
+	param.room_hf            = tail_case.room_hf;
+	param.hf_reference       = 20.0f; // With roomHF in use, this puts its poles near 1.
+	Ngs2Reverb reverb, twin;
+	reverb.Configure(param, rate);
+	twin.Configure(param, rate);
+	std::vector<float> block(grain), twin_block(grain);
+	const double       run_for =
+        tail_case.end_by > 0 ? tail_case.end_by + checked_after_end : still_sounding_at;
+	double ended = -1.0;
+	for (uint32_t b = 0; double(b) * grain / rate < run_for; ++b) {
+		std::ranges::fill(block, 0.0f);
+		block[0]   = b == 1 ? 1.0f : 0.0f; // An impulse after the fade-in grain.
+		twin_block = block;
+		twin_block[0] += keep_alive;
+		reverb.Process(block.data(), 1, grain);
+		twin.Process(twin_block.data(), 1, grain);
+		if (ended < 0.0 && b > 1 && !reverb.HasTail()) {
+			ended = double(b + 1) * grain / rate;
+		}
+		Check(ended < 0.0 || std::ranges::all_of(twin_block, [&](float sample) {
+			      return std::fabs(sample) <= threshold;
+		      }),
+		      "reverb tail ended while what it held could still reach -120 dBFS");
+	}
+	Check(tail_case.end_by > 0 ? ended > 0.0 && ended <= tail_case.end_by : ended < 0.0,
+	      tail_case.end_by > 0 ? "reverb tail ran on long after it fell silent"
+	                           : "reverb ended a slow low end that was still sounding");
+}
+
+// The library most likely never ends a reverb tail, so ending one is an emulator shortcut that
+// must not be heard. The tail ends once nothing it holds can reach -120 dBFS, which the twin in
+// RunTail checks, and slow low ends at a high decay HF ratio keep running.
+//
+// The bound is a worst case for how the stored samples could line up, and real tails never get
+// near it. So the twin cannot tell when one of its terms is dropped or loosened, namely the
+// comb low-pass state, the all-pass scan, the all-pass gain bound, and roomHF's inner state.
+// Those terms are kept because they make the bound sound, not because a test sees them.
+void TestCustomReverbTailEnd() {
+	const TailCase cases[] = {
+	    {0.5f, 0.1f, 100, 1, 0, 1.2}, {0.5f, 5, 100, 1, 0, 12.7}, {0.5f, 20, 100, 1, 0, 50.5},
+	    {1, 0.1f, 100, 1, 0, 0.4},    {1, 5, 100, 1, 0, 14.5},    {1, 20, 100, 1, 0, 57.7},
+	    {1.5f, 0.1f, 100, 1, 0, 0.4}, {1.5f, 5, 100, 1, 0, 18.9}, {1.5f, 20, 100, 1, 0, 76.2},
+	    {2, 0.1f, 100, 1, 0, 0.4},    {2, 5, 100, 1, 0, 0},       {2, 20, 100, 1, 0, 0},
+	    {1, 5, 0, 1, 0, 14.5},        {1, 5, 100, 32, 0, 17.6},   {1, 1, 100, 1, -1000, 3.0}};
+	for (const auto& tail_case: cases) {
+		RunTail(tail_case);
+	}
+	// After the end the reverb is silent, and a new sound plays as through a fresh reverb.
+	const auto param = ReverbParam(0.1f, 0, 0);
+	Ngs2Reverb reverb;
+	reverb.Configure(param, 48000);
+	std::vector<float> block(256);
+	RunIntoTail(reverb, block, 256);
+	for (int b = 0; b < 100 && reverb.HasTail(); ++b) {
+		std::ranges::fill(block, 0.0f);
+		reverb.Process(block.data(), 1, 256);
+	}
+	std::ranges::fill(block, 0.0f);
+	reverb.Process(block.data(), 1, 256);
+	Check(!reverb.HasTail() &&
+	          std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "reverb was not silent after its tail ended");
+	block[0] = 1.0f;
+	reverb.Process(block.data(), 1, 256);
+	Check(block == FreshImpulse(param, 256), "reverb after its tail ended does not sound fresh");
+}
+
+// A reverb and a twin with the same settings. The twin gets a 1e-30 sample every grain, which
+// keeps its tail from ever ending, so it plays what the library would.
+struct TwinRig {
+	static constexpr uint32_t grain = 256, rate = 48000;
+	Ngs2Reverb                reverb, twin;
+	std::vector<float>        block = std::vector<float>(grain), twin_block = block;
+
+	// Sends the same settings to both.
+	void Configure(const Ngs2ReverbI3dl2Param& param) {
+		reverb.Configure(param, rate);
+		twin.Configure(param, rate);
+	}
+
+	// Renders one grain into both, with an impulse in it when `impulse` is set.
+	void Render(bool impulse) {
+		std::ranges::fill(block, 0.0f);
+		block[0]   = impulse ? 1.0f : 0.0f;
+		twin_block = block;
+		twin_block[0] += 1e-30f;
+		reverb.Process(block.data(), 1, grain);
+		twin.Process(twin_block.data(), 1, grain);
+	}
+
+	// Whether the reverb sounds like the twin. The twin may still hold a tail the reverb has
+	// dropped, which is under -120 dBFS, hence the small tolerance.
+	[[nodiscard]] bool MatchesTwin() const {
+		for (uint32_t i = 0; i < grain; ++i) {
+			if (!(std::fabs(block[i] - twin_block[i]) <= 2e-6f + std::fabs(twin_block[i]) * 1e-5f)) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
+// A tail that ends on its own keeps its wet and dry levels, since the library would have kept
+// running. So a dry change sent with the next sound ramps over that grain, as in the twin.
+void TestCustomReverbTailEndKeepsLevels() {
+	auto    param = ReverbParam(0.1f, 0, 0, 1.0f);
+	TwinRig rig;
+	rig.Configure(param);
+	rig.Render(false);
+	rig.Render(true);
+	for (int b = 0; b < 400 && rig.reverb.HasTail(); ++b) {
+		rig.Render(false);
+	}
+	Check(!rig.reverb.HasTail(), "reverb tail did not end");
+	param.dry = 0.0f;
+	rig.Configure(param);
+	rig.Render(true);
+	Check(rig.MatchesTwin(), "a tail that ended on its own jumped to new levels instead of ramping");
+}
+
+// A game may mute the reverb during silence and restore it later, and the library then plays
+// the rest of the tail. So a muted level must not let a loud tail end.
+void TestCustomReverbTailMutedThenRestored() {
+	// Half a second in, the history ring holds only silence but the tail is still loud.
+	constexpr uint32_t loud_grains = TwinRig::rate / 2 / TwinRig::grain;
+	constexpr int      muted_grains = 8, restored_grains = 40;
+	auto               param = ReverbParam(5.0f, 0, 0);
+	TwinRig            rig;
+	rig.Configure(param);
+	rig.Render(false);
+	rig.Render(true);
+	for (uint32_t b = 0; b < loud_grains; ++b) {
+		rig.Render(false);
+	}
+	param.reverb = -10000;
+	rig.Configure(param);
+	for (int b = 0; b < muted_grains; ++b) {
+		rig.Render(false);
+	}
+	param.reverb = 0;
+	rig.Configure(param);
+	for (int b = 0; b < restored_grains; ++b) {
+		rig.Render(false);
+		Check(rig.MatchesTwin(), "reverb dropped a loud tail while its level was muted");
+	}
+	Check(rig.reverb.HasTail(), "reverb dropped a loud tail while its level was muted");
+}
+
+// A reverb whose low end is still sounding ten minutes after the last sound, at a low rate so
+// the test runs quickly, and a twin kept sounding by a 1e-30 sample each grain.
+struct CeilingRig {
+	// The reverb's TailCeilingSeconds and CeilingFadeSeconds.
+	static constexpr uint32_t ceiling_seconds = 600, fade_seconds = 3;
+	static constexpr uint32_t grain = 256, rate = 8000;
+	static constexpr uint32_t ceiling_grains = ceiling_seconds * rate / grain;
+	static constexpr uint32_t fade_length    = fade_seconds * rate;
+	// The grain arithmetic below needs the ceiling to fall on a grain boundary.
+	static_assert(ceiling_seconds * rate % grain == 0);
+	Ngs2Reverb                reverb, twin;
+	std::vector<float>        block = std::vector<float>(grain), twin_block = block;
+	uint32_t                  next  = 0;
+
+	CeilingRig() {
+		auto param           = ReverbParam(20.0f, 0, 0);
+		param.decay_hf_ratio = 2.0f;
+		param.density        = 0.0f;
+		reverb.Configure(param, rate);
+		twin.Configure(param, rate);
+	}
+
+	// Renders one grain into both, with an impulse in it when `impulse` is set.
+	void Render(bool impulse = false) {
+		std::ranges::fill(block, 0.0f);
+		block[0]   = impulse || next == 1 ? 1.0f : 0.0f;
+		twin_block = block;
+		twin_block[0] += 1e-30f;
+		reverb.Process(block.data(), 1, grain);
+		twin.Process(twin_block.data(), 1, grain);
+		next++;
+	}
+
+	// Renders up to the grain where the ceiling is reached, with the tail sounding throughout
+	// from the impulse on. The impulse is grain 1, so the silence after it reaches the ceiling
+	// at the end of grain ceiling_grains + 1, and the fade starts on the grain after.
+	void RenderToCeiling() {
+		while (next < ceiling_grains + 2) {
+			Render();
+			Check(next < 2 || reverb.HasTail(), "reverb ended a slow low end before the ceiling");
+		}
+	}
+};
+
+// At the ceiling the tail fades out over a few seconds, as the twin times a falling level. Each
+// grain's level falls in a straight line from where the last grain left it. Afterwards the
+// reverb is silent, and a new sound plays at full wet as through a fresh reverb.
+void TestCustomReverbTailCeiling() {
+	CeilingRig     rig;
+	const uint32_t fade_length = CeilingRig::fade_length;
+	rig.RenderToCeiling();
+	float from = 1.0f;
+	for (uint32_t remaining = fade_length; remaining > 0;) {
+		remaining      = remaining > CeilingRig::grain ? remaining - CeilingRig::grain : 0;
+		const float to = static_cast<float>(remaining) / static_cast<float>(fade_length);
+		rig.Render();
+		for (uint32_t i = 0; i < CeilingRig::grain; ++i) {
+			const float level    = from + (to - from) * static_cast<float>(i) / CeilingRig::grain;
+			const float expected = rig.twin_block[i] * level;
+			Check(std::fabs(rig.block[i] - expected) <= 1e-4f * std::fabs(rig.twin_block[i]) + 1e-9f,
+			      "reverb did not fade its tail out over a few seconds at the ceiling");
+		}
+		from = to;
+	}
+	Check(!rig.reverb.HasTail(), "reverb tail did not end after the fade at the ceiling");
+	rig.Render();
+	Check(std::ranges::all_of(rig.block, [](float sample) { return sample == 0.0f; }),
+	      "reverb was not silent after the fade at the ceiling");
+	rig.Render(true);
+	auto param           = ReverbParam(20.0f, 0, 0);
+	param.decay_hf_ratio = 2.0f;
+	param.density        = 0.0f;
+	Check(rig.block == FreshImpulse(param, CeilingRig::grain, 1, CeilingRig::rate),
+	      "a new sound after the fade at the ceiling did not play at full wet");
+}
+
+// A new sound during the fade at the ceiling cancels it and keeps the tail. The wet level
+// climbs back in a straight line over that grain, and from then on the reverb sounds like the
+// twin that never faded. A roomHF pole of exactly 1, which only hf_reference at a multiple of
+// the rate gives, never settles, so that tail is never quiet.
+void TestCustomReverbTailCeilingCancel() {
+	constexpr uint32_t faded_grains = 3, grain = CeilingRig::grain;
+	CeilingRig         rig;
+	rig.RenderToCeiling();
+	for (uint32_t b = 0; b < faded_grains; ++b) {
+		rig.Render();
+	}
+	const float from = static_cast<float>(CeilingRig::fade_length - faded_grains * grain) /
+	                   static_cast<float>(CeilingRig::fade_length);
+	rig.Render(true);
+	for (uint32_t i = 0; i < grain; ++i) {
+		const float level = from + (1.0f - from) * static_cast<float>(i) / grain;
+		Check(std::fabs(rig.block[i] - rig.twin_block[i] * level) <=
+		          1e-4f * std::fabs(rig.twin_block[i]) + 1e-9f,
+		      "a new sound did not bring the wet level back over one grain");
+	}
+	for (uint32_t b = 0; b < CeilingRig::fade_length / grain + 1; ++b) {
+		rig.Render();
+		for (uint32_t i = 0; i < grain; ++i) {
+			Check(std::fabs(rig.block[i] - rig.twin_block[i]) <=
+			          1e-4f * std::fabs(rig.twin_block[i]) + 1e-9f,
+			      "a new sound did not cancel the fade at the ceiling");
+		}
+	}
+
+	auto param         = ReverbParam(1.0f, 0, 0);
+	param.room_hf      = -600;
+	param.hf_reference = 16000.0f;
+	Ngs2Reverb         stuck;
+	std::vector<float> block(256);
+	stuck.Configure(param, 16000);
+	// The filter then takes no input at all, so the output stays silent while its state can
+	// never be shown to settle. Only the ceiling ends such a tail.
+	for (int b = 0; b < 16000 * 10 / 256; ++b) {
+		std::ranges::fill(block, 0.0f);
+		block[0] = b == 1 ? 1.0f : 0.0f;
+		stuck.Process(block.data(), 1, 256);
+	}
+	Check(stuck.HasTail(), "reverb ended a tail whose roomHF filter never settles");
+}
+
+// A custom submixer with a reverb module, fed an impulse by a sampler voice. It is started with
+// event 1, as a game does, so the start clears the reverb as it would in a game.
+struct ReverbVoiceRig {
+	static constexpr uint32_t       grain = 256;
+	Fixture                         source {48000};
+	Ngs2Internal                    system;
+	Ngs2RackInternal                rack {};
+	Ngs2VoiceInternal               voice;
+	std::vector<Ngs2VoiceInternal*> voices {&source.voice};
+	// The impulse sits halfway into the first grain, where the settings fade-in is at half.
+	std::array<int16_t, grain / 2 + 1> pcm {};
+
+	ReverbVoiceRig() {
+		pcm.back() = 32767;
+		source.Queue(pcm.data(), static_cast<uint32_t>(pcm.size()), 0);
+		system.option.sample_rate       = 48000;
+		system.option.num_grain_samples = grain;
+		rack.ngs                        = &system;
+		rack.type                       = Ngs2RackType::CustomSubmixer;
+		auto& custom                    = rack.option.custom_submixer.custom_rack_option;
+		custom.num_buffers              = 1;
+		custom.num_modules              = 1;
+		custom.module[0].module_id      = Ngs2Reverb::ModuleId;
+		voice.rack                      = &rack;
+		voice.channels                  = 1;
+		voice.modules.resize(1);
+		source.voice.ports.resize(1);
+		source.voice.ports[0].dest = &voice;
+		struct ReverbControl {
+			Ngs2VoiceParamHeader header {sizeof(ReverbControl), 0, 0x40001b00};
+			Ngs2ReverbI3dl2Param i3dl2 = ReverbParam(1.0f, 0, 0);
+		} control;
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &control.header) == OK,
+		      "reverb module control was not accepted");
+		voice.SetEvent(1);
+	}
+
+	// Renders one grain and returns whether the submixer output any sound.
+	bool Render() {
+		source.voice.rendered = false;
+		voice.rendered        = false;
+		Ngs2RenderVoice(voice, voices, grain);
+		return voice.has_samples &&
+		       std::ranges::any_of(voice.samples, [](float sample) { return sample != 0.0f; });
+	}
+
+	// Renders into the tail, which must still be sounding when the test acts on it.
+	void RenderIntoTail() {
+		for (int i = 0; i < 6; ++i) {
+			Render();
+		}
+		Check(Render(), "reverb voice had no tail to clear");
+	}
+};
+
+// A stopped or killed submixer renders nothing, so its reverb keeps the old tail until the
+// voice plays again. Starting must clear it, as must a new 0x4002 setup.
+void TestCustomReverbVoiceRestart() {
+	for (const uint32_t stop_event: {4u, 8u, 2u}) {
+		ReverbVoiceRig rig;
+		rig.RenderIntoTail();
+		rig.voice.SetEvent(stop_event);
+		Check(!rig.Render(), "stopped reverb voice was not silent");
+		rig.voice.SetEvent(1);
+		Check(!rig.Render(), "reverb replayed its old tail after the voice restarted");
+	}
+	ReverbVoiceRig same_tick;
+	same_tick.RenderIntoTail();
+	same_tick.voice.SetEvent(2);
+	same_tick.voice.SetEvent(1);
+	Check(!same_tick.Render(), "reverb kept its tail through a stop and play in one tick");
+
+	ReverbVoiceRig setup;
+	setup.RenderIntoTail();
+	struct SetupControl {
+		Ngs2VoiceParamHeader header {sizeof(SetupControl), 0, 0x40020000};
+		uint32_t             channels[2] {1, 1};
+	} control;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&setup.voice), &control.header) == OK,
+	      "custom submixer setup was not accepted");
+	Check(!setup.Render(), "reverb kept its tail through a new setup");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -1727,6 +2819,26 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestCustomReverbDsp();
+	TestCustomReverbLowRates();
+	TestCustomReverbHighRates();
+	TestCustomReverbRefusedRateKeepsState();
+	TestCustomReverbMatchesLibrary();
+	TestCustomReverbVoice();
+	TestCustomReverbClearTail();
+	TestCustomReverbClearTailNewChannels();
+	TestCustomReverbNonFiniteInput();
+	TestCustomReverbReportsNonFiniteInput();
+	TestCustomReverbWetOverflow();
+	TestCustomReverbDryOverflow();
+	TestCustomReverbWetLevelOverflow();
+	TestCustomReverbDelayedOverflow();
+	TestCustomReverbTailEnd();
+	TestCustomReverbTailEndKeepsLevels();
+	TestCustomReverbTailMutedThenRestored();
+	TestCustomReverbTailCeiling();
+	TestCustomReverbTailCeilingCancel();
+	TestCustomReverbVoiceRestart();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

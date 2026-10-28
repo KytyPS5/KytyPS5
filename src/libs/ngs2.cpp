@@ -3,9 +3,11 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "libatrac9.h"
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/ngs2_reverb.h"
 
 #include <algorithm>
 #include <array>
@@ -19,8 +21,6 @@
 #include <memory>
 #include <numbers>
 #include <vector>
-
-#include "libatrac9.h"
 
 namespace Libs::Audio {
 
@@ -548,9 +548,12 @@ struct Ngs2VoiceInternal {
 		std::vector<uint8_t>     param, work, state;
 		void                     KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*) = nullptr;
 		std::array<uintptr_t, 3> user_data {};
+		std::unique_ptr<Ngs2Reverb> reverb; // Module 0x1b, created when the game configures it.
 		uint32_t                 flags          = 1;
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
+		bool                     input_warned   = false; // NaN or inf reached the reverb.
+		bool                     output_warned  = false; // The reverb's output overflowed.
 	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
@@ -742,10 +745,21 @@ struct Ngs2VoiceInternal {
 		EXIT_NOT_IMPLEMENTED(index >= ports.size());
 		ports[index].matrix = matrix;
 	}
+	// Empties every reverb module, keeping its settings.
+	void ClearReverbTails() {
+		for (auto& module: modules) {
+			if (module.reverb != nullptr) {
+				module.reverb->ClearTail();
+			}
+		}
+	}
 	void SetEvent(uint32_t id) {
 		switch (id) {
 			case 1:
 				if (state == Ngs2VoicePlayState::Empty || state == Ngs2VoicePlayState::Stopped) {
+					// A stopped voice renders nothing, so its reverb kept the old tail. Starting
+					// here, before any grain renders, also makes a stop and play in one tick clean.
+					ClearReverbTails();
 					state = Ngs2VoicePlayState::Playing;
 					// Reserve the voice immediately; publish playback flags after rendering.
 					state_flags |= 1;
@@ -1802,6 +1816,12 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					voice.has_samples = true;
 				}
 			}
+			// A custom sampler ends once its data and filter history run out, without waiting for
+			// its reverb tail, so the tail is cut off after that grain. Waiting would keep the voice
+			// playing for as long as the tail rings, which can be minutes, and a game that reuses
+			// voices once they end would be held up. The library's behaviour here is unknown, and
+			// AnyPS5 does not run the custom reverb at all. Games seen so far put it on custom
+			// submixers, which never end here.
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
 			    voice.frame_cursor == voice.frame_samples &&
 			    voice.next_frame_samples == 0 &&
@@ -1844,12 +1864,43 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.has_samples = true;
 			}
 		}
+		// A reverb keeps sounding after its input stops, so its tail is rendered from silence.
+		if (!voice.has_samples &&
+		    std::ranges::any_of(voice.modules, [](const auto& module) {
+			    return module.reverb != nullptr && module.reverb->HasTail();
+		    })) {
+			voice.has_samples = true;
+		}
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				const auto& info   = custom.module[m];
 				auto&       module = voice.modules[m];
+				if (info.module_id == Ngs2Reverb::ModuleId) {
+					// Until the game configures it, the module passes audio through unchanged.
+					if (module.reverb != nullptr) {
+						module.reverb->Process(voice.Buffer(info.source_buffer_id, grain),
+						                       voice.channels, grain);
+						// The reverb already played the bad samples as silence. The warning
+						// points at the voice whose source chain makes them.
+						if (!module.input_warned && module.reverb->SawNonFiniteInput()) {
+							Log::WriteToConsoleAndLog(fmt::sprintf(
+							    "warning: NGS2 reverb at module index %zu of voice 0x%016" PRIx64
+							    " received NaN or inf input, treated as silence\n",
+							    m, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&voice))));
+							module.input_warned = true;
+						}
+						if (!module.output_warned && module.reverb->SawNonFiniteOutput()) {
+							Log::WriteToConsoleAndLog(fmt::sprintf(
+							    "warning: NGS2 reverb at module index %zu of voice 0x%016" PRIx64
+							    " overflowed to NaN or inf on huge input, treated as silence\n",
+							    m, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&voice))));
+							module.output_warned = true;
+						}
+					}
+					continue;
+				}
 				if (info.module_id != 0x19 && info.module_id != 0x1f) {
 					if (!module.render_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
@@ -2452,13 +2503,33 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id;
 				auto& module = voice->modules[index];
 				if ((param->id & 0xffffffe0u) != (0x40000000u | module_id << 8u) ||
-				    (module_id != 0x19 && module_id != 0x1f)) {
+				    (module_id != 0x19 && module_id != Ngs2Reverb::ModuleId &&
+				     module_id != 0x1f)) {
 					if (!module.control_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
 						    param->id));
 						module.control_warned = true;
 					}
+					break;
+				}
+				if (module_id == Ngs2Reverb::ModuleId) {
+					// The custom reverb module. The control is Ngs2CustomVoiceReverbParam, a header
+					// followed by the I3DL2 settings.
+					EXIT_NOT_IMPLEMENTED(param->size !=
+					                     sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2ReverbI3dl2Param));
+					const auto& i3dl2 = *reinterpret_cast<const Ngs2ReverbI3dl2Param*>(param + 1);
+					LOGF("\t reverb: wet = %f, dry = %f, room = %d, roomHF = %d, decay = %f, "
+					     "hfRatio = %f, reflections = %d @ %f, reverb = %d @ %f, diffusion = %f, "
+					     "density = %f, hfReference = %f\n",
+					     i3dl2.wet, i3dl2.dry, i3dl2.room, i3dl2.room_hf, i3dl2.decay_time,
+					     i3dl2.decay_hf_ratio, i3dl2.reflections, i3dl2.reflections_delay,
+					     i3dl2.reverb, i3dl2.reverb_delay, i3dl2.diffusion, i3dl2.density,
+					     i3dl2.hf_reference);
+					if (module.reverb == nullptr) {
+						module.reverb = std::make_unique<Ngs2Reverb>();
+					}
+					module.reverb->Configure(i3dl2, voice->rack->ngs->option.sample_rate);
 					break;
 				}
 				if (module_id == 0x19) {
@@ -2556,6 +2627,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				const auto* channels   = reinterpret_cast<const uint32_t*>(param + 1);
 				EXIT_NOT_IMPLEMENTED(channels[0] != channels[1]);
 				voice->channels = channels[0];
+				// A new setup may change the channel layout, so the reverb starts empty.
+				voice->ClearReverbTails();
 				break;
 			}
 			case 0x4003: {

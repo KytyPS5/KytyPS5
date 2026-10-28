@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -140,11 +141,17 @@ private:
 	};
 
 	// The steps of Process. They and the stateless helpers are defined in ngs2_reverb.cpp.
+	[[nodiscard]] bool  StartGrain(float* samples, size_t total);
+	void                WriteHistory(uint32_t grain);
+	void                RunCombs(uint32_t grain);
+	void                MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset);
+	void                AdvanceTail(uint32_t grain);
 	void                RunTaps(const Taps& taps, const float* input, uint32_t grain, float* early,
 	                            float* late) const;
 	void                RenderTaps(uint32_t grain, float rate);
 	[[nodiscard]] Taps  TapsFor(uint32_t size, float rate) const;
 	void                SetupComb(Comb& comb, uint32_t length, float rate, bool clear) const;
+	static void         SetDamping(Comb& comb, float ratio);
 	void                Reset();
 	void                ClearHistory();
 	void                ApplyParams(float rate);

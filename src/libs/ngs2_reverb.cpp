@@ -152,18 +152,7 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 		return;
 	}
 	const size_t total = size_t(channels) * grain;
-	const bool   silent_input =
-	    std::all_of(samples, samples + total, [](float sample) { return sample == 0.0f; });
-	if (!silent_input) {
-		// Any sound restarts the countdown to the end of the tail. The combs fade 60 dB
-		// per decay time, so the tail is 120 dB down after two decay times (2000 ms per
-		// second of decay). The extra 400 ms covers the longest reflections delay (0.3 s)
-		// plus the longest reverb delay (0.1 s).
-		m_tail_remaining = Samples(2000.0f * m_params.decay_time + 400.0f, float(m_rate));
-	} else if (m_tail_remaining == 0 && !m_reset && !m_changed) {
-		// Silent input and no tail left means silent output. Pending settings skip this,
-		// so their crossfade starts on the same grain as the library's would.
-		std::fill(samples, samples + total, 0.0f);
+	if (!StartGrain(samples, total)) {
 		return;
 	}
 	const float rate  = static_cast<float>(m_rate);
@@ -179,45 +168,85 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	m_late.resize(grain);
 	MixDown(m_input.data(), channels, grain, m_mono.data());
 	RenderTaps(grain, rate);
-	// Add this grain to the history, so later grains can reach back into it.
+	WriteHistory(grain);
+	RunCombs(grain);
+	UpdateRoomFilter(rate);
+	m_tail.resize(grain);
+	for (uint32_t channel = 0; channel < channels; channel++) {
+		MixChannel(samples, channel, grain, reset);
+	}
+	m_reset   = false;
+	m_changed = false;
+	AdvanceTail(grain);
+}
+
+// Restarts the tail countdown when the grain has sound. Returns false, with `samples` set to
+// silence, when the input is silent, no tail is left and no settings are pending, so the
+// grain needs no further work.
+bool Ngs2Reverb::StartGrain(float* samples, size_t total) {
+	const bool silent_input =
+	    std::all_of(samples, samples + total, [](float sample) { return sample == 0.0f; });
+	if (!silent_input) {
+		// Any sound restarts the countdown to the end of the tail. The combs fade 60 dB
+		// per decay time, so the tail is 120 dB down after two decay times (2000 ms per
+		// second of decay). The extra 400 ms covers the longest reflections delay (0.3 s)
+		// plus the longest reverb delay (0.1 s).
+		m_tail_remaining = Samples(2000.0f * m_params.decay_time + 400.0f, float(m_rate));
+	} else if (m_tail_remaining == 0 && !m_reset && !m_changed) {
+		// Silent input and no tail left means silent output. Pending settings skip this,
+		// so their crossfade starts on the same grain as the library's would.
+		std::fill(samples, samples + total, 0.0f);
+		return false;
+	}
+	return true;
+}
+
+// Adds this grain's mono signal to the history, so later grains can reach back into it.
+void Ngs2Reverb::WriteHistory(uint32_t grain) {
 	for (uint32_t i = 0; i < grain; i++) {
 		m_ring[m_ring_cursor] = m_mono[i];
 		m_ring_cursor         = m_ring_cursor + 1 == m_ring.size() ? 0 : m_ring_cursor + 1;
 	}
+}
+
+// Runs the late feed through every comb, one block of m_combs_out per comb.
+void Ngs2Reverb::RunCombs(uint32_t grain) {
 	m_combs_out.resize(size_t(Combs) * grain);
 	for (uint32_t i = 0; i < Combs; i++) {
 		RunComb(m_combs[i], m_late.data(), m_combs_out.data() + size_t(i) * grain, grain);
 	}
-	UpdateRoomFilter(rate);
-	m_tail.resize(grain);
-	for (uint32_t channel = 0; channel < channels; channel++) {
-		auto&        state = m_channels[channel];
-		float*       out   = samples + size_t(channel) * grain;
-		const float* in    = m_input.data() + size_t(channel) * grain;
-		// The LFE channel gets no reverb, only its own dry signal.
-		if (channel == LfeChannel) {
-			std::copy(in, in + grain, out);
-		} else {
-			RenderWet(state, channel, out, grain);
-		}
-		// Scale the reverb by wet and add the dry input scaled by dry. Each level moves
-		// from where the last grain left it to the new setting over this grain. Right
-		// after a reset there is no last grain, so they start at the new settings.
-		const float wet = channel == LfeChannel ? 0.0f : m_params.wet;
-		Ramp(out, reset ? wet : state.wet, wet, grain, out, false);
-		Ramp(out, reset ? m_params.dry : state.dry, m_params.dry, grain, in, true);
-		state.wet = wet;
-		state.dry = m_params.dry;
+}
+
+// Writes one output channel, the reverb scaled by wet plus the dry input scaled by dry.
+void Ngs2Reverb::MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset) {
+	auto&        state = m_channels[channel];
+	float*       out   = samples + size_t(channel) * grain;
+	const float* in    = m_input.data() + size_t(channel) * grain;
+	// The LFE channel gets no reverb, only its own dry signal.
+	if (channel == LfeChannel) {
+		std::copy(in, in + grain, out);
+	} else {
+		RenderWet(state, channel, out, grain);
 	}
-	m_reset   = false;
-	m_changed = false;
-	if (m_tail_remaining != 0) {
-		m_tail_remaining = m_tail_remaining > grain ? m_tail_remaining - grain : 0;
-		if (m_tail_remaining == 0) {
-			// The tail is now 120 dB down. Drop the tiny leftovers so the next sound
-			// starts from true silence.
-			ClearHistory();
-		}
+	// Each level moves from where the last grain left it to the new setting over this grain.
+	// Right after a reset there is no last grain, so they start at the new settings.
+	const float wet = channel == LfeChannel ? 0.0f : m_params.wet;
+	Ramp(out, reset ? wet : state.wet, wet, grain, out, false);
+	Ramp(out, reset ? m_params.dry : state.dry, m_params.dry, grain, in, true);
+	state.wet = wet;
+	state.dry = m_params.dry;
+}
+
+// Counts the tail down by one grain, and clears the history once it has run out.
+void Ngs2Reverb::AdvanceTail(uint32_t grain) {
+	if (m_tail_remaining == 0) {
+		return;
+	}
+	m_tail_remaining = m_tail_remaining > grain ? m_tail_remaining - grain : 0;
+	if (m_tail_remaining == 0) {
+		// The tail is now 120 dB down. Drop the tiny leftovers so the next sound starts from
+		// true silence.
+		ClearHistory();
 	}
 }
 
@@ -309,6 +338,19 @@ void Ngs2Reverb::SetupComb(Comb& comb, uint32_t length, float rate, bool clear) 
 	// 10^-3, which is the 60 dB fade that decay_time promises.
 	comb.feedback = std::pow(10.0f, static_cast<float>(length) / rate / params.decay_time * -3.0f);
 	const float ratio = params.decay_hf_ratio;
+	SetDamping(comb, ratio);
+	// The pre-emphasis filter is y = (x - tilt * previous x) / (1 - tilt). It leaves the
+	// lows unchanged and scales the highest frequencies by 1 / sqrt(ratio). With a ratio
+	// below 1 it lifts the highs going into the comb, which offsets part of the damping.
+	const float root   = std::sqrt(ratio);
+	const float tilt   = (1.0f - root) / (root + 1.0f);
+	comb.emphasis      = tilt / (1.0f - tilt) + 1.0f;
+	comb.emphasis_back = -tilt / (1.0f - tilt);
+}
+
+// Sets how the comb damps its feedback for a decay_hf_ratio of `ratio`, which makes the
+// highs and lows fade at different rates. It needs the comb's feedback to be set first.
+void Ngs2Reverb::SetDamping(Comb& comb, float ratio) {
 	if (ratio > 1.0f) {
 		// The library feeds back the delayed signal in full, plus a share of a fixed
 		// low-pass of it. The share is 1 - feedback^(ratio - 1), written with pow and log10.
@@ -339,13 +381,6 @@ void Ngs2Reverb::SetupComb(Comb& comb, uint32_t length, float rate, bool clear) 
 		comb.direct       = 0.0f;
 		comb.filtered     = 1.0f;
 	}
-	// The pre-emphasis filter is y = (x - tilt * previous x) / (1 - tilt). It leaves the
-	// lows unchanged and scales the highest frequencies by 1 / sqrt(ratio). With a ratio
-	// below 1 it lifts the highs going into the comb, which offsets part of the damping.
-	const float root   = std::sqrt(ratio);
-	const float tilt   = (1.0f - root) / (root + 1.0f);
-	comb.emphasis      = tilt / (1.0f - tilt) + 1.0f;
-	comb.emphasis_back = -tilt / (1.0f - tilt);
 }
 
 // Empties all of the history and filters for a fresh start. ApplyParams then sizes them.

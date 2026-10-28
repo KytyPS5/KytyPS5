@@ -1244,6 +1244,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Read) continue;
 			const auto components = IR::BufferComponentCount(inst.GetOpcode());
 			if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) continue;
 			const auto& memory = ctx.Memory(inst);
@@ -1414,8 +1415,34 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+uint32_t EmitIndirectBufferAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		return EmitValueOrZeroIfCondition(
+		    state, IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false), [&]() {
+			    const auto bda = GetBdaPointer(state, aligned);
+			    const auto present =
+			        Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+			    return EmitValueOrZeroIfCondition(state, present, [&]() {
+				    const auto pointer = state.builder.AllocateId();
+				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+				                              pointer, bda);
+				    const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				    EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
+				    return old;
+			    });
+		    });
+	});
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		return EmitIndirectBufferAtomic32(ctx, inst);
+	}
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

@@ -10796,6 +10796,55 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
   }
 }
 
+void TestLoopPhiBufferAtomicIAdd32UsesBda() {
+  // Same loop-carried V# shape as TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured,
+  // but BUFFER_ATOMIC_ADD. Admitting the atomic without a BDA emit path EXIT()s.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128), // preheader: s0 = 0
+      EncodeMubuf0(0x32, 0, true, true),
+      EncodeMubuf1(0, 0, 1),       // loop: BUFFER_ATOMIC_ADD v0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
+      EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
+      EncodeSopp(0x01),
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_ADD") != std::string::npos),
+        "loop-Phi buffer atomic did not decode BUFFER_ATOMIC_ADD");
+  Check((result.ir_dump.find("BufferAtomicIAdd32") != std::string::npos),
+        "loop-Phi buffer atomic did not lower to BufferAtomicIAdd32");
+
+  uint32_t indirect_atomics = 0;
+  for (const auto *block : result.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() !=
+          ShaderRecompiler::IR::ValueOpcode::BufferAtomicIAdd32) {
+        continue;
+      }
+      const auto &memory = result.program.memory_info
+          [inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index];
+      indirect_atomics +=
+          memory.kind == ShaderRecompiler::IR::ResourceKind::IndirectBuffer &&
+          !memory.planning_only;
+    }
+  }
+  Check(result.program.info.uses_dma && indirect_atomics == 1u,
+        "loop-Phi BufferAtomicIAdd32 was not planned as an indirect buffer");
+
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("get_bda_pointer") != std::string::npos &&
+            source.find("OpConvertUToPtr") != std::string::npos &&
+            source.find("OpAtomicIAdd") != std::string::npos &&
+            source.find("OpMemoryBarrier") != std::string::npos,
+        "loop-Phi BufferAtomicIAdd32 SPIR-V is not a BDA atomic");
+  Check(source.find("load_indirect_buffer") == std::string::npos,
+        "BufferAtomicIAdd32 was emitted as an indirect buffer load helper");
+}
+
 void TestCapturedBufferAtomicsX2() {
   using ShaderRecompiler::IR::ValueOpcode;
   struct Case {
@@ -17241,6 +17290,7 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
+  TestLoopPhiBufferAtomicIAdd32UsesBda();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();

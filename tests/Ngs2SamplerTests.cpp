@@ -864,7 +864,8 @@ double WindowRms(const std::vector<float>& signal, double from, double to) {
 }
 
 // The custom reverb module (0x1b). The late reverb decays by 60 dB over decayTime, the tail ends
-// once it is 120 dB down, muted I3DL2 levels are inaudible, and dry passes the input through.
+// once nothing left in it can reach -120 dBFS, muted I3DL2 levels are inaudible, and dry passes
+// the input through.
 void TestCustomReverbDsp() {
 	constexpr uint32_t grain = 256, channels = 2;
 	Ngs2Reverb         reverb;
@@ -885,7 +886,7 @@ void TestCustomReverbDsp() {
 	Check(drop_db > 12.0 && drop_db < 24.0, "reverb tail does not decay at about 60 dB per decayTime");
 	Check(!reverb.HasTail() && std::ranges::all_of(left.end() - grain * 20, left.end(),
 	                                               [](float sample) { return sample == 0.0f; }),
-	      "reverb tail did not end after twice decayTime");
+	      "reverb tail did not end within 3 s of a 1 s decayTime");
 
 	// -10000 mB is the library's floor (-100 dB), not silence, but what is left is inaudible.
 	Ngs2Reverb muted;
@@ -1232,10 +1233,10 @@ void RunIntoTail(Ngs2Reverb& reverb, std::vector<float>& block, uint32_t grain) 
 // Runs a silent fade-in grain and then an impulse on every channel through a fresh reverb, and
 // returns the impulse grain. A cleared reverb must sound exactly like this.
 std::vector<float> FreshImpulse(const Ngs2ReverbI3dl2Param& param, uint32_t grain,
-                                uint32_t channels = 1) {
+                                uint32_t channels = 1, uint32_t rate = 48000) {
 	Ngs2Reverb         fresh;
 	std::vector<float> block(size_t(grain) * channels, 0.0f);
-	fresh.Configure(param, 48000);
+	fresh.Configure(param, rate);
 	fresh.Process(block.data(), channels, grain);
 	for (uint32_t channel = 0; channel < channels; ++channel) {
 		block[size_t(channel) * grain] = 1.0f;
@@ -1353,6 +1354,296 @@ void TestCustomReverbNonFiniteInput() {
 	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
 	          !idle.HasTail(),
 	      "a grain of NaN was treated as sound");
+}
+
+// One case of the tail-end grid. A positive end_by is the latest the tail may end, about a
+// quarter above where it was measured to end, so a bound that turns much stricter and keeps
+// tails running longer than needed fails. 0 means the tail is still sounding after 70 s.
+struct TailCase {
+	float  decay_hf_ratio, decay, density, wet;
+	int    room_hf;
+	double end_by;
+};
+
+// Runs an impulse and then silence through a reverb, and checks when its tail ends. A twin
+// that can never end runs alongside. It gets the same input plus a 1e-30 sample each grain,
+// which keeps it sounding, so its output is the true continuation of the tail to far below the
+// threshold. For five seconds after the end the twin must stay at or under -120 dBFS.
+void RunTail(const TailCase& tail_case) {
+	constexpr uint32_t grain = 256, rate = 48000;
+	constexpr float    threshold = 1e-6f, keep_alive = 1e-30f;
+	constexpr double   still_sounding_at = 70.0, checked_after_end = 5.0;
+	auto               param = ReverbParam(tail_case.decay, 0, 0);
+	param.decay_hf_ratio     = tail_case.decay_hf_ratio;
+	param.density            = tail_case.density;
+	param.wet                = tail_case.wet;
+	param.room_hf            = tail_case.room_hf;
+	param.hf_reference       = 20.0f; // With roomHF in use, this puts its poles near 1.
+	Ngs2Reverb reverb, twin;
+	reverb.Configure(param, rate);
+	twin.Configure(param, rate);
+	std::vector<float> block(grain), twin_block(grain);
+	const double       run_for =
+        tail_case.end_by > 0 ? tail_case.end_by + checked_after_end : still_sounding_at;
+	double ended = -1.0;
+	for (uint32_t b = 0; double(b) * grain / rate < run_for; ++b) {
+		std::ranges::fill(block, 0.0f);
+		block[0]   = b == 1 ? 1.0f : 0.0f; // An impulse after the fade-in grain.
+		twin_block = block;
+		twin_block[0] += keep_alive;
+		reverb.Process(block.data(), 1, grain);
+		twin.Process(twin_block.data(), 1, grain);
+		if (ended < 0.0 && b > 1 && !reverb.HasTail()) {
+			ended = double(b + 1) * grain / rate;
+		}
+		Check(ended < 0.0 || std::ranges::all_of(twin_block, [&](float sample) {
+			      return std::fabs(sample) <= threshold;
+		      }),
+		      "reverb tail ended while what it held could still reach -120 dBFS");
+	}
+	Check(tail_case.end_by > 0 ? ended > 0.0 && ended <= tail_case.end_by : ended < 0.0,
+	      tail_case.end_by > 0 ? "reverb tail ran on long after it fell silent"
+	                           : "reverb ended a slow low end that was still sounding");
+}
+
+// The library most likely never ends a reverb tail, so ending one is an emulator shortcut that
+// must not be heard. The tail ends once nothing it holds can reach -120 dBFS, which the twin in
+// RunTail checks, and slow low ends at a high decay HF ratio keep running.
+//
+// The bound is a worst case for how the stored samples could line up, and real tails never get
+// near it. So the twin cannot tell when one of its terms is dropped or loosened, namely the
+// comb low-pass state, the all-pass scan, the all-pass gain bound, and roomHF's inner state.
+// Those terms are kept because they make the bound sound, not because a test sees them.
+void TestCustomReverbTailEnd() {
+	const TailCase cases[] = {
+	    {0.5f, 0.1f, 100, 1, 0, 1.2}, {0.5f, 5, 100, 1, 0, 12.7}, {0.5f, 20, 100, 1, 0, 50.5},
+	    {1, 0.1f, 100, 1, 0, 0.4},    {1, 5, 100, 1, 0, 14.5},    {1, 20, 100, 1, 0, 57.7},
+	    {1.5f, 0.1f, 100, 1, 0, 0.4}, {1.5f, 5, 100, 1, 0, 18.9}, {1.5f, 20, 100, 1, 0, 76.2},
+	    {2, 0.1f, 100, 1, 0, 0.4},    {2, 5, 100, 1, 0, 0},       {2, 20, 100, 1, 0, 0},
+	    {1, 5, 0, 1, 0, 14.5},        {1, 5, 100, 32, 0, 17.6},   {1, 1, 100, 1, -1000, 3.0}};
+	for (const auto& tail_case: cases) {
+		RunTail(tail_case);
+	}
+	// After the end the reverb is silent, and a new sound plays as through a fresh reverb.
+	const auto param = ReverbParam(0.1f, 0, 0);
+	Ngs2Reverb reverb;
+	reverb.Configure(param, 48000);
+	std::vector<float> block(256);
+	RunIntoTail(reverb, block, 256);
+	for (int b = 0; b < 100 && reverb.HasTail(); ++b) {
+		std::ranges::fill(block, 0.0f);
+		reverb.Process(block.data(), 1, 256);
+	}
+	std::ranges::fill(block, 0.0f);
+	reverb.Process(block.data(), 1, 256);
+	Check(!reverb.HasTail() &&
+	          std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "reverb was not silent after its tail ended");
+	block[0] = 1.0f;
+	reverb.Process(block.data(), 1, 256);
+	Check(block == FreshImpulse(param, 256), "reverb after its tail ended does not sound fresh");
+}
+
+// A reverb and a twin with the same settings. The twin gets a 1e-30 sample every grain, which
+// keeps its tail from ever ending, so it plays what the library would.
+struct TwinRig {
+	static constexpr uint32_t grain = 256, rate = 48000;
+	Ngs2Reverb                reverb, twin;
+	std::vector<float>        block = std::vector<float>(grain), twin_block = block;
+
+	// Sends the same settings to both.
+	void Configure(const Ngs2ReverbI3dl2Param& param) {
+		reverb.Configure(param, rate);
+		twin.Configure(param, rate);
+	}
+
+	// Renders one grain into both, with an impulse in it when `impulse` is set.
+	void Render(bool impulse) {
+		std::ranges::fill(block, 0.0f);
+		block[0]   = impulse ? 1.0f : 0.0f;
+		twin_block = block;
+		twin_block[0] += 1e-30f;
+		reverb.Process(block.data(), 1, grain);
+		twin.Process(twin_block.data(), 1, grain);
+	}
+
+	// Whether the reverb sounds like the twin. The twin may still hold a tail the reverb has
+	// dropped, which is under -120 dBFS, hence the small tolerance.
+	[[nodiscard]] bool MatchesTwin() const {
+		for (uint32_t i = 0; i < grain; ++i) {
+			if (!(std::fabs(block[i] - twin_block[i]) <= 2e-6f + std::fabs(twin_block[i]) * 1e-5f)) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
+// A tail that ends on its own keeps its wet and dry levels, since the library would have kept
+// running. So a dry change sent with the next sound ramps over that grain, as in the twin.
+void TestCustomReverbTailEndKeepsLevels() {
+	auto    param = ReverbParam(0.1f, 0, 0, 1.0f);
+	TwinRig rig;
+	rig.Configure(param);
+	rig.Render(false);
+	rig.Render(true);
+	for (int b = 0; b < 400 && rig.reverb.HasTail(); ++b) {
+		rig.Render(false);
+	}
+	Check(!rig.reverb.HasTail(), "reverb tail did not end");
+	param.dry = 0.0f;
+	rig.Configure(param);
+	rig.Render(true);
+	Check(rig.MatchesTwin(), "a tail that ended on its own jumped to new levels instead of ramping");
+}
+
+// A game may mute the reverb during silence and restore it later, and the library then plays
+// the rest of the tail. So a muted level must not let a loud tail end.
+void TestCustomReverbTailMutedThenRestored() {
+	// Half a second in, the history ring holds only silence but the tail is still loud.
+	constexpr uint32_t loud_grains = TwinRig::rate / 2 / TwinRig::grain;
+	constexpr int      muted_grains = 8, restored_grains = 40;
+	auto               param = ReverbParam(5.0f, 0, 0);
+	TwinRig            rig;
+	rig.Configure(param);
+	rig.Render(false);
+	rig.Render(true);
+	for (uint32_t b = 0; b < loud_grains; ++b) {
+		rig.Render(false);
+	}
+	param.reverb = -10000;
+	rig.Configure(param);
+	for (int b = 0; b < muted_grains; ++b) {
+		rig.Render(false);
+	}
+	param.reverb = 0;
+	rig.Configure(param);
+	for (int b = 0; b < restored_grains; ++b) {
+		rig.Render(false);
+		Check(rig.MatchesTwin(), "reverb dropped a loud tail while its level was muted");
+	}
+	Check(rig.reverb.HasTail(), "reverb dropped a loud tail while its level was muted");
+}
+
+// A reverb whose low end is still sounding ten minutes after the last sound, at a low rate so
+// the test runs quickly, and a twin kept sounding by a 1e-30 sample each grain.
+struct CeilingRig {
+	// The reverb's TailCeilingSeconds and CeilingFadeSeconds.
+	static constexpr uint32_t ceiling_seconds = 600, fade_seconds = 3;
+	static constexpr uint32_t grain = 256, rate = 8000;
+	static constexpr uint32_t ceiling_grains = ceiling_seconds * rate / grain;
+	static constexpr uint32_t fade_length    = fade_seconds * rate;
+	// The grain arithmetic below needs the ceiling to fall on a grain boundary.
+	static_assert(ceiling_seconds * rate % grain == 0);
+	Ngs2Reverb                reverb, twin;
+	std::vector<float>        block = std::vector<float>(grain), twin_block = block;
+	uint32_t                  next  = 0;
+
+	CeilingRig() {
+		auto param           = ReverbParam(20.0f, 0, 0);
+		param.decay_hf_ratio = 2.0f;
+		param.density        = 0.0f;
+		reverb.Configure(param, rate);
+		twin.Configure(param, rate);
+	}
+
+	// Renders one grain into both, with an impulse in it when `impulse` is set.
+	void Render(bool impulse = false) {
+		std::ranges::fill(block, 0.0f);
+		block[0]   = impulse || next == 1 ? 1.0f : 0.0f;
+		twin_block = block;
+		twin_block[0] += 1e-30f;
+		reverb.Process(block.data(), 1, grain);
+		twin.Process(twin_block.data(), 1, grain);
+		next++;
+	}
+
+	// Renders up to the grain where the ceiling is reached, with the tail sounding throughout
+	// from the impulse on. The impulse is grain 1, so the silence after it reaches the ceiling
+	// at the end of grain ceiling_grains + 1, and the fade starts on the grain after.
+	void RenderToCeiling() {
+		while (next < ceiling_grains + 2) {
+			Render();
+			Check(next < 2 || reverb.HasTail(), "reverb ended a slow low end before the ceiling");
+		}
+	}
+};
+
+// At the ceiling the tail fades out over a few seconds, as the twin times a falling level. Each
+// grain's level falls in a straight line from where the last grain left it. Afterwards the
+// reverb is silent, and a new sound plays at full wet as through a fresh reverb.
+void TestCustomReverbTailCeiling() {
+	CeilingRig     rig;
+	const uint32_t fade_length = CeilingRig::fade_length;
+	rig.RenderToCeiling();
+	float from = 1.0f;
+	for (uint32_t remaining = fade_length; remaining > 0;) {
+		remaining      = remaining > CeilingRig::grain ? remaining - CeilingRig::grain : 0;
+		const float to = static_cast<float>(remaining) / static_cast<float>(fade_length);
+		rig.Render();
+		for (uint32_t i = 0; i < CeilingRig::grain; ++i) {
+			const float level    = from + (to - from) * static_cast<float>(i) / CeilingRig::grain;
+			const float expected = rig.twin_block[i] * level;
+			Check(std::fabs(rig.block[i] - expected) <= 1e-4f * std::fabs(rig.twin_block[i]) + 1e-9f,
+			      "reverb did not fade its tail out over a few seconds at the ceiling");
+		}
+		from = to;
+	}
+	Check(!rig.reverb.HasTail(), "reverb tail did not end after the fade at the ceiling");
+	rig.Render();
+	Check(std::ranges::all_of(rig.block, [](float sample) { return sample == 0.0f; }),
+	      "reverb was not silent after the fade at the ceiling");
+	rig.Render(true);
+	auto param           = ReverbParam(20.0f, 0, 0);
+	param.decay_hf_ratio = 2.0f;
+	param.density        = 0.0f;
+	Check(rig.block == FreshImpulse(param, CeilingRig::grain, 1, CeilingRig::rate),
+	      "a new sound after the fade at the ceiling did not play at full wet");
+}
+
+// A new sound during the fade at the ceiling cancels it and keeps the tail. The wet level
+// climbs back in a straight line over that grain, and from then on the reverb sounds like the
+// twin that never faded. A roomHF pole of exactly 1, which only hf_reference at a multiple of
+// the rate gives, never settles, so that tail is never quiet.
+void TestCustomReverbTailCeilingCancel() {
+	constexpr uint32_t faded_grains = 3, grain = CeilingRig::grain;
+	CeilingRig         rig;
+	rig.RenderToCeiling();
+	for (uint32_t b = 0; b < faded_grains; ++b) {
+		rig.Render();
+	}
+	const float from = static_cast<float>(CeilingRig::fade_length - faded_grains * grain) /
+	                   static_cast<float>(CeilingRig::fade_length);
+	rig.Render(true);
+	for (uint32_t i = 0; i < grain; ++i) {
+		const float level = from + (1.0f - from) * static_cast<float>(i) / grain;
+		Check(std::fabs(rig.block[i] - rig.twin_block[i] * level) <=
+		          1e-4f * std::fabs(rig.twin_block[i]) + 1e-9f,
+		      "a new sound did not bring the wet level back over one grain");
+	}
+	for (uint32_t b = 0; b < CeilingRig::fade_length / grain + 1; ++b) {
+		rig.Render();
+		for (uint32_t i = 0; i < grain; ++i) {
+			Check(std::fabs(rig.block[i] - rig.twin_block[i]) <=
+			          1e-4f * std::fabs(rig.twin_block[i]) + 1e-9f,
+			      "a new sound did not cancel the fade at the ceiling");
+		}
+	}
+
+	auto param         = ReverbParam(1.0f, 0, 0);
+	param.room_hf      = -600;
+	param.hf_reference = 16000.0f;
+	Ngs2Reverb         stuck;
+	std::vector<float> block(256);
+	stuck.Configure(param, 16000);
+	// The filter then takes no input at all, so the output stays silent while its state can
+	// never be shown to settle. Only the ceiling ends such a tail.
+	for (int b = 0; b < 16000 * 10 / 256; ++b) {
+		std::ranges::fill(block, 0.0f);
+		block[0] = b == 1 ? 1.0f : 0.0f;
+		stuck.Process(block.data(), 1, 256);
+	}
+	Check(stuck.HasTail(), "reverb ended a tail whose roomHF filter never settles");
 }
 
 // A custom submixer with a reverb module, fed an impulse by a sampler voice. It is started with
@@ -2336,6 +2627,11 @@ int main() {
 	TestCustomReverbClearTail();
 	TestCustomReverbClearTailNewChannels();
 	TestCustomReverbNonFiniteInput();
+	TestCustomReverbTailEnd();
+	TestCustomReverbTailEndKeepsLevels();
+	TestCustomReverbTailMutedThenRestored();
+	TestCustomReverbTailCeiling();
+	TestCustomReverbTailCeilingCancel();
 	TestCustomReverbVoiceRestart();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();

@@ -99,7 +99,7 @@ public:
 	// sounding, or while new settings are pending, since the library starts their crossfade on
 	// the next grain whether or not there is sound.
 	[[nodiscard]] bool HasTail() const {
-		return m_tail_remaining != 0 || (m_configured && (m_reset || m_changed));
+		return m_active || (m_configured && (m_reset || m_changed));
 	}
 
 	// The length in samples of one channel's all-pass delay line, so tests can check how the
@@ -154,11 +154,15 @@ private:
 	};
 
 	// The steps of Process. They and the stateless helpers are defined in ngs2_reverb.cpp.
-	[[nodiscard]] bool  StartGrain(float* samples, size_t total);
+	[[nodiscard]] bool  StartGrain(float* samples, size_t total, uint32_t grain);
 	void                WriteHistory(uint32_t grain);
 	void                RunCombs(uint32_t grain);
 	void                MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset);
-	void                AdvanceTail(uint32_t grain);
+	void                EndTail(uint32_t grain);
+	void                DropTail();
+	[[nodiscard]] bool  IsQuiet() const;
+	[[nodiscard]] bool  RoomFilterQuiet(float limit) const;
+	[[nodiscard]] float FadeLevel(uint32_t grain) const;
 	void                RunTaps(const Taps& taps, const float* input, uint32_t grain, float* early,
 	                            float* late) const;
 	void                RenderTaps(uint32_t grain, float rate);
@@ -188,8 +192,15 @@ private:
 	// settings, as after a reset. ClearTail sets it, since levels from before the clear are stale
 	// and a channel added by a new setup has no last level even when no settings are pending.
 	bool m_restart_levels = false;
-	// Samples left until the tail is 120 dB down. 0 means the reverb is quiet.
-	uint32_t m_tail_remaining = 0;
+	// Whether the reverb still holds sound, so it must keep running on silent input.
+	bool m_active = false;
+	// Silent input samples since the last sound. The tail can only end once the history ring
+	// holds nothing but silence, and the ceiling counts from the last sound.
+	uint64_t m_silent_samples = 0;
+	// Samples left in the fade that ends a tail at the ceiling, and the fade's full length. No
+	// fade runs while m_fade_remaining is 0.
+	uint32_t m_fade_remaining = 0;
+	uint32_t m_fade_length    = 0;
 	// The last RingSamples samples of mono input, for the taps to read.
 	std::vector<float> m_ring;
 	// Where the next mono sample goes in m_ring.

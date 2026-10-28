@@ -21,11 +21,30 @@ constexpr float    TwoPi       = 2.0f * std::numbers::pi_v<float>;
 // The shortest all-pass delay line. A delay line needs at least one sample.
 constexpr int32_t MinAllpassLength = 1;
 
-// The combs fade 60 dB per decay time, so the tail is 120 dB down after two decay times.
-constexpr float TailDecayTimes        = 2.0f;
-constexpr float MillisecondsPerSecond = 1000.0f;
-// Covers the longest reflections delay (0.3 s) plus the longest reverb delay (0.1 s).
-constexpr float TailDelayMilliseconds = 400.0f;
+// The library most likely never ends a tail, so ending one is an emulator shortcut that must
+// not be heard. It ends once nothing stored can reach -120 dBFS at the output, 30 times below
+// a 16-bit step, so the clear that ends it is inaudible.
+constexpr float EndThreshold = 1e-6f;
+// Each channel sums eight combs. Their weights add up to at most 8 in size, at density 100, and
+// 6.42 at density 0.
+constexpr float CombSumBound = 8.0f;
+// The late level at reverb 0 mB and room 0 mB, with the library's 24 dB allowance for summing
+// the combs. The tail-end check never assumes a lower level, so a game that mutes the reverb
+// during silence and restores it later still hears the rest of the tail, as with the library.
+// It is the nominal level, not the highest, so a restore above 0 mB could bring back a dropped
+// tail at up to about -100 dBFS, still below a 16-bit step.
+constexpr float NominalLateMillibels = -2400.0f;
+// The all-pass gain is at most 0.5, so each of the four outputs at most twice the larger of
+// its input and what it holds.
+constexpr float AllpassGainBound = 16.0f;
+// With roomHF in use, what the filter still holds and the late reverb passing through it each
+// get half the threshold. Splitting it is conservative, since the filter in fact keeps the
+// larger of the two.
+constexpr float RoomFilterShare = 2.0f;
+// At a decay HF ratio near 2 the low end can ring for hours. A tail still above the threshold
+// this long after the last sound fades out over a few seconds instead of running on.
+constexpr uint32_t TailCeilingSeconds = 600;
+constexpr uint32_t CeilingFadeSeconds = 3;
 
 // The reflection patterns. Each has four tap times in ms after the reflections delay, and
 // a gain for each tap. A negative gain flips the echo's polarity.
@@ -115,6 +134,13 @@ void MixDown(const float* input, uint32_t channels, uint32_t grain, float* mono)
 	}
 }
 
+// Whether every sample is within `limit` in size. A NaN or inf never counts as within, so it
+// keeps the tail running.
+bool AllWithin(const std::vector<float>& samples, float limit) {
+	return std::ranges::all_of(samples,
+	                           [limit](float sample) { return std::fabs(sample) <= limit; });
+}
+
 } // namespace
 
 // Takes new settings, which apply from the next grain.
@@ -172,7 +198,7 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	// lets a grain of garbage count as silence.
 	std::replace_if(
 	    samples, samples + total, [](float sample) { return !std::isfinite(sample); }, 0.0f);
-	if (!StartGrain(samples, total)) {
+	if (!StartGrain(samples, total, grain)) {
 		return;
 	}
 	const float rate  = static_cast<float>(m_rate);
@@ -198,35 +224,45 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	m_reset          = false;
 	m_changed        = false;
 	m_restart_levels = false;
-	AdvanceTail(grain);
+	EndTail(grain);
 }
 
 // Empties the history and stops the tail. The level flag survives grains that StartGrain skips,
 // so it applies to the first grain that is actually mixed. That matters after a setup that adds
 // channels, which were never mixed and so have no levels to ramp from.
 void Ngs2Reverb::ClearTail() {
-	ClearHistory();
-	m_tail_remaining = 0;
+	DropTail();
 	m_restart_levels = true;
 }
 
-// Restarts the tail countdown when the grain has sound. Returns false, with `samples` set to
-// silence, when the input is silent, no tail is left and no settings are pending, so the
-// grain needs no further work.
-bool Ngs2Reverb::StartGrain(float* samples, size_t total) {
+// Empties the history and stops the tail but keeps the wet and dry levels. When a tail ends on
+// its own the library would have kept running, so the next sound ramps on from those levels.
+void Ngs2Reverb::DropTail() {
+	ClearHistory();
+	m_active         = false;
+	m_silent_samples = 0;
+	m_fade_remaining = 0;
+}
+
+// Keeps the tail running while the grain has sound, and counts the silence after it. Returns
+// false, with `samples` set to silence, when the input is silent, no tail is left and no
+// settings are pending, so the grain needs no further work.
+bool Ngs2Reverb::StartGrain(float* samples, size_t total, uint32_t grain) {
 	const bool silent_input =
 	    std::all_of(samples, samples + total, [](float sample) { return sample == 0.0f; });
 	if (!silent_input) {
-		// Any sound restarts the countdown to the end of the tail.
-		m_tail_remaining =
-		    Samples(TailDecayTimes * MillisecondsPerSecond * m_params.decay_time +
-		                TailDelayMilliseconds,
-		            float(m_rate));
-	} else if (m_tail_remaining == 0 && !m_reset && !m_changed) {
+		// Any sound restarts the tail and cancels a fade at the ceiling. Finishing the fade
+		// would fade out the new sound and then clear it from the history.
+		m_active         = true;
+		m_silent_samples = 0;
+		m_fade_remaining = 0;
+	} else if (!m_active && !m_reset && !m_changed) {
 		// Silent input and no tail left means silent output. Pending settings skip this,
 		// so their crossfade starts on the same grain as the library's would.
 		std::fill(samples, samples + total, 0.0f);
 		return false;
+	} else if (m_active) {
+		m_silent_samples += grain;
 	}
 	return true;
 }
@@ -260,24 +296,107 @@ void Ngs2Reverb::MixChannel(float* samples, uint32_t channel, uint32_t grain, bo
 	}
 	// Each level moves from where the last grain left it to the new setting over this grain.
 	// Right after a reset there is no last grain, so they start at the new settings.
-	const float wet = channel == LfeChannel ? 0.0f : m_params.wet;
+	// A fade at the ceiling lowers the wet target grain by grain, so the ramp carries it smoothly.
+	const float wet = channel == LfeChannel ? 0.0f : m_params.wet * FadeLevel(grain);
 	Ramp(out, reset ? wet : state.wet, wet, grain, out, false);
 	Ramp(out, reset ? m_params.dry : state.dry, m_params.dry, grain, in, true);
 	state.wet = wet;
 	state.dry = m_params.dry;
 }
 
-// Counts the tail down by one grain, and clears the history once it has run out.
-void Ngs2Reverb::AdvanceTail(uint32_t grain) {
-	if (m_tail_remaining == 0) {
+// Ends the tail after a silent grain once nothing stored can be heard. A tail still sounding
+// at the ceiling fades out over a few seconds instead, so a loud slow low end is not cut off.
+void Ngs2Reverb::EndTail(uint32_t grain) {
+	// No silence counted means this grain had sound.
+	if (!m_active || m_silent_samples == 0) {
 		return;
 	}
-	m_tail_remaining = m_tail_remaining > grain ? m_tail_remaining - grain : 0;
-	if (m_tail_remaining == 0) {
-		// The tail is now 120 dB down. Drop the tiny leftovers so the next sound starts from
-		// true silence.
-		ClearHistory();
+	if (m_fade_remaining != 0) {
+		m_fade_remaining = m_fade_remaining > grain ? m_fade_remaining - grain : 0;
+		if (m_fade_remaining == 0) {
+			DropTail();
+			// The library never faded, so the next sound plays at the full wet level.
+			for (uint32_t channel = 0; channel < MaxChannels; channel++) {
+				m_channels[channel].wet = channel == LfeChannel ? 0.0f : m_params.wet;
+			}
+		}
+		return;
 	}
+	if (m_silent_samples >= uint64_t(TailCeilingSeconds) * m_rate) {
+		m_fade_length    = CeilingFadeSeconds * m_rate;
+		m_fade_remaining = m_fade_length;
+		return;
+	}
+	// Until the history ring is all silence, a tap can still deliver the last sound.
+	if (m_silent_samples >= RingSamples && IsQuiet()) {
+		DropTail();
+	}
+}
+
+// Whether nothing stored can still reach EndThreshold at the output, so a clear steps the
+// output by no more than that. Each limit is the threshold divided by the most a stored sample
+// can grow on its way out. Written as !(x <= limit), a NaN or inf never counts as quiet. Most
+// grains of a tail stop at the first loud sample, so the full scan only runs near the end.
+bool Ngs2Reverb::IsQuiet() const {
+	const float budget =
+	    EndThreshold / (std::max(m_params.wet, 1.0f) * (m_room_filter ? RoomFilterShare : 1.0f));
+	// Like wet, the late level counts as at least nominal, since a game may raise it again.
+	const float late_gain  = std::max(m_late_gain, Millibels(NominalLateMillibels));
+	const float late_limit = budget / (late_gain * AllpassGainBound);
+	const float comb_limit = late_limit / CombSumBound;
+	// The cheap checks come first, so a tail held up by its filter state alone skips the scan.
+	if (!RoomFilterQuiet(budget)) {
+		return false;
+	}
+	// The low-pass state carries the slow low end when the decay HF ratio is above 1.
+	for (const auto& comb: m_combs) {
+		if (!(std::fabs(comb.lowpass) <= comb_limit) || !(std::fabs(comb.previous) <= comb_limit)) {
+			return false;
+		}
+	}
+	for (const auto& comb: m_combs) {
+		if (!AllWithin(comb.buffer, comb_limit)) {
+			return false;
+		}
+	}
+	for (const auto& channel: m_channels) {
+		for (const auto& allpass: channel.allpasses) {
+			if (!AllWithin(allpass.buffer, late_limit)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+// Whether the roomHF filter's state can still reach `limit`. Its last two outputs are not
+// enough, since with a pole near 1 the state can swing far above them. The first of the two
+// one-pole filters holds that swing, and its output is recovered from the last two outputs.
+// A pole of 1 never settles, so it is never quiet.
+bool Ngs2Reverb::RoomFilterQuiet(float limit) const {
+	if (!m_room_filter) {
+		return true;
+	}
+	const float pole = m_room_a1 * 0.5f;
+	if (!(pole < 1.0f)) {
+		return false;
+	}
+	for (const auto& channel: m_channels) {
+		const float inner = (channel.y1 - pole * channel.y2) / (1.0f - pole);
+		if (!(std::fabs(channel.y1) <= limit) || !(std::fabs(inner) <= limit)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// The share of the wet level left at the end of this grain while a ceiling fade runs.
+float Ngs2Reverb::FadeLevel(uint32_t grain) const {
+	if (m_fade_remaining == 0) {
+		return 1.0f;
+	}
+	const uint32_t left = m_fade_remaining > grain ? m_fade_remaining - grain : 0;
+	return static_cast<float>(left) / static_cast<float>(m_fade_length);
 }
 
 // Fills `early` with the four reflections and `late` with the late feed for this grain.

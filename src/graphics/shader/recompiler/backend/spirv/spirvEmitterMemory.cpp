@@ -1122,11 +1122,11 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 	});
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
+// One component of a formatted load through a V# selected at runtime: `selector` is the
+// component's DST_SEL (0 and 1 are constants, 4..7 the format's X..W).
+uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                                        uint32_t geometry, uint32_t selector) {
 	auto& state = ctx.state;
-	const auto geometry = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
-	                          state.indirect_format_geometry_function, buffer.format);
 	const auto field = [&](uint32_t index) {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, geometry, index);
@@ -1135,7 +1135,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	const auto bytes = field(0);
 	const auto component = Binary(
 	    state, spv::OpUMod, TypeU32(state),
-	    Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)), field(1));
+	    Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)), field(1));
 	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3));
 	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 	                         Unary(state, spv::OpNot, TypeU64(state), alignment));
@@ -1145,8 +1145,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	          Binary(state, spv::OpIMul, TypeU32(state), component, field(2))));
 	const auto memory = AndCondition(
 	    state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
-	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
-	           ConstantU32(state, 4)));
+	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector, ConstantU32(state, 4)));
 	const auto raw = EmitValueOrZeroIfCondition(
 	    state, AndCondition(state, memory, IndirectBufferInBounds(state, buffer, 0u, bytes, true)),
 	    [&]() {
@@ -1163,9 +1162,36 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	    });
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
-	                          state.indirect_format_function, buffer.format, buffer.selector,
+	                          state.indirect_format_function, buffer.format, selector,
 	                          component, raw);
 	return result;
+}
+
+uint32_t IndirectFormatGeometry(EmitterState& state, const IndirectBufferAccess& buffer) {
+	const auto geometry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
+	                          state.indirect_format_geometry_function, buffer.format);
+	return geometry;
+}
+
+// buffer_load_format_x/xy/xyz/xyzw through a runtime V#: each component takes its own DST_SEL
+// (X from the prepared buffer, the others from the V#'s DWORD 3 in `args`).
+uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                               const std::array<uint32_t, 8>& args, uint32_t components) {
+	auto& state = ctx.state;
+	const auto geometry = IndirectFormatGeometry(state, buffer);
+	if (components == 1u) {
+		return LoadIndirectFormattedComponent(ctx, buffer, geometry, buffer.selector);
+	}
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto selector =
+		    component == 0u ? buffer.selector
+		                    : EmitBitFieldUExtract(state, args[3], ConstantU32(state, component * 3u),
+		                                           ConstantU32(state, 3));
+		values[component] = LoadIndirectFormattedComponent(ctx, buffer, geometry, selector);
+	}
+	return ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1437,7 +1463,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			}
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
+			const auto result = memory.formatted ? LoadIndirectFormatted(ctx, buffer, args, components)
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);

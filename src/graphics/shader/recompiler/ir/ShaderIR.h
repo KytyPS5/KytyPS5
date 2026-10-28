@@ -89,7 +89,10 @@ struct MemoryInfo {
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
 		                        opcode == ValueOpcode::LoadBufferU32 ||
 		                        opcode == ValueOpcode::LoadBufferU32x2 ||

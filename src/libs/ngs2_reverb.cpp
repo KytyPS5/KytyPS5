@@ -13,10 +13,14 @@ constexpr uint32_t EarlyTaps = Ngs2Reverb::EarlyTaps;
 constexpr uint32_t Combs     = Ngs2Reverb::Combs;
 constexpr uint32_t Allpasses = Ngs2Reverb::Allpasses;
 
-// The history holds 300 ms at 48 kHz, enough for the longest reflections delay.
+// The history holds 300 ms at 48 kHz, enough for the longest reflections delay. Its size is
+// fixed, so at higher rates longer delays land on its far end, 75 ms at 192 kHz.
 constexpr uint32_t RingSamples = 14400;
-constexpr uint32_t LfeChannel  = 3;
-constexpr float    TwoPi       = 2.0f * std::numbers::pi_v<float>;
+// The highest sample rate the reverb accepts, the highest in common use. Far higher rates would
+// only allocate huge delay lines, and the sample counts worked out from them would overflow.
+constexpr uint32_t MaxRate    = 192000;
+constexpr uint32_t LfeChannel = 3;
+constexpr float    TwoPi      = 2.0f * std::numbers::pi_v<float>;
 
 // The shortest all-pass delay line. A delay line needs at least one sample.
 constexpr int32_t MinAllpassLength = 1;
@@ -162,8 +166,9 @@ bool AllWithin(const std::vector<float>& samples, float limit) {
 void Ngs2Reverb::Configure(const Ngs2ReverbI3dl2Param& param, uint32_t rate) {
 	// Every delay line and filter is built from the rate, and a rate of 0 would divide by zero.
 	// The whole update is ignored, as with a NaN setting, so a reverb that was never
-	// configured passes audio through.
-	if (rate == 0) {
+	// configured passes audio through. A configured one keeps its old settings and rate even
+	// though the system now runs at another, since a system set up that way is already broken.
+	if (rate == 0 || rate > MaxRate) {
 		return;
 	}
 	// The library ignores the whole update when any float setting is NaN.

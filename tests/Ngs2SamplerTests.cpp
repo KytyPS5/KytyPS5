@@ -1217,7 +1217,9 @@ void TestCustomReverbVoice() {
 }
 
 // Runs a fade-in grain, an impulse and four silent grains, so the reverb is left in the middle
-// of its tail.
+// of its tail. It expects 48 kHz and 256-sample grains. The last grain is 1024 to 1279 samples
+// after the impulse, where the first comb echoes land at that rate, but at many other rates the
+// echoes fall outside it and the check that a tail is sounding fails.
 void RunIntoTail(Ngs2Reverb& reverb, std::vector<float>& block, uint32_t grain) {
 	for (int b = 0; b < 6; ++b) {
 		std::ranges::fill(block, 0.0f);
@@ -1228,6 +1230,72 @@ void RunIntoTail(Ngs2Reverb& reverb, std::vector<float>& block, uint32_t grain) 
 	}
 	Check(std::ranges::any_of(block, [](float sample) { return sample != 0.0f; }),
 	      "reverb had no tail to clear");
+}
+
+// Rates above 192 kHz are refused like 0, since they would only size huge delay lines and
+// overflow the sample counts worked out from them. 192 kHz itself still works.
+void TestCustomReverbHighRates() {
+	constexpr uint32_t grain = 256, max_rate = 192000;
+	constexpr uint32_t refused[] = {max_rate + 1, std::numeric_limits<uint32_t>::max()};
+	std::vector<float> block(grain);
+	for (const uint32_t rate: refused) {
+		Ngs2Reverb high;
+		high.Configure(ReverbParam(1.0f, 0, 0), rate);
+		std::ranges::fill(block, 0.5f);
+		high.Process(block.data(), 1, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return sample == 0.5f; }) &&
+		          !high.HasTail(),
+		      "reverb accepted a sample rate above 192 kHz");
+	}
+
+	// The early reflections are at their -100 dB floor, so only the combs can pass the -80 dB
+	// threshold. The shortest comb is 22.01 ms, 4226 samples at this rate, so its first echo
+	// lands in grain 17, counting the fade-in grain as 0 and the impulse grain as 1.
+	constexpr int   top_grains = 40, first_comb_grain = 17;
+	constexpr float audible = 1e-4f;
+	Ngs2Reverb      top;
+	top.Configure(ReverbParam(1.0f, -10000, 0), max_rate);
+	// Accepted settings are pending, so the reverb runs on the next grain.
+	Check(top.HasTail(), "reverb refused a sample rate of 192 kHz");
+	bool tail = false;
+	for (int b = 0; b < top_grains; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = 1.0f; // An impulse after the fade-in grain.
+		}
+		top.Process(block.data(), 1, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "reverb at 192 kHz produced a non-finite sample");
+		Check(b >= first_comb_grain ||
+		          std::ranges::all_of(block,
+		                              [](float sample) { return std::fabs(sample) <= audible; }),
+		      "reverb at 192 kHz sounded before its first comb echo");
+		tail = tail ||
+		       std::ranges::any_of(block, [](float sample) { return std::fabs(sample) > audible; });
+	}
+	Check(tail, "reverb at 192 kHz produced no comb tail");
+}
+
+// A rate above 192 kHz is refused even by a running reverb, which keeps its old settings and
+// rate. It keeps sounding exactly like a twin that never got the update.
+void TestCustomReverbRefusedRateKeepsState() {
+	constexpr uint32_t grain = 256, refused_rate = 384000;
+	std::vector<float> block(grain);
+	const auto         param = ReverbParam(1.0f, 0, 0);
+	Ngs2Reverb         used, twin;
+	used.Configure(param, 48000);
+	twin.Configure(param, 48000);
+	std::vector<float> expected(grain);
+	RunIntoTail(used, block, grain);
+	RunIntoTail(twin, expected, grain);
+	used.Configure(ReverbParam(5.0f, 0, 0), refused_rate);
+	for (int b = 0; b < 4; ++b) {
+		std::ranges::fill(block, 0.0f);
+		std::ranges::fill(expected, 0.0f);
+		used.Process(block.data(), 1, grain);
+		twin.Process(expected.data(), 1, grain);
+		Check(block == expected, "a refused rate changed a running reverb");
+	}
 }
 
 // Runs a silent fade-in grain and then an impulse on every channel through a fresh reverb, and
@@ -2753,6 +2821,8 @@ int main() {
 	TestPitchClamps();
 	TestCustomReverbDsp();
 	TestCustomReverbLowRates();
+	TestCustomReverbHighRates();
+	TestCustomReverbRefusedRateKeepsState();
 	TestCustomReverbMatchesLibrary();
 	TestCustomReverbVoice();
 	TestCustomReverbClearTail();

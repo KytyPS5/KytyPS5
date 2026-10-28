@@ -469,8 +469,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
+	// Guest buffers are mirrors of host memory. Device memory is the scarce resource
+	// on 16 GiB cards, while this cache can be large streaming geometry/constants, so
+	// keep it in host-visible memory and leave device-local space for images.
 	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+	    m_graphics, m_scheduler, MemoryUsage::Upload, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),

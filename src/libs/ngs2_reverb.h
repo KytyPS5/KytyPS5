@@ -117,6 +117,10 @@ public:
 	// settings are kept, and the next sound starts at the current wet and dry levels.
 	void ClearTail();
 
+	// Whether Process has ever replaced a NaN or inf input sample with silence, so the caller can
+	// warn about it once. It stays set, since a game that sends garbage once is worth one warning.
+	[[nodiscard]] bool SawNonFiniteInput() const { return m_non_finite_input; }
+
 private:
 	// Where to read the history for the early reflections and the late feed.
 	struct Taps {
@@ -192,6 +196,8 @@ private:
 	// settings, as after a reset. ClearTail sets it, since levels from before the clear are stale
 	// and a channel added by a new setup has no last level even when no settings are pending.
 	bool m_restart_levels = false;
+	// Whether a NaN or inf input sample was ever replaced with silence.
+	bool m_non_finite_input = false;
 	// Whether the reverb still holds sound, so it must keep running on silent input.
 	bool m_active = false;
 	// Silent input samples since the last sound. The tail can only end once the history ring

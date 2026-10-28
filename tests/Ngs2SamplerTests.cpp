@@ -1356,6 +1356,42 @@ void TestCustomReverbNonFiniteInput() {
 	      "a grain of NaN was treated as sound");
 }
 
+// The reverb reports NaN or inf input so the voice can warn once. Clean audio never sets the
+// flag, and once set it stays through a clear and later clean grains. A reverb that skips the
+// grain, unconfigured or with too many channels, neither cleans nor reports it.
+void TestCustomReverbReportsNonFiniteInput() {
+	constexpr uint32_t grain = 256;
+	const auto         nan   = std::numeric_limits<float>::quiet_NaN();
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(ReverbParam(1.0f, 0, 0), 48000);
+	block[0] = 1.0f;
+	reverb.Process(block.data(), 1, grain);
+	Check(!reverb.SawNonFiniteInput(), "clean input was reported as NaN or inf");
+	std::ranges::fill(block, 0.0f);
+	block[5] = nan;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteInput(), "NaN input was not reported");
+	Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+	      "reported NaN input still reached the output");
+	reverb.ClearTail();
+	std::ranges::fill(block, 0.0f);
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteInput(), "the NaN report did not stay set");
+
+	Ngs2Reverb unconfigured;
+	block[5] = nan;
+	unconfigured.Process(block.data(), 1, grain);
+	Check(!unconfigured.SawNonFiniteInput() && std::isnan(block[5]),
+	      "an unconfigured reverb touched NaN input");
+	Ngs2Reverb         too_wide;
+	std::vector<float> wide(size_t(grain) * (Ngs2Reverb::MaxChannels + 1), nan);
+	too_wide.Configure(ReverbParam(1.0f, 0, 0), 48000);
+	too_wide.Process(wide.data(), Ngs2Reverb::MaxChannels + 1, grain);
+	Check(!too_wide.SawNonFiniteInput() && std::isnan(wide[0]),
+	      "a reverb given too many channels touched NaN input");
+}
+
 // One case of the tail-end grid. A positive end_by is the latest the tail may end, about a
 // quarter above where it was measured to end, so a bound that turns much stricter and keeps
 // tails running longer than needed fails. 0 means the tail is still sounding after 70 s.
@@ -2627,6 +2663,7 @@ int main() {
 	TestCustomReverbClearTail();
 	TestCustomReverbClearTailNewChannels();
 	TestCustomReverbNonFiniteInput();
+	TestCustomReverbReportsNonFiniteInput();
 	TestCustomReverbTailEnd();
 	TestCustomReverbTailEndKeepsLevels();
 	TestCustomReverbTailMutedThenRestored();

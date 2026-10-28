@@ -195,9 +195,13 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	const size_t total = size_t(channels) * grain;
 	// One NaN or inf would spread through every delay line for the rest of the tail. Zero adds
 	// nothing, where a clamp would turn garbage into a full-scale impulse. Doing it first also
-	// lets a grain of garbage count as silence.
-	std::replace_if(
-	    samples, samples + total, [](float sample) { return !std::isfinite(sample); }, 0.0f);
+	// lets a grain of garbage count as silence. The check comes first so clean audio, the usual
+	// case, is only read and never rewritten.
+	const auto non_finite = [](float sample) { return !std::isfinite(sample); };
+	if (std::any_of(samples, samples + total, non_finite)) {
+		m_non_finite_input = true;
+		std::replace_if(samples, samples + total, non_finite, 0.0f);
+	}
 	if (!StartGrain(samples, total, grain)) {
 		return;
 	}

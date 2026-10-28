@@ -552,6 +552,7 @@ struct Ngs2VoiceInternal {
 		uint32_t                 flags          = 1;
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
+		bool                     input_warned   = false; // NaN or inf reached the reverb.
 	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
@@ -1874,6 +1875,15 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					if (module.reverb != nullptr) {
 						module.reverb->Process(voice.Buffer(info.source_buffer_id, grain),
 						                       voice.channels, grain);
+						// The reverb already played the bad samples as silence. The warning
+						// points at the voice whose source chain makes them.
+						if (!module.input_warned && module.reverb->SawNonFiniteInput()) {
+							Log::WriteToConsoleAndLog(fmt::sprintf(
+							    "warning: NGS2 reverb at module index %zu of voice 0x%016" PRIx64
+							    " received NaN or inf input, treated as silence\n",
+							    m, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&voice))));
+							module.input_warned = true;
+						}
 					}
 					continue;
 				}

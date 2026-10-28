@@ -83,6 +83,42 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
+      # pgo/gtav.profdata was recorded with LLVM 22.1.8: a profile written by a newer
+      # LLVM than the compiler that reads it fails with "unsupported instrumentation profile format version",
+      # and the runner's Visual Studio ships an older clang-cl. Use the same version as the profile.
+      - name: Install LLVM 22.1.8
+        shell: pwsh
+        run: |
+          $version = "22.1.8"
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/S", "/D=C:\LLVM-$version" -Wait
+          "C:\LLVM-$version\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # A profile the compiler cannot read (or that is missing) must not fail the release: it is built
+      # without profile-guided optimization, with a warning.
+      - name: Check the PGO profile
+        shell: pwsh
+        run: |
+          $profile = (Join-Path $env:GITHUB_WORKSPACE "pgo/gtav.profdata") -replace '\\', '/'
+          $ok = $false
+          if (Test-Path $profile) {
+            & "C:\LLVM-22.1.8\bin\llvm-profdata.exe" show $profile *> $null
+            $ok = ($LASTEXITCODE -eq 0)
+          }
+          if ($ok) {
+            "KYTY_PGO_PROFILE=$profile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            # sccache does not hash the -fprofile-use file: give each profile its own cache so objects
+            # optimized with an older profile are never reused.
+            $hash = (Get-FileHash -Algorithm SHA256 $profile).Hash.Substring(0, 16)
+            "SCCACHE_GHA_VERSION=pgo-$hash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "::warning::pgo/gtav.profdata is missing or unreadable: building without PGO"
+            "KYTY_PGO_PROFILE=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          # The failed llvm-profdata call above must not fail the step through $LASTEXITCODE.
+          exit 0
+
       - name: Verify toolchain
         shell: cmd
         run: |
@@ -92,6 +128,7 @@ jobs:
           clang-cl --version
           glslangValidator --version
           echo Qt6_DIR=%Qt6_DIR%
+          echo PGO profile=%KYTY_PGO_PROFILE%
 
       - name: Configure
         shell: cmd
@@ -100,6 +137,8 @@ jobs:
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_NATIVE_V3=ON ^
+            -DKYTY_PGO_USE=%KYTY_PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^

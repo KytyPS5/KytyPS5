@@ -8041,6 +8041,94 @@ void TestFiniteInlineSampler() {
              "finite sampler planning accepted a shared SampleAdjust handle");
 }
 
+void TestNestedStructuredSamplerPhi() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // Builds a two-level structured merge selecting between memory-resident S# records.
+  // The condition source distinguishes a wave-uniform selection from a lane-varying one.
+  const auto build = [](bool uniform) {
+    auto fixture = std::make_unique<Fixture>(ShaderType::Pixel);
+    auto *entry = fixture->block;
+    auto *inner_branch = fixture->AddBlock();
+    auto *inner_tail = fixture->AddBlock();
+    auto *inner_merge = fixture->AddBlock();
+    auto *other = fixture->AddBlock();
+    auto *merge = fixture->AddBlock();
+    entry->AddBranch(inner_branch);
+    entry->AddBranch(other);
+    inner_branch->AddBranch(inner_tail);
+    inner_branch->AddBranch(inner_merge);
+    inner_tail->AddBranch(inner_merge);
+    inner_merge->AddBranch(merge);
+    other->AddBranch(merge);
+    const auto condition = [&](uint32_t index) {
+      const auto lhs = uniform ? fixture->UserData(index)
+                               : fixture->Emit(ValueOpcode::LaneId);
+      return fixture->Emit(ValueOpcode::IEqual32, {lhs, Value(0u)});
+    };
+    entry->condition = condition(0);
+    inner_branch->condition = condition(1);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = inner_branch, .false_block = other,
+                         .merge_block = merge};
+    inner_branch->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                .true_block = inner_tail, .false_block = inner_merge,
+                                .merge_block = inner_merge};
+    inner_tail->terminator = {.kind = CFG::TerminatorKind::Branch,
+                              .true_block = inner_merge};
+    inner_merge->terminator = {.kind = CFG::TerminatorKind::Branch,
+                               .true_block = merge};
+    other->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+
+    // Memory-resident S# words: the direct path cannot unify the differing constant-buffer
+    // offsets, so only a value-level Select lowering can describe this selection.
+    const auto base = fixture->Buffer({fixture->UserData(2), fixture->UserData(3),
+                                       Value(0u), Value(0u)});
+    const auto load = [&](Block *block, uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarBuffer;
+      memory.offset = offset;
+      return fixture->Emit(ValueOpcode::ReadConstBuffer, {base, Value(0u)},
+                           fixture->AddMemory(memory, pc), block);
+    };
+    const auto inner_low = load(inner_tail, 0u, 0x4c8u);
+    const auto inner_high = load(inner_branch, 16u, 0x480u);
+    const auto outer_other = load(other, 32u, 0x470u);
+    auto &inner = inner_merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    inner.AddPhiOperand(inner_tail, inner_low);
+    inner.AddPhiOperand(inner_branch, inner_high);
+    auto &outer = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    outer.AddPhiOperand(inner_merge, Value(&inner));
+    outer.AddPhiOperand(other, outer_other);
+    fixture->block = merge;
+    const auto sampler = fixture->Sampler({Value(&outer), Value(0u), Value(0u), Value(0u)});
+    const auto image = fixture->Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                       Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+                  {image, sampler, fixture->ImageAddress(), Value(true)},
+                  fixture->AddMemory(sample, 0x1dd0u));
+    return fixture;
+  };
+
+  auto fixture = build(true);
+  fixture->PlanAndTrack();
+  const auto root = fixture->program.memory_info[0].sampler;
+  const auto source = fixture->program.info.samplers[root].source;
+  const auto &descriptor = fixture->program.descriptor_sources[source];
+  const auto *dword0 = descriptor.dwords[0].ResolveInstruction();
+  Check(dword0 != nullptr && dword0->GetOpcode() == ValueOpcode::SelectU32,
+        "nested uniform sampler selection was not lowered into a Select");
+  Check(!descriptor.indirect_descriptor.has_value(),
+        "nested uniform sampler selection should not need a GPU-selected descriptor");
+
+  auto varying = build(false);
+  CheckFatal([&] { varying->PlanAndTrack(); }, "not a valid runtime value",
+             "nested lane-varying sampler selection was accepted");
+}
+
 void TestFiniteImageBitScanSentinel() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   for (const bool nonzero : {false, true}) {
@@ -9052,6 +9140,7 @@ int main() {
     Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
+    Run("nested structured sampler phi", TestNestedStructuredSamplerPhi);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);

@@ -153,6 +153,30 @@ void RenderContext::RunGarbageCollector() {
 	m_buffer_cache.RunGarbageCollector();
 }
 
+void RenderContext::RunPressureGarbageCollector() {
+	if (!m_graphics.CanReportMemoryUsage()) {
+		return;
+	}
+	const uint64_t budget = m_graphics.GetTotalMemoryBudget();
+	if (budget == 0) {
+		return;
+	}
+	const uint64_t usage = m_graphics.GetDeviceMemoryUsage();
+	// GetTotalMemoryBudget already leaves a 1 GiB device reserve. Keep another low
+	// watermark below it so a loading burst does not fragment the last few MiB.
+	constexpr uint64_t LowWatermark = 256ull * 1024 * 1024;
+	if (usage + LowWatermark < budget) {
+		return;
+	}
+
+	constexpr uint64_t CriticalHeadroom = 64ull * 1024 * 1024;
+	const bool         critical = usage >= budget || budget - usage < CriticalHeadroom;
+
+	m_image_heap.RunGarbageCollector(true);
+	m_texture_cache.RunGarbageCollector(true, critical);
+	m_buffer_cache.RunGarbageCollector(true, critical);
+}
+
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
 	Common::LockGuard lock(m_interrupt_mutex);
 

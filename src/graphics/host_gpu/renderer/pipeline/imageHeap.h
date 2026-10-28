@@ -47,8 +47,9 @@ public:
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
-	// At a suspend point.
-	void RunGarbageCollector();
+	// At a suspend point. Under memory pressure, also release large tables that no
+	// recent draw has acquired, so their images can be evicted.
+	void RunGarbageCollector(bool pressure = false);
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;

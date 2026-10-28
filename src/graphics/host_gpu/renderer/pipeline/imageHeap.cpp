@@ -607,11 +607,17 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	});
 }
 
-void ImageHeap::RunGarbageCollector() {
-	// A smaller table rebuilt each frame moves to a new base. Larger ones keep their dead words.
+void ImageHeap::RunGarbageCollector(bool pressure) {
+	// A smaller table rebuilt each frame moves to a new base. Larger ones keep their dead
+	// words, unless memory pressure makes their pinned images worth rebuilding later.
+	constexpr uint64_t StaleDraws = 2048;
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
-		if (memory->size >= MinTableBytes || memory->draw > m_suspend_draw) return false;
+		if (memory->size < MinTableBytes) {
+			if (memory->draw > m_suspend_draw) return false;
+		} else if (!pressure || memory->draw + StaleDraws >= m_draw) {
+			return false;
+		}
 		Drop(*memory);
 		return true;
 	});

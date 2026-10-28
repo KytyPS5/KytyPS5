@@ -707,6 +707,183 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// `S_AND_B64 VCC, EXEC, mask` followed by a VCC test reaches the IR as a per-lane
+	// bit test of a 64-bit scalar mask:
+	//   ((Select(LaneId < 32, lo, hi) >> (LaneId & 31)) & 1) != 0
+	// The subgroup reduction of that predicate depends only on lo and hi, so recover the
+	// uniform value the host walker can evaluate.
+	Value LaneMaskNonZero(Value predicate) {
+		predicate               = predicate.Resolve();
+		const auto* not_equal   = predicate.TryInstruction();
+		if (not_equal == nullptr || not_equal->GetOpcode() != ValueOpcode::INotEqual32) {
+			return {};
+		}
+		const auto zero = not_equal->Arg(1).Resolve();
+		if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u) {
+			return {};
+		}
+		Value bits = not_equal->Arg(0).Resolve();
+		if (const auto* masked = bits.TryInstruction();
+		    masked != nullptr && masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			const auto mask = masked->Arg(1).Resolve();
+			if (mask.IsImmediate() && mask.GetType() == Type::U32 && mask.U32() == 1u) {
+				bits = masked->Arg(0).Resolve();
+			}
+		}
+		const auto* shift = bits.TryInstruction();
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32) {
+			return {};
+		}
+		Value lane = shift->Arg(1).Resolve();
+		if (const auto* masked = lane.TryInstruction();
+		    masked != nullptr && masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			const auto mask = masked->Arg(1).Resolve();
+			if (mask.IsImmediate() && mask.GetType() == Type::U32 && mask.U32() == 31u) {
+				lane = masked->Arg(0).Resolve();
+			}
+		}
+		const auto* lane_id = lane.TryInstruction();
+		if (lane_id == nullptr || lane_id->GetOpcode() != ValueOpcode::LaneId) {
+			return {};
+		}
+		const auto* select = shift->Arg(0).Resolve().TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
+		    select->NumArgs() != 3u) {
+			return {};
+		}
+		const auto* bound = select->Arg(0).Resolve().TryInstruction();
+		if (bound == nullptr || bound->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    bound->Arg(0).Resolve().TryInstruction() != lane_id) {
+			return {};
+		}
+		const auto limit = bound->Arg(1).Resolve();
+		if (!limit.IsImmediate() || limit.GetType() != Type::U32 || limit.U32() != 32u) {
+			return {};
+		}
+		const auto lo = select->Arg(1).Resolve();
+		const auto hi = select->Arg(2).Resolve();
+		const auto is_zero = [](Value value) {
+			value = value.Resolve();
+			return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == 0u;
+		};
+		// Both halves of the WQM/EXEC mask gated by one scalar predicate: a live wave has
+		// at least one enabled lane, so the reduction is exactly that predicate.
+		const auto shared_predicate = [&](Value a, Value b) -> Value {
+			const auto* first  = a.TryInstruction();
+			const auto* second = b.TryInstruction();
+			if (first == nullptr || second == nullptr ||
+			    first->GetOpcode() != ValueOpcode::SelectU32 ||
+			    second->GetOpcode() != ValueOpcode::SelectU32 || first->NumArgs() != 3u ||
+			    second->NumArgs() != 3u ||
+			    first->Arg(0).Resolve() != second->Arg(0).Resolve() ||
+			    !is_zero(first->Arg(2)) || !is_zero(second->Arg(2)) ||
+			    is_zero(first->Arg(1)) || is_zero(second->Arg(1))) {
+				return {};
+			}
+			const auto condition = first->Arg(0).Resolve();
+			return ValidateRuntimeValue(m_program, condition, RuntimeValueType::Integer) ? condition
+			                                                                            : Value {};
+		};
+		if (const auto shared = shared_predicate(lo, hi); !shared.IsEmpty()) {
+			return shared;
+		}
+		if (m_program.wave_size <= 32u) {
+			if (!ValidateRuntimeValue(m_program, lo)) {
+				return {};
+			}
+			auto& nonzero = m_program.value_storage.emplace_back(ValueOpcode::INotEqual32);
+			nonzero.SetArg(0, Value(0u));
+			nonzero.SetArg(1, lo);
+			return Value(&nonzero);
+		}
+		if (!ValidateRuntimeValue(m_program, lo) || !ValidateRuntimeValue(m_program, hi)) {
+			return {};
+		}
+		auto& bits_or = m_program.value_storage.emplace_back(ValueOpcode::BitwiseOr32);
+		bits_or.SetArg(0, lo);
+		bits_or.SetArg(1, hi);
+		auto& nonzero = m_program.value_storage.emplace_back(ValueOpcode::INotEqual32);
+		nonzero.SetArg(0, Value(0u));
+		nonzero.SetArg(1, Value(&bits_or));
+		return Value(&nonzero);
+	}
+
+	// Turn a native branch condition into a scalar value the SRT walker can evaluate.
+	// Returns an empty value when the condition is genuinely lane-varying.
+	Value UniformControlCondition(Value value) {
+		value = value.Resolve();
+		// Preserve every condition that was already known to be uniform, including scalar
+		// SCC branches and expressions mixing them with lane masks.
+		if (ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer)) {
+			return value;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return {};
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::LogicalNot: {
+				const auto inner = UniformControlCondition(inst->Arg(0));
+				if (inner.IsEmpty()) {
+					return {};
+				}
+				auto& result = m_program.value_storage.emplace_back(ValueOpcode::LogicalNot);
+				result.SetArg(0, inner);
+				return Value(&result);
+			}
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr: {
+				const auto left  = UniformControlCondition(inst->Arg(0));
+				const auto right = UniformControlCondition(inst->Arg(1));
+				if (left.IsEmpty() || right.IsEmpty()) {
+					return {};
+				}
+				auto& result = m_program.value_storage.emplace_back(inst->GetOpcode());
+				result.SetArg(0, left);
+				result.SetArg(1, right);
+				return Value(&result);
+			}
+			case ValueOpcode::ConditionRef: {
+				const auto kind    = inst->Flags<CFG::BranchCondition>();
+				const bool zero    = kind == CFG::BranchCondition::SccZero ||
+				                  kind == CFG::BranchCondition::VccZero ||
+				                  kind == CFG::BranchCondition::ExecZero;
+				const bool nonzero = kind == CFG::BranchCondition::SccNonZero ||
+				                     kind == CFG::BranchCondition::VccNonZero ||
+				                     kind == CFG::BranchCondition::ExecNonZero;
+				if (!zero && !nonzero) {
+					return {};
+				}
+				const auto reduced = LaneMaskNonZero(inst->Arg(0));
+				if (reduced.IsEmpty()) {
+					return {};
+				}
+				if (!zero) {
+					return reduced;
+				}
+				auto& result = m_program.value_storage.emplace_back(ValueOpcode::LogicalNot);
+				result.SetArg(0, reduced);
+				return Value(&result);
+			}
+			default:
+				return ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer)
+				           ? value
+				           : Value {};
+		}
+	}
+
+	// The condition a descriptor select can use. Compute shaders keep the strict immutable
+	// requirement; elsewhere a native branch that reduces to a uniform scalar is enough.
+	Value DescriptorCondition(const Block& branch) {
+		if (m_shader_writes) {
+			return ValidateRuntimeValue(m_program, branch.condition,
+			                            RuntimeValueType::ImmutableInteger)
+			           ? branch.condition
+			           : Value {};
+		}
+		return UniformControlCondition(branch.condition);
+	}
+
 	Value LowerDescriptorValue(Value value) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
@@ -730,56 +907,179 @@ private:
 			if (projected != nullptr) cached->second = Value(projected);
 			return cached->second;
 		}
-		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
-			return value;
+		if (const auto lowered = LowerDiamondPhi(*inst); !lowered.IsEmpty()) {
+			cached->second = lowered;
+			return cached->second;
 		}
-		const auto* merge = inst->Parent();
-		const auto* branch = inst->PhiBlock(0);
-		if (merge == nullptr || branch == nullptr || inst->PhiBlock(1) == nullptr ||
-		    branch == inst->PhiBlock(1)) {
-			return value;
+		if (const auto lowered = LowerStructuredPhi(*inst); !lowered.IsEmpty()) {
+			cached->second = lowered;
+			return cached->second;
+		}
+		return value;
+	}
+
+	// A two-arm diamond whose arms are single-predecessor tails into the merge.
+	Value LowerDiamondPhi(const Inst& inst) {
+		if (inst.NumArgs() != 2u || inst.NumPhiBlocks() != 2u || inst.GetType() != Type::U32) {
+			return {};
+		}
+		const auto* merge  = inst.Parent();
+		const auto* branch = inst.PhiBlock(0);
+		if (merge == nullptr || branch == nullptr || inst.PhiBlock(1) == nullptr ||
+		    branch == inst.PhiBlock(1)) {
+			return {};
 		}
 		if (branch->ImmSuccessors().size() != 2u) {
 			if (branch->ImmPredecessors().size() != 1u) {
-				return value;
+				return {};
 			}
 			branch = branch->ImmPredecessors()[0];
 		}
 		if (branch == merge || branch->ImmSuccessors().size() != 2u) {
-			return value;
+			return {};
 		}
 		std::array<const Block*, 2> targets;
 		for (uint32_t arm = 0; arm < 2; arm++) {
-			const auto* incoming = inst->PhiBlock(arm);
+			const auto* incoming = inst.PhiBlock(arm);
 			if (incoming == merge ||
 			    (incoming != branch &&
 			     (incoming->ImmPredecessors().size() != 1u ||
 			      incoming->ImmPredecessors()[0] != branch ||
 			      incoming->ImmSuccessors().size() != 1u ||
 			      incoming->ImmSuccessors()[0] != merge))) {
-				return value;
+				return {};
 			}
 			targets[arm] = incoming == branch ? merge : incoming;
 		}
-		const auto& info = *branch;
-		const auto& term = info.terminator;
+		const auto& term = branch->terminator;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
-		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
-			return value;
+		      (term.false_block == targets[0] && term.true_block == targets[1]))) {
+			return {};
+		}
+		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
+		auto       condition = DescriptorCondition(*branch);
+		if (condition.IsEmpty() && m_approximate_sampler_select) {
+			if (!m_logged_approximate_sampler) {
+				LOGF("ShaderRecompiler: sampler descriptor selected by lane-varying state; "
+				     "using the true-path variant (approximate)\n");
+				m_logged_approximate_sampler = true;
+			}
+			const auto value = LowerDescriptorValue(inst.Arg(true_arg));
+			return ValidateRuntimeValue(m_program, value) ? value : Value {};
+		}
+		if (condition.IsEmpty()) {
+			return {};
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
-		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
-		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-		selected.SetArg(0, info.condition);
-		selected.SetArg(1, inst->Arg(true_arg));
-		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
-		cached->second = Value(&selected);
-		return cached->second;
+		const auto true_value  = LowerDescriptorValue(inst.Arg(true_arg));
+		const auto false_value = LowerDescriptorValue(inst.Arg(true_arg ^ 1u));
+		if (!ValidateRuntimeValue(m_program, true_value) ||
+		    !ValidateRuntimeValue(m_program, false_value)) {
+			return {};
+		}
+		auto& selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+		selected.SetArg(0, condition);
+		selected.SetArg(1, true_value);
+		selected.SetArg(2, false_value);
+		return Value(&selected);
+	}
+
+	static bool ReachesBefore(const Block* from, const Block* target, const Block* stop) {
+		if (from == nullptr || target == nullptr) {
+			return false;
+		}
+		std::vector<const Block*> pending {from};
+		std::vector<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == nullptr || block == stop ||
+			    std::ranges::find(visited, block) != visited.end()) {
+				continue;
+			}
+			visited.push_back(block);
+			if (block == target) {
+				return true;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				pending.push_back(successor);
+			}
+		}
+		return false;
+	}
+
+	// A structured merge whose controlling conditional branch nominates this block as its
+	// merge. The two arms may themselves contain nested merges, so lower them recursively.
+	Value LowerStructuredPhi(const Inst& inst) {
+		if (inst.NumArgs() != 2u || inst.NumPhiBlocks() != 2u || inst.GetType() != Type::U32) {
+			return {};
+		}
+		const auto* merge = inst.Parent();
+		if (merge == nullptr) {
+			return {};
+		}
+		const Block* branch = nullptr;
+		for (const auto* candidate: m_program.blocks) {
+			if (candidate->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    candidate->terminator.merge_block == merge) {
+				branch = candidate;
+				break;
+			}
+		}
+		if (branch == nullptr) {
+			return {};
+		}
+		const auto& term = branch->terminator;
+		std::array<Value, 2> values;
+		std::array<bool, 2>  found {};
+		for (uint32_t arm = 0; arm < inst.NumArgs(); ++arm) {
+			const auto* incoming = inst.PhiBlock(arm);
+			uint32_t    side     = 2u;
+			if (incoming == branch) {
+				if (term.true_block == merge) {
+					side = 0u;
+				} else if (term.false_block == merge) {
+					side = 1u;
+				}
+			} else if (ReachesBefore(term.true_block, incoming, merge)) {
+				side = 0u;
+			} else if (ReachesBefore(term.false_block, incoming, merge)) {
+				side = 1u;
+			}
+			if (side >= 2u || found[side]) {
+				return {};
+			}
+			found[side]  = true;
+			values[side] = inst.Arg(arm);
+		}
+		if (!found[0] || !found[1]) {
+			return {};
+		}
+		auto condition = DescriptorCondition(*branch);
+		if (condition.IsEmpty() && m_approximate_sampler_select) {
+			if (!m_logged_approximate_sampler) {
+				LOGF("ShaderRecompiler: sampler descriptor selected by lane-varying state; "
+				     "using the true-path variant (approximate)\n");
+				m_logged_approximate_sampler = true;
+			}
+			const auto value = LowerDescriptorValue(values[0]);
+			return ValidateRuntimeValue(m_program, value) ? value : Value {};
+		}
+		if (condition.IsEmpty()) {
+			return {};
+		}
+		const auto true_value  = LowerDescriptorValue(values[0]);
+		const auto false_value = LowerDescriptorValue(values[1]);
+		if (!ValidateRuntimeValue(m_program, true_value) ||
+		    !ValidateRuntimeValue(m_program, false_value)) {
+			return {};
+		}
+		auto& selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+		selected.SetArg(0, condition);
+		selected.SetArg(1, true_value);
+		selected.SetArg(2, false_value);
+		return Value(&selected);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -791,6 +1091,8 @@ private:
 			descriptor = resolved->source;
 			return;
 		}
+		const bool previous_approximation = m_approximate_sampler_select;
+		m_approximate_sampler_select      = sampler && !m_shader_writes;
 		if (handle.NumArgs() != width) {
 			Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
@@ -811,6 +1113,7 @@ private:
 			descriptor.dwords[3] = Value(0u);
 		}
 		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
+		m_approximate_sampler_select = previous_approximation;
 	}
 
 	uint32_t ScalarReadBase(const Inst& read) const {
@@ -2937,8 +3240,28 @@ private:
 			if (indexed) {
 				if (handle.NumArgs() != 8u) return false;
 				const auto* selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
-				if (selected == nullptr) return false;
-				const auto* extract = selected->Arg(1).Resolve().TryInstruction();
+				Value       material_guard;
+				const auto* extract = selected != nullptr
+				    ? selected->Arg(1).Resolve().TryInstruction()
+				    : nullptr;
+				if (selected != nullptr) {
+					material_guard = selected->Arg(0).Resolve();
+				} else {
+					// `V_READLANE` of a per-lane table load: the GPU selects the
+					// descriptor slot, so the load is the table read. A guarded
+					// select keeps the previous descriptor for inactive lanes.
+					if (read->GetOpcode() != ValueOpcode::ReadLane || read->NumArgs() != 2u)
+						return false;
+					const auto local = read->Arg(0).Resolve();
+					const auto* select = local.TryInstruction();
+					if (select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32 &&
+					    select->NumArgs() == 3u) {
+						extract        = select->Arg(1).Resolve().TryInstruction();
+						material_guard = select->Arg(0).Resolve();
+					} else {
+						extract = local.TryInstruction();
+					}
+				}
 				if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 				    !ImmediateU32(extract->Arg(1), component) || component >= 4u) return false;
 				read = extract->Arg(0).Resolve().TryInstruction();
@@ -2951,10 +3274,12 @@ private:
 				    !memory->idxen || memory->offen || memory->data_bits != 32u ||
 				    memory->data_dwords != 4u ||
 				    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
-				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-				    !EquivalentValue(m_program, read->Arg(4), selected->Arg(0)) ||
-				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4)))) return false;
-				table_guard = read->Arg(4);
+				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u) return false;
+				const auto guard = read->Arg(4).Resolve();
+				if (!material_guard.IsEmpty() &&
+				    !EquivalentValue(m_program, guard, material_guard)) return false;
+				if (dword != 0u && !EquivalentValue(m_program, table_guard, guard)) return false;
+				table_guard = guard;
 			}
 			if (memory->offset > INT32_MAX || (!allow_fixed && (memory->offset & 3u) != 0u) ||
 			    !MemoryIndexBelongsTo(memory_index, *read)) {
@@ -3214,6 +3539,7 @@ private:
 		indirect.table_offset = table_offset;
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
+		indirect.indexed = plan.table_indexed;
 		indirect.workgroup_axis = WorkgroupAxis(key);
 		if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
@@ -4359,6 +4685,10 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
+	// Sampler descriptors selected by lane-varying state cannot be evaluated on the host.
+	// Fall back to the true-path variant instead of aborting compilation.
+	bool                                       m_approximate_sampler_select = false;
+	bool                                       m_logged_approximate_sampler = false;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,

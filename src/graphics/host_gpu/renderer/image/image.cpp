@@ -225,6 +225,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	// Every use of the image goes through here, also when no barrier is needed: the cache keeps
+	// a released image until the GPU has finished the last tick that used it.
+	tick_accessed_last = std::max(tick_accessed_last, m_scheduler.CurrentTick());
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -736,9 +739,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		// Let InsertImage evict idle images and retry; it exits if nothing can be freed.
+		allocation_failed = true;
+		return;
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,

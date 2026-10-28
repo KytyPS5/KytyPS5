@@ -119,14 +119,16 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		m_bda_pagetable_buffer->EnsureResident(table_offset,
+		                                       size_pages * sizeof(vk::DeviceAddress));
+		WriteDataBuffer(*m_bda_pagetable_buffer, table_offset, addresses.data(),
+		                addresses.size() * sizeof(vk::DeviceAddress));
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -135,15 +137,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		m_bda_pagetable_buffer->Fill(table_offset, size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, LruClock());
 	}
 }
 
@@ -152,11 +153,18 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
-	} else {
-		m_slot_buffers.erase(id);
+	// Command buffers submitted earlier may still use the buffer on the GPU.
+	m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+}
+
+void BufferCache::ReleaseBuffer(BufferId id) {
+	const auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer != nullptr && !m_scheduler.IsFree(buffer->last_use_tick)) {
+		// Bound after it was dropped, in a tick the GPU has not finished: keep it until then.
+		m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+		return;
 	}
+	m_slot_buffers.erase(id);
 }
 
 template <bool async>
@@ -245,8 +253,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+      // One entry per 16 KiB page of the whole guest address space (768 MiB). Sparse where the
+      // device allows, so only the parts covering mapped guest memory take device memory.
+      m_bda_pagetable_buffer(
+          graphics.sparse_buffer_enabled
+              ? std::make_unique<Buffer>(graphics, scheduler, AllFlags, BDA_PAGETABLE_SIZE,
+			                             SparseResidency {1ull << 20u})
+			  : std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+			                             BDA_PAGETABLE_SIZE)),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -255,10 +269,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer->Handle(),
 	                     "BDA Page Table Buffer");
 	m_scheduler.BeginCommand();
-	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+	for (auto* buffer: {m_bda_pagetable_buffer.get(), m_fault_manager.GetFaultBuffer()}) {
 		buffer->Fill(0, buffer->Size(), 0);
 	}
 	const auto null_id =
@@ -322,6 +336,43 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			QueueBdaSync(vaddr, size);
 		}
 	});
+}
+
+uint64_t BufferCache::EvictCleanForAllocation(uint64_t target_bytes) {
+	if (target_bytes == 0) {
+		return 0;
+	}
+	const auto clock = LruClock();
+	if (clock == 0) {
+		return 0;
+	}
+
+	uint64_t freed = 0;
+	m_lru_cache.ForEachItemBelow(clock - 1, [&](BufferId id) {
+		if (id == NULL_BUFFER_ID) {
+			return false;
+		}
+		auto* buffer = m_slot_buffers.try_get(id);
+		if (buffer == nullptr || buffer->is_deleted ||
+		    !m_scheduler.IsFree(buffer->last_use_tick)) {
+			return false;
+		}
+		if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size()) ||
+		    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
+			return false;
+		}
+		freed += buffer->AllocatedSize();
+		DeleteBufferForAllocation(id);
+		return freed >= target_bytes;
+	});
+	return freed;
+}
+
+void BufferCache::DeleteBufferForAllocation(BufferId id) {
+	auto& buffer = m_slot_buffers[id];
+	m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+	Unregister(id);
+	ReleaseBuffer(id);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -407,13 +458,22 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+	constexpr uint64_t AllocationHeadroom = 256ull << 20u;
+	if (m_graphics.CanReportMemoryUsage() &&
+	    m_graphics.GetDeviceMemoryUsage() + AllocationHeadroom >=
+	        m_graphics.GetTotalMemoryBudget()) {
+		(void)EvictCleanForAllocation(64ull << 20u);
+	}
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
+	// Guest buffers are mirrors of host memory. Device memory is the scarce resource
+	// on 16 GiB cards, while this cache can be large streaming geometry/constants, so
+	// keep it in host-visible memory and leave device-local space for images.
 	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+	    m_graphics, m_scheduler, MemoryUsage::Upload, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
@@ -518,6 +578,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
+	buffer.last_use_tick = m_scheduler.CurrentTick();
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -535,6 +596,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
+			buffer.last_use_tick = m_scheduler.CurrentTick();
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 			return {&buffer, buffer.Offset(vaddr)};
@@ -662,30 +724,34 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+uint64_t BufferCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
+void BufferCache::RunGarbageCollector(bool force_pressure, bool force_critical) {
+	m_gc_tick++;
+	const auto clock  = LruClock();
+	const bool forced = force_pressure || force_critical;
+	if (forced && clock == 0) {
+		// Before the first presented frame there is no safe age basis for emergency eviction.
+		return;
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (!forced && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const bool     aggressive = forced || m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
-			return false;
-		}
 		if (dirty) {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);

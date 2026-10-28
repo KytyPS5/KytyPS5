@@ -149,6 +149,8 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Set when CreateImage could not allocate backing; InsertImage evicts and retries.
+	bool             allocation_failed = false;
 	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

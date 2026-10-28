@@ -60,6 +60,9 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// Pressure-gated cache GC for submission boundaries. Unlike RunGarbageCollector it skips
+	// image-heap aging and download processing, which belong at a frame boundary.
+	void               RunPressureGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

@@ -10550,6 +10550,36 @@ void TestNewShaderRecompilerNativeU64Translation() {
         "captured VOP3 V_LSHLREV_B64 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
 
+  const uint32_t ashrrev_i64_shader[] = {
+      0xd7010001u, 0x0000d50cu, // v_ashrrev_i64 v[1:2], v12, vcc
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_ashrrev_i64;
+  ShaderRecompiler::Decoder::DecodeInstruction(ashrrev_i64_shader, 0u,
+                                               decoded_ashrrev_i64);
+  Check(decoded_ashrrev_i64.opcode == Decoder::Opcode::V_ASHRREV_I64 &&
+            decoded_ashrrev_i64.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_i64.dst.reg == 1u &&
+            decoded_ashrrev_i64.src_count == 2u &&
+            decoded_ashrrev_i64.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_i64.src0.reg == 12u &&
+            decoded_ashrrev_i64.src1.kind == Decoder::OperandKind::VccLo,
+        "decoder rejected VOP3 V_ASHRREV_I64 fields");
+  result = RecompileForTest(ashrrev_i64_shader, options);
+  Check((result.decoded_dump.find("V_ASHRREV_I64 v1, v12, vcc_lo") != std::string::npos),
+        "VOP3 V_ASHRREV_I64 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // Exact encoding captured from the failing mission pixel shader (VOP3 opcode 0x301).
+  const uint32_t ashrrev_captured[] = {0xd7010007u, 0x00020498u, EncodeSopp(0x01)};
+  Decoder::Instruction decoded_ashrrev_captured;
+  ShaderRecompiler::Decoder::DecodeInstruction(ashrrev_captured, 0u,
+                                               decoded_ashrrev_captured);
+  Check(decoded_ashrrev_captured.opcode == Decoder::Opcode::V_ASHRREV_I64 &&
+            decoded_ashrrev_captured.family == Decoder::Family::VOP3 &&
+            decoded_ashrrev_captured.src_count == 2u,
+        "captured VOP3 V_ASHRREV_I64 opcode 0x301 was not decoded");
+
   const uint32_t cmpx_i64_shader[] = {
       0xd4b5007eu, 0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
       EncodeSopp(0x01),

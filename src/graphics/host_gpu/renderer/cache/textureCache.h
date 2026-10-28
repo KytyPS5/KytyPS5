@@ -78,7 +78,9 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void RunGarbageCollector();
+	// force_pressure/force_critical are set by the allocation/submission pressure gate when
+	// total device usage is high even if this cache's own bytes are below its thresholds.
+	void RunGarbageCollector(bool force_pressure = false, bool force_critical = false);
 
 private:
 	struct MetaDataInfo {
@@ -112,11 +114,18 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, ImageId keep = {});
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
-	void                      DeleteImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	void                      DeleteImage(ImageId id, bool release_now = false);
+	void                      ReleaseImage(ImageId id);
+	void                      FreeImage(ImageId id, bool release_now = false);
+	// Allocation-path pressure valve. Caller holds m_lock. Releases clean images the GPU is
+	// done with, except `keep`, bound/target and heap-resident images.
+	uint64_t                  EvictForAllocation(ImageId keep, uint64_t target_bytes);
+	// Allocation-failure fallback: evict older GPU-written images with write-back. This is a
+	// last-resort path for low-VRAM devices; it can churn and stall.
+	bool                      EvictForAllocationFailure(ImageId keep);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -185,6 +194,11 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_gc_budget_frame        = 0;
+	uint64_t         m_gc_freed_bytes_frame   = 0;
+	size_t           m_gc_freed_images_frame  = 0;
+	uint64_t         m_gc_written_back_bytes_frame = 0;
+	[[nodiscard]] uint64_t LruClock() const noexcept;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 

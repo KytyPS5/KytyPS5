@@ -565,6 +565,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_LSHRREV_B64:
 			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightLogical64, IR::Type::U64, true,
 			                     false, false);
+		case O::V_ASHRREV_I64:
+			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightArithmetic64, IR::Type::U64, true,
+			                     false, false);
 
 		case O::V_XNOR_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseXor32, false, true, false);

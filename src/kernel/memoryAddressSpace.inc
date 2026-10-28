@@ -203,6 +203,9 @@ public:
 		}
 		std::lock_guard lock(m_mutex);
 		std::memset(m_backing_base + backing_offset, 0, size);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		g_test_backing_bytes_zeroed += size;
+#endif
 		return true;
 	}
 
@@ -287,6 +290,18 @@ public:
 		return true;
 	}
 
+	bool ProtectViews(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		std::shared_lock lock(m_mutex);
+		bool             ok = true;
+		ForEachSparseRange(
+		    m_maps, vaddr, size,
+		    [&](const auto&, uint64_t start, uint64_t bytes) {
+			    ok = ok && VirtualMemory::Protect(start, bytes, mode);
+		    },
+		    [&](uint64_t, uint64_t) { ok = false; });
+		return ok;
+	}
+
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -324,13 +339,9 @@ public:
 #endif
 	}
 
-	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+	bool Unmap(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
-		}
-
-		if (placeholder_preserved != nullptr) {
-			*placeholder_preserved = false;
 		}
 
 		const auto            end = vaddr + size;
@@ -350,42 +361,36 @@ public:
 			}
 		}
 
-		std::vector<MapEntry> removed;
-		removed.reserve(targets.size());
+		size_t removed  = 0;
+		auto   rollback = [&] {
+			while (removed != 0) {
+				const auto& previous = targets[--removed];
+				EXIT_IF(!MapFixed(previous.vaddr, previous.size, previous.backing_offset,
+				                  previous.mode));
+			}
+		};
 		for (const auto& entry: targets) {
-			bool part_placeholder_preserved = false;
-			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
-				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-					EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
-				}
-				if (placeholder_preserved != nullptr) {
-					*placeholder_preserved = false;
-				}
+			if (!UnmapOne(entry.vaddr, entry.size)) {
+				rollback();
 				return false;
 			}
-			EXIT_IF(!part_placeholder_preserved);
-			removed.push_back(entry);
+			++removed;
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
 		// records this contiguous guest span as one free range, so normalize fragmented backing
 		// views into one placeholder before publishing it there.
-		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
-			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-				EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
-			}
+		if (removed > 1 && !CoalescePlaceholders(vaddr, size)) {
+			rollback();
 			return false;
 		}
 #endif
 
-		if (placeholder_preserved != nullptr) {
-			*placeholder_preserved = true;
-		}
 		return true;
 	}
 
-	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+	bool UnmapOne(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
 			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
@@ -428,9 +433,7 @@ public:
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
-			if (placeholder_preserved != nullptr) {
-				*placeholder_preserved = true;
-			}
+
 			return true;
 		}
 
@@ -451,9 +454,6 @@ public:
 				     ok;
 			}
 			if (ok) {
-				if (placeholder_preserved != nullptr) {
-					*placeholder_preserved = true;
-				}
 				return true;
 			}
 
@@ -481,9 +481,6 @@ public:
 		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
 
-		if (placeholder_preserved != nullptr) {
-			*placeholder_preserved = true;
-		}
 		return true;
 #endif
 	}
@@ -634,8 +631,6 @@ private:
 
 	HANDLE m_handle = nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
-
 	static int GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PROT_READ;
@@ -760,7 +755,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
@@ -864,11 +859,7 @@ public:
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
 		}
-		bool placeholder_preserved = false;
-		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved)) {
-			return false;
-		}
-		if (!placeholder_preserved) {
+		if (!m_backing->Unmap(vaddr, size)) {
 			return false;
 		}
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
@@ -876,12 +867,13 @@ public:
 		return true;
 	}
 
+	// Reservations live in VirtualRanges; these free-range checks only read the host placeholders.
 	uint64_t ReserveAligned(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 		if (size == 0) {
 			return 0;
 		}
 		alignment = std::max<uint64_t>(alignment != 0 ? alignment : PageSize(), PageSize());
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		if (search_addr == 0) {
 			auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN,
 			                                    HOST_SYSTEM_MANAGED_MAX + 1u, size, alignment);
@@ -898,7 +890,7 @@ public:
 			return 0;
 		}
 		alignment = std::max<uint64_t>(alignment, PageSize());
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
 	}
 
@@ -906,19 +898,19 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
@@ -1041,10 +1033,6 @@ private:
 		return (value & (PageSize() - 1u)) == 0;
 	}
 
-	[[nodiscard]] bool IsGranularityAligned(uint64_t value) const {
-		return (value & (m_granularity - 1u)) == 0;
-	}
-
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
@@ -1055,8 +1043,20 @@ private:
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start < range_end &&
-			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			if (range_start >= range_end) {
+				continue;
+			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// Rollback can split a backing view without changing the owner interval.
+			// Windows protection calls must stay within each actual view.
+			if (region.type == MappingType::Backing) {
+				if (!m_backing->ProtectViews(range_start, range_end - range_start, mode)) {
+					return false;
+				}
+				continue;
+			}
+#endif
+			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
 		}
@@ -1312,12 +1312,21 @@ private:
 	}
 
 	uint64_t FindFreeAlignedUnlocked(uint64_t search_start, uint64_t search_end, uint64_t size,
-	                                 uint64_t alignment) {
+	                                 uint64_t alignment) const {
 		if (search_start >= search_end || size > search_end - search_start) {
 			return 0;
 		}
-		for (const auto& [base, range_size]: m_free) {
-			const auto candidate = AlignUp(std::max(base, search_start), alignment);
+		// Include the predecessor because search_start can lie inside a free range.
+		auto it = m_free.upper_bound(search_start);
+		if (it != m_free.begin()) {
+			--it;
+		}
+		for (; it != m_free.end() && it->first < search_end; ++it) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+			g_test_free_range_visits.fetch_add(1, std::memory_order_relaxed);
+#endif
+			const auto& [base, range_size] = *it;
+			const auto candidate           = AlignUp(std::max(base, search_start), alignment);
 			if (candidate < search_end && size <= search_end - candidate &&
 			    GuestFreeRangeContains(base, range_size, candidate, size)) {
 				return candidate;
@@ -1331,9 +1340,8 @@ private:
 		if (next == m_free.begin()) {
 			return m_free.end();
 		}
-		auto it  = std::prev(next);
-		auto end = it->first + it->second;
-		return (vaddr >= it->first && vaddr + size <= end ? it : m_free.end());
+		auto it = std::prev(next);
+		return GuestFreeRangeContains(it->first, it->second, vaddr, size) ? it : m_free.end();
 	}
 
 	bool SplitUnlocked(std::map<uint64_t, uint64_t>::iterator it, uint64_t vaddr, uint64_t size) {

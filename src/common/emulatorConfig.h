@@ -64,6 +64,7 @@ struct ConfigOptions {
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
@@ -72,6 +73,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   shader_cache_enabled        = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -124,6 +126,7 @@ int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
+bool     StretchEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();
@@ -132,6 +135,7 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+bool                   ShaderCacheEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

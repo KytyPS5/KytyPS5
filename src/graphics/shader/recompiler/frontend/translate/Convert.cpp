@@ -49,18 +49,11 @@ void Translator::V_CVT_F16_16(const Decoder::Instruction& inst, bool signed_valu
 }
 
 void Translator::V_CVT_16_F16(const Decoder::Instruction& inst, bool signed_value) {
-	const auto value = ReadF16AsF32(inst.src0);
 	// The 32-bit conversion already saturates and maps NaN to zero.
-	if (signed_value) {
-		const auto converted = ir.Emit(IR::ValueOpcode::ConvertS32F32, {value});
-		const auto low = ir.Emit(IR::ValueOpcode::SMax32, {converted, IR::Value(0xffff8000u)});
-		Write16Bits(DestinationOperand(inst),
-		            IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)})));
-		return;
-	}
-	const auto converted = ir.Emit(IR::ValueOpcode::ConvertU32F32, {value});
-	Write16Bits(DestinationOperand(inst),
-	            IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {converted, IR::Value(0xffffu)})));
+	const auto converted = IR::U32(
+	    ir.Emit(signed_value ? IR::ValueOpcode::ConvertS32F32 : IR::ValueOpcode::ConvertU32F32,
+	            {ReadF16AsF32(inst.src0)}));
+	Write16Bits(DestinationOperand(inst), Saturate16(converted, signed_value));
 }
 
 void Translator::V_CVT_RPI_I32_F32(const Decoder::Instruction& inst) {
@@ -130,14 +123,30 @@ void Translator::V_CVT_PK_U8_F32(const Decoder::Instruction& inst) {
 	                     {ReadU32(SourceAt(inst, 2)), byte, shift, IR::Value(8u)}));
 }
 
+void Translator::V_CVT_PK_16_32(const Decoder::Instruction& inst, bool signed_value) {
+	WriteOperand(DestinationOperand(inst),
+	             PackU16Lanes(Saturate16(ReadU32(inst.src0), signed_value),
+	                          Saturate16(ReadU32(inst.src1), signed_value)));
+}
+
 void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst),
 	             PackU16Lanes(Read16LaneBits(inst.src0, false), Read16LaneBits(inst.src1, false)));
 }
 
 IR::U32 Translator::PackU16Lanes(IR::U32 low, IR::U32 high) {
+	// A zero high lane zero-extends; descriptor tracking bounds a mask, not a bitfield insert.
+	if (high == IR::Value(0u)) return ir.BitwiseAnd(low, IR::U32(IR::Value(0xffffu)));
 	return IR::U32(
 	    ir.Emit(IR::ValueOpcode::BitFieldInsert, {low, high, IR::Value(16u), IR::Value(16u)}));
+}
+
+IR::U32 Translator::Saturate16(IR::U32 value, bool signed_value) {
+	if (!signed_value) {
+		return IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {value, IR::Value(0xffffu)}));
+	}
+	const auto low = ir.Emit(IR::ValueOpcode::SMax32, {value, IR::Value(0xffff8000u)});
+	return IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)}));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

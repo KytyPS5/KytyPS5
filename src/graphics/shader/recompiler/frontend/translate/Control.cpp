@@ -51,33 +51,33 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
-	if (!write_64) {
-		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
-		const auto old = ir.GetExecLo();
-		const auto src = ReadU32(inst.src0);
+	const auto combine = [&](IR::U32 old, IR::U32 src) {
 		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		IR::U32 result;
-		switch (operation) {
-			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
-			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
-			default: EXIT("unsupported SAVEEXEC operation");
-		}
+		return operation == IR::ValueOpcode::LogicalAnd ? ir.BitwiseAnd(lhs, rhs)
+		                                                : ir.BitwiseOr(lhs, rhs);
+	};
+	if (!write_64) {
+		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
+		const auto old    = ir.GetExecLo();
+		const auto result = combine(old, ReadU32(inst.src0));
 		WriteRawU32(inst.dst, old);
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo), result);
 		ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 		return;
 	}
-	const auto old    = ir.GetExec();
-	const auto src    = ReadMask(inst.src0);
-	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
-	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
-	WriteMask(inst.dst, old, true);
-	const auto mask = BallotMask(result);
-	ir.SetExec(result);
-	ir.SetExecLo(mask[0]);
-	ir.SetExecHi(mask[1]);
+	// EXEC words combine bitwise; the per-lane EXEC combines the per-lane masks, so helper lanes
+	// stay enabled.
+	const auto old      = ir.GetExec();
+	const auto src      = ReadMask(inst.src0);
+	const auto lhs      = negate_exec ? ir.LogicalNot(old) : old;
+	const auto rhs      = negate_source ? ir.LogicalNot(src) : src;
+	const auto src_mask = ReadU32Pair(inst.src0);
+	const std::array old_mask {ir.GetExecLo(), ir.GetExecHi()};
+	const std::array mask {combine(old_mask[0], src_mask[0]), combine(old_mask[1], src_mask[1])};
+	WriteMask(inst.dst, old, old_mask, true);
+	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), IR::U1(ir.Emit(operation, {lhs, rhs})),
+	          mask);
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 }
 
@@ -95,7 +95,7 @@ void Translator::ADD_U32(const Decoder::Instruction& inst, bool vector, bool use
 	}
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
+		WriteVectorMask(inst.dst2, carry);
 	} else {
 		ir.SetScc(carry);
 	}
@@ -108,7 +108,7 @@ void Translator::SUB_U32(const Decoder::Instruction& inst, bool vector, bool rev
 	const auto borrow = ir.UGreaterThan(rhs, lhs);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
+		WriteVectorMask(inst.dst2, borrow);
 	} else {
 		ir.SetScc(borrow);
 	}
@@ -126,7 +126,7 @@ void Translator::SUBB_U32(const Decoder::Instruction& inst, bool vector, bool re
 	const auto borrow    = ir.LogicalOr(borrow0, borrow1);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
+		WriteVectorMask(inst.dst2, borrow);
 	} else {
 		ir.SetScc(borrow);
 	}
@@ -465,9 +465,13 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
-	const auto result =
-	    ir.Emit(IR::ValueOpcode::Permlane16U32,
-	            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec()}, flags);
+	// An EXEC-disabled source lane without FI disables the write unless BOUND_CTRL reads zero.
+	const auto inactive = flags.fetch_inactive || flags.bound_control
+	                          ? IR::U32(IR::Value(0u))
+	                          : ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
+	const auto result   = ir.Emit(
+	    IR::ValueOpcode::Permlane16U32,
+	    {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec(), inactive}, flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

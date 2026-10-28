@@ -153,6 +153,28 @@ void RenderContext::RunGarbageCollector() {
 	m_buffer_cache.RunGarbageCollector();
 }
 
+void RenderContext::RunPressureGarbageCollector() {
+	if (!m_graphics.CanReportMemoryUsage()) {
+		return;
+	}
+	const uint64_t budget = m_graphics.GetTotalMemoryBudget();
+	if (budget == 0) {
+		return;
+	}
+	const uint64_t usage = m_graphics.GetDeviceMemoryUsage();
+	if (usage < budget) {
+		return;
+	}
+
+	// GetTotalMemoryBudget already leaves a 1 GiB device reserve. Crossing it means the next
+	// image is at risk, so force the caches past their own per-cache pressure marks.
+	constexpr uint64_t CriticalStep = 512ull * 1024 * 1024;
+	const bool         critical      = usage >= budget + CriticalStep;
+
+	m_texture_cache.RunGarbageCollector(true, critical);
+	m_buffer_cache.RunGarbageCollector(true, critical);
+}
+
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
 	Common::LockGuard lock(m_interrupt_mutex);
 

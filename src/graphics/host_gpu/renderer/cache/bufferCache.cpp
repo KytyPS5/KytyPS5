@@ -338,6 +338,43 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
+uint64_t BufferCache::EvictCleanForAllocation(uint64_t target_bytes) {
+	if (target_bytes == 0) {
+		return 0;
+	}
+	const auto clock = LruClock();
+	if (clock == 0) {
+		return 0;
+	}
+
+	uint64_t freed = 0;
+	m_lru_cache.ForEachItemBelow(clock - 1, [&](BufferId id) {
+		if (id == NULL_BUFFER_ID) {
+			return false;
+		}
+		auto* buffer = m_slot_buffers.try_get(id);
+		if (buffer == nullptr || buffer->is_deleted ||
+		    !m_scheduler.IsFree(buffer->last_use_tick)) {
+			return false;
+		}
+		if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size()) ||
+		    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
+			return false;
+		}
+		freed += buffer->AllocatedSize();
+		DeleteBufferForAllocation(id);
+		return freed >= target_bytes;
+	});
+	return freed;
+}
+
+void BufferCache::DeleteBufferForAllocation(BufferId id) {
+	auto& buffer = m_slot_buffers[id];
+	m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+	Unregister(id);
+	ReleaseBuffer(id);
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -421,6 +458,10 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+	if (m_graphics.CanReportMemoryUsage() &&
+	    m_graphics.GetDeviceMemoryUsage() >= m_graphics.GetTotalMemoryBudget()) {
+		(void)EvictCleanForAllocation(64ull << 20u);
+	}
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -682,14 +723,19 @@ uint64_t BufferCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::RunGarbageCollector(bool force_pressure, bool force_critical) {
 	m_gc_tick++;
-	const auto clock = LruClock();
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const auto clock  = LruClock();
+	const bool forced = force_pressure || force_critical;
+	if (forced && clock == 0) {
+		// Before the first presented frame there is no safe age basis for emergency eviction.
+		return;
+	}
+	if (!forced && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = forced || m_total_used_memory >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 

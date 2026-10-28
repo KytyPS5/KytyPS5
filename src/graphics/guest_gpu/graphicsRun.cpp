@@ -527,6 +527,7 @@ bool GuestGpu::Process(Submission& submission) {
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
 				cp.BufferFlush();
+				m_renderer.RunPressureGarbageCollector();
 			}
 			break;
 		case SubmissionType::FlipPreparation:

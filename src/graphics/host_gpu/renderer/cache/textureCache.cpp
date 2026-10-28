@@ -201,10 +201,56 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
+ImageId TextureCache::InsertImage(const ImageInfo& info, ImageId keep) {
+	// Allocation-path pressure valve. The submission-boundary collector cannot help a burst
+	// that allocates several GiB inside one submission, so reclaim clean buffers and images the
+	// GPU is done with before attempting the image allocation. No downloads or waits: this runs
+	// while the cache lock is held and a draw may be in preparation.
+	if (m_graphics.CanReportMemoryUsage() &&
+	    m_graphics.GetDeviceMemoryUsage() >= m_graphics.GetTotalMemoryBudget()) {
+		constexpr uint64_t buffer_target = 64ull << 20u;
+		constexpr uint64_t image_target  = 32ull << 20u;
+		(void)m_buffer_cache.EvictCleanForAllocation(buffer_target);
+		(void)EvictForAllocation(keep, image_target);
+	}
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	RegisterImage(id);
 	return id;
+}
+
+uint64_t TextureCache::EvictForAllocation(ImageId keep, uint64_t target_bytes) {
+	if (target_bytes == 0) {
+		return 0;
+	}
+	const uint64_t clock = LruClock();
+	if (clock == 0) {
+		return 0;
+	}
+
+	uint64_t freed = 0;
+	m_lru_cache.ForEachItemBelow(clock, [&](ImageId id) {
+		if (id == keep) {
+			return false;
+		}
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->info.IsDepth() ||
+		    image->heap_refs.load(std::memory_order_relaxed) != 0u ||
+		    image->IsGpuModified() || image->binding.is_bound || image->binding.is_target ||
+		    !m_scheduler.IsFree(image->tick_accessed_last)) {
+			return false;
+		}
+		uint64_t allocation_size = 0;
+		if (image->backing.allocation != nullptr) {
+			VmaAllocationInfo allocation {};
+			vmaGetAllocationInfo(m_graphics.allocator, image->backing.allocation, &allocation);
+			allocation_size = allocation.size;
+		}
+		freed += allocation_size;
+		FreeImage(id, true);
+		return freed >= target_bytes;
+	});
+	return freed;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -250,7 +296,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.registered = false;
 }
 
-void TextureCache::DeleteImage(ImageId id) {
+void TextureCache::DeleteImage(ImageId id, bool release_now) {
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
@@ -260,7 +306,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image.stencil_ids, {})) {
-			FreeImage(association);
+			FreeImage(association, release_now);
 		}
 	}
 	if (image.IsGpuModified()) {
@@ -272,8 +318,13 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
-	// earlier may still be sampling the image on the GPU.
-	m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+	// earlier may still be sampling the image on the GPU. The allocation path knows the image's
+	// last use tick is complete, so it can release immediately instead of deferring.
+	if (release_now) {
+		ReleaseImage(id);
+	} else {
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+	}
 }
 
 void TextureCache::ReleaseImage(ImageId id) {
@@ -286,12 +337,12 @@ void TextureCache::ReleaseImage(ImageId id) {
 	m_slot_images.erase(id);
 }
 
-void TextureCache::FreeImage(ImageId id) {
+void TextureCache::FreeImage(ImageId id, bool release_now) {
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
-	DeleteImage(id);
+	DeleteImage(id, release_now);
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -701,7 +752,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.first_tail_level    = cached.info.first_tail_level;
 	}
 	info.htile_initial_clear  = false;
-	const auto replacement_id = InsertImage(info);
+	const auto replacement_id = InsertImage(info, cached_id);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
@@ -919,7 +970,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
-	const auto expanded_id = InsertImage(info);
+	const auto expanded_id = InsertImage(info, source_id);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
@@ -1233,7 +1284,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		ImageInfo info {};
 		info.data   = stencil;
 		info.extent = depth.info.extent;
-		association = InsertImage(info);
+		association = InsertImage(info, depth_id);
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
@@ -1999,11 +2050,16 @@ uint64_t TextureCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RunGarbageCollector(bool force_pressure, bool force_critical) {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
-	const uint64_t clock = LruClock();
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	const uint64_t clock  = LruClock();
+	const bool     forced = force_pressure || force_critical;
+	if (forced && clock == 0) {
+		// Before the first presented frame there is no safe age basis for emergency eviction.
+		return;
+	}
+	if (!forced && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	if (m_gc_budget_frame != clock) {
@@ -2013,8 +2069,9 @@ void TextureCache::RunGarbageCollector() {
 		m_gc_written_back_bytes_frame = 0;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool pressured  = forced || m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = (allow_aggressive || force_critical) &&
+		                  (force_critical || m_total_used_memory >= m_critical_gc_memory);
 		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
 		constexpr uint64_t MiB             = 1024 * 1024;
 		constexpr size_t   MaxFreesInFrame = 1024;
@@ -2022,9 +2079,15 @@ void TextureCache::RunGarbageCollector() {
 		size_t             deletions       = 10;
 		if (pressured || aggressive) {
 			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
-			const auto excess    = m_total_used_memory - threshold;
+			const auto excess =
+			    m_total_used_memory > threshold ? m_total_used_memory - threshold : 0;
 			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
 			                         : std::max<uint64_t>(16 * MiB, excess / 8);
+			if (force_critical) {
+				byte_budget = std::max<uint64_t>(byte_budget, 256 * MiB);
+			} else if (forced) {
+				byte_budget = std::max<uint64_t>(byte_budget, 128 * MiB);
+			}
 			if (m_gc_freed_bytes_frame >= byte_budget ||
 			    m_gc_freed_images_frame >= MaxFreesInFrame) {
 				return;
@@ -2097,7 +2160,7 @@ void TextureCache::RunGarbageCollector() {
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (force_critical || m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

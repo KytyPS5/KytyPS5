@@ -57,6 +57,9 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Allocation-path pressure valve: release clean buffers the GPU is done with. No downloads,
+	// no scheduler waits, so it is safe while a draw is being prepared.
+	uint64_t EvictCleanForAllocation(uint64_t target_bytes);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -91,7 +94,8 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(bool force_pressure = false,
+	                                       bool force_critical = false);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -117,6 +121,7 @@ private:
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	void ReleaseBuffer(BufferId id);
+	void DeleteBufferForAllocation(BufferId id);
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);

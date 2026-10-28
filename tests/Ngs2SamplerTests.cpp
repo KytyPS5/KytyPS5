@@ -1780,6 +1780,45 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+// The meter takes the largest sample across every channel, so a stereo voice whose right channel
+// is louder reports the right channel's peak. Reading the peak doesn't reset it.
+void TestPeakMeterStereo() {
+	Fixture f(48000, 2);
+	// Interleaved left and right frames. The right channel holds the largest sample.
+	const int16_t    pcm[] = {1024, 4096, -2048, -16384};
+	PeakMeterControl meter;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Queue(pcm, 2, 0);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "the peak missed the louder right channel");
+	Check(f.State().peak_height == 0.5f, "reading the peak reset it");
+}
+
+// The meter reads the voice after its filters. Alternating samples sit at the Nyquist frequency,
+// far above a 100 Hz low-pass cutoff, so the reported peak is the small filtered level and not the
+// source's 0.5.
+void TestPeakMeterAfterFilter() {
+	constexpr uint32_t   frames = 64;
+	constexpr float      cutoff = 100.0f;
+	constexpr int16_t    level  = 16384;
+	Fixture              f(48000);
+	PeakMeterControl     meter;
+	std::vector<int16_t> pcm(frames);
+	for (uint32_t i = 0; i < frames; ++i) {
+		pcm[i] = i % 2 == 0 ? level : static_cast<int16_t>(-level);
+	}
+	SetLowPass(f, cutoff);
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Queue(pcm.data(), frames, 0);
+	f.Render(frames);
+	const float filtered_peak = Ngs2PeakHeight(f.voice.samples);
+	Check(filtered_peak < 0.25f, "the low-pass filter did not attenuate the test signal");
+	Check(filtered_peak > 0.0f, "the low-pass filter silenced the test signal");
+	Check(f.State().peak_height == filtered_peak, "the peak was not read after the filter");
+}
+
 } // namespace
 
 int main() {
@@ -1819,6 +1858,8 @@ int main() {
 	TestPeakHeightHelper();
 	TestPeakMeter();
 	TestPeakMeterReset();
+	TestPeakMeterStereo();
+	TestPeakMeterAfterFilter();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

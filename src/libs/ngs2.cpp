@@ -598,8 +598,8 @@ struct Ngs2VoiceInternal {
 	uint32_t                            skip_remaining     = 0;
 	const uint8_t*                      waveform_end       = nullptr;
 	std::vector<Ngs2SamplerFilter>      filters;
-	// Sampler voice peak meter (SamplerVoicePeakMeterParam): when enabled, the largest absolute
-	// sample of the voice's last render, reported as peak_height in the sampler voice state.
+	// The sampler voice peak meter. While it is enabled, peak_height holds the largest absolute
+	// sample of the voice's last render, which the sampler voice state reports.
 	bool                                peak_meter_enabled = false;
 	float                               peak_height        = 0.0f;
 

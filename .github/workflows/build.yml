@@ -32,7 +32,7 @@ jobs:
   windows:
     name: Build KytyPS5 (Windows)
     needs: metadata
-    runs-on: windows-2022
+    runs-on: windows-2025
 
     steps:
       - name: Checkout repository

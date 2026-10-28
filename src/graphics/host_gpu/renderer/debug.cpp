@@ -595,13 +595,6 @@ void LogDrawPhase(const char* draw_name, const char* phase) {
 	}
 }
 
-void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id) {
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: %s VS=%" PRIu64 " PS=%" PRIu64 "\n", phase, vertex_program_id,
-		     pixel_program_id);
-	}
-}
-
 static void VpPrint(const char* func, const HW::ScreenViewport& vp,
                     const HW::ScanModeControl& smc) {
 	LOGF("%s\n", func);

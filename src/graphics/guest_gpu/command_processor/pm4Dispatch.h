@@ -136,6 +136,7 @@ uint32_t CpOpEventWrite(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, 
 uint32_t CpOpDmaData(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpAcquireMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpMemSemaphore(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetContextReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetShaderReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetUconfigReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

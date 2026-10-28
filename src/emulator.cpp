@@ -99,10 +99,6 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
-		if (const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
-		    flexible_memory_size != 0) {
-			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
-		}
 	}
 	if (cfg.splash_enabled) {
 		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
@@ -188,7 +184,7 @@ void Run(const RunOptions& options) {
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, title_id);
+	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 

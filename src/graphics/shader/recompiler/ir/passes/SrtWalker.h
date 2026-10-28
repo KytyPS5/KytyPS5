@@ -78,6 +78,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

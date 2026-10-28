@@ -53,6 +53,11 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Shader cache record of a plan; loading it into a default-constructed plan rebuilds the walker
+// and scratch state like extraction. A failed load leaves a plan that must not be used.
+std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
+bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);

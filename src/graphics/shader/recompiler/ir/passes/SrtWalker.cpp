@@ -82,6 +82,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
@@ -147,8 +148,8 @@ bool ImmediateBits(Value value, uint64_t& bits) {
 }
 
 // Scratch layout in bytes: per descriptor source its eight DWORDs and a known DWORD, one
-// activity byte per source, then one qword per walked value (all ones when unknown). The
-// walker's value slots, captured addresses, reachability and states follow.
+// activity byte per source, then per image, then one qword per walked value (all ones when
+// unknown). The walker's value slots, captured addresses, reachability and states follow.
 constexpr uint32_t DescriptorStride = 9u * sizeof(uint32_t);
 
 uint32_t ActiveOffset(const ResourcePlan& plan) {
@@ -156,7 +157,8 @@ uint32_t ActiveOffset(const ResourcePlan& plan) {
 }
 
 uint32_t OutputOffset(const ResourcePlan& plan) {
-	return (ActiveOffset(plan) + static_cast<uint32_t>(plan.descriptor_sources.size()) + 7u) & ~7u;
+	const auto active = plan.descriptor_sources.size() + plan.info.images.size();
+	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
 }
 
 const uint8_t* Scratch(const ResourcePlan& plan) {
@@ -1038,6 +1040,23 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 			c.L(done);
 			break;
 		}
+		case ValueOpcode::ConvertS32F32: {
+			// The conversion saturates and maps NaN to zero. cvttss2si's out-of-range result,
+			// INT32_MIN, is already right for negative overflow.
+			Xbyak::Label done;
+			c.movd(c.xmm0, c.eax);
+			c.xor_(c.eax, c.eax);
+			c.ucomiss(c.xmm0, c.xmm0);
+			c.jp(done, Near);
+			c.mov(c.ecx, 0x4f000000u);
+			c.movd(c.xmm1, c.ecx);
+			c.mov(c.eax, INT32_MAX);
+			c.ucomiss(c.xmm0, c.xmm1);
+			c.jae(done, Near);
+			c.cvttss2si(c.eax, c.xmm0);
+			c.L(done);
+			break;
+		}
 		case ValueOpcode::FPMul32:
 			c.movd(c.xmm0, c.eax);
 			c.movd(c.xmm1, c.ecx);
@@ -1272,11 +1291,14 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			for (const auto slot: blocks[block].srt_reads) flat(slot);
 			c.L(skip);
 		}
-		// A source no block lists is always active.
-		for (uint32_t source = 0; source < sources.size(); ++source) {
+		// A source or image no block lists is always active.
+		for (uint32_t index = 0; index < sources.size() + m_plan.info.images.size(); ++index) {
+			const bool     image = index >= sources.size();
+			const uint32_t id    = image ? index - static_cast<uint32_t>(sources.size()) : index;
 			bool listed = false;
 			for (uint32_t block = 0; block < blocks.size(); ++block) {
-				if (std::ranges::find(blocks[block].sources, source) == blocks[block].sources.end()) continue;
+				const auto& list = image ? blocks[block].images : blocks[block].sources;
+				if (std::ranges::find(list, id) == list.end()) continue;
 				if (listed) {
 					c.or_(c.al, c.byte[c.rdx + m_reach + block]);
 				} else {
@@ -1284,7 +1306,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				}
 				listed = true;
 			}
-			const auto active = c.byte[c.rdx + ActiveOffset(m_plan) + source];
+			const auto active = c.byte[c.rdx + ActiveOffset(m_plan) + index];
 			if (listed) {
 				c.mov(active, c.al);
 			} else {
@@ -1389,6 +1411,10 @@ bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue
 
 bool WalkedActive(const ResourcePlan& plan, uint32_t source) {
 	return Scratch(plan)[ActiveOffset(plan) + source] != 0u;
+}
+
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
+	return Scratch(plan)[ActiveOffset(plan) + plan.descriptor_sources.size() + image] != 0u;
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {

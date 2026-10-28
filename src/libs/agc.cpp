@@ -2480,6 +2480,9 @@ static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG       = 0xc8020000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG            = 0xc8000000u;
+static constexpr uint32_t AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG    = 0xc9010000u;
+static constexpr uint32_t AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG      = 0xc9020000u;
+static constexpr uint32_t AGC_MEM_SEMAPHORE_END_TAG             = 0xc9000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW           = 4u;
 static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
@@ -3075,6 +3078,42 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
 	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
 	                        poll_cycles);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
+	EXIT_NOT_IMPLEMENTED(op != 6u && op != 7u);
+
+	auto* cmd =
+	    buf->AllocateDW(AGC_WAIT_USER_DATA_BEGIN_DW + AGC_INTERNAL_DATA_PACKET_SIZE_DW + 4u);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	const auto address_value = reinterpret_cast<uint64_t>(address);
+	const bool signal        = (op == 6u);
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
+	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
+	cmd[3] = static_cast<uint32_t>(address_value);
+
+	// A signal pads with a NOP header where a wait ends with its end marker.
+	auto* semaphore = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
+	if (signal) {
+		semaphore[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_NOP, 0u);
+		semaphore += AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	}
+	semaphore[0] = KYTY_PM4(4, Pm4::IT_MEM_SEMAPHORE, 0u);
+	semaphore[1] = static_cast<uint32_t>(address_value) & ~0x7u;
+	semaphore[2] = static_cast<uint32_t>(address_value >> 32u);
+	semaphore[3] = (static_cast<uint32_t>(op) << 29u) | ((signal_type & 0x1u) << 20u) |
+	               ((mailbox & 0x1u) << 16u);
+	if (!signal) {
+		write_agc_internal_data_packet(semaphore + 4, AGC_MEM_SEMAPHORE_END_TAG);
+	}
+
+	return cmd;
 }
 
 uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
@@ -3840,11 +3879,12 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	const auto size_dw = KYTY_PM4_LEN(cmd_id);
 	if (size_dw == AGC_WAIT_USER_DATA_BEGIN_DW) {
 		const auto tag = payload[1] & 0xffff0000u;
-		return tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG;
+		return tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG ||
+		       tag == AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG || tag == AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG;
 	}
 
 	return size_dw == AGC_INTERNAL_DATA_PACKET_SIZE_DW &&
-	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG ||
+	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG || payload[1] == AGC_MEM_SEMAPHORE_END_TAG ||
 	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
 	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
 }

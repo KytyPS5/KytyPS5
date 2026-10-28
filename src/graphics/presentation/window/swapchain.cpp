@@ -290,7 +290,8 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
-	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
+	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
+	                 const vk::Rect2D& rect);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -637,7 +638,23 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
-void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer) {
+static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& target) {
+	const uint64_t src_w = std::max(source.width, 1u);
+	const uint64_t src_h = std::max(source.height, 1u);
+	uint32_t       w     = target.width;
+	uint32_t       h     = target.height;
+	if (src_w * h > src_h * w) {
+		h = std::max<uint32_t>(1, static_cast<uint32_t>(src_h * w / src_w));
+	} else {
+		w = std::max<uint32_t>(1, static_cast<uint32_t>(src_w * h / src_h));
+	}
+	return {{static_cast<int32_t>((target.width - w) / 2),
+	         static_cast<int32_t>((target.height - h) / 2)},
+	        {w, h}};
+}
+
+void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
+                            const vk::Rect2D& rect) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -756,12 +773,14 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
 	command.beginRendering(&rendering);
-	const vk::Viewport viewport {
-	    0.0f, 0.0f, static_cast<float>(m_extent.width), static_cast<float>(m_extent.height),
-	    0.0f, 1.0f};
-	const vk::Rect2D scissor {{0, 0}, m_extent};
+	const vk::Viewport viewport {static_cast<float>(rect.offset.x),
+	                             static_cast<float>(rect.offset.y),
+	                             static_cast<float>(rect.extent.width),
+	                             static_cast<float>(rect.extent.height),
+	                             0.0f,
+	                             1.0f};
 	command.setViewport(0, 1, &viewport);
-	command.setScissor(0, 1, &scissor);
+	command.setScissor(0, 1, &rect);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
 }
@@ -799,6 +818,24 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
+	const auto* aspect_source = source != nullptr ? source : overlay.frame;
+	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
+	                               ? FitAspect(aspect_source->image.extent, m_extent)
+	                               : vk::Rect2D {{0, 0}, m_extent};
+	if (source == nullptr || game_rect.extent != m_extent) {
+		const vk::ClearColorValue black {};
+		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
+		                           &black, 1, &to_transfer.subresourceRange);
+		if (source != nullptr) {
+			vk::ImageMemoryBarrier after_clear = to_transfer;
+			after_clear.srcAccessMask          = vk::AccessFlagBits::eTransferWrite;
+			after_clear.oldLayout              = vk::ImageLayout::eTransferDstOptimal;
+			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                           vk::PipelineStageFlagBits::eTransfer,
+			                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1,
+			                           &after_clear);
+		}
+	}
 	if (source != nullptr) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
@@ -812,16 +849,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstSubresource.mipLevel       = 0;
 		region.dstSubresource.baseArrayLayer = 0;
 		region.dstSubresource.layerCount     = 1;
-		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
-		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
+		region.dstOffsets[0].x = game_rect.offset.x;
+		region.dstOffsets[0].y = game_rect.offset.y;
+		region.dstOffsets[1].x = game_rect.offset.x + static_cast<int>(game_rect.extent.width);
+		region.dstOffsets[1].y = game_rect.offset.y + static_cast<int>(game_rect.extent.height);
 		region.dstOffsets[1].z               = 1;
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
-	} else {
-		const vk::ClearColorValue black {};
-		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
-		                           &black, 1, &to_transfer.subresourceRange);
 	}
 
 	vk::ImageMemoryBarrier to_present {};
@@ -848,7 +883,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           &to_present);
 	if (draw_attachment) {
 		if (draw_overlay) {
-			DrawOverlay(vk_command, overlay);
+			DrawOverlay(vk_command, overlay, game_rect);
 			if (draw_system_overlay) {
 				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;

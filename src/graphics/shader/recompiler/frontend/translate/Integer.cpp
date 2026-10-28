@@ -25,8 +25,7 @@ void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
 	const auto rhs    = ReadU16AsU32(inst.src1, true);
 	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, true));
 	if (inst.dst.clamp) {
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
+		result = Saturate16(result, true);
 	}
 	Write16Bits(DestinationOperand(inst), result);
 }
@@ -108,19 +107,7 @@ void Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 			default: return false;
 		}
 	};
-	if (is_exec_or_vcc(inst.dst) || is_exec_or_vcc(inst.src0) ||
-	    (inst.src_count > 1u && is_exec_or_vcc(inst.src1))) {
-		const auto mask = WriteMask(inst.dst, invocation_result, true);
-		ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
-		return;
-	}
-
-	// Descriptor tracking reasons about each scalar word independently.
-	const auto lhs        = ReadU32Pair(inst.src0);
-	auto       mask_valid = ReadMaskValid(inst.src0);
-	if (inst.src_count > 1u) {
-		mask_valid = ir.LogicalAnd(mask_valid, ReadMaskValid(inst.src1));
-	}
+	const auto lhs = ReadU32Pair(inst.src0);
 	std::array<IR::U32, 2> result;
 	if (unary) {
 		result = {ir.BitwiseNot(lhs[0]), ir.BitwiseNot(lhs[1])};
@@ -133,11 +120,21 @@ void Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 			result[component] = negate_result ? ir.BitwiseNot(IR::U32(value)) : IR::U32(value);
 		}
 	}
-	WriteU32Pair(inst.dst, result);
-	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
-		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
-		ir.SetThreadBitScalarReg(dst, invocation_result);
-		ir.SetScalarMaskTag(dst, mask_valid);
+	if (is_exec_or_vcc(inst.dst) || is_exec_or_vcc(inst.src0) ||
+	    (inst.src_count > 1u && is_exec_or_vcc(inst.src1))) {
+		WriteMask(inst.dst, invocation_result, result, true);
+	} else {
+		// Descriptor tracking reasons about each scalar word independently.
+		auto mask_valid = ReadMaskValid(inst.src0);
+		if (inst.src_count > 1u) {
+			mask_valid = ir.LogicalAnd(mask_valid, ReadMaskValid(inst.src1));
+		}
+		WriteU32Pair(inst.dst, result);
+		if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+			const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
+			ir.SetThreadBitScalarReg(dst, invocation_result);
+			ir.SetScalarMaskTag(dst, mask_valid);
+		}
 	}
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u))));
 }
@@ -293,7 +290,8 @@ void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
 	if (inst.dst2.kind != Decoder::OperandKind::Null &&
 	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
 		// The 32x32 product fits in 64 bits, so only the addition can carry.
-		WriteMask(inst.dst2, IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product})));
+		const auto carry = IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product}));
+		WriteVectorMask(inst.dst2, carry);
 	}
 }
 
@@ -473,7 +471,7 @@ void Translator::S_BITCMP_B32(const Decoder::Instruction& inst, bool expected) {
 	const auto offset = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
 	const auto bit =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {value, offset, IR::Value(1u)}));
-	WriteCompareResult(inst.dst, ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
+	ir.SetScc(ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
 }
 
 void Translator::S_BITCMP_B64(const Decoder::Instruction& inst, bool expected) {
@@ -484,7 +482,7 @@ void Translator::S_BITCMP_B64(const Decoder::Instruction& inst, bool expected) {
 	    ir.Select(ir.ULessThan(offset, IR::U32(IR::Value(32u))), value[0], value[1]);
 	const auto bit =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {word, word_bit, IR::Value(1u)}));
-	WriteCompareResult(inst.dst, ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
+	ir.SetScc(ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
 }
 
 void Translator::V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset) {

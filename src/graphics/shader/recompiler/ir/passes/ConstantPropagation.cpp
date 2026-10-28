@@ -167,6 +167,16 @@ bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
 	return false;
 }
 
+// Whether one operand is the other's negation.
+bool IsComplementPair(const Inst& inst, ValueOpcode negation) {
+	for (uint32_t arg = 0; arg < 2u; ++arg) {
+		const auto* negate = Arg(inst, arg).TryInstruction();
+		if (negate != nullptr && negate->GetOpcode() == negation &&
+		    Arg(*negate, 0) == Arg(inst, arg ^ 1u)) return true;
+	}
+	return false;
+}
+
 bool FoldSelect(Inst& inst) {
 	const auto condition   = Arg(inst, 0);
 	const auto true_value  = Arg(inst, 1);
@@ -626,8 +636,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitwiseXor32:
 			if (!FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
-			    })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0u);
+			    }) && !ReplaceBinaryIdentity(inst, Type::U32, 0u) &&
+			    IsComplementPair(inst, ValueOpcode::BitwiseNot32)) {
+				Replace(inst, Value(UINT32_MAX));
 			}
 			return;
 		case ValueOpcode::BitwiseNot32: {
@@ -802,6 +813,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 					Replace(inst, lhs.U1() ? lhs : rhs);
 				} else if (IsImmediate(rhs, Type::U1)) {
 					Replace(inst, rhs.U1() ? rhs : lhs);
+				} else if (IsComplementPair(inst, ValueOpcode::LogicalNot)) {
+					Replace(inst, Value(true));
 				} else {
 					const auto* left = lhs.TryInstruction();
 					const auto* right = rhs.TryInstruction();
@@ -892,8 +905,10 @@ private:
 		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 		    !Immediate(Arg(inst, 1), 0u)) return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
-		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
-		           ? Arg(*source, 0) : Value {};
+		if (source == nullptr) return {};
+		// Helper lanes keep the per-lane EXEC, so the live mask projects to true.
+		if (source->GetOpcode() == ValueOpcode::LiveMask) return Value(true);
+		return source->GetOpcode() == ValueOpcode::Ballot ? Arg(*source, 0) : Value {};
 	}
 
 	bool CanProject(Value value) {

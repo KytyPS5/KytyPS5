@@ -45,9 +45,10 @@ enum class DrawOffsetSource : uint8_t {
 
 // Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
-	uint64_t address = 0;
-	uint32_t count   = 0;
-	uint32_t stride  = 0;
+	uint64_t              address = 0;
+	uint32_t              count   = 0;
+	uint32_t              stride  = 0;
+	ShaderIndirectOffsets offsets;
 };
 
 struct DrawIndexArgs {

@@ -476,6 +476,8 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
+		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
+		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
 		default: return UINT32_MAX;
 	}
 }
@@ -526,7 +528,9 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::Layer:
-			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
+			case IR::StageInputKind::SampleId:
+			case IR::StageInputKind::BaseVertex:
+			case IR::StageInputKind::BaseInstance: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
@@ -594,6 +598,13 @@ void DefineInputs(EmitterState& state) {
 		if (state.program.stage == ShaderType::Pixel) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
+	}
+	if (state.program.info.helper_invocation) {
+		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
+		                                              "gl_HelperInvocation");
+		state.helper_invocation_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInHelperInvocation);
 	}
 }
 
@@ -691,13 +702,15 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
-				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				auto type = TypeF32Vector(state, 4);
+				if (binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel && binding.index < 8u) {
+					// Packed UNorm stores its encoded bits.
+					const auto bit = 1u << binding.index;
+					type = (state.input_info.pixel->target_packed_unorm_mask & bit) != 0u
+					           ? TypeU32Vector(state, 4)
+					           : MrtOutputType(state, binding.index);
+				}
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -792,6 +805,10 @@ void DefineModule(EmitterState& state) {
 	}
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
+	}
+	if (InputVariableForKind(state, IR::StageInputKind::BaseVertex) != 0 ||
+	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
+		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);

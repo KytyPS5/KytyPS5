@@ -138,6 +138,9 @@ private:
 	// Holds a label and/or interrupt back until the earlier deferred signals and readbacks land.
 	void DeferSignal(void* label, uint64_t value, uint32_t size, bool interrupt,
 	                 uint32_t interrupt_context_id);
+	// Lands every held-back signal now, before this thread blocks on something a game may only
+	// release after reading one of them. GPU thread only, and nothing to do when none are held.
+	void LandHeldBackSignals();
 	// Writes `gds_dw_count` GDS dwords from `gds_dw_offset` to `label` as end-of-pipe labels behind
 	// any pending image readbacks, raising the interrupt after the last one if `interrupt` is set.
 	// Call after Finish(), when the GDS values are final.

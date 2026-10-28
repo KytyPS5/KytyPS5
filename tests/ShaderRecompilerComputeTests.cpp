@@ -170,6 +170,10 @@ struct CommandProcessorTestAccess {
   static std::atomic<uint32_t> &PendingSignals(CommandProcessor &processor) {
     return *processor.m_pending_signals;
   }
+  // What WAIT_FLIP_DONE runs before it blocks, without needing a display to flip.
+  static void LandHeldBackSignals(CommandProcessor &processor) {
+    processor.LandHeldBackSignals();
+  }
 };
 
 struct BufferCacheTestAccess {
@@ -53078,6 +53082,38 @@ void CheckPm4CrossQueueLabelOrder(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// WAIT_FLIP_DONE blocks the GPU thread, where held-back labels land, so when it would block it
+// lands them first. A game waiting for one would otherwise stall until the flip completes.
+void CheckPm4FlipWaitLandsHeldLabels(RenderContext &renderer) {
+  constexpr const char *name = "Pm4FlipWaitLandsHeldLabels";
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  CommandProcessor processor(renderer, 0);
+
+  alignas(uint64_t) uint32_t label = 0;
+  const auto release = MakeLabelRelease(1, &label, 0x55u);
+  bool held = false;
+  bool landed = false;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    // Pretend an earlier label is still waiting on a readback, so this one is held back too.
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
+    behind.fetch_add(1);
+    Pm4Execution execution;
+    held = processor.Process(execution, release) == Pm4ProcessResult::Complete && label == 0;
+    behind.fetch_sub(1);
+    // Without the guard the label would land only through a later GPU-thread command.
+    CommandProcessorTestAccess::LandHeldBackSignals(processor);
+    landed = label == 0x55u && behind.load() == 0;
+  });
+  Require(name, "held", held, "a label behind a pending signal was written at once");
+  Require(name, "landed before blocking", landed,
+          "a flip wait would block with a held-back label still unwritten");
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // A submission can still be blocked on a deferred label when the GPU shuts down. The label lands
 // through a GPU-thread command, so shutdown has to keep running commands until the GPU thread
 // exits. Otherwise the submission never finishes and shutdown never returns.
@@ -54139,6 +54175,7 @@ int main(int argc, char **argv) {
     CheckPm4GdsLabelBehindDeferredLabel(vulkan.RuntimeRenderer());
     CheckPm4GdsMultiDwordLabel(vulkan.RuntimeRenderer());
     CheckPm4CrossQueueLabelOrder(vulkan.RuntimeRenderer());
+    CheckPm4FlipWaitLandsHeldLabels(vulkan.RuntimeRenderer());
     CheckPm4DeferredLabelShutdown(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -54456,6 +54493,7 @@ int main(int argc, char **argv) {
   CheckPm4GdsLabelBehindDeferredLabel(vulkan.RuntimeRenderer());
   CheckPm4GdsMultiDwordLabel(vulkan.RuntimeRenderer());
   CheckPm4CrossQueueLabelOrder(vulkan.RuntimeRenderer());
+  CheckPm4FlipWaitLandsHeldLabels(vulkan.RuntimeRenderer());
   CheckPm4DeferredLabelShutdown(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();

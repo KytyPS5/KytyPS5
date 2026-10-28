@@ -1060,9 +1060,19 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
+	auto&      video_out = m_renderer.GetVideoOut();
+	const auto handle    = static_cast<int>(video_out_handle);
+	const auto index     = static_cast<int>(display_buffer_index);
+	// The wait blocks the GPU thread, where held-back labels land, while a flip of this buffer is
+	// still queued. A game waiting for one of those labels would stall until the flip completes,
+	// and for good if the flip waits on the game. So they land first, but only when the wait would
+	// block, since the GPU thread would wait anyway then, and otherwise the frame's work keeps
+	// overlapping.
+	if (video_out.IsFlipQueued(handle, index)) {
+		LandHeldBackSignals();
+	}
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	video_out.WaitFlipDone(handle, index);
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
@@ -1232,6 +1242,20 @@ void CommandProcessor::DeferSignal(void* label, uint64_t value, uint32_t size, b
 	// order their callbacks ran, which is the order they were deferred in.
 	GetScheduler().DeferPriorityOperation(
 	    [&gpu = m_renderer.GetGpu(), signal] { gpu.QueueReadySignal(signal); });
+}
+
+// Finishes the GPU work the held-back signals' readbacks ride on, waits for the priority callbacks
+// that queue them as ready, then lands them. RenderContext::UnmapMemory does the same before it
+// removes memory. Off the GPU thread there is nothing that would block on them.
+void CommandProcessor::LandHeldBackSignals() {
+	if (m_pending_signals->load(std::memory_order_acquire) == 0 || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	auto&      scheduler = GetScheduler();
+	const auto tick      = scheduler.CurrentTick();
+	scheduler.Finish();
+	scheduler.WaitPriorityOperations(tick);
+	m_renderer.GetGpu().LandReadySignals();
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

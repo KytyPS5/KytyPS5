@@ -222,8 +222,13 @@ public:
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
+	// Whether a flip of this buffer is still queued, so Wait would block.
+	[[nodiscard]] bool IsQueued(VideoOutConfig& cfg, int index);
 
 private:
+	// Whether a flip of this buffer is still queued. The caller holds m_mutex.
+	[[nodiscard]] bool HasRequest(const VideoOutConfig& cfg, int index) const;
+
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
 
 	struct Request {
@@ -1205,17 +1210,23 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
+bool FlipQueue::HasRequest(const VideoOutConfig& cfg, int index) const {
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+}
+
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
-	auto has_request = [this, &cfg, index] {
-		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
-		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
-	};
-	while (has_request()) {
+	while (HasRequest(cfg, index)) {
 		m_done_cond_var.Wait(&m_mutex);
 	}
+}
+
+bool FlipQueue::IsQueued(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	return HasRequest(cfg, index);
 }
 
 bool FlipQueue::Flip(uint32_t micros) {
@@ -1700,6 +1711,16 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
 	m_impl->GetFlipQueue().Wait(*ctx, index);
+}
+
+// Whether WaitFlipDone would block now. An invalid handle or index reports false, so the
+// following WaitFlipDone reports it.
+bool VideoOutDriver::IsFlipQueued(int handle, int index) {
+	auto* ctx = m_impl->Get(handle);
+	if (ctx == nullptr || !IsValidBufferIndex(index)) {
+		return false;
+	}
+	return m_impl->GetFlipQueue().IsQueued(*ctx, index);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

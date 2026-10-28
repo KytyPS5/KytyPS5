@@ -662,6 +662,14 @@ public:
 			m_reduction_db = 0.0;
 			m_gain         = m_level;
 		}
+		// The detector skips samples that are not finite, so this should never happen. If the
+		// state still turns NaN or infinite, start again from no reduction instead of muting or
+		// corrupting the bus for good. The settings are kept.
+		if (!std::isfinite(m_power) || !std::isfinite(m_reduction_db)) {
+			m_power        = 0.0;
+			m_reduction_db = 0.0;
+			m_gain         = m_level;
+		}
 	}
 
 private:
@@ -695,7 +703,12 @@ private:
 		if (detect != nullptr) {
 			for (uint32_t ch = 0; ch < channels; ++ch) {
 				const double x = detect[ch * grain + i];
-				level          = rms ? level + x * x : std::max(level, std::abs(x));
+				// A NaN or infinite sample has no level, so it is skipped. Otherwise it would
+				// stay in the running average, or in the reduction, for good.
+				if (!std::isfinite(x)) {
+					continue;
+				}
+				level = rms ? level + x * x : std::max(level, std::abs(x));
 			}
 		}
 		if (rms) {

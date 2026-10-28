@@ -801,6 +801,43 @@ void TestCompressorDsp() {
 	Check(!compressor.Enabled(), "flags 0 did not disable the compressor");
 }
 
+// A NaN or infinite sample in the detected signal is skipped, so it can't leave the compressor
+// stuck. The limiter (peak detection, instant times) and the ducking setup (side-chain RMS) both
+// keep working afterwards.
+void TestCompressorNonFinite() {
+	constexpr uint32_t Rate = 1000;
+	constexpr float    Inf  = std::numeric_limits<float>::infinity();
+	constexpr float    NaN  = std::numeric_limits<float>::quiet_NaN();
+	Ngs2Compressor     compressor;
+
+	for (const float bad: {Inf, NaN}) {
+		compressor.Reset();
+		compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 0.0f), Rate);
+		float limited[] = {bad, 0.5f};
+		compressor.Process(limited, nullptr, 1, 2);
+		Check(limited[1] == 0.5f, "a non-finite sample broke the limiter");
+
+		compressor.Reset();
+		compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 1.0f), Rate);
+		float released[] = {bad, 0.5f};
+		compressor.Process(released, nullptr, 1, 2);
+		Check(released[1] == 0.5f, "a non-finite sample left the limiter reducing");
+
+		// A key of 0.1 is 10 dB over the RMS threshold, so at ratio 0.25 it ducks by 7.5 dB.
+		compressor.Reset();
+		compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+		std::vector<float> signal(Rate, 0.5f);
+		std::vector<float> key(Rate, bad);
+		compressor.Process(signal.data(), key.data(), 1, Rate);
+		Check(signal[Rate - 1] == 0.5f, "a non-finite key ducked the signal");
+		std::fill(signal.begin(), signal.end(), 0.5f);
+		std::fill(key.begin(), key.end(), 0.1f);
+		compressor.Process(signal.data(), key.data(), 1, Rate);
+		Check(Near(signal[Rate - 1], 0.5 * std::pow(10.0, -7.5 / 20.0), 1e-5),
+		      "a non-finite key stopped the ducking");
+	}
+}
+
 // A submixer with a side-chain compressor (peak-keyed here, so one sample settles it) ducks
 // input 0 while input 1 has signal.
 void TestSubmixerCompressorVoice() {
@@ -1874,6 +1911,7 @@ int main() {
 	TestPitchClamps();
 	TestSubmixerSideChainInput();
 	TestCompressorDsp();
+	TestCompressorNonFinite();
 	TestSubmixerCompressorVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();

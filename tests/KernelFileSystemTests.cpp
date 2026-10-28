@@ -324,6 +324,7 @@ void CheckSaveRename(const std::filesystem::path &root,
 }
 
 void TestRandomDevices() {
+  namespace Net = Libs::Network::Net;
   for (const auto* path : {"/dev/urandom", "/dev/random"}) {
     const int fd = FileSystem::KernelOpen(path, 0, 0);
     FileSystem::FileStat stat {};
@@ -333,7 +334,18 @@ void TestRandomDevices() {
     std::array<uint8_t, 32> entropy {};
     Check(FileSystem::KernelRead(fd, entropy.data(), entropy.size()) == entropy.size(),
           "character device supplies requested entropy");
+    // OpenSSL RAND_poll selects the device before reading it; a null timeout must not block.
+    std::array<uint64_t, 16> readable {};
+    readable[fd / 64] = uint64_t {1} << (fd % 64);
+    auto writable = readable;
+    const auto requested = readable;
+    Check(Net::Select(fd + 1, readable.data(), writable.data(), nullptr, nullptr) == 2 &&
+              readable == requested && writable == requested,
+          "select reports an entropy source ready at once");
     Check(FileSystem::KernelClose(fd) == OK, "close entropy source");
+    Check(Net::Select(fd + 1, readable.data(), nullptr, nullptr, nullptr) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+          "select rejects a closed descriptor");
   }
 }
 
@@ -494,9 +506,9 @@ void TestAddContent(const std::filesystem::path& root) {
   write(folder / "duplicate" / "sce_sys" / "param.json", param("PPSA11111", label(1)));
   write(folder / label(0) / "payload.txt", "DLC payload");
 
-  Loader::AddContentLoad(folder, "");
+  Loader::AddContentLoad(folder, {}, "");
   Check(Loader::AddContentGetAll().empty(), "unknown title never exposes unrelated add-ons");
-  Loader::AddContentLoad(folder, "PPSA11111");
+  Loader::AddContentLoad(folder, {}, "PPSA11111");
   Check(Loader::AddContentGetAll().size() == 65,
         "scan filters title before deduplication and ignores invalid/non-package metadata");
 
@@ -591,7 +603,39 @@ void TestAddContent(const std::filesystem::path& root) {
   for (size_t i = 1; i < mounts.size(); ++i) {
     Check(unmount(&mounts[i]) == OK, "unmount fixture");
   }
-  Loader::AddContentLoad(folder / "missing", "PPSA11111");
+
+  const auto user_dir = root / "user-add-on";
+  write(user_dir / "payload.txt", "user payload");
+  const auto user_arg = label(0) + "=" + Common::PathToString(user_dir);
+  Check(!Common::ParseAddContent("SHORT") && !Common::ParseAddContent("lowercase0000000") &&
+            !Common::ParseAddContent("LICENSE0000000001") &&
+            !Common::ParseAddContent(user_arg + "/missing"),
+        "user add-on needs a 16-character A-Z/0-9 label and an existing folder");
+  const auto licensed = Common::ParseAddContent("LICENSE000000001");
+  const auto replaced = Common::ParseAddContent(user_arg);
+  const auto duplicate =
+      Common::ParseAddContent("LICENSE000000001=" + Common::PathToString(user_dir));
+  Check(licensed && replaced && duplicate, "user add-ons parse with and without extra data");
+  Loader::AddContentLoad(folder, {*duplicate, *licensed, *replaced}, "PPSA11111");
+  Check(list(0, nullptr, 0, &count) == OK && count == 69,
+        "user add-ons replace detected labels and append new ones");
+  Label user {};
+  std::memcpy(user.data, "LICENSE000000001", 17);
+  Check(get(0, &user, &single) == OK && single.package_type == 3 && single.download_status == 0 &&
+            mount(0, &user, &point) == static_cast<int>(0x80d90005u),
+        "last entry of a label wins and a license-only add-on has no extra data to mount");
+  Check(mount(0, &info[3].label, &point) == OK, "user add-on mounts its extra data");
+  const std::string user_file = std::string(point.data) + "/payload.txt";
+  const int user_fd = FileSystem::KernelOpen(user_file.c_str(), 0, 0);
+  std::array<char, 12> user_payload {};
+  Check(user_fd >= 3 &&
+            FileSystem::KernelRead(user_fd, user_payload.data(), user_payload.size()) ==
+                user_payload.size() &&
+            std::string_view(user_payload.data(), user_payload.size()) == "user payload" &&
+            FileSystem::KernelClose(user_fd) == OK && unmount(&point) == OK,
+        "user add-on replaces the detected folder of its label");
+
+  Loader::AddContentLoad(folder / "missing", {}, "PPSA11111");
   Check(list(0, info.data(), 4, &count) == OK && count == 3,
         "missing add-ons folder retains GTA V entitlements");
   for (size_t i = 0; i < existing.size(); ++i) {
@@ -2453,8 +2497,8 @@ int main(int argc, char** argv) {
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
-  FileSystem::Shutdown();
   CheckSocketWakeup();
+  FileSystem::Shutdown();
   CheckEtherAddressFormatting();
 #if defined(__linux__)
   TestNetCtlHostIpv4();

@@ -109,4 +109,23 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 	return entries;
 }
 
+std::optional<AddContentEntry> ParseAddContent(std::string_view value) {
+	static const std::regex label_pattern("^[A-Z0-9]{16}$");
+	const auto              eq    = value.find('=');
+	const auto              label = value.substr(0, eq);
+	if (!std::regex_match(label.begin(), label.end(), label_pattern)) {
+		return std::nullopt;
+	}
+
+	AddContentEntry entry {{}, std::string(label), {}, {}};
+	if (eq != std::string_view::npos) {
+		entry.mount_dir = PathFromUtf8(FixFilenameSlash(value.substr(eq + 1)));
+		std::error_code ec;
+		if (!std::filesystem::is_directory(entry.mount_dir, ec)) {
+			return std::nullopt;
+		}
+	}
+	return entry;
+}
+
 } // namespace Common

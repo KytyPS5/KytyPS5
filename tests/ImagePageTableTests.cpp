@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -12,6 +14,11 @@ using Owners     = std::vector<uint32_t>;
 using Table      = Libs::Graphics::MultiLevelPageTable<Owners, 20, 44, 14>;
 using PageOwners = Libs::Graphics::InlinePageOwnerList<uint32_t, 16>;
 using OwnerTable = Libs::Graphics::MultiLevelPageTable<PageOwners, 20, 44, 14>;
+
+// MSVC's STL and libc++ don't need these traits for std::any_of, but libstdc++ does, so only a
+// Linux build would notice them missing.
+static_assert(std::is_same_v<std::iterator_traits<PageOwners::const_iterator>::iterator_category,
+                             std::input_iterator_tag>);
 
 void Check(bool value, const char* text) {
 	if (!value) {

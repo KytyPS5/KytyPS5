@@ -113,6 +113,13 @@
         </widget>
        </item>
        <item>
+        <widget class="QCheckBox" name="close_terminal">
+         <property name="text">
+          <string>Close terminal automatically</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <layout class="QHBoxLayout" name="themeLayout">
          <item>
           <widget class="QLabel" name="label_theme">

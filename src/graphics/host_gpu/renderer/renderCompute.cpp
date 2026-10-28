@@ -53,7 +53,7 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
-	const auto& program   = *input.stage.program;
+	const auto& program   = input.stage.module->info;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
@@ -135,7 +135,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
                                           CommandBuffer& command, uint32_t group_x,
                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
-	const auto& program   = *input.stage.program;
+	const auto& program   = input.stage.module->info;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
@@ -208,7 +208,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-		     image_clear ? "image clear" : "buffer fill", input.stage.program->shader_hash,
+		     image_clear ? "image clear" : "buffer fill", input.stage.module->info.shader_hash,
 		     descriptor.Base48(), size, packed_clear);
 	}
 	return true;
@@ -216,7 +216,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
-	if (input.stage.program->bindings.descriptor_counts[
+	if (input.stage.module->info.bindings.descriptor_counts[
 	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
@@ -248,7 +248,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
-	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
@@ -293,7 +292,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& cs_regs = sh_ctx.GetCs();
-	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
@@ -311,16 +309,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
-	if (!compute_program) return;
+	m_context.GetImageHeap().BeginDraw();
+	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
-	const auto& program   = *input_info.stage.program;
+	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
@@ -350,8 +347,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -362,6 +358,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
@@ -497,20 +496,22 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
-	if (!compute_program) return;
+	m_context.GetImageHeap().BeginDraw();
+	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
-	const auto& program = *input_info.stage.program;
+	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
+	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(

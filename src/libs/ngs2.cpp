@@ -44,6 +44,8 @@ constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
     static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
+// Sampler voice control that turns the voice's peak meter on or off.
+constexpr uint32_t NGS2_SAMPLER_CONTROL_PEAK_METER = 9;
 
 struct Ngs2SystemOption {
 	size_t    size                     = 0;
@@ -436,6 +438,13 @@ static_assert(sizeof(Ngs2SamplerFilterParam) == 48);
 static_assert(offsetof(Ngs2SamplerFilterParam, type) == 8 &&
               offsetof(Ngs2SamplerFilterParam, channel_mask) == 16 &&
               offsetof(Ngs2SamplerFilterParam, frequency) == 24);
+
+// The SDK's SamplerVoicePeakMeterParam, sent after the control header.
+struct Ngs2SamplerPeakMeterParam {
+	uint32_t enable_flag;
+	uint32_t reserved;
+};
+static_assert(sizeof(Ngs2SamplerPeakMeterParam) == 8);
 
 struct Ngs2SamplerFilter {
 	struct History {
@@ -2555,16 +2564,17 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							    static_cast<double>(voice->sample_rate) * clamped_ratio * 4294967296.0));
 						break;
 					}
-					case 9: {
-						// SamplerVoicePeakMeterParam {enableFlag, reserved}.
+					case NGS2_SAMPLER_CONTROL_PEAK_METER: {
 						EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler);
-						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) + 8u);
-						const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
-						voice->peak_meter_enabled = values[0] != 0;
+						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
+						                                        sizeof(Ngs2SamplerPeakMeterParam));
+						const auto& meter =
+						    *reinterpret_cast<const Ngs2SamplerPeakMeterParam*>(param + 1);
+						voice->peak_meter_enabled = meter.enable_flag != 0;
 						if (!voice->peak_meter_enabled) {
 							voice->peak_height = 0.0f;
 						}
-						LOGF("\t peak meter enable flag = 0x%08" PRIx32 "\n", values[0]);
+						LOGF("\t peak meter enable flag = 0x%08" PRIx32 "\n", meter.enable_flag);
 						break;
 					}
 					case 0xa: {

@@ -29,16 +29,21 @@ struct Fixture {
 		rack.type                 = type;
 		voice.rack                = &rack;
 		SetCapacity(4);
-		struct Setup {
+		Setup(rate, channels);
+		voice.state = Ngs2VoicePlayState::Playing;
+	}
+
+	// Sends the sampler setup control, as a game does before a voice plays a new sound.
+	void Setup(uint32_t rate, uint32_t channels) {
+		struct SetupParam {
 			Ngs2VoiceParamHeader header {40, 0, 0x10000000};
 			Ngs2WaveformFormat   format;
 			uint32_t             flags = 0, reserved = 0;
 		} setup;
-		setup.header.id = type == Ngs2RackType::Sampler ? 0x10000000 : 0x40010000;
+		setup.header.id = rack.type == Ngs2RackType::Sampler ? 0x10000000 : 0x40010000;
 		setup.format    = {0x12, channels, rate};
 		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
 		      "sampler setup failed");
-		voice.state = Ngs2VoicePlayState::Playing;
 	}
 
 	void SetCapacity(uint32_t capacity) {
@@ -836,17 +841,26 @@ void TestPitchClamps() {
 	      "pitch was not clamped to four times playback speed");
 }
 
-// SamplerVoicePeakMeterParam (0x10000009): the voice state reports the largest absolute sample of
-// the last render while the peak meter is enabled, and 0 otherwise.
+// Id of a sampler rack voice control. The rack id 0x1000 sits in the high half.
+constexpr uint32_t SamplerControlId(uint32_t control) {
+	return 0x10000000u | control;
+}
+
+// The sampler voice peak meter control as a game sends it.
+struct PeakMeterControl {
+	Ngs2VoiceParamHeader      header {static_cast<uint16_t>(sizeof(Ngs2VoiceParamHeader) +
+	                                                        sizeof(Ngs2SamplerPeakMeterParam)),
+	                                  0, SamplerControlId(NGS2_SAMPLER_CONTROL_PEAK_METER)};
+	Ngs2SamplerPeakMeterParam param {1, 0};
+};
+
+// While the peak meter is enabled, the voice state reports the largest absolute sample of the
+// last render, and 0 otherwise.
 void TestPeakMeter() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {8192, -16384, 4096, 0, 2048, 0};
 	f.Queue(pcm, 6, 0);
-	struct PeakMeter {
-		Ngs2VoiceParamHeader header {16, 0, 0x10000009};
-		uint32_t             enable   = 1;
-		uint32_t             reserved = 0;
-	} meter;
+	PeakMeterControl meter;
 	f.Render(2);
 	Check(f.State().peak_height == 0.0f, "peak height reported while the peak meter is disabled");
 	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
@@ -863,7 +877,7 @@ void TestPeakMeter() {
 	Check(f.State().peak_height == 0.0625f, "peak height kept a sample from an earlier render");
 	f.Render(2);
 	Check(f.State().peak_height == 0.0f, "peak height not cleared once the voice ran out of data");
-	meter.enable = 0;
+	meter.param.enable_flag = 0;
 	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK &&
 	          f.State().peak_height == 0.0f,
 	      "disabling the peak meter did not clear the peak height");
@@ -874,11 +888,7 @@ void TestPeakMeter() {
 void TestPeakMeterReset() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 0, 16384, 0, 16384, 0};
-	struct PeakMeter {
-		Ngs2VoiceParamHeader header {16, 0, 0x10000009};
-		uint32_t             enable   = 1;
-		uint32_t             reserved = 0;
-	} meter;
+	PeakMeterControl meter;
 	const auto voice = reinterpret_cast<uintptr_t>(&f.voice);
 	Check(Ngs2VoiceControl(voice, &meter.header) == OK, "peak meter control failed");
 	f.Queue(pcm, 6, 0);
@@ -889,12 +899,7 @@ void TestPeakMeterReset() {
 	f.voice.SetEvent(1);
 	f.Render(2);
 	Check(f.State().peak_height == 0.5f, "the peak meter stopped after a voice reset");
-	struct Setup {
-		Ngs2VoiceParamHeader header {40, 0, 0x10000000};
-		Ngs2WaveformFormat   format {0x12, 1, 48000};
-		uint32_t             flags = 0, reserved = 0;
-	} setup;
-	Check(Ngs2VoiceControl(voice, &setup.header) == OK, "sampler setup failed");
+	f.Setup(48000, 1);
 	Check(f.voice.peak_height == 0.0f, "a voice set up again kept the previous sound's peak");
 	f.voice.state = Ngs2VoicePlayState::Playing;
 	f.Queue(pcm, 6, 0);

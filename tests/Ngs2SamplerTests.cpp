@@ -1303,6 +1303,58 @@ void TestCustomReverbClearTail() {
 	}
 }
 
+// Feeds an impulse with NaN and inf scattered through it, the LFE included, and checks every
+// grain against a twin fed zeros in their place. With no reflections or reverb delay the NaN
+// would reach the output through the combs and all-passes well within the window.
+void CheckNonFiniteInput(float dry) {
+	constexpr uint32_t grain = 256, channels = 6, grains = 20;
+	const auto         param = ReverbParam(1.0f, 0, 0, dry);
+	Ngs2Reverb         used, twin;
+	used.Configure(param, 48000);
+	twin.Configure(param, 48000);
+	std::vector<float> block(size_t(grain) * channels), expected(block.size());
+	for (uint32_t b = 0; b < grains; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0]              = 1.0f; // An impulse after the fade-in grain.
+			block[10]             = std::numeric_limits<float>::quiet_NaN();
+			block[grain + 20]     = std::numeric_limits<float>::infinity();
+			block[2 * grain + 30] = -std::numeric_limits<float>::infinity();
+			block[3 * grain + 40] = std::numeric_limits<float>::quiet_NaN(); // The LFE.
+		}
+		expected = block;
+		std::ranges::replace_if(
+		    expected, [](float sample) { return !std::isfinite(sample); }, 0.0f);
+		used.Process(block.data(), channels, grain);
+		twin.Process(expected.data(), channels, grain);
+		// NaN never compares equal, so finiteness comes first or a mismatch could hide.
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "NaN or inf input reached the reverb's output");
+		Check(block == expected, "reverb treated NaN or inf input as anything but silence");
+	}
+}
+
+// One NaN or inf input sample must not poison the reverb, and a grain of nothing but NaN is
+// silence. Both dry levels are checked because even at dry 0 the dry path multiplies the input,
+// and NaN times zero is still NaN.
+void TestCustomReverbNonFiniteInput() {
+	CheckNonFiniteInput(0.0f);
+	CheckNonFiniteInput(1.0f);
+
+	constexpr uint32_t grain = 256, channels = 6;
+	Ngs2Reverb         idle;
+	idle.Configure(ReverbParam(1.0f, 0, 0), 48000);
+	std::vector<float> block(size_t(grain) * channels, 0.0f);
+	idle.Process(block.data(), channels, grain);
+	// Past the fade-in grain nothing is pending, so only sound can make the reverb run.
+	Check(!idle.HasTail(), "idle reverb still had its fade-in pending");
+	std::ranges::fill(block, std::numeric_limits<float>::quiet_NaN());
+	idle.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
+	          !idle.HasTail(),
+	      "a grain of NaN was treated as sound");
+}
+
 // A custom submixer with a reverb module, fed an impulse by a sampler voice. It is started with
 // event 1, as a game does, so the start clears the reverb as it would in a game.
 struct ReverbVoiceRig {
@@ -2283,6 +2335,7 @@ int main() {
 	TestCustomReverbVoice();
 	TestCustomReverbClearTail();
 	TestCustomReverbClearTailNewChannels();
+	TestCustomReverbNonFiniteInput();
 	TestCustomReverbVoiceRestart();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();

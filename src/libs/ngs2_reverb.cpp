@@ -167,6 +167,11 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 		return;
 	}
 	const size_t total = size_t(channels) * grain;
+	// One NaN or inf would spread through every delay line for the rest of the tail. Zero adds
+	// nothing, where a clamp would turn garbage into a full-scale impulse. Doing it first also
+	// lets a grain of garbage count as silence.
+	std::replace_if(
+	    samples, samples + total, [](float sample) { return !std::isfinite(sample); }, 0.0f);
 	if (!StartGrain(samples, total)) {
 		return;
 	}

@@ -109,7 +109,8 @@ public:
 	}
 
 	// Applies the reverb in place to `samples`, which holds `channels` blocks of `grain`
-	// samples, one block per channel.
+	// samples, one block per channel. Once configured, it treats NaN and inf input samples as
+	// silence and writes 0 in their place.
 	void Process(float* samples, uint32_t channels, uint32_t grain);
 
 	// Empties the reverb so a new start does not replay the tail of the sound before it. The

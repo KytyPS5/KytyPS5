@@ -522,7 +522,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
 		case ValueOpcode::SubgroupUMinU32:
-		case ValueOpcode::SubgroupUMaxU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupUMaxU32:
+		case ValueOpcode::SubgroupBitwiseOrU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {

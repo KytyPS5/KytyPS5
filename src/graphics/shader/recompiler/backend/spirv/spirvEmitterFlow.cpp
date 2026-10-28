@@ -859,6 +859,10 @@ uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst);
 }
 
+uint32_t EmitSubgroupBitwiseOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseOr, EmitBitwiseOr32>(ctx, inst);
+}
+
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();

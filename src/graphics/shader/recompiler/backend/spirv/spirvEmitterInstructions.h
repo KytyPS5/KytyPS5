@@ -236,6 +236,7 @@ uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& i
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupBitwiseOrU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

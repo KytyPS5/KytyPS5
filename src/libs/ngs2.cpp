@@ -1942,6 +1942,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 			}
 			continue;
 		}
+		// The channel counts no longer have to match, so bound the output's own count (1 to 8
+		// channels) before it sizes the buffer check and the mix below.
+		EXIT_NOT_IMPLEMENTED(output.num_channels == 0 || output.num_channels > 8);
 		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
 		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
 		                                                                             : sizeof(float)));

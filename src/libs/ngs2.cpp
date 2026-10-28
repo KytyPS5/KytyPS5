@@ -1816,6 +1816,12 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					voice.has_samples = true;
 				}
 			}
+			// A custom sampler ends once its data and filter history run out, without waiting for
+			// its reverb tail, so the tail is cut off after that grain. Waiting would keep the voice
+			// playing for as long as the tail rings, which can be minutes, and a game that reuses
+			// voices once they end would be held up. The library's behaviour here is unknown, and
+			// AnyPS5 does not run the custom reverb at all. Games seen so far put it on custom
+			// submixers, which never end here.
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
 			    voice.frame_cursor == voice.frame_samples &&
 			    voice.next_frame_samples == 0 &&

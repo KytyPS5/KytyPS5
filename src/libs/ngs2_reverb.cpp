@@ -18,6 +18,12 @@ constexpr uint32_t RingSamples = 14400;
 constexpr uint32_t LfeChannel  = 3;
 constexpr float    TwoPi       = 2.0f * std::numbers::pi_v<float>;
 
+// The combs fade 60 dB per decay time, so the tail is 120 dB down after two decay times.
+constexpr float TailDecayTimes        = 2.0f;
+constexpr float MillisecondsPerSecond = 1000.0f;
+// Covers the longest reflections delay (0.3 s) plus the longest reverb delay (0.1 s).
+constexpr float TailDelayMilliseconds = 400.0f;
+
 // The reflection patterns. Each has four tap times in ms after the reflections delay, and
 // a gain for each tap. A negative gain flips the echo's polarity.
 constexpr float TapTimes[8][EarlyTaps] = {{0, 11, 23, 35}, {0, 14.75f, 26.55f, 38.03f},
@@ -187,11 +193,11 @@ bool Ngs2Reverb::StartGrain(float* samples, size_t total) {
 	const bool silent_input =
 	    std::all_of(samples, samples + total, [](float sample) { return sample == 0.0f; });
 	if (!silent_input) {
-		// Any sound restarts the countdown to the end of the tail. The combs fade 60 dB
-		// per decay time, so the tail is 120 dB down after two decay times (2000 ms per
-		// second of decay). The extra 400 ms covers the longest reflections delay (0.3 s)
-		// plus the longest reverb delay (0.1 s).
-		m_tail_remaining = Samples(2000.0f * m_params.decay_time + 400.0f, float(m_rate));
+		// Any sound restarts the countdown to the end of the tail.
+		m_tail_remaining =
+		    Samples(TailDecayTimes * MillisecondsPerSecond * m_params.decay_time +
+		                TailDelayMilliseconds,
+		            float(m_rate));
 	} else if (m_tail_remaining == 0 && !m_reset && !m_changed) {
 		// Silent input and no tail left means silent output. Pending settings skip this,
 		// so their crossfade starts on the same grain as the library's would.

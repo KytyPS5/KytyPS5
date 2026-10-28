@@ -85,6 +85,8 @@ static_assert(sizeof(Ngs2ReverbI3dl2Param) == 88);
 // library to within rounding. A few odd-looking expressions are kept exactly for that reason.
 class Ngs2Reverb {
 public:
+	// The module id a custom rack uses for this reverb.
+	static constexpr uint32_t ModuleId    = 0x1b;
 	static constexpr uint32_t MaxChannels = 8;
 	static constexpr uint32_t EarlyTaps   = 4;
 	static constexpr uint32_t Combs       = 16;

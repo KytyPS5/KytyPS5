@@ -1858,7 +1858,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				const auto& info   = custom.module[m];
 				auto&       module = voice.modules[m];
-				if (info.module_id == 0x1b) {
+				if (info.module_id == Ngs2Reverb::ModuleId) {
 					// Until the game configures it, the module passes audio through unchanged.
 					if (module.reverb != nullptr) {
 						module.reverb->Process(voice.Buffer(info.source_buffer_id, grain),
@@ -2468,7 +2468,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id;
 				auto& module = voice->modules[index];
 				if ((param->id & 0xffffffe0u) != (0x40000000u | module_id << 8u) ||
-				    (module_id != 0x19 && module_id != 0x1b && module_id != 0x1f)) {
+				    (module_id != 0x19 && module_id != Ngs2Reverb::ModuleId &&
+				     module_id != 0x1f)) {
 					if (!module.control_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
@@ -2477,7 +2478,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					}
 					break;
 				}
-				if (module_id == 0x1b) {
+				if (module_id == Ngs2Reverb::ModuleId) {
 					// The custom reverb module. The control is Ngs2CustomVoiceReverbParam, a header
 					// followed by the I3DL2 settings.
 					EXIT_NOT_IMPLEMENTED(param->size !=

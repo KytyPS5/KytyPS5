@@ -764,16 +764,27 @@ void TestCompressorDsp() {
 	// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices). The RMS detector
 	// compares power with the threshold, so a key of 0.1 (power 0.01) is 10 dB over 0.001 and
 	// reduces the signal by 10 * (1 - ratio) dB once the RMS window fills. The main signal's own
-	// level is ignored.
+	// level is ignored. The power is summed across channels, so the same key in both channels of
+	// a stereo bus is 3 dB louder (13 dB over), and a key in only one channel ducks like mono.
 	compressor.Reset();
 	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
-	const double       ducked = 0.5 * std::pow(10.0, -7.5 / 20.0);
+	const double       ducked        = 0.5 * std::pow(10.0, -7.5 / 20.0);
+	const double       stereo_over   = 10.0 * std::log10(2 * 0.1 * 0.1 / 0.001); // About 13 dB.
+	const double       stereo_ducked = 0.5 * std::pow(10.0, -stereo_over * (1.0 - 0.25) / 20.0);
 	std::vector<float> stereo(size_t(Rate) * 2, 0.5f);
 	std::vector<float> stereo_key(size_t(Rate) * 2, 0.1f);
 	std::fill(stereo_key.begin() + Rate, stereo_key.end(), -0.1f);
 	compressor.Process(stereo.data(), stereo_key.data(), 2, Rate);
-	Check(Near(stereo[Rate - 1], ducked, 1e-5) && Near(stereo[2 * Rate - 1], ducked, 1e-5),
+	Check(Near(stereo[Rate - 1], stereo_ducked, 1e-5) &&
+	          Near(stereo[2 * Rate - 1], stereo_ducked, 1e-5),
 	      "the side-chain key did not duck the signal");
+	compressor.Reset();
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+	std::fill(stereo.begin(), stereo.end(), 0.5f);
+	std::fill(stereo_key.begin() + Rate, stereo_key.end(), 0.0f);
+	compressor.Process(stereo.data(), stereo_key.data(), 2, Rate);
+	Check(Near(stereo[Rate - 1], ducked, 1e-5) && Near(stereo[2 * Rate - 1], ducked, 1e-5),
+	      "a key in one stereo channel did not duck like mono");
 	std::vector<float> signal(Rate, 0.5f);
 	compressor.Process(signal.data(), nullptr, 1, Rate);
 	Check(signal[Rate - 1] == 0.5f, "the compressor did not recover without a key");

@@ -570,12 +570,15 @@ static_assert(sizeof(Ngs2SubmixerCompressorParam) == 32);
 // from the side-chain inputs instead, and 0x2 selects RMS detection. The game sends 0x0a to duck
 // music under voices, with a 0.1 s attack and a 4 s release. Flags 0 disables the compressor.
 //
-// The RMS detector compares the mean square (the power, averaged over RmsWindow) with the
-// threshold, so a threshold of 0.001 is -30 dB. Above the threshold the output level rises by
-// `ratio` dB per input dB, and `knee` softens the transition over that many dB. `level` is
-// applied to the compressed signal. Attack and release smooth the gain reduction exponentially,
-// and give the time it takes to settle within 60 dB of the target, as the reverb's decay time
-// does.
+// The RMS detector compares the power with the threshold, so a threshold of 0.001 is -30 dB. The
+// power is summed across the channels and averaged over RmsWindow. Summing (and not averaging)
+// the channels matches the depth of the ducking in a PS5 capture of PPSA28465. That capture only
+// had stereo buses, so the depth on mono and surround buses is unverified.
+//
+// Above the threshold the output level rises by `ratio` dB per input dB, and `knee` softens the
+// transition over that many dB. `level` is applied to the compressed signal. Attack and release
+// smooth the gain reduction exponentially, and give the time it takes to settle within 60 dB of
+// the target, as the reverb's decay time does.
 //
 // A model of the submixer's compressor. For each sample it measures how loud the detected
 // signal is and how far that is above the threshold. From that it works out how many dB to turn
@@ -584,7 +587,7 @@ static_assert(sizeof(Ngs2SubmixerCompressorParam) == 32);
 //
 // The work is done in dB because loudness is heard on a log scale. A level `x` (1 is full
 // scale) is 20 * log10(x) dB, so halving a level takes away about 6 dB. A power (a level
-// squared) is 10 * log10(p) dB, which gives the same dB figure for the same signal.
+// squared) is 10 * log10(p) dB, which gives the same dB figure for the same one-channel signal.
 class Ngs2Compressor {
 public:
 	static constexpr uint32_t FlagPeak      = 0x1;
@@ -694,9 +697,10 @@ private:
 	// negative below the threshold and minus infinity for silence. `detect` may be null, which
 	// is silence.
 	//
-	// Peak detection takes the loudest channel at this one sample. RMS detection takes the
-	// mean power across the channels and averages it over time, so it follows how loud the
-	// signal sounds and ignores short spikes.
+	// Peak detection takes the loudest channel at this one sample. RMS detection adds up the
+	// power of all the channels and averages it over time, so it follows how loud the signal
+	// sounds and ignores short spikes. A stereo signal with the same level in both channels
+	// detects 3 dB louder than mono.
 	double OverThresholdDb(const float* detect, uint32_t i, uint32_t channels, uint32_t grain) {
 		const bool rms   = (m_flags & FlagRms) != 0;
 		double     level = 0.0;
@@ -712,8 +716,8 @@ private:
 			}
 		}
 		if (rms) {
-			// Mix this sample's mean power into the running average.
-			m_power = m_rms_window * m_power + (1.0 - m_rms_window) * level / channels;
+			// Mix this sample's total power into the running average.
+			m_power = m_rms_window * m_power + (1.0 - m_rms_window) * level;
 			// A power is compared in dB with 10 * log10 where a level uses 20 * log10.
 			return m_power > 0.0 ? 10.0 * std::log10(m_power / m_threshold)
 			                     : -std::numeric_limits<double>::infinity();
@@ -752,7 +756,7 @@ private:
 	double   m_attack       = 0.0; // Smoothing coefficient while the reduction grows.
 	double   m_release      = 0.0; // Smoothing coefficient while the reduction shrinks.
 	double   m_rms_window   = 0.0; // Smoothing coefficient of the RMS detector.
-	double   m_power        = 0.0; // Smoothed mean square, for RMS detection.
+	double   m_power        = 0.0; // Smoothed power summed across channels, for RMS detection.
 	double   m_reduction_db = 0.0; // Current gain reduction.
 	double   m_gain         = 1.0; // Current gain, `m_level` less the reduction.
 };

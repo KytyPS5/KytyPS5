@@ -396,6 +396,9 @@ private:
 		// Elements visited by every binding, and whenever the guest backing changes.
 		std::vector<uint32_t>                always;
 		std::vector<uint32_t>                unchecked_backing;
+		// The state of a compute program: no draw samples its depth elements in an attachment
+		// layout (see DepthTableElement()).
+		bool                                 compute = false;
 		// Elements marked for a visit by this binding.
 		std::vector<uint64_t>                marks;
 		uint64_t                             mark_stamp = 0;

@@ -111,6 +111,15 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	return {nullptr, view, texture.layout};
 }
 
+// A depth image a table names may be the depth target of a later draw, which samples it in the
+// attachment layout: such elements of the tables of draws are visited by every binding, so their
+// descriptors follow the layout and AcquireRenderTargets() sees them. Those of compute programs
+// are checked as the others (GTA V's ray tracing tables have ~800 depth copies).
+static bool DepthTableElement(TextureCache& texture_cache, const TextureBinding& texture) {
+	if (!texture.image_id) return false;
+	return texture_cache.GetImage(texture.image_id).info.IsDepth();
+}
+
 static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) {
 	const auto type = descriptor.Type();
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
@@ -1393,7 +1402,7 @@ void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 		state.elements.push_back({.resolution = element, .table = &resolution, .source = value,
 		                          .root = roots.at(changed.range)});
 		auto& entry = state.elements.back();
-		if (element->volatile_dcc || DepthTableElement(texture_cache, element->texture)) {
+		if (element->volatile_dcc || (!state.compute && DepthTableElement(texture_cache, element->texture))) {
 			state.always.push_back(index);
 		} else if (!element->permanent && !element->backing_checkable) {
 			state.unchecked_backing.push_back(index);
@@ -1507,7 +1516,7 @@ void RenderExecutor::FinishTableBindings(TableBindingState& state,
 	for (uint32_t index = 0; index < state.elements.size(); index++) {
 		auto&       element    = state.elements[index];
 		const auto& resolution = *element.resolution;
-		if (resolution.volatile_dcc) {
+		if (resolution.volatile_dcc || (!state.compute && DepthTableElement(texture_cache, resolution.texture))) {
 			state.always.push_back(index);
 		} else if (!resolution.permanent && !resolution.backing_checkable) {
 			state.unchecked_backing.push_back(index);
@@ -1631,7 +1640,7 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 		       (image->info.data.Empty() ||
 		        (image->registered && view.valid &&
 		         ImageLookupState::Of(texture.image_id, *image) == view.state)) &&
-		       !texture_cache.DepthCopyStale(*image) && TableImageReady(*image, texture);
+		       (!image->is_depth_copy || texture_cache.DepthCopyCurrent(*image)) && TableImageReady(*image, texture);
 	};
 	// The images the operation binds so far: TableImageReady() reads the binding state they have
 	// in this operation, which their versions do not count.
@@ -1690,8 +1699,8 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 				checked              = {};
 				continue;
 			}
-			// A depth copy also depends on its color image (DepthCopyStale()); depth elements
-			// are few (and visited by every binding, see FinishTableBindings()).
+			// A depth copy also depends on its color image (DepthCopyCurrent()): depth elements
+			// are checked by every binding (and those of draws visited, see DepthTableElement()).
 			const auto* image = image_id ? texture_cache.m_slot_images.try_get(image_id) : nullptr;
 			if (slot >= m_table_element_versions.size() ||
 			    (image != nullptr && (image->info.IsDepth() || image->is_depth_copy))) {
@@ -1904,6 +1913,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		    return image.table_capacity != 0u;
 	    })) {
 		table_state           = &m_table_states[&program];
+		table_state->compute  = program.stage == ShaderType::Compute;
 		prepared.table_state  = table_state;
 		prepared.tables_reused =
 		    ReuseTableBindings(program, snapshot, *table_state, stamp, prepared);

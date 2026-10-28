@@ -879,6 +879,42 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				sampled_aspects |= info.aspect;
 				feedback_aspects |= feedback;
 			}
+			// Bindless table elements sample the depth target the same way. The bindings
+			// visit every depth element of a table (FinishTableBindings()), so the elements
+			// below are all the table elements this draw can sample it through.
+			const auto table_element = [&](const TextureBinding& binding) {
+				if (binding.image_id != depth.image_id ||
+				    binding.desc.type != TextureCache::BindingType::Texture) return;
+				const auto& views = cache.GetImage(depth.image_id).views;
+				const auto  native =
+				    std::ranges::find(views, binding.image_view, &CachedImageView::view);
+				EXIT_IF(native == views.end());
+				const auto feedback =
+				    DepthFeedbackAspects(draw_writes, depth.desc.view_info, native->info);
+				// A table element is shared by the draws that bind the table: it cannot be
+				// redirected to a pre-draw copy for this draw only. Without
+				// VK_EXT_attachment_feedback_loop_layout the draw samples the attachment it writes in
+				// the general layout, as upstream does: undefined on such hosts, but not an exit.
+				if (feedback && !feedback_loops) {
+					static std::atomic_bool logged = false;
+					if (!logged.exchange(true, std::memory_order_relaxed)) {
+						std::printf("depth attachment feedback loop is not supported by the host: a "
+						            "bindless table element samples the depth target its draw writes\n");
+					}
+				}
+				sampled_aspects |= native->info.aspect;
+				feedback_aspects |= feedback;
+			};
+			if (stage->tables_reused) {
+				const auto& table_state = *static_cast<const TableBindingState*>(stage->table_state);
+				for (const auto index: stage->table_visits) {
+					table_element(table_state.elements[index].resolution->texture);
+				}
+			} else {
+				for (const auto* binding: stage->table_images) {
+					table_element(*binding);
+				}
+			}
 		}
 		auto& image = cache.GetImage(depth.image_id);
 		auto layout = depth_attachment_layout(depth);

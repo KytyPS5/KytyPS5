@@ -627,10 +627,13 @@ public:
 
 		m_flags = param.flags;
 		// Unknown bits are kept, since any nonzero flags turn the compressor on, but nothing reads
-		// them. Warn once so a game that relies on them can be found.
-		if ((m_flags & ~KnownFlags) != 0 && !m_flags_warned) {
+		// them. Peak and RMS together have no known meaning, and OverThresholdDb then detects RMS.
+		// Warn once about either so a game that relies on them can be found.
+		const bool peak_and_rms = (m_flags & (FlagPeak | FlagRms)) == (FlagPeak | FlagRms);
+		if (((m_flags & ~KnownFlags) != 0 || peak_and_rms) && !m_flags_warned) {
 			Log::WriteToConsoleAndLog(fmt::sprintf(
-			    "warning: NGS2 submixer compressor flags 0x%x have unknown bits\n", m_flags));
+			    "warning: NGS2 submixer compressor flags 0x%x are not fully supported\n",
+			    m_flags));
 			m_flags_warned = true;
 		}
 		// A threshold of 0 or less has no level in dB, so it becomes a tiny positive one instead.
@@ -795,7 +798,7 @@ private:
 	double   m_power        = 0.0; // Smoothed power summed across channels, for RMS detection.
 	double   m_reduction_db = 0.0; // Current gain reduction.
 	double   m_gain         = 1.0; // Current gain, `m_level` less the reduction.
-	// Unknown flag bits have been reported.
+	// The flags warning has been given, for unknown bits or peak with RMS.
 	bool m_flags_warned = false;
 };
 

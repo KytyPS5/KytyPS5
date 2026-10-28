@@ -743,10 +743,21 @@ struct Ngs2VoiceInternal {
 		EXIT_NOT_IMPLEMENTED(index >= ports.size());
 		ports[index].matrix = matrix;
 	}
+	// Empties every reverb module, keeping its settings.
+	void ClearReverbTails() {
+		for (auto& module: modules) {
+			if (module.reverb != nullptr) {
+				module.reverb->ClearTail();
+			}
+		}
+	}
 	void SetEvent(uint32_t id) {
 		switch (id) {
 			case 1:
 				if (state == Ngs2VoicePlayState::Empty || state == Ngs2VoicePlayState::Stopped) {
+					// A stopped voice renders nothing, so its reverb kept the old tail. Starting
+					// here, before any grain renders, also makes a stop and play in one tick clean.
+					ClearReverbTails();
 					state = Ngs2VoicePlayState::Playing;
 					// Reserve the voice immediately; publish playback flags after rendering.
 					state_flags |= 1;
@@ -2592,6 +2603,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				const auto* channels   = reinterpret_cast<const uint32_t*>(param + 1);
 				EXIT_NOT_IMPLEMENTED(channels[0] != channels[1]);
 				voice->channels = channels[0];
+				// A new setup may change the channel layout, so the reverb starts empty.
+				voice->ClearReverbTails();
 				break;
 			}
 			case 0x4003: {

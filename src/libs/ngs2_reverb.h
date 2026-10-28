@@ -112,6 +112,10 @@ public:
 	// samples, one block per channel.
 	void Process(float* samples, uint32_t channels, uint32_t grain);
 
+	// Empties the reverb so a new start does not replay the tail of the sound before it. The
+	// settings are kept, and the next sound starts at the current wet and dry levels.
+	void ClearTail();
+
 private:
 	// Where to read the history for the early reflections and the late feed.
 	struct Taps {
@@ -179,6 +183,10 @@ private:
 	// Whether the settings changed since the last grain, which starts a crossfade.
 	bool     m_changed = true;
 	uint32_t m_rate    = 0;
+	// Whether the next grain that reaches the mix starts its wet and dry levels at the current
+	// settings, as after a reset. ClearTail sets it, since levels from before the clear are stale
+	// and a channel added by a new setup has no last level even when no settings are pending.
+	bool m_restart_levels = false;
 	// Samples left until the tail is 120 dB down. 0 means the reverb is quiet.
 	uint32_t m_tail_remaining = 0;
 	// The last RingSamples samples of mono input, for the taps to read.

@@ -1215,6 +1215,177 @@ void TestCustomReverbVoice() {
 	Check(tail, "reverb tail stopped when its input did");
 }
 
+// Runs a fade-in grain, an impulse and four silent grains, so the reverb is left in the middle
+// of its tail.
+void RunIntoTail(Ngs2Reverb& reverb, std::vector<float>& block, uint32_t grain) {
+	for (int b = 0; b < 6; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = 1.0f; // An impulse after the fade-in grain.
+		}
+		reverb.Process(block.data(), 1, grain);
+	}
+	Check(std::ranges::any_of(block, [](float sample) { return sample != 0.0f; }),
+	      "reverb had no tail to clear");
+}
+
+// Runs a silent fade-in grain and then an impulse on every channel through a fresh reverb, and
+// returns the impulse grain. A cleared reverb must sound exactly like this.
+std::vector<float> FreshImpulse(const Ngs2ReverbI3dl2Param& param, uint32_t grain,
+                                uint32_t channels = 1) {
+	Ngs2Reverb         fresh;
+	std::vector<float> block(size_t(grain) * channels, 0.0f);
+	fresh.Configure(param, 48000);
+	fresh.Process(block.data(), channels, grain);
+	for (uint32_t channel = 0; channel < channels; ++channel) {
+		block[size_t(channel) * grain] = 1.0f;
+	}
+	fresh.Process(block.data(), channels, grain);
+	return block;
+}
+
+// A new setup can add channels that were never mixed, so their levels start from nothing.
+// Nothing is pending after the clear, so a silent grain is skipped, and the level restart must
+// wait for the first grain that is mixed. Every channel then starts at full wet.
+void TestCustomReverbClearTailNewChannels() {
+	constexpr uint32_t grain = 256, channels = 2;
+	const auto         param = ReverbParam(1.0f, 0, 0);
+	std::vector<float> mono(grain);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	RunIntoTail(reverb, mono, grain);
+	reverb.ClearTail();
+	std::vector<float> block(size_t(grain) * channels, 0.0f);
+	reverb.Process(block.data(), channels, grain);
+	block[0] = block[grain] = 1.0f;
+	reverb.Process(block.data(), channels, grain);
+	Check(block == FreshImpulse(param, grain, channels),
+	      "a channel added before the restart ramped in instead of starting at full wet");
+}
+
+// ClearTail empties the reverb and keeps its settings. Afterwards silence stays silent, and an
+// impulse sounds like one through a fresh reverb. Empty delay lines read the same whatever
+// their cursors, so the match is exact.
+void TestCustomReverbClearTail() {
+	constexpr uint32_t grain = 256;
+	const auto         param = ReverbParam(1.0f, 0, 0);
+	std::vector<float> block(grain);
+	Ngs2Reverb         used;
+	used.Configure(param, 48000);
+	RunIntoTail(used, block, grain);
+	used.ClearTail();
+	std::ranges::fill(block, 0.0f);
+	used.Process(block.data(), 1, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
+	          !used.HasTail(),
+	      "cleared reverb still sounded");
+	block[0] = 1.0f;
+	used.Process(block.data(), 1, grain);
+	Check(block == FreshImpulse(param, grain), "cleared reverb does not sound like a fresh one");
+
+	// A wet change made while the voice was stopped applies in full to the first sound after the
+	// clear, instead of ramping from the level before it. The settings crossfade on that grain
+	// rounds a little, hence the tolerance.
+	auto half = param;
+	half.wet  = 0.5f;
+	Ngs2Reverb changed;
+	changed.Configure(param, 48000);
+	RunIntoTail(changed, block, grain);
+	changed.Configure(half, 48000);
+	changed.ClearTail();
+	std::ranges::fill(block, 0.0f);
+	block[0] = 1.0f;
+	changed.Process(block.data(), 1, grain);
+	const auto expected = FreshImpulse(half, grain);
+	for (uint32_t i = 0; i < grain; ++i) {
+		Check(std::fabs(block[i] - expected[i]) <= 1e-6f + std::fabs(expected[i]) * 1e-5f,
+		      "cleared reverb ramped its wet level from before the clear");
+	}
+}
+
+// A custom submixer with a reverb module, fed an impulse by a sampler voice. It is started with
+// event 1, as a game does, so the start clears the reverb as it would in a game.
+struct ReverbVoiceRig {
+	static constexpr uint32_t       grain = 256;
+	Fixture                         source {48000};
+	Ngs2Internal                    system;
+	Ngs2RackInternal                rack {};
+	Ngs2VoiceInternal               voice;
+	std::vector<Ngs2VoiceInternal*> voices {&source.voice};
+	// The impulse sits halfway into the first grain, where the settings fade-in is at half.
+	std::array<int16_t, grain / 2 + 1> pcm {};
+
+	ReverbVoiceRig() {
+		pcm.back() = 32767;
+		source.Queue(pcm.data(), static_cast<uint32_t>(pcm.size()), 0);
+		system.option.sample_rate       = 48000;
+		system.option.num_grain_samples = grain;
+		rack.ngs                        = &system;
+		rack.type                       = Ngs2RackType::CustomSubmixer;
+		auto& custom                    = rack.option.custom_submixer.custom_rack_option;
+		custom.num_buffers              = 1;
+		custom.num_modules              = 1;
+		custom.module[0].module_id      = Ngs2Reverb::ModuleId;
+		voice.rack                      = &rack;
+		voice.channels                  = 1;
+		voice.modules.resize(1);
+		source.voice.ports.resize(1);
+		source.voice.ports[0].dest = &voice;
+		struct ReverbControl {
+			Ngs2VoiceParamHeader header {sizeof(ReverbControl), 0, 0x40001b00};
+			Ngs2ReverbI3dl2Param i3dl2 = ReverbParam(1.0f, 0, 0);
+		} control;
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &control.header) == OK,
+		      "reverb module control was not accepted");
+		voice.SetEvent(1);
+	}
+
+	// Renders one grain and returns whether the submixer output any sound.
+	bool Render() {
+		source.voice.rendered = false;
+		voice.rendered        = false;
+		Ngs2RenderVoice(voice, voices, grain);
+		return voice.has_samples &&
+		       std::ranges::any_of(voice.samples, [](float sample) { return sample != 0.0f; });
+	}
+
+	// Renders into the tail, which must still be sounding when the test acts on it.
+	void RenderIntoTail() {
+		for (int i = 0; i < 6; ++i) {
+			Render();
+		}
+		Check(Render(), "reverb voice had no tail to clear");
+	}
+};
+
+// A stopped or killed submixer renders nothing, so its reverb keeps the old tail until the
+// voice plays again. Starting must clear it, as must a new 0x4002 setup.
+void TestCustomReverbVoiceRestart() {
+	for (const uint32_t stop_event: {4u, 8u, 2u}) {
+		ReverbVoiceRig rig;
+		rig.RenderIntoTail();
+		rig.voice.SetEvent(stop_event);
+		Check(!rig.Render(), "stopped reverb voice was not silent");
+		rig.voice.SetEvent(1);
+		Check(!rig.Render(), "reverb replayed its old tail after the voice restarted");
+	}
+	ReverbVoiceRig same_tick;
+	same_tick.RenderIntoTail();
+	same_tick.voice.SetEvent(2);
+	same_tick.voice.SetEvent(1);
+	Check(!same_tick.Render(), "reverb kept its tail through a stop and play in one tick");
+
+	ReverbVoiceRig setup;
+	setup.RenderIntoTail();
+	struct SetupControl {
+		Ngs2VoiceParamHeader header {sizeof(SetupControl), 0, 0x40020000};
+		uint32_t             channels[2] {1, 1};
+	} control;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&setup.voice), &control.header) == OK,
+	      "custom submixer setup was not accepted");
+	Check(!setup.Render(), "reverb kept its tail through a new setup");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -2110,6 +2281,9 @@ int main() {
 	TestCustomReverbLowRates();
 	TestCustomReverbMatchesLibrary();
 	TestCustomReverbVoice();
+	TestCustomReverbClearTail();
+	TestCustomReverbClearTailNewChannels();
+	TestCustomReverbVoiceRestart();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

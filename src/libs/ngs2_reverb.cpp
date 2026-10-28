@@ -188,11 +188,21 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	UpdateRoomFilter(rate);
 	m_tail.resize(grain);
 	for (uint32_t channel = 0; channel < channels; channel++) {
-		MixChannel(samples, channel, grain, reset);
+		MixChannel(samples, channel, grain, reset || m_restart_levels);
 	}
-	m_reset   = false;
-	m_changed = false;
+	m_reset          = false;
+	m_changed        = false;
+	m_restart_levels = false;
 	AdvanceTail(grain);
+}
+
+// Empties the history and stops the tail. The level flag survives grains that StartGrain skips,
+// so it applies to the first grain that is actually mixed. That matters after a setup that adds
+// channels, which were never mixed and so have no levels to ramp from.
+void Ngs2Reverb::ClearTail() {
+	ClearHistory();
+	m_tail_remaining = 0;
+	m_restart_levels = true;
 }
 
 // Restarts the tail countdown when the grain has sound. Returns false, with `samples` set to

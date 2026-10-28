@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <limits>
 #include <mutex>
 
 // macOS has no clock_nanosleep.
@@ -411,6 +412,9 @@ struct ThreadWithStackPrivate {
 ThreadWithStack::ThreadWithStack(thread_func_t func, void* arg, size_t stack_size)
     : m_thread(std::make_unique<ThreadWithStackPrivate>(func, arg)) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (stack_size > std::numeric_limits<unsigned>::max()) {
+		EXIT("stack size %zu does not fit _beginthreadex\n", stack_size);
+	}
 	// Reserve the stack; pages are committed as the thread uses them.
 	m_thread->handle = reinterpret_cast<HANDLE>(
 	    _beginthreadex(nullptr, static_cast<unsigned>(stack_size), ThreadWithStackPrivate::Run,
@@ -443,14 +447,21 @@ ThreadWithStack::~ThreadWithStack() {
 
 void ThreadWithStack::Join() {
 	if (m_thread->joined) return;
+	// EXIT as in the constructor: a self-join or a failed wait must not pass as joined in
+	// KYTY_FINAL.
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	EXIT_IF(GetThreadId(m_thread->handle) == GetCurrentThreadId());
-	const auto waited = WaitForSingleObject(m_thread->handle, INFINITE);
-	EXIT_IF(waited != WAIT_OBJECT_0);
+	if (GetThreadId(m_thread->handle) == GetCurrentThreadId()) {
+		EXIT("thread joins itself\n");
+	}
+	if (const auto waited = WaitForSingleObject(m_thread->handle, INFINITE);
+	    waited != WAIT_OBJECT_0) {
+		EXIT("WaitForSingleObject failed: %lu\n", static_cast<unsigned long>(waited));
+	}
 	CloseHandle(m_thread->handle);
 #else
-	const int error = pthread_join(m_thread->thread, nullptr);
-	EXIT_IF(error != 0);
+	if (const int error = pthread_join(m_thread->thread, nullptr); error != 0) {
+		EXIT("pthread_join failed: %d\n", error);
+	}
 #endif
 	m_thread->joined = true;
 }

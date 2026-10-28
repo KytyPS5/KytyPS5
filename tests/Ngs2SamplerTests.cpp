@@ -740,8 +740,8 @@ bool Near(double value, double expected, double tolerance) {
 	return std::abs(value - expected) <= tolerance;
 }
 
-// Checks the submixer compressor model (see Ngs2Compressor), its curve, knee, envelope and keying.
-void TestCompressorDsp() {
+// Checks the submixer compressor's curve (see Ngs2Compressor) as a limiter and with a soft knee.
+void TestCompressorCurveAndKnee() {
 	constexpr uint32_t Rate = 1000;
 	Ngs2Compressor     compressor;
 	Check(!compressor.Enabled(), "a reset compressor was enabled");
@@ -760,12 +760,16 @@ void TestCompressorDsp() {
 	float knee[] = {0.5f};
 	compressor.Process(knee, nullptr, 1, 1);
 	Check(Near(knee[0], 0.5 * std::pow(10.0, -0.75 / 20.0), 1e-5), "the soft knee is wrong");
+}
 
-	// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices). The RMS detector
-	// compares power with the threshold, so a key of 0.1 (power 0.01) is 10 dB over 0.001 and
-	// reduces the signal by 10 * (1 - ratio) dB once the RMS window fills. The main signal's own
-	// level is ignored. The power is summed across channels, so the same key in both channels of
-	// a stereo bus is 3 dB louder (13 dB over), and a key in only one channel ducks like mono.
+// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices). The RMS detector
+// compares power with the threshold, so a key of 0.1 (power 0.01) is 10 dB over 0.001 and
+// reduces the signal by 10 * (1 - ratio) dB once the RMS window fills. The main signal's own
+// level is ignored. The power is summed across channels, so the same key in both channels of
+// a stereo bus is 3 dB louder (13 dB over), and a key in only one channel ducks like mono.
+void TestCompressorSideChainRms() {
+	constexpr uint32_t Rate = 1000;
+	Ngs2Compressor     compressor;
 	compressor.Reset();
 	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
 	const double       ducked        = 0.5 * std::pow(10.0, -7.5 / 20.0);
@@ -788,9 +792,15 @@ void TestCompressorDsp() {
 	std::vector<float> signal(Rate, 0.5f);
 	compressor.Process(signal.data(), nullptr, 1, Rate);
 	Check(signal[Rate - 1] == 0.5f, "the compressor did not recover without a key");
+}
 
-	// Attack and release smooth the reduction, so the key takes time to duck the signal, and the
-	// signal returns gradually once the key stops.
+// Attack and release smooth the reduction, so the key takes time to duck the signal, and the
+// signal returns gradually once the key stops. Flags 0 then turn the compressor off.
+void TestCompressorAttackRelease() {
+	constexpr uint32_t Rate   = 1000;
+	const double       ducked = 0.5 * std::pow(10.0, -7.5 / 20.0);
+	Ngs2Compressor     compressor;
+	std::vector<float> signal(Rate, 0.5f);
 	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.1f, 1.0f), Rate);
 	std::fill(signal.begin(), signal.end(), 0.5f);
 	std::vector<float> keyed(Rate, 0.1f);
@@ -2113,7 +2123,9 @@ int main() {
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestSubmixerSideChainInput();
-	TestCompressorDsp();
+	TestCompressorCurveAndKnee();
+	TestCompressorSideChainRms();
+	TestCompressorAttackRelease();
 	TestCompressorNonFinite();
 	TestCompressorTimeConstant();
 	TestCompressorVoiceEvents();

@@ -597,6 +597,16 @@ public:
 	static constexpr uint32_t FlagRms       = 0x2;
 	static constexpr uint32_t FlagSideChain = 0x8;
 	static constexpr double   RmsWindow     = 0.01; // In seconds.
+	static constexpr uint32_t KnownFlags    = FlagPeak | FlagRms | FlagSideChain;
+	// Limits on values a game should never send. Configure explains each one.
+	static constexpr double MaxAttackSeconds  = 10.0;
+	static constexpr double MaxReleaseSeconds = 60.0;
+	static constexpr double MinThreshold      = 1e-9;
+	static constexpr double MaxKneeDb         = 60.0;
+	static constexpr double MaxLevel          = 16.0; // +24 dB.
+	// Below these the running power and reduction are flushed to 0. See the end of Process.
+	static constexpr double PowerFlushFloor       = 1e-20;
+	static constexpr double ReductionFlushFloorDb = 1e-9;
 
 	void Configure(const Ngs2SubmixerCompressorParam& param, uint32_t rate) {
 		// The NGS2 documentation gives no valid range for these values, so these limits are our
@@ -608,20 +618,29 @@ public:
 		// A negative attack or release time means an instant change. Attack is capped at 10 s and
 		// release at 60 s, since the gain would barely move with anything longer. The game uses
 		// 0.1 s and 4 s.
-		const double attack_seconds  = std::clamp(OrDefault(param.attack_time, 0.0f), 0.0, 10.0);
-		const double release_seconds = std::clamp(OrDefault(param.release_time, 0.0f), 0.0, 60.0);
+		const double attack_seconds =
+		    std::clamp(OrDefault(param.attack_time, 0.0f), 0.0, MaxAttackSeconds);
+		const double release_seconds =
+		    std::clamp(OrDefault(param.release_time, 0.0f), 0.0, MaxReleaseSeconds);
 
 		m_flags = param.flags;
+		// Unknown bits are kept, since any nonzero flags turn the compressor on, but nothing reads
+		// them. Warn once so a game that relies on them can be found.
+		if ((m_flags & ~KnownFlags) != 0 && !m_flags_warned) {
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "warning: NGS2 submixer compressor flags 0x%x have unknown bits\n", m_flags));
+			m_flags_warned = true;
+		}
 		// A threshold of 0 or less has no level in dB, so it becomes a tiny positive one instead.
-		m_threshold = std::max(1e-9, OrDefault(param.threshold, 1.0f));
+		m_threshold = std::max(MinThreshold, OrDefault(param.threshold, 1.0f));
 		// The compressor only ever reduces the gain. A ratio above 1 would expand the signal
 		// instead, and one below 0 would make louder input come out quieter.
 		m_ratio = std::clamp(OrDefault(param.ratio, 1.0f), 0.0, 1.0);
 		// A negative knee has no meaning, and 60 dB already spans the whole useful range.
-		m_knee_db = std::clamp(OrDefault(param.knee, 0.0f), 0.0, 60.0);
+		m_knee_db = std::clamp(OrDefault(param.knee, 0.0f), 0.0, MaxKneeDb);
 		// A negative level would invert the signal. 16 (+24 dB) is a cap that keeps a bad value
 		// from blowing up the mix.
-		m_level   = std::clamp(OrDefault(param.level, 1.0f), 0.0, 16.0);
+		m_level   = std::clamp(OrDefault(param.level, 1.0f), 0.0, MaxLevel);
 		m_attack  = TimeConstantCoefficient(attack_seconds, rate);
 		m_release = TimeConstantCoefficient(release_seconds, rate);
 		// The RMS detector averages the power over roughly the last 10 ms. With this coefficient
@@ -669,10 +688,10 @@ public:
 		}
 		// The smoothing only ever approaches its target, so flush values too small to matter.
 		// That lets the envelope reach exactly no reduction and skip the gain update again.
-		if (m_power < 1e-20) {
+		if (m_power < PowerFlushFloor) {
 			m_power = 0.0;
 		}
-		if (m_reduction_db < 1e-9 && m_reduction_db != 0.0) {
+		if (m_reduction_db < ReductionFlushFloorDb && m_reduction_db != 0.0) {
 			m_reduction_db = 0.0;
 			m_gain         = m_level;
 		}
@@ -769,6 +788,8 @@ private:
 	double   m_power        = 0.0; // Smoothed power summed across channels, for RMS detection.
 	double   m_reduction_db = 0.0; // Current gain reduction.
 	double   m_gain         = 1.0; // Current gain, `m_level` less the reduction.
+	// Unknown flag bits have been reported.
+	bool m_flags_warned = false;
 };
 
 struct Ngs2VoiceInternal {
@@ -811,6 +832,8 @@ struct Ngs2VoiceInternal {
 	bool                            has_samples     = false;
 	Ngs2Compressor                  compressor; // standard submixers
 	std::vector<float>              side_chain; // side-chain inputs of this render
+	// An ignored submixer control has been reported.
+	bool                            submixer_control_warned = false;
 
 	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
 	std::vector<float>                  decoded_frame;
@@ -2709,6 +2732,13 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					     compressor.flags, compressor.threshold, compressor.ratio, compressor.knee,
 					     compressor.attack_time, compressor.release_time, compressor.level);
 					voice->compressor.Configure(compressor, voice->rack->ngs->option.sample_rate);
+				} else if (!voice->submixer_control_warned) {
+					// PPSA28465 sends 0x20000006 with an all-zero filter payload, which as a filter
+					// means off, so ignoring it is harmless there. Warn once per voice so a game
+					// that needs another submixer control can be found.
+					Log::WriteToConsoleAndLog(fmt::sprintf(
+					    "warning: NGS2 submixer control 0x%08" PRIx32 " is ignored\n", param->id));
+					voice->submixer_control_warned = true;
 				}
 				break;
 			}

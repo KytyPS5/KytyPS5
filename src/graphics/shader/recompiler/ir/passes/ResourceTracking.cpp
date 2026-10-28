@@ -707,6 +707,183 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// `S_AND_B64 VCC, EXEC, mask` followed by a VCC test reaches the IR as a per-lane
+	// bit test of a 64-bit scalar mask:
+	//   ((Select(LaneId < 32, lo, hi) >> (LaneId & 31)) & 1) != 0
+	// The subgroup reduction of that predicate depends only on lo and hi, so recover the
+	// uniform value the host walker can evaluate.
+	Value LaneMaskNonZero(Value predicate) {
+		predicate               = predicate.Resolve();
+		const auto* not_equal   = predicate.TryInstruction();
+		if (not_equal == nullptr || not_equal->GetOpcode() != ValueOpcode::INotEqual32) {
+			return {};
+		}
+		const auto zero = not_equal->Arg(1).Resolve();
+		if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u) {
+			return {};
+		}
+		Value bits = not_equal->Arg(0).Resolve();
+		if (const auto* masked = bits.TryInstruction();
+		    masked != nullptr && masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			const auto mask = masked->Arg(1).Resolve();
+			if (mask.IsImmediate() && mask.GetType() == Type::U32 && mask.U32() == 1u) {
+				bits = masked->Arg(0).Resolve();
+			}
+		}
+		const auto* shift = bits.TryInstruction();
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32) {
+			return {};
+		}
+		Value lane = shift->Arg(1).Resolve();
+		if (const auto* masked = lane.TryInstruction();
+		    masked != nullptr && masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			const auto mask = masked->Arg(1).Resolve();
+			if (mask.IsImmediate() && mask.GetType() == Type::U32 && mask.U32() == 31u) {
+				lane = masked->Arg(0).Resolve();
+			}
+		}
+		const auto* lane_id = lane.TryInstruction();
+		if (lane_id == nullptr || lane_id->GetOpcode() != ValueOpcode::LaneId) {
+			return {};
+		}
+		const auto* select = shift->Arg(0).Resolve().TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
+		    select->NumArgs() != 3u) {
+			return {};
+		}
+		const auto* bound = select->Arg(0).Resolve().TryInstruction();
+		if (bound == nullptr || bound->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    bound->Arg(0).Resolve().TryInstruction() != lane_id) {
+			return {};
+		}
+		const auto limit = bound->Arg(1).Resolve();
+		if (!limit.IsImmediate() || limit.GetType() != Type::U32 || limit.U32() != 32u) {
+			return {};
+		}
+		const auto lo = select->Arg(1).Resolve();
+		const auto hi = select->Arg(2).Resolve();
+		const auto is_zero = [](Value value) {
+			value = value.Resolve();
+			return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == 0u;
+		};
+		// Both halves of the WQM/EXEC mask gated by one scalar predicate: a live wave has
+		// at least one enabled lane, so the reduction is exactly that predicate.
+		const auto shared_predicate = [&](Value a, Value b) -> Value {
+			const auto* first  = a.TryInstruction();
+			const auto* second = b.TryInstruction();
+			if (first == nullptr || second == nullptr ||
+			    first->GetOpcode() != ValueOpcode::SelectU32 ||
+			    second->GetOpcode() != ValueOpcode::SelectU32 || first->NumArgs() != 3u ||
+			    second->NumArgs() != 3u ||
+			    first->Arg(0).Resolve() != second->Arg(0).Resolve() ||
+			    !is_zero(first->Arg(2)) || !is_zero(second->Arg(2)) ||
+			    is_zero(first->Arg(1)) || is_zero(second->Arg(1))) {
+				return {};
+			}
+			const auto condition = first->Arg(0).Resolve();
+			return ValidateRuntimeValue(m_program, condition, RuntimeValueType::Integer) ? condition
+			                                                                            : Value {};
+		};
+		if (const auto shared = shared_predicate(lo, hi); !shared.IsEmpty()) {
+			return shared;
+		}
+		if (m_program.wave_size <= 32u) {
+			if (!ValidateRuntimeValue(m_program, lo)) {
+				return {};
+			}
+			auto& nonzero = m_program.value_storage.emplace_back(ValueOpcode::INotEqual32);
+			nonzero.SetArg(0, Value(0u));
+			nonzero.SetArg(1, lo);
+			return Value(&nonzero);
+		}
+		if (!ValidateRuntimeValue(m_program, lo) || !ValidateRuntimeValue(m_program, hi)) {
+			return {};
+		}
+		auto& bits_or = m_program.value_storage.emplace_back(ValueOpcode::BitwiseOr32);
+		bits_or.SetArg(0, lo);
+		bits_or.SetArg(1, hi);
+		auto& nonzero = m_program.value_storage.emplace_back(ValueOpcode::INotEqual32);
+		nonzero.SetArg(0, Value(0u));
+		nonzero.SetArg(1, Value(&bits_or));
+		return Value(&nonzero);
+	}
+
+	// Turn a native branch condition into a scalar value the SRT walker can evaluate.
+	// Returns an empty value when the condition is genuinely lane-varying.
+	Value UniformControlCondition(Value value) {
+		value = value.Resolve();
+		// Preserve every condition that was already known to be uniform, including scalar
+		// SCC branches and expressions mixing them with lane masks.
+		if (ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer)) {
+			return value;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return {};
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::LogicalNot: {
+				const auto inner = UniformControlCondition(inst->Arg(0));
+				if (inner.IsEmpty()) {
+					return {};
+				}
+				auto& result = m_program.value_storage.emplace_back(ValueOpcode::LogicalNot);
+				result.SetArg(0, inner);
+				return Value(&result);
+			}
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr: {
+				const auto left  = UniformControlCondition(inst->Arg(0));
+				const auto right = UniformControlCondition(inst->Arg(1));
+				if (left.IsEmpty() || right.IsEmpty()) {
+					return {};
+				}
+				auto& result = m_program.value_storage.emplace_back(inst->GetOpcode());
+				result.SetArg(0, left);
+				result.SetArg(1, right);
+				return Value(&result);
+			}
+			case ValueOpcode::ConditionRef: {
+				const auto kind    = inst->Flags<CFG::BranchCondition>();
+				const bool zero    = kind == CFG::BranchCondition::SccZero ||
+				                  kind == CFG::BranchCondition::VccZero ||
+				                  kind == CFG::BranchCondition::ExecZero;
+				const bool nonzero = kind == CFG::BranchCondition::SccNonZero ||
+				                     kind == CFG::BranchCondition::VccNonZero ||
+				                     kind == CFG::BranchCondition::ExecNonZero;
+				if (!zero && !nonzero) {
+					return {};
+				}
+				const auto reduced = LaneMaskNonZero(inst->Arg(0));
+				if (reduced.IsEmpty()) {
+					return {};
+				}
+				if (!zero) {
+					return reduced;
+				}
+				auto& result = m_program.value_storage.emplace_back(ValueOpcode::LogicalNot);
+				result.SetArg(0, reduced);
+				return Value(&result);
+			}
+			default:
+				return ValidateRuntimeValue(m_program, value, RuntimeValueType::Integer)
+				           ? value
+				           : Value {};
+		}
+	}
+
+	// The condition a descriptor select can use. Compute shaders keep the strict immutable
+	// requirement; elsewhere a native branch that reduces to a uniform scalar is enough.
+	Value DescriptorCondition(const Block& branch) {
+		if (m_shader_writes) {
+			return ValidateRuntimeValue(m_program, branch.condition,
+			                            RuntimeValueType::ImmutableInteger)
+			           ? branch.condition
+			           : Value {};
+		}
+		return UniformControlCondition(branch.condition);
+	}
+
 	Value LowerDescriptorValue(Value value) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
@@ -777,13 +954,24 @@ private:
 		const auto& term = branch->terminator;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
-		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, branch->condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+		      (term.false_block == targets[0] && term.true_block == targets[1]))) {
+			return {};
+		}
+		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
+		auto       condition = DescriptorCondition(*branch);
+		if (condition.IsEmpty() && m_approximate_sampler_select) {
+			if (!m_logged_approximate_sampler) {
+				LOGF("ShaderRecompiler: sampler descriptor selected by lane-varying state; "
+				     "using the true-path variant (approximate)\n");
+				m_logged_approximate_sampler = true;
+			}
+			const auto value = LowerDescriptorValue(inst.Arg(true_arg));
+			return ValidateRuntimeValue(m_program, value) ? value : Value {};
+		}
+		if (condition.IsEmpty()) {
 			return {};
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
-		const auto true_arg    = term.true_block == targets[0] ? 0u : 1u;
 		const auto true_value  = LowerDescriptorValue(inst.Arg(true_arg));
 		const auto false_value = LowerDescriptorValue(inst.Arg(true_arg ^ 1u));
 		if (!ValidateRuntimeValue(m_program, true_value) ||
@@ -791,7 +979,7 @@ private:
 			return {};
 		}
 		auto& selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-		selected.SetArg(0, branch->condition);
+		selected.SetArg(0, condition);
 		selected.SetArg(1, true_value);
 		selected.SetArg(2, false_value);
 		return Value(&selected);
@@ -839,9 +1027,7 @@ private:
 				break;
 			}
 		}
-		if (branch == nullptr ||
-		    !ValidateRuntimeValue(m_program, branch->condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+		if (branch == nullptr) {
 			return {};
 		}
 		const auto& term = branch->terminator;
@@ -870,6 +1056,19 @@ private:
 		if (!found[0] || !found[1]) {
 			return {};
 		}
+		auto condition = DescriptorCondition(*branch);
+		if (condition.IsEmpty() && m_approximate_sampler_select) {
+			if (!m_logged_approximate_sampler) {
+				LOGF("ShaderRecompiler: sampler descriptor selected by lane-varying state; "
+				     "using the true-path variant (approximate)\n");
+				m_logged_approximate_sampler = true;
+			}
+			const auto value = LowerDescriptorValue(values[0]);
+			return ValidateRuntimeValue(m_program, value) ? value : Value {};
+		}
+		if (condition.IsEmpty()) {
+			return {};
+		}
 		const auto true_value  = LowerDescriptorValue(values[0]);
 		const auto false_value = LowerDescriptorValue(values[1]);
 		if (!ValidateRuntimeValue(m_program, true_value) ||
@@ -877,7 +1076,7 @@ private:
 			return {};
 		}
 		auto& selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-		selected.SetArg(0, branch->condition);
+		selected.SetArg(0, condition);
 		selected.SetArg(1, true_value);
 		selected.SetArg(2, false_value);
 		return Value(&selected);
@@ -892,6 +1091,8 @@ private:
 			descriptor = resolved->source;
 			return;
 		}
+		const bool previous_approximation = m_approximate_sampler_select;
+		m_approximate_sampler_select      = sampler && !m_shader_writes;
 		if (handle.NumArgs() != width) {
 			Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
@@ -912,6 +1113,7 @@ private:
 			descriptor.dwords[3] = Value(0u);
 		}
 		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
+		m_approximate_sampler_select = previous_approximation;
 	}
 
 	uint32_t ScalarReadBase(const Inst& read) const {
@@ -4460,6 +4662,10 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
+	// Sampler descriptors selected by lane-varying state cannot be evaluated on the host.
+	// Fall back to the true-path variant instead of aborting compilation.
+	bool                                       m_approximate_sampler_select = false;
+	bool                                       m_logged_approximate_sampler = false;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,

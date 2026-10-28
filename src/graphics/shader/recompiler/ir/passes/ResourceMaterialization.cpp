@@ -669,7 +669,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return failed("indexed pointer geometry", fmt::format("rows={}", domain));
 			const bool affine = indirect.table_stride != 0u || indexed_pointer;
 			const bool image_heap = dword_count == 8u && pointer == nullptr;
+			const uint64_t heap_stride =
+			    table.Stride() != 0u ? table.Stride() : indirect.table_record_bytes;
 			const uint64_t step = indexed_pointer ? table.Stride()
+			    : (image_heap && indirect.indexed) ? std::max<uint64_t>(heap_stride, 4u)
 			    : indirect.table_maximum ? indirect.table_stride
 			    : affine ? std::max(uint64_t {1} << std::countr_zero(indirect.table_stride), uint64_t {4})
 			             : 4u;

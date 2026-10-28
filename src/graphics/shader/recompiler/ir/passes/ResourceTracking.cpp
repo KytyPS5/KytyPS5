@@ -3240,8 +3240,28 @@ private:
 			if (indexed) {
 				if (handle.NumArgs() != 8u) return false;
 				const auto* selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
-				if (selected == nullptr) return false;
-				const auto* extract = selected->Arg(1).Resolve().TryInstruction();
+				Value       material_guard;
+				const auto* extract = selected != nullptr
+				    ? selected->Arg(1).Resolve().TryInstruction()
+				    : nullptr;
+				if (selected != nullptr) {
+					material_guard = selected->Arg(0).Resolve();
+				} else {
+					// `V_READLANE` of a per-lane table load: the GPU selects the
+					// descriptor slot, so the load is the table read. A guarded
+					// select keeps the previous descriptor for inactive lanes.
+					if (read->GetOpcode() != ValueOpcode::ReadLane || read->NumArgs() != 2u)
+						return false;
+					const auto local = read->Arg(0).Resolve();
+					const auto* select = local.TryInstruction();
+					if (select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32 &&
+					    select->NumArgs() == 3u) {
+						extract        = select->Arg(1).Resolve().TryInstruction();
+						material_guard = select->Arg(0).Resolve();
+					} else {
+						extract = local.TryInstruction();
+					}
+				}
 				if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 				    !ImmediateU32(extract->Arg(1), component) || component >= 4u) return false;
 				read = extract->Arg(0).Resolve().TryInstruction();
@@ -3254,10 +3274,12 @@ private:
 				    !memory->idxen || memory->offen || memory->data_bits != 32u ||
 				    memory->data_dwords != 4u ||
 				    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
-				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-				    !EquivalentValue(m_program, read->Arg(4), selected->Arg(0)) ||
-				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4)))) return false;
-				table_guard = read->Arg(4);
+				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u) return false;
+				const auto guard = read->Arg(4).Resolve();
+				if (!material_guard.IsEmpty() &&
+				    !EquivalentValue(m_program, guard, material_guard)) return false;
+				if (dword != 0u && !EquivalentValue(m_program, table_guard, guard)) return false;
+				table_guard = guard;
 			}
 			if (memory->offset > INT32_MAX || (!allow_fixed && (memory->offset & 3u) != 0u) ||
 			    !MemoryIndexBelongsTo(memory_index, *read)) {
@@ -3517,6 +3539,7 @@ private:
 		indirect.table_offset = table_offset;
 		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
+		indirect.indexed = plan.table_indexed;
 		indirect.workgroup_axis = WorkgroupAxis(key);
 		if (indirect.workgroup_axis != UINT32_MAX && !plan.table_indexed) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;

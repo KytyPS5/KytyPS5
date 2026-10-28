@@ -39753,7 +39753,8 @@ TestCase ImageGetLodComputeLaneQuads(const char *name, u32 width_shift,
   test.name = name;
   test.code = code;
   test.expected.assign(2 * lanes, 0x40000000u);
-  test.expected_float_tolerance = 1.0f / 64.0f;
+  // Vulkan guarantees only 4 mipmapPrecisionBits, so a conforming LOD may be 1/16 off.
+  test.expected_float_tolerance = 1.0f / 16.0f;
   test.opcodes = {O::V_AND_B32,    O::V_CVT_F32_U32,      O::V_MOV_B32,
                   O::V_MUL_F32,    O::IMAGE_GET_LOD,      O::V_LSHLREV_B32,
                   O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};

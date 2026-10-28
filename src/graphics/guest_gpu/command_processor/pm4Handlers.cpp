@@ -1582,7 +1582,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	// The native indexed packet enables the high-half first-index destination in word 3.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
+	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP, Pm4::SH_NOP};
 
 	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
 
@@ -1602,10 +1602,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
-	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3.
+	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 4
+	// bit 31 enables the subdraw index, written to the register in its low half.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
+	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
+	    (buffer[3] >> 31u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
@@ -2056,6 +2058,21 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
 
 	return 7;
+}
+
+KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto control = buffer[2];
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
+	                     (control >> 29u) < 6u);
+
+	auto* counter = reinterpret_cast<uint64_t*>(
+	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
+	// A signal updates the counter before the next packet, so its mailbox stall never waits.
+	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
+
+	return 3;
 }
 
 KYTY_CP_OP_PARSER(CpOpSetContextReg) {

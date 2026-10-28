@@ -175,6 +175,8 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::GlobalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 			break;
+		case StageInputKind::BaseVertex: AddInput(info, kind, 0, 1, "gl_BaseVertex"); break;
+		case StageInputKind::BaseInstance: AddInput(info, kind, 0, 1, "gl_BaseInstance"); break;
 		case StageInputKind::PackedAncillary:
 		case StageInputKind::Parameter: break;
 	}
@@ -366,7 +368,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.function_lds |= kind == ResourceKind::Lds &&
 			                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
 			if (shared_access == SharedAccess::Append || shared_access == SharedAccess::Consume) {
-				info.subgroup_ballot = true;
 				info.subgroup_shuffle = true;
 				info.subgroup_local_invocation_id = true;
 			}
@@ -445,6 +446,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::InstanceIndex:
 				case StageInputKind::FrontFacing:
 				case StageInputKind::LocalInvocationIndex:
+				case StageInputKind::BaseVertex:
+				case StageInputKind::BaseInstance:
 					if (component != 0u) {
 						return Fail("typed scalar builtin component is out of range");
 					}
@@ -517,7 +520,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
-		case ValueOpcode::SubgroupUMinU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
+		case ValueOpcode::SubgroupUMinU32:
+		case ValueOpcode::SubgroupUMaxU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -576,7 +581,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
 	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
-	    info.subgroup_shuffle = info.subgroup_arithmetic =
+	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;

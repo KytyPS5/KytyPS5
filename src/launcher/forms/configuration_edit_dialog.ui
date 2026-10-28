@@ -115,7 +115,17 @@
             </item>
             <item row="0" column="1">
              <widget class="QComboBox" name="comboBox_screen_resolution">
-              <property name="toolTip"><string>Window resolution</string></property>
+              <property name="toolTip"><string>Window resolution as WIDTHxHEIGHT; pick a preset or type a custom size. Non-16:9 sizes such as 21:9 show the game with black bars unless Stretch to window is on.</string></property>
+              <property name="editable"><bool>true</bool></property>
+              <property name="insertPolicy"><enum>QComboBox::NoInsert</enum></property>
+              <item><property name="text"><string notr="true">1280x720</string></property></item>
+              <item><property name="text"><string notr="true">1920x1080</string></property></item>
+              <item><property name="text"><string notr="true">2560x1440</string></property></item>
+              <item><property name="text"><string notr="true">3840x2160</string></property></item>
+              <item><property name="text"><string notr="true">2560x1080</string></property></item>
+              <item><property name="text"><string notr="true">3440x1440</string></property></item>
+              <item><property name="text"><string notr="true">3840x1600</string></property></item>
+              <item><property name="text"><string notr="true">5120x2160</string></property></item>
              </widget>
             </item>
             <item row="1" column="0">
@@ -141,6 +151,7 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
+            <!--
             <item row="3" column="0">
              <widget class="QLabel" name="label_shader_optimization">
               <property name="text"><string>Shader optimization:</string></property>
@@ -151,6 +162,7 @@
               <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
              </widget>
             </item>
+            -->
             <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>
@@ -189,6 +201,12 @@
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
+             </widget>
+            </item>
+            <item row="10" column="1">
+             <widget class="QCheckBox" name="checkBox_shader_cache">
+              <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
+              <property name="text"><string>Cache shaders</string></property>
              </widget>
             </item>
            </layout>
@@ -246,6 +264,12 @@
              <widget class="QCheckBox" name="checkBox_hide_cursor">
               <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
               <property name="text"><string>Auto-hide cursor</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_stretch">
+              <property name="toolTip"><string>Stretch the game image to fill the window instead of keeping its aspect ratio with black bars</string></property>
+              <property name="text"><string>Stretch to window</string></property>
              </widget>
             </item>
             <item>

@@ -519,7 +519,20 @@ void GameController::SetDevices(int active_id) {
 	m_trigger_state      = {};
 }
 
+// Input that changes no button or touch contact updates the newest unread sample, so a burst of
+// stick or sensor events between two reads cannot push unread button or touch changes out.
 void GameController::AddState() {
+	if (m_states_num != 0) {
+		const auto newest = (m_first_state + m_states_num - 1) % STATES_MAX;
+		auto&      last   = m_states[newest];
+		if (!m_obtained[newest] && last.buttons == m_state.buttons &&
+		    last.touch[0].down == m_state.touch[0].down &&
+		    last.touch[1].down == m_state.touch[1].down) {
+			last = m_state;
+			return;
+		}
+	}
+
 	if (m_states_num >= STATES_MAX) {
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <map>
 
 namespace Libs::Graphics {
@@ -17,14 +18,19 @@ public:
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
-		uint64_t begin = address;
-		uint64_t last  = end;
-		while (it != m_ranges.end() && it->first <= last) {
-			begin = std::min(begin, it->first);
-			last  = std::max(last, it->second);
-			it    = m_ranges.erase(it);
+		if (it == m_ranges.end() || it->first > address) {
+			it = m_ranges.emplace_hint(it, address, end);
+		} else {
+			if (it->second >= end) {
+				return;
+			}
+			it->second = end;
 		}
-		m_ranges.emplace(begin, last);
+		auto next = std::next(it);
+		while (next != m_ranges.end() && next->first <= it->second) {
+			it->second = std::max(it->second, next->second);
+			next       = m_ranges.erase(next);
+		}
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {

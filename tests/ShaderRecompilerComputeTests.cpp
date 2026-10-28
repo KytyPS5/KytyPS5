@@ -2276,6 +2276,60 @@ public:
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
   }
 
+  /// Exercises the scalar-read guard through the renderer's descriptor commit.
+  /// Disjoint reads must succeed for fixed and indexed writes; overlaps must terminate.
+  void CheckScalarBufferWriteBindings(bool overlapping, bool fixed = false) {
+    const char *name = fixed ? "FixedBufferWriteBindings" : "ScalarBufferWriteBindings";
+    constexpr uint64_t guest_base = 0x1000;
+    constexpr uint64_t bytes = 0x840;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Compute;
+    ShaderRecompiler::IR::BufferResource resource{};
+    resource.read = true;
+    resource.written = true;
+    resource.atomic = true;
+    resource.descriptor_index = 0;
+    resource.packed_stride = 64;
+    // A fixed atomic subtraction is unsupported by the indexed proof, so its
+    // disjoint read must be accepted by upstream's write_extent check alone.
+    resource.write_extent = fixed ? 4u : UINT32_MAX;
+    resource.unknown_write_pattern = fixed;
+    if (!fixed) resource.indexed_write_patterns.emplace_back(24, 4);
+    program.info.buffers.push_back(resource);
+    program.bindings.descriptor_counts[0] = 1;
+    program.bindings.descriptor_mask = 1;
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.specialization_reads.emplace_back(
+        guest_base + (fixed ? (overlapping ? 0 : 64) : (overlapping ? 24 : 0)),
+        sizeof(uint32_t));
+    ShaderStageRuntime runtime{&program, &snapshot};
+    auto host = CreateHostBuffer(name, bytes,
+                                vk::BufferUsageFlagBits::eStorageBuffer, {});
+    PreparedBindings bindings;
+    bindings.runtime = &runtime;
+    bindings.buffer_sources.push_back({guest_base, bytes, {}});
+    bindings.buffers.emplace_back(host.buffer, 0, bytes);
+    bindings.shader_data.resize(program.bindings.ShaderDataDwords());
+
+    const auto pipeline = RenderExecutorTestAccess::CommitBindings(
+        context.GetRenderExecutor(), scheduler.Current(), bindings);
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(
+        context.GetRenderExecutor(), std::span{&pipeline, 1u});
+    DestroyBuffer(&host);
+    Require(name, "overlapping field", !overlapping,
+            "CommitBindings accepted a scalar read of the atomic write field");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
@@ -47560,6 +47614,50 @@ void CheckEmbeddedFetchVertexOffset() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
+/// Checks disjoint reads and fatal rejection of overlaps for fixed and indexed writes.
+void CheckScalarBufferWriteBindingsContract(VulkanHarness &vulkan,
+                                          const char *executable) {
+  vulkan.CheckScalarBufferWriteBindings(false);
+  vulkan.CheckScalarBufferWriteBindings(false, true);
+  for (const char *selector : {"--scalar-buffer-overlap-death", "--scalar-fixed-overlap-death"}) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    constexpr const char *name = "ScalarBufferWriteBindings";
+    char path[MAX_PATH]{};
+    Require(name, "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+            "GetModuleFileName failed");
+    std::string command = std::string("\"") + path + "\" " + selector;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    Require(name, "host",
+            CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                           FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                           &process) != 0,
+            "CreateProcess failed");
+    const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+    if (wait != WAIT_OBJECT_0) {
+      TerminateProcess(process.hProcess, 0x7f);
+      WaitForSingleObject(process.hProcess, 10000);
+    }
+    DWORD exit_code = 0;
+    const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    Require(name, "fatal overlap guard",
+            wait == WAIT_OBJECT_0 && exited && exit_code == 321,
+            "overlapping scalar read did not retain the fatal guard");
+#else
+    ExpectFatal("ScalarBufferWriteBindings", [executable, selector] {
+      // Re-exec rather than using Vulkan driver state inherited across fork.
+      ::execlp(executable, executable, selector,
+               static_cast<char *>(nullptr));
+      std::_Exit(0x7f);
+    });
+#endif
+  }
+}
+
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
   (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
@@ -52361,6 +52459,22 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-buffer-overlap-death") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarBufferWriteBindings(true);
+    return 0x7f;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-fixed-overlap-death") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarBufferWriteBindings(true, true);
+    return 0x7f;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-buffer-overlap-only") == 0) {
+    VulkanHarness vulkan;
+    CheckScalarBufferWriteBindingsContract(vulkan, argv[0]);
+    return 0;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
@@ -53533,6 +53647,7 @@ int main(int argc, char **argv) {
   const bool rasterization = vulkan.RasterizationSupported();
   bool skipped_device_checks = false;
 #endif
+  CheckScalarBufferWriteBindingsContract(vulkan, argv[0]);
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();

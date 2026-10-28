@@ -5214,6 +5214,7 @@ void TestSharedAppendSelectorBounds() {
   }
 }
 
+/// Verifies compute-fill recognition and rejects extra stores or incompatible control flow.
 void TestComputeBufferFill() {
   struct Options {
     bool scalar = false;
@@ -5318,6 +5319,70 @@ void TestComputeBufferFill() {
   Run({.branch = true});
 }
 
+/// Checks the captured atomic/header layout against enumerated indexed writes.
+/// Covers wrapped offsets, multiple writers, and conservative unsupported-mode fallbacks.
+void TestIndexedWriteFootprints() {
+  // PPSA01342 shader 72c9c6d90df9ab3d reads a loop count at byte zero,
+  // while BUFFER_ATOMIC_ADD writes a field at byte 24 of indexed records.
+  for (uint32_t mode = 0; mode < 6; ++mode) {
+    Fixture fixture;
+    const auto handle = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                       fixture.UserData(2), fixture.UserData(3)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.offset = 24;
+    memory.formatted = mode == 3;
+    fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+        {handle, fixture.UserData(5), mode == 1 ? fixture.UserData(6) : Value(0u),
+         mode == 2 ? fixture.UserData(7) : Value(0u), Value(1u), Value(true)},
+        fixture.AddMemory(memory, 0xdc));
+    if (mode == 4 || mode == 5) {
+      memory.offset = 0;
+      fixture.Emit(mode == 4 ? ValueOpcode::BufferAtomicISub32 : ValueOpcode::StoreBufferU32,
+          {handle, fixture.UserData(5), Value(0u), Value(0u), Value(1u), Value(true)},
+          fixture.AddMemory(memory, 0x100));
+    }
+    fixture.PlanAndTrack();
+    auto resource = fixture.program.info.buffers.at(0);
+    Check(resource.write_extent == UINT32_MAX,
+          "indexed writes were incorrectly bounded by a fixed write extent");
+    resource.packed_stride = 64;
+    Check(resource.WritesOverlap(0x1000, 0x840, 0x1000, 4) == (mode != 0),
+          "indexed atomic proof lost the header or accepted an unknown write");
+    Check(resource.WritesOverlap(0x1000, 0x840, 0x1018, 4),
+          "indexed atomic field escaped the overlap guard");
+    if (mode != 0) continue;
+    for (const uint32_t stride : {4u, 8u, 16u, 32u, 64u, 128u}) {
+      resource.packed_stride = stride;
+      for (const auto [byte_offset, width] :
+           {std::pair{24u, 4u}, std::pair{60u, 16u}, std::pair{0xfffffffcu, 4u}}) {
+        resource.indexed_write_patterns = {{byte_offset, width}};
+        for (uint64_t start = stride; start < stride + 160; ++start) {
+          for (uint64_t length = 0; length < 50; ++length) {
+            bool expected = false;
+            for (uint64_t write = byte_offset & (stride - 1u); write < 0x840; write += stride)
+              expected |= length != 0 && start < write + width && write < start + length;
+            const bool actual = resource.WritesOverlap(0x1000, 0x840, 0x1000 + start, length);
+            Check(width > stride ? (!expected || actual) : actual == expected,
+                  "indexed write overlap disagrees with enumerated byte ranges");
+          }
+        }
+      }
+    }
+    resource.indexed_write_patterns = {{24, 4}};
+    for (const auto stride : {0u, 12u, 64u | (1u << 14u), 64u | (1u << 20u)}) {
+      resource.packed_stride = stride;
+      Check(resource.WritesOverlap(0x1000, 0x840, 0x1000, 4),
+            "unsupported stride or address mode accepted an indexed proof");
+    }
+    resource.packed_stride = 64;
+    resource.indirect_root = 0;
+    Check(resource.WritesOverlap(0x1000, 0x840, 0x1000, 4),
+          "indirect alias accepted an indexed proof");
+  }
+}
+
+/// Verifies that equivalent buffer sources share dense tracked descriptor bindings.
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -8992,8 +9057,10 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
+/// Runs the resource-tracking regressions and reports the failing case on exceptions.
 int main() {
   try {
+    /// Runs one regression and prefixes any exception with its registered test name.
     const auto Run = [](const char *name, auto test) {
       try {
         test();
@@ -9001,6 +9068,7 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("indexed write footprints", TestIndexedWriteFootprints);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

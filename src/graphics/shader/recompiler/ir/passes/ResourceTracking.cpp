@@ -4022,6 +4022,8 @@ private:
 		}
 	}
 
+	/// Interns a buffer descriptor source and merges this instruction into its metadata.
+	/// @return The dense resource index, or UINT32_MAX if the buffer budget is exhausted.
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -4040,12 +4042,39 @@ private:
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
+	/// Accumulates access flags and supported constant-offset write patterns.
+	/// Any unsupported write marks the whole resource proof as unknown, so later
+	/// overlap checks cannot rely on the remaining supported instructions alone.
 	static void Merge(BufferResource& resource, const MemoryInfo& memory, const Inst& inst,
 	                  uint32_t pc) {
 		const auto op            = inst.GetOpcode();
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
+		if (write) {
+			uint32_t width = 0;
+			switch (op) {
+				case ValueOpcode::StoreBufferU32: width = 4; break;
+				case ValueOpcode::StoreBufferU32x2: width = 8; break;
+				case ValueOpcode::StoreBufferU32x3: width = 12; break;
+				case ValueOpcode::StoreBufferU32x4: width = 16; break;
+				default: break;
+			}
+			const auto offset    = inst.Arg(2).Resolve();
+			const auto soffset   = inst.Arg(3).Resolve();
+			/// Accepts only resolved U32 literals suitable for modular byte-offset arithmetic.
+			const auto immediate = [](Value value) {
+				return value.IsImmediate() && value.GetType() == Type::U32;
+			};
+			const auto pattern_width = op == ValueOpcode::BufferAtomicIAdd32 ? 4u : width;
+			if (pattern_width == 0u || memory.formatted || memory.typed ||
+			    memory.kind != ResourceKind::Buffer || !immediate(offset) || !immediate(soffset)) {
+				resource.unknown_write_pattern = true;
+			} else {
+				const auto start = offset.U32() + soffset.U32() + memory.offset;
+				resource.indexed_write_patterns.emplace_back(start & ~3u, pattern_width);
+			}
+		}
 		resource.first_use_pc    = std::min(resource.first_use_pc, pc);
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
@@ -4180,6 +4209,8 @@ private:
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
 	}
 
+	/// Resolves a memory instruction into tracked resources and records binding patches.
+	/// Buffer instructions retain their operands for write-pattern analysis.
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect) {

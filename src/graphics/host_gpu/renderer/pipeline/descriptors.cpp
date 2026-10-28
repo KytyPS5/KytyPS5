@@ -898,6 +898,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+/// Validates captured scalar reads against bound writes and commits native descriptors.
+/// Captured scalar reads may pass an overlapping binding only when its write-pattern proof
+/// establishes disjoint bytes; invalid ranges and unproven overlaps remain fatal.
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -963,8 +966,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
 					const auto written_size =
 					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written_size)) {
+					if (written_size != 0 &&
+					    ImageRangeOverlaps(address, size, written.address, written_size) &&
+					    resource.WritesOverlap(written.address, written.size, address, size)) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

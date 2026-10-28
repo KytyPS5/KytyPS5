@@ -323,8 +323,8 @@ void Ngs2Reverb::RunCombs(uint32_t grain) {
 }
 
 // Writes one output channel, the reverb scaled by wet plus the dry input scaled by dry. Returns
-// whether the reverb overflowed. Its wet grain is then silenced, since the finite samples next to an
-// inf are huge garbage too.
+// whether the reverb overflowed. Its wet grain is then silenced, since the finite samples next to
+// an inf are huge garbage too.
 bool Ngs2Reverb::MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset) {
 	auto&        state = m_channels[channel];
 	float*       out   = samples + size_t(channel) * grain;

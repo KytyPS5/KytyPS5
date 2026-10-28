@@ -1,11 +1,9 @@
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -324,8 +322,8 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
                                        const Decoder::Operand&     base) {
 	std::array<IR::Value, 13> components {};
 	components.fill(IR::Value(0u));
-	const auto count =
-	    Decoder::ImageAddressDwordCount(inst.image_sample_flags, inst.image_address_components);
+	const auto count = Decoder::ImageAddressDwordCount(
+	    inst.image_sample_flags, inst.image_dimension, inst.image_address_components);
 	EXIT_IF(count > components.size());
 	const auto nsa_components =
 	    std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
@@ -455,12 +453,17 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	            AddMemoryInfo(memory, inst.pc));
 	if (bits != 32u) {
 		WriteOperand(inst.dst, WidenSubdword(loaded, bits, sign));
-	} else if (memory.data_dwords == 1u) {
-		WriteOperand(inst.dst, loaded);
-	} else {
-		for (uint32_t component = 0; component < memory.data_dwords; component++) {
-			WriteOperand(OffsetOperand(inst.dst, component),
-			             ir.CompositeExtract(loaded, component));
+		return;
+	}
+	for (uint32_t component = 0; component < memory.data_dwords; component++) {
+		const auto dst = OffsetOperand(inst.dst, component);
+		const auto value =
+		    memory.data_dwords == 1u ? IR::U32(loaded) : ir.CompositeExtract(loaded, component);
+		// D16 formats with an odd component count keep the high half of their final VGPR.
+		if (memory.data_bits == 16u && component * 2u + 1u == memory.component_count) {
+			Write16Bits(dst, value);
+		} else {
+			WriteOperand(dst, value);
 		}
 	}
 }
@@ -860,9 +863,10 @@ void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
-	WriteOperand(inst.dst, ir.Emit(opcode,
-	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	                               AddMemoryInfo(memory, inst.pc)));
+	const auto exec   = ExecMask();
+	WriteOperand(inst.dst,
+	             ir.Emit(opcode, {ReadU32(MemorySourceAt(inst, 0)), exec[0], exec[1], ir.GetExec()},
+	                     AddMemoryInfo(memory, inst.pc)));
 }
 
 void Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
@@ -898,10 +902,7 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 		const auto packer = ir.BitwiseAnd(m0, IR::U32(IR::Value(0xfu)));
 		address = ir.IAdd(address, ir.ShiftLeftLogical(packer, IR::U32(IR::Value(2u))));
 	}
-	const auto exec   = ir.GetExec();
-	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {exec});
-	const auto low = ir.CompositeExtract(ballot, 0u);
-	const auto high = ir.CompositeExtract(ballot, 1u);
+	const auto [low, high] = ExecMask();
 	const auto active = ir.INotEqual(ir.BitwiseOr(low, high), IR::U32(IR::Value(0u)));
 	const auto first = ir.Select(
 	    ir.INotEqual(low, IR::U32(IR::Value(0u))),
@@ -940,6 +941,12 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
+		// Translated scalar loads have no cache of their own to invalidate.
+		case Decoder::Opcode::S_DCACHE_INV: return;
+		case Decoder::Opcode::BUFFER_GL0_INV:
+		case Decoder::Opcode::BUFFER_GL1_INV:
+			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
+			return;
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
 			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
@@ -960,17 +967,9 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
-		case Decoder::Opcode::S_MEMREALTIME: {
-			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-			if (!warned.test_and_set(std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(
-				    "Warning: S_MEMREALTIME uses placeholder UINT64_MAX; real-time clock not implemented.\n");
-			}
-			for (uint32_t component = 0; component < 2; component++) {
-				WriteOperand(ScalarDestinationOperand(inst.dst, component), IR::Value(UINT32_MAX));
-			}
-			return;
-		}
+		case Decoder::Opcode::S_MEMREALTIME:
+			return WriteU32Pair(inst.dst,
+			                    ExtractU64(IR::U64(ir.Emit(IR::ValueOpcode::ReadRealtimeClock))));
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
@@ -988,6 +987,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
@@ -1008,6 +1009,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
@@ -1028,6 +1031,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMIN:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin32);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin64);
 		case Decoder::Opcode::BUFFER_ATOMIC_SMAX:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMax32);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMAX:
@@ -1145,6 +1150,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::FLAT_LOAD_USHORT:
 		case Decoder::Opcode::FLAT_LOAD_SSHORT:
 		case Decoder::Opcode::FLAT_LOAD_SHORT_D16:
+		case Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI:
 		case Decoder::Opcode::FLAT_LOAD_DWORD:
 		case Decoder::Opcode::FLAT_LOAD_DWORDX2:
 		case Decoder::Opcode::FLAT_LOAD_DWORDX3:
@@ -1164,15 +1170,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
-		case Decoder::Opcode::IMAGE_GATHER4_L:
-		case Decoder::Opcode::IMAGE_GATHER4_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_C:
-		case Decoder::Opcode::IMAGE_GATHER4_C_L:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_GATHER4: return IMAGE_GATHER(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicFMin32, false);

@@ -90,6 +90,14 @@ void Delay(Uint32) {}
 #undef SDL_CloseGamepad
 #undef SDL_Delay
 
+namespace Libs::Controller {
+// No virtual headset in these tests (padVr.cpp is not linked here).
+int PadVrPortHand(int) { return -1; }
+int PadVrPort(int, int, int, bool) { return PAD_ERROR_INVALID_ARG; }
+int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
+int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
+} // namespace Libs::Controller
+
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
 	haptics.push_back({large_motor, small_motor, duration_ms});
@@ -681,6 +689,27 @@ void TestTriggerEffectState() {
 	check_state(0, 0, "switching controllers retained effect states");
 }
 
+void TestUnreadPressSurvivesStickBurst() {
+	Controller              controller;
+	std::array<PadData, 64> data {};
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	for (int value = 0; value < 100; value++) {
+		SetAxis(1, Axis::LeftX, value);
+	}
+	SetButton(1, PAD_BUTTON_CROSS, false);
+	for (int value = 100; value < 200; value++) {
+		SetAxis(1, Axis::LeftX, value);
+	}
+	Check(PadRead(1, data.data(), 64) == 2 && data[0].buttons == PAD_BUTTON_CROSS &&
+	          data[0].left_stick_x == 99 && data[1].buttons == 0 && data[1].left_stick_x == 199,
+	      "a stick burst pushed an unread press out of the pad history");
+	SetAxis(1, Axis::LeftX, 50);
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	Check(PadRead(1, data.data(), 64) == 2 && data[0].buttons == 0 &&
+	          data[0].left_stick_x == 50 && data[1].buttons == PAD_BUTTON_CROSS,
+	      "a stick move after a read did not add a sample");
+}
+
 } // namespace
 
 int main() {
@@ -694,6 +723,7 @@ int main() {
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
 	TestTriggerEffectState();
+	TestUnreadPressSurvivesStickBurst();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();

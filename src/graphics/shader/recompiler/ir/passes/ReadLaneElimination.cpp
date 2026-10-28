@@ -99,89 +99,66 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 	return Value(&phi);
 }
 
-// A full-EXEC prefix scan with both half-wave endpoint reads is a reduction.
+// A full-EXEC prefix scan with both half-wave endpoint reads is a reduction. Wave64 first joins
+// the two rows of each half; a wave32 half is one row.
 // Fragment subgroups may have no physical invocation at either endpoint.
-class UMinReductionMatcher {
+class WaveReductionMatcher {
 public:
-	explicit UMinReductionMatcher(Block* block): block(block) {}
+	WaveReductionMatcher(const Block* block, ValueOpcode operation)
+	    : block(block), operation(operation) {}
 
-	Value Match(const Inst& minimum) {
-		const auto* low  = Get(minimum.Arg(0), ValueOpcode::ReadLane);
-		const auto* high = Get(minimum.Arg(1), ValueOpcode::ReadLane);
+	Value Match(const Inst& reduction, uint32_t wave_size) const {
+		const auto* low  = Get(reduction.Arg(0), ValueOpcode::ReadLane);
+		const auto* high = Get(reduction.Arg(1), ValueOpcode::ReadLane);
 		if (low == nullptr || high == nullptr || low->Arg(0).Resolve() != high->Arg(0).Resolve()) {
 			return {};
 		}
-		const auto lane = [](Value value, uint32_t expected) {
+		const auto lane = [&](Value value, uint32_t expected) {
 			value = value.Resolve();
 			return value.IsImmediate() && value.GetType() == Type::U32 &&
-			       value.U32() % 64u == expected;
+			       value.U32() % wave_size == expected;
 		};
-		if (!((lane(low->Arg(1), 31) && lane(high->Arg(1), 63)) ||
-		      (lane(low->Arg(1), 63) && lane(high->Arg(1), 31)))) {
+		const auto half = wave_size / 2u;
+		if (!((lane(low->Arg(1), half - 1u) && lane(high->Arg(1), wave_size - 1u)) ||
+		      (lane(low->Arg(1), wave_size - 1u) && lane(high->Arg(1), half - 1u)))) {
 			return {};
 		}
-		const auto* joined = Get(Unwrap(low->Arg(0)), ValueOpcode::UMin32);
+		if (wave_size == 32u) return MatchScan(low->Arg(0));
+		const auto* joined = Get(low->Arg(0), operation);
 		if (joined == nullptr) return {};
 		for (size_t index = 0; index < 2; index++) {
-			auto attempt = *this;
-			const auto* cross = attempt.Get(attempt.Unwrap(joined->Arg(index)), ValueOpcode::Permlane16U32);
+			const auto* cross = Get(joined->Arg(index), ValueOpcode::Permlane16U32);
 			if (cross == nullptr) continue;
-			const auto flags = cross->Flags<PermlaneFlags>();
-			auto prefix = attempt.Unwrap(joined->Arg(1 - index));
+			const auto flags  = cross->Flags<PermlaneFlags>();
+			const auto prefix = joined->Arg(1 - index).Resolve();
 			if (!flags.x16 || flags.fetch_inactive || !flags.bound_control ||
 			    cross->Arg(1).Resolve() != Value(UINT32_MAX) ||
-			    cross->Arg(2).Resolve() != Value(UINT32_MAX) ||
-			    !attempt.FullExec(cross->Arg(3)) || attempt.Unwrap(cross->Arg(0)) != prefix) {
+			    cross->Arg(2).Resolve() != Value(UINT32_MAX) || !FullExec(cross->Arg(3)) ||
+			    cross->Arg(0).Resolve() != prefix) {
 				continue;
 			}
-			for (const uint32_t shift: {8u, 4u, 2u, 1u}) {
-				prefix = attempt.MatchRow(prefix, shift);
-			}
-			prefix = attempt.Unwrap(prefix);
-			if (prefix.IsEmpty() || attempt.saved_exec.IsEmpty()) return prefix;
-			const auto* seed = attempt.Get(prefix, ValueOpcode::SelectU32);
-			if (seed != nullptr && seed->Arg(2).Resolve() == Value(UINT32_MAX)) {
-				const auto predicate = seed->Arg(0).Resolve();
-				const auto* subset = attempt.Get(predicate, ValueOpcode::LogicalAnd);
-				if (predicate == attempt.saved_exec ||
-				    (subset != nullptr && (subset->Arg(0).Resolve() == attempt.saved_exec ||
-				                           subset->Arg(1).Resolve() == attempt.saved_exec))) {
-					return prefix;
-				}
-			}
+			if (const auto seed = MatchScan(prefix); !seed.IsEmpty()) return seed;
 		}
 		return {};
 	}
 
 private:
+	// The row scan's input.
+	Value MatchScan(Value prefix) const {
+		for (const uint32_t shift: {8u, 4u, 2u, 1u}) {
+			prefix = MatchRow(prefix, shift);
+		}
+		return prefix;
+	}
+
 	Inst* Get(Value value, ValueOpcode opcode) const {
 		auto* inst = value.Resolve().TryInstruction();
 		return inst != nullptr && inst->Parent() == block && inst->GetOpcode() == opcode
 		           ? inst : nullptr;
 	}
 
-	bool FullExec(Value predicate) {
-		predicate = predicate.Resolve();
-		if (predicate == Value(true)) return true;
-		const auto* either = Get(predicate, ValueOpcode::LogicalOr);
-		if (either == nullptr) return false;
-		for (size_t index = 0; index < 2; index++) {
-			const auto* negate = Get(either->Arg(index), ValueOpcode::LogicalNot);
-			if (negate == nullptr || negate->Arg(0).Resolve() != either->Arg(1 - index).Resolve()) continue;
-			const auto original = negate->Arg(0).Resolve();
-			if (saved_exec.IsEmpty()) saved_exec = original;
-			return saved_exec == original;
-		}
-		return false;
-	}
-
-	Value Unwrap(Value value) {
-		while (const auto* select = Get(value, ValueOpcode::SelectU32)) {
-			if (!FullExec(select->Arg(0))) break;
-			value = select->Arg(1);
-		}
-		return value.Resolve();
-	}
+	// Constant propagation folds the x | ~x EXEC of s_orn2_saveexec to true.
+	static bool FullExec(Value predicate) { return predicate.Resolve() == Value(true); }
 
 	static bool IsRowShift(const Inst& inst, uint32_t shift) {
 		const auto flags = inst.Flags<DppMoveFlags>();
@@ -189,22 +166,24 @@ private:
 		       flags.bank_mask == 0xf && !flags.fetch_inactive && !flags.bound_control && !flags.dpp8;
 	}
 
-	Value MatchRow(Value value, uint32_t shift) {
-		const auto* update = Get(Unwrap(value), ValueOpcode::DppUpdateU32);
+	Value MatchRow(Value value, uint32_t shift) const {
+		const auto* update = Get(value, ValueOpcode::DppUpdateU32);
 		if (update == nullptr || !IsRowShift(*update, shift) || !FullExec(update->Arg(2))) return {};
-		const auto* minimum = Get(update->Arg(0), ValueOpcode::UMin32);
-		if (minimum == nullptr) return {};
+		const auto* combined = Get(update->Arg(0), operation);
+		if (combined == nullptr) return {};
 		for (size_t index = 0; index < 2; index++) {
-			const auto* move = Get(minimum->Arg(index), ValueOpcode::DppMoveU32);
+			const auto* move = Get(combined->Arg(index), ValueOpcode::DppMoveU32);
 			if (move == nullptr || !IsRowShift(*move, shift) || !FullExec(move->Arg(1))) continue;
-			const auto previous = Unwrap(minimum->Arg(1 - index));
-			if (Unwrap(move->Arg(0)) == previous && Unwrap(update->Arg(1)) == previous) return previous;
+			const auto previous = combined->Arg(1 - index).Resolve();
+			if (move->Arg(0).Resolve() == previous && update->Arg(1).Resolve() == previous) {
+				return previous;
+			}
 		}
 		return {};
 	}
 
-	Block* block;
-	Value  saved_exec;
+	const Block* block;
+	ValueOpcode  operation;
 };
 
 } // namespace
@@ -217,18 +196,22 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
-			if (wave_size == 64u && inst.GetOpcode() == ValueOpcode::UMin32) {
-				const auto seed = UMinReductionMatcher(block).Match(inst);
+			const auto opcode = inst.GetOpcode();
+			if (opcode == ValueOpcode::UMin32 || opcode == ValueOpcode::UMax32) {
+				const auto seed = WaveReductionMatcher(block, opcode).Match(inst, wave_size);
 				if (!seed.IsEmpty()) {
 					const auto position = std::find_if(block->begin(), block->end(),
 					                                  [&](const Inst& candidate) { return &candidate == &inst; });
-					auto& reduction = *block->PrependNewInst(position, ValueOpcode::SubgroupUMinU32, {seed});
+					const auto reduce    = opcode == ValueOpcode::UMin32
+					                           ? ValueOpcode::SubgroupUMinU32
+					                           : ValueOpcode::SubgroupUMaxU32;
+					auto&      reduction = *block->PrependNewInst(position, reduce, {seed});
 					inst.ReplaceUsesWith(Value(&reduction));
 					stats.rewritten_reductions++;
 				}
 				continue;
 			}
-			if (inst.GetOpcode() != ValueOpcode::ReadLane) {
+			if (opcode != ValueOpcode::ReadLane) {
 				continue;
 			}
 			const auto selector = inst.Arg(1).Resolve();

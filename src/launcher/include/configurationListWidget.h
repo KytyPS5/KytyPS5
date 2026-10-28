@@ -68,6 +68,7 @@ protected slots:
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
 	void open_game_folder();
 	void remove_save_data();
+	void compress_game();
 	void filter_configurations(const QString& text);
 
 private:
@@ -86,6 +87,7 @@ private:
 	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
 	QString                       m_addons_dir;
+	QMap<QString, QStringList>    m_addcont; // User add-ons by title ID.
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;

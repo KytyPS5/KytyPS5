@@ -40,7 +40,7 @@ int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver);
 int KYTY_SYSV_ABI   AgcCreateShader(Shader** dst, void* header, const volatile void* code);
-int KYTY_SYSV_ABI   AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* front,
+int KYTY_SYSV_ABI   AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
                                                  const Shader* back);
 int KYTY_SYSV_ABI   AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
                                                const Shader* back, void* scratch_mem);
@@ -216,6 +216,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles);
 uint64_t KYTY_SYSV_ABI  AgcAcbWaitOnAddressGetSize(uint8_t size);
+uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op);
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,

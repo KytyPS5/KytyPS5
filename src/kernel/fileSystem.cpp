@@ -410,6 +410,11 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 	return g_mount_points->ResolvePath(mounted_file_name);
 }
 
+bool IsOpenDescriptor(int d) {
+	const auto* file = g_files->GetFile(d);
+	return file != nullptr && file->opened;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
@@ -1323,6 +1328,27 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
 
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	Common::LockGuard lock(file->mutex);
+	if (file->f.IsInvalid() || !file->f.Flush()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tFsync: %s\n", Common::PathToString(file->real_name).c_str());
 	return OK;
 }
 

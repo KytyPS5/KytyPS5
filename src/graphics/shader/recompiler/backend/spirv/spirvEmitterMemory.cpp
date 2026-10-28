@@ -1541,16 +1541,16 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 	const auto access = PrepareMemoryResourceAccess(state, mem);
-	const auto exec   = ctx.Arg(inst, 1);
-	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto low    = state.builder.AllocateId();
-	const auto high   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	// Elect and count from the guest EXEC words, which V_MBCNT also ranks lanes by.
+	const auto low   = ctx.Arg(inst, 1);
+	const auto high  = ctx.Arg(inst, 2);
 	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
-	const auto first = ctx.FirstLane(ballot);
+	const auto mask  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), mask, low, high,
+	                          ConstantU32(state, 0), ConstantU32(state, 0));
+	const auto first = ctx.FirstLane(mask);
 	const auto source_lane =
 	    state.lane_count == 2
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
@@ -1564,9 +1564,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
-	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
-	                                                ConstantU32(state, 0))
-	                                       : exec,
+	                 Binary(state, spv::OpINotEqual, TypeBool(state), count, ConstantU32(state, 0)),
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();

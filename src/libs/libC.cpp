@@ -771,10 +771,10 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
 	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
 	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
-	LIB_FUNC("aesyjrHVWy4", LibcInternal::strcmp);
-	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strncmp);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp);
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp);
 	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
-	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy);
+	LIB_FUNC("kiZSXIWd9vg", LibcInternal::strcpy);
 	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
 	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);

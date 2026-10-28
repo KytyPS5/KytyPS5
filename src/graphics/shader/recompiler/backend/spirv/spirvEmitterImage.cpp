@@ -38,7 +38,8 @@ bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 
 uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
-	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component);
+	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags,
+	                                                         mem.image_dimension, component);
 	const auto packed = layout.bit_offset / 32u;
 	if (packed >= address.NumArgs()) return ConstantU32(ctx.state, 0);
 	auto value = ctx.Def(address.Arg(packed));
@@ -55,10 +56,11 @@ uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::
 
 uint32_t AddressF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
-	const auto value = AddressU32(ctx, mem, address, component);
-	return Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component).bit_width == 16u
-	           ? EmitF16BitsToF32(ctx.state, value)
-	           : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), value);
+	const auto value  = AddressU32(ctx, mem, address, component);
+	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags,
+	                                                         mem.image_dimension, component);
+	return layout.bit_width == 16u ? EmitF16BitsToF32(ctx.state, value)
+	                               : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), value);
 }
 
 ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
@@ -77,6 +79,7 @@ ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
 	layout.coord = cursor;
 	cursor += info.coordinate_components;
 	if (HasFlag(mem, Decoder::ImageSampleFlagLod)) layout.lod = cursor++;
+	if (HasFlag(mem, Decoder::ImageSampleFlagLodClamp)) layout.clamp = cursor++;
 	return layout;
 }
 
@@ -810,6 +813,25 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	return mixed ? value : result_bits(mem.resource, value);
 }
 
+// Ordinals outside the table select candidates[0]. Past ordinal 0, a consecutive table is an
+// offset of ordinal - 1, which wraps at 0 so that one unsigned compare checks both ends.
+uint32_t SamplerArrayIndex(EmitterState& state, uint32_t ordinal,
+                           const std::vector<uint32_t>& candidates) {
+	const auto count = static_cast<uint32_t>(candidates.size());
+	const auto gap = std::adjacent_find(candidates.begin() + 1, candidates.end(),
+	    [](uint32_t lhs, uint32_t rhs) { return rhs != lhs + 1u; });
+	if (count == 1u || gap != candidates.end()) {
+		return EmitIndexSwitch(state, ordinal, count, TypeU32(state),
+		                       [&](uint32_t item) { return ConstantU32(state, candidates[item]); });
+	}
+	const auto offset = Binary(state, spv::OpISub, TypeU32(state), ordinal, ConstantU32(state, 1u));
+	const auto in_table = Binary(state, spv::OpULessThan, TypeBool(state), offset,
+	                             ConstantU32(state, count - 1u));
+	const auto index = Binary(state, spv::OpIAdd, TypeU32(state), offset,
+	                          ConstantU32(state, candidates[1]));
+	return Select(state, TypeU32(state), in_table, index, ConstantU32(state, candidates[0]));
+}
+
 struct ImageSampler {
 	uint32_t id = 0;
 	bool dynamic = false;
@@ -845,9 +867,7 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 				selected = EmitIndirectResourceIndex(state, selected,
 				    samplers[index].indirect_mapping_offset,
 				    samplers[index].indirect_search_iterations, 0u);
-			array_index = EmitIndexSwitch(
-			    state, selected, static_cast<uint32_t>(candidates.size()),
-			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, candidates[ordinal]); });
+			array_index = SamplerArrayIndex(state, selected, candidates);
 		}
 		sampler = {LoadSamplerDescriptor(state, index, array_index), array_index != 0u};
 	};
@@ -1069,7 +1089,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		std::array<uint32_t, 4> operands {};
+		// _cl clamps the computed LOD from below.
+		uint32_t min_lod = 0;
+		if (layout.clamp != NoImageComponent) {
+			min_lod = AddressF32(ctx, mem, *address, layout.clamp);
+		}
+		std::array<uint32_t, 5> operands {};
 		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
@@ -1080,6 +1105,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto lod = ZeroF32(state);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
+			}
+			// SPIR-V takes MinLod only with implicit LOD or Grad.
+			if (min_lod != 0) {
+				lod     = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, lod, min_lod);
+				min_lod = 0;
 			}
 			operands[0] = spv::ImageOperandsLodMask;
 			operands[1] = lod;
@@ -1103,6 +1133,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
+			}
+			// MinLod follows the offset in operand order.
+			if (min_lod != 0) {
+				state.builder.RequireCapability(spv::CapabilityMinLod);
+				sample_operand_count = std::max(size_t{1}, sample_operand_count);
+				sample_operands[0] |= spv::ImageOperandsMinLodMask;
+				sample_operands[sample_operand_count++] = min_lod;
 			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,

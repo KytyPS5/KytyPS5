@@ -30,6 +30,13 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
+uint32_t MrtOutputType(EmitterState& state, uint32_t index) {
+	const auto& pixel = *state.input_info.pixel;
+	if ((pixel.target_sint_mask & (1u << index)) != 0u) return TypeI32Vector(state, 4);
+	if ((pixel.target_uint_mask & (1u << index)) != 0u) return TypeU32Vector(state, 4);
+	return TypeF32Vector(state, 4);
+}
+
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
 	if (exp.kind == IR::ExportTargetKind::Position && exp.index == 0) {
 		return state.per_vertex_variable;

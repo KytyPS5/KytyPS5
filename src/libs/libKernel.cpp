@@ -1370,22 +1370,8 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 	[[maybe_unused]] auto* heap_posix_memalign = api[6];
 }
 
-static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
-	// PRINT_NAME();
-
-	EXIT_NOT_IMPLEMENTED(d < 0);
-
-	if (Network::Net::IsSocket(d)) {
-		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
-	}
-
-	if (d > 2) {
-		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
-	}
-
-	int size_int = static_cast<int>(size);
-
-	return size_int;
+static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {

@@ -869,6 +869,41 @@ void TestPeakMeter() {
 	      "disabling the peak meter did not clear the peak height");
 }
 
+// A killed or reset voice and a voice set up again start a new sound, so neither reports the old
+// sound's peak. Setup also turns the meter off, as it clears the voice's other controls.
+void TestPeakMeterReset() {
+	Fixture       f(48000);
+	const int16_t pcm[] = {16384, 0, 16384, 0, 16384, 0};
+	struct PeakMeter {
+		Ngs2VoiceParamHeader header {16, 0, 0x10000009};
+		uint32_t             enable   = 1;
+		uint32_t             reserved = 0;
+	} meter;
+	const auto voice = reinterpret_cast<uintptr_t>(&f.voice);
+	Check(Ngs2VoiceControl(voice, &meter.header) == OK, "peak meter control failed");
+	f.Queue(pcm, 6, 0);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "peak meter did not report the first render's peak");
+	f.voice.SetEvent(8);
+	Check(f.State().peak_height == 0.0f, "a reset voice kept the previous sound's peak");
+	f.voice.SetEvent(1);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "the peak meter stopped after a voice reset");
+	struct Setup {
+		Ngs2VoiceParamHeader header {40, 0, 0x10000000};
+		Ngs2WaveformFormat   format {0x12, 1, 48000};
+		uint32_t             flags = 0, reserved = 0;
+	} setup;
+	Check(Ngs2VoiceControl(voice, &setup.header) == OK, "sampler setup failed");
+	Check(f.voice.peak_height == 0.0f, "a voice set up again kept the previous sound's peak");
+	f.voice.state = Ngs2VoicePlayState::Playing;
+	f.Queue(pcm, 6, 0);
+	f.Render(2);
+	// The voice must really have rendered, so the 0 below comes from the disabled meter.
+	Check(f.voice.samples[0] == 0.5f, "the voice did not render after setup");
+	Check(f.State().peak_height == 0.0f, "setup left the peak meter enabled");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -1761,6 +1796,7 @@ int main() {
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestPeakMeter();
+	TestPeakMeterReset();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

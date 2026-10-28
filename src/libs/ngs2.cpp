@@ -625,6 +625,9 @@ struct Ngs2VoiceInternal {
 			matrix.clear();
 		}
 		filters.clear();
+		// Setup starts a new sound and clears the voice's other controls above, so the peak meter
+		// starts off too. SetEvent(4) has already cleared the last peak.
+		peak_meter_enabled = false;
 	}
 
 	void ClearWaveformBlocks() {
@@ -761,7 +764,12 @@ struct Ngs2VoiceInternal {
 				}
 				break;
 			case 4:
-			case 8: state = Ngs2VoicePlayState::Empty; break;
+			case 8:
+				state = Ngs2VoicePlayState::Empty;
+				// A killed or reset voice starts its next sound from silence, so its last peak must
+				// not be reported before it renders again.
+				peak_height = 0.0f;
+				break;
 			case 16:
 				if (state == Ngs2VoicePlayState::Playing) {
 					state = Ngs2VoicePlayState::Paused;

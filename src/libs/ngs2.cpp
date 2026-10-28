@@ -562,6 +562,11 @@ struct Ngs2SubmixerCompressorParam {
 };
 static_assert(sizeof(Ngs2SubmixerCompressorParam) == 32);
 
+// A model of the submixer's compressor. For each sample it measures how loud the detected
+// signal is and how far that is above the threshold. From that it works out how many dB to turn
+// the signal down, smooths that over time with the attack and release, and applies it to every
+// channel.
+//
 // The NGS2 submixer compressor is undocumented, so this model is inferred from the settings
 // PPSA28465 sends and may need tuning.
 //
@@ -583,11 +588,6 @@ static_assert(sizeof(Ngs2SubmixerCompressorParam) == 32);
 // The attack follows the same rule, which matches the quick fade heard on hardware when a voice
 // starts but has not been measured.
 //
-// A model of the submixer's compressor. For each sample it measures how loud the detected
-// signal is and how far that is above the threshold. From that it works out how many dB to turn
-// the signal down, smooths that over time with the attack and release, and applies it to every
-// channel.
-//
 // The work is done in dB because loudness is heard on a log scale. A level `x` (1 is full
 // scale) is 20 * log10(x) dB, so halving a level takes away about 6 dB. A power (a level
 // squared) is 10 * log10(p) dB, which gives the same dB figure for the same one-channel signal.
@@ -608,6 +608,8 @@ public:
 	static constexpr double PowerFlushFloor       = 1e-20;
 	static constexpr double ReductionFlushFloorDb = 1e-9;
 
+	// Applies the game's settings. The running level and reduction are kept, so a change of
+	// settings carries the current duck over instead of restarting it.
 	void Configure(const Ngs2SubmixerCompressorParam& param, uint32_t rate) {
 		// The NGS2 documentation gives no valid range for these values, so these limits are our
 		// own. They only guard against values a game should never send, which could otherwise
@@ -649,6 +651,8 @@ public:
 		m_gain       = m_level * DbToGain(-m_reduction_db);
 	}
 
+	// Turns the compressor off and drops its settings and running state, as a submixer setup
+	// does.
 	void Reset() { *this = {}; }
 
 	// Drops the running level and reduction but keeps the settings, so a voice that ends, or
@@ -659,6 +663,7 @@ public:
 		m_gain         = m_level;
 	}
 
+	// Whether the game turned the compressor on. Any nonzero flags do.
 	[[nodiscard]] bool Enabled() const { return m_flags != 0; }
 	[[nodiscard]] bool UsesSideChain() const { return (m_flags & FlagSideChain) != 0; }
 	// The gain currently applied to the signal (1 means no reduction), reported as the
@@ -673,13 +678,15 @@ public:
 		const float* detect = UsesSideChain() ? key : samples;
 		for (uint32_t i = 0; i < grain; ++i) {
 			const double target = GainReduction(OverThresholdDb(detect, i, channels, grain));
-			// Move the reduction part of the way toward its target. Each sample closes (1 - c) of
-			// the remaining distance, using the attack coefficient while the reduction grows and
-			// the release coefficient while it shrinks. Smoothing the dB figure, and not the gain
-			// itself, makes the release time the same however deep the reduction was.
+			// Move the reduction part of the way toward its target. Each sample closes
+			// (1 - coefficient) of the remaining distance, using the attack coefficient while the
+			// reduction grows and the release coefficient while it shrinks. Because the dB figure
+			// is smoothed, and not the gain itself, the same fraction of the reduction is left
+			// after a given time, however deep it was. A deeper duck still takes longer to become
+			// inaudible.
 			if (target != 0.0 || m_reduction_db != 0.0) {
-				const double c = target > m_reduction_db ? m_attack : m_release;
-				m_reduction_db = c * m_reduction_db + (1.0 - c) * target;
+				const double coefficient = target > m_reduction_db ? m_attack : m_release;
+				m_reduction_db = coefficient * m_reduction_db + (1.0 - coefficient) * target;
 				m_gain         = m_level * DbToGain(-m_reduction_db);
 			}
 			for (uint32_t ch = 0; ch < channels; ++ch) {
@@ -735,13 +742,13 @@ private:
 		double     level = 0.0;
 		if (detect != nullptr) {
 			for (uint32_t ch = 0; ch < channels; ++ch) {
-				const double x = detect[ch * grain + i];
+				const double value = detect[ch * grain + i];
 				// A NaN or infinite sample has no level, so it is skipped. Otherwise it would
 				// stay in the running average, or in the reduction, for good.
-				if (!std::isfinite(x)) {
+				if (!std::isfinite(value)) {
 					continue;
 				}
-				level = rms ? level + x * x : std::max(level, std::abs(x));
+				level = rms ? level + value * value : std::max(level, std::abs(value));
 			}
 		}
 		if (rms) {

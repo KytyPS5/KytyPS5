@@ -121,6 +121,11 @@ public:
 	// warn about it once. It stays set, since a game that sends garbage once is worth one warning.
 	[[nodiscard]] bool SawNonFiniteInput() const { return m_non_finite_input; }
 
+	// Whether the output ever overflowed to NaN or inf, which finite but huge input can cause.
+	// Process silences those samples, and drops the tail when the reverb itself overflowed. It
+	// stays set like SawNonFiniteInput.
+	[[nodiscard]] bool SawNonFiniteOutput() const { return m_non_finite_output; }
+
 private:
 	// Where to read the history for the early reflections and the late feed.
 	struct Taps {
@@ -161,7 +166,8 @@ private:
 	[[nodiscard]] bool  StartGrain(float* samples, size_t total, uint32_t grain);
 	void                WriteHistory(uint32_t grain);
 	void                RunCombs(uint32_t grain);
-	void                MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset);
+	[[nodiscard]] bool  MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset);
+	void                FinishGrain(float* samples, size_t total, bool overflowed);
 	void                EndTail(uint32_t grain);
 	void                DropTail();
 	[[nodiscard]] bool  IsQuiet() const;
@@ -198,6 +204,8 @@ private:
 	bool m_restart_levels = false;
 	// Whether a NaN or inf input sample was ever replaced with silence.
 	bool m_non_finite_input = false;
+	// Whether an output sample ever overflowed to NaN or inf.
+	bool m_non_finite_output = false;
 	// Whether the reverb still holds sound, so it must keep running on silent input.
 	bool m_active = false;
 	// Silent input samples since the last sound. The tail can only end once the history ring

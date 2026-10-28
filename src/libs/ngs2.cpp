@@ -553,6 +553,7 @@ struct Ngs2VoiceInternal {
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
 		bool                     input_warned   = false; // NaN or inf reached the reverb.
+		bool                     output_warned  = false; // The reverb's output overflowed.
 	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
@@ -1883,6 +1884,13 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 							    " received NaN or inf input, treated as silence\n",
 							    m, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&voice))));
 							module.input_warned = true;
+						}
+						if (!module.output_warned && module.reverb->SawNonFiniteOutput()) {
+							Log::WriteToConsoleAndLog(fmt::sprintf(
+							    "warning: NGS2 reverb at module index %zu of voice 0x%016" PRIx64
+							    " overflowed to NaN or inf on huge input, treated as silence\n",
+							    m, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&voice))));
+							module.output_warned = true;
 						}
 					}
 					continue;

@@ -134,6 +134,21 @@ void MixDown(const float* input, uint32_t channels, uint32_t grain, float* mono)
 	}
 }
 
+// Whether a sample is NaN or inf.
+bool NonFinite(float sample) {
+	return !std::isfinite(sample);
+}
+
+// Writes 0 over every NaN and inf in `samples`. Returns whether there were any. The check comes
+// first so clean audio, the usual case, is only read and never rewritten.
+bool ZeroNonFinite(float* samples, size_t count) {
+	if (!std::any_of(samples, samples + count, NonFinite)) {
+		return false;
+	}
+	std::replace_if(samples, samples + count, NonFinite, 0.0f);
+	return true;
+}
+
 // Whether every sample is within `limit` in size. A NaN or inf never counts as within, so it
 // keeps the tail running.
 bool AllWithin(const std::vector<float>& samples, float limit) {
@@ -195,12 +210,9 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	const size_t total = size_t(channels) * grain;
 	// One NaN or inf would spread through every delay line for the rest of the tail. Zero adds
 	// nothing, where a clamp would turn garbage into a full-scale impulse. Doing it first also
-	// lets a grain of garbage count as silence. The check comes first so clean audio, the usual
-	// case, is only read and never rewritten.
-	const auto non_finite = [](float sample) { return !std::isfinite(sample); };
-	if (std::any_of(samples, samples + total, non_finite)) {
+	// lets a grain of garbage count as silence.
+	if (ZeroNonFinite(samples, total)) {
 		m_non_finite_input = true;
-		std::replace_if(samples, samples + total, non_finite, 0.0f);
 	}
 	if (!StartGrain(samples, total, grain)) {
 		return;
@@ -222,13 +234,31 @@ void Ngs2Reverb::Process(float* samples, uint32_t channels, uint32_t grain) {
 	RunCombs(grain);
 	UpdateRoomFilter(rate);
 	m_tail.resize(grain);
+	bool overflowed = false;
 	for (uint32_t channel = 0; channel < channels; channel++) {
-		MixChannel(samples, channel, grain, reset || m_restart_levels);
+		overflowed |= MixChannel(samples, channel, grain, reset || m_restart_levels);
 	}
 	m_reset          = false;
 	m_changed        = false;
 	m_restart_levels = false;
+	FinishGrain(samples, total, overflowed);
 	EndTail(grain);
+}
+
+// Recovers from overflow, which finite but huge input can cause. When the reverb overflowed,
+// its delay lines and filters hold garbage that would ring for the rest of the tail, so it is
+// dropped here, after every channel has used this grain's comb output. The wet and dry levels
+// are still good, so the next grain ramps on from them. Another channel's wet grain can still
+// hold huge finite samples from the same combs for this one grain. That is accepted, since the
+// input that caused it is already full-scale garbage in the dry path. Overflow in the dry path
+// alone leaves the reverb intact, so those samples are only zeroed.
+void Ngs2Reverb::FinishGrain(float* samples, size_t total, bool overflowed) {
+	if (overflowed) {
+		DropTail();
+	}
+	if (ZeroNonFinite(samples, total) || overflowed) {
+		m_non_finite_output = true;
+	}
 }
 
 // Empties the history and stops the tail. The level flag survives grains that StartGrain skips,
@@ -287,8 +317,10 @@ void Ngs2Reverb::RunCombs(uint32_t grain) {
 	}
 }
 
-// Writes one output channel, the reverb scaled by wet plus the dry input scaled by dry.
-void Ngs2Reverb::MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset) {
+// Writes one output channel, the reverb scaled by wet plus the dry input scaled by dry. Returns
+// whether the reverb overflowed. Its wet grain is then silenced, since the finite samples next to an
+// inf are huge garbage too.
+bool Ngs2Reverb::MixChannel(float* samples, uint32_t channel, uint32_t grain, bool reset) {
 	auto&        state = m_channels[channel];
 	float*       out   = samples + size_t(channel) * grain;
 	const float* in    = m_input.data() + size_t(channel) * grain;
@@ -303,9 +335,16 @@ void Ngs2Reverb::MixChannel(float* samples, uint32_t channel, uint32_t grain, bo
 	// A fade at the ceiling lowers the wet target grain by grain, so the ramp carries it smoothly.
 	const float wet = channel == LfeChannel ? 0.0f : m_params.wet * FadeLevel(grain);
 	Ramp(out, reset ? wet : state.wet, wet, grain, out, false);
+	// Checked after the wet level, which goes up to 32, since a reverb holding huge samples is
+	// garbage even when they only overflow once scaled. The LFE's wet is 0, so it never trips.
+	const bool overflowed = std::any_of(out, out + grain, NonFinite);
+	if (overflowed) {
+		std::fill(out, out + grain, 0.0f);
+	}
 	Ramp(out, reset ? m_params.dry : state.dry, m_params.dry, grain, in, true);
 	state.wet = wet;
 	state.dry = m_params.dry;
+	return overflowed;
 }
 
 // Ends the tail after a silent grain once nothing stored can be heard. A tail still sounding
@@ -339,8 +378,10 @@ void Ngs2Reverb::EndTail(uint32_t grain) {
 
 // Whether nothing stored can still reach EndThreshold at the output, so a clear steps the
 // output by no more than that. Each limit is the threshold divided by the most a stored sample
-// can grow on its way out. Written as !(x <= limit), a NaN or inf never counts as quiet. Most
-// grains of a tail stop at the first loud sample, so the full scan only runs near the end.
+// can grow on its way out. Written as !(x <= limit), an inf from overflow never counts as quiet,
+// so the tail runs until the inf reaches the output and FinishGrain drops it. A NaN that would
+// count as quiet would only drop the tail early, which clears it all the same. Most grains of a
+// tail stop at the first loud sample, so the full scan only runs near the end.
 bool Ngs2Reverb::IsQuiet() const {
 	const float budget =
 	    EndThreshold / (std::max(m_params.wet, 1.0f) * (m_room_filter ? RoomFilterShare : 1.0f));

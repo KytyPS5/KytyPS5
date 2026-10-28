@@ -1392,6 +1392,101 @@ void TestCustomReverbReportsNonFiniteInput() {
 	      "a reverb given too many channels touched NaN input");
 }
 
+// Finite but huge input can overflow. Reflections at +10 dB push a 3e38 sample past the float
+// limit in the early reflections on the same grain, and a 1e38 sample next to it stays finite
+// but huge. The reverb's whole grain is silenced and its tail dropped, so silence after it stays
+// silent and a later impulse sounds like one through a fresh reverb.
+void TestCustomReverbWetOverflow() {
+	constexpr uint32_t grain     = 256;
+	constexpr float    overflows = 3e38f, huge = 1e38f;
+	const auto         param = ReverbParam(1.0f, 1000, 0);
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	block[0] = overflows;
+	block[1] = huge;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteOutput(), "reverb overflow was not reported");
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "an overflowed reverb grain was not silenced");
+	Check(!reverb.HasTail(), "an overflowed reverb kept its tail");
+	std::ranges::fill(block, 0.0f);
+	reverb.Process(block.data(), 1, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }),
+	      "an overflowed reverb still sounded afterwards");
+	block[0] = 1.0f;
+	reverb.Process(block.data(), 1, grain);
+	Check(block == FreshImpulse(param, grain), "a reverb cleared by overflow does not sound fresh");
+}
+
+// Overflow in the dry path alone leaves the reverb intact. The overflowed samples are silenced
+// and reported, but the tail keeps running.
+void TestCustomReverbDryOverflow() {
+	constexpr uint32_t grain = 256;
+	constexpr float    huge  = 2e38f;
+	auto               param = ReverbParam(1.0f, 0, 0, 32.0f);
+	param.wet                = 0.0f;
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	block[0] = huge;
+	block[1] = 1.0f;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteOutput(), "dry overflow was not reported");
+	Check(block[0] == 0.0f && block[1] == 32.0f, "dry overflow was not silenced on its own");
+	Check(reverb.HasTail(), "dry overflow dropped an intact reverb tail");
+}
+
+// A reverb signal that is finite but huge can overflow only once the wet level, up to 32,
+// scales it. That is still the reverb overflowing, so the whole wet grain goes and the tail is
+// dropped, including the 1e37 sample that stays finite at 2.2e38.
+void TestCustomReverbWetLevelOverflow() {
+	constexpr uint32_t grain     = 256;
+	constexpr float    overflows = 3e38f, huge = 1e37f;
+	auto               param = ReverbParam(1.0f, 0, 0);
+	param.wet                = 32.0f;
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	block[0] = overflows;
+	block[1] = huge;
+	reverb.Process(block.data(), 1, grain);
+	Check(reverb.SawNonFiniteOutput(), "wet level overflow was not reported");
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.0f; }) &&
+	          !reverb.HasTail(),
+	      "wet level overflow was not treated as the reverb overflowing");
+}
+
+// With the early reflections at their floor, a grain of huge samples only overflows once the
+// combs sum it, a comb delay after it went in. A single sample would not do, since each comb
+// returns it at a different time. Until then the output stays finite and the tail keeps running,
+// and the overflow is caught whenever it comes out.
+void TestCustomReverbDelayedOverflow() {
+	constexpr uint32_t grain = 256, max_grains = 40;
+	constexpr float    huge  = 3e38f;
+	const auto         param = ReverbParam(1.0f, -10000, 2000);
+	std::vector<float> block(grain, 0.0f);
+	Ngs2Reverb         reverb;
+	reverb.Configure(param, 48000);
+	reverb.Process(block.data(), 1, grain);
+	std::ranges::fill(block, huge);
+	reverb.Process(block.data(), 1, grain);
+	Check(!reverb.SawNonFiniteOutput(), "the combs overflowed before their delay");
+	uint32_t grains = 0;
+	while (!reverb.SawNonFiniteOutput() && grains < max_grains) {
+		std::ranges::fill(block, 0.0f);
+		reverb.Process(block.data(), 1, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "delayed overflow reached the output");
+		++grains;
+	}
+	Check(reverb.SawNonFiniteOutput() && !reverb.HasTail(),
+	      "delayed overflow was not caught and the tail dropped");
+}
+
 // One case of the tail-end grid. A positive end_by is the latest the tail may end, about a
 // quarter above where it was measured to end, so a bound that turns much stricter and keeps
 // tails running longer than needed fails. 0 means the tail is still sounding after 70 s.
@@ -2664,6 +2759,10 @@ int main() {
 	TestCustomReverbClearTailNewChannels();
 	TestCustomReverbNonFiniteInput();
 	TestCustomReverbReportsNonFiniteInput();
+	TestCustomReverbWetOverflow();
+	TestCustomReverbDryOverflow();
+	TestCustomReverbWetLevelOverflow();
+	TestCustomReverbDelayedOverflow();
 	TestCustomReverbTailEnd();
 	TestCustomReverbTailEndKeepsLevels();
 	TestCustomReverbTailMutedThenRestored();

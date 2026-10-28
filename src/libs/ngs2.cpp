@@ -18,6 +18,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <numbers>
+#include <span>
 #include <vector>
 
 #include "libatrac9.h"
@@ -1798,6 +1799,20 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	voice.has_samples = output != 0;
 }
 
+// Largest absolute sample in a voice's rendered output, as a linear level where 1.0 is full scale.
+// Levels above full scale are kept, since float sources and resonant filters can exceed it. A NaN
+// or infinite sample from a misbehaving filter is skipped, so the game never gets a peak it can't
+// turn into a level.
+static float Ngs2PeakHeight(std::span<const float> samples) {
+	float peak = 0.0f;
+	for (const float sample: samples) {
+		if (std::isfinite(sample)) {
+			peak = std::max(peak, std::abs(sample));
+		}
+	}
+	return peak;
+}
+
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
@@ -1826,14 +1841,13 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					voice.has_samples = true;
 				}
 			}
-			if (voice.peak_meter_enabled) {
-				float peak = 0.0f;
-				if (voice.has_samples) {
-					for (const float sample: voice.samples) {
-						peak = std::max(peak, std::abs(sample));
-					}
-				}
-				voice.peak_height = peak;
+			// The meter reads the voice after its filters and before port volume and routing, so
+			// muting or attenuating a port doesn't hide the voice's level. It should move after
+			// the envelope once envelopes are implemented. The peak is already 0 from the start of
+			// this render when the voice produced nothing.
+			if (voice.peak_meter_enabled && voice.has_samples) {
+				voice.peak_height =
+				    Ngs2PeakHeight({voice.Buffer(0, grain), size_t {grain} * voice.channels});
 			}
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
 			    voice.frame_cursor == voice.frame_samples &&

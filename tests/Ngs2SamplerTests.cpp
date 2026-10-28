@@ -854,6 +854,22 @@ struct PeakMeterControl {
 	Ngs2SamplerPeakMeterParam param {1, 0};
 };
 
+// The peak is the largest absolute sample, kept above full scale, with NaN and infinite samples
+// skipped so the game always gets a usable level.
+void TestPeakHeightHelper() {
+	constexpr float infinity = std::numeric_limits<float>::infinity();
+	constexpr float quiet_nan = std::numeric_limits<float>::quiet_NaN();
+	const float     mixed_signs[] = {0.25f, -0.75f, 0.5f};
+	const float     loud[] = {1.5f, -2.0f};
+	const float     invalid[] = {0.125f, quiet_nan, infinity, -infinity, -0.0625f};
+	const float     only_invalid[] = {quiet_nan, infinity, -infinity};
+	Check(Ngs2PeakHeight({}) == 0.0f, "an empty buffer has a nonzero peak");
+	Check(Ngs2PeakHeight(mixed_signs) == 0.75f, "the peak ignored the sign of a sample");
+	Check(Ngs2PeakHeight(loud) == 2.0f, "the peak was clamped at full scale");
+	Check(Ngs2PeakHeight(invalid) == 0.125f, "a NaN or infinite sample reached the peak");
+	Check(Ngs2PeakHeight(only_invalid) == 0.0f, "a buffer of only invalid samples has a nonzero peak");
+}
+
 // While the peak meter is enabled, the voice state reports the largest absolute sample of the
 // last render, and 0 otherwise.
 void TestPeakMeter() {
@@ -1800,6 +1816,7 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestPeakHeightHelper();
 	TestPeakMeter();
 	TestPeakMeterReset();
 	TestStarvationAndPause();

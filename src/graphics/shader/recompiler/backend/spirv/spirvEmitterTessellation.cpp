@@ -29,12 +29,16 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
 		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-		const auto index = inst.Arg(1).U32() / 4u;
-		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		// The factor buffer holds the outer factors then the inner ones: 3 + 1 for triangles,
+		// 4 + 2 for quads (VGT_TF_PARAM.TYPE 1 and 2).
+		const auto index       = inst.Arg(1).U32() / 4u;
+		const auto outer_count = tess.domain == 2u ? 4u : 3u;
+		const auto inner_count = tess.domain == 2u ? 2u : 1u;
+		const auto outer       = index < outer_count;
+		EXIT_NOT_IMPLEMENTED(index >= outer_count + inner_count);
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
-		                          ConstantU32(state, outer ? index : index - 3u));
+		                          ConstantU32(state, outer ? index : index - outer_count));
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
@@ -128,20 +132,30 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	// CxVgtTfParam: triangles, integer or fractional-odd partitioning, clockwise output.
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u ||
-	                     (tess.partitioning != 0u && tess.partitioning != 2u) ||
-	                     tess.output_topology != 2u);
+	// CxVgtTfParam. Domain: 1 = triangles, 2 = quads. Output topology: 2 = clockwise triangles,
+	// 3 = counter-clockwise ones. Partitioning: 0 = integer, 1 = power of two, 2 = fractional
+	// odd, 3 = fractional even.
+	if ((tess.domain != 1u && tess.domain != 2u) || tess.partitioning > 3u ||
+	    (tess.output_topology != 2u && tess.output_topology != 3u)) {
+		EXIT("unsupported tessellation: domain=%u partitioning=%u topology=%u\n", tess.domain,
+		     tess.partitioning, tess.output_topology);
+	}
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
 	} else {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
+		state.builder.AddExecutionMode(state.main_func, tess.domain == 2u
+		                                                    ? spv::ExecutionModeQuads
+		                                                    : spv::ExecutionModeTriangles);
+		// Vulkan has no power-of-two spacing: it is approximated with equal (integer) spacing.
 		state.builder.AddExecutionMode(
-		    state.main_func, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
-		                                             : spv::ExecutionModeSpacingFractionalOdd);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
+		    state.main_func, tess.partitioning == 2u   ? spv::ExecutionModeSpacingFractionalOdd
+		                     : tess.partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven
+		                                               : spv::ExecutionModeSpacingEqual);
+		state.builder.AddExecutionMode(state.main_func, tess.output_topology == 3u
+		                                                    ? spv::ExecutionModeVertexOrderCcw
+		                                                    : spv::ExecutionModeVertexOrderCw);
 	}
 }
 

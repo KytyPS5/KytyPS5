@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -230,6 +231,15 @@ struct SaveDataDelete {
 	int32_t                   pad2;
 };
 
+struct SaveDataConvert {
+	int32_t                   user_id;
+	int32_t                   pad;
+	const SceSaveDataDirName* src_dir_name;
+	const SceSaveDataDirName* dst_dir_name;
+	uint64_t                  dst_blocks;
+	uint8_t                   reserved[24];
+};
+
 struct SaveDataEvent {
 	uint32_t           type;
 	int32_t            error_code;
@@ -300,15 +310,29 @@ static std::string memory_dir_name(uint32_t slot_id) {
 	return "sce_sdmemory" + (slot_id == 0 ? std::string() : std::to_string(slot_id));
 }
 
-static std::filesystem::path save_directory(std::string_view title_id, std::string_view dir_name,
-                                            int32_t user_id) {
-	const auto directory = std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name;
+static std::filesystem::path save_user_directory(std::string_view title_id, int32_t user_id) {
+	auto directory = std::filesystem::path(SAVE_DATA_DIR);
+	if (Config::IsGuestUserId(user_id)) {
+		directory /= std::filesystem::path("[users]") / std::to_string(user_id);
+	}
+	return directory / title_id;
+}
+
+static bool is_memory_dir_name(std::string_view dir_name) {
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		if (dir_name == memory_dir_name(slot)) {
-			return directory / std::to_string(user_id);
+			return true;
 		}
 	}
-	return directory;
+	return false;
+}
+
+static std::filesystem::path save_directory(std::string_view title_id, std::string_view dir_name,
+                                            int32_t user_id) {
+	if (is_memory_dir_name(dir_name)) {
+		return std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name / std::to_string(user_id);
+	}
+	return save_user_directory(title_id, user_id) / dir_name;
 }
 
 static std::filesystem::path memory_directory(int32_t user_id, uint32_t slot_id) {
@@ -590,8 +614,13 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string title_id = cond->title_id != nullptr ? cond->title_id->data : get_title_id();
-	const auto        root     = std::filesystem::path(SAVE_DATA_DIR) / title_id;
-	std::vector<std::string> dir_list;
+	const auto        root     = save_user_directory(title_id, cond->user_id);
+	struct Found {
+		uint64_t    key = 0;
+		std::string name;
+		auto        operator<=>(const Found&) const = default;
+	};
+	std::vector<Found> dir_list;
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
@@ -601,22 +630,34 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
-					dir_list.push_back(entry.name);
+					dir_list.push_back({.name = entry.name});
 				}
 			}
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
-	});
-
-	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
+	// A save whose metadata cannot be read sorts as 0.
+	for (auto& found: dir_list) {
+		const auto directory = root / found.name;
+		switch (cond->key) {
+			case SaveDataSortKey::UserParam: {
+				SaveDataParam param {};
+				read_save_param(save_param_path(directory), &param);
+				found.key = param.user_param;
+				break;
+			}
+			case SaveDataSortKey::Blocks:
+			case SaveDataSortKey::FreeBlocks: read_save_blocks(directory, &found.key); break;
+			case SaveDataSortKey::Mtime:
+				found.key = static_cast<uint64_t>(newest_save_time(directory));
+				break;
+			default: break;
 		}
-		dir_list = reversed;
+	}
+	// Directory names break ties; descending order reverses both.
+	std::sort(dir_list.begin(), dir_list.end());
+	if (cond->order == SaveDataSortOrder::Descent) {
+		std::reverse(dir_list.begin(), dir_list.end());
 	}
 
 	auto max_count =
@@ -627,9 +668,9 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	for (size_t i = 0; i < max_count; i++) {
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
-		              dir_list[i].c_str());
+		              dir_list[i].name.c_str());
 		if (result->params != nullptr) {
-			const int status = load_save_param(root / dir_list[i], &result->params[i]);
+			const int status = load_save_param(root / dir_list[i].name, &result->params[i]);
 			if (status != OK) {
 				return status;
 			}
@@ -637,7 +678,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		if (result->infos != nullptr) {
 			auto& info = result->infos[i];
 			info = {};
-			const int status = read_save_blocks(root / dir_list[i], &info.blocks);
+			const int status = read_save_blocks(root / dir_list[i].name, &info.blocks);
 			if (status != OK) {
 				return status;
 			}
@@ -1141,12 +1182,8 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
+int KYTY_SYSV_ABI SaveDataGetEventResult(const void* /*event_param*/, SaveDataEvent* event) {
 	PRINT_NAME();
-
-	LOGF("\t event_param = 0x%016" PRIx64 "\n"
-	     "\t event       = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
 
 	if (event == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -1169,6 +1206,56 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 	     event->dir_name.data);
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
+	PRINT_NAME();
+
+	const auto valid_name = [](const SceSaveDataDirName* name) {
+		return valid_path_component(name->data) && !is_memory_dir_name(name->data);
+	};
+	if (convert == nullptr || convert->src_dir_name == nullptr ||
+	    !valid_name(convert->src_dir_name) ||
+	    (convert->dst_dir_name != nullptr && !valid_name(convert->dst_dir_name)) ||
+	    convert->dst_blocks < SAVE_DATA_BLOCKS_MIN || convert->dst_blocks > SAVE_DATA_BLOCKS_MAX) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	if (convert->user_id < 0) {
+		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+	}
+
+	LOGF("\t user_id      = %" PRId32 "\n"
+	     "\t src_dir_name = %s\n"
+	     "\t dst_dir_name = %s\n"
+	     "\t dst_blocks   = %" PRIu64 "\n",
+	     convert->user_id, convert->src_dir_name->data,
+	     convert->dst_dir_name != nullptr ? convert->dst_dir_name->data : "<none>",
+	     convert->dst_blocks);
+
+	Common::LockGuard lock(g_mount_mutex);
+	const auto        source =
+	    save_directory(get_title_id(), convert->src_dir_name->data, convert->user_id);
+	if (!Common::File::IsDirectoryExisting(source)) {
+		return SAVE_DATA_ERROR_NOT_FOUND;
+	}
+	if (g_mount_slots.FindAvailable(source) == SaveDataMountSlots::BUSY) {
+		return SAVE_DATA_ERROR_BUSY;
+	}
+	if (convert->dst_dir_name != nullptr &&
+	    Common::File::IsDirectoryExisting(
+	        save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id))) {
+		return SAVE_DATA_ERROR_EXISTS;
+	}
+	uint64_t blocks = 0;
+	if (read_save_blocks(source, &blocks) == OK) {
+		if (convert->dst_blocks == blocks) {
+			return SAVE_DATA_ERROR_NO_NEED_CONVERT;
+		}
+		if (convert->dst_blocks < blocks) {
+			return SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC;
+		}
+	}
+	EXIT("save data conversion of %s is not implemented\n", convert->src_dir_name->data);
 }
 
 int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
@@ -1304,6 +1391,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cduy9v4YmT4", ::Libs::SaveData::SaveDataSetSaveDataMemory2);
 	LIB_FUNC("wiT9jeC7xPw", ::Libs::SaveData::SaveDataSyncSaveDataMemory);
 	LIB_FUNC("j8xKtiFj0SY", ::Libs::SaveData::SaveDataGetEventResult);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
 	LIB_FUNC("WAzWTZm1H+I", ::Libs::SaveData::SaveDataTransferringMount);
 	LIB_FUNC("RjMlsR8EXrw", ::Libs::SaveData::SaveDataTransferringMount);
 	LIB_FUNC("z1JA8-iJt3k", ::Libs::SaveData::SaveDataBackup);
@@ -1334,6 +1422,7 @@ LIB_DEFINE(InitSaveData_1) {
 	LIB_FUNC("cduy9v4YmT4", SaveData::SaveDataSetSaveDataMemory2);
 	LIB_FUNC("wiT9jeC7xPw", SaveData::SaveDataSyncSaveDataMemory);
 	LIB_FUNC("j8xKtiFj0SY", SaveData::SaveDataGetEventResult);
+	LIB_FUNC("2mfSRGdshtk", SaveData::SaveDataConvert);
 	LIB_FUNC("WAzWTZm1H+I", SaveData::SaveDataTransferringMount);
 	LIB_FUNC("RjMlsR8EXrw", SaveData::SaveDataTransferringMount);
 	LIB_FUNC("z1JA8-iJt3k", SaveData::SaveDataBackup);

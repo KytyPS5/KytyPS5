@@ -47,6 +47,7 @@ struct Fixture {
 		} else {
 			rack.option.custom_sampler.max_waveform_blocks = capacity;
 			rack.option.custom_sampler.custom_rack_option.state_size = sizeof(Ngs2CustomSamplerVoiceState);
+			rack.option.custom_sampler.custom_rack_option.num_buffers = 1;
 		}
 	}
 
@@ -123,7 +124,7 @@ void TestWaveformQueueCapacity() {
 			for (uint32_t i = 0; i < capacity; ++i) {
 				Check(f.voice.blocks[i].data == reinterpret_cast<const uint8_t*>(pcm) &&
 				          f.voice.blocks[i].info.user_data == i + 1 &&
-				          f.voice.blocks[i].cursor == (i == 0 ? 1u : 0u),
+				          f.voice.blocks[i].data_cursor == (i == 0 ? sizeof(int16_t) : 0u),
 				      "rejected waveform request replaced an outstanding block");
 			}
 			f.Render(3);
@@ -703,6 +704,53 @@ void TestSubmixerSetupAndRouting() {
 	}
 }
 
+uint32_t g_side_chain_flags = 0;
+
+void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
+	Check(context->num_channels == 1 && context->grain_samples == 1 &&
+	          context->user_data[0] == 7,
+	      "user FX context did not describe the custom voice");
+	g_side_chain_flags = context->flags;
+	context->channels[0][0] *= context->channels[1][0];
+}
+
+void TestCustomSideChainUserFx() {
+	Fixture          main(48000), side(48000);
+	Ngs2RackInternal custom_rack {};
+	auto&            custom = custom_rack.option.custom_submixer.custom_rack_option;
+	custom_rack.ngs         = &main.system;
+	custom_rack.type        = Ngs2RackType::CustomSubmixer;
+	custom.num_buffers      = 2;
+	custom.num_modules      = 1;
+	custom.module[0]        = {nullptr, 0x19, 0, 1, 0};
+	Ngs2VoiceInternal voice;
+	voice.rack = &custom_rack;
+	voice.ports.resize(1);
+	voice.modules.resize(1);
+	struct {
+		Ngs2VoiceParamHeader header {24, 0, 0x40020000};
+		uint32_t             inputs = 1, outputs = 1, flags = 0, reserved = 0;
+	} setup;
+	struct {
+		Ngs2VoiceParamHeader header;
+		void                 KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*);
+		uintptr_t            user_data[3];
+	} fx {{40, 0, 0x40001900}, MultiplyBySideChain, {7, 0, 0}};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK &&
+	          Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &fx.header) == OK,
+	      "custom submixer user FX setup failed");
+	voice.state = Ngs2VoicePlayState::Playing;
+	main.voice.ports.push_back({&voice, 0, 1.0f, -1});
+	side.voice.ports.push_back({&voice, 1, 1.0f, -1});
+	const int16_t main_pcm = 8192, side_pcm = 16384;
+	main.Queue(&main_pcm, 1, 0);
+	side.Queue(&side_pcm, 1, 0);
+	Ngs2RenderVoice(voice, {&main.voice, &side.voice, &voice}, 1);
+	Check(voice.has_samples && voice.samples[0] == 0.125f && voice.samples[1] == 0.5f &&
+	          g_side_chain_flags == 1,
+	      "user FX did not receive the side-chain buffer after the source channels");
+}
+
 void TestPcm16RenderOutput() {
 	Ngs2Internal system;
 	system.option                   = Ngs2DefaultSystemOption();
@@ -798,11 +846,55 @@ void TestStarvationAndPause() {
 	f.Queue(pcm, 2, 0);
 	f.voice.SetEvent(16);
 	f.Render(2);
-	Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0, "paused voice consumed data");
+	Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
+	      "paused voice consumed data");
 	f.voice.SetEvent(32);
 	f.Render(2);
 	Check(f.voice.samples[0] == 0.5f && f.voice.samples[1] == 0.25f,
 	      "stream failed to resume after starvation/pause");
+}
+
+void TestPcmByteUnitStreaming() {
+	Fixture                 f(48000);
+	const int16_t           pcm[] = {0, 4096, 8192, 12288, 16384, 20480, 24576, 28672};
+	const Ngs2WaveformBlock first {0, 4, 0, 1, 5, 0, 0}, rest {4, 12, 0, 0, 99, 0, 0};
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK && f.QueueBlocks(pcm, &rest, 1, 0x12) == OK &&
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 1),
+	      "byte-unit stream was rejected or its read address ignored the skipped frame");
+	f.Render(8);
+	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0, 0, 0} &&
+	          f.voice.blocks.empty() && f.voice.decoded_samples == 5,
+	      "byte-unit stream did not play exactly its duration across data-only blocks");
+}
+
+void TestPcmSkipAcrossBlocks() {
+	Fixture                 f(48000);
+	const int16_t           pcm[] = {1, 2, 3, 8192, 16384};
+	const Ngs2WaveformBlock first {0, 4, 0, 3, 2, 0, 0}, rest {4, 6, 0, 0, 0, 0, 0};
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK, "skipping stream block was rejected");
+	f.Render(1);
+	Check(!f.voice.has_samples && f.voice.blocks.empty(), "skip-only block produced samples");
+	Check(f.QueueBlocks(pcm, &rest, 1, 2) == OK &&
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 3),
+	      "read address ignored the skip remaining from the previous block");
+	f.Render(2);
+	Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} && f.voice.decoded_samples == 2 &&
+	          f.voice.decoded_bytes == sizeof(pcm),
+	      "skip spanning blocks played skipped frames or miscounted decoded data");
+}
+
+void TestPcmBlocksEndWithTheirData() {
+	// The Last Oricru queues blocks holding fewer frames than they declare, even none.
+	Fixture                 f(48000, 2);
+	const int16_t           pcm[] = {4096, -4096, 8192, -8192, 12288, -12288};
+	const Ngs2WaveformBlock blocks[] = {
+	    {0, 0, 0, 0, 16385, 0, 0}, {0, 8, 0, 0, 4, 0, 0}, {8, 4, 0, 0, 3, 0, 0}};
+	Check(f.QueueBlocks(pcm, blocks, 3, 0) == OK, "partially filled blocks were rejected");
+	f.Render(5);
+	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0, 0, -0.125f, -0.25f,
+	                                             -0.375f, 0, 0} &&
+	          f.voice.blocks.empty() && f.voice.decoded_samples == 3,
+	      "partially filled blocks did not play their data back to back");
 }
 
 void TestMonoRateAndRouting() {
@@ -882,7 +974,7 @@ void TestSamplerReuseResetsRouting() {
 		const int16_t pcm[] = {8192, 16384, -8192, -16384};
 		f.Queue(pcm, 2, 0);
 		f.Render(1);
-		Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0,
+		Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
 		      "sampler setup started the new waveform without a play event");
 		f.voice.ports[0].dest = &mastering;
 		f.voice.SetEvent(1);
@@ -1145,9 +1237,9 @@ void KYTY_SYSV_ABI RecordLoopCallback(const Ngs2VoiceCallbackInfo* info) {
 	}
 }
 
-void TestLoopCallbacksAndExit() {
+void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	const int16_t pcm[] = {8192, 16384, 24576};
-	Fixture       f(48000);
+	Fixture       f(48000, 1, type);
 	LoopCallbacks log;
 	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
 	f.voice.callback_data  = reinterpret_cast<uintptr_t>(&log);
@@ -1158,7 +1250,7 @@ void TestLoopCallbacksAndExit() {
 	      "loop and completion callbacks lost the completed repeat count");
 	Check(f.voice.blocks.empty(), "finite loop did not complete");
 
-	Fixture active(48000);
+	Fixture active(48000, 1, type);
 	log.events.clear();
 	log.pause                   = true;
 	active.voice.callback       = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
@@ -1168,9 +1260,10 @@ void TestLoopCallbacksAndExit() {
 	active.Queue(pcm + 2, 1, 0);
 	active.Render(6);
 	Check(log.events.size() == 1 && active.voice.decoded_samples == 2 &&
-	          active.voice.blocks.front().cursor == 0 && active.voice.samples[2] == 0,
+	          active.voice.blocks.front().data_cursor == 0 && active.voice.samples[2] == 0,
 	      "loop callback pause consumed another iteration");
-	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0, 0x10000004};
+	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0,
+	                                type == Ngs2RackType::Sampler ? 0x10000004u : 0x40010004u};
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&active.voice), &exit_loop);
 	active.voice.SetEvent(32);
 	active.Render(5);
@@ -1178,7 +1271,7 @@ void TestLoopCallbacksAndExit() {
 	          active.voice.blocks.empty() && log.events.size() == 1,
 	      "exiting infinite loop lost its final iteration or ignored callback flags");
 
-	Fixture pending(48000);
+	Fixture pending(48000, 1, type);
 	pending.Queue(pcm, 1, 1);
 	pending.Queue(pcm + 1, 1, 1, UINT32_MAX);
 	pending.Queue(pcm + 2, 1, 0);
@@ -1374,7 +1467,7 @@ void TestCallbackStopsConsumption() {
 			      "completion callback failed to interrupt playback");
 			Check(f.voice.samples[0] == 0.0f && f.voice.samples[1] == 0.0f &&
 			          f.voice.decoded_samples == 1 && f.voice.blocks.size() == 1 &&
-			          f.voice.blocks.front().cursor == 0,
+			          f.voice.blocks.front().data_cursor == 0,
 			      "callback pause/stop consumed the next queued block");
 			if (event == 16) {
 				f.voice.SetEvent(32);
@@ -1474,7 +1567,7 @@ void TestCallbackReplacesSource() {
 				f.Render(4);
 				Check(!f.voice.has_samples && f.voice.samples.size() == (setup ? 4u : 8u) &&
 				          std::ranges::all_of(f.voice.samples, [](float value) { return value == 0; }) &&
-				          f.voice.blocks.size() == 1 && f.voice.blocks.front().cursor == 0,
+				          f.voice.blocks.size() == 1 && f.voice.blocks.front().data_cursor == 0,
 				      "callback source replacement used an old frame or channel layout");
 				f.Render(4);
 				const std::vector<float> expected = setup
@@ -1608,13 +1701,15 @@ int main() {
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
+	TestCustomSideChainUserFx();
 	TestWaveformBlockGeometry();
 	TestAtrac9ResampleAfterStarvation();
 	TestAtrac9ResampleAcrossFrames();
 	TestResamplingPhaseAfterStarvation();
 	TestSamplerReuseResetsRouting();
 	TestDeferredSamplerSetup();
-	TestLoopCallbacksAndExit();
+	TestLoopCallbacksAndExit(Ngs2RackType::Sampler);
+	TestLoopCallbacksAndExit(Ngs2RackType::CustomSampler);
 	TestAtrac9Looping();
 	TestAtrac9WaveformJoining();
 	TestWaveformReadAddress();
@@ -1633,6 +1728,9 @@ int main() {
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestStarvationAndPause();
+	TestPcmByteUnitStreaming();
+	TestPcmSkipAcrossBlocks();
+	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();

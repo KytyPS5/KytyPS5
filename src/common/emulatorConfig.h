@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <array>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -35,10 +36,16 @@ constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
 
+constexpr int     MAX_PLAYERS         = 4;
+constexpr int32_t PLAYER_USER_ID_STEP = 0x100;
+constexpr int32_t MAX_USER_ID =
+    std::numeric_limits<int32_t>::max() - (MAX_PLAYERS - 1) * PLAYER_USER_ID_STEP;
+
 constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	constexpr int32_t USER_ID_EVERYONE = 0xfe;
 	constexpr int32_t USER_ID_SYSTEM   = 0xff;
-	return user_id >= 0 && user_id != USER_ID_EVERYONE && user_id != USER_ID_SYSTEM;
+	return user_id >= 0 && user_id <= MAX_USER_ID && user_id != USER_ID_EVERYONE &&
+	       user_id != USER_ID_SYSTEM;
 }
 
 struct ConfigOptions {
@@ -50,11 +57,14 @@ struct ConfigOptions {
 	std::optional<ControllerColor> controller_color;
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
+	uint32_t               keyboard_player                = 0;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
@@ -63,6 +73,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   shader_cache_enabled        = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -76,10 +87,13 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   occlusion_queries_enabled   = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
+	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -100,11 +114,19 @@ const std::string& GetAudioInputDevice();
 const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
+uint32_t GetKeyboardPlayer();
+// Player 0 is the configured user; later players derive their IDs from it.
+int32_t  GetPlayerUserId(int player);
+// Returns -1 when the user ID does not belong to any player.
+int      GetPlayerFromUserId(int32_t user_id);
+// Players after the first are guests: they have no profile, trophies or NP account.
+bool     IsGuestUserId(int32_t user_id);
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
+bool     StretchEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();
@@ -113,6 +135,7 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+bool                   ShaderCacheEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
@@ -133,8 +156,10 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
+bool OcclusionQueriesEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

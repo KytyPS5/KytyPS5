@@ -102,6 +102,12 @@ public:
 		return m_tail_remaining != 0 || (m_configured && (m_reset || m_changed));
 	}
 
+	// The length in samples of one channel's all-pass delay line, so tests can check how the
+	// lines are sized for a rate. The lines are built on the first Process after Configure.
+	[[nodiscard]] uint32_t AllpassLength(uint32_t channel, uint32_t stage) const {
+		return static_cast<uint32_t>(m_channels.at(channel).allpasses.at(stage).buffer.size());
+	}
+
 	// Applies the reverb in place to `samples`, which holds `channels` blocks of `grain`
 	// samples, one block per channel.
 	void Process(float* samples, uint32_t channels, uint32_t grain);

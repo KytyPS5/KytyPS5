@@ -904,6 +904,48 @@ void TestCustomReverbDsp() {
 	      "muted reverb with dry 1 did not pass the input through");
 }
 
+// Below about 7.4 kHz the per-channel all-pass offsets are longer than the shortest delays, and
+// a rate of 0 would divide by zero. Neither may crash or produce NaN.
+void TestCustomReverbLowRates() {
+	constexpr uint32_t grain = 256, channels = 8;
+	constexpr uint32_t low_rate = 4000;
+	std::vector<float> block(size_t(grain) * channels);
+	Ngs2Reverb         low;
+	low.Configure(ReverbParam(1.0f, 0, 0), low_rate);
+	bool tail = false;
+	for (int b = 0; b < 20; ++b) {
+		std::ranges::fill(block, 0.0f);
+		if (b == 1) {
+			block[0] = 1.0f; // An impulse after the fade-in grain.
+		}
+		low.Process(block.data(), channels, grain);
+		Check(std::ranges::all_of(block, [](float sample) { return std::isfinite(sample); }),
+		      "reverb at a low rate produced a non-finite sample");
+		tail = tail || std::ranges::any_of(block, [](float sample) { return sample != 0.0f; });
+	}
+	Check(tail, "reverb at a low rate produced no output");
+	// 46 samples is the longest all-pass at this rate, 11.58 ms with no offset.
+	constexpr uint32_t longest_allpass = 46;
+	for (uint32_t channel = 0; channel < Ngs2Reverb::MaxChannels; ++channel) {
+		for (uint32_t stage = 0; stage < Ngs2Reverb::Allpasses; ++stage) {
+			const auto length = low.AllpassLength(channel, stage);
+			Check(length >= 1 && length <= longest_allpass,
+			      "reverb at a low rate sized an all-pass line below one sample or wrapped it");
+		}
+	}
+	// Channel 1's last stage is 19 samples with a -34 offset, so it sits on the clamp.
+	Check(low.AllpassLength(1, 3) == 1, "reverb did not clamp a negative all-pass length to 1");
+
+	// A rate of 0 is refused, so the reverb stays unconfigured and the input passes through.
+	Ngs2Reverb zero;
+	zero.Configure(ReverbParam(1.0f, 0, 0), 0);
+	std::ranges::fill(block, 0.5f);
+	zero.Process(block.data(), channels, grain);
+	Check(std::ranges::all_of(block, [](float sample) { return sample == 0.5f; }) &&
+	          !zero.HasTail(),
+	      "reverb accepted a sample rate of 0");
+}
+
 // Golden outputs of the PS4 libSceNgs2 I3DL2 reverb, from AnyPS5 (GPL-2.0) commit
 // e15f1644e384ab055f721347a4d31cdff02e9a47 (core/libs/prx/libSceNgs2.native/tests/Ngs2Render.cpp).
 // Each case is an impulse (or noise) at frame 3 of a 4096-frame input, rendered in 256-sample
@@ -2065,6 +2107,7 @@ int main() {
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestCustomReverbDsp();
+	TestCustomReverbLowRates();
 	TestCustomReverbMatchesLibrary();
 	TestCustomReverbVoice();
 	TestStarvationAndPause();

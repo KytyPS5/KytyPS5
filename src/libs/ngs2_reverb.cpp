@@ -18,6 +18,9 @@ constexpr uint32_t RingSamples = 14400;
 constexpr uint32_t LfeChannel  = 3;
 constexpr float    TwoPi       = 2.0f * std::numbers::pi_v<float>;
 
+// The shortest all-pass delay line. A delay line needs at least one sample.
+constexpr int32_t MinAllpassLength = 1;
+
 // The combs fade 60 dB per decay time, so the tail is 120 dB down after two decay times.
 constexpr float TailDecayTimes        = 2.0f;
 constexpr float MillisecondsPerSecond = 1000.0f;
@@ -116,6 +119,12 @@ void MixDown(const float* input, uint32_t channels, uint32_t grain, float* mono)
 
 // Takes new settings, which apply from the next grain.
 void Ngs2Reverb::Configure(const Ngs2ReverbI3dl2Param& param, uint32_t rate) {
+	// Every delay line and filter is built from the rate, and a rate of 0 would divide by zero.
+	// The whole update is ignored, as with a NaN setting, so a reverb that was never
+	// configured passes audio through.
+	if (rate == 0) {
+		return;
+	}
 	// The library ignores the whole update when any float setting is NaN.
 	const float values[] = {param.wet,
 	                        param.dry,
@@ -442,10 +451,13 @@ void Ngs2Reverb::ApplyParams(float rate) {
 	}
 	for (uint32_t channel = 0; channel < MaxChannels; channel++) {
 		for (uint32_t stage = 0; stage < Allpasses; stage++) {
-			auto&      allpass = m_channels[channel].allpasses[stage];
-			const auto length =
-			    static_cast<uint32_t>(static_cast<int32_t>(Samples(AllpassTimes[stage], rate)) +
-			                          AllpassOffsets[channel][stage]);
+			auto& allpass = m_channels[channel].allpasses[stage];
+			// The offsets are fixed sample counts tuned for 48 kHz. Below about 7.4 kHz they
+			// outgrow the shortest delays, so the length is kept at one sample at least.
+			const auto length = static_cast<uint32_t>(
+			    std::max(static_cast<int32_t>(Samples(AllpassTimes[stage], rate)) +
+			                 AllpassOffsets[channel][stage],
+			             MinAllpassLength));
 			if (allpass.buffer.size() != length) {
 				allpass.buffer.assign(length, 0.0f);
 			}

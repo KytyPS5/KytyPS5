@@ -52,6 +52,9 @@ struct DynamicState {
 		bool stencil_back_write_mask    : 1;
 		bool stencil_back_compare_mask  : 1;
 
+		bool cull_mode  : 1;
+		bool front_face : 1;
+
 		bool blend_constants       : 1;
 		bool color_write_enables   : 1;
 		bool line_width            : 1;
@@ -85,6 +88,9 @@ struct DynamicState {
 	uint32_t   stencil_back_reference {};
 	uint32_t   stencil_back_write_mask {};
 	uint32_t   stencil_back_compare_mask {};
+
+	vk::CullModeFlags cull_mode {};
+	vk::FrontFace     front_face {};
 
 	std::array<float, 4>                               blend_constants {};
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enables {};
@@ -218,6 +224,20 @@ struct DynamicState {
 		if (stencil_back_compare_mask != back_compare_mask) {
 			stencil_back_compare_mask             = back_compare_mask;
 			dirty_state.stencil_back_compare_mask = true;
+		}
+	}
+
+	void SetCullMode(const vk::CullModeFlags cull_mode_) {
+		if (cull_mode != cull_mode_) {
+			cull_mode             = cull_mode_;
+			dirty_state.cull_mode = true;
+		}
+	}
+
+	void SetFrontFace(const vk::FrontFace front_face_) {
+		if (front_face != front_face_) {
+			front_face             = front_face_;
+			dirty_state.front_face = true;
 		}
 	}
 

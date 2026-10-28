@@ -1,0 +1,50 @@
+#version 450
+
+// One workgroup per metadata slice; see TileManager::CheckColorClear.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer Metadata { uint data[]; } metadata;
+layout(set = 0, binding = 1, std430) writeonly buffer Predicates { uint data[]; } predicates;
+
+layout(push_constant, std430) uniform Check {
+	uint metadata_base;
+	uint words;
+	uint keys;
+	uint expand;
+} params;
+
+const uint Slots = 8u; // TileManager::ColorClearSlots
+
+shared uint key;
+shared uint mismatch;
+
+void main() {
+	const uint slice = gl_WorkGroupID.x;
+	const uint base  = (params.metadata_base >> 2u) + slice * params.words;
+	// Each invocation reads, and may rewrite, only its own words.
+	if (gl_LocalInvocationIndex == 0u) {
+		key      = metadata.data[base] & 0xffu;
+		mismatch = 0u;
+	}
+	barrier();
+	const uint pattern = key * 0x01010101u;
+	bool       same    = true;
+	for (uint i = gl_LocalInvocationIndex; same && i < params.words; i += gl_WorkGroupSize.x) {
+		same = metadata.data[base + i] == pattern;
+	}
+	if (!same) {
+		atomicOr(mismatch, 1u);
+	}
+	barrier();
+	const uint slot = key >> 5u;
+	const bool hit  = mismatch == 0u && (key & 0x1fu) == 0u && (params.keys & (1u << slot)) != 0u;
+	if (gl_LocalInvocationIndex < Slots) {
+		predicates.data[slice * Slots + gl_LocalInvocationIndex] =
+		    uint(hit && slot == gl_LocalInvocationIndex);
+	}
+	if (hit && params.expand != 0u) {
+		for (uint i = gl_LocalInvocationIndex; i < params.words; i += gl_WorkGroupSize.x) {
+			metadata.data[base + i] = 0xffffffffu;
+		}
+	}
+}

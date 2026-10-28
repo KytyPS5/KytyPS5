@@ -6,15 +6,18 @@
 #include "common/file.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/additionalContent.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -83,6 +86,148 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "KernelFileSystemTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+template <typename Predicate>
+void WaitForMutexTest(Predicate ready) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!ready()) {
+    Check(std::chrono::steady_clock::now() < deadline, "mutex waiter made progress");
+    std::this_thread::yield();
+  }
+}
+
+struct MutexWaiter {
+  Libs::LibKernel::PthreadMutex *mutex;
+  Libs::LibKernel::KernelUseconds timeout = 0;
+  bool cancel = false;
+  Libs::LibKernel::Pthread thread = nullptr;
+  std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
+  std::atomic<unsigned> parked{0}, resume{0};
+  std::atomic<bool> acquired{false}, release{false}, finished{false};
+  int result = 0;
+};
+
+thread_local MutexWaiter *current_mutex_waiter = nullptr;
+
+void KYTY_SYSV_ABI ParkMutexWaiter(int, void *) {
+  auto &waiter = *current_mutex_waiter;
+  const auto ticket = waiter.parked.fetch_add(1) + 1;
+  WaitForMutexTest([&] { return waiter.resume.load() >= ticket; });
+}
+
+void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
+  using namespace Libs::LibKernel;
+  auto &waiter = *static_cast<MutexWaiter *>(arg);
+  current_mutex_waiter = &waiter;
+  waiter.result = waiter.timeout == 0 ? PthreadMutexLock(waiter.mutex)
+                                      : PthreadMutexTimedlock(waiter.mutex, waiter.timeout);
+  if (waiter.result == OK) {
+    waiter.acquired = true;
+    WaitForMutexTest([&] { return waiter.release.load(); });
+    Check(PthreadMutexUnlock(waiter.mutex) == OK, "waiter unlocks owned mutex");
+  }
+  waiter.finished = true;
+  if (waiter.cancel) {
+    PthreadTestcancel();
+    Check(false, "deferred mutex waiter cancellation remains pending");
+  }
+  return nullptr;
+}
+
+void QueueMutexWaiter(MutexWaiter &waiter) {
+  using namespace Libs::LibKernel;
+  PthreadAttr attr = nullptr;
+  Check(PthreadAttrInit(&attr) == OK &&
+            PthreadAttrSetstack(&attr, waiter.stack.data(), waiter.stack.size()) == OK &&
+            PthreadCreate(&waiter.thread, &attr, RunMutexWaiter, &waiter, "MutexTest") == OK &&
+            PthreadAttrDestroy(&attr) == OK,
+        "create guest mutex waiter");
+  // Pending guest signals are dispatched inside the contended lock, after enqueueing.
+  // Holding that callback proves queue order without letting the waiter acquire.
+  PthreadQueuePendingSignal(waiter.thread, 30);
+  WaitForMutexTest([&] { return waiter.parked.load() == 1; });
+}
+
+void TestMutexHandoff() {
+  using namespace Libs::LibKernel;
+  Common::Singleton<Loader::RuntimeLinker>::Instance();
+  Initialize();
+  PthreadInitSelfForMainThread();
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
+  Check(install_symbol != nullptr && remove_symbol != nullptr, "mutex signal exports resolve");
+  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
+  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
+  Check(install(30, reinterpret_cast<void *>(ParkMutexWaiter)) == OK, "install mutex test signal");
+
+  PthreadMutexattr attr = nullptr;
+  Check(PthreadMutexattrInit(&attr) == OK && PthreadMutexattrSettype(&attr, 2) == OK,
+        "create recursive mutex attributes");
+  for (unsigned timed = 0; timed < 3; ++timed) {
+    PthreadMutex mutex = nullptr;
+    Check(PthreadMutexInit(&mutex, &attr, "MutexHandoff") == OK &&
+              PthreadMutexLock(&mutex) == OK && PthreadMutexLock(&mutex) == OK,
+          "lock recursive mutex twice");
+    std::array<MutexWaiter, 3> waiters{{{&mutex}, {&mutex}, {&mutex}}};
+    waiters[timed].timeout = 5000;
+    for (auto &waiter : waiters) {
+      QueueMutexWaiter(waiter);
+    }
+    waiters[timed].resume = 1;
+    Check(PthreadJoin(waiters[timed].thread, nullptr) == OK &&
+              waiters[timed].result == KERNEL_ERROR_ETIMEDOUT,
+          "timed waiter unlinks from queue head, middle and tail");
+    Check(PthreadMutexUnlock(&mutex) == OK && PthreadMutexTrylock(&mutex) == OK &&
+              PthreadMutexUnlock(&mutex) == OK,
+          "partial recursive unlock retains ownership");
+    Check(PthreadMutexUnlock(&mutex) == OK &&
+              PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY,
+          "unlock reserves ownership before queued waiter runs");
+    for (auto &waiter : waiters) {
+      if (&waiter == &waiters[timed]) {
+        continue;
+      }
+      waiter.resume = 1;
+      WaitForMutexTest([&] { return waiter.acquired.load(); });
+      Check(PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY, "FIFO waiter owns mutex");
+      waiter.release = true;
+      WaitForMutexTest([&] { return waiter.finished.load(); });
+      Check(PthreadJoin(waiter.thread, nullptr) == OK && waiter.result == OK,
+            "FIFO waiter completes");
+    }
+    Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
+              PthreadMutexDestroy(&mutex) == OK,
+          "mutex remains usable after timed waiter removal");
+  }
+  Check(PthreadMutexattrDestroy(&attr) == OK, "destroy recursive mutex attributes");
+
+  PthreadMutex mutex = nullptr;
+  Check(PthreadMutexInit(&mutex, nullptr, "MutexCancel") == OK &&
+            PthreadMutexLock(&mutex) == OK &&
+            PthreadMutexTimedlock(&mutex, 5000) == KERNEL_ERROR_EDEADLK,
+        "nonrecursive self timed lock reports deadlock");
+  MutexWaiter waiter{&mutex};
+  waiter.cancel = true;
+  QueueMutexWaiter(waiter);
+  Check(PthreadCancel(waiter.thread) == OK, "cancel queued mutex waiter");
+  PthreadQueuePendingSignal(waiter.thread, 30);
+  waiter.resume = 1;
+  WaitForMutexTest([&] { return waiter.parked.load() == 2; });
+  Check(PthreadMutexUnlock(&mutex) == OK &&
+            PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY,
+        "canceled waiter retains its queue position");
+  waiter.release = true;
+  waiter.resume = 2;
+  void *result = nullptr;
+  Check(PthreadJoin(waiter.thread, &result) == OK &&
+            result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
+        "mutex lock defers cancellation until explicit cancellation point");
+  Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
+            PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
+        "mutex remains usable after waiter cancellation");
 }
 
 class TempDirectory {
@@ -179,6 +324,7 @@ void CheckSaveRename(const std::filesystem::path &root,
 }
 
 void TestRandomDevices() {
+  namespace Net = Libs::Network::Net;
   for (const auto* path : {"/dev/urandom", "/dev/random"}) {
     const int fd = FileSystem::KernelOpen(path, 0, 0);
     FileSystem::FileStat stat {};
@@ -188,7 +334,18 @@ void TestRandomDevices() {
     std::array<uint8_t, 32> entropy {};
     Check(FileSystem::KernelRead(fd, entropy.data(), entropy.size()) == entropy.size(),
           "character device supplies requested entropy");
+    // OpenSSL RAND_poll selects the device before reading it; a null timeout must not block.
+    std::array<uint64_t, 16> readable {};
+    readable[fd / 64] = uint64_t {1} << (fd % 64);
+    auto writable = readable;
+    const auto requested = readable;
+    Check(Net::Select(fd + 1, readable.data(), writable.data(), nullptr, nullptr) == 2 &&
+              readable == requested && writable == requested,
+          "select reports an entropy source ready at once");
     Check(FileSystem::KernelClose(fd) == OK, "close entropy source");
+    Check(Net::Select(fd + 1, readable.data(), nullptr, nullptr, nullptr) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+          "select rejects a closed descriptor");
   }
 }
 
@@ -349,9 +506,9 @@ void TestAddContent(const std::filesystem::path& root) {
   write(folder / "duplicate" / "sce_sys" / "param.json", param("PPSA11111", label(1)));
   write(folder / label(0) / "payload.txt", "DLC payload");
 
-  Loader::AddContentLoad(folder, "");
+  Loader::AddContentLoad(folder, {}, "");
   Check(Loader::AddContentGetAll().empty(), "unknown title never exposes unrelated add-ons");
-  Loader::AddContentLoad(folder, "PPSA11111");
+  Loader::AddContentLoad(folder, {}, "PPSA11111");
   Check(Loader::AddContentGetAll().size() == 65,
         "scan filters title before deduplication and ignores invalid/non-package metadata");
 
@@ -446,7 +603,39 @@ void TestAddContent(const std::filesystem::path& root) {
   for (size_t i = 1; i < mounts.size(); ++i) {
     Check(unmount(&mounts[i]) == OK, "unmount fixture");
   }
-  Loader::AddContentLoad(folder / "missing", "PPSA11111");
+
+  const auto user_dir = root / "user-add-on";
+  write(user_dir / "payload.txt", "user payload");
+  const auto user_arg = label(0) + "=" + Common::PathToString(user_dir);
+  Check(!Common::ParseAddContent("SHORT") && !Common::ParseAddContent("lowercase0000000") &&
+            !Common::ParseAddContent("LICENSE0000000001") &&
+            !Common::ParseAddContent(user_arg + "/missing"),
+        "user add-on needs a 16-character A-Z/0-9 label and an existing folder");
+  const auto licensed = Common::ParseAddContent("LICENSE000000001");
+  const auto replaced = Common::ParseAddContent(user_arg);
+  const auto duplicate =
+      Common::ParseAddContent("LICENSE000000001=" + Common::PathToString(user_dir));
+  Check(licensed && replaced && duplicate, "user add-ons parse with and without extra data");
+  Loader::AddContentLoad(folder, {*duplicate, *licensed, *replaced}, "PPSA11111");
+  Check(list(0, nullptr, 0, &count) == OK && count == 69,
+        "user add-ons replace detected labels and append new ones");
+  Label user {};
+  std::memcpy(user.data, "LICENSE000000001", 17);
+  Check(get(0, &user, &single) == OK && single.package_type == 3 && single.download_status == 0 &&
+            mount(0, &user, &point) == static_cast<int>(0x80d90005u),
+        "last entry of a label wins and a license-only add-on has no extra data to mount");
+  Check(mount(0, &info[3].label, &point) == OK, "user add-on mounts its extra data");
+  const std::string user_file = std::string(point.data) + "/payload.txt";
+  const int user_fd = FileSystem::KernelOpen(user_file.c_str(), 0, 0);
+  std::array<char, 12> user_payload {};
+  Check(user_fd >= 3 &&
+            FileSystem::KernelRead(user_fd, user_payload.data(), user_payload.size()) ==
+                user_payload.size() &&
+            std::string_view(user_payload.data(), user_payload.size()) == "user payload" &&
+            FileSystem::KernelClose(user_fd) == OK && unmount(&point) == OK,
+        "user add-on replaces the detected folder of its label");
+
+  Loader::AddContentLoad(folder / "missing", {}, "PPSA11111");
   Check(list(0, info.data(), 4, &count) == OK && count == 3,
         "missing add-ons folder retains GTA V entitlements");
   for (size_t i = 0; i < existing.size(); ++i) {
@@ -481,6 +670,27 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestFsync() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"juWbTNM+8hw", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr, "POSIX fsync export resolves");
+  const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
+  Check(fsync(std::numeric_limits<int>::min()) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "invalid fsync descriptor reports POSIX EBADF");
+
+  constexpr char Path[] = "/savedata0/fsync.dat";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "save", 4) == 4 && fsync(fd) == OK &&
+            FileSystem::KernelLseek(fd, 0, 1) == 4,
+        "fsync flushes a writable file without changing its offset");
+  Check(FileSystem::KernelClose(fd) == OK && fsync(fd) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "closed fsync descriptor reports POSIX EBADF");
 }
 
 void TestSaveTruncate() {
@@ -973,6 +1183,9 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             std::equal(bytes.begin(), bytes.begin() + 9, payload.end() - 9) &&
             FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 0,
         "archive reads stop at the member boundary");
+  Check(FileSystem::KernelFsync(fd) == OK &&
+            FileSystem::KernelLseek(fd, 0, 1) == payload.size(),
+        "fsync succeeds on an immutable archive member without changing its offset");
   Check(FileSystem::KernelWrite(fd, bytes.data(), 1) ==
             Libs::LibKernel::KERNEL_ERROR_EBADF &&
             FileSystem::KernelPwrite(fd, bytes.data(), 1, 0) ==
@@ -2236,7 +2449,7 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -2244,6 +2457,13 @@ int main(int, char**) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  TestMutexHandoff();
+  if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: mutex cases passed\n");
+    return 0;
+  }
 
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
@@ -2271,13 +2491,14 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestFsync();
   TestSaveTruncate();
   TestSaveWritev();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
-  FileSystem::Shutdown();
   CheckSocketWakeup();
+  FileSystem::Shutdown();
   CheckEtherAddressFormatting();
 #if defined(__linux__)
   TestNetCtlHostIpv4();

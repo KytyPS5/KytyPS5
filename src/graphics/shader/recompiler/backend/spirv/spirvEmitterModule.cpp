@@ -206,6 +206,17 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
+void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR::ImageResource& image,
+                      uint32_t count, uint32_t set, uint32_t binding) {
+	definition.type     = ImageType(state, image);
+	const auto array    = state.builder.Type(spv::OpTypeArray, definition.type, ConstantU32(state, count));
+	definition.variable = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassUniformConstant, array), spv::StorageClassUniformConstant);
+	state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationDescriptorSet, set);
+	state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationBinding, binding);
+	definition.pointer_type = TypePointer(state, spv::StorageClassUniformConstant, definition.type);
+}
+
 void DefineDescriptors(EmitterState& state) {
 	using Kind = IR::DescriptorBindingKind;
 	auto& info = state.program.info;
@@ -221,6 +232,14 @@ void DefineDescriptors(EmitterState& state) {
 		if (!kind.has_value() || image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			EXIT("shader image has an invalid descriptor type or mip count");
+		}
+		if (image.heap) {
+			// Heap kinds alias one array; the root itself is never accessed.
+			auto& definition = state.heap_images[IR::ImageBindingIndex(*kind)];
+			if (image.indirect_resources.empty() && definition.variable == 0) {
+				DefineImageArray(state, definition, image, IR::ImageHeapCapacity, IR::ImageHeapSet, 0u);
+			}
+			continue;
 		}
 		auto& count = counts[static_cast<size_t>(*kind)];
 		image.descriptor_index = count;
@@ -244,7 +263,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0) {
+	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -331,21 +350,11 @@ void DefineDescriptors(EmitterState& state) {
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
 				        IR::ImageResourceClass::None);
-				const auto& image = *image_types[IR::ImageBindingIndex(kind)];
-				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(kind));
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
-				definition.type = ImageType(state, image);
-				definition.variable = Define(ArrayType(definition.type), name.c_str(),
-				                             spv::StorageClassUniformConstant);
-				definition.pointer_type = TypePointer(
-				    state, spv::StorageClassUniformConstant, definition.type);
-				if (image.dimension == ImageDimension::Dim1D ||
-				    image.dimension == ImageDimension::Dim1DArray) {
-					state.builder.RequireCapability(image.resource_class ==
-					                                        IR::ImageResourceClass::Sampled
-					                                    ? spv::CapabilitySampled1D
-					                                    : spv::CapabilityImage1D);
-				}
+				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
+				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
+				state.builder.AddName(definition.variable,
+				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
 				break;
 			}
 		}
@@ -467,6 +476,8 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
+		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
+		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
 		default: return UINT32_MAX;
 	}
 }
@@ -517,7 +528,9 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::Layer:
-			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
+			case IR::StageInputKind::SampleId:
+			case IR::StageInputKind::BaseVertex:
+			case IR::StageInputKind::BaseInstance: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
@@ -586,6 +599,13 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
+	if (state.program.info.helper_invocation) {
+		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
+		                                              "gl_HelperInvocation");
+		state.helper_invocation_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInHelperInvocation);
+	}
 }
 
 void DefineOutputs(EmitterState& state) {
@@ -600,14 +620,24 @@ void DefineOutputs(EmitterState& state) {
 			cull_distance_count = std::max(cull_distance_count, output.index + 1);
 		}
 	}
+	const bool position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		return output.kind == IR::StageOutputKind::Position;
+	});
+	if (position && state.input_info.vertex->user_clip_planes != 0) {
+		// PipelineCache rejects UCP_ENA with shader clip or cull distances.
+		EXIT_IF(clip_distance_count + cull_distance_count != 0);
+		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
+		for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
+			state.outputs.push_back(
+			    {{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0, "gl_ClipDistance"}});
+		}
+	}
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u && position) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
@@ -672,13 +702,15 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
-				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				auto type = TypeF32Vector(state, 4);
+				if (binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel && binding.index < 8u) {
+					// Packed UNorm stores its encoded bits.
+					const auto bit = 1u << binding.index;
+					type = (state.input_info.pixel->target_packed_unorm_mask & bit) != 0u
+					           ? TypeU32Vector(state, 4)
+					           : MrtOutputType(state, binding.index);
+				}
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -742,7 +774,7 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || state.program.info.uses_image_heap) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -773,6 +805,10 @@ void DefineModule(EmitterState& state) {
 	}
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
+	}
+	if (InputVariableForKind(state, IR::StageInputKind::BaseVertex) != 0 ||
+	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
+		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
@@ -810,7 +846,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(state.program.info.uses_dma || state.program.info.uses_image_heap
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

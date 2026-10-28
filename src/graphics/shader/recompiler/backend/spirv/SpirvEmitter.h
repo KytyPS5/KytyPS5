@@ -9,11 +9,24 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
+// Host device capabilities that change the emitted SPIR-V. Built once per device.
+struct Profile {
+	bool maintenance8         = false; // Dynamic texel offsets on image samples.
+	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// shaderDenormPreserveFloat32, and the f32 denorm mode may differ from the other widths'
+	// (denormBehaviorIndependence is not NONE).
+	bool denorm_preserve_f32 = false;
+	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
+	uint32_t device_clock_period_ps = 0;
+};
+
+inline constexpr Profile DefaultProfile {};
+
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword = 0,
-                                  bool maintenance8_enabled = false, bool emit_debug_info = false,
-                                  bool denorm_preserve_f32 = false);
+                                  uint32_t       push_data_start_dword = 0,
+                                  const Profile& profile               = DefaultProfile,
+                                  bool           emit_debug_info       = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

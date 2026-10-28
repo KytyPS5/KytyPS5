@@ -458,8 +458,10 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+	constexpr uint64_t AllocationHeadroom = 256ull << 20u;
 	if (m_graphics.CanReportMemoryUsage() &&
-	    m_graphics.GetDeviceMemoryUsage() >= m_graphics.GetTotalMemoryBudget()) {
+	    m_graphics.GetDeviceMemoryUsage() + AllocationHeadroom >=
+	        m_graphics.GetTotalMemoryBudget()) {
 		(void)EvictCleanForAllocation(64ull << 20u);
 	}
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);

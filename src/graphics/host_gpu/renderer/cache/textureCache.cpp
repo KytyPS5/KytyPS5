@@ -206,8 +206,10 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, ImageId keep) {
 	// that allocates several GiB inside one submission, so reclaim clean buffers and images the
 	// GPU is done with before attempting the image allocation. No downloads or waits: this runs
 	// while the cache lock is held and a draw may be in preparation.
+	constexpr uint64_t AllocationHeadroom = 256ull << 20u;
 	if (m_graphics.CanReportMemoryUsage() &&
-	    m_graphics.GetDeviceMemoryUsage() >= m_graphics.GetTotalMemoryBudget()) {
+	    m_graphics.GetDeviceMemoryUsage() + AllocationHeadroom >=
+	        m_graphics.GetTotalMemoryBudget()) {
 		constexpr uint64_t buffer_target = 64ull << 20u;
 		constexpr uint64_t image_target  = 32ull << 20u;
 		(void)m_buffer_cache.EvictCleanForAllocation(buffer_target);
@@ -232,14 +234,14 @@ bool TextureCache::EvictForAllocationFailure(ImageId keep) {
 	constexpr uint64_t EVICT_TARGET    = 256ull << 20u;
 	constexpr uint64_t DOWNLOAD_BUDGET = 32ull << 20u;
 	const uint64_t     clock           = LruClock();
-	if (clock < 2) {
+	if (clock == 0) {
 		return false;
 	}
 
 	std::vector<ImageId> victims;
 	uint64_t             bytes      = 0;
 	uint64_t             downloaded = 0;
-	m_lru_cache.ForEachItemBelow(clock - 2, [&](ImageId id) {
+	m_lru_cache.ForEachItemBelow(clock, [&](ImageId id) {
 		if (id == keep) {
 			return false;
 		}
@@ -2133,7 +2135,10 @@ void TextureCache::RunGarbageCollector(bool force_pressure, bool force_critical)
 		bool pressured  = forced || m_total_used_memory >= m_pressure_gc_memory;
 		bool aggressive = (allow_aggressive || force_critical) &&
 		                  (force_critical || m_total_used_memory >= m_critical_gc_memory);
-		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		// A forced collection runs between submissions. Loading bursts touch every
+		// texture each frame, so an age window would make the whole burst unevictable.
+		const uint64_t age =
+		    forced ? 0u : std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
 		constexpr uint64_t MiB             = 1024 * 1024;
 		constexpr size_t   MaxFreesInFrame = 1024;
 		uint64_t           byte_budget     = 0;
@@ -2145,9 +2150,9 @@ void TextureCache::RunGarbageCollector(bool force_pressure, bool force_critical)
 			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
 			                         : std::max<uint64_t>(16 * MiB, excess / 8);
 			if (force_critical) {
-				byte_budget = std::max<uint64_t>(byte_budget, 256 * MiB);
+				byte_budget = std::max<uint64_t>(byte_budget, 1024 * MiB);
 			} else if (forced) {
-				byte_budget = std::max<uint64_t>(byte_budget, 128 * MiB);
+				byte_budget = std::max<uint64_t>(byte_budget, 512 * MiB);
 			}
 			if (m_gc_freed_bytes_frame >= byte_budget ||
 			    m_gc_freed_images_frame >= MaxFreesInFrame) {
@@ -2155,7 +2160,8 @@ void TextureCache::RunGarbageCollector(bool force_pressure, bool force_critical)
 			}
 			deletions = MaxFreesInFrame - m_gc_freed_images_frame;
 		}
-		const size_t         visit_limit = pressured || aggressive ? deletions * 4 : deletions;
+		const size_t         visit_limit =
+		    pressured || aggressive ? std::max<size_t>(deletions * 16, 16384) : deletions;
 		std::vector<ImageId> candidates;
 		candidates.reserve(std::min<size_t>(visit_limit, 4096));
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal

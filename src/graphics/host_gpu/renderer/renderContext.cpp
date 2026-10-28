@@ -162,15 +162,17 @@ void RenderContext::RunPressureGarbageCollector() {
 		return;
 	}
 	const uint64_t usage = m_graphics.GetDeviceMemoryUsage();
-	if (usage < budget) {
+	// GetTotalMemoryBudget already leaves a 1 GiB device reserve. Keep another low
+	// watermark below it so a loading burst does not fragment the last few MiB.
+	constexpr uint64_t LowWatermark = 256ull * 1024 * 1024;
+	if (usage + LowWatermark < budget) {
 		return;
 	}
 
-	// GetTotalMemoryBudget already leaves a 1 GiB device reserve. Crossing it means the next
-	// image is at risk, so force the caches past their own per-cache pressure marks.
-	constexpr uint64_t CriticalStep = 512ull * 1024 * 1024;
-	const bool         critical      = usage >= budget + CriticalStep;
+	constexpr uint64_t CriticalHeadroom = 64ull * 1024 * 1024;
+	const bool         critical = usage >= budget || budget - usage < CriticalHeadroom;
 
+	m_image_heap.RunGarbageCollector(true);
 	m_texture_cache.RunGarbageCollector(true, critical);
 	m_buffer_cache.RunGarbageCollector(true, critical);
 }

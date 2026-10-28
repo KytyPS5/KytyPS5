@@ -1155,8 +1155,14 @@ void TestCustomReverbVoice() {
 		voice.rendered        = false;
 		Ngs2RenderVoice(voice, voices, grain);
 	};
+	// The last pcm sample, where a leaked direct sound would show. Earlier frames are silent input.
+	constexpr size_t impulse_frame = 16;
+	// Reflections at -10000 mB still pass 1e-5. With the first tap's 0.7 and the fade-in at 16/256,
+	// the impulse frame holds a -127 dB echo (about 4.4e-7). A leaked direct sound would be near
+	// 1, far above this -80 dB limit.
+	constexpr float leak_limit = 1e-4f;
 	render(); // The impulse.
-	Check(voice.has_samples && voice.samples[0] == 0.0f,
+	Check(voice.has_samples && std::fabs(voice.samples[impulse_frame]) < leak_limit,
 	      "reverb with dry 0 passed the direct sound through");
 	bool tail = false;
 	for (int i = 0; i < 20; ++i) { // The source is empty from here on.

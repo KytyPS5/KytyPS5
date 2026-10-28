@@ -669,9 +669,13 @@ public:
 	// Whether the game turned the compressor on. Any nonzero flags do.
 	[[nodiscard]] bool Enabled() const { return m_flags != 0; }
 	[[nodiscard]] bool UsesSideChain() const { return (m_flags & FlagSideChain) != 0; }
-	// The gain currently applied to the signal (1 means no reduction), reported as the
-	// submixer's compressor height.
+	// The gain currently applied to the signal, the make-up level less the reduction.
 	[[nodiscard]] float Gain() const { return static_cast<float>(m_gain); }
+	// The gain the reduction alone applies (1 means no reduction), without the make-up level.
+	// The submixer reports it as its compressor height.
+	[[nodiscard]] float ReductionGain() const {
+		return static_cast<float>(DbToGain(-m_reduction_db));
+	}
 
 	// Compresses `samples` (channel-major, `grain` samples per channel). `key` holds the
 	// side-chain inputs in the same layout, or is null when they are silent.
@@ -2996,9 +3000,10 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			auto* submixer                    = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
 			*submixer                         = {};
 			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
-			// The gain the compressor currently applies, 1 when it is off.
+			// The gain the compressor's reduction currently applies, without the make-up level.
+			// It stays 0 when the compressor is off, as before the compressor was emulated.
 			submixer->compressor_height =
-			    voice->compressor.Enabled() ? voice->compressor.Gain() : 1.0f;
+			    voice->compressor.Enabled() ? voice->compressor.ReductionGain() : 0.0f;
 			break;
 		}
 		case Ngs2RackType::CustomMastering: {

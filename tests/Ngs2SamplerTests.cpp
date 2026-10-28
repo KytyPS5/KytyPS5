@@ -1099,6 +1099,34 @@ void TestSubmixerCompressorVoice() {
 	      "the submixer state kept a gain reduction without a key");
 }
 
+// A submixer reports its compressor height as the gain of the reduction alone, without the
+// make-up level, and 0 while the compressor is off.
+void TestSubmixerCompressorHeight() {
+	Fixture          f(48000, 1);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs  = &f.system;
+	submixer_rack.type = Ngs2RackType::Submixer;
+	Ngs2VoiceInternal submixer;
+	submixer.rack = &submixer_rack;
+	const auto height = [&] {
+		Ngs2SubmixerVoiceState state {};
+		Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&submixer), &state.voice_state,
+		                        sizeof(state)) == OK,
+		      "the submixer state could not be read");
+		return state.compressor_height;
+	};
+	Check(height() == 0.0f, "a submixer without a compressor reported a height");
+
+	constexpr float Level = 2.0f;
+	submixer.compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 0.0f, 0.0f, Level, 0}, 48000);
+	float key[]    = {0.1f};
+	float sample[] = {0.5f};
+	submixer.compressor.Process(sample, key, 1, 1);
+	Check(submixer.compressor.Gain() < Level &&
+	          Near(height(), submixer.compressor.Gain() / Level, 1e-6),
+	      "the compressor height included the make-up level");
+}
+
 uint32_t g_side_chain_flags = 0;
 
 void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
@@ -2132,6 +2160,7 @@ int main() {
 	TestCompressorLevelAndCurveLimits();
 	TestCompressorTimeLimits();
 	TestSubmixerCompressorVoice();
+	TestSubmixerCompressorHeight();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

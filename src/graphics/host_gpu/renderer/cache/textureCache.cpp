@@ -213,9 +213,70 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, ImageId keep) {
 		(void)m_buffer_cache.EvictCleanForAllocation(buffer_target);
 		(void)EvictForAllocation(keep, image_target);
 	}
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	for (int attempt = 0; m_slot_images[id].allocation_failed; ++attempt) {
+		m_slot_images.erase(id);
+		if (attempt == 3 || !EvictForAllocationFailure(keep)) {
+			EXIT("failed to create image: extent=%ux%ux%u format=%u layers=%u levels=%u\n",
+			     info.extent.width, info.extent.height, info.extent.depth,
+			     static_cast<uint32_t>(info.pixel_format), info.resources.layers,
+			     info.resources.levels);
+		}
+		id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	}
 	RegisterImage(id);
 	return id;
+}
+
+bool TextureCache::EvictForAllocationFailure(ImageId keep) {
+	constexpr uint64_t EVICT_TARGET    = 256ull << 20u;
+	constexpr uint64_t DOWNLOAD_BUDGET = 32ull << 20u;
+	const uint64_t     clock           = LruClock();
+	if (clock < 2) {
+		return false;
+	}
+
+	std::vector<ImageId> victims;
+	uint64_t             bytes      = 0;
+	uint64_t             downloaded = 0;
+	m_lru_cache.ForEachItemBelow(clock - 2, [&](ImageId id) {
+		if (id == keep) {
+			return false;
+		}
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->info.IsDepth() ||
+		    image->heap_refs.load(std::memory_order_relaxed) != 0u ||
+		    image->binding.is_bound || image->binding.is_target) {
+			return false;
+		}
+		if (image->IsGpuModified() && image->SafeToDownload()) {
+			if (downloaded + image->info.data.size > DOWNLOAD_BUDGET) {
+				return false;
+			}
+			downloaded += image->info.data.size;
+		}
+		victims.push_back(id);
+		bytes += image->AccountedSize();
+		return bytes >= EVICT_TARGET;
+	});
+
+	size_t freed = 0;
+	for (const auto id: victims) {
+		auto& image = m_slot_images[id];
+		if (image.IsGpuModified() && image.SafeToDownload() && !DownloadImageMemory(id)) {
+			continue;
+		}
+		FreeImage(id);
+		++freed;
+	}
+	LOGF("TextureCache: out of device memory, evicted %zu images (%" PRIu64 " MiB)\n", freed,
+	     bytes >> 20u);
+	if (freed == 0) {
+		return false;
+	}
+	m_scheduler.Finish();
+	return true;
 }
 
 uint64_t TextureCache::EvictForAllocation(ImageId keep, uint64_t target_bytes) {

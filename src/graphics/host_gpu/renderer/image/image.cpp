@@ -739,9 +739,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		// Let InsertImage evict idle images and retry; it exits if nothing can be freed.
+		allocation_failed = true;
+		return;
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,

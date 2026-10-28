@@ -123,6 +123,9 @@ private:
 	// Allocation-path pressure valve. Caller holds m_lock. Releases clean images the GPU is
 	// done with, except `keep`, bound/target and heap-resident images.
 	uint64_t                  EvictForAllocation(ImageId keep, uint64_t target_bytes);
+	// Allocation-failure fallback: evict older GPU-written images with write-back. This is a
+	// last-resort path for low-VRAM devices; it can churn and stall.
+	bool                      EvictForAllocationFailure(ImageId keep);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);

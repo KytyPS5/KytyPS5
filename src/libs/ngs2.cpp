@@ -632,6 +632,14 @@ public:
 
 	void Reset() { *this = {}; }
 
+	// Drops the running level and reduction but keeps the settings, so a voice that ends, or
+	// whose state went NaN or infinite, starts again with no duck instead of one left over.
+	void ClearEnvelope() {
+		m_power        = 0.0;
+		m_reduction_db = 0.0;
+		m_gain         = m_level;
+	}
+
 	[[nodiscard]] bool Enabled() const { return m_flags != 0; }
 	[[nodiscard]] bool UsesSideChain() const { return (m_flags & FlagSideChain) != 0; }
 	// The gain currently applied to the signal (1 means no reduction), reported as the
@@ -672,9 +680,7 @@ public:
 		// state still turns NaN or infinite, start again from no reduction instead of muting or
 		// corrupting the bus for good. The settings are kept.
 		if (!std::isfinite(m_power) || !std::isfinite(m_reduction_db)) {
-			m_power        = 0.0;
-			m_reduction_db = 0.0;
-			m_gain         = m_level;
+			ClearEnvelope();
 		}
 	}
 
@@ -978,6 +984,15 @@ struct Ngs2VoiceInternal {
 		EXIT_NOT_IMPLEMENTED(index >= ports.size());
 		ports[index].matrix = matrix;
 	}
+	// No release envelope is configured, so a stop finishes at the end of the render it was
+	// issued in. The voice is then done, so its compressor starts again with no duck, as after a
+	// kill.
+	void FinishStop() {
+		if (state == Ngs2VoicePlayState::Stopped) {
+			state = Ngs2VoicePlayState::Empty;
+			compressor.ClearEnvelope();
+		}
+	}
 	void SetEvent(uint32_t id) {
 		switch (id) {
 			case 1:
@@ -993,7 +1008,12 @@ struct Ngs2VoiceInternal {
 				}
 				break;
 			case 4:
-			case 8: state = Ngs2VoicePlayState::Empty; break;
+			case 8:
+				// Kill and reset discard the voice, so its compressor starts again with no duck.
+				// A paused voice keeps its duck. A stopped one clears it in FinishStop.
+				state = Ngs2VoicePlayState::Empty;
+				compressor.ClearEnvelope();
+				break;
 			case 16:
 				if (state == Ngs2VoicePlayState::Playing) {
 					state = Ngs2VoicePlayState::Paused;
@@ -2230,10 +2250,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 	}
 	for (auto* voice: voices) {
-		// No envelope is configured, so a release stop finishes in this render.
-		if (voice->state == Ngs2VoicePlayState::Stopped) {
-			voice->state = Ngs2VoicePlayState::Empty;
-		}
+		voice->FinishStop();
 		voice->state_flags = static_cast<uint32_t>(voice->state);
 	}
 	++ngs->render_count;

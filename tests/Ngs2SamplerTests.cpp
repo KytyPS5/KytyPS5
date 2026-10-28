@@ -886,6 +886,57 @@ void TestCompressorTimeConstant() {
 	      "the attack time is not a one-pole time constant");
 }
 
+// Killing (event 4) or resetting (event 8) a voice clears its compressor's duck but keeps the
+// settings, so the same key ducks by the same amount again. A stop (event 2) clears it once the
+// render finishes the voice. Pause and resume keep the duck. A make-up level of 2 checks that a
+// cleared compressor goes back to that level and not to 1.
+void TestCompressorVoiceEvents() {
+	constexpr uint32_t Rate  = 1000;
+	constexpr float    Level = 2.0f;
+	Ngs2VoiceInternal  voice;
+	voice.compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 0.0f, 2.0f, Level, 0}, Rate);
+	float      key[] = {0.1f};
+	const auto duck  = [&] {
+		float sample[] = {0.5f};
+		voice.compressor.Process(sample, key, 1, 1);
+		return voice.compressor.Gain();
+	};
+	const float ducked = duck();
+	Check(ducked < Level, "the key did not duck the voice's compressor");
+
+	voice.state = Ngs2VoicePlayState::Playing;
+	voice.SetEvent(16);
+	voice.SetEvent(32);
+	voice.FinishStop();
+	Check(voice.state == Ngs2VoicePlayState::Playing && voice.compressor.Gain() == ducked,
+	      "pause or resume changed the duck");
+	// Playing again before the render finishes the stop means the voice never ended.
+	voice.SetEvent(2);
+	voice.SetEvent(1);
+	voice.FinishStop();
+	Check(voice.state == Ngs2VoicePlayState::Playing && voice.compressor.Gain() == ducked,
+	      "playing again before a stop finished cleared the duck");
+
+	const auto finish_stop = [&] {
+		voice.SetEvent(2);
+		Check(voice.compressor.Gain() == ducked,
+		      "a stop cleared the duck before the voice finished");
+		voice.FinishStop();
+	};
+	for (const uint32_t event: {4u, 8u, 2u}) {
+		voice.state = Ngs2VoicePlayState::Playing;
+		if (event == 2u) {
+			finish_stop();
+		} else {
+			voice.SetEvent(event);
+		}
+		Check(voice.state == Ngs2VoicePlayState::Empty && voice.compressor.Gain() == Level &&
+		          voice.compressor.Enabled(),
+		      "kill, reset or a finished stop did not clear the duck, or lost the settings");
+		Check(duck() == ducked, "kill, reset or stop changed the compressor's settings");
+	}
+}
+
 // A submixer with a side-chain compressor (peak-keyed here, so one sample settles it) ducks
 // input 0 while input 1 has signal.
 void TestSubmixerCompressorVoice() {
@@ -1961,6 +2012,7 @@ int main() {
 	TestCompressorDsp();
 	TestCompressorNonFinite();
 	TestCompressorTimeConstant();
+	TestCompressorVoiceEvents();
 	TestSubmixerCompressorVoice();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();

@@ -4393,6 +4393,22 @@ void TestNewShaderRecompilerScalarB64LaneTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// For each `<op> %float` in the disassembly, in order: whether its result is
+// NoContraction.
+std::vector<bool> NoContractionMarks(const std::string &source,
+                                     const std::string &op) {
+  std::vector<bool> marks;
+  for (auto pos = source.find(" = " + op + " %float ");
+       pos != std::string::npos;
+       pos = source.find(" = " + op + " %float ", pos + 1)) {
+    const auto begin = source.rfind('%', pos);
+    const auto id = source.substr(begin, pos - begin);
+    marks.push_back(source.find("OpDecorate " + id + " NoContraction") !=
+                    std::string::npos);
+  }
+  return marks;
+}
+
 void TestNewShaderRecompilerF32ProductAddNoContraction() {
   const uint32_t shader[] = {
       EncodeVop2(0x08, 2, 256 + 0, 1), // v_mul_f32 v2, v0, v1
@@ -4415,20 +4431,38 @@ void TestNewShaderRecompilerF32ProductAddNoContraction() {
   const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  const auto no_contraction = [&](const std::string &op) {
-    std::vector<bool> marks;
-    for (auto pos = source.find(" = " + op + " %float "); pos != std::string::npos;
-         pos = source.find(" = " + op + " %float ", pos + 1)) {
-      const auto begin = source.rfind('%', pos);
-      const auto id = source.substr(begin, pos - begin);
-      marks.push_back(source.find("OpDecorate " + id + " NoContraction") != std::string::npos);
-    }
-    return marks;
+  Check(NoContractionMarks(source, "OpFSub") == std::vector<bool>{true, true} &&
+            NoContractionMarks(source, "OpFAdd") ==
+                std::vector<bool>{true, false} &&
+            NoContractionMarks(source, "OpFMul") ==
+                std::vector<bool>{false, false},
+        "only an add or subtract of a product (or a negated product) must be "
+        "NoContraction");
+}
+
+void TestNewShaderRecompilerF32ProductAddUnderExecNoContraction() {
+  // After an EXEC write each VGPR write is a select on EXEC, so the product
+  // reaches the subtract through bitcasts and an OpSelect.
+  const uint32_t shader[] = {
+      EncodeVopc(0x04, 256 + 0, 1),    // v_cmp_gt_f32 vcc, v0, v1
+      EncodeSop1(0x24, 0, 106),        // s_and_saveexec_b64 s[0:1], vcc
+      EncodeVop2(0x08, 2, 256 + 0, 1), // v_mul_f32 v2, v0, v1
+      EncodeVop2(0x04, 3, 256 + 2, 0), // v_sub_f32 v3, v2, v0
+      EncodeVop2(0x03, 4, 256 + 0, 1), // v_add_f32 v4, v0, v1
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(3, 12, 0),
+      EncodeMubuf0(0x1c, 4, false),
+      EncodeMubuf1(4, 12, 0),
+      EncodeSopp(0x01),
   };
-  Check(no_contraction("OpFSub") == std::vector<bool>{true, true} &&
-            no_contraction("OpFAdd") == std::vector<bool>{true, false} &&
-            no_contraction("OpFMul") == std::vector<bool>{false, false},
-        "only an add or subtract of a product (or a negated product) must be NoContraction");
+  const auto result =
+      RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find(" = OpSelect %uint ") != std::string::npos &&
+            NoContractionMarks(source, "OpFSub") == std::vector<bool>{true} &&
+            NoContractionMarks(source, "OpFAdd") == std::vector<bool>{false},
+        "a subtract of a product written under EXEC must be NoContraction");
 }
 
 void TestFloatComparisonInputModes() {
@@ -17186,6 +17220,7 @@ int main() {
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly();
   TestNewShaderRecompilerF32ProductAddNoContraction();
+  TestNewShaderRecompilerF32ProductAddUnderExecNoContraction();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

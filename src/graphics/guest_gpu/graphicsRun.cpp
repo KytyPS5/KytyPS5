@@ -79,16 +79,43 @@ bool GuestGpu::IsStopping() {
 }
 
 void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
+	// These callers never send after Shutdown() has begun; a refused command is a bug.
+	EXIT_IF(!TrySendCommand(std::move(command)));
+}
+
+// A command that unblocks a waiting submission, such as a deferred label landing, does not clear
+// the blocked flags, which ThreadRun only clears when a submission completes or after its stall
+// poll. Clearing them here lets the waiters retry on the GPU thread's next pass.
+void GuestGpu::RetryBlockedSubmissions() {
+	EXIT_IF(!IsGpuThread());
+	Common::LockGuard lock(m_queue_mutex);
+	for (auto& queue: m_queues) {
+		if (!queue.empty()) {
+			queue.front().blocked = false;
+		}
+	}
+}
+
+// Queues `command` to run on the GPU thread between PM4 packets, in the order commands were sent,
+// or runs it at once when called on the GPU thread. Unlike SendCommand, which exits when the GPU
+// no longer accepts commands, this returns false once Shutdown() has begun and drops the command,
+// so callbacks that can run during shutdown (such as deferred end-of-pipe signals) can skip their
+// work instead.
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		command();
-		return;
+		return true;
 	}
 	Common::LockGuard lock(m_queue_mutex);
-	EXIT_IF(!m_accepting);
+	// Shutdown() stops accepting commands before it joins the GPU thread.
+	if (!m_accepting) {
+		return false;
+	}
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
+	return true;
 }
 
 void GuestGpu::ProcessCommands() {
@@ -240,6 +267,52 @@ void CommandProcessor::WaitForRewind(bool valid) {
 	}
 }
 
+namespace {
+
+// Writes an end-of-pipe label. A label beside GPU-written bytes goes to the backing store, so they
+// are not downloaded. Other labels go through the guest mapping, whose fault keeps a clean cached
+// copy current and downloads GPU-written bytes under the label before the store. A held-back label
+// decides when it lands, since the readbacks it waited for change the buffer cache's state.
+void WriteEndOfPipeLabel(RenderContext& renderer, void* label, const void* value, uint64_t size) {
+	const auto vaddr   = reinterpret_cast<uint64_t>(label);
+	auto&      buffers = renderer.GetBufferCache();
+	if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
+	    buffers.HasGpuDirtyBytes(vaddr, size) ||
+	    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		std::memcpy(label, value, size);
+	}
+}
+
+// An end-of-pipe label and/or interrupt deferred behind image readbacks.
+struct DeferredSignal {
+	RenderContext*                         renderer;
+	void*                                  label; // Null for an interrupt-only signal.
+	uint64_t                               value;
+	uint32_t                               size;
+	bool                                   interrupt;
+	int                                    event_id;
+	uint32_t                               interrupt_context_id;
+	std::shared_ptr<std::atomic<uint32_t>> pending;
+
+	// Runs on the GPU thread, where a write to a page the buffer cache tracks can fault into a
+	// buffer readback. So a deferred interrupt is raised on the GPU thread, where an immediate one
+	// is raised on the priority thread.
+	void Land() const {
+		if (label != nullptr) {
+			// The low bytes are the label (little-endian).
+			WriteEndOfPipeLabel(*renderer, label, &value, size);
+			// Submissions waiting on the label retry at once instead of after the stall poll.
+			renderer->GetGpu().RetryBlockedSubmissions();
+		}
+		pending->fetch_sub(1, std::memory_order_acq_rel);
+		if (interrupt) {
+			renderer->TriggerInterrupt(event_id, interrupt_context_id);
+		}
+	}
+};
+
+} // namespace
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -264,9 +337,14 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+	if (TestWaitRegMemValue(*addr, ref, mask, func)) {
+		return;
 	}
+	// A label deferred behind readbacks is not in memory yet, so the wait blocks until it lands
+	// (DeferredSignal::Land retries it). Passing on the deferred value instead would let packets
+	// after the wait run ahead of the label's landing. A WRITE_DATA reset of the label would then
+	// be overwritten by the late value, and COND_EXEC and BRANCH would see the old one.
+	SuspendPm4();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -983,45 +1061,146 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
-	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
-	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
-	// downloads GPU-written bytes under the label before the store.
-	const auto write_label = [this, address](const void* value, uint64_t size) {
-		const auto vaddr   = reinterpret_cast<uint64_t>(address);
-		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
-			std::memcpy(address, value, size);
-		}
-	};
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	switch (data_sel) {
-		case 0: break;
-		case 1: {
-			const auto value = static_cast<uint32_t>(data);
-			write_label(&value, sizeof(value));
+		case 0: SignalBehindReadbacks(nullptr, 0, 0, interrupt, interrupt_context_id); break;
+		case 1:
+			SignalBehindReadbacks(address, data, sizeof(uint32_t), interrupt, interrupt_context_id);
 			break;
-		}
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: write_label(&data, sizeof(data)); break;
+		case 2:
+			SignalBehindReadbacks(address, data, sizeof(uint64_t), interrupt, interrupt_context_id);
+			break;
 		case 5: {
+			// The data holds the GDS dword offset in its low half and the count in its high half.
+			constexpr uint32_t GdsOffsetMask = 0xffffu;
+			constexpr uint32_t GdsCountShift = 16;
+			// Readbacks queued here ride Finish()'s submission, and the GDS labels still wait for
+			// them.
+			(void)QueueReadbacksBeforeLabel();
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
-			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
-			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
+			SignalGdsBehindReadbacks(address, gds & GdsOffsetMask, gds >> GdsCountShift, interrupt,
+			                         interrupt_context_id);
 			break;
 		}
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
 	}
+}
 
-	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
+// GDS labels go through the same deferral as every other label, so they wait behind deferred
+// signals instead of the GPU thread waiting for those to land. A signal holds at most 8 bytes, so a
+// longer read goes out as several labels, which the deferral path keeps in order.
+void CommandProcessor::SignalGdsBehindReadbacks(void* label, uint32_t gds_dw_offset,
+                                                uint32_t gds_dw_count, bool interrupt,
+                                                uint32_t interrupt_context_id) {
+	constexpr uint32_t DwordsPerSignal = sizeof(uint64_t) / sizeof(uint32_t);
+	// The caller queued readbacks and ran Finish() already, so there is nothing new to queue here.
+	constexpr bool ReadbacksQueued = false;
+	if (gds_dw_count == 0) {
+		if (interrupt) {
+			EmitSignal(nullptr, 0, 0, true, interrupt_context_id, ReadbacksQueued);
+		}
+		return;
+	}
+	const auto& gds   = *m_renderer.GetBufferCache().GetGdsBuffer();
+	auto*       words = static_cast<uint32_t*>(label);
+	for (uint32_t first = 0; first < gds_dw_count; first += DwordsPerSignal) {
+		const uint32_t count = std::min(DwordsPerSignal, gds_dw_count - first);
+		std::array<uint32_t, DwordsPerSignal> slice {};
+		Sync::ReadGds(gds, slice.data(), gds_dw_offset + first, count);
+		uint64_t value = 0;
+		std::memcpy(&value, slice.data(), count * sizeof(uint32_t));
+		const bool last = first + count == gds_dw_count;
+		EmitSignal(words + first, value, count * sizeof(uint32_t), interrupt && last,
+		           interrupt_context_id, ReadbacksQueued);
+	}
+}
+
+// Queues the pending GPU-to-guest image readbacks, so they land before the signal that follows.
+// Returns true if any were queued.
+bool CommandProcessor::QueueReadbacksBeforeLabel() {
+	auto& textures = m_renderer.GetTextureCache();
+	// Readbacks are off by default, so skip the renderer lock then.
+	if (!textures.ReadbacksEnabled()) {
+		return false;
+	}
+	Common::LockGuard lock(m_renderer.GetMutex());
+	return textures.ProcessDownloadImages();
+}
+
+// Writes an end-of-pipe label and raises its interrupt, holding both back behind any pending
+// image readbacks so the guest never sees the signal before the data it announces.
+void CommandProcessor::SignalBehindReadbacks(void* label, uint64_t value, uint32_t size,
+                                             bool interrupt, uint32_t interrupt_context_id) {
+	EXIT_IF(label != nullptr && size != sizeof(uint32_t) && size != sizeof(uint64_t));
+	const bool readbacks_queued = QueueReadbacksBeforeLabel();
+	EmitSignal(label, value, size, interrupt, interrupt_context_id, readbacks_queued);
+
+	// Submit at once only when this signal put new readbacks in flight, so they start promptly.
+	// Otherwise the signal lands with the current command buffer, which the command processor
+	// submits when it finishes or suspends the submission. Submitting for every deferred signal
+	// split a frame into dozens of queue submissions.
+	if (readbacks_queued) {
+		GetScheduler().Flush();
+	}
+}
+
+bool CommandProcessor::ShouldDeferSignal(bool has_label, bool readbacks_queued) const {
+	// Defer while an earlier signal on any queue is still deferred, so signals stay in order.
+	if (m_pending_signals->load(std::memory_order_acquire) != 0) {
+		return true;
+	}
+	// A label also waits for readbacks queued now or still in flight, since the guest could
+	// otherwise read the readback destination before the data lands. An interrupt alone does not
+	// need to wait, because its priority callback runs after the readbacks' callbacks (priority
+	// operations run in order).
+	//
+	// Only with readbacks enabled. HasReadbacksInFlight also counts the write-backs of images the
+	// texture cache evicts, even with readbacks off, and a label released before one of those lands
+	// can still reach the guest early. Holding labels behind them too would close that gap, but it
+	// would put this path in front of every game that evicts images. Left for a future change.
+	auto& textures = m_renderer.GetTextureCache();
+	return has_label && textures.ReadbacksEnabled() &&
+	       (readbacks_queued || textures.HasReadbacksInFlight());
+}
+
+void CommandProcessor::EmitSignal(void* label, uint64_t value, uint32_t size, bool interrupt,
+                                  uint32_t interrupt_context_id, bool readbacks_queued) {
+	if (ShouldDeferSignal(label != nullptr, readbacks_queued)) {
+		DeferSignal(label, value, size, interrupt, interrupt_context_id);
+		return;
+	}
+	if (label != nullptr) {
+		// The low bytes are the label (little-endian).
+		WriteEndOfPipeLabel(m_renderer, label, &value, size);
+	}
 	if (interrupt) {
+		// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		    });
 	}
+}
+
+// Flip completion has its own priority operation and is not held behind deferred signals, so it
+// can reach the guest before a label released earlier is written.
+void CommandProcessor::DeferSignal(void* label, uint64_t value, uint32_t size, bool interrupt,
+                                   uint32_t interrupt_context_id) {
+	m_pending_signals->fetch_add(1, std::memory_order_acq_rel);
+	const DeferredSignal signal {
+	    &m_renderer,      label, value, size, interrupt, m_interrupt_event_id, interrupt_context_id,
+	    m_pending_signals};
+	// The priority callback, which runs once the readbacks have landed, only hands the signal to
+	// the GPU thread (DeferredSignal::Land explains why). GPU-thread commands run in order between
+	// PM4 packets, so signals stay ordered.
+	GetScheduler().DeferPriorityOperation([&gpu = m_renderer.GetGpu(), signal] {
+		if (!gpu.TrySendCommand([signal] { signal.Land(); })) {
+			// The GPU no longer accepts commands, so the signal is dropped.
+			signal.pending->fetch_sub(1, std::memory_order_acq_rel);
+		}
+	});
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

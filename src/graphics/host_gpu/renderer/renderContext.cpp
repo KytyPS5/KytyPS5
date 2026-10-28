@@ -34,6 +34,14 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// Deferred EOP labels hand their writes to the GPU object, so let them run before it goes.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.Finish();
+		}
+		m_command_scheduler.DrainPriorityOperations();
+		// Every deferred signal has now landed or been dropped. The count outlives this GPU, so a
+		// leaked one would defer every queue's signals from here on.
+		EXIT_IF(m_pending_signals->load(std::memory_order_acquire) != 0);
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {

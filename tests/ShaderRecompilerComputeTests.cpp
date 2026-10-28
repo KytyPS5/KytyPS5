@@ -166,6 +166,12 @@ static_assert(!HasPolicyTileImageBacking<TileManager>);
 static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
+struct CommandProcessorTestAccess {
+  static std::atomic<uint32_t> &PendingSignals(CommandProcessor &processor) {
+    return *processor.m_pending_signals;
+  }
+};
+
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
@@ -4001,6 +4007,56 @@ public:
     Require("GpuCommandLane", "RELEASE_MEM label on a clean cached page",
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
+
+    // A label held back behind readbacks makes the same choice when it lands, through
+    // DeferredSignal::Land. An earlier signal is faked as still pending, so this one is held back.
+    constexpr uint64_t held_gpu_address = fault_base + 0xe000;
+    constexpr uint64_t held_beside_address = fault_base + 0xe100;
+    gpu.SendCommandSync([&] {
+      auto dirty = buffer_cache.ObtainBuffer(
+          held_gpu_address, sizeof(label_gpu_value), true, false);
+      Require("GpuCommandLane", "held label page setup", dirty.first != nullptr,
+              "held label test has no GPU-written page");
+      buffer_cache.FillBuffer(held_gpu_address, sizeof(label_gpu_value),
+                              label_gpu_value, false);
+    });
+    auto &pending = *resources.GetPendingSignals();
+    LibKernel::Memory::InstallGpuResources(&resources);
+    const auto held_packet = make_interrupt_packet(
+        2, 0, reinterpret_cast<void *>(held_beside_address), label_value, 0);
+    auto &held_scheduler = context.GetCommandScheduler();
+    bool label_held = false;
+    // A standalone processor on the GPU thread, so no end-of-slice flush lands the label before
+    // the check that it was held.
+    GraphicsInitJmpTables();
+    gpu.SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      pending.fetch_add(1);
+      Pm4Execution execution;
+      // The fake signal and the held label.
+      label_held = processor.Process(execution, held_packet) == Pm4ProcessResult::Complete &&
+                   pending.load() == 2;
+      pending.fetch_sub(1);
+      held_scheduler.Finish();
+      held_scheduler.WaitPriorityOperations(held_scheduler.CurrentTick() - 1);
+    });
+    // The held label lands through a GPU-thread command queued by its priority callback.
+    gpu.SendCommandSync([] {});
+    uint64_t held_label = 0;
+    const bool held_stored =
+        pending.load() == 0 &&
+        LibKernel::Memory::TryReadBacking(held_beside_address, &held_label,
+                                          sizeof(held_label)) &&
+        held_label == label_value &&
+        buffer_cache.HasGpuDirtyBytes(held_gpu_address,
+                                      sizeof(label_gpu_value));
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require("GpuCommandLane", "held RELEASE_MEM label",
+            label_held, "a label released behind a pending signal was not held back");
+    Require("GpuCommandLane", "held RELEASE_MEM label beside GPU-written bytes",
+            held_stored,
+            "a held-back label downloaded the GPU-written bytes beside it");
 
     resources.UnmapMemory(fault_base, fault_size);
     Require("GpuCommandLane", "processor fault unmap",
@@ -10400,6 +10456,114 @@ public:
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
     }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A label released while an image readback is pending is held back until the readback's data is
+  // in guest memory. Unlike the PM4 tests, nothing fakes a pending signal here.
+  void CheckReadbackHoldsLabel() {
+    constexpr const char *name = "ReadbackHoldsLabel";
+    constexpr uintptr_t base = 0x0000000240400000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t stale_value = 0x2468ace0u;
+    constexpr uint32_t label_value = 0x55u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, allocation_size);
+    auto &texture_cache = context.GetTextureCache();
+    CommandProcessor processor(context, 0);
+
+    alignas(uint64_t) uint32_t label = 0;
+    const auto label_address = reinterpret_cast<uint64_t>(&label);
+    std::array<uint32_t, 8> release{};
+    release[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+    release[1] = 0x28u | (5u << 8u);
+    release[2] = 1u << 29u; // INT_SEL 0 (none), DATA_SEL 1 (32-bit value)
+    release[3] = static_cast<uint32_t>(label_address);
+    release[4] = static_cast<uint32_t>(label_address >> 32u);
+    release[5] = label_value;
+    release[7] = 0x123u;
+
+    const auto read_guest = [] {
+      uint32_t value = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value));
+      return value;
+    };
+    bool held = false;
+    std::binary_semaphore priority_parked{0};
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      desc.type = BindingType::Storage;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      Require(name, "image clear",
+              texture_cache.ClearImageFromBuffer(scheduler.Current(), base, sizeof(uint32_t),
+                                                 gpu_value),
+              "failed to create GPU-current image contents");
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+      Libs::LibKernel::Memory::WriteBacking(base, &stale_value, sizeof(stale_value));
+      // Hold the priority thread, so the readback's guest write cannot land before the checks
+      // below. The release only submits, so nothing here waits for the priority thread.
+      scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+
+      // The release queues the readback, submits it, and holds the label back behind it.
+      const auto tick = scheduler.CurrentTick();
+      Pm4Execution execution;
+      held = processor.Process(execution, release) == Pm4ProcessResult::Complete &&
+             label == 0 && scheduler.CurrentTick() == tick + 1 &&
+             texture_cache.HasReadbacksInFlight() && read_guest() == stale_value;
+    });
+    priority_parked.release();
+    Require(name, "held", held,
+            "a label released behind a pending readback was written before the readback landed");
+
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    // The label lands through a GPU-thread command queued after the readback's guest write.
+    gpu.SendCommandSync([] {});
+    Require(name, "landed",
+            label == label_value && read_guest() == gpu_value &&
+                !texture_cache.HasReadbacksInFlight(),
+            "the label or the readback data did not reach guest memory");
+
+    TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
@@ -52351,6 +52515,385 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckPm4DeferredLabelWait(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DeferredLabelWait";
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor processor(renderer, 0);
+
+  alignas(uint64_t) uint32_t label = 0;
+  uint32_t marker = 0;
+  const auto address = [](const void *value) {
+    return reinterpret_cast<uint64_t>(value);
+  };
+  std::array<uint32_t, 8> release{};
+  release[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+  release[1] = 0x28u | (5u << 8u) | ((1u << 9u) << 12u);
+  release[2] = 1u << 29u;
+  release[3] = static_cast<uint32_t>(address(&label));
+  release[4] = static_cast<uint32_t>(address(&label) >> 32u);
+  release[5] = 0x55u;
+  release[7] = 0x123u;
+  const auto make_wait = [&](uint32_t reference) {
+    std::array<uint32_t, 12> commands{};
+    commands[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+    commands[1] = 0x10u | 3u;
+    commands[2] = static_cast<uint32_t>(address(&label));
+    commands[3] = static_cast<uint32_t>(address(&label) >> 32u);
+    commands[4] = reference;
+    commands[5] = UINT32_MAX;
+    commands[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+    commands[8] = 0;
+    commands[9] = static_cast<uint32_t>(address(&marker));
+    commands[10] = static_cast<uint32_t>(address(&marker) >> 32u);
+    commands[11] = reference;
+    return commands;
+  };
+
+  bool deferred = false;
+  bool wait_blocked = false;
+  bool other_blocked = false;
+  // Kept outside the GPU-thread commands so the blocked wait can resume once the label lands.
+  auto deferred_wait = make_wait(0x55u);
+  Pm4Execution deferred_wait_execution;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    // Pretend an earlier label is still waiting on a readback, so this one is deferred too.
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
+    behind.fetch_add(1);
+    const auto tick = scheduler.CurrentTick();
+    Pm4Execution release_execution;
+    deferred = processor.Process(release_execution, release) == Pm4ProcessResult::Complete &&
+               label == 0 && scheduler.CurrentTick() == tick;
+
+    wait_blocked = processor.Process(deferred_wait_execution, deferred_wait) ==
+                       Pm4ProcessResult::Blocked &&
+                   marker == 0 && label == 0;
+
+    auto other = make_wait(0x66u);
+    Pm4Execution other_execution;
+    other_blocked = processor.Process(other_execution, other) == Pm4ProcessResult::Blocked &&
+                    marker == 0;
+    behind.fetch_sub(1);
+  });
+  Require(name, "deferred", deferred,
+          "a label behind a readback was written at once, or one that queued no readback "
+          "submitted GPU work");
+  Require(name, "wait on deferred label", wait_blocked,
+          "a command-stream wait passed before its deferred label reached memory");
+  Require(name, "other value", other_blocked,
+          "a wait for a value no deferred label carries did not block");
+
+  gpu.SendCommandSync([&] {
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+  });
+  // The deferred label lands through a GPU-thread command queued by the priority callback.
+  gpu.SendCommandSync([] {});
+  Require(name, "landed", label == 0x55u, "the deferred label never reached memory");
+
+  bool resumed = false;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    resumed = processor.Process(deferred_wait_execution, deferred_wait) ==
+                  Pm4ProcessResult::Complete &&
+              marker == 0x55u;
+    scheduler.Finish();
+  });
+  Require(name, "resumed", resumed,
+          "a wait blocked on a deferred label did not complete once the label landed");
+
+  // Once nothing is deferred, a wait follows the label's value in memory alone.
+  bool follows_memory = false;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    label = 0;
+    auto wait = make_wait(0x55u);
+    Pm4Execution execution;
+    follows_memory = processor.Process(execution, wait) == Pm4ProcessResult::Blocked;
+    label = 0x55u;
+    follows_memory =
+        follows_memory && processor.Process(execution, wait) == Pm4ProcessResult::Complete;
+    scheduler.Finish();
+  });
+  Require(name, "wait follows memory", follows_memory,
+          "a wait did not follow the label's value in memory after the deferred label landed");
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// An interrupt-only RELEASE_MEM must not overtake a label deferred behind readbacks. That label
+// lands through a GPU-thread command, so the interrupt has to be raised the same way, after it;
+// otherwise the guest can handle the interrupt and read the label's old value.
+void CheckPm4InterruptBehindDeferredLabel(RenderContext &renderer) {
+  constexpr const char *name = "Pm4InterruptBehindDeferredLabel";
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor processor(renderer, 0);
+
+  constexpr int interrupt_event_id = 0;
+  alignas(uint64_t) uint32_t label = 0;
+  const auto label_address = reinterpret_cast<uint64_t>(&label);
+  // Two packets: a label release with no interrupt, then an interrupt-only release.
+  std::array<uint32_t, 16> commands{};
+  commands[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+  commands[1] = 0x28u | (5u << 8u);
+  commands[2] = 1u << 29u; // INT_SEL 0 (none), DATA_SEL 1 (32-bit value)
+  commands[3] = static_cast<uint32_t>(label_address);
+  commands[4] = static_cast<uint32_t>(label_address >> 32u);
+  commands[5] = 0x55u;
+  commands[7] = 0x123u;
+  commands[8] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+  commands[9] = 0x28u | (5u << 8u);
+  commands[10] = 1u << 24u; // INT_SEL 1 (interrupt only), DATA_SEL 0 (no data)
+  commands[15] = 0x123u;
+
+  LibKernel::EventQueue::KernelEqueue queue = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+  uint32_t udata = 0;
+  Require(name, "event queue",
+          LibKernel::EventQueue::KernelCreateEqueue(&queue, "deferred-interrupt") == 0 &&
+              Sync::AddEqEvent(renderer, queue, interrupt_event_id, &udata) == 0,
+          "failed to register the interrupt event");
+  const auto poll_interrupt = [&] {
+    LibKernel::EventQueue::KernelEvent event{};
+    int count = 0;
+    LibKernel::KernelUseconds timeout = 0;
+    return LibKernel::EventQueue::KernelWaitEqueue(queue, &event, 1, &count, &timeout) == 0 &&
+           count == 1;
+  };
+
+  bool deferred = false;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    // Pretend an earlier label is still waiting on a readback.
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
+    behind.fetch_add(1);
+    Pm4Execution execution;
+    deferred = processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
+               label == 0 && behind.load() == 3;
+    behind.fetch_sub(1);
+  });
+  Require(name, "deferred", deferred && !poll_interrupt(),
+          "a label or interrupt was released ahead of a label deferred behind readbacks");
+
+  gpu.SendCommandSync([&] {
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+  });
+  // The deferred signals land through GPU-thread commands queued by the priority callbacks, the
+  // label first, so it is in memory by the time the interrupt arrives.
+  gpu.SendCommandSync([] {});
+  Require(name, "raised after the label",
+          poll_interrupt() && label == 0x55u &&
+              CommandProcessorTestAccess::PendingSignals(processor).load() == 0,
+          "the deferred interrupt never arrived, or arrived without the label before it");
+  (void)Sync::DeleteEqEvent(renderer, queue, interrupt_event_id);
+  LibKernel::EventQueue::KernelDeleteEqueue(queue);
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A RELEASE_MEM packet writing `value` to `label` with the given data selector (5 reads GDS, with
+// the dword offset in the low half of `value` and the count in the high half).
+std::array<uint32_t, 8> MakeLabelRelease(uint32_t data_sel, void *label, uint64_t value) {
+  const auto address = reinterpret_cast<uint64_t>(label);
+  std::array<uint32_t, 8> release{};
+  release[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+  release[1] = 0x28u | (5u << 8u) | ((1u << 9u) << 12u);
+  release[2] = data_sel << 29u;
+  release[3] = static_cast<uint32_t>(address);
+  release[4] = static_cast<uint32_t>(address >> 32u);
+  release[5] = static_cast<uint32_t>(value);
+  release[6] = static_cast<uint32_t>(value >> 32u);
+  release[7] = 0x123u;
+  return release;
+}
+
+// A GDS label waits behind an earlier deferred label like any other label, instead of the GPU
+// thread waiting for the priority thread to land it first.
+void CheckPm4GdsLabelBehindDeferredLabel(RenderContext &renderer) {
+  constexpr const char *name = "Pm4GdsLabelBehindDeferredLabel";
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor processor(renderer, 0);
+
+  alignas(uint64_t) uint32_t label = 0;
+  const auto immediate = MakeLabelRelease(1, &label, 0x55u);
+  const auto gds = MakeLabelRelease(5, &label, 1u << 16u);
+  std::array<uint32_t, 16> commands{};
+  std::copy(immediate.begin(), immediate.end(), commands.begin());
+  std::copy(gds.begin(), gds.end(), commands.begin() + 8);
+
+  std::binary_semaphore priority_parked{0};
+  std::binary_semaphore processed{0};
+  bool complete = false;
+  bool held = false;
+  std::jthread parser([&] {
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      renderer.GetBufferCache().FillBuffer(0, sizeof(uint32_t), 0x77u, true);
+      scheduler.Finish();
+      // Hold the priority thread, so draining it from here would block until the test lets go.
+      // This relies on no ordinary deferred operation being queued at this tick, because
+      // Finish() waits for the priority operations up to the tick of each one it pops.
+      scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+      // Pretend an earlier label is still waiting on a readback, so both labels are deferred.
+      auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
+      behind.fetch_add(1);
+      Pm4Execution execution;
+      complete = processor.Process(execution, commands) == Pm4ProcessResult::Complete;
+      held = label == 0 && behind.load() == 3;
+      behind.fetch_sub(1);
+    });
+    processed.release();
+  });
+  const bool did_not_wait = processed.try_acquire_for(std::chrono::seconds(2));
+  priority_parked.release();
+  parser.join();
+  Require(name, "no wait", did_not_wait,
+          "a GDS label waited for the priority thread to land an earlier deferred label");
+  Require(name, "deferred", complete && held,
+          "a GDS label behind a deferred label was written at once");
+
+  gpu.SendCommandSync([&] {
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+  });
+  // The deferred labels land through GPU-thread commands queued by the priority callbacks.
+  gpu.SendCommandSync([] {});
+  Require(name, "landed in order",
+          label == 0x77u && CommandProcessorTestAccess::PendingSignals(processor).load() == 0,
+          "the GDS label did not land after the earlier deferred label");
+  // GDS outlives the GPU object; later tests expect it zeroed.
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    renderer.GetBufferCache().FillBuffer(0, sizeof(uint32_t), 0, true);
+    scheduler.Finish();
+  });
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A GDS read longer than one 8-byte label goes out as several labels, written at once when nothing
+// is deferred and all in order behind a deferred label otherwise, leaving the next dword alone.
+void CheckPm4GdsMultiDwordLabel(RenderContext &renderer) {
+  constexpr const char *name = "Pm4GdsMultiDwordLabel";
+  constexpr uint32_t sentinel = 0xdeadbeefu;
+  constexpr std::array<uint32_t, 3> gds_values{0x11u, 0x22u, 0x33u};
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor processor(renderer, 0);
+
+  alignas(uint64_t) std::array<uint32_t, 4> labels{};
+  const auto release = MakeLabelRelease(5, labels.data(), uint64_t{gds_values.size()} << 16u);
+  const auto matches = [&] {
+    return labels[0] == gds_values[0] && labels[1] == gds_values[1] &&
+           labels[2] == gds_values[2] && labels[3] == sentinel;
+  };
+
+  bool immediate = false;
+  bool deferred = false;
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    for (uint32_t i = 0; i < gds_values.size(); i++) {
+      renderer.GetBufferCache().FillBuffer(i * sizeof(uint32_t), sizeof(uint32_t), gds_values[i],
+                                           true);
+    }
+    labels.fill(sentinel);
+    const auto tick = scheduler.CurrentTick();
+    Pm4Execution execution;
+    immediate = processor.Process(execution, release) == Pm4ProcessResult::Complete && matches() &&
+                scheduler.CurrentTick() == tick + 1;
+
+    labels.fill(sentinel);
+    // Pretend an earlier label is still waiting on a readback, so the GDS labels are deferred.
+    auto &behind = CommandProcessorTestAccess::PendingSignals(processor);
+    behind.fetch_add(1);
+    Pm4Execution deferred_execution;
+    deferred = processor.Process(deferred_execution, release) == Pm4ProcessResult::Complete &&
+               labels[0] == sentinel && labels[2] == sentinel && behind.load() == 3;
+    behind.fetch_sub(1);
+  });
+  Require(name, "immediate", immediate,
+          "a 3-dword GDS label was not written whole at once, or submitted extra work");
+  Require(name, "deferred", deferred,
+          "a 3-dword GDS label behind a deferred label was written at once, or not as two labels");
+
+  gpu.SendCommandSync([&] {
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+  });
+  gpu.SendCommandSync([] {});
+  Require(name, "landed", matches() &&
+                              CommandProcessorTestAccess::PendingSignals(processor).load() == 0,
+          "a deferred 3-dword GDS label did not land whole");
+  // GDS outlives the GPU object; later tests expect it zeroed.
+  gpu.SendCommandSync([&] {
+    processor.BufferInit();
+    renderer.GetBufferCache().FillBuffer(0, gds_values.size() * sizeof(uint32_t), 0, true);
+    scheduler.Finish();
+  });
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A label released on one queue waits behind a label still deferred on another queue, so the
+// guest sees them in the order they were released.
+void CheckPm4CrossQueueLabelOrder(RenderContext &renderer) {
+  constexpr const char *name = "Pm4CrossQueueLabelOrder";
+  constexpr int graphics_event_id = 0;
+  constexpr int compute_event_id = 0x20;
+  GraphicsInitJmpTables();
+  renderer.InitializeGpu(nullptr);
+  auto &gpu = renderer.GetGpu();
+  auto &scheduler = renderer.GetCommandScheduler();
+  CommandProcessor graphics(renderer, graphics_event_id);
+  CommandProcessor compute(renderer, compute_event_id);
+
+  // Both queues write the same label, so its final value shows which landed last.
+  alignas(uint64_t) uint32_t label = 0;
+  const auto graphics_release = MakeLabelRelease(1, &label, 0x55u);
+  const auto compute_release = MakeLabelRelease(1, &label, 0x66u);
+
+  bool deferred = false;
+  gpu.SendCommandSync([&] {
+    graphics.BufferInit();
+    compute.BufferInit();
+    // Pretend an earlier graphics label is still waiting on a readback.
+    auto &pending = CommandProcessorTestAccess::PendingSignals(graphics);
+    pending.fetch_add(1);
+    Pm4Execution graphics_execution;
+    Pm4Execution compute_execution;
+    deferred =
+        graphics.Process(graphics_execution, graphics_release) == Pm4ProcessResult::Complete &&
+        compute.Process(compute_execution, compute_release) == Pm4ProcessResult::Complete &&
+        label == 0 && pending.load() == 3;
+    pending.fetch_sub(1);
+  });
+  Require(name, "deferred", deferred,
+          "a compute label was written while a graphics label was still deferred");
+
+  gpu.SendCommandSync([&] {
+    scheduler.Finish();
+    scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+  });
+  // The deferred labels land through GPU-thread commands queued by the priority callbacks.
+  gpu.SendCommandSync([] {});
+  Require(name, "landed in order",
+          label == 0x66u && CommandProcessorTestAccess::PendingSignals(graphics).load() == 0,
+          "the compute label did not land after the graphics label released before it");
+  renderer.ShutdownGpu();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -53344,6 +53887,11 @@ int main(int argc, char **argv) {
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+    CheckPm4DeferredLabelWait(vulkan.RuntimeRenderer());
+    CheckPm4InterruptBehindDeferredLabel(vulkan.RuntimeRenderer());
+    CheckPm4GdsLabelBehindDeferredLabel(vulkan.RuntimeRenderer());
+    CheckPm4GdsMultiDwordLabel(vulkan.RuntimeRenderer());
+    CheckPm4CrossQueueLabelOrder(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
@@ -53655,6 +54203,11 @@ int main(int argc, char **argv) {
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+  CheckPm4DeferredLabelWait(vulkan.RuntimeRenderer());
+  CheckPm4InterruptBehindDeferredLabel(vulkan.RuntimeRenderer());
+  CheckPm4GdsLabelBehindDeferredLabel(vulkan.RuntimeRenderer());
+  CheckPm4GdsMultiDwordLabel(vulkan.RuntimeRenderer());
+  CheckPm4CrossQueueLabelOrder(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
@@ -53712,6 +54265,7 @@ int main(int argc, char **argv) {
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckTextureCacheDownloadRetry();
+  vulkan.CheckReadbackHoldsLabel();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

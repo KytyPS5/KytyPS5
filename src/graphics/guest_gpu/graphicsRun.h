@@ -31,6 +31,11 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Lets blocked submissions retry on the GPU thread's next pass instead of after its stall poll
+	// (100 us, or a timer tick on Windows). GPU thread only, outside the queue lock.
+	void               RetryBlockedSubmissions();
+	// Like SendCommand, but returns false instead of exiting once Shutdown() has begun.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);

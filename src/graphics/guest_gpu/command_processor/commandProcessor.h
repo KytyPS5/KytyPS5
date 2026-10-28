@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -52,7 +54,8 @@ private:
 class CommandProcessor {
 public:
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
-	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
+	    : m_renderer(renderer), m_pending_signals(renderer.GetPendingSignals()),
+	      m_interrupt_event_id(interrupt_event_id) {}
 	~CommandProcessor() = default;
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
@@ -88,6 +91,11 @@ public:
 	                uint32_t interrupt_context_id);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
+	/// Writes an end-of-pipe label (the low `size` bytes of `value`, or none if `label` is null)
+	/// and raises its interrupt if `interrupt` is set, behind any pending image readbacks, so the
+	/// guest never sees the signal before the data it announces has landed.
+	void SignalBehindReadbacks(void* label, uint64_t value, uint32_t size, bool interrupt,
+	                           uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
@@ -117,6 +125,24 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	friend struct CommandProcessorTestAccess;
+
+	// Queues pending GPU-to-guest image readbacks. Returns true if any were queued.
+	bool QueueReadbacksBeforeLabel();
+	// Whether a signal has to wait behind earlier deferred signals or behind readbacks.
+	// `readbacks_queued` says whether this signal just queued readbacks.
+	[[nodiscard]] bool ShouldDeferSignal(bool has_label, bool readbacks_queued) const;
+	// Writes the label and raises the interrupt now, or defers them if ShouldDeferSignal says so.
+	void EmitSignal(void* label, uint64_t value, uint32_t size, bool interrupt,
+	                uint32_t interrupt_context_id, bool readbacks_queued);
+	// Holds a label and/or interrupt back until the earlier deferred signals and readbacks land.
+	void DeferSignal(void* label, uint64_t value, uint32_t size, bool interrupt,
+	                 uint32_t interrupt_context_id);
+	// Writes `gds_dw_count` GDS dwords from `gds_dw_offset` to `label` as end-of-pipe labels behind
+	// any pending image readbacks, raising the interrupt after the last one if `interrupt` is set.
+	// Call after Finish(), when the GDS values are final.
+	void SignalGdsBehindReadbacks(void* label, uint32_t gds_dw_offset, uint32_t gds_dw_count,
+	                              bool interrupt, uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	uint32_t            NumInstances();
@@ -125,6 +151,8 @@ private:
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext& m_renderer;
+	// The renderer's count of deferred signals on every queue (RenderContext::GetPendingSignals).
+	std::shared_ptr<std::atomic<uint32_t>> m_pending_signals;
 	HW::Context    m_ctx;
 	HW::Context    m_saved_ctx;
 	bool           m_context_state_pushed = false;

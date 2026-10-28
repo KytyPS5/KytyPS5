@@ -2073,6 +2073,23 @@ static bool Ngs2IsSideChainInput(const Ngs2VoiceInternal& voice, uint32_t input)
 	       input < voice.rack->option.submixer.max_inputs;
 }
 
+// Runs a standard submixer's compressor on the mixed input, then drops this grain's side-chain
+// key. The submixer's modules are assumed to run as the input mix, then envelope, filter and EQ
+// (not emulated), then this compressor, then distortion and the peak meter (not emulated), then
+// the output ports. A future submixer peak meter should read the samples after this call.
+//
+// It runs on silent grains too, so the release carries on between voice lines. The key is
+// cleared even when the compressor is off, because the port loop only zeroes it when it is
+// empty, so a kept key would add onto the next grain's.
+static void Ngs2ApplySubmixerCompressor(Ngs2VoiceInternal& voice, uint32_t grain) {
+	if (voice.rack->type == Ngs2RackType::Submixer && voice.compressor.Enabled()) {
+		voice.compressor.Process(voice.samples.data(),
+		                         voice.side_chain.empty() ? nullptr : voice.side_chain.data(),
+		                         voice.channels, grain);
+	}
+	voice.side_chain.clear();
+}
+
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
@@ -2147,13 +2164,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.has_samples = voice.has_samples || !side_chain;
 			}
 		}
-		if (voice.rack->type == Ngs2RackType::Submixer && voice.compressor.Enabled()) {
-			// Runs on silent grains too, so the envelope releases while nothing plays.
-			voice.compressor.Process(voice.samples.data(),
-			                         voice.side_chain.empty() ? nullptr : voice.side_chain.data(),
-			                         voice.channels, grain);
-		}
-		voice.side_chain.clear();
+		Ngs2ApplySubmixerCompressor(voice, grain);
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;

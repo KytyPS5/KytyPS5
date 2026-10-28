@@ -1819,6 +1819,30 @@ void TestPeakMeterAfterFilter() {
 	Check(f.State().peak_height == filtered_peak, "the peak was not read after the filter");
 }
 
+// A voice that stops rendering, here by pausing, reports 0 from its next render, since the meter
+// holds no peak from an earlier grain.
+void TestPeakMeterPaused() {
+	Fixture          f(48000);
+	const int16_t    pcm[] = {16384, 0, 16384, 0};
+	PeakMeterControl meter;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Queue(pcm, 4, 0);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "the paused-voice fixture did not report its peak");
+	f.voice.SetEvent(16);
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "a paused voice kept its last peak");
+}
+
+// The default sampler rack asks for the one peak meter block seen in games.
+void TestPeakMeterDefaultBlocks() {
+	Ngs2RackOptionUnion defaults {};
+	Ngs2FillDefaultRackOption(0x1000, &defaults);
+	Check(defaults.sampler.num_peak_meter_blocks == NGS2_SAMPLER_PEAK_METER_BLOCKS,
+	      "the default sampler rack does not ask for one peak meter block");
+}
+
 } // namespace
 
 int main() {
@@ -1860,6 +1884,8 @@ int main() {
 	TestPeakMeterReset();
 	TestPeakMeterStereo();
 	TestPeakMeterAfterFilter();
+	TestPeakMeterPaused();
+	TestPeakMeterDefaultBlocks();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

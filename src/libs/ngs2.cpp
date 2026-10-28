@@ -47,6 +47,9 @@ constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
 // Sampler voice control that turns the voice's peak meter on or off.
 constexpr uint32_t NGS2_SAMPLER_CONTROL_PEAK_METER = 9;
+// Peak meter blocks a sampler rack asks for in every game seen so far (Trails in the Sky 1st
+// Chapter). What other counts mean is unknown, so the meter always reports each grain's peak.
+constexpr uint32_t NGS2_SAMPLER_PEAK_METER_BLOCKS = 1;
 
 struct Ngs2SystemOption {
 	size_t    size                     = 0;
@@ -1024,7 +1027,8 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 			option->sampler.max_atrac9_decoders                = 256;
 			option->sampler.max_atrac9_channel_works           = 256;
 			option->sampler.max_ajm_atrac9_decoders            = 0;
-			option->sampler.num_peak_meter_blocks              = 8;
+			// The SDK's default is not known, so this uses the only count seen in a game.
+			option->sampler.num_peak_meter_blocks              = NGS2_SAMPLER_PEAK_METER_BLOCKS;
 			break;
 		case 0x2000:
 			option->submixer.rack_option.size                   = sizeof(Ngs2SubmixerRackOption);
@@ -1322,6 +1326,14 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SamplerRackOption));
 			rack->option.sampler = *reinterpret_cast<const Ngs2SamplerRackOption*>(option);
 			rack->type           = Ngs2RackType::Sampler;
+			// Another count could mean a longer window, shorter sub-blocks or an allocation size.
+			// Logging it lets the first game that asks for one show which.
+			if (rack->option.sampler.num_peak_meter_blocks != NGS2_SAMPLER_PEAK_METER_BLOCKS) {
+				Log::WriteToConsoleAndLog(fmt::sprintf(
+				    "warning: NGS2 sampler rack asks for %u peak meter blocks, using 1 (the peak of "
+				    "the last grain only)\n",
+				    rack->option.sampler.num_peak_meter_blocks));
+			}
 			break;
 		case 0x2000:
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SubmixerRackOption));

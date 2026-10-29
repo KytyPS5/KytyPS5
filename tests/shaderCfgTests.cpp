@@ -12065,10 +12065,11 @@ void TestMeshInputAssembly() {
   }
 }
 
-// Body indices that send a jump-table entry back to the jump block itself or to the
-// preamble before it.
+// Body indices that send a jump-table entry back to the jump block itself, to the
+// preamble before it, or straight to the shared s_endpgm that the bodies join at.
 constexpr uint32_t JumpTableSelfTarget = UINT32_MAX;
 constexpr uint32_t JumpTablePreambleTarget = UINT32_MAX - 1u;
+constexpr uint32_t JumpTableJoinTarget = UINT32_MAX - 2u;
 
 // Shape of a synthetic jump-table shader. Entry i jumps to body entry_bodies[i]. Each
 // body sets s20 and branches to a shared s_endpgm, except that with fall_through an even
@@ -12134,6 +12135,7 @@ std::vector<uint32_t> MakeJumpTableShader(const JumpTableShape &shape) {
   for (const auto body : shape.entry_bodies) {
     const auto pc = body == JumpTableSelfTarget       ? static_cast<uint32_t>(jump_index) * 4u
                     : body == JumpTablePreambleTarget ? 0u
+                    : body == JumpTableJoinTarget     ? static_cast<uint32_t>(end) * 4u
                                                       : body_pcs.at(body);
     const auto offset = static_cast<int64_t>(pc) - static_cast<int64_t>(target_base);
     code.push_back(static_cast<uint32_t>(offset));
@@ -12244,6 +12246,7 @@ void TestCfgJumpTableGotoChain() {
       {"loop header target", {{0u, JumpTableSelfTarget, 1u}, 2u}},
       {"earlier loop header target", {{JumpTablePreambleTarget, 0u, 1u}, 2u}},
       {"two-latch loop header", {{JumpTableSelfTarget, 0u, 1u, 2u}, 3u, false, 1u}},
+      {"shared join target", {{0u, 1u, JumpTableJoinTarget, 2u}, 3u}},
   };
   for (const auto &test : cases) {
     ShaderRecompiler::Decoder::Program decoded;
@@ -12303,6 +12306,63 @@ void TestCfgJumpTableGotoChain() {
                 TraceJumpTableGraph(native, selectors, trace_instructions),
             "structured jump table ran different guest code for a selector");
     }
+  }
+}
+
+// ResourceTracking prunes an impossible jump-table arm only on a direct conditional edge
+// from the goto chain. A sentinel entry that jumps straight to the join the bodies share
+// must reach that join on such an edge, not through route flags.
+void TestCfgJumpTableJoinEdgeIsDirect() {
+  namespace CFG = ShaderRecompiler::CFG;
+  using Op = CFG::ConditionExpression::Op;
+  constexpr uint32_t entry_bytes = 8u;
+  const JumpTableShape shapes[] = {
+      {{0u, 1u, JumpTableJoinTarget}, 2u},
+      {{JumpTableJoinTarget, 0u, 1u, 2u}, 3u},
+      {{0u, JumpTableJoinTarget, 1u, 2u, 3u}, 4u, true},
+  };
+  for (const auto &shape : shapes) {
+    ShaderRecompiler::Decoder::Program decoded;
+    const auto native = NativeJumpTableGraph(MakeJumpTableShader(shape), decoded);
+    const auto structured = CFG::Structurize(native);
+    Check(!structured.unsupported, "shared join jump table did not structurize");
+    const auto sentinel =
+        static_cast<uint32_t>(std::ranges::find(shape.entry_bodies, JumpTableJoinTarget) -
+                              shape.entry_bodies.begin()) *
+        entry_bytes;
+    // The join is the only block that holds the final s_endpgm.
+    const auto join_inst = static_cast<uint32_t>(decoded.instructions.size() - 1);
+    const auto join = std::ranges::find_if(structured.blocks, [&](const auto &block) {
+      return block.inst_begin == join_inst;
+    });
+    Check(join != structured.blocks.end(), "structured jump table lost its join block");
+    // True when the branch takes the join exactly when the sentinel's SelectorIn holds.
+    const auto takes_join_on_sentinel = [&](const CFG::Terminator &term) {
+      auto expression = term.expression;
+      bool negated = false;
+      while (structured.expressions[expression].op == Op::Not) {
+        expression = structured.expressions[expression].lhs;
+        negated = !negated;
+      }
+      if ((negated ? term.false_block : term.true_block) != join->id) return false;
+      const auto &variable = structured.expressions[expression];
+      if (variable.op != Op::Variable) return false;
+      return std::ranges::any_of(structured.blocks, [&](const auto &block) {
+        return std::ranges::any_of(block.assignments, [&](const auto &assignment) {
+          const auto &value = structured.expressions[assignment.expression];
+          return assignment.variable == variable.lhs && value.op == Op::SelectorIn &&
+                 structured.selector_value_lists[value.rhs] == std::vector<uint32_t>{sentinel};
+        });
+      });
+    };
+    Check(std::ranges::any_of(join->predecessors,
+                              [&](uint32_t predecessor) {
+                                const auto &term = structured.blocks[predecessor].terminator;
+                                return term.kind == CFG::TerminatorKind::ConditionalBranch &&
+                                       term.expression != UINT32_MAX &&
+                                       takes_join_on_sentinel(term);
+                              }),
+          "sentinel jump-table entry reached its join through route flags");
   }
 }
 
@@ -17695,6 +17755,7 @@ int main() {
   TestNewShaderRecompilerSetpcJumpTable();
   TestCfgJumpTableGotoChain();
   TestCfgJumpTableFallbacks();
+  TestCfgJumpTableJoinEdgeIsDirect();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable(6);
   TestNewShaderRecompilerSetpcDwordJumpTable(106);

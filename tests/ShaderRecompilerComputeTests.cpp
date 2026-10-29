@@ -35090,6 +35090,19 @@ TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64() {
   return test;
 }
 
+// Binds a checked-range test with the Vulkan range ending exactly at the length the shader
+// checks, so a speculative load of an out-of-range element would really be out of the bound
+// range. Vulkan lets such an access spoil in-range ones within 16 bytes, and the selected loads
+// clamp their index to avoid it. The test GPU did not spoil neighbours, so these show the clamped
+// loads still give the right results and the device survives them. The CPU test proves the clamp
+// exists.
+TestCase TightCheckedRange(TestCase test, const char *name) {
+  test.name = name;
+  test.storage_buffer_range_bytes = test.storage_buffer_shader_size_bytes;
+  test.storage_buffer_shader_size_bytes = 0;
+  return test;
+}
+
 TestCase BufferFormatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -46933,6 +46946,22 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferLoadPastCheckedRange(64, true));
   cases.push_back(BufferFormatLoadPastCheckedRange(32));
   cases.push_back(BufferFormatLoadPastCheckedRange(64));
+  cases.push_back(TightCheckedRange(ScalarBufferLoadPastCheckedRange(32),
+                                    "ScalarBufferLoadTightRangeWave32"));
+  cases.push_back(TightCheckedRange(ScalarBufferLoadPastCheckedRange(64),
+                                    "ScalarBufferLoadTightRangeWave64"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(32, false),
+                                    "BufferLoadTightRangeWave32"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(64, false),
+                                    "BufferLoadTightRangeWave64"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(32, true),
+                                    "BufferLoadSubwordTightRangeWave32"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(64, true),
+                                    "BufferLoadSubwordTightRangeWave64"));
+  cases.push_back(TightCheckedRange(BufferFormatLoadPastCheckedRange(32),
+                                    "BufferFormatLoadTightRangeWave32"));
+  cases.push_back(TightCheckedRange(BufferFormatLoadPastCheckedRange(64),
+                                    "BufferFormatLoadTightRangeWave64"));
   for (const u32 components : {1u, 2u, 4u}) {
     cases.push_back(BufferLoadBranchlessInactiveLanes(32, components, InactiveLanes::Odd));
     cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::Odd));

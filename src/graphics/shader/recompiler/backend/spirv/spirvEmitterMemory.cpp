@@ -398,7 +398,10 @@ static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
 // Picks how the exec guard around a whole buffer access is emitted. Running the access for
 // inactive lanes is safe when it reads robust storage buffers through a constant slot and every
 // element load inside still selects its own bounds. An indirect root picks its slot from a GPU
-// value and a coherent access may read an atomic pair, so both keep the branch.
+// value and a coherent access may read an atomic pair, so both keep the branch. Inactive lanes
+// then really read memory, which another invocation may be writing. The Vulkan memory model
+// counts that as a data race even though the value is discarded, so this relies on hardware
+// tolerating such reads, which is why selecting is opt-in.
 static GuardStrategy AccessGuardStrategy(const EmitterState& state, const IR::MemoryInfo& mem) {
 	const bool direct_buffer = mem.kind == IR::ResourceKind::Buffer && !mem.coherent &&
 	                           state.program.info.buffers.at(mem.resource).indirect_root != mem.resource;
@@ -406,14 +409,38 @@ static GuardStrategy AccessGuardStrategy(const EmitterState& state, const IR::Me
 	                                                           : GuardStrategy::Branch;
 }
 
+// The element a speculative load reads when its own index is out of range. Every storage buffer
+// is bound with a range at least as long as its checked length, and an empty one is bound to a
+// 16-byte null buffer, so element 0 is in range. A non-empty buffer smaller than one element of
+// the view stays out of range. That only matters for a narrower in-range read of the same few
+// bytes in the same shader, which is rare enough to leave. The discarded read of element 0 may
+// race with another invocation writing it, the same caveat as the exec guard above, so it too is
+// left to the opt-in.
+constexpr uint32_t SAFE_SPECULATIVE_ELEMENT = 0u;
+
+// Keeps a load that a select guards inside the bound range. Vulkan lets an out-of-range access
+// spoil in-range accesses to the same buffer within 16 bytes, so an out-of-range index reads the
+// safe element instead, and the guard still replaces that value with the default.
+static uint32_t SpeculativeElementIndex(EmitterState& state, GuardStrategy strategy,
+                                        uint32_t in_bounds, uint32_t index) {
+	if (strategy != GuardStrategy::Select || in_bounds == ConstantBool(state, true) ||
+	    in_bounds == ConstantBool(state, false)) {
+		return index;
+	}
+	return Select(state, TypeU32(state), in_bounds, index,
+	              ConstantU32(state, SAFE_SPECULATIVE_ELEMENT));
+}
+
 // Loads one dword through a prepared resource, or zero when it lies past the checked length.
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
-	return EmitGuardedValue(ctx.state, LoadGuardStrategy(ctx.state, resource),
-	                        EmitMemoryElementInBounds(ctx.state, resource, index),
-	                        ValueShape {TypeU32(ctx.state), 1u}, ConstantU32(ctx.state, 0),
-	                        [&]() { return LoadWordInBounds(ctx, resource, index); });
+	const auto index     = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	const auto strategy  = LoadGuardStrategy(ctx.state, resource);
+	const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+	const auto safe      = SpeculativeElementIndex(ctx.state, strategy, in_bounds, index);
+	return EmitGuardedValue(ctx.state, strategy, in_bounds, ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0),
+	                        [&]() { return LoadWordInBounds(ctx, resource, safe); });
 }
 
 // Loads one dword for the active lanes, and zero for the others.
@@ -435,10 +462,13 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
-	return EmitGuardedValue(ctx.state, LoadGuardStrategy(ctx.state, resource),
-	                        EmitMemoryElementInBounds(ctx.state, resource, index),
-	                        ValueShape {TypeU32(ctx.state), 1u}, ConstantU32(ctx.state, 0), [&]() {
-		                        return LoadSubwordInBounds(ctx, resource, address, index, bits,
+	const auto strategy  = LoadGuardStrategy(ctx.state, resource);
+	const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+	// Only the index addresses memory. The address supplies the byte within the loaded word.
+	const auto safe = SpeculativeElementIndex(ctx.state, strategy, in_bounds, index);
+	return EmitGuardedValue(ctx.state, strategy, in_bounds, ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0), [&]() {
+		                        return LoadSubwordInBounds(ctx, resource, address, safe, bits,
 		                                                   sign_extend);
 	                        });
 }
@@ -739,6 +769,8 @@ struct PreparedFormattedMemory {
 	MemoryResourceAccess     resource;
 	uint32_t                 base = 0;
 	uint32_t                 in_bounds = 0;
+	// Set when the components are loaded speculatively and selected, so each stays in range.
+	bool                     speculative = false;
 };
 
 PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -769,8 +801,16 @@ std::pair<uint32_t, uint32_t> FormattedComponentAddress(EmitterState& state,
 	const auto offset = Format::GetFormatComponentByteOffset(plan.info, component);
 	const auto address = offset == 0u ? plan.base : Binary(
 	    state, spv::OpIAdd, TypeU32(state), plan.base, ConstantU32(state, offset));
-	return {address, Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
-	                        ConstantU32(state, std::countr_zero(plan.resource.element_bits / 8u)))};
+	const auto element_shift = std::countr_zero(plan.resource.element_bits / 8u);
+	const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
+	                          ConstantU32(state, element_shift));
+	// Each component is clamped, since a clamped base plus a component offset can still be out of
+	// range for a short buffer.
+	if (plan.speculative) {
+		return {address,
+		        SpeculativeElementIndex(state, GuardStrategy::Select, plan.in_bounds, index)};
+	}
+	return {address, index};
 }
 
 uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
@@ -826,12 +866,14 @@ uint32_t SelectFormattedComponents(ValueEmitContext& ctx, const IR::MemoryInfo& 
                                    const PreparedFormattedMemory& plan, uint32_t count) {
 	auto&      state     = ctx.state;
 	const auto fallbacks = FormattedOutOfBoundsComponents(ctx, mem, plan, count);
+	auto       speculative = plan;
+	speculative.speculative = true;
 	std::array<uint32_t, 4> values {};
 	for (uint32_t component = 0; component < count; component++) {
-		values[component] =
-		    EmitGuardedValue(state, GuardStrategy::Select, plan.in_bounds,
-		                     ValueShape {TypeU32(state), 1u}, fallbacks[component],
-		                     [&]() { return LoadFormattedInBounds(ctx, mem, plan, component); });
+		values[component] = EmitGuardedValue(
+		    state, GuardStrategy::Select, plan.in_bounds, ValueShape {TypeU32(state), 1u},
+		    fallbacks[component],
+		    [&]() { return LoadFormattedInBounds(ctx, mem, speculative, component); });
 	}
 	return ConstructU32Composite(state, count, values);
 }
@@ -1694,11 +1736,12 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitGuardedValue(state, LoadGuardStrategy(state, access), condition,
-	                                  ValueShape {TypeU32(state), 1u}, ConstantU32(state, 0),
-	                                  [&]() {
+	const auto strategy  = LoadGuardStrategy(state, access);
+	const auto safe      = SpeculativeElementIndex(state, strategy, condition, element);
+	ctx.Define(inst, EmitGuardedValue(state, strategy, condition, ValueShape {TypeU32(state), 1u},
+	                                  ConstantU32(state, 0), [&]() {
 		                                  return EmitNative<spv::OpLoad, IR::Type::U32>(
-		                                      state, EmitMemoryElementPointer(state, access, element));
+		                                      state, EmitMemoryElementPointer(state, access, safe));
 	                                  }));
 }
 

@@ -629,7 +629,9 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 // How a guarded value is emitted. Branch runs the computation only when its condition holds.
 // Select runs it unconditionally and picks the result, which keeps the module free of control
 // flow that drivers are slow to compile. Select is only safe for a computation with no side
-// effects whose memory reads are safe at any index.
+// effects whose memory reads are safe at any index. Robust buffer access alone is not enough,
+// since Vulkan lets an out-of-range access spoil in-range ones within 16 bytes, so callers keep
+// each speculative load's index in range.
 enum class GuardStrategy { Branch, Select };
 
 // Result type of a guarded value with its component count, kept together so a call site states both.

@@ -14651,6 +14651,169 @@ bool SpirvSelectGuardsLoad(const std::vector<uint32_t> &binary) {
 // Selected guarded loads are opt-in, so the tests of the select form ask for it.
 constexpr ShaderRecompiler::Spirv::Profile SelectGuardedLoadsProfile{.select_guarded_loads = true};
 
+// The parts of a SPIR-V module the clamp check reads. Users map each id to the instructions that
+// take it as an operand, so a load's value can be followed to the select that guards it.
+struct SpirvLoadGraph {
+  std::unordered_set<uint32_t> buffer_views;
+  std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> chains; // pointer to base and index
+  std::unordered_map<uint32_t, std::array<uint32_t, 3>> selects;      // result to condition, a, b
+  std::unordered_map<uint32_t, std::vector<uint32_t>> users;
+  std::unordered_set<uint32_t> zeros;
+  std::unordered_set<uint32_t> constants;
+  std::vector<std::pair<uint32_t, uint32_t>> loads; // result and pointer
+};
+
+// Reads the instructions the clamp check needs. The guest storage buffer views are told apart
+// from other storage buffers, such as shader data, by their variable names.
+SpirvLoadGraph ParseSpirvLoadGraph(const std::vector<uint32_t> &binary) {
+  constexpr size_t header_words = 5, first_operand = 3;
+  SpirvLoadGraph graph;
+  for (size_t pos = header_words; pos < binary.size();) {
+    const auto opcode = binary[pos] & 0xffffu;
+    const auto count = binary[pos] >> 16u;
+    if (count == 0u || pos + count > binary.size()) break;
+    const auto word = [&](size_t index) { return index < count ? binary[pos + index] : 0u; };
+    if (opcode == spv::OpName) {
+      const std::string name(reinterpret_cast<const char *>(&binary[pos + 2]));
+      if (name == "buffers" || name == "buffers_u8" || name == "buffers_u16")
+        graph.buffer_views.insert(word(1));
+    }
+    if (opcode == spv::OpConstant) {
+      graph.constants.insert(word(2));
+      if (count == 4u && word(3) == 0u) graph.zeros.insert(word(2));
+    }
+    if ((opcode == spv::OpAccessChain || opcode == spv::OpInBoundsAccessChain) && count >= 5u)
+      graph.chains[word(2)] = {word(3), word(count - 1u)};
+    if (opcode == spv::OpSelect && count >= 6u) graph.selects[word(2)] = {word(3), word(4), word(5)};
+    if (opcode == spv::OpLoad) graph.loads.emplace_back(word(2), word(3));
+    for (size_t index = first_operand; index < count; ++index) graph.users[word(index)].push_back(word(2));
+    pos += count;
+  }
+  return graph;
+}
+
+// The condition of the select that guards a load, found by following the load's value forward
+// until it is the chosen operand of a select. Returns zero when no select guards it.
+uint32_t GuardCondition(const SpirvLoadGraph &graph, uint32_t loaded) {
+  std::vector<uint32_t> pending {loaded};
+  std::unordered_set<uint32_t> seen {loaded};
+  while (!pending.empty()) {
+    const auto value = pending.back();
+    pending.pop_back();
+    const auto users = graph.users.find(value);
+    if (users == graph.users.end()) continue;
+    for (const auto user : users->second) {
+      const auto select = graph.selects.find(user);
+      if (select != graph.selects.end() && select->second[1] == value) return select->second[0];
+      if (seen.insert(user).second) pending.push_back(user);
+    }
+  }
+  return 0u;
+}
+
+// Counts the loads from the guest storage buffer views, and how many read through an index
+// clamped as SpeculativeElementIndex does it. A clamped index is an OpSelect of the real index
+// against the constant zero, on the same condition as the select that guards the load's value.
+struct SpirvBufferLoadIndices {
+  uint32_t loads = 0;
+  uint32_t clamped = 0;
+  // Loads whose index is a select against zero on any condition, including one that drives a
+  // branch, so a clamp left on a branched load is still seen.
+  uint32_t zero_selected = 0;
+};
+
+// Counts the guest buffer loads of a module and which of them read through a clamped index.
+SpirvBufferLoadIndices FindSpirvBufferLoadIndices(const std::vector<uint32_t> &binary) {
+  const auto graph = ParseSpirvLoadGraph(binary);
+  const auto root = [&](uint32_t pointer) {
+    for (auto chain = graph.chains.find(pointer); chain != graph.chains.end();
+         chain = graph.chains.find(pointer))
+      pointer = chain->second.first;
+    return pointer;
+  };
+  SpirvBufferLoadIndices result;
+  for (const auto &[loaded, pointer] : graph.loads) {
+    const auto chain = graph.chains.find(pointer);
+    if (chain == graph.chains.end() || !graph.buffer_views.contains(root(pointer))) continue;
+    result.loads++;
+    const auto select = graph.selects.find(chain->second.second);
+    if (select == graph.selects.end()) continue;
+    const auto [condition, value, fallback] = select->second;
+    if (!graph.zeros.contains(fallback) || graph.constants.contains(value)) continue;
+    result.zero_selected++;
+    if (GuardCondition(graph, loaded) == condition) result.clamped++;
+  }
+  return result;
+}
+
+// Compiles a shader with and without opting in to selected loads, and checks that every guest
+// buffer load reads through a clamped index when opted in and none does otherwise.
+void CheckBufferLoadsClamped(std::span<const uint32_t> shader, ShaderRecompiler::CompileOptions options,
+                             const char *what) {
+  for (const bool selecting : {true, false}) {
+    options.profile = selecting ? &SelectGuardedLoadsProfile : &ShaderRecompiler::Spirv::DefaultProfile;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto indices = FindSpirvBufferLoadIndices(result.spirv);
+    Check(indices.loads != 0u, what);
+    Check(selecting ? indices.clamped == indices.loads : indices.zero_selected == 0u, what);
+  }
+}
+
+// The formatted fixture from FormattedLoadSelectsWhenOptedIn, with the given record format.
+std::array<uint32_t, 4> FormattedFixture(Prospero::BufferFormat format, uint32_t stride) {
+  constexpr uint32_t records = 4u, format_shift = 12u;
+  // Word 3 bit 24, which the GPU harness sets on every structured buffer descriptor.
+  constexpr uint32_t resource_level = 1u << 24u;
+  return {0x1000u, stride << 16u, records,
+          DstSel(4, 5, 6, 7) | resource_level | (static_cast<uint32_t>(format) << format_shift)};
+}
+
+// A load that a select guards runs even when its index is out of range, and Vulkan lets such an
+// access spoil in-range accesses to the same buffer within 16 bytes. So when selecting is opted in,
+// every guest buffer load must read through a clamped index, and without it none may. The cases
+// cover raw dword and dwordx4 loads, byte and short loads, formatted records read as words and as
+// halves, and a scalar buffer load.
+void TestNewShaderRecompilerSelectedLoadsClampIndex() {
+  constexpr uint32_t mubuf = 0x38u << 26u;
+  constexpr uint32_t offen = 1u << 12u;
+  constexpr uint32_t opcode_shift = 18u;
+  constexpr uint32_t ubyte = 0x08u, ushort = 0x0au, dword = 0x0cu, dwordx4 = 0x0eu;
+  constexpr uint32_t store_dword = 0x1cu, s_endpgm = 0x01u;
+  for (const uint32_t load : {ubyte, ushort, dword, dwordx4}) {
+    const uint32_t shader[] = {
+        mubuf | (load << opcode_shift) | offen, EncodeMubuf1(2, 0, 0), // buffer_load v[2..], v0
+        EncodeMubuf0(store_dword, 0, false), EncodeMubuf1(2, 0, 0),    // buffer_store_dword v2
+        EncodeSopp(s_endpgm),
+    };
+    CheckBufferLoadsClamped(shader, MakeCompileOptions(ShaderType::Compute),
+                            "a raw buffer load was clamped wrongly or not at all");
+  }
+  const uint32_t formatted[] = {
+      EncodeMubuf0(0x03, 0), EncodeMubuf1(96, 0, 1),          // buffer_load_format_xyzw
+      EncodeMubuf0(store_dword, 0, false), EncodeMubuf1(96, 0, 0), EncodeSopp(s_endpgm),
+  };
+  constexpr uint32_t float4_stride = 16u, half4_stride = 8u;
+  for (const auto &[format, stride] :
+       {std::pair {Prospero::BufferFormat::k32_32_32_32Float, float4_stride},
+        std::pair {Prospero::BufferFormat::k16_16_16_16Float, half4_stride}}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const auto user_data = FormattedFixture(format, stride);
+    options.user_data = user_data;
+    CheckBufferLoadsClamped(formatted, options, "a formatted component was clamped wrongly or not at all");
+  }
+  const uint32_t scalar[] = {
+      EncodeSmem0(0x08, 12, 4), 0u, // s_buffer_load_dword s12, s[8:11], s0
+      EncodeVop1(0x01, 0, 12), EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(s_endpgm),
+  };
+  std::array<uint32_t, 12> scalar_data{};
+  scalar_data[8] = 0x2000u;
+  scalar_data[10] = 4u;
+  auto scalar_options = MakeCompileOptions(ShaderType::Pixel);
+  scalar_options.user_data = scalar_data;
+  CheckBufferLoadsClamped(scalar, scalar_options, "a scalar buffer load was clamped wrongly or not at all");
+}
+
 // A scalar buffer load at a constant descriptor slot runs unguarded under robustBufferAccess
 // and selects zero when out of range, so it adds no branch or merge for the driver to compile.
 void TestNewShaderRecompilerScalarBufferLoadSelectsWhenOptedIn() {
@@ -17664,6 +17827,7 @@ int main() {
   TestNewShaderRecompilerLdsLoadKeepsBranch();
   TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn();
   TestNewShaderRecompilerExecGuardedLoadSelects();
+  TestNewShaderRecompilerSelectedLoadsClampIndex();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestVop3F16InterpolationTranslation();

@@ -392,6 +392,12 @@
         </widget>
        </item>
        <item>
+        <widget class="QCheckBox" name="checkBox_ea_emulation">
+         <property name="toolTip"><string>Answer games of EA with a built-in stand-in for EA's servers, so they reach their offline menus.</string></property>
+         <property name="text"><string>Emulate EA servers (compatibility)</string></property>
+        </widget>
+       </item>
+       <item>
         <spacer name="networkSpacer">
          <property name="orientation"><enum>Qt::Vertical</enum></property>
          <property name="sizeHint" stdset="0"><size><width>20</width><height>40</height></size></property>

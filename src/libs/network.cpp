@@ -32,8 +32,10 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/httpOfflineServices.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/eaEmulation/eaServer.h"
 
 #include <algorithm>
 #include <array>
@@ -42,6 +44,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fstream>
@@ -55,6 +58,12 @@
 #include <vector>
 
 namespace Libs::Network {
+
+// What a guest HTTP epoll handle holds: the events of every request attached to it.
+struct HttpEventQueue {
+	Common::Mutex        mutex;
+	std::deque<Http::HttpNBEvent> events;
+};
 
 class Network {
 public:
@@ -153,6 +162,10 @@ public:
 	bool HttpSetAutoRedirect(Id id, int enable);
 	bool HttpSetAuthEnabled(Id id, int enable);
 	bool HttpMarkRequestSent(Id req_id, int result);
+	int  HttpSendRequest(Id req_id, const void* post_data, size_t size);
+	int  HttpReadData(Id req_id, void* data, size_t size);
+	bool HttpSetRequestEpoll(Id req_id, HttpEventQueue* queue, void* user_arg);
+	void HttpDetachEpoll(HttpEventQueue* queue);
 	bool HttpGetRequestResponse(Id req_id, int* send_result, int* status_code, const char** headers,
 	                            size_t* headers_size, uint64_t* content_length);
 
@@ -227,6 +240,12 @@ private:
 		int         send_result    = HTTP_ERROR_BEFORE_SEND;
 		int         status_code    = 0;
 		std::string response_headers;
+		std::string request_body;
+		std::string response_body;
+		size_t      response_read   = 0;
+		bool        response_ready  = false;
+		HttpEventQueue* epoll          = nullptr;
+		void*           epoll_user_arg = nullptr;
 	};
 
 	HttpBase* FindHttpBase(Id id, bool include_request);
@@ -656,10 +675,144 @@ bool Network::HttpGetRequestResponse(Id req_id, int* send_result, int* status_co
 		*headers_size = request.response_headers.size();
 	}
 	if (content_length != nullptr) {
-		*content_length = 0;
+		*content_length = request.response_body.size();
 	}
 
 	return true;
+}
+
+static std::string HostOfUrl(const std::string& url) {
+	auto begin = url.find("://");
+	begin      = (begin == std::string::npos ? 0 : begin + 3);
+	auto end   = url.find_first_of(":/", begin);
+	return url.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+}
+
+int Network::HttpSendRequest(Id req_id, const void* post_data, size_t size) {
+	OfflineServices::Request  in;
+	OfflineServices::Response out;
+
+	{
+		Common::LockGuard lock(m_mutex);
+
+		if (!HttpValidRequest(req_id)) {
+			return HTTP_ERROR_INVALID_ID;
+		}
+
+		auto& request = m_requests[req_id.GetId()];
+		if (request.send_attempted) {
+			return HTTP_ERROR_AFTER_SEND;
+		}
+
+		in.method = request.method;
+		in.host   = HostOfUrl(request.HttpConnection::url);
+		in.path   = request.url;
+		for (const auto& h: request.headers) {
+			in.headers.push_back({h.name, h.value});
+		}
+		if (post_data != nullptr && size > 0) {
+			in.body.assign(static_cast<const char*>(post_data), size);
+		}
+	}
+
+	const bool handled = OfflineServices::Handle(in, out);
+
+	LOGF("\t %s %s %s (%s)\n", in.method.c_str(), in.host.c_str(), in.path.c_str(),
+	     handled ? "answered here" : "no service, transfer fails");
+	for (const auto& h: in.headers) {
+		LOGF("\t   %s: %s\n", h.name.c_str(), h.value.c_str());
+	}
+	LOGF("\t   body (%zu bytes): %.*s\n", in.body.size(),
+	     static_cast<int>(std::min<size_t>(in.body.size(), 2048)), in.body.c_str());
+
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValidRequest(req_id)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	auto& request          = m_requests[req_id.GetId()];
+	request.send_attempted = true;
+	request.request_body   = std::move(in.body);
+
+	if (!handled) {
+		request.send_result    = HTTP_ERROR_TIMEOUT;
+		request.status_code    = 0;
+		request.response_ready = false;
+		request.response_headers.clear();
+		request.response_body.clear();
+		return HTTP_ERROR_TIMEOUT;
+	}
+
+	request.send_result    = OK;
+	request.status_code    = out.status;
+	request.response_body  = std::move(out.body);
+	request.response_read  = 0;
+	request.response_ready = true;
+
+	request.response_headers = fmt::format("HTTP/1.1 {} \r\n", out.status);
+	for (const auto& h: out.headers) {
+		request.response_headers += fmt::format("{}: {}\r\n", h.name, h.value);
+	}
+	request.response_headers += fmt::format("Content-Length: {}\r\n\r\n", request.response_body.size());
+
+	if (request.epoll != nullptr) {
+		Common::LockGuard queue_lock(request.epoll->mutex);
+		// IN: data to read. OUT: ready to send. RESOLVED: the name lookup is done.
+		constexpr uint32_t events = 0x00000001u | 0x00000002u | 0x00010000u;
+		request.epoll->events.push_back({events, events, req_id.ToInt(), request.epoll_user_arg});
+	}
+
+	return OK;
+}
+
+int Network::HttpReadData(Id req_id, void* data, size_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValidRequest(req_id)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	auto& request = m_requests[req_id.GetId()];
+	if (!request.send_attempted) {
+		return HTTP_ERROR_BEFORE_SEND;
+	}
+	if (!request.response_ready) {
+		return request.send_result;
+	}
+
+	const auto count = std::min(size, request.response_body.size() - request.response_read);
+	if (count > 0) {
+		std::memcpy(data, request.response_body.data() + request.response_read, count);
+		request.response_read += count;
+	}
+
+	return static_cast<int>(count);
+}
+
+bool Network::HttpSetRequestEpoll(Id req_id, HttpEventQueue* queue, void* user_arg) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValidRequest(req_id)) {
+		return false;
+	}
+
+	auto& request          = m_requests[req_id.GetId()];
+	request.epoll          = queue;
+	request.epoll_user_arg = user_arg;
+
+	return true;
+}
+
+void Network::HttpDetachEpoll(HttpEventQueue* queue) {
+	Common::LockGuard lock(m_mutex);
+
+	for (auto& request: m_requests) {
+		if (request.epoll == queue) {
+			request.epoll          = nullptr;
+			request.epoll_user_arg = nullptr;
+		}
+	}
 }
 
 bool Network::HttpDeleteTemplate(Id tmpl_id) {
@@ -1483,7 +1636,9 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	(void)timeout;
 	(void)retry;
 
-	if (hostname == nullptr || addr == nullptr || (flags & ~0x00010000) != 0) {
+	// 0x1: the game asks for an asynchronous lookup. The answer is ready when this call returns.
+	constexpr int resolver_flag_async = 0x00000001;
+	if (hostname == nullptr || addr == nullptr || (flags & ~(0x00010000 | resolver_flag_async)) != 0) {
 		return NET_ERROR_EINVAL;
 	}
 
@@ -1498,6 +1653,20 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 
 	if (!EnsureSocketBackend()) {
 		return NET_ERROR_ENETDOWN;
+	}
+
+	// The game's own server (libs/eaEmulation) runs on this machine.
+	const std::string_view blaze_suffix = ".blaze.ea.com";
+	const std::string_view host_view(hostname);
+	if (EaEmulation::Port() != 0 && host_view.size() > blaze_suffix.size() &&
+	    host_view.substr(host_view.size() - blaze_suffix.size()) == blaze_suffix) {
+		const uint8_t loopback[4] = {127, 0, 0, 1};
+		std::memcpy(addr, loopback, sizeof(loopback));
+		if ((flags & resolver_flag_async) != 0) {
+			std::swap(static_cast<uint8_t*>(addr)[0], static_cast<uint8_t*>(addr)[3]);
+			std::swap(static_cast<uint8_t*>(addr)[1], static_cast<uint8_t*>(addr)[2]);
+		}
+		return OK;
 	}
 
 	addrinfo hints {};
@@ -1524,6 +1693,16 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		    ai->ai_addrlen >= sizeof(sockaddr_in)) {
 			const auto* in = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
 			std::memcpy(addr, &in->sin_addr, sizeof(in->sin_addr));
+			if ((flags & resolver_flag_async) != 0) {
+				// Observed with a game of EA: for an asynchronous lookup the game connects to the bytes of the
+				// answer in the reverse order. Not confirmed against a console.
+				std::swap(static_cast<uint8_t*>(addr)[0], static_cast<uint8_t*>(addr)[3]);
+				std::swap(static_cast<uint8_t*>(addr)[1], static_cast<uint8_t*>(addr)[2]);
+			}
+			LOGF("\t resolved = %u.%u.%u.%u\n", static_cast<unsigned>(static_cast<const uint8_t*>(addr)[0]),
+			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[1]),
+			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[2]),
+			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[3]));
 			freeaddrinfo(result);
 			return OK;
 		}
@@ -2027,10 +2206,43 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 		return -1;
 	}
 
-	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
-		return SetHostSocketError();
+	if (host_addr.ss_family == AF_INET) {
+		char text[INET_ADDRSTRLEN] = {};
+		const auto* in             = reinterpret_cast<const sockaddr_in*>(&host_addr);
+		inet_ntop(AF_INET, &in->sin_addr, text, sizeof(text));
+		LOGF("\t host    = %s:%u\n", text, static_cast<unsigned>(ntohs(in->sin_port)));
+		const auto* raw = static_cast<const uint8_t*>(addr);
+		LOGF("\t guest sockaddr = %02x %02x %02x %02x %02x %02x %02x %02x\n", raw[0], raw[1], raw[2],
+		     raw[3], raw[4], raw[5], raw[6], raw[7]);
 	}
 
+#if !defined(_WIN32)
+	// The server of libs/eaEmulation has no port: the game's socket becomes one end of a pair of
+	// connected sockets, and the server has the other end. dup2 keeps the number of the socket, so
+	// every later call (select, epoll, send, recv, close) works as for any other socket.
+	if (host_addr.ss_family == AF_INET && EaEmulation::Port() != 0) {
+		const auto* in = reinterpret_cast<const sockaddr_in*>(&host_addr);
+		if (ntohs(in->sin_port) == EaEmulation::Port() && ntohl(in->sin_addr.s_addr) == INADDR_LOOPBACK) {
+			const int pair_end = EaEmulation::OpenConnection();
+			if (pair_end >= 0) {
+				if ((fcntl(socket, F_GETFL) & O_NONBLOCK) != 0) fcntl(pair_end, F_SETFL, fcntl(pair_end, F_GETFL) | O_NONBLOCK);
+				const int replaced = dup2(pair_end, socket);
+				::close(pair_end);
+				if (replaced < 0) return SetHostSocketError();
+				LOGF("\t connected to the server of libs/eaEmulation without a port\n");
+				return 0;
+			}
+		}
+	}
+#endif
+
+	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
+		const int result = SetHostSocketError();
+		LOGF("\t connect failed, result = %d\n", result);
+		return result;
+	}
+
+	LOGF("\t connected\n");
 	return 0;
 }
 
@@ -2789,17 +3001,10 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 namespace Http {
 
 struct HttpEpoll {
-	Network::Id http_ctx_id = Network::Id(0);
-	Network::Id request_id  = Network::Id(0);
-	void*       user_arg    = nullptr;
+	Network::Id    http_ctx_id = Network::Id(0);
+	HttpEventQueue queue;
 };
 
-struct HttpNBEvent {
-	uint32_t events       = 0;
-	uint32_t event_detail = 0;
-	int      id           = 0;
-	void*    user_arg     = nullptr;
-};
 
 LIB_NAME("Http", "Http");
 
@@ -3220,6 +3425,8 @@ int KYTY_SYSV_ABI HttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh) {
 
 	EXIT_NOT_IMPLEMENTED(!g_net->HttpValid(Network::Id(http_ctx_id)));
 
+	g_net->HttpDetachEpoll(&eh->queue);
+
 	delete eh;
 
 	return OK;
@@ -3232,10 +3439,9 @@ int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
 
 	EXIT_NOT_IMPLEMENTED(eh == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValidRequest(Network::Id(id)));
-
-	eh->request_id = Network::Id(id);
-	eh->user_arg   = user_arg;
+	if (!g_net->HttpSetRequestEpoll(Network::Id(id), &eh->queue, user_arg)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
 
 	return OK;
 }
@@ -3245,23 +3451,39 @@ int KYTY_SYSV_ABI HttpUnsetEpoll(int id) {
 
 	LOGF("\t id = %d\n", id);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValidRequest(Network::Id(id)));
+	if (!g_net->HttpSetRequestEpoll(Network::Id(id), nullptr, nullptr)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* /*post_data*/, size_t /*size*/) {
+int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* post_data, size_t size) {
 	PRINT_NAME();
 
-	LOGF("\t request_id = %d\n", request_id);
+	LOGF("\t request_id = %d\n"
+	     "\t size       = %" PRIu64 "\n",
+	     request_id, static_cast<uint64_t>(size));
 
 	EXIT_IF(g_net == nullptr);
 
-	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_TIMEOUT)) {
-		return HTTP_ERROR_INVALID_ID;
+	return g_net->HttpSendRequest(Network::Id(request_id), post_data, size);
+}
+
+int KYTY_SYSV_ABI HttpReadData(int request_id, void* data, size_t size) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t size       = %" PRIu64 "\n",
+	     request_id, static_cast<uint64_t>(size));
+
+	EXIT_IF(g_net == nullptr);
+
+	if (data == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	return HTTP_ERROR_TIMEOUT;
+	return g_net->HttpReadData(Network::Id(request_id), data, size);
 }
 
 int KYTY_SYSV_ABI HttpAbortRequest(int request_id) {
@@ -3294,7 +3516,16 @@ int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int max
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	return 0;
+	// Every answer is ready when the request is sent, so there is nothing to wait for.
+	Common::LockGuard lock(eh->queue.mutex);
+
+	int count = 0;
+	while (count < maxevents && !eh->queue.events.empty()) {
+		nbev[count++] = eh->queue.events.front();
+		eh->queue.events.pop_front();
+	}
+
+	return count;
 }
 
 int KYTY_SYSV_ABI HttpGetStatusCode(int request_id, int* status_code) {
@@ -4054,6 +4285,13 @@ constexpr int      np_error_request_not_found           = -2141913068; /* 0x8055
 constexpr int      np_error_invalid_id                  = -2141913067; /* 0x80550015 */
 constexpr int      np_request_max                       = 128;
 constexpr uint32_t np_state_signed_out                  = 1;
+constexpr uint32_t np_state_signed_in                   = 2;
+
+// EXPERIMENT: KYTY_PSN_SIGNED_IN=1 makes the local user look signed in to the network.
+static bool NpFakeSignedIn() {
+	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || EaEmulation::SignedInForTitle();
+	return enabled;
+}
 
 struct NpStateCallback {
 	NpStateCallbackA callback = nullptr;
@@ -4114,6 +4352,11 @@ static NpRequest* np_get_request_locked(int req_id) {
 }
 
 static int np_complete_signed_out_locked(NpRequest* request) {
+	if (NpFakeSignedIn() && request->state == NpRequestState::Ready) {
+		request->state  = NpRequestState::Complete;
+		request->result = OK;
+		return OK;
+	}
 	if (request->state == NpRequestState::Complete) {
 		request->result = np_error_invalid_argument;
 		return np_error_invalid_argument;
@@ -4140,7 +4383,8 @@ int KYTY_SYSV_ABI NpCheckCallback() {
 		}
 	}
 	for (const auto& entry: pending) {
-		entry.callback(Config::GetUserId(), np_state_signed_out, entry.userdata);
+		entry.callback(Config::GetUserId(), NpFakeSignedIn() ? np_state_signed_in : np_state_signed_out,
+		               entry.userdata);
 	}
 
 	return OK;
@@ -4240,7 +4484,11 @@ int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
 	// np_id->handle.term = 0;
 	std::memset(np_id, 0, sizeof(*np_id));
 
-	// return OK;
+	if (NpFakeSignedIn()) {
+		std::snprintf(np_id->handle.data, sizeof(np_id->handle.data), "KytyPlayer");
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4256,7 +4504,11 @@ int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
 	// online_id->term = 0;
 	std::memset(online_id, 0, sizeof(*online_id));
 
-	// return OK;
+	if (NpFakeSignedIn()) {
+		std::snprintf(online_id->data, sizeof(online_id->data), "KytyPlayer");
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4270,7 +4522,11 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 	// *account_id = 0x00000000feedfaceull;
 	*account_id = 0;
 
-	// return OK;
+	if (NpFakeSignedIn()) {
+		*account_id = 0x00000000feedfaceull;
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4283,10 +4539,12 @@ int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
 
 	auto* code = static_cast<NpCountryCode*>(country_code);
 	std::memset(code, 0, sizeof(*code));
-	// code->data[0] = '';
-	// code->data[1] = 'S';
+	if (NpFakeSignedIn()) {
+		code->data[0] = 'u';
+		code->data[1] = 's';
+		return OK;
+	}
 
-	// return OK;
 	return np_error_signed_out;
 }
 
@@ -4301,10 +4559,13 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 		return np_error_invalid_argument;
 	}
 
-	// *age = 21;
 	*age = 0;
 
-	// return OK;
+	if (NpFakeSignedIn()) {
+		*age = 21;
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4531,7 +4792,7 @@ int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*state = np_state_signed_out;
+	*state = NpFakeSignedIn() ? np_state_signed_in : np_state_signed_out;
 
 	return OK;
 }
@@ -4545,8 +4806,8 @@ int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	// *state = 2; // SCE_NP_REACHABILITY_STATE_REACHABLE
-	*state = 0; // SCE_NP_REACHABILITY_STATE_UNAVAILABLE
+	// 2: SCE_NP_REACHABILITY_STATE_REACHABLE, 0: SCE_NP_REACHABILITY_STATE_UNAVAILABLE
+	*state = NpFakeSignedIn() ? 2 : 0;
 
 	return OK;
 }
@@ -4560,7 +4821,7 @@ int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*has_signed_up = false;
+	*has_signed_up = NpFakeSignedIn();
 
 	return OK;
 }

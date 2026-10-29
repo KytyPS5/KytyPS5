@@ -25,6 +25,23 @@ FetchContent_MakeAvailable(opus)
 set(BUILD_TESTING "${kyty_build_testing_saved}")
 install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
 
+# The built-in stand-in for EA's game server (src/libs/fakeEaServer.cpp) is a TLS 1.2 server: the
+# game's own TLS client connects to it.
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(INSTALL_MBEDTLS_HEADERS OFF CACHE BOOL "" FORCE)
+set(kyty_build_testing_saved_tls "${BUILD_TESTING}")
+set(BUILD_TESTING OFF)
+FetchContent_Declare(mbedtls
+	GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
+	GIT_TAG 068ff080b369adfac81509f9b57b2afabaf82dc5 # v3.6.7
+	GIT_SHALLOW FALSE
+	GIT_SUBMODULES "framework")
+FetchContent_MakeAvailable(mbedtls)
+set(BUILD_TESTING "${kyty_build_testing_saved_tls}")
+install(FILES "${mbedtls_SOURCE_DIR}/LICENSE" DESTINATION "licenses/mbedtls")
+
 # Headsets are driven through OpenXR. Only the static loader is built; the runtime that serves it
 # (for example SteamVR, Monado or Virtual Desktop) comes from the user's system.
 set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)

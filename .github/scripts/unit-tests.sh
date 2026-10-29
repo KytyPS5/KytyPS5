@@ -29,6 +29,9 @@ names=(
 	copy_workers
 	depth_snapshot_plan
 	device_suitability
+	ea_emulation_patch_plan
+	ea_emulation_pre_auth
+	ea_emulation_tdf
 	event_queue_lifetime
 	fence_retirement
 	file_lock
@@ -42,6 +45,7 @@ names=(
 	http_uri_parse
 	image_page_table
 	image_readback
+	np_webapi2_entitlements
 	overlay_queue
 	const_ram
 	ime_dialog

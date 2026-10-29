@@ -14,6 +14,7 @@
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,6 +39,9 @@ struct Plan {
 	std::vector<Write>       writes;
 	std::vector<std::string> mod_names;
 	std::vector<uint64_t>    cave_pages;
+	// The first write's old bytes are found by search, at any address: its offset says nothing. For
+	// the plans the emulator makes itself (ApplyBuiltIn).
+	bool                     find_anywhere = false;
 };
 
 using Json = nlohmann::json;
@@ -62,12 +66,7 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 	return true;
 }
 
-bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
-	std::ifstream file(path, std::ios::binary);
-	if (!file) {
-		return Fail(error, "could not read cheat file");
-	}
-
+bool LoadPlan(std::istream& file, Plan* plan, std::string* error) {
 	const auto root = Json::parse(file, nullptr, false);
 	if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
 	    !root.contains("process") || !root.contains("mods")) {
@@ -167,7 +166,7 @@ bool Matches(Plan* plan, const Program& program, uint64_t* source_base) {
 				break;
 			}
 			const auto rva = static_cast<uint64_t>(found - begin) + segment.p_vaddr;
-			if (anchor->source_address >= rva) {
+			if (plan->find_anywhere || anchor->source_address >= rva) {
 				*source_base = anchor->source_address - rva;
 				if (TranslateAndValidate(plan, program, *source_base)) {
 					return true;
@@ -245,14 +244,7 @@ bool ApplyWrites(Plan* plan, const Program& program, std::string* error) {
 
 } // namespace
 
-bool Apply(const std::filesystem::path& plan_path, Program* main_program,
-           const std::vector<Program*>& programs) {
-	Plan        plan;
-	std::string error;
-	if (!LoadPlan(plan_path, &plan, &error) || !ValidateGame(plan, main_program, &error)) {
-		::printf("Game cheat error: %s\n", error.c_str());
-		return false;
-	}
+bool ApplyLoaded(Plan plan, Program* main_program, const std::vector<Program*>& programs) {
 	if (plan.writes.empty()) {
 		return true;
 	}
@@ -268,6 +260,64 @@ bool Apply(const std::filesystem::path& plan_path, Program* main_program,
 	}
 	::printf("Game cheat: waiting for the matching module\n");
 	return true;
+}
+
+bool Apply(const std::filesystem::path& plan_path, Program* main_program,
+           const std::vector<Program*>& programs) {
+	Plan        plan;
+	std::string error;
+	std::ifstream file(plan_path, std::ios::binary);
+	if (!file) {
+		::printf("Game cheat error: could not read cheat file\n");
+		return false;
+	}
+	if (!LoadPlan(file, &plan, &error) || !ValidateGame(plan, main_program, &error)) {
+		::printf("Game cheat error: %s\n", error.c_str());
+		return false;
+	}
+	return ApplyLoaded(std::move(plan), main_program, programs);
+}
+
+bool ApplyBuiltIn(const std::string& json, Program* main_program, const std::vector<Program*>& programs) {
+	Plan        plan;
+	std::string error;
+	std::istringstream stream(json);
+	if (!LoadPlan(stream, &plan, &error)) {
+		::printf("Built-in patch error: %s\n", error.c_str());
+		return false;
+	}
+	plan.find_anywhere = true;
+	if (!ValidateGame(plan, main_program, &error)) {
+		// Another version of the game: its data is somewhere else, and the patch does not apply.
+		::printf("Built-in patch not applied: %s\n", error.c_str());
+		return false;
+	}
+	return ApplyLoaded(std::move(plan), main_program, programs);
+}
+
+bool ContainsBytes(const std::vector<Program*>& programs, const std::vector<uint8_t>& bytes) {
+	if (bytes.empty()) {
+		return false;
+	}
+	for (const auto* program: programs) {
+		if (program == nullptr || program->elf == nullptr || program->base_vaddr == 0) {
+			continue;
+		}
+		const auto* ehdr = program->elf->GetEhdr();
+		const auto* phdr = program->elf->GetPhdr();
+		for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+			const auto& segment = phdr[index];
+			if ((segment.p_type != PT_LOAD && segment.p_type != PT_OS_RELRO) || segment.p_filesz < bytes.size()) {
+				continue;
+			}
+			const auto* begin = reinterpret_cast<const uint8_t*>(program->base_vaddr + segment.p_vaddr);
+			const auto* end   = begin + segment.p_filesz;
+			if (std::search(begin, end, bytes.begin(), bytes.end()) != end) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 bool ApplyPending(Program* program) {

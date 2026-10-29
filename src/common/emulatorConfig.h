@@ -72,6 +72,7 @@ struct ConfigOptions {
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
 	bool                   network_connected           = false;
+	bool                   ea_emulation_enabled        = true;
 	uint32_t               vblank_frequency            = 60;
 	// Guest frames (suspend points) recorded before the host GPU completes the oldest of them.
 	uint32_t               gpu_frames_in_flight        = 2;
@@ -149,6 +150,10 @@ bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();
+// For a title whose servers the emulator answers itself (libs/eaEmulation): its network is reachable.
+void     SetNetworkConnected();
+// A game of EA gets the built-in stand-in for EA's servers (libs/eaEmulation).
+bool     EaEmulationEnabled();
 uint32_t GetVblankFrequency();
 inline constexpr uint32_t MAX_GPU_FRAMES_IN_FLIGHT = 3;
 uint32_t                  GetGpuFramesInFlight();

@@ -145,6 +145,14 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
+void SetNetworkConnected() {
+	g_config->network_connected = true;
+}
+
+bool EaEmulationEnabled() {
+	return g_config->ea_emulation_enabled;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }

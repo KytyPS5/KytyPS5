@@ -209,6 +209,8 @@ add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/libs/*.cpp"
 	"${KYTY_SOURCE_DIR}/libs/*.h"
+	"${KYTY_SOURCE_DIR}/libs/eaEmulation/*.cpp"
+	"${KYTY_SOURCE_DIR}/libs/eaEmulation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/*.cpp"
@@ -342,7 +344,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
 
 # Linux system libraries.
 if(LINUX)
@@ -444,6 +446,35 @@ target_include_directories(frame_pacer_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(frame_pacer_tests Threads::Threads)
 endif()
+
+add_executable(ea_emulation_tdf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EaEmulationTdfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/eaEmulation/eaTdf.cpp"
+)
+target_include_directories(ea_emulation_tdf_tests PRIVATE ${inc_headers})
+target_link_libraries(ea_emulation_tdf_tests fmt::fmt)
+
+add_executable(ea_emulation_pre_auth_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EaEmulationPreAuthTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/eaEmulation/eaPreAuth.cpp"
+	"${KYTY_SOURCE_DIR}/libs/eaEmulation/eaTdf.cpp"
+)
+target_include_directories(ea_emulation_pre_auth_tests PRIVATE ${inc_headers})
+target_link_libraries(ea_emulation_pre_auth_tests fmt::fmt)
+
+add_executable(np_webapi2_entitlements_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NpWebApi2EntitlementsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/npWebApi2Entitlements.cpp"
+)
+target_include_directories(np_webapi2_entitlements_tests PRIVATE ${inc_headers})
+target_link_libraries(np_webapi2_entitlements_tests nlohmann_json::nlohmann_json)
+
+add_executable(ea_emulation_patch_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EaEmulationPatchPlanTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/eaEmulation/eaPatchPlan.cpp"
+)
+target_include_directories(ea_emulation_patch_plan_tests PRIVATE ${inc_headers})
+target_link_libraries(ea_emulation_patch_plan_tests fmt::fmt nlohmann_json::nlohmann_json)
 
 add_executable(pending_labels_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PendingLabelsTests.cpp"
@@ -813,6 +844,10 @@ if(BUILD_TESTING)
 	add_test(NAME guest_write_log COMMAND $<TARGET_FILE:guest_write_log_tests>)
 	add_test(NAME copy_workers COMMAND $<TARGET_FILE:copy_workers_tests>)
 	add_test(NAME frame_pacer COMMAND $<TARGET_FILE:frame_pacer_tests>)
+	add_test(NAME ea_emulation_tdf COMMAND $<TARGET_FILE:ea_emulation_tdf_tests>)
+	add_test(NAME ea_emulation_pre_auth COMMAND $<TARGET_FILE:ea_emulation_pre_auth_tests>)
+	add_test(NAME np_webapi2_entitlements COMMAND $<TARGET_FILE:np_webapi2_entitlements_tests>)
+	add_test(NAME ea_emulation_patch_plan COMMAND $<TARGET_FILE:ea_emulation_patch_plan_tests>)
 	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
 	add_test(NAME guest_memory_window COMMAND $<TARGET_FILE:guest_memory_window_tests>)
 	add_test(NAME gpu_write_ticks COMMAND $<TARGET_FILE:gpu_write_ticks_tests>)
@@ -928,6 +963,10 @@ if(BUILD_TESTING)
 		guest_write_log_tests
 		copy_workers_tests
 		frame_pacer_tests
+		ea_emulation_tdf_tests
+		ea_emulation_pre_auth_tests
+		ea_emulation_patch_plan_tests
+		np_webapi2_entitlements_tests
 		pending_labels_tests
 		guest_memory_window_tests
 		gpu_write_ticks_tests

@@ -1,3 +1,4 @@
+#include "libs/eaEmulation/eaServer.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -5,6 +6,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/npWebApi2Entitlements.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -727,6 +729,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
 	LIB_FUNC("EY28T2bkN7k", Http::HttpAddRequestHeader);
 	LIB_FUNC("1e2BNwI-XzE", Http::HttpSendRequest);
+	LIB_FUNC("P5pdoykPYTk", Http::HttpReadData);
 	LIB_FUNC("hvG6GfBMXg8", Http::HttpAbortRequest);
 	LIB_FUNC("qISjDHrxONc", Http::HttpWaitRequest);
 	LIB_FUNC("0a2TBNfE3BU", Http::HttpGetStatusCode);
@@ -1835,6 +1838,19 @@ static int np_auth_complete_signed_out(NpAuthRequest* request) {
 	return request->async ? 0 : NP_ERROR_SIGNED_OUT;
 }
 
+// KYTY_PSN_SIGNED_IN: the local user has a PSN account, so a request for an authorization code or
+// an id token succeeds with a placeholder. Only a stand-in server accepts it.
+static bool np_auth_ea_signed_in() {
+	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || EaEmulation::SignedInForTitle();
+	return enabled;
+}
+
+static int np_auth_complete_ok(NpAuthRequest* request) {
+	request->state  = NpAuthRequestState::Complete;
+	request->result = 0;
+	return 0;
+}
+
 static int KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
 	PRINT_NAME();
 
@@ -1884,6 +1900,15 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 	// request->result = 0;
 
 	// return 0;
+	if (np_auth_ea_signed_in()) {
+		if (auth_code != nullptr) {
+			std::strncpy(static_cast<char*>(auth_code), "kyty0001", 127);
+		}
+		if (issuer_id != nullptr) {
+			*issuer_id = 256;
+		}
+		return np_auth_complete_ok(request);
+	}
 	return np_auth_complete_signed_out(request);
 }
 
@@ -1913,6 +1938,12 @@ static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void*
 	// request->result = 0;
 
 	// return 0;
+	if (np_auth_ea_signed_in()) {
+		if (id_token != nullptr) {
+			std::strncpy(static_cast<char*>(id_token), "kyty.emulated.idtoken", 4103);
+		}
+		return np_auth_complete_ok(request);
+	}
 	return np_auth_complete_signed_out(request);
 }
 
@@ -2042,6 +2073,12 @@ struct NpWebApi2ResponseInformationOption {
 	size_t  error_object_size;
 	size_t  response_data_size;
 };
+
+// KYTY_PSN_SIGNED_IN: see the same switch in NpAuth.
+static bool np_webapi2_ea_signed_in() {
+	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || EaEmulation::SignedInForTitle();
+	return enabled;
+}
 
 struct NpWebApi2Request {
 	std::string api_group;
@@ -2177,6 +2214,28 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 
 	request->second.response.clear();
 	request->second.read_offset = 0;
+
+	// KYTY_PSN_SIGNED_IN: the answers a signed-in account would get. The bodies follow the public
+	// shape of these calls; the game's own checks decide whether they are enough.
+	if (np_webapi2_ea_signed_in()) {
+		const auto& path = request->second.path;
+		if (path.find("/entitlements") != std::string::npos) {
+			request->second.response = Network::OwnedEntitlementsJson(path);
+		} else if (path.find("/communication/restriction/status") != std::string::npos) {
+			request->second.response = R"({"restricted":false,"restrictionStatus":"NOT_RESTRICTED"})";
+		} else {
+			request->second.response = "{}";
+		}
+		if (response_info_option != nullptr) {
+			response_info_option->http_status        = 200;
+			response_info_option->response_data_size = request->second.response.size();
+			if (response_info_option->error_object != nullptr &&
+			    response_info_option->error_object_size > 0) {
+				response_info_option->error_object[0] = '\0';
+			}
+		}
+		return 0;
+	}
 
 	if (response_info_option != nullptr) {
 		response_info_option->http_status        = 0;

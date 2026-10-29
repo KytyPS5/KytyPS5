@@ -21,6 +21,11 @@ namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
 
+// The emulator's NOT_READY result, which a push to a missing context returns.
+constexpr int AUDIO_OUT2_ERROR_NOT_READY = -2144960504; // 0x80268008
+// How long a push thread may take before a test counts it as never returning.
+constexpr std::chrono::seconds PUSH_RETURN_LIMIT {10};
+
 AudioOut2::AudioOut2UserHandle     g_user_handle = 0;
 std::mutex                        g_device_mutex;
 std::condition_variable           g_device_cv;
@@ -921,6 +926,39 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 
 } // namespace Libs::LibKernel
 
+// Pushes on its own thread and waits a bounded time for it, so a push that never returns fails
+// the test instead of hanging it. Returns the push result.
+int PushWithLimit(AudioOut2::AudioOut2ContextHandle context, uint32_t blocking) {
+	std::atomic<bool> returned {false};
+	int               result = OK;
+	std::thread       pusher([&]() {
+		result   = AudioOut2::AudioOut2ContextPush(context, blocking);
+		returned = true;
+	});
+	const auto deadline = std::chrono::steady_clock::now() + PUSH_RETURN_LIMIT;
+	while (!returned && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	if (!returned) {
+		Check(false, "push to a missing context never returned");
+	}
+	pusher.join();
+	return result;
+}
+
+// A push to a context that is gone, or never existed, returns instead of waiting for it forever.
+void TestPushToMissingContextReturns() {
+	constexpr AudioOut2::AudioOut2ContextHandle never_created = 0xdead0000u;
+	const auto                                  destroyed     = CreateContext();
+	AudioOut2::AudioOut2ContextDestroy(destroyed);
+	Check(PushWithLimit(destroyed, 1) == AUDIO_OUT2_ERROR_NOT_READY,
+	      "blocking push to a destroyed context did not report NOT_READY");
+	Check(PushWithLimit(destroyed, 0) == AUDIO_OUT2_ERROR_NOT_READY,
+	      "non-blocking push to a destroyed context changed its result");
+	Check(PushWithLimit(never_created, 1) == AUDIO_OUT2_ERROR_NOT_READY,
+	      "blocking push to an unknown context did not report NOT_READY");
+}
+
 int main() {
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
 	TestUserSupportedAttributes();
@@ -942,6 +980,7 @@ int main() {
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
 	TestBlockedPushOnlyHoldsItsContext();
+	TestPushToMissingContextReturns();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

@@ -633,23 +633,27 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
 		// vibration/failed-open handle) has no downstream operation that can block this call.
 		g_audioout2_state_mutex.Lock();
-		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
-			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
-				auto& submission = audioout2_submission(*state);
-				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
-				return OK;
+		auto* state = audioout2_find_context_locked(ctx);
+		if (state == nullptr) {
+			g_audioout2_state_mutex.Unlock();
+			// A blocking push to a context destroyed under it would otherwise wait forever. The
+			// console's error for this case is unknown, so both modes keep the non-blocking result.
+			return AUDIO_OUT2_ERROR_NOT_READY;
+		}
+		const bool use_device_clock = blocking != 0 && audioout2_context_has_queueable_device(*state);
+		audioout2_update_context_locked(state);
+		sleep_micros = audioout2_grain_micros(state->num_grains);
+		if (state->queued < state->queue_depth || use_device_clock) {
+			if (state->queued == 0) {
+				state->last_update = audioout2_clock();
 			}
+			if (state->queued < state->queue_depth) {
+				state->queued++;
+			}
+			auto& submission = audioout2_submission(*state);
+			g_audioout2_state_mutex.Unlock();
+			audioout2_queue_context_audio(ctx, submission, blocking != 0);
+			return OK;
 		}
 		g_audioout2_state_mutex.Unlock();
 

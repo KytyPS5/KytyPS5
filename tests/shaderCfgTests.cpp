@@ -14819,43 +14819,60 @@ void TestNewShaderRecompilerFormattedLoadSelectsDefault() {
         "branch_guarded_loads did not restore the branch around a formatted load");
 }
 
-// A buffer load under a runtime EXEC mask runs for every lane and selects zero for the inactive
-// ones, so the EXEC guard adds no phi. A coherent load keeps the branch around the whole access.
-// The dwordx2 load returns a two-word array, which must be selected one component at a time.
-// Each shader is compared with the same shader writing VCC instead of EXEC, so only phis the
-// EXEC guard adds are counted.
-void TestNewShaderRecompilerExecGuardedLoadSelects() {
+// Compiles a buffer load followed by a second load of the given width, with EXEC written from
+// the first load's value either before the second load, which guards it, or after it, which does
+// not. Both orders contain the same instructions, so they differ only in that one guard.
+TestCompileResult CompileExecOrderShader(uint32_t load, bool coherent, bool exec_before_load) {
   constexpr uint32_t mubuf = 0x38u << 26u;
   constexpr uint32_t offen = 1u << 12u;
   constexpr uint32_t glc = 1u << 14u;
   constexpr uint32_t opcode_shift = 18u;
-  constexpr uint32_t load_dword = 0x0cu, load_dwordx2 = 0x0du, store_dword = 0x1cu;
-  constexpr uint32_t v_cmp_gt_u32 = 0xc4u, v_cmpx_gt_u32 = 0xd4u;
+  constexpr uint32_t load_dword = 0x0cu, store_dword = 0x1cu;
+  constexpr uint32_t v_cmpx_gt_u32 = 0xd4u;
   constexpr uint32_t s_endpgm = 0x01u;
   constexpr uint32_t vgpr_base = 256u;
-  const auto compile = [&](uint32_t load, bool coherent, bool exec_guard) {
-    const uint32_t shader[] = {
-        mubuf | (load_dword << opcode_shift) | offen,
-        EncodeMubuf1(2, 0, 0), // buffer_load_dword v2, v0 offen
-        // EXEC from a loaded value stays runtime. The VCC form leaves the load unguarded.
-        EncodeVopc(exec_guard ? v_cmpx_gt_u32 : v_cmp_gt_u32, vgpr_base + 2, 0),
-        mubuf | (load << opcode_shift) | offen | (coherent ? glc : 0u),
-        EncodeMubuf1(3, 0, 0), // buffer_load_dword or dwordx2 v3, v0 offen
-        EncodeMubuf0(store_dword, 0, false),
-        EncodeMubuf1(3, 0, 0), // buffer_store_dword v3
-        EncodeSopp(s_endpgm),
-    };
-    auto options = MakeCompileOptions(ShaderType::Compute);
-    auto result = RecompileForTest(shader, options);
-    CheckSpirvBinaryValidates(result.spirv);
-    return result;
+  // EXEC from a loaded value stays runtime.
+  const uint32_t exec_write = EncodeVopc(v_cmpx_gt_u32, vgpr_base + 2, 0);
+  const uint32_t second_load[] = {
+      mubuf | (load << opcode_shift) | offen | (coherent ? glc : 0u),
+      EncodeMubuf1(3, 0, 0), // buffer_load_dword or dwordx2 v3, v0 offen
   };
+  std::vector<uint32_t> shader = {
+      mubuf | (load_dword << opcode_shift) | offen,
+      EncodeMubuf1(2, 0, 0), // buffer_load_dword v2, v0 offen
+  };
+  if (exec_before_load) shader.push_back(exec_write);
+  shader.insert(shader.end(), std::begin(second_load), std::end(second_load));
+  if (!exec_before_load) shader.push_back(exec_write);
+  shader.insert(shader.end(), {
+      EncodeMubuf0(store_dword, 0, false),
+      EncodeMubuf1(3, 0, 0), // buffer_store_dword v3
+      EncodeSopp(s_endpgm),
+  });
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  return result;
+}
+
+// A buffer load under a runtime EXEC mask runs for every lane and selects zero for the inactive
+// ones, so the EXEC guard adds no phi. A coherent load keeps the branch around the whole access.
+// The dwordx2 load returns a two-word array, which must be selected one word at a time.
+// Each shader is compared with the same instructions with EXEC written after the second load.
+// The shader starts with every lane active, so in that order the second load has no runtime EXEC
+// guard, and the only extra phis or selects are the ones guarding it by EXEC. A second load that
+// lost that guard, or kept it on only one word, would leave too few extra selects.
+void TestNewShaderRecompilerExecGuardedLoadSelects() {
+  constexpr uint32_t load_dword = 0x0cu, load_dwordx2 = 0x0du;
   for (const uint32_t load : {load_dword, load_dwordx2}) {
+    const uint32_t loaded_words = load == load_dwordx2 ? 2u : 1u;
     for (const bool coherent : {false, true}) {
-      const auto guarded = compile(load, coherent, true);
-      const auto unguarded = compile(load, coherent, false);
+      const auto guarded = CompileExecOrderShader(load, coherent, true);
+      const auto unguarded = CompileExecOrderShader(load, coherent, false);
       const auto guarded_phis = SpirvInstructionOpcodeCount(guarded.spirv, spv::OpPhi);
       const auto unguarded_phis = SpirvInstructionOpcodeCount(unguarded.spirv, spv::OpPhi);
+      const auto guarded_selects = SpirvInstructionOpcodeCount(guarded.spirv, spv::OpSelect);
+      const auto unguarded_selects = SpirvInstructionOpcodeCount(unguarded.spirv, spv::OpSelect);
       const auto guards = FindSpirvLoadGuards(guarded.spirv);
       if (coherent) {
         Check(guarded_phis > unguarded_phis, "coherent EXEC-guarded load lost its branch");
@@ -14863,6 +14880,8 @@ void TestNewShaderRecompilerExecGuardedLoadSelects() {
         Check(guarded_phis == unguarded_phis, "EXEC-guarded buffer load kept a branch");
         Check(guards.selected_classes.contains(spv::StorageClassStorageBuffer),
               "EXEC-guarded buffer load was not selected");
+        Check(guarded_selects >= unguarded_selects + loaded_words,
+              "EXEC-guarded buffer load did not select each loaded word");
       }
     }
   }

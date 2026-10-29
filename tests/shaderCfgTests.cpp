@@ -43,12 +43,14 @@
 #include <deque>
 #include <initializer_list>
 #include <iterator>
+#include <map>
 #include <span>
 #include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -12063,6 +12065,289 @@ void TestMeshInputAssembly() {
   }
 }
 
+// Body indices that send a jump-table entry back to the jump block itself or to the
+// preamble before it.
+constexpr uint32_t JumpTableSelfTarget = UINT32_MAX;
+constexpr uint32_t JumpTablePreambleTarget = UINT32_MAX - 1u;
+
+// Shape of a synthetic jump-table shader. Entry i jumps to body entry_bodies[i]. Each
+// body sets s20 and branches to a shared s_endpgm, except that with fall_through an even
+// body runs into the next one, and body latch_body branches back to the jump block.
+struct JumpTableShape {
+  std::vector<uint32_t> entry_bodies;
+  uint32_t bodies = 0;
+  bool fall_through = false;
+  uint32_t latch_body = UINT32_MAX;
+};
+
+// Builds a compute shader whose s_setpc_b64 jumps through an 8-byte table indexed by s0,
+// after one preamble instruction.
+std::vector<uint32_t> MakeJumpTableShader(const JumpTableShape &shape) {
+  constexpr uint32_t inline_zero = 128u;
+  constexpr uint32_t max_inline = 64u;
+  constexpr uint32_t literal = 255u;
+  const auto last_entry = static_cast<uint32_t>(shape.entry_bodies.size() - 1);
+  std::vector<uint32_t> code{EncodeSMovB32(21, 129)}; // preamble
+  const auto jump_index = code.size();
+  if (last_entry <= max_inline) {
+    code.push_back(EncodeSop2(0x07, 0, 0, inline_zero + last_entry)); // s_min_u32 s0
+  } else {
+    code.push_back(EncodeSop2(0x07, 0, 0, literal));
+    code.push_back(last_entry);
+  }
+  code.push_back(EncodeSop2(0x1e, 0, 0, 131)); // s_lshl_b32 s0, s0, 3
+  code.push_back(EncodeSop1(0x1f, 8, 0));      // s_getpc_b64 s[8:9]
+  const auto table_base = static_cast<uint32_t>(code.size()) * 4u;
+  code.push_back(EncodeSop2(0x00, 8, 8, literal)); // s_add_u32 s8, s8, literal
+  const auto table_literal = code.size();
+  code.push_back(0u);
+  code.push_back(EncodeSop2(0x04, 9, 9, inline_zero)); // s_addc_u32 s9, s9, 0
+  code.push_back(EncodeSmem0(0x01, 4, 4));
+  code.push_back(0u);                          // s_load_dwordx2 s[4:5], s[8:9], s0
+  code.push_back(EncodeSopp(0x0c, 0));         // s_waitcnt 0
+  code.push_back(EncodeSop1(0x1f, 10, 0));     // s_getpc_b64 s[10:11]
+  const auto target_base = static_cast<uint32_t>(code.size()) * 4u;
+  code.push_back(EncodeSop2(0x00, 10, 10, 4)); // s_add_u32 s10, s10, s4
+  code.push_back(EncodeSop2(0x04, 11, 11, 5)); // s_addc_u32 s11, s11, s5
+  code.push_back(EncodeSop1(0x20, 0, 10));     // s_setpc_b64 s[10:11]
+  std::vector<uint32_t> body_pcs;
+  std::vector<size_t> exits;
+  for (uint32_t body = 0; body < shape.bodies; ++body) {
+    body_pcs.push_back(static_cast<uint32_t>(code.size()) * 4u);
+    code.push_back(EncodeSMovB32(20, 129 + body % 8u));
+    if (body == shape.latch_body) {
+      // s_branch counts dwords from the next instruction, so a backward jump is negative.
+      const auto back = static_cast<int64_t>(jump_index) - static_cast<int64_t>(code.size() + 1);
+      code.push_back(EncodeSopp(0x02, static_cast<uint16_t>(back)));
+      continue;
+    }
+    if (shape.fall_through && body % 2u == 0 && body + 1 < shape.bodies) continue;
+    exits.push_back(code.size());
+    code.push_back(EncodeSopp(0x02, 0));
+  }
+  const auto end = code.size();
+  for (const auto exit : exits) {
+    code[exit] = EncodeSopp(0x02, static_cast<uint32_t>(end - exit - 1));
+  }
+  code.push_back(EncodeSopp(0x01, 0)); // s_endpgm
+  code[table_literal] = static_cast<uint32_t>(code.size()) * 4u - table_base;
+  for (const auto body : shape.entry_bodies) {
+    const auto pc = body == JumpTableSelfTarget       ? static_cast<uint32_t>(jump_index) * 4u
+                    : body == JumpTablePreambleTarget ? 0u
+                                                      : body_pcs.at(body);
+    const auto offset = static_cast<int64_t>(pc) - static_cast<int64_t>(target_base);
+    code.push_back(static_cast<uint32_t>(offset));
+    code.push_back(static_cast<uint32_t>(static_cast<uint64_t>(offset) >> 32u));
+  }
+  return code;
+}
+
+// Follows a CFG from its entry and returns the first max_instructions guest instructions
+// it runs. Each time the jump table is reached it reads the next selector, and the last
+// one repeats. The native graph reads it at the indirect branch and the structured graph
+// at the block that captures SelectorIn, so a capture that goes stale in a loop shows up.
+// The limit counts instructions, not blocks, because a structured loop adds empty blocks
+// to each iteration. A selector outside the table returns, like the dispatcher's default.
+std::vector<uint32_t> TraceJumpTableGraph(const ShaderRecompiler::CFG::Graph &graph,
+                                          const std::vector<uint32_t> &selectors,
+                                          size_t max_instructions) {
+  namespace CFG = ShaderRecompiler::CFG;
+  using Op = CFG::ConditionExpression::Op;
+  constexpr uint32_t max_blocks = 100000u;
+  std::vector<uint32_t> executed;
+  std::map<uint32_t, bool> variables;
+  size_t visit = 0;
+  const auto selector = [&] { return selectors.at(std::min(visit, selectors.size() - 1)); };
+  const auto evaluate = [&](auto &&self, uint32_t index) -> bool {
+    const auto &value = graph.expressions.at(index);
+    switch (value.op) {
+    case Op::Constant: return value.lhs != 0;
+    case Op::Variable: return variables[value.lhs];
+    case Op::Not: return !self(self, value.lhs);
+    case Op::Or: return self(self, value.lhs) || self(self, value.rhs);
+    case Op::SelectorIn: {
+      const auto &values = graph.selector_value_lists.at(value.rhs);
+      return std::ranges::find(values, selector()) != values.end();
+    }
+    case Op::Native: break;
+    }
+    Check(false, "jump-table trace met a native predicate");
+    return false;
+  };
+  auto current = graph.entry_block;
+  for (uint32_t step = 0; step < max_blocks && executed.size() < max_instructions; ++step) {
+    const auto &block = graph.blocks.at(current);
+    for (auto inst = block.inst_begin; inst < block.inst_end; ++inst)
+      executed.push_back(inst);
+    bool read_selector = false;
+    for (const auto &assignment : block.assignments) {
+      read_selector |= graph.expressions[assignment.expression].op == Op::SelectorIn;
+      variables[assignment.variable] = evaluate(evaluate, assignment.expression);
+    }
+    visit += read_selector ? 1u : 0u;
+    const auto &term = block.terminator;
+    if (term.kind == CFG::TerminatorKind::Return) break;
+    if (term.kind == CFG::TerminatorKind::IndirectBranch) {
+      const auto found = std::ranges::find(term.indirect_selector_values, selector());
+      ++visit;
+      if (found == term.indirect_selector_values.end()) break;
+      current = term.indirect_selector_targets.at(
+          static_cast<size_t>(found - term.indirect_selector_values.begin()));
+      continue;
+    }
+    Check(term.kind == CFG::TerminatorKind::Branch ||
+              (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+               term.expression != UINT32_MAX),
+          "jump-table trace met an unsupported terminator");
+    const bool taken = term.kind == CFG::TerminatorKind::Branch ||
+                       evaluate(evaluate, term.expression);
+    current = taken ? term.true_block : term.false_block;
+  }
+  if (executed.size() > max_instructions) executed.resize(max_instructions);
+  return executed;
+}
+
+// Builds the native graph of a jump-table shader. BuildGraph still sends every jump table
+// to the dispatcher by marking the graph irreducible, so the test checks that the graph
+// really is reducible and clears that flag.
+ShaderRecompiler::CFG::Graph NativeJumpTableGraph(const std::vector<uint32_t> &shader,
+                                                  ShaderRecompiler::Decoder::Program &decoded) {
+  namespace CFG = ShaderRecompiler::CFG;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto native = CFG::BuildGraph(decoded);
+  Check(native.irreducible &&
+            native.failure_kind == CFG::FailureKind::IrreducibleControlFlow,
+        "jump-table fixture did not resolve its table");
+  Check(std::ranges::all_of(native.back_edges, [](const auto &edge) { return edge.natural; }) &&
+            std::ranges::none_of(native.components,
+                                 [](const auto &component) { return component.irreducible; }),
+        "jump-table fixture is not reducible");
+  native.irreducible = false;
+  native.failure_kind = CFG::FailureKind::None;
+  native.unsupported_reason.clear();
+  return native;
+}
+
+// A resolved jump table must structurize into one SelectorIn goto per target and run
+// the same guest instructions as the native graph for every selector sequence.
+void TestCfgJumpTableGotoChain() {
+  namespace CFG = ShaderRecompiler::CFG;
+  constexpr uint32_t entry_bytes = 8u;
+  constexpr size_t trace_instructions = 200u;
+  struct Case {
+    const char *name;
+    JumpTableShape shape;
+  };
+  const Case cases[] = {
+      {"duplicate targets", {{0u, 1u, 0u, 2u}, 3u}},
+      {"fall-through bodies", {{3u, 2u, 1u, 0u}, 4u, true}},
+      {"loop header target", {{0u, JumpTableSelfTarget, 1u}, 2u}},
+      {"earlier loop header target", {{JumpTablePreambleTarget, 0u, 1u}, 2u}},
+      {"two-latch loop header", {{JumpTableSelfTarget, 0u, 1u, 2u}, 3u, false, 1u}},
+  };
+  for (const auto &test : cases) {
+    ShaderRecompiler::Decoder::Program decoded;
+    const auto native = NativeJumpTableGraph(MakeJumpTableShader(test.shape), decoded);
+    // A second latch makes the structurizer reach the header through a continue label.
+    Check(test.shape.latch_body == UINT32_MAX ||
+              std::ranges::any_of(native.natural_loops,
+                                  [&](const auto &loop) {
+                                    return std::ranges::count(native.natural_loops, loop.header,
+                                                              &CFG::NaturalLoop::header) >= 2;
+                                  }),
+          "two-latch jump-table fixture did not build two latches");
+    const auto structured = CFG::Structurize(native);
+    Check(!structured.unsupported, test.name);
+    Check(std::ranges::none_of(structured.blocks,
+                               [](const auto &block) {
+                                 return block.terminator.kind ==
+                                        CFG::TerminatorKind::IndirectBranch;
+                               }),
+          "structured jump table kept an indirect branch");
+    Check(CfgInstructionCoverage(structured, decoded.instructions.size()) ==
+              CfgInstructionCoverage(native, decoded.instructions.size()),
+          "structured jump table duplicated or dropped guest instructions");
+    auto unique_bodies = test.shape.entry_bodies;
+    std::ranges::sort(unique_bodies);
+    unique_bodies.erase(std::unique(unique_bodies.begin(), unique_bodies.end()),
+                        unique_bodies.end());
+    Check(structured.selector_value_lists.size() == unique_bodies.size(),
+          "structured jump table did not test each target once");
+    if (&test == &cases[0]) {
+      Check(std::ranges::count(structured.selector_value_lists,
+                               std::vector<uint32_t>{0u, 2u * entry_bytes}) == 1,
+            "entries sharing a target were not grouped into one SelectorIn");
+    }
+    // The selector is read at block end, so no later guest code may share its block.
+    const auto jump_end = std::ranges::find_if(native.blocks, [](const auto &block) {
+                            return block.terminator.kind == CFG::TerminatorKind::IndirectBranch;
+                          })->inst_end;
+    for (const auto &block : structured.blocks) {
+      const bool reads_selector =
+          std::ranges::any_of(block.assignments, [&](const auto &assignment) {
+            return structured.expressions[assignment.expression].op ==
+                   CFG::ConditionExpression::Op::SelectorIn;
+          });
+      Check(!reads_selector || block.inst_end == jump_end,
+            "structured jump table read its selector after later guest code");
+    }
+    // Start at each entry and at the first offset past the table, which must return. Then
+    // walk the following ones and end past the table.
+    const auto entries = static_cast<uint32_t>(test.shape.entry_bodies.size());
+    for (uint32_t first = 0; first <= entries; ++first) {
+      std::vector<uint32_t> selectors;
+      for (uint32_t step = 0; step <= entries; ++step)
+        selectors.push_back((first + step) % (entries + 1u) * entry_bytes);
+      selectors.push_back(entries * entry_bytes);
+      Check(TraceJumpTableGraph(structured, selectors, trace_instructions) ==
+                TraceJumpTableGraph(native, selectors, trace_instructions),
+            "structured jump table ran different guest code for a selector");
+    }
+  }
+}
+
+// Jump tables the goto chain cannot express must fail structurization so the dispatcher
+// keeps handling them. A table at the target cap still structurizes.
+void TestCfgJumpTableFallbacks() {
+  namespace CFG = ShaderRecompiler::CFG;
+  constexpr uint32_t cap = 64u;
+  for (const auto targets : {cap, cap + 1u}) {
+    JumpTableShape shape{std::vector<uint32_t>(targets), targets};
+    for (uint32_t entry = 0; entry < targets; ++entry) shape.entry_bodies[entry] = entry;
+    ShaderRecompiler::Decoder::Program decoded;
+    const auto structured =
+        CFG::Structurize(NativeJumpTableGraph(MakeJumpTableShader(shape), decoded));
+    const bool over_cap = structured.unsupported &&
+                          structured.unsupported_reason.find("too many targets") !=
+                              std::string::npos;
+    Check(over_cap == (targets > cap) && (over_cap || !structured.unsupported),
+          "jump-table target cap did not split at 64 targets");
+  }
+  // Without an indexed selector the chain would have no gotos and always return.
+  ShaderRecompiler::Decoder::Program decoded;
+  auto native = NativeJumpTableGraph(MakeJumpTableShader({{0u, 1u}, 2u}), decoded);
+  for (auto &block : native.blocks) {
+    if (block.terminator.kind == CFG::TerminatorKind::IndirectBranch)
+      block.terminator.indirect_selector_code = UINT32_MAX;
+  }
+  const auto structured = CFG::Structurize(native);
+  Check(structured.unsupported &&
+            structured.unsupported_reason.find("no indexed selector") != std::string::npos,
+        "jump table without an indexed selector did not fail structurization");
+  // A repeated value would take the first matching target where the dispatcher takes the last.
+  ShaderRecompiler::Decoder::Program repeated_decoded;
+  auto repeated = NativeJumpTableGraph(MakeJumpTableShader({{0u, 1u}, 2u}), repeated_decoded);
+  for (auto &block : repeated.blocks) {
+    auto &values = block.terminator.indirect_selector_values;
+    if (values.size() > 1) values[1] = values[0];
+  }
+  const auto repeated_structured = CFG::Structurize(repeated);
+  Check(repeated_structured.unsupported &&
+            repeated_structured.unsupported_reason.find("repeats a selector value") !=
+                std::string::npos,
+        "jump table with a repeated selector value did not fail structurization");
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -17408,6 +17693,8 @@ int main() {
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
+  TestCfgJumpTableGotoChain();
+  TestCfgJumpTableFallbacks();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable(6);
   TestNewShaderRecompilerSetpcDwordJumpTable(106);

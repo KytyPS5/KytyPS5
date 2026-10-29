@@ -14779,6 +14779,46 @@ void TestNewShaderRecompilerLdsLoadKeepsBranch() {
         "LDS load lost its bounds branch");
 }
 
+// Formatted loads select each component against its out-of-range value, with no phi for the
+// driver to merge, and the kill switch brings the branch back. The xy record uses a two-word
+// array type that a vector select could not take, so it checks the scalar selects validate.
+void TestNewShaderRecompilerFormattedLoadSelectsDefault() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x01, 0),
+      EncodeMubuf1(88, 0, 1), // buffer_load_format_xy
+      EncodeMubuf0(0x03, 0),
+      EncodeMubuf1(96, 0, 1), // buffer_load_format_xyzw
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(88, 0, 0), // buffer_store_dword v88
+      EncodeMubuf0(0x1c, 4, false),
+      EncodeMubuf1(99, 0, 0), // buffer_store_dword v99
+      EncodeSopp(0x01),
+  };
+  constexpr uint32_t selected_components = 2u + 4u;
+  constexpr uint32_t stride = 16u, records = 4u, format_shift = 12u;
+  // Word 3 bit 24, which the GPU harness sets on every structured buffer descriptor.
+  constexpr uint32_t resource_level = 1u << 24u;
+  // A structured float4 buffer, so the loads take the formatted path.
+  const std::array<uint32_t, 4> user_data{
+      0x1000u, stride << 16u, records,
+      DstSel(4, 5, 6, 7) | resource_level |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << format_shift)};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpPhi) == 0u &&
+            SpirvInstructionOpcodeCount(result.spirv, spv::OpSelect) >= selected_components,
+        "formatted loads were not selected per component");
+  ShaderRecompiler::Spirv::Profile branched{};
+  branched.branch_guarded_loads = true;
+  options.profile = &branched;
+  const auto fallback = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(fallback.spirv);
+  Check(SpirvInstructionOpcodeCount(fallback.spirv, spv::OpPhi) != 0u,
+        "branch_guarded_loads did not restore the branch around a formatted load");
+}
+
 void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
@@ -17541,6 +17581,7 @@ int main() {
   TestNewShaderRecompilerScalarBufferLoadSelectsDefault();
   TestNewShaderRecompilerBufferLoadSelectsDefault();
   TestNewShaderRecompilerLdsLoadKeepsBranch();
+  TestNewShaderRecompilerFormattedLoadSelectsDefault();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestVop3F16InterpolationTranslation();

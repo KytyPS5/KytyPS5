@@ -34058,6 +34058,50 @@ TestCase BufferLoadPastCheckedRange(u32 wave_size, bool subword) {
   return test;
 }
 
+// A formatted load of a record past the length the shader checks must read its out-of-range
+// value, now that its component loads run unguarded and each component is selected. The record
+// behind the checked length holds readable canaries, so only the select keeps them out. The w
+// lane selects a constant 1.0, so a fallback taken from the wrong component would show.
+TestCase BufferFormatLoadPastCheckedRange(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 stride = 16u, records = 8u, checked_records = 4u, canary = 0xc0de0000u;
+  constexpr u32 components = 4u, index_vgpr = 20u, one = 0x3f800000u, w = 3u;
+  constexpr u32 load_format_xyzw = 0x03u;
+  constexpr std::array loaded_records{checked_records - 1u, checked_records};
+  TestCase test;
+  test.name = wave_size == 64u ? "BufferFormatLoadPastCheckedRangeWave64"
+                               : "BufferFormatLoadPastCheckedRangeWave32";
+  for (u32 i = 0; i < records * components; ++i) test.initial.push_back(canary + i);
+  test.expected = test.initial;
+  u32 dst = 0;
+  for (const auto record : loaded_records) {
+    AppendVMovU32(&test.code, index_vgpr, record);
+    test.code.push_back(EncodeMubuf0(load_format_xyzw, 0, true, false));
+    test.code.push_back(EncodeMubuf1(dst, 0, index_vgpr));
+    const bool inside = record < checked_records;
+    for (u32 c = 0; c < components; ++c)
+      test.expected[dst++] = c == w ? one : inside ? canary + record * components + c : 0u;
+  }
+  for (u32 i = 0; i < dst; ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.user_data = MakeStructuredStorageBufferData(
+      stride, records, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(4, 5, 6, 1);
+  test.has_user_data = true;
+  test.storage_buffer_shader_size_bytes = checked_records * stride;
+  // A branched record merges its four components through a vector phi, which nothing else here
+  // produces.
+  test.required_spirv = {"OpSelect %uint"};
+  test.forbidden_spirv = {"OpPhi %v4uint"};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -46768,6 +46812,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferLoadPastCheckedRange(64, false));
   cases.push_back(BufferLoadPastCheckedRange(32, true));
   cases.push_back(BufferLoadPastCheckedRange(64, true));
+  cases.push_back(BufferFormatLoadPastCheckedRange(32));
+  cases.push_back(BufferFormatLoadPastCheckedRange(64));
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);

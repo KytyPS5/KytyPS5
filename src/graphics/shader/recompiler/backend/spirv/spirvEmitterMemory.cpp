@@ -382,8 +382,8 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 // not bound a descriptor array index, and non_uniform marks a slot chosen by a GPU value.
 // Callers guard one element load through an already resolved resource, so this resource is
 // enough here. A slot picked by a GPU value is non_uniform, and a coherent pair is volatile.
-// The guard around a whole vector access still needs the indirect root and pair checks. The
-// profile can force branches.
+// The outer exec guard around a whole access still needs the indirect root and pair checks.
+// The profile can force branches.
 static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
                                        const MemoryResourceAccess& resource) {
 	const bool robust_kind = resource.kind == IR::ResourceKind::Buffer ||
@@ -780,14 +780,62 @@ uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
 	return result;
 }
 
-uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                   const PreparedFormattedMemory& plan, uint32_t components) {
+// Returns the constant each component of a formatted record reads when the record is out of
+// range.
+std::array<uint32_t, 4> FormattedOutOfBoundsComponents(ValueEmitContext& ctx,
+                                                       const IR::MemoryInfo& mem,
+                                                       const PreparedFormattedMemory& plan,
+                                                       uint32_t components) {
 	std::array<uint32_t, 4> values {};
 	for (uint32_t component = 0; component < components; component++) {
 		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
 		values[component] = FormattedConstant(ctx, plan.info, source.kind);
 	}
-	return ConstructU32Composite(ctx.state, components, values);
+	return values;
+}
+
+uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                   const PreparedFormattedMemory& plan, uint32_t components) {
+	return ConstructU32Composite(ctx.state, components,
+	                             FormattedOutOfBoundsComponents(ctx, mem, plan, components));
+}
+
+// Loads every component of a formatted record unguarded and selects each one against its
+// out-of-range default. Each component is its own element load, so a record past the end never
+// becomes one wide load straddling the bound range. Selecting each scalar also avoids the bool
+// vector a vector select needs under SPIR-V 1.3, and works for the two-word array type.
+uint32_t SelectFormattedComponents(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                   const PreparedFormattedMemory& plan, uint32_t count) {
+	auto&      state     = ctx.state;
+	const auto fallbacks = FormattedOutOfBoundsComponents(ctx, mem, plan, count);
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < count; component++) {
+		values[component] =
+		    EmitGuardedValue(state, GuardStrategy::Select, plan.in_bounds,
+		                     ValueShape {TypeU32(state), 1u}, fallbacks[component],
+		                     [&]() { return LoadFormattedInBounds(ctx, mem, plan, component); });
+	}
+	return ConstructU32Composite(state, count, values);
+}
+
+// Reads a formatted record, or its out-of-range value when the record lies past the checked
+// length or the resource is null. LoadGuardStrategy picks per-component selects or one branch.
+uint32_t GuardFormattedRecord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                              const PreparedFormattedMemory& plan,
+                              const MemoryResourceAccess& resource, uint32_t count) {
+	auto& state = ctx.state;
+	if (resource.object_pointer == 0u) return FormattedOutOfBoundsValue(ctx, mem, plan, count);
+	if (LoadGuardStrategy(state, resource) == GuardStrategy::Select)
+		return SelectFormattedComponents(ctx, mem, plan, count);
+	return EmitValueOrDefaultIfCondition(
+	    state, plan.in_bounds, TypeU32Composite(state, count),
+	    FormattedOutOfBoundsValue(ctx, mem, plan, count), [&]() {
+		    std::array<uint32_t, 4> values {};
+		    for (uint32_t component = 0; component < count; component++) {
+			    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
+		    }
+		    return ConstructU32Composite(state, count, values);
+	    });
 }
 
 uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -797,15 +845,7 @@ uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto count = mem.data_bits == 16u ? mem.component_count : components;
 	const auto plan = resource.object_pointer == 0u ? PreparedFormattedMemory{.info = info}
 	                                              : PrepareFormattedMemory(ctx, inst, mem, resource, info);
-	const auto out_of_bounds = FormattedOutOfBoundsValue(ctx, mem, plan, count);
-	const auto value = resource.object_pointer == 0u ? out_of_bounds : EmitValueOrDefaultIfCondition(
-	    state, plan.in_bounds, TypeU32Composite(state, count), out_of_bounds, [&]() {
-		    std::array<uint32_t, 4> values {};
-		    for (uint32_t component = 0; component < count; component++) {
-			    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
-		    }
-		    return ConstructU32Composite(state, count, values);
-	    });
+	const auto value = GuardFormattedRecord(ctx, mem, plan, resource, count);
 	if (mem.data_bits != 16u) return value;
 	const bool integer = info.type == Format::ComponentType::Uint ||
 	                     info.type == Format::ComponentType::Sint;

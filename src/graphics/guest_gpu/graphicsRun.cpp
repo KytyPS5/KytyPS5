@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -150,6 +151,10 @@ void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	if (m_labels_ready.load(std::memory_order_acquire)) {
 		WriteCompletedLabels();
+	}
+	if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		// A command may unmap or read back memory the pending work uses: it is recorded first.
+		m_renderer.GetRenderExecutor().FlushPendingWork();
 	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
@@ -490,10 +495,20 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
+	auto& executor     = m_renderer.GetRenderExecutor();
+	// Behind the draws and dispatches before it, which read and write the same memory.
+	const auto run = [&](auto action) {
+		if (executor.HasPendingWork()) {
+			executor.QueueDeferred(std::move(action));
+		} else {
+			action();
+		}
+	};
 	if (src_sel == 2) {
-		buffer_cache.FillBuffer(
-		    dst_address_or_offset, num_bytes,
-		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		run([&buffer_cache, dst_address_or_offset, num_bytes, dst_gds,
+		     value = static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu)] {
+			buffer_cache.FillBuffer(dst_address_or_offset, num_bytes, value, dst_gds);
+		});
 		return;
 	}
 	bool src_gds = false;
@@ -503,8 +518,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
-	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
-	                        dst_gds, src_gds);
+	run([&buffer_cache, dst_address_or_offset, src = src_address_or_offset_or_immediate, num_bytes,
+	     dst_gds, src_gds] {
+		buffer_cache.CopyBuffer(dst_address_or_offset, src, num_bytes, dst_gds, src_gds);
+	});
 }
 
 void GuestGpu::Enqueue(Submission submission) {
@@ -769,6 +786,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	// A suspended or finished stream records nothing more: its last work is recorded now.
+	m_renderer.GetRenderExecutor().FlushPendingWork();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -783,6 +802,87 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
+}
+
+// Packets that leave a draw or dispatch pending (RenderExecutor::FlushPendingWork): they set
+// registers or the state the next draw reads, and record nothing; a draw or dispatch packet
+// decides itself.
+static bool KeepsWorkPending(const uint32_t* packet) {
+	const auto header = packet[0];
+	switch ((header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_WRITE_CONST_RAM:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		// The draws record in order: one whose arguments the CPU reads records the work before
+		// it first (CommandProcessor::DrawIndirectMulti).
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		// Only CP state: queued draws have their argument addresses already.
+		case Pm4::IT_SET_BASE:
+		// Queued behind the pending work (CommandProcessor::DmaData).
+		case Pm4::IT_DMA_DATA:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		// Cache actions: the handler does nothing (CpOpAcquireMem).
+		case Pm4::IT_ACQUIRE_MEM: return true;
+		// Flushes and cache writebacks order nothing the renderer does not (TriggerEvent); an
+		// occlusion counter dump writes memory.
+		case Pm4::IT_EVENT_WRITE: return (packet[1] & 0x3fu) != 0x39u;
+		case Pm4::IT_NOP: {
+			// Padding and the user data markers; other markers flip or write memory.
+			// Debug markers only log (CpOpPushMarker, CpOpPopMarker); a context state operation
+			// changes the registers the queued work already copied.
+			if (const auto r = KYTY_PM4_R(header);
+			    r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER || r == Pm4::R_CONTEXT_STATE) {
+				return true;
+			}
+			if (KYTY_PM4_R(header) != Pm4::R_ZERO) return false;
+			const auto word = packet[1];
+			return (word & 0xffff0000u) != 0x68750000u || word == 0x68750004u ||
+			       word == 0x6875000du;
+		}
+		default: return false;
+	}
+}
+
+// Packets that only set state or dispatch: the GPU runs the dispatches around them together.
+// Any other packet may synchronize them (partial flushes, cache actions, waits, memory writes).
+static bool LeavesComputeChainOpen(uint32_t packet_header) {
+	switch ((packet_header >> 8u) & 0xffu) {
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_CONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_QUEUE_REG:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_CONTEXT_CONTROL:
+		case Pm4::IT_CLEAR_STATE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_DISPATCH_DIRECT: return true;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			return r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+		}
+		default: return false;
+	}
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
@@ -863,8 +963,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (!KeepsWorkPending(packet)) {
+			m_renderer.GetRenderExecutor().FlushPendingWork();
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (!LeavesComputeChainOpen(packet_header)) {
+			// After the pending work: a dispatch queued last can open a chain when it is recorded.
+			// Any other queued work ends a chain it follows itself.
+			auto& executor = m_renderer.GetRenderExecutor();
+			if (executor.LastPendingIsDispatch()) {
+				executor.QueueDeferred([&scheduler = GetScheduler()] { scheduler.EndComputeChain(); });
+			} else if (!executor.HasPendingWork()) {
+				GetScheduler().EndComputeChain();
+			}
+		}
 		// Whatever the packet prepared buffers for has been recorded by now.
 		m_renderer.GetBufferCache().SettleGpuWrites();
 		GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Packet);
@@ -1032,8 +1145,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto args_size =
 		    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 		// Memory outside the tracked guest range (a test's host buffer) is never GPU-written.
+		// Work not recorded yet may write the arguments, and its writes are not tracked until it
+		// is: the host GPU reads them then too.
+		auto& executor = m_renderer.GetRenderExecutor();
 		if (GuestRange {args_address, args_size}.Valid() &&
-		    m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size)) {
+		    (executor.HasPendingWork() ||
+		     m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size))) {
 			const bool drawn =
 			    indexed ? DrawIndex({.index_count = m_index_buffer_size,
 			                         .index_addr  = reinterpret_cast<const void*>(m_index_base_addr),
@@ -1049,6 +1166,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// The CPU reads the count and the arguments: after the work before them is recorded.
+	m_renderer.GetRenderExecutor().FlushPendingWork();
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		draw_count = *count_addr;
@@ -1061,6 +1180,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
+	PerfCounters::Add(PerfCounters::Counter::CpuArgsDraws, draw_count);
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);

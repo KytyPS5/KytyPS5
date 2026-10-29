@@ -389,6 +389,19 @@ bool LoadsWithoutBranch(IR::ResourceKind kind) {
 	return kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer;
 }
 
+// Workgroup memory has no robust access: a read there is made in every lane at an index kept in
+// range, and the value is chosen afterwards (a lane that is off or out of range reads zero).
+// Two branches around each read, one for the lanes and one for the range, cost more than the
+// read: every branch saves and restores the lane mask.
+bool IsWorkgroupMemory(const IR::MemoryInfo& mem) {
+	return mem.kind == IR::ResourceKind::Lds;
+}
+
+uint32_t ClampLdsIndex(EmitterState& state, uint32_t index) {
+	const auto dwords = LdsDwordCount(state);
+	return EmitUMin32(state, index, ConstantU32(state, dwords == 0u ? 0u : dwords - 1u));
+}
+
 // `value` or, where `condition` is false, `otherwise`: composites of `components` words.
 uint32_t SelectU32Composite(EmitterState& state, uint32_t components, uint32_t condition,
                             uint32_t value, uint32_t otherwise) {
@@ -429,6 +442,15 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	const auto exec = ctx.Arg(inst, inst.NumArgs() - 1);
+	if (IsWorkgroupMemory(mem)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (resource.object_pointer != 0u) {
+			const auto index     = DwordIndex(ctx, inst, mem, resource.byte_offset);
+			const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+			return SelectOrZero(ctx.state, AndCondition(ctx.state, exec, in_bounds),
+			                    LoadWordInBounds(ctx, resource, ClampLdsIndex(ctx.state, index)));
+		}
+	}
 	if (LoadsWithoutBranch(mem.kind)) {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return SelectOrZero(ctx.state, exec, LoadWordPrepared(ctx, inst, mem, resource));
@@ -730,6 +752,18 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
+	if (IsWorkgroupMemory(mem)) {
+		// One branch for the lanes and the range together.
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (resource.object_pointer == 0u) return;
+		const auto index     = DwordIndex(ctx, inst, mem, resource.byte_offset);
+		const auto condition = AndCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1),
+		                                    EmitMemoryElementInBounds(ctx.state, resource, index));
+		EmitIfCondition(ctx.state, condition, [&]() {
+			StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, inst.NumArgs() - 2));
+		});
+		return;
+	}
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
 			StoreWordPrepared(ctx, inst, selected, resource, ctx.Arg(inst, inst.NumArgs() - 2));
@@ -1293,6 +1327,27 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 
 uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	if (IsWorkgroupMemory(ctx.Memory(inst))) {
+		const auto mem      = ctx.Memory(inst);
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		if (resource.object_pointer != 0u) {
+			const auto              exec = ctx.Arg(inst, inst.NumArgs() - 1);
+			const auto              base = ByteAddress(ctx, inst, mem);
+			std::array<uint32_t, 4> values {};
+			for (uint32_t component = 0; component < components; component++) {
+				const auto address = component == 0u
+				                         ? base
+				                         : Binary(state, spv::OpIAdd, TypeU32(state), base,
+				                                  ConstantU32(state, component * 4u));
+				const auto index   = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+				                            address, ConstantU32(state, 2));
+				values[component]  = SelectOrZero(
+				    state, AndCondition(state, exec, EmitMemoryElementInBounds(state, resource, index)),
+				    LoadWordInBounds(ctx, resource, ClampLdsIndex(state, index)));
+			}
+			return ConstructU32Composite(state, components, values);
+		}
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
@@ -1317,6 +1372,24 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 
 void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	if (IsWorkgroupMemory(ctx.Memory(inst))) {
+		const auto mem      = ctx.Memory(inst);
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		if (resource.object_pointer == 0u) return;
+		const auto exec = ctx.Arg(inst, inst.NumArgs() - 1);
+		const auto base = ByteAddress(ctx, inst, mem);
+		for (uint32_t component = 0; component < components; component++) {
+			const auto address = component == 0u ? base
+			                                     : Binary(state, spv::OpIAdd, TypeU32(state), base,
+			                                              ConstantU32(state, component * 4u));
+			const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
+			                          ConstantU32(state, 2));
+			EmitIfCondition(
+			    state, AndCondition(state, exec, EmitMemoryElementInBounds(state, resource, index)),
+			    [&]() { StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, component + 1u)); });
+		}
+		return;
+	}
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto mem      = ctx.Memory(inst);
 		const auto resource = PrepareMemoryResourceAccess(state, mem);

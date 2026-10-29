@@ -255,7 +255,7 @@ struct TextureCacheTestAccess {
            fill->second.consumed.empty();
   }
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<RecursiveTrackingLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 
@@ -441,15 +441,28 @@ inline TextureBinding HandBinding(ImageId id, vk::ImageView view,
           .type = desc.type};
 }
 
+// CommandProcessor::DispatchDirect recorded at once, as at the end of a packet stream: the
+// executor may leave a dispatch pending (RenderExecutor::FlushPendingWork).
+void DispatchNow(RenderContext &context, CommandProcessor &processor, uint32_t x, uint32_t y,
+                 uint32_t z, uint32_t mode) {
+  processor.DispatchDirect(x, y, z, mode);
+  context.GetRenderExecutor().FlushPendingWork();
+}
+
 struct RenderExecutorTestAccess {
+  // Recorded at once, as at the end of a packet stream (RenderExecutor::FlushPendingWork).
   static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
-    return executor.DrawIndex(0, command, args);
+    const bool drawn = executor.DrawIndex(0, command, args);
+    executor.FlushPendingWork();
+    return drawn;
   }
 
   static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
-    return executor.DrawAuto(0, command, args);
+    const bool drawn = executor.DrawAuto(0, command, args);
+    executor.FlushPendingWork();
+    return drawn;
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -3414,8 +3427,9 @@ public:
       });
     };
     const auto wait_for_interrupt =
-        [&](LibKernel::EventQueue::KernelEvent &event, int &count) {
-          LibKernel::KernelUseconds timeout = 0;
+        [&](LibKernel::EventQueue::KernelEvent &event, int &count,
+            LibKernel::KernelUseconds timeout = 0) {
+          // An expected interrupt may arrive after the GPU goes idle: it gets a timeout.
           return LibKernel::EventQueue::KernelWaitEqueue(
               interrupt_queue, &event, 1, &count, &timeout);
         };
@@ -3470,7 +3484,7 @@ public:
 
     interrupt_count = 0;
     const auto graphics_interrupt_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     Require("GpuCommandLane", "graphics interrupt routing",
             graphics_interrupt_wait == 0 && interrupt_count == 1 &&
                 interrupt_event.ident == 0 && interrupt_event.data == 0 &&
@@ -3496,7 +3510,7 @@ public:
 
     interrupt_count = 0;
     const auto compute_interrupt_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     const bool compute_interrupt_matches =
         compute_interrupt_wait == 0 && interrupt_count == 1 &&
         interrupt_event.ident == 0x20 && interrupt_event.data == 0x456u &&
@@ -3512,7 +3526,7 @@ public:
 
     interrupt_count = 0;
     const auto compute_clock_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     const bool compute_clock_matches =
         compute_clock_wait == 0 && interrupt_count == 1 &&
         interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
@@ -3530,7 +3544,7 @@ public:
 
     interrupt_count = 0;
     const auto compute_done_wait =
-        wait_for_interrupt(interrupt_event, interrupt_count);
+        wait_for_interrupt(interrupt_event, interrupt_count, 2000000);
     Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
             compute_done_wait == 0 && interrupt_count == 1 &&
                 interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
@@ -11511,7 +11525,7 @@ public:
                     MakeImageInfo(binding).imageView == nullptr &&
                     binding.layout == vk::ImageLayout::eGeneral;
               }), "an all-zero guest descriptor allocated or bound a backing image");
-          processor.DispatchDirect(1, 1, 1, 0x41u |
+          DispatchNow(context, processor, 1, 1, 1, 0x41u |
               (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
         }
         for (u32 phase : {0u, 2u}) {
@@ -11626,7 +11640,7 @@ public:
                     std::pair<uint64_t, uint64_t>{test.address, sizeof(leaf)}) !=
                     input.stage.resources->specialization_reads.end(),
                 "function relocation retained an old code dependency");
-        processor.DispatchDirect(1, 1, 1, 0x41u);
+        DispatchNow(context, processor, 1, 1, 1, 0x41u);
         cache.ReadMemory(output, sizeof(u32));
         u32 actual = 0;
         Require(name, "scalar leaf execution and return",
@@ -11750,7 +11764,7 @@ public:
               std::printf("[gpu]     %-32s wave%u calls%u: %zu SPIR-V words\n",
                           name, wave_size, call_count, compiled.spirv.size());
             }
-            processor.DispatchDirect(1, 1, 1, 0x41u |
+            DispatchNow(context, processor, 1, 1, 1, 0x41u |
                 (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
             cache.ReadMemory(output, wave_size * 4);
             Require(name, "read vector helper output", LibKernel::Memory::TryReadBacking(
@@ -11850,7 +11864,7 @@ public:
               shaders.SetCsUserSgpr(i, input.fields[i], HW::UserSgprType::Unknown);
               shaders.SetCsUserSgpr(i + 4, out.fields[i], HW::UserSgprType::Unknown);
             }
-            processor.DispatchDirect(1, 1, 1, wave == 32 ? 0x8041u : 0x41u);
+            DispatchNow(context, processor, 1, 1, 1, wave == 32 ? 0x8041u : 0x41u);
             cache.ReadMemory(output, wave * sizeof(u32));
             std::array<u32, 64> actual{};
             Require(name, "readback", LibKernel::Memory::TryReadBacking(
@@ -11963,7 +11977,7 @@ public:
           for (u32 i = 0; i < 3; ++i)
             shaders.SetCsUserSgpr(4 + i, i == 2 ? count : groups[i],
                                   HW::UserSgprType::Unknown);
-          processor.DispatchDirect(groups[0], groups[1], groups[2],
+          DispatchNow(context, processor, groups[0], groups[1], groups[2],
                                    wave_size == 32 ? 0x8049u : 0x49u);
           cache.CopyBuffer(base + 63 * sizeof(u32), 0, sizeof(u32), false,
                            true);
@@ -12151,7 +12165,7 @@ public:
             set_buffer(i * 4u, args + i * 4u, 4);
             shaders.SetCsUserSgpr(12u + i, test.dimensions[i], HW::UserSgprType::Unknown);
           }
-          processor.DispatchDirect(1, 1, 1, 0x41u);
+          DispatchNow(context, processor, 1, 1, 1, 0x41u);
         }
         std::array<u32, 3> stale{};
         Require(name, "GPU-only argument write",
@@ -12231,7 +12245,7 @@ public:
           shaders.SetCsUserSgpr(12u + i, i == 0 ? count : 1u,
                                HW::UserSgprType::Unknown);
         }
-        processor.DispatchDirect(1, 1, 1, 0x41u);
+        DispatchNow(context, processor, 1, 1, 1, 0x41u);
         Require(name, "GPU-owned descriptor count", cache.HasGpuDirtyBytes(count_args, 4),
                 "the descriptor count was already visible to the CPU");
         // Raw buffer access keeps its own contents even after a newer overlapping image write.
@@ -12378,7 +12392,7 @@ public:
         const auto target = textures.FindImage(binding_desc);
         TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), target,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-        processor.DispatchDirect(1, 1, test.groups, 0x41u);
+        DispatchNow(context, processor, 1, 1, test.groups, 0x41u);
         const auto pixels = ReadCachedTexel(name, context, target, {},
                                             {test.width, test.height, 1});
         for (u32 pixel = 0; pixel < pixels.size(); pixel++) {
@@ -12451,7 +12465,7 @@ public:
             set_buffer(word * 4u, address + word * stride, 4u);
             shaders.SetCsUserSgpr(12u + word, values[word], HW::UserSgprType::Unknown);
           }
-          processor.DispatchDirect(1, 1, 1, 0x41u);
+          DispatchNow(context, processor, 1, 1, 1, 0x41u);
         };
         for (const u32 wave : {32u, 64u}) {
           u32 first = based ? 2u : 0u;
@@ -12570,7 +12584,7 @@ public:
                              .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, material_keys, material_groups, 4u);
-        processor.DispatchDirect(3, 1, 1, 0x41u);
+        DispatchNow(context, processor, 3, 1, 1, 0x41u);
         std::vector<u32> cpu_keys(material_groups);
         Require(name, "GPU-only material keys",
                 cache.HasGpuDirtyBytes(material_keys, stale_keys.size() * 4u) &&
@@ -12622,7 +12636,7 @@ public:
                     bindings.descriptor_counts[static_cast<size_t>(
                         ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)] == 1u,
                 "large binding-prefix data did not use the existing shader-data buffer");
-        processor.DispatchDirect(material_groups, 1, 1, 0x41u |
+        DispatchNow(context, processor, material_groups, 1, 1, 0x41u |
             (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
         for (u32 row = 1; row < material_rows; ++row)
           Require(name, "every selected material becomes GPU-owned",
@@ -12677,7 +12691,7 @@ public:
             set_buffer(axis * 4, lds_args + axis * sizeof(u32), sizeof(u32));
             shaders.SetCsUserSgpr(12 + axis, groups[axis], HW::UserSgprType::Unknown);
           }
-          processor.DispatchDirect(1, 1, 1, 0x41u);
+          DispatchNow(context, processor, 1, 1, 1, 0x41u);
           Require(name, "GPU-authored LDS dispatch arguments",
                   cache.HasGpuDirtyBytes(lds_args, 3 * sizeof(u32)),
                   "indirect LDS dimensions were already visible on the CPU");
@@ -12694,7 +12708,7 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
                   "the GPU-authored LDS dispatch was not consumed");
         } else {
-          processor.DispatchDirect(2, 2, 2, 0x41u);
+          DispatchNow(context, processor, 2, 2, 2, 0x41u);
         }
         cache.ReadMemory(lds_output, lds_words * sizeof(u32));
         std::array<u32, lds_words> actual{};
@@ -13013,6 +13027,7 @@ public:
             shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
           }
           executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
+          executor.FlushPendingWork();
         };
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
         if (fill_case.goat) {

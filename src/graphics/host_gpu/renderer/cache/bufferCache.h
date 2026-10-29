@@ -106,6 +106,10 @@ public:
 	[[nodiscard]] bool ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] bool WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Any thread (the front worker, see frontWorker.h); HasGpuDirtyBytes is for the GPU thread.
+	[[nodiscard]] bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
+	// Raised when GPU-written bytes are added: what a reader found clean before may not be now.
+	[[nodiscard]] uint64_t GpuModifiedVersion() const noexcept { return m_gpu_modified_version; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Moves into `ranges` the guest ranges that gained bytes the GPU has not seen since the last
@@ -231,6 +235,8 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Held by the GPU thread to change m_gpu_modified_ranges and by others to read it.
+	std::mutex                                        m_gpu_modified_mutex;
 	// Raised when a range is added to m_gpu_modified_ranges (see HasGpuDirtyBytes).
 	uint64_t                                          m_gpu_modified_version = 0;
 	struct CleanPage {

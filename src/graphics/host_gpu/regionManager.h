@@ -50,11 +50,35 @@ public:
 #endif
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
+		// Odd while held: a reader that started before sees the number change (TryRead).
+		m_sequence.store(m_sequence.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
+		m_sequence.store(m_sequence.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 		m_lock.clear(std::memory_order_release);
+	}
+
+	// Runs `read` without the lock, and tells whether it ran with no holder in between: if not,
+	// what it read may be torn and must be dropped. `read` may only read plain data, and must
+	// stay safe to run on torn data (no pointers taken from it). It takes no atomic read-modify-
+	// write, where lock() takes one, which is most of what a short read of a few words costs.
+	template <typename Read>
+	[[nodiscard]] bool TryRead(Read&& read) const noexcept {
+		const auto before = m_sequence.load(std::memory_order_acquire);
+		if ((before & 1u) != 0) {
+			return false;
+		}
+		read();
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return m_sequence.load(std::memory_order_relaxed) == before;
+	}
+
+	// Whether the calling thread holds the lock now.
+	[[nodiscard]] bool HeldByCurrentThread() const noexcept {
+		return m_owner.load(std::memory_order_relaxed) == CurrentThread();
 	}
 
 private:
@@ -76,9 +100,34 @@ private:
 
 	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
 	std::atomic_uint32_t m_owner {0};
+	std::atomic_uint32_t m_sequence {0};
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+
+// A TrackingSpinLock the holder can take again. A caller that makes many short calls into one
+// object takes the lock once around them; each call inside then costs a read, not an atomic
+// read-modify-write.
+class RecursiveTrackingLock final {
+public:
+	void lock() noexcept {
+		if (m_lock.HeldByCurrentThread()) {
+			m_depth++;
+			return;
+		}
+		m_lock.lock();
+		m_depth = 1;
+	}
+	void unlock() noexcept {
+		if (--m_depth == 0) {
+			m_lock.unlock();
+		}
+	}
+
+private:
+	TrackingSpinLock m_lock;
+	uint32_t         m_depth = 0; // written by the holder only
+};
 
 class RegionManager final {
 public:
@@ -178,6 +227,7 @@ public:
 					m_armed |= arm;
 					if (arm.Any()) {
 						maybe_armed.store(true, std::memory_order_relaxed);
+						s_arm_generation.fetch_add(1, std::memory_order_relaxed);
 					}
 				} else {
 					m_write_heat.KeepHotDirty(bits, start, end, Frame());
@@ -228,6 +278,10 @@ public:
 
 	// A guest submission started: armed pages are due for a scan (HarvestIfDue).
 	static void NoteSubmission() noexcept { s_submission.fetch_add(1, std::memory_order_relaxed); }
+	static uint64_t Submission() noexcept { return s_submission.load(std::memory_order_relaxed); }
+	// Counts the times a region got armed pages: a scan that found nothing due stays that way
+	// until the submission or this changes.
+	static uint64_t ArmGeneration() noexcept { return s_arm_generation.load(std::memory_order_relaxed); }
 
 	// Under the lock, before the CPU dirty state is read: once per guest submission, the armed
 	// pages the CPU wrote since their last scan become dirty, as if the writes had faulted, and
@@ -351,6 +405,7 @@ private:
 	static inline std::atomic<uint32_t> s_heat_epoch {0};
 	static inline std::atomic<uint32_t> s_frame {0};
 	static inline std::atomic<uint64_t> s_submission {1};
+	static inline std::atomic<uint64_t> s_arm_generation {0};
 };
 
 } // namespace Libs::Graphics

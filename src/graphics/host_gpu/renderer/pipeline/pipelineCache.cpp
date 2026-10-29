@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/frontWorker.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -270,6 +271,36 @@ struct PipelineCache::ProgramCache {
 		uint64_t identity = 0;
 	};
 
+	// A spin lock for microseconds; a copy is a new, free lock (a map entry is built in place).
+	struct PlanLock {
+		PlanLock() = default;
+		PlanLock(const PlanLock&) noexcept {}
+		PlanLock& operator=(const PlanLock&) noexcept { return *this; }
+		void lock() noexcept {
+			while (m_flag.test_and_set(std::memory_order_acquire)) {
+				while (m_flag.test(std::memory_order_relaxed)) {
+#if defined(__x86_64__)
+					__builtin_ia32_pause();
+#endif
+				}
+			}
+		}
+		void unlock() noexcept { m_flag.clear(std::memory_order_release); }
+
+	private:
+		std::atomic_flag m_flag;
+	};
+
+	// The key of a lookup on a front worker thread.
+	static ProgramKey& FrontKey() {
+		thread_local ProgramKey key = [] {
+			ProgramKey made;
+			made.static_state.reserve(MaxStaticKeyWords);
+			return made;
+		}();
+		return key;
+	}
+
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
@@ -286,6 +317,9 @@ struct PipelineCache::ProgramCache {
 			           : std::span<const uint32_t>(linked.code).subspan(call_source->code.size());
 		}
 
+		// Held while a lookup writes `specialization`, the plan's walk state or `resources`.
+		mutable PlanLock lock;
+
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 			const auto revision = call_source->revision;
 			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
@@ -295,11 +329,16 @@ struct PipelineCache::ProgramCache {
 
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
+		                             uint32_t push_data_cursor,
+		                             ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
 			{
 				KYTY_PROFILER_BLOCK("MaterializeResources");
-				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-				    resource_plan, runtime, resources, specialization));
+				if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, snapshot,
+				                                                specialization)) {
+					// The front worker stops where the GPU thread would read back GPU writes.
+					EXIT_IF(!InFrontJob() || !FrontJobAborted());
+					return nullptr;
+				}
 			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
@@ -460,9 +499,12 @@ struct PipelineCache::ProgramCache {
 		return options;
 	}
 
+	// `storage`: where the stage's resources go (see PipelineCache::StageResources); null keeps
+	// them with the program.
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor,
+	                  ShaderRecompiler::IR::ResourceSnapshot* storage = nullptr) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -474,6 +516,8 @@ struct PipelineCache::ProgramCache {
 		}
 
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
+		// A front worker thread builds its own key.
+		ProgramKey& lookup_key = InFrontJob() ? FrontKey() : this->lookup_key;
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -491,19 +535,34 @@ struct PipelineCache::ProgramCache {
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
 		bool source_changed = false;
+		// The front worker finds known programs: a translation, a skipped dispatch or a call
+		// source (which reads and rewrites the source) is left to the GPU thread.
+		if (InFrontJob() && (entry == programs.end() || entry->second.skip_dispatch ||
+		                     entry->second.call_source)) {
+			AbortFrontJob();
+			return {};
+		}
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
+			// Front worker threads look up the same program at once: a lookup writes the program's
+			// specialization and walk state.
+			std::lock_guard plan_lock(cached.lock);
+			auto&        snapshot    = storage != nullptr ? *storage : cached.resources;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor, snapshot);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+				permutation = cached.FindPermutation<false>(runtime, push_data_cursor, snapshot);
+			}
+			if (InFrontJob() && (permutation == nullptr || FrontJobAborted())) {
+				AbortFrontJob();
+				return {};
 			}
 			if (permutation != nullptr) {
 				CommandScheduler::NoteProgramHash(permutation->handle.id, params.hash);
-				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+				input_info.stage = {.program = &permutation->program, .resources = &snapshot};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -545,13 +604,17 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
+			if (storage != nullptr) *storage = entry->second.resources;
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
-				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+			auto& snapshot = storage != nullptr ? *storage : entry->second.resources;
+			std::unique_lock plan_lock(entry->second.lock);
+			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, snapshot)) {
+				input_info.stage = {.program = &permutation->program, .resources = &snapshot};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			plan_lock.unlock();
 		}
 		auto compiled = CompileChecked(stage_name, options, std::move(translated),
 		                               entry->second.specialization, push_data_cursor);
@@ -566,7 +629,8 @@ struct PipelineCache::ProgramCache {
 		    std::move(compiled), entry->second.specialization, entry->second.FunctionCode()));
 		auto& permutation = entry->second.permutations.back();
 		Name(entry->second, permutation, identity);
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+		input_info.stage = {.program   = &permutation.program,
+		                    .resources = storage != nullptr ? storage : &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -1529,10 +1593,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const ShaderColorTarget, 8> color_targets, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    StageResources* resources) {
 	KYTY_PROFILER_FUNCTION();
-	m_program_cache->Adopt();
-	QueueListedPipelines();
+	// On the front worker the GPU thread has done these (PrepareFrontLookups).
+	if (!InFrontJob()) {
+		PrepareFrontLookups();
+	}
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -1706,8 +1773,15 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		pixel_info.ps_depth_bounds_dword = push_data_cursor;
 		push_data_cursor += ShaderRecompiler::IR::PushData::DepthBoundsDwordCount;
 	}
+	if (InFrontJob() && FrontJobAborted()) {
+		return {};
+	}
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
+		                                    resources != nullptr ? &resources->pixel : nullptr);
+		if (InFrontJob() && FrontJobAborted()) {
+			return {};
+		}
 		// What the pixel shader reads both flat and interpolated, the last vertex stage writes
 		// twice.
 		std::vector<uint32_t> active_inputs;
@@ -1724,21 +1798,31 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		                                         [](uint8_t location) { return location != 0; }));
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor,
+		                                        resources != nullptr ? &resources->vertex[i] : nullptr);
 	}
 	return result;
+}
+
+void PipelineCache::PrepareFrontLookups() {
+	m_program_cache->Adopt();
+	QueueListedPipelines();
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
-                                               uint32_t                     push_data_cursor) {
-	m_program_cache->Adopt();
+                                               uint32_t                     push_data_cursor,
+                                               ShaderRecompiler::IR::ResourceSnapshot* resources) {
+	// On the front worker the GPU thread has done this (PrepareFrontLookups).
+	if (!InFrontJob()) {
+		m_program_cache->Adopt();
+	}
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	return m_program_cache->Get(params, input_info, push_data_cursor, resources);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

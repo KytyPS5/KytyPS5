@@ -57,6 +57,9 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// GPU thread: runs the commands other threads sent (SendCommand), as between packets.
+	void ServiceCommands() { ProcessCommands(); }
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;

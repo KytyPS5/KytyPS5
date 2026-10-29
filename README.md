@@ -269,6 +269,30 @@ sudo dnf install gdb perf valgrind strace radeontop \
 - `radeontop` shows whether the GPU is busy; `umr` inspects AMD GPU state, such as the waves of a
   hung shader (it needs root or access to the amdgpu debugfs files).
 
+#### Crash dumps
+
+On distributions with systemd-coredump, every crash of the emulator or a test leaves a dump in
+`/var/lib/systemd/coredump`, and crashing test runs can fill it quickly. `coredumpctl` lists them
+but has no option to delete them:
+
+```bash
+coredumpctl list                              # deleted dumps stay listed as "missing"; harmless
+sudo rm -f /var/lib/systemd/coredump/*        # delete all stored dumps now
+sudo systemd-tmpfiles --clean                 # delete only dumps older than the tmpfiles.d age (two weeks on Fedora)
+```
+
+To cap the space future dumps use, add a drop-in file. The `coredump.conf.d` folder does not exist
+until you create it, and unlike edits to `/etc/systemd/coredump.conf`, the drop-in survives package
+updates:
+
+```bash
+sudo mkdir -p /etc/systemd/coredump.conf.d
+printf '[Coredump]\nMaxUse=500M\n' | sudo tee /etc/systemd/coredump.conf.d/size.conf
+```
+
+Use `Storage=none` instead of `MaxUse=500M` to keep no dumps at all. The setting applies from the
+next crash; nothing needs to be restarted.
+
 ### Building on NixOS
 
 A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
@@ -461,6 +485,14 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
+
+A worker thread looks up the shader programs of the next draw while the GPU thread records the
+current one. To keep the lookups on the GPU thread, for example when narrowing down a rendering
+problem, set `KYTY_FRONT_WORKER=0`:
+
+```bash
+KYTY_FRONT_WORKER=0 ./kyty_emulator --game "/games/ExampleGame"
+```
 
 ### AI Use
 

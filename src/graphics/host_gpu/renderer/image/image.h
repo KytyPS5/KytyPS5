@@ -143,6 +143,8 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// The cache's GC tick when the image was last put at the back of the LRU list.
+	uint64_t         lru_touched_gc     = ~uint64_t {0};
 	size_t           lru_id             = 0;
 
 private:

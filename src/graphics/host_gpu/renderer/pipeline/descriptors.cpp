@@ -894,6 +894,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
+	// One lock for the lookups of the draw: each call below finds it held. No caller of this
+	// function holds the lock, so the discovery can let it go: that can submit the scheduler.
+	std::unique_lock hold {texture_cache.m_lock};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
@@ -902,9 +905,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
+			hold.unlock();
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].type == TextureCache::BindingType::Storage);
+			hold.lock();
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
@@ -945,10 +950,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda(address_writes);
 	}
+	auto& cache = m_context.GetTextureCache();
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
-	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
@@ -1004,7 +1009,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
+	// Binding orders nothing: a dispatch's bindings leave its compute chain open.
+	auto   vk_buffer        = buffer.StateHandle();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1109,7 +1115,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-			vk_buffer.pipelineBarrier(
+			buffer.Handle().pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
 			        vk::PipelineStageFlagBits::eComputeShader,
@@ -1125,7 +1131,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage) {
 					buffer.EndRendering();
 					m_context.GetNullTextures().Reset(
-					    *ShaderRecompiler::IR::DescriptorBindingForImage(resource), vk_buffer);
+					    *ShaderRecompiler::IR::DescriptorBindingForImage(resource), buffer.Handle());
 				}
 				continue;
 			}

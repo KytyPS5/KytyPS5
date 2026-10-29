@@ -17645,17 +17645,18 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wide_lds_result = compile("wide-lds", wide_lds,
-                                       {.words = 548,
-                                        .instructions = 156,
+                                       {.words = 490,
+                                        .instructions = 115,
+                                        .ext_inst_imports = 1,
                                         .variables = 1,
                                         .workgroup_variables = 1,
                                         .loads = 4,
                                         .stores = 4,
-                                        .phis = 5,
-                                        .labels = 34,
-                                        .selection_merges = 10,
-                                        .branches = 23,
-                                        .conditional_branches = 10});
+                                        .phis = 0,
+                                        .labels = 11,
+                                        .selection_merges = 4,
+                                        .branches = 6,
+                                        .conditional_branches = 4});
   const auto wide_lds_metrics = MeasureSpirv(wide_lds_result.spirv);
   Check(wide_lds_metrics.workgroup_variables == 1u &&
             wide_lds_metrics.runtime_arrays == 0u &&

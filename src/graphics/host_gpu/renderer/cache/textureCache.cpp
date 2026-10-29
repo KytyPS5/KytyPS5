@@ -328,6 +328,7 @@ void TextureCache::FreeImage(ImageId id) {
 void TextureCache::TouchImage(Image& image) {
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+		image.lru_touched_gc = m_gc_tick;
 	}
 }
 
@@ -1469,6 +1470,17 @@ TextureCache::FindImageKey TextureCache::MakeFindImageKey(const ImageDesc& desc,
 }
 
 void TextureCache::ReuseImage(ImageId id, const ImageDesc& desc) {
+	// An image with no metadata to check that a draw of this command buffer touched already needs
+	// nothing again (the same checks as ResolveTexture's memo, which reads the change log without
+	// the lock too).
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+	    desc.info.metadata.kind != ImageMetadataKind::Cmask && desc.type != BindingType::VideoOut) {
+		if (const auto* image = m_slot_images.try_get(id);
+		    image != nullptr && image->tick_accessed_last == m_scheduler.CurrentTick() &&
+		    image->lru_touched_gc == m_gc_tick) {
+			return;
+		}
+	}
 	{
 		std::scoped_lock lock {m_lock};
 		auto&            image = m_slot_images[id];

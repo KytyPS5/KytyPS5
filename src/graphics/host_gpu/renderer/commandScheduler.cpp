@@ -206,11 +206,7 @@ bool CommandScheduler::SubmitIfDue(SubmitPoint point) {
 	if (used && m_open_since == std::chrono::steady_clock::time_point {}) {
 		m_open_since = std::chrono::steady_clock::now();
 	}
-	uint32_t open_operations = 0;
-	{
-		std::lock_guard lock(m_operation_mutex);
-		open_operations = m_open_operations;
-	}
+	const uint32_t open_operations = m_open_operations.load(std::memory_order_relaxed);
 	SubmitState state {.open_work       = m_open_work,
 	                   .open_callbacks  = point == SubmitPoint::Packet ? 0u : m_open_callbacks,
 	                   .open_operations = open_operations,
@@ -502,6 +498,12 @@ void CommandScheduler::CheckActive() const {
 CommandBuffer& CommandScheduler::Current() {
 	EXIT_IF(m_command.IsInvalid());
 	return m_command;
+}
+
+void CommandScheduler::EndComputeChain() {
+	if (!m_command.IsInvalid()) {
+		m_command.EndComputeChain();
+	}
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {

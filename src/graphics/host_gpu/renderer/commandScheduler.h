@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <condition_variable>
@@ -89,6 +90,9 @@ public:
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
+	// The guest synchronized: dispatches recorded after this wait for those before
+	// (CommandBuffer::ContinueComputeChain).
+	void                           EndComputeChain();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
@@ -138,9 +142,10 @@ private:
 	// What the open command buffer holds, for SubmitIfDue. Reset at every submission.
 	uint32_t                              m_open_work      = 0;
 	uint32_t                              m_open_callbacks = 0;
-	// Deferred operations queued for the open command buffer. Under m_operation_mutex: any
-	// thread queues them. Reset at every submission.
-	uint32_t                              m_open_operations = 0;
+	// Deferred operations queued for the open command buffer. Written under m_operation_mutex:
+	// any thread queues them. SubmitIfDue reads it after every packet without the lock. Reset at
+	// every submission.
+	std::atomic<uint32_t>                 m_open_operations = 0;
 	std::chrono::steady_clock::time_point m_open_since {};
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void RetireCallbackState(Common::UniqueFunction<void>&& callback);

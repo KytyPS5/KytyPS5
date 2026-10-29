@@ -173,6 +173,8 @@ private:
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
+	std::atomic<uint64_t>                          m_harvested_submission {0};
+	std::atomic<uint64_t>                          m_harvested_generation {~uint64_t {0}};
 	PageManager&                                   m_page_manager;
 	std::function<void(uint64_t, uint64_t)>        m_armed_write_hook;
 };

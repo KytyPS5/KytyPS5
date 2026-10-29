@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <deque>
 #include <functional>
 #include <map>
@@ -48,7 +49,12 @@ public:
 		label.serial = ++m_last_serial;
 		m_recorded.push_back({label, false});
 		if (label.bytes != 0) {
-			m_latest[label.address] = label;
+			const auto [it, inserted] = m_latest.try_emplace(label.address, label);
+			if (inserted) {
+				m_pages[PageBucket(label.address)]++;
+			} else {
+				it->second = label;
+			}
 		}
 		return label.serial;
 	}
@@ -89,6 +95,7 @@ public:
 		std::scoped_lock lock {m_mutex};
 		const auto latest = m_latest.find(label.address);
 		if (latest != m_latest.end() && latest->second.serial == label.serial) {
+			m_pages[PageBucket(latest->first)]--;
 			m_latest.erase(latest);
 		}
 	}
@@ -152,7 +159,7 @@ public:
 	// lock: the buffer cache asks for every buffer of every draw.
 	[[nodiscard]] std::vector<Label> PendingForGpu(uint64_t begin, uint64_t end) {
 		std::vector<Label> labels;
-		if (m_latest.empty()) {
+		if (m_latest.empty() || !MayOverlap(begin, end)) {
 			return labels;
 		}
 		ForOverlapping(begin, end, [&](Label& label) {
@@ -183,6 +190,28 @@ public:
 	}
 
 private:
+	// Labels are rare next to the buffers asked about: a count for each hashed 4 KiB page tells
+	// that a short range holds none, without the search of m_latest.
+	static constexpr uint64_t PageBits    = 12;
+	static constexpr size_t   PageBuckets = 4096;
+	static size_t PageBucket(uint64_t address) {
+		return static_cast<size_t>(((address >> PageBits) * 0x9e3779b97f4a7c15ull) >> 52u);
+	}
+	[[nodiscard]] bool MayOverlap(uint64_t begin, uint64_t end) const {
+		// A label starts up to 7 bytes before `begin` and still reaches it.
+		const auto first = (begin >= 7 ? begin - 7 : 0) >> PageBits;
+		const auto last  = (end == 0 ? 0 : end - 1) >> PageBits;
+		if (last < first || last - first >= 16) {
+			return true;
+		}
+		for (auto page = first; page <= last; page++) {
+			if (m_pages[PageBucket(page << PageBits)] != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	template <typename Visit>
 	void ForOverlapping(uint64_t begin, uint64_t end, Visit&& visit) {
 		for (auto it = m_latest.lower_bound(begin >= 7 ? begin - 7 : 0);
@@ -202,6 +231,8 @@ private:
 	std::deque<Entry>         m_recorded;
 	// The newest label of each address that is not retired.
 	std::map<uint64_t, Label> m_latest;
+	// Entries of m_latest for each hashed page of its address (MayOverlap).
+	std::array<uint16_t, PageBuckets> m_pages {};
 	uint64_t                  m_last_serial = 0;
 	std::function<void()>     m_wake;
 };

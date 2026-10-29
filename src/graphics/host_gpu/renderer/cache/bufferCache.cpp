@@ -186,6 +186,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
+		    std::lock_guard lock(m_gpu_modified_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -387,7 +388,10 @@ void BufferCache::ReplaceMemory(uint64_t vaddr, const void* data, uint64_t size)
 	m_write_watches.NotifyWrite(vaddr, size);
 	// What the GPU wrote in the range is about to be overwritten in full, so it is dropped: a
 	// read-back of it would only make the caller wait for bytes nobody reads.
-	m_gpu_modified_ranges.Subtract(vaddr, size);
+	{
+		std::lock_guard lock(m_gpu_modified_mutex);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
 	LibKernel::Memory::WriteBacking(vaddr, data, size);
@@ -542,6 +546,7 @@ bool BufferCache::PublishFromBufferMemory(Buffer& buffer, uint64_t vaddr, uint64
 			    Libs::LibKernel::Memory::WriteBacking(start, memory.data() + offset, end - start);
 			    published = true;
 		    });
+		    std::lock_guard lock(m_gpu_modified_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	return published;
@@ -697,7 +702,10 @@ bool BufferCache::ForgetGuestBackedWrites(uint64_t vaddr, uint64_t size) {
 	bool written = false;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    {
+			    std::lock_guard lock(m_gpu_modified_mutex);
+			    m_gpu_modified_ranges.Subtract(address, bytes);
+		    }
 		    written = true;
 	    });
 	return written;
@@ -1129,6 +1137,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_write_watches.NotifyWrite(vaddr, size);
 		// A draw that writes the same buffer as the last one adds nothing: clean pages stay known.
 		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
+			std::lock_guard lock(m_gpu_modified_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
 			m_gpu_modified_version++;
 		}
@@ -1376,6 +1385,11 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 		known = {page + 1, m_gpu_modified_version};
 	}
 	return dirty;
+}
+
+bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_gpu_modified_mutex);
+	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

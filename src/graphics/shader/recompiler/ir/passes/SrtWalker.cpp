@@ -4,22 +4,21 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <xbyak/xbyak.h>
-
 #include <algorithm>
 #include <bit>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime SrtReadCapture::ObservedRuntime() {
-	auto runtime = m_source;
+	auto runtime     = m_source;
 	runtime.userdata = this;
-	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
-	                                         ? Read : nullptr;
+	runtime.read_specialization_memory =
+	    m_source.read_specialization_memory != nullptr ? Read : nullptr;
 	return runtime;
 }
 
@@ -98,6 +97,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::SMin32:
 		case ValueOpcode::UMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -277,7 +277,8 @@ private:
 		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
 			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
 			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
-			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
+			              inst->Arg(0) ==
+			                  Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
 			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
 		}
 		if (op == ValueOpcode::Phi) {
@@ -322,8 +323,9 @@ private:
 			}
 			if (op == ValueOpcode::LoadBufferU32) {
 				const auto guard = inst->Arg(4).Resolve();
-				return finish(Validate(inst->Arg(0)) &&
-				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
+				return finish(
+				    Validate(inst->Arg(0)) &&
+				    ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 			}
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
@@ -362,7 +364,6 @@ private:
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
-
 
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
 // state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
@@ -409,38 +410,38 @@ private:
 	}
 
 	uint32_t Context(Value mask) {
-		mask = mask.Resolve();
+		mask             = mask.Resolve();
 		const auto found = std::ranges::find(m_masks, mask);
 		if (found != m_masks.end()) return static_cast<uint32_t>(found - m_masks.begin());
 		m_masks.push_back(mask);
 		return static_cast<uint32_t>(m_masks.size() - 1u);
 	}
 
-	void AddOutput(Value value, uint32_t gate);
-	void Consume(std::vector<std::vector<uint32_t>>& gates);
-	Ref Evaluate(Value value, uint32_t context);
+	void    AddOutput(Value value, uint32_t gate);
+	void    Consume(std::vector<std::vector<uint32_t>>& gates);
+	Ref     Evaluate(Value value, uint32_t context);
 	Operand Analyze(uint32_t index);
 	Operand AnalyzeRead(Node& node, const auto& arg, Operand self);
-	void Layout();
-	void Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip);
-	void Zero(uint32_t offset, uint32_t size);
-	void Branch(const Operand& operand, const Xbyak::Label& unknown);
-	void Load(const Xbyak::Reg64& reg, const Operand& operand);
-	void Fetch(const Operand& operand, const Xbyak::Label& unknown);
-	void Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Operand&));
-	void Store(const Node& node);
-	void EmitNode(uint32_t index);
-	void EmitRead(const Node& node);
-	void EmitStrict(const Node& node);
+	void    Layout();
+	void    Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip);
+	void    Zero(uint32_t offset, uint32_t size);
+	void    Branch(const Operand& operand, const Xbyak::Label& unknown);
+	void    Load(const Xbyak::Reg64& reg, const Operand& operand);
+	void    Fetch(const Operand& operand, const Xbyak::Label& unknown);
+	void    Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Operand&));
+	void    Store(const Node& node);
+	void    EmitNode(uint32_t index);
+	void    EmitRead(const Node& node);
+	void    EmitStrict(const Node& node);
 
-	ResourcePlan&                                     m_plan;
-	Xbyak::CodeGenerator&                             m_code;
-	std::vector<Value>                                m_masks {Value {}};
-	std::deque<Node>                                  m_nodes;
+	ResourcePlan&                                        m_plan;
+	Xbyak::CodeGenerator&                                m_code;
+	std::vector<Value>                                   m_masks {Value {}};
+	std::deque<Node>                                     m_nodes;
 	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
-	std::vector<Value>                                m_outputs;
-	std::vector<std::vector<uint32_t>>                m_output_gates;
-	Xbyak::Label                                      m_ret;
+	std::vector<Value>                                   m_outputs;
+	std::vector<std::vector<uint32_t>>                   m_output_gates;
+	Xbyak::Label                                         m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
@@ -479,16 +480,21 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 				if (indirect->selector->rows) add(indirect->selector->rows->source);
 			}
 		}
-		for (const auto source: indirect->sources) add(source);
+		for (const auto source: indirect->sources)
+			add(source);
 		AddOutput(indirect->key_count, root);
 		AddOutput(indirect->selector_first, root);
 		AddOutput(indirect->selector_mask, root);
 	};
-	for (const auto& buffer: m_plan.info.buffers) consume(buffer.source);
-	for (const auto& image: m_plan.info.images) consume(image.source);
+	for (const auto& buffer: m_plan.info.buffers)
+		consume(buffer.source);
+	for (const auto& image: m_plan.info.images)
+		consume(image.source);
 	for (const auto& sampler: m_plan.info.samplers) {
-		const auto* indirect = sampler.source < sources.size() && sources[sampler.source].indirect_descriptor
-		    ? &*sources[sampler.source].indirect_descriptor : nullptr;
+		const auto* indirect =
+		    sampler.source < sources.size() && sources[sampler.source].indirect_descriptor
+		        ? &*sources[sampler.source].indirect_descriptor
+		        : nullptr;
 		if (indirect == nullptr || indirect->sources.empty()) {
 			consume(sampler.source);
 		} else if (indirect->sources[0] < sources.size()) {
@@ -499,7 +505,8 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 	if (fill.fill.words != 0) {
 		AddOutput(fill.pattern_size, UINT32_MAX);
 		AddOutput(fill.element_count, UINT32_MAX);
-		for (const auto value: fill.values) AddOutput(value, UINT32_MAX);
+		for (const auto value: fill.values)
+			AddOutput(value, UINT32_MAX);
 	}
 }
 
@@ -515,7 +522,8 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 	const auto* inst = value.TryInstruction();
 	if (inst == nullptr) return {};
 	const auto op = inst->GetOpcode();
-	if (context != 0 && IsRuntimeSelect(op) && inst->NumArgs() == 3 && inst->Arg(0).Resolve() == mask) {
+	if (context != 0 && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
+	    inst->Arg(0).Resolve() == mask) {
 		return {Evaluate(inst->Arg(1), context).operand, true};
 	}
 	switch (op) {
@@ -526,7 +534,8 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			const auto* source = inst->Arg(0).ResolveInstruction();
 			const auto  index  = inst->Arg(1).Resolve();
 			if (source == nullptr || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 ||
-			    !index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) return {};
+			    !index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u)
+				return {};
 			return Evaluate(source->Arg(index.U32()), context);
 		}
 		case ValueOpcode::ReadFirstLane:
@@ -534,7 +543,9 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			return {Evaluate(inst->Arg(0), Context(inst->Arg(1))).operand};
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-			if (reg < m_plan.user_data_base || reg - m_plan.user_data_base >= m_plan.user_data_count) return {};
+			if (reg < m_plan.user_data_base ||
+			    reg - m_plan.user_data_base >= m_plan.user_data_count)
+				return {};
 			return {{Kind::UserData, reg - m_plan.user_data_base}};
 		}
 		case ValueOpcode::GetShaderBase: return {{Kind::ShaderBase}};
@@ -546,7 +557,8 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			break;
 		default: break;
 	}
-	const auto [found, inserted] = m_memo.try_emplace({inst, context}, static_cast<uint32_t>(m_nodes.size()));
+	const auto [found, inserted] =
+	    m_memo.try_emplace({inst, context}, static_cast<uint32_t>(m_nodes.size()));
 	const auto index = found->second;
 	if (!inserted) {
 		auto& node = m_nodes[index];
@@ -594,20 +606,25 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 		case ValueOpcode::SelectF32: {
 			const auto predicate = arg(inst.Arg(0));
 			if (predicate.kind == Kind::Unknown) return {};
-			if (predicate.kind == Kind::Constant) return arg(inst.Arg(predicate.value != 0u ? 1 : 2));
+			if (predicate.kind == Kind::Constant)
+				return arg(inst.Arg(predicate.value != 0u ? 1 : 2));
 			node.args = {predicate, arg(inst.Arg(1)), arg(inst.Arg(2))};
-			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown ? Operand {} : self;
+			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown
+			           ? Operand {}
+			           : self;
 		}
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::ULessThanEqual32: {
-			// No U32 is below zero and every U32 is at least zero, including an unknown loop-carried
-			// or varying lane value. args[0] is that zero-tested bound.
+			// No U32 is below zero and every U32 is at least zero, including an unknown
+			// loop-carried or varying lane value. args[0] is that zero-tested bound.
 			const bool less  = inst.GetOpcode() == ValueOpcode::ULessThan32;
 			const auto bound = arg(inst.Arg(less ? 1 : 0));
 			if (bound.kind == Kind::Unknown) return {};
-			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) return constant(!less);
+			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u)
+				return constant(!less);
 			node.args = {bound, arg(inst.Arg(less ? 0 : 1))};
-			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {} : self;
+			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {}
+			                                                                          : self;
 		}
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd: {
@@ -627,22 +644,28 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 			Operand refined;
 			if (conjunction && MayBeUnknown(a)) {
 				refined = Evaluate(inst.Arg(1), Context(inst.Arg(0))).operand;
-				if (refined == b || (refined.kind == Kind::Constant && refined.value != 0u)) refined = {};
+				if (refined == b || (refined.kind == Kind::Constant && refined.value != 0u))
+					refined = {};
 				if (a.kind == Kind::Unknown && refined.kind == Kind::Constant) return constant(0u);
 			}
 			if (a.kind == Kind::Unknown && refined.kind == Kind::Unknown &&
-			    (b.kind == Kind::Unknown || b.kind == Kind::Constant)) return {};
+			    (b.kind == Kind::Unknown || b.kind == Kind::Constant))
+				return {};
 			node.args = {a, b, refined};
 			return self;
 		}
 		case ValueOpcode::CompositeExtractU64: {
 			const auto component = inst.Arg(1).Resolve();
-			if (!component.IsImmediate() || component.GetType() != Type::U32 || component.U32() >= 2u) return {};
+			if (!component.IsImmediate() || component.GetType() != Type::U32 ||
+			    component.U32() >= 2u)
+				return {};
 			[[fallthrough]];
 		}
 		default:
-			// The other runtime-uniform ops are strict; a U32x2 pair is only read through its extracts.
-			if (!IsRuntimeUniformOp(inst.GetOpcode()) || inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
+			// The other runtime-uniform ops are strict; a U32x2 pair is only read through its
+			// extracts.
+			if (!IsRuntimeUniformOp(inst.GetOpcode()) ||
+			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
 				return {};
 			for (size_t i = 0; i < inst.NumArgs(); ++i) {
 				node.args.push_back(arg(inst.Arg(i)));
@@ -653,7 +676,7 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 }
 
 WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg, Operand self) {
-	const auto& inst = *node.inst;
+	const auto& inst   = *node.inst;
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (!IsRawRead(m_plan, inst) || handle == nullptr) return {};
 	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
@@ -664,7 +687,8 @@ WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg,
 		node.args.push_back(guard);
 	}
 	const bool buffer = inst.GetOpcode() != ValueOpcode::LoadAddressU32;
-	const auto offset = static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset);
+	const auto offset =
+	    static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset);
 	bool failed = buffer && (handle->NumArgs() != 4u || offset < 0);
 	for (const auto& word: {handle->Arg(0), handle->Arg(1), inst.Arg(1)}) {
 		node.args.push_back(arg(word));
@@ -683,7 +707,7 @@ WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg,
 
 void WalkerCompiler::Layout() {
 	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
-	m_shader_base = offset;
+	m_shader_base   = offset;
 	offset += 8u;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
@@ -793,8 +817,8 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 	}
 	switch (node.inst->GetOpcode()) {
 		case ValueOpcode::Phi: {
-			// Only predecessors reached by this walk contribute, and they must agree. The state is 3
-			// once one of them has stored the value; callers read it like 1, as unknown.
+			// Only predecessors reached by this walk contribute, and they must agree. The state is
+			// 3 once one of them has stored the value; callers read it like 1, as unknown.
 			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
 			const auto  state  = c.byte[c.rdx + node.state];
 			for (size_t i = 0; i < args.size(); ++i) {
@@ -837,7 +861,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		}
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::ULessThanEqual32: {
-			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
+			const bool   less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
 			Xbyak::Label bound_zero;
 			Fetch(args[0], m_ret);
 			c.test(c.eax, c.eax);
@@ -856,9 +880,9 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		}
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd: {
-			const bool conjunction = node.inst->GetOpcode() == ValueOpcode::LogicalAnd;
+			const bool   conjunction = node.inst->GetOpcode() == ValueOpcode::LogicalAnd;
 			Xbyak::Label unknown_left, refine, decided;
-			const auto decide = [&] {
+			const auto   decide = [&] {
 				if (conjunction) {
 					c.jz(decided, Near);
 				} else {
@@ -900,11 +924,11 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 
 // Raw scalar and uniform DWORD buffer loads; out-of-bounds reads are zero.
 void WalkerCompiler::EmitRead(const Node& node) {
-	auto&      c    = m_code;
-	const auto& inst = *node.inst;
-	const auto op = inst.GetOpcode();
-	const bool vector = op == ValueOpcode::LoadBufferU32;
-	auto args = std::span(node.args);
+	auto&        c      = m_code;
+	const auto&  inst   = *node.inst;
+	const auto   op     = inst.GetOpcode();
+	const bool   vector = op == ValueOpcode::LoadBufferU32;
+	auto         args   = std::span(node.args);
 	Xbyak::Label zero;
 	if (vector) {
 		Fetch(args[0], m_ret);
@@ -914,10 +938,11 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		if (args.empty()) c.jmp(m_ret, Near);
 	}
 	if (!args.empty()) {
-		for (const auto& arg: args) Branch(arg, m_ret);
-		const auto immediate =
-		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
-		    ~int64_t {3};
+		for (const auto& arg: args)
+			Branch(arg, m_ret);
+		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(
+		                           m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
+		                       ~int64_t {3};
 		// rax = the 48-bit base (high << 32 | low) with its low two bits clear.
 		Load(c.rax, args[1]);
 		c.shl(c.rax, 48);
@@ -977,9 +1002,11 @@ void WalkerCompiler::EmitRead(const Node& node) {
 void WalkerCompiler::EmitStrict(const Node& node) {
 	auto&       c    = m_code;
 	const auto& inst = *node.inst;
-	for (const auto& arg: node.args) Branch(arg, m_ret);
+	for (const auto& arg: node.args)
+		Branch(arg, m_ret);
 	const std::array regs {c.rax, c.rcx, c.r9, c.r11};
-	for (size_t i = 0; i < node.args.size() && i < regs.size(); ++i) Load(regs[i], node.args[i]);
+	for (size_t i = 0; i < node.args.size() && i < regs.size(); ++i)
+		Load(regs[i], node.args[i]);
 	// Field ops require offset + width <= 32. Leaves (1 << width) - 1 in r11, the offset in
 	// cl and the former rcx (the offset or the inserted value) in r10.
 	const auto field = [&](const Xbyak::Reg32& offset, const Xbyak::Reg32& width) {
@@ -1014,6 +1041,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::UMin32:
 			c.cmp(c.eax, c.ecx);
 			c.cmova(c.eax, c.ecx);
+			break;
+		case ValueOpcode::SMin32:
+			c.cmp(c.eax, c.ecx);
+			c.cmovg(c.eax, c.ecx);
 			break;
 		case ValueOpcode::UMax32:
 			c.cmp(c.eax, c.ecx);
@@ -1191,26 +1222,30 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 }
 
 void WalkerCompiler::Compile(std::span<const Value> values) {
-	auto&       c         = m_code;
-	const auto& sources   = m_plan.descriptor_sources;
-	const auto& blocks    = m_plan.control_flow;
-	const bool  resources = values.empty();
+	auto&                              c         = m_code;
+	const auto&                        sources   = m_plan.descriptor_sources;
+	const auto&                        blocks    = m_plan.control_flow;
+	const bool                         resources = values.empty();
 	std::vector<std::vector<uint32_t>> gates(sources.size());
 	if (resources) Consume(gates);
-	for (const auto value: values) AddOutput(value, UINT32_MAX);
+	for (const auto value: values)
+		AddOutput(value, UINT32_MAX);
 	// Analyze every root first, so thunk bodies only reuse finished operands.
 	std::vector<Operand>              conditions, reads, outputs;
 	std::vector<std::vector<Operand>> descriptors(sources.size());
 	if (resources) {
-		for (const auto& block: blocks) conditions.push_back(Evaluate(block.condition, 0).operand);
-		for (const auto& read: m_plan.srt_reads) reads.push_back(Evaluate(read.value, 0).operand);
+		for (const auto& block: blocks)
+			conditions.push_back(Evaluate(block.condition, 0).operand);
+		for (const auto& read: m_plan.srt_reads)
+			reads.push_back(Evaluate(read.value, 0).operand);
 		for (uint32_t source = 0; source < sources.size(); ++source) {
 			if (gates[source].empty()) continue;
 			for (uint32_t word = 0; word < sources[source].dword_count; ++word)
 				descriptors[source].push_back(Evaluate(sources[source].dwords[word], 0).operand);
 		}
 	}
-	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	for (const auto value: m_outputs)
+		outputs.push_back(Evaluate(value, 0).operand);
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
@@ -1218,22 +1253,26 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 	if (!resources) {
-		for (uint32_t block = 0; block < blocks.size(); ++block) c.mov(c.byte[c.rdx + m_reach + block], 1);
+		for (uint32_t block = 0; block < blocks.size(); ++block)
+			c.mov(c.byte[c.rdx + m_reach + block], 1);
 	} else if (!blocks.empty()) {
 		// Reachability grows monotonically. A newly reached predecessor of an evaluated
 		// control Phi restarts the walk with fresh values; a retreating edge resumes at its target.
 		std::vector<std::vector<uint32_t>> rechecks(blocks.size());
 		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 			const auto& node = m_nodes[index];
-			if (node.inst->GetOpcode() != ValueOpcode::Phi || node.result != Operand {Kind::Node, index}) continue;
-			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
+			if (node.inst->GetOpcode() != ValueOpcode::Phi ||
+			    node.result != Operand {Kind::Node, index})
+				continue;
+			for (const auto block: m_plan.control_phi_predecessors.at(node.inst))
+				rechecks[block].push_back(node.state);
 		}
 		std::vector<Xbyak::Label> starts(blocks.size());
 		c.mov(c.byte[c.rdx + m_reach], 1);
 		c.L(pass);
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			Xbyak::Label next;
-			const auto mark = [&](uint32_t target) {
+			const auto   mark = [&](uint32_t target) {
 				Xbyak::Label reached;
 				c.cmp(c.byte[c.rdx + m_reach + target], 0);
 				c.jne(reached, Near);
@@ -1265,14 +1304,16 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 					c.jmp(next, Near);
 					c.L(both);
 				}
-				for (const auto successor: successors) mark(successor);
+				for (const auto successor: successors)
+					mark(successor);
 			}
 			c.L(next);
 		}
 	}
 	if (resources) {
 		const auto flat = [&](uint32_t slot) {
-			const auto offset = slot < reads.size() ? m_plan.srt_reads[slot].flat_offset : UINT32_MAX;
+			const auto offset =
+			    slot < reads.size() ? m_plan.srt_reads[slot].flat_offset : UINT32_MAX;
 			if (offset >= reads.size()) {
 				c.jmp(fail, Near);
 				return;
@@ -1281,21 +1322,23 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
 		};
 		if (blocks.empty()) {
-			for (uint32_t slot = 0; slot < reads.size(); ++slot) flat(slot);
+			for (uint32_t slot = 0; slot < reads.size(); ++slot)
+				flat(slot);
 		}
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			if (blocks[block].srt_reads.empty()) continue;
 			Xbyak::Label skip;
 			c.cmp(c.byte[c.rdx + m_reach + block], 0);
 			c.je(skip, Near);
-			for (const auto slot: blocks[block].srt_reads) flat(slot);
+			for (const auto slot: blocks[block].srt_reads)
+				flat(slot);
 			c.L(skip);
 		}
 		// A source or image no block lists is always active.
 		for (uint32_t index = 0; index < sources.size() + m_plan.info.images.size(); ++index) {
-			const bool     image = index >= sources.size();
-			const uint32_t id    = image ? index - static_cast<uint32_t>(sources.size()) : index;
-			bool listed = false;
+			const bool     image  = index >= sources.size();
+			const uint32_t id     = image ? index - static_cast<uint32_t>(sources.size()) : index;
+			bool           listed = false;
 			for (uint32_t block = 0; block < blocks.size(); ++block) {
 				const auto& list = image ? blocks[block].images : blocks[block].sources;
 				if (std::ranges::find(list, id) == list.end()) continue;
@@ -1316,7 +1359,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		for (uint32_t source = 0; source < sources.size(); ++source) {
 			if (gates[source].empty()) continue;
 			Xbyak::Label skip;
-			const auto known = c.dword[c.rdx + source * DescriptorStride + 8u * sizeof(uint32_t)];
+			const auto   known = c.dword[c.rdx + source * DescriptorStride + 8u * sizeof(uint32_t)];
 			c.mov(known, 0);
 			Gate(gates[source], skip);
 			for (uint32_t word = 0; word < descriptors[source].size(); ++word) {
@@ -1329,7 +1372,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (uint32_t index = 0; index < outputs.size(); ++index) {
 		Xbyak::Label skip;
-		const auto output = c.qword[c.rdx + OutputOffset(m_plan) + index * 8u];
+		const auto   output = c.qword[c.rdx + OutputOffset(m_plan) + index * 8u];
 		c.mov(output, -1);
 		Gate(m_output_gates[index], skip);
 		Fetch(outputs[index], skip);
@@ -1369,10 +1412,11 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	using Walker =
+	    const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	const auto* end  = plan.srt_code->getCode<Walker>()(
+	    runtime.user_data.data(), flat.data(), plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
@@ -1383,7 +1427,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 }
 
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
-	value = value.Resolve();
+	value         = value.Resolve();
 	uint64_t bits = 0;
 	if (value.IsImmediate()) {
 		if (!ImmediateBits(value, bits)) return false;
@@ -1403,7 +1447,7 @@ bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue
 	std::array<uint32_t, 9> words {};
 	std::memcpy(words.data(), Scratch(plan) + source * DescriptorStride, DescriptorStride);
 	if (words[8] == 0u) return false;
-	result = {};
+	result             = {};
 	result.dword_count = plan.descriptor_sources[source].dword_count;
 	std::copy_n(words.begin(), result.dword_count, result.dwords.begin());
 	return true;
@@ -1427,7 +1471,8 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
 	if (t_running_walker == nullptr ||
-	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >= t_running_walker->getSize())
+	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >=
+	        t_running_walker->getSize())
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
 	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;

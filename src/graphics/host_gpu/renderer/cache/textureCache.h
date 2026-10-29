@@ -32,7 +32,7 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
 class TextureCache {
@@ -63,7 +63,8 @@ public:
 		TouchImage(image);
 		return image;
 	}
-	void MarkGpuWritten(ImageId id);
+	void                  MarkGpuWritten(ImageId id);
+	[[nodiscard]] ImageId MaterializeStencilStorage(ImageId id, const ImageDesc& desc);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -98,9 +99,9 @@ private:
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
+		using FuncReturn                   = typename std::invoke_result<Func, uint64_t>::type;
 		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
-		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
+		const uint64_t        page_end     = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
@@ -112,6 +113,8 @@ private:
 		}
 	}
 
+	void CopyStencilStorage(Image& depth, Image& color, const ImageSubresourceRange& range,
+	                        bool to_depth);
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
@@ -139,13 +142,12 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -154,13 +156,13 @@ private:
 	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
 	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
 	// render area.
-	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
-	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level, uint32_t layer,
+	                               uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
-	void PrepareImageCopy(Image& image);
-	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	void       PrepareImageCopy(Image& image);
+	void       RefreshCopySource(ImageId id);
+	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
+	void                  CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
@@ -183,10 +185,10 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
-	bool             m_readback_linear_images = false;
-	bool             m_readback_tiled_images  = false;
+	uint64_t m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t m_gc_tick                = 0;
+	bool     m_readback_linear_images = false;
+	bool     m_readback_tiled_images  = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

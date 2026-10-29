@@ -49,14 +49,20 @@ struct Reader {
 	}
 };
 
-template <class S> constexpr bool Reading = std::is_same_v<S, Reader>;
-template <class T, template <class...> class Of> constexpr bool IsA = false;
-template <template <class...> class Of, class... A> constexpr bool IsA<Of<A...>, Of> = true;
-template <class T, class U> concept Is = std::is_same_v<std::remove_const_t<T>, U>;
+template <class S>
+constexpr bool Reading = std::is_same_v<S, Reader>;
+template <class T, template <class...> class Of>
+constexpr bool IsA = false;
+template <template <class...> class Of, class... A>
+constexpr bool IsA<Of<A...>, Of> = true;
+template <class T, class U>
+concept Is = std::is_same_v<std::remove_const_t<T>, U>;
 
-template <class S, class T> void Io(S& io, T& value);
+template <class S, class T>
+void Io(S& io, T& value);
 
-template <class S, class... T> void IoAll(S& io, T&&... values) {
+template <class S, class... T>
+void IoAll(S& io, T&&... values) {
 	(Io(io, values), ...);
 }
 
@@ -104,13 +110,16 @@ inline void IoValue(Reader& reader, Value& value) {
 		case Type::U32: value = Value(static_cast<uint32_t>(bits)); break;
 		case Type::U64: value = Value(bits); break;
 		case Type::F16: value = Value::F16(static_cast<uint16_t>(bits)); break;
-		case Type::F32: value = Value::F32(std::bit_cast<float>(static_cast<uint32_t>(bits))); break;
+		case Type::F32:
+			value = Value::F32(std::bit_cast<float>(static_cast<uint32_t>(bits)));
+			break;
 		default: reader.ok = false; break;
 	}
 }
 
 // Scalars and standard containers; structs have their own overloads below.
-template <class S, class T> void Io(S& io, T& value) {
+template <class S, class T>
+void Io(S& io, T& value) {
 	using U = std::remove_const_t<T>;
 	static_assert(!std::is_pointer_v<U>, "pointers do not persist");
 	if constexpr (std::is_arithmetic_v<U> || std::is_enum_v<U>) {
@@ -125,45 +134,52 @@ template <class S, class T> void Io(S& io, T& value) {
 		if constexpr (std::is_arithmetic_v<E> || std::is_enum_v<E>) {
 			io.Raw(value.data(), value.size() * sizeof(E));
 		} else {
-			for (auto& element: value) Io(io, element);
+			for (auto& element: value)
+				Io(io, element);
 		}
 	} else if constexpr (IsA<U, std::optional>) {
 		bool has = value.has_value();
 		Io(io, has);
 		if constexpr (Reading<S>) {
-			if (has) value = typename U::value_type {}; // Not emplace(): clang rejects nested aggregates.
-			else value.reset();
+			if (has)
+				value =
+				    typename U::value_type {}; // Not emplace(): clang rejects nested aggregates.
+			else
+				value.reset();
 		}
 		if (has) Io(io, *value);
 	} else {
 		static_assert(requires { std::tuple_size<U>::value; }, "struct without an Io overload");
-		std::apply([&](auto&... elements) { IoAll(io, elements...); }, value); // std::array, std::pair
+		std::apply([&](auto&... elements) { IoAll(io, elements...); },
+		           value); // std::array, std::pair
 	}
 }
 
 // Binds every field, so that a field added later fails to compile until it is listed.
 #define KYTY_IO_FIELDS(Struct, ...)                                                                \
-	template <class S, Is<Struct> T> void Io(S& io, T& object) {                                   \
+	template <class S, Is<Struct> T>                                                               \
+	void Io(S& io, T& object) {                                                                    \
 		auto& [__VA_ARGS__] = object;                                                              \
 		IoAll(io, __VA_ARGS__);                                                                    \
 	}
-KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)
+KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
+               y)
 KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
 KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
 KYTY_IO_FIELDS(StageOutput, a, b, c, d)
-KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M)
+KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
+               y, z, A, B, C, D, E, F, G, H, I, J, K, L, M)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
-               l)
+               l, m, n)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p,
                q, r)
-KYTY_IO_FIELDS(DescriptorSource, a, b, c)
+KYTY_IO_FIELDS(DescriptorSource, a, b, c, d)
 KYTY_IO_FIELDS(SrtRead, a, b)
 KYTY_IO_FIELDS(ResourceBlock, a, b, c, d, e)
 KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f)

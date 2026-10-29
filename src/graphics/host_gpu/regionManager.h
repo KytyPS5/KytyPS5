@@ -4,11 +4,13 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/uffdWriteWatch.h"
 #include "graphics/host_gpu/writeHeat.h"
 
 #include <atomic>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -116,6 +118,7 @@ public:
 		}
 		if constexpr (source == DirtySource::Cpu && !enable) {
 			m_write_heat.Cool(start, end);
+			m_armed.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
 			// A hot page is kept dirty only so that it is uploaded at every use. The caller has
@@ -125,6 +128,7 @@ public:
 					m_cpu_dirty.UnsetRange(page, page + 1);
 				}
 			}
+			m_armed.UnsetRange(start, end);
 			if (m_write_heat.Cool(start, end)) {
 				UpdateProtection<true, false>();
 			}
@@ -157,7 +161,27 @@ public:
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				ForgetOldHeat();
-				m_write_heat.KeepHotDirty(bits, start, end, Frame());
+				auto* const watch = UffdWriteWatch::Get();
+				if (watch != nullptr &&
+				    watch->Covers(m_cpu_addr + start * TRACKER_PAGE_SIZE,
+				                  (end - start) * TRACKER_PAGE_SIZE)) {
+					// The hot pages stay open but clean, protected through the watch: a scan
+					// finds the ones written since (HarvestIfDue).
+					auto kept = bits;
+					m_write_heat.KeepHotDirty(kept, start, end, Frame());
+					// Pages armed already were protected again by their scan.
+					const auto arm = (kept ^ bits) & ~m_armed;
+					for (const auto [first, last]: arm) {
+						watch->Protect(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+						               (last - first) * TRACKER_PAGE_SIZE);
+					}
+					m_armed |= arm;
+					if (arm.Any()) {
+						maybe_armed.store(true, std::memory_order_relaxed);
+					}
+				} else {
+					m_write_heat.KeepHotDirty(bits, start, end, Frame());
+				}
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -176,6 +200,78 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		ForgetOldHeat();
 		m_write_heat.Cool(start, end);
+		// Armed pages written since their scan are dirty for this upload; then they are closed.
+		const RegionBits armed(m_armed, start, end);
+		if (armed.Any()) {
+			std::vector<GuestRange> written;
+			for (const auto [first, last]: armed) {
+				UffdWriteWatch::Get()->TakeWritten(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+				                                   (last - first) * TRACKER_PAGE_SIZE, written);
+			}
+			for (const auto& range: written) {
+				const auto [first, last] = GetPageRange(range.address, range.size);
+				m_cpu_dirty.SetRange(first, last);
+			}
+			m_armed.UnsetRange(start, end);
+			UpdateProtection<true, false>();
+		}
+	}
+
+	// Memory that is no longer tracked: its pages are no longer armed.
+	void Disarm(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		m_armed.UnsetRange(start, end);
+	}
+
+	// Set when pages are armed; HarvestIfDue clears it once none are. Read without the lock.
+	std::atomic<bool> maybe_armed {false};
+
+	// A guest submission started: armed pages are due for a scan (HarvestIfDue).
+	static void NoteSubmission() noexcept { s_submission.fetch_add(1, std::memory_order_relaxed); }
+
+	// Under the lock, before the CPU dirty state is read: once per guest submission, the armed
+	// pages the CPU wrote since their last scan become dirty, as if the writes had faulted, and
+	// are appended to `written`. Armed pages whose heat ended are closed (protected as clean).
+	void HarvestIfDue(std::vector<GuestRange>& written) {
+		if (!maybe_armed.load(std::memory_order_relaxed)) {
+			return;
+		}
+		const auto epoch = s_submission.load(std::memory_order_relaxed);
+		if (m_harvest_epoch == epoch) {
+			return;
+		}
+		m_harvest_epoch = epoch;
+		ForgetOldHeat();
+		const auto first = m_armed.FirstRange().first;
+		const auto last  = m_armed.LastRange().second;
+		if (first < last) {
+			// One scan from the first armed page to the last; it reports open dirty pages too,
+			// which are left out.
+			m_scan.clear();
+			UffdWriteWatch::Get()->TakeWritten(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+			                                   (last - first) * TRACKER_PAGE_SIZE, m_scan);
+			for (const auto& range: m_scan) {
+				const auto [start, end] = GetPageRange(range.address, range.size);
+				for (const auto [armed_start, armed_end]: RegionBits(m_armed, start, end)) {
+					for (size_t page = armed_start; page < armed_end; page++) {
+						if (!m_cpu_dirty.Get(page)) {
+							m_write_heat.NoteWrite(page, page + 1, Frame());
+						}
+					}
+					m_cpu_dirty.SetRange(armed_start, armed_end);
+					written.push_back({m_cpu_addr + armed_start * TRACKER_PAGE_SIZE,
+					                   (armed_end - armed_start) * TRACKER_PAGE_SIZE});
+				}
+			}
+		}
+		const auto still_hot = m_armed & m_write_heat.Hot();
+		if ((still_hot ^ m_armed).Any()) {
+			m_armed = still_hot;
+			UpdateProtection<true, false>();
+		}
+		if (m_armed.None()) {
+			maybe_armed.store(false, std::memory_order_relaxed);
+		}
 	}
 
 	TrackingSpinLock lock;
@@ -200,7 +296,8 @@ private:
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		// Armed pages stay writable: the watch sees their writes.
+		const auto protection = is_read ? ~m_gpu_dirty : (m_cpu_dirty | m_armed);
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -244,11 +341,16 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// Hot pages that are open and clean, write-protected through the UffdWriteWatch.
+	RegionBits   m_armed;
+	std::vector<GuestRange> m_scan;
+	uint64_t                m_harvest_epoch = 0;
 	// Pages the guest writes again and again stay open and dirty (see writeHeat.h).
 	WriteHeat<TRACKER_REGION_PAGES>     m_write_heat;
 	uint32_t                            m_heat_epoch = 0;
 	static inline std::atomic<uint32_t> s_heat_epoch {0};
 	static inline std::atomic<uint32_t> s_frame {0};
+	static inline std::atomic<uint64_t> s_submission {1};
 };
 
 } // namespace Libs::Graphics

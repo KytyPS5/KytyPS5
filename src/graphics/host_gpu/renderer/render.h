@@ -161,7 +161,8 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -248,6 +249,9 @@ private:
 	std::unique_ptr<ThreadDimensionDispatch> m_thread_dimensions; // created on first use
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	// The last color target each slot resolved (colorRenderTarget.cpp).
+	struct ColorTargetMemos;
+	std::unique_ptr<ColorTargetMemos>    m_color_target_memos;
 	std::vector<ImageId>                  m_bound_images;
 	// The frame in which each render target was last drawn into. A target is an image slot with
 	// its generation (so a slot given to a new image does not inherit the frame of the old one)
@@ -299,10 +303,26 @@ private:
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	// Dropped whole when full: a frame of Crash Bandicoot 4 decodes about 1,500 different ones.
+	// CommitBindings: the (address, size) ranges a draw or dispatch writes.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
+	// Dropped whole at the end of a frame when full (bindings point into it): a frame of Crash
+	// Bandicoot 4 decodes about 1,500 different ones.
 	static constexpr size_t                MaxDecodedTextures = 4096;
 	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash, TextureDecodeKeyEqual>
 	    m_decoded_textures;
+	// The entry each shader image slot found last, by the slot's address: a draw that binds the
+	// same descriptor to the slot again compares instead of hashing. The resource is kept to be
+	// compared too, since a freed program's address can be reused. Void when the table is cleared.
+	struct DecodedSlot {
+		const ShaderRecompiler::IR::ImageResource* slot = nullptr;
+		ShaderRecompiler::IR::ImageResource        resource;
+		ShaderRecompiler::IR::DescriptorValue      value;
+		const DecodedTexture*                      texture = nullptr;
+		uint64_t                                   epoch   = 0;
+	};
+	std::array<DecodedSlot, 8192> m_decoded_slots {};
+	uint64_t                      m_decoded_epoch = 1;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -53,12 +53,16 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; });
 }
 
+// The format a metadata clear code decodes to.
+[[nodiscard]] vk::Format ColorClearFormat(const TextureCache::ImageDesc& desc) {
+	return desc.info.IsDepth() ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
+	                           : desc.view_info.format;
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.info.IsDepth()
-	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
-	                           : desc.view_info.format;
+	const auto  format   = ColorClearFormat(desc);
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
@@ -216,6 +220,29 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+void TextureCache::NoteImageChange(uint64_t address, uint64_t size) {
+	m_image_changes[m_image_change_count % ImageChangeLogSize] = {address, std::max<uint64_t>(size, 1)};
+	m_image_change_count++;
+}
+
+bool TextureCache::RangeUnchangedSince(uint64_t address, uint64_t size, uint64_t& since) const {
+	if (since == m_image_change_count) {
+		return true;
+	}
+	if (since > m_image_change_count || m_image_change_count - since > ImageChangeLogSize) {
+		return false;
+	}
+	const auto end = address + std::max<uint64_t>(size, 1);
+	for (auto change = since; change < m_image_change_count; ++change) {
+		const auto& logged = m_image_changes[change % ImageChangeLogSize];
+		if (logged.address < end && address < logged.address + logged.size) {
+			return false;
+		}
+	}
+	since = m_image_change_count;
+	return true;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	RegisterImage(id);
@@ -234,6 +261,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	NoteImageChange(image.info.data.address, image.info.data.size);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -255,6 +283,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	NoteImageChange(image.info.data.address, image.info.data.size);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -438,13 +467,24 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		return {};
 	}
 
+	ImageIds result;
+	auto&    query = m_region_queries[((address >> 14u) ^ (size >> 10u)) % m_region_queries.size()];
+	// A page overlap answer holds while the range's whole pages are unchanged.
+	const auto page_size  = uint64_t {1} << ImagePageTable::kPageBits;
+	const auto watched    = page_overlap ? address & ~(page_size - 1u) : address;
+	const auto watched_to = page_overlap ? Common::AlignUp(address + size, page_size) : address + size;
+	if (query.address == address && query.size == size && query.page_overlap == page_overlap &&
+	    RangeUnchangedSince(watched, watched_to - watched, query.since)) {
+		for (const auto id: query.ids) result.push_back(id);
+		return result;
+	}
+
 	uint32_t query_epoch = ++m_image_query_epoch;
 	if (query_epoch == 0) {
 		m_slot_images.ForEach([](ImageId, const Image& image) { image.query_epoch = 0; });
 		query_epoch = ++m_image_query_epoch;
 	}
 
-	ImageIds result;
 	ForEachPage(address, size, [&](uint64_t page) {
 		const auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr) {
@@ -464,6 +504,12 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 			}
 		});
 	});
+	query.address      = address;
+	query.size         = size;
+	query.page_overlap = page_overlap;
+	query.since        = m_image_change_count;
+	query.ids.clear();
+	for (const auto id: result) query.ids.push_back(id);
 	return result;
 }
 
@@ -1086,6 +1132,42 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	// The slices held no clear when their bytes were last read for this image, and nothing wrote
+	// them since: GPU writes, replacements and downloads change the watch's generation, and a CPU
+	// write faults, and so changes it, unless the CPU owns the page already (it is CPU dirty).
+	auto&                watches = m_buffer_cache.WriteWatches();
+	ColorMetadataChecked check {.image                = id,
+	                            .size                 = range.size,
+	                            .first                = first,
+	                            .count                = count,
+	                            .format               = ColorClearFormat(desc),
+	                            .clear_word           = desc.info.metadata.clear_word,
+	                            .kind                 = desc.info.metadata.kind,
+	                            .type                 = desc.type,
+	                            .clear_register_valid = desc.info.metadata.clear_register_valid,
+	                            .dcc_alpha_msb        = desc.info.metadata.dcc_alpha_msb};
+	bool watched   = false;
+	bool unchanged = false;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto       checked = m_color_metadata_checked.find({range.address, range.size, id});
+		if (checked != m_color_metadata_checked.end()) {
+			watched     = true;
+			check.watch = checked->second.watch;
+			unchanged   = checked->second.epoch == m_color_metadata_checked_epoch &&
+			            checked->second.SameSlices(check) &&
+			            watches.Generation(check.watch) == checked->second.generation;
+		}
+	}
+	if (unchanged && !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+		return;
+	}
+	if (!watched) {
+		check.watch = watches.Watch(range.address, range.size);
+	}
+	// Before the bytes are read: a write after this is seen at the next binding.
+	check.generation = watches.Generation(check.watch);
+	bool cleared     = false;
 	// The guest wrote the whole block with one code in a fill dispatch the renderer recognized:
 	// the code is known without reading the bytes back. Any write since then voids the record.
 	std::optional<ColorMetadataFill> known;
@@ -1154,6 +1236,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			            view.base_level, view.level_count,
 			            image_first + batch->first, batch->count}, clear);
 		}
+		cleared = true;
 		batch.reset();
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
@@ -1249,6 +1332,30 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		slice++;
 	}
+	std::scoped_lock lock {m_lock};
+	const ColorMetadataCheckedKey key {range.address, range.size, id};
+	auto                          checked = m_color_metadata_checked.find(key);
+	if (cleared ||
+	    (checked != m_color_metadata_checked.end() && checked->second.watch != check.watch)) {
+		// The clears changed the bytes; or another thread recorded the range meanwhile.
+		if (!watched) {
+			watches.Unwatch(check.watch);
+		}
+		if (cleared && checked != m_color_metadata_checked.end()) {
+			checked->second.epoch = 0;
+		}
+		return;
+	}
+	if (checked == m_color_metadata_checked.end() &&
+	    m_color_metadata_checked.size() >= MaxColorMetadataChecked) {
+		// A cache: emptied when the guest binds more metadata ranges than any frame needs.
+		for (const auto& [address, entry]: m_color_metadata_checked) {
+			watches.Unwatch(entry.watch);
+		}
+		m_color_metadata_checked.clear();
+	}
+	check.epoch                   = m_color_metadata_checked_epoch;
+	m_color_metadata_checked[key] = check;
 }
 
 void TextureCache::RefreshImage(ImageId id) {
@@ -1324,12 +1431,55 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
+		// FindImage answers for the plane's range depend on its info and owner.
+		NoteImageChange(stencil.address, stencil.size);
 	}
 
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+size_t TextureCache::FindImageKeyHash::operator()(const FindImageKey& key) const noexcept {
+	uint64_t h = key.address * 0x9e3779b97f4a7c15ull;
+	h ^= (key.size + (uint64_t {key.width} << 32u) + key.height) * 0xc2b2ae3d27d4eb4full;
+	h ^= (uint64_t {key.pixel_format} << 32u | key.guest_format) * 0x165667b19e3779f9ull;
+	h ^= (uint64_t {key.levels} << 40u | uint64_t {key.layers} << 16u | key.tile_mode << 8u |
+	      key.binding << 4u | key.exact_format);
+	return static_cast<size_t>(h ^ (h >> 29u));
+}
+
+TextureCache::FindImageKey TextureCache::MakeFindImageKey(const ImageDesc& desc,
+                                                          bool             exact_format) {
+	const auto& info = desc.info;
+	return {.address         = info.data.address,
+	        .size            = info.data.size,
+	        .width           = info.extent.width,
+	        .height          = info.extent.height,
+	        .depth           = info.extent.depth,
+	        .levels          = info.resources.levels,
+	        .layers          = info.resources.layers,
+	        .samples         = info.samples,
+	        .bytes_per_block = info.bytes_per_block,
+	        .pixel_format    = static_cast<uint32_t>(info.pixel_format),
+	        .guest_format    = static_cast<uint32_t>(info.guest_format),
+	        .tile_mode       = static_cast<uint32_t>(info.tile_mode),
+	        .type            = static_cast<uint8_t>(info.type),
+	        .binding         = static_cast<uint8_t>(desc.type),
+	        .exact_format    = static_cast<uint8_t>(exact_format),
+	        .bgra16          = static_cast<uint8_t>(info.bgra16)};
+}
+
+void TextureCache::ReuseImage(ImageId id, const ImageDesc& desc) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	MaterializeColorClear(id, desc, desc.view_info.base_layer);
+	CheckVideoOutRead(id, desc);
+}
+
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* plain) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1341,9 +1491,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		const auto       key   = MakeFindImageKey(desc, exact_format);
+		const auto       found = m_found_images.find(key);
+		if (found != m_found_images.end() &&
+		    RangeUnchangedSince(key.address, key.size, found->second.since)) {
+			result      = found->second.id;
+			auto& image = m_slot_images[result];
+			image.tick_accessed_last = m_scheduler.CurrentTick();
+			TouchImage(image);
+		}
+	}
+	if (result) {
+		if (plain != nullptr) *plain = true;
+		MaterializeColorClear(result, desc, metadata_base_layer);
+		CheckVideoOutRead(result, desc);
+		return result;
+	}
+	{
+		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 		bool block_alias = false;
+		// Another image the result could be a block alias of: the answer depends on its state.
+		bool alias_candidate = false;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1362,11 +1532,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
-			} else if (image.SafeToDownload() &&
-			           BcAlias::Matches(desc.info, image.info)) {
-				block_alias = true;
+			} else if (BcAlias::Matches(desc.info, image.info)) {
+				alias_candidate = true;
+				block_alias     = block_alias || image.SafeToDownload();
 			}
 		}
+		const bool matched = static_cast<bool>(result) && !alias_candidate;
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1409,6 +1580,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+		} else if (matched) {
+			if (m_found_images.size() >= MaxFoundImages) m_found_images.clear();
+			m_found_images[MakeFindImageKey(desc, exact_format)] = {m_image_change_count, result};
+			if (plain != nullptr) *plain = true;
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
@@ -1421,19 +1596,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		TouchImage(image);
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
-	if (desc.type == BindingType::VideoOut &&
-	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
-		std::scoped_lock lock {m_lock};
-		const auto& image = m_slot_images[result];
-		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
-		const bool native_current =
-		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
-		if (!native_current) {
-			EXIT("TextureCache: compressed video-out read requires clean native GPU "
-			     "contents\n");
-		}
-	}
+	CheckVideoOutRead(result, desc);
 	return result;
+}
+
+void TextureCache::CheckVideoOutRead(ImageId id, const ImageDesc& desc) {
+	if (desc.type != BindingType::VideoOut ||
+	    desc.info.metadata.compression == VideoOutCompression::Uncompressed) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto&      image       = m_slot_images[id];
+	const bool       guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
+	const bool       native_current =
+	    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
+	if (!native_current) {
+		EXIT("TextureCache: compressed video-out read requires clean native GPU contents\n");
+	}
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -1484,20 +1663,25 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	return FindTexture(id, desc.info, desc.view_info, desc.type);
+}
+
+vk::ImageView TextureCache::FindTexture(ImageId id, const ImageInfo& info,
+                                        const ImageViewInfo& view_info, BindingType type) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
-	if (desc.type == BindingType::Storage) {
+	if (type == BindingType::Storage) {
 		image.NoteContentWrite();
 		image.MarkGpuModified();
 	}
 	RefreshImage(id);
 	if (image.info.HasStencil() &&
-	    desc.info.data.address >= image.info.stencil.address &&
-	    desc.info.data.End() <= image.info.stencil.End()) {
+	    info.data.address >= image.info.stencil.address &&
+	    info.data.End() <= image.info.stencil.End()) {
 		for (const auto stencil_id:
 		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
 			const auto* stencil = m_slot_images.try_get(stencil_id);
@@ -1508,7 +1692,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			}
 		}
 	}
-	switch (desc.type) {
+	switch (type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			CommitGpuWrite(image);
@@ -1516,7 +1700,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	return image.FindView(desc.view_info);
+	return image.FindView(view_info);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
@@ -2141,6 +2325,7 @@ void TextureCache::RecordColorMetadataFill(uint64_t address, uint64_t size, uint
 void TextureCache::DropColorMetadataFills() {
 	std::scoped_lock lock {m_lock};
 	DropColorMetadataFillsLocked();
+	m_color_metadata_checked_epoch++;
 }
 
 void TextureCache::DropColorMetadataFillsLocked() {

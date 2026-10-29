@@ -544,7 +544,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {
 				if (binding.image_id != depth.image_id ||
-				    binding.desc.type != TextureCache::BindingType::Texture) continue;
+				    binding.type != TextureCache::BindingType::Texture) continue;
 				const auto native =
 				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 				EXIT_IF(native == image.views.end());
@@ -1201,6 +1201,14 @@ void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderS
 }
 
 void RenderExecutor::NoteFlip() {
+	if (m_decoded_textures.size() >= MaxDecodedTextures) {
+		// Prepared bindings point into the table; each draw prepares its own again.
+		for (auto& stage: m_graphics_bindings.vertex) stage.images.clear();
+		if (m_graphics_bindings.pixel) m_graphics_bindings.pixel->images.clear();
+		m_compute_bindings.images.clear();
+		m_decoded_textures.clear();
+		m_decoded_epoch++;
+	}
 	m_frame++;
 	RegionManager::NoteFrame();
 	PerfCounters::EndFrame();

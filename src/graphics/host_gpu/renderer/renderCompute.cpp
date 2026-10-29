@@ -167,11 +167,12 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 			    groups[axis] * threads > UINT32_MAX) return false;
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
-		const auto& destination = binding.desc.info.data;
+		if (binding.texture == nullptr) return false;
+		const auto& destination = binding.texture->desc.info.data;
 		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
 		std::scoped_lock lock {cache.m_lock};
 		const auto&      image = cache.GetImage(binding.image_id);
-		const auto&      view  = binding.desc.view_info;
+		const auto&      view  = binding.view_info;
 		if (image.backing.format != vk::Format::eD32SfloatS8Uint || image.info.samples != 1 ||
 		    image.info.stencil != destination || view.base_level >= image.backing.mip_levels ||
 		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||

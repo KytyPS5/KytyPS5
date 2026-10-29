@@ -13,10 +13,12 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/writeWatchSet.h"
 
+#include <array>
 #include <bitset>
 #include <map>
 #include <type_traits>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -51,11 +53,18 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `plain`: set when the answer came from a plain backing match, which holds while the
+	// image over its range changes (RangeUnchangedSince); ReuseImage gives it again.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      bool* plain = nullptr);
+	// The image FindImage found for `desc` by a plain match, used again: its access is noted.
+	void                        ReuseImage(ImageId id, const ImageDesc& desc);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageInfo& info,
+	                                        const ImageViewInfo& view_info, BindingType type);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -83,7 +92,8 @@ public:
 	// metadata code, the next colour clear resolution for that range uses it instead of reading the
 	// bytes back from the GPU. Call after the dispatch is recorded, so its own write is counted.
 	void RecordColorMetadataFill(uint64_t address, uint64_t size, uint32_t value);
-	// Voids every record: a GPU write is coming that no write watch will see.
+	// Voids every record, and every check of slices without a clear: a GPU write is coming that
+	// no write watch will see.
 	void DropColorMetadataFills();
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -123,6 +133,8 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	// A compressed video-out image is read from its native contents only.
+	void                      CheckVideoOutRead(ImageId id, const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -215,12 +227,115 @@ private:
 	using ColorMetadataFillMap                    = std::map<uint64_t, ColorMetadataFill>;
 	ColorMetadataFillMap::iterator DropColorMetadataFill(ColorMetadataFillMap::iterator fill);
 	void                           DropColorMetadataFillsLocked();
+	// Colour metadata slices whose bytes held no clear for an image, by metadata block range.
+	// While nothing writes the range (the write generation is unchanged and every CPU write would
+	// fault), binding the image again finds the same, and MaterializeColorClear returns early.
+	struct ColorMetadataChecked {
+		ImageId           image;
+		uint64_t          size         = 0;
+		uint32_t          first        = 0;
+		uint32_t          count        = 0;
+		// What DecodeColorClear reads of the description.
+		vk::Format        format               = vk::Format::eUndefined;
+		uint64_t          clear_word           = 0;
+		ImageMetadataKind kind                 = ImageMetadataKind::None;
+		BindingType       type                 = BindingType::Texture;
+		bool              clear_register_valid = false;
+		bool              dcc_alpha_msb        = false;
+		WriteWatchSet::Id watch                = 0;
+		uint64_t          generation           = 0;
+		// A check from an earlier epoch is void (DropColorMetadataFills); its watch is kept.
+		uint64_t          epoch                = 0;
+
+		[[nodiscard]] bool SameSlices(const ColorMetadataChecked& other) const noexcept {
+			return image == other.image && size == other.size && first == other.first &&
+			       count == other.count && format == other.format &&
+			       clear_word == other.clear_word && kind == other.kind && type == other.type &&
+			       clear_register_valid == other.clear_register_valid &&
+			       dcc_alpha_msb == other.dcc_alpha_msb;
+		}
+	};
+	// Images can share a metadata block address with other sizes or descriptions: one record each.
+	struct ColorMetadataCheckedKey {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		ImageId  image;
+		bool     operator==(const ColorMetadataCheckedKey&) const = default;
+	};
+	struct ColorMetadataCheckedHash {
+		size_t operator()(const ColorMetadataCheckedKey& key) const noexcept {
+			return std::hash<uint64_t> {}(key.address ^ (key.size << 20u)) ^
+			       (std::hash<ImageId> {}(key.image) * 0x9e3779b97f4a7c15ull);
+		}
+	};
+	std::unordered_map<ColorMetadataCheckedKey, ColorMetadataChecked, ColorMetadataCheckedHash>
+	    m_color_metadata_checked;
+	uint64_t                                           m_color_metadata_checked_epoch = 1;
+	static constexpr size_t MaxColorMetadataChecked = 4096;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// Recent FindImagesInRegion answers. Image ranges do not change while an image is
+	// registered, so an answer holds until an image over its range is registered or
+	// unregistered (RangeUnchangedSince).
+	struct RegionQuery {
+		uint64_t             address      = 0;
+		uint64_t             size         = 0;
+		uint64_t             since        = UINT64_MAX;
+		bool                 page_overlap = false;
+		std::vector<ImageId> ids;
+	};
+	mutable std::array<RegionQuery, 64> m_region_queries {};
+	// The ranges of the last ImageChangeLogSize registrations, unregistrations and changes of
+	// images, in order. An answer about a range, made when m_image_change_count was `since`,
+	// holds while none of the changes after it overlaps the range: images elsewhere, even next
+	// to it, do not end it.
+	struct ImageChange {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	static constexpr size_t                     ImageChangeLogSize = 256;
+	std::array<ImageChange, ImageChangeLogSize> m_image_changes {};
+	uint64_t                                    m_image_change_count = 0;
+	void                                        NoteImageChange(uint64_t address, uint64_t size);
+	// Moves `since` to the current count when the range is unchanged. False also when the log
+	// no longer reaches back to `since`.
+	[[nodiscard]] bool RangeUnchangedSince(uint64_t address, uint64_t size, uint64_t& since) const;
+	// FindImage answers that came from a plain backing match. What decides such an answer is
+	// the requested info and the images registered over its range, so it holds until an image
+	// over the range changes.
+	struct FindImageKey {
+		uint64_t address         = 0;
+		uint64_t size            = 0;
+		uint32_t width           = 0;
+		uint32_t height          = 0;
+		uint32_t depth           = 0;
+		uint32_t levels          = 0;
+		uint32_t layers          = 0;
+		uint32_t samples         = 0;
+		uint32_t bytes_per_block = 0;
+		uint32_t pixel_format    = 0;
+		uint32_t guest_format    = 0;
+		uint32_t tile_mode       = 0;
+		uint8_t  type            = 0;
+		uint8_t  binding         = 0;
+		uint8_t  exact_format    = 0;
+		uint8_t  bgra16          = 0;
+		bool     operator==(const FindImageKey&) const = default;
+	};
+	struct FindImageKeyHash {
+		size_t operator()(const FindImageKey& key) const noexcept;
+	};
+	struct FoundImage {
+		uint64_t since = 0;
+		ImageId  id;
+	};
+	[[nodiscard]] static FindImageKey MakeFindImageKey(const ImageDesc& desc, bool exact_format);
+	static constexpr size_t MaxFoundImages = 1u << 16u;
+	std::unordered_map<FindImageKey, FoundImage, FindImageKeyHash> m_found_images;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

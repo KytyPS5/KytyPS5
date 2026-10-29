@@ -19,14 +19,6 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
-struct TextureBinding {
-	ImageId                    image_id;
-	vk::ImageView              image_view = nullptr;
-	TextureCache::ImageDesc    desc;
-	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
-	std::vector<vk::ImageView> mip_views;
-};
-
 // What a texture descriptor decodes to before the texture cache looks up its image (see
 // RenderExecutor::DecodeTexture). It depends only on the descriptor and on how the shader uses the
 // texture, so a frame that binds the same texture thousands of times decodes it once.
@@ -36,6 +28,32 @@ struct DecodedTexture {
 	bool                    shader_conversion = false;
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
+	// The image a plain backing match found for the description (TextureCache::FindImage), and
+	// the image bound for it (the depth owner of a stencil plane): kept until an image over the
+	// description's range changes (TextureCache::RangeUnchangedSince from image_since).
+	mutable ImageId  found_image;
+	mutable ImageId  bound_image;
+	mutable uint64_t image_since = 0;
+};
+
+struct TextureBinding {
+	ImageId                    image_id;
+	vk::ImageView              image_view = nullptr;
+	// The decoded texture, which RenderExecutor keeps until the frame ends, and its view.
+	const DecodedTexture*      texture = nullptr;
+	ImageViewInfo              view_info;
+	TextureCache::BindingType  type   = TextureCache::BindingType::Texture;
+	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
+	std::vector<vk::ImageView> mip_views;
+
+	// The whole description: the decoded texture's, with the binding's view.
+	[[nodiscard]] TextureCache::ImageDesc Desc() const {
+		EXIT_IF(texture == nullptr);
+		auto desc      = texture->desc;
+		desc.view_info = view_info;
+		desc.type      = type;
+		return desc;
+	}
 };
 
 struct TextureDecodeKey {
@@ -63,8 +81,30 @@ struct TextureDecodeKeyHash {
 		for (const auto dword: key.value.dwords) {
 			hash = Common::Fnv64Step(hash, dword);
 		}
-		hash = Common::Fnv64Step(hash, key.resource.source);
-		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(key.resource.written));
+		// Every field the keys are compared by: one texture that many shaders read (each its
+		// own first use, descriptor index) would otherwise fill a single bucket.
+		const auto& r = key.resource;
+		hash = Common::Fnv64Step(hash, r.source);
+		hash = Common::Fnv64Step(hash, r.descriptor_index);
+		hash = Common::Fnv64Step(hash, r.first_use_pc);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(r.resource_class) |
+		                                   static_cast<uint32_t>(r.numeric_class) << 8u |
+		                                   static_cast<uint32_t>(r.dimension) << 16u |
+		                                   static_cast<uint32_t>(r.mip_mode) << 24u);
+		hash = Common::Fnv64Step(hash, r.mip_count);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(r.conversion_format));
+		hash = Common::Fnv64Step(hash, r.shader_swizzle);
+		hash = Common::Fnv64Step(hash, uint32_t {r.read} | uint32_t {r.written} << 1u |
+		                                   uint32_t {r.atomic} << 2u | uint32_t {r.atomic64} << 3u |
+		                                   uint32_t {r.unfiltered_access_only} << 4u |
+		                                   uint32_t {r.depth_compare} << 5u |
+		                                   uint32_t {r.cube} << 6u | uint32_t {r.r128} << 7u);
+		hash = Common::Fnv64Step(hash, r.indirect_root);
+		hash = Common::Fnv64Step(hash, r.indirect_mapping_offset);
+		hash = Common::Fnv64Step(hash, r.indirect_search_iterations);
+		for (const auto index: r.indirect_resources) {
+			hash = Common::Fnv64Step(hash, index);
+		}
 		return static_cast<size_t>(hash);
 	}
 };

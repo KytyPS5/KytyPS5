@@ -960,6 +960,14 @@ namespace {
 // Each jump-table target nests one more If, so a larger table stays on the dispatcher.
 constexpr size_t MaxJumpTableTargets = 64;
 
+// True when an indirect branch reads its target from a table indexed by a selector
+// register, which is the only form the goto chain can express.
+bool IsIndexedJumpTable(const Terminator& term) {
+	return term.kind == TerminatorKind::IndirectBranch &&
+	       term.indirect_selector_code != UINT32_MAX && !term.indirect_selector_values.empty() &&
+	       term.indirect_selector_values.size() == term.indirect_selector_targets.size();
+}
+
 // Eliminate gotos by moving them through a structured statement tree. Every Code node
 // retains exactly one guest block; only Boolean route values cross construct boundaries.
 // This follows the outward/inward/lifting transformations used by shadPS4's GotoPass.
@@ -1101,8 +1109,7 @@ private:
 	// Returns why a jump table cannot become a goto chain, or nullptr when it can. The chain
 	// takes the first target whose values match, so every table value must be unique.
 	static const char* JumpTableFailure(const Terminator& term, size_t targets) {
-		if (term.indirect_selector_code == UINT32_MAX || term.indirect_selector_values.empty() ||
-		    term.indirect_selector_values.size() != term.indirect_selector_targets.size()) {
+		if (!IsIndexedJumpTable(term)) {
 			return "jump table has no indexed selector";
 		}
 		auto values = term.indirect_selector_values;
@@ -1781,16 +1788,14 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	RecomputeAnalyses(graph);
 
-	if (indirect_setpc) {
-		graph.irreducible  = true;
-		graph.unsupported  = false;
-		graph.failure_kind = FailureKind::IrreducibleControlFlow;
-		const auto indirect =
-		    std::find_if(graph.blocks.begin(), graph.blocks.end(), [](const auto& block) {
-			    return block.terminator.kind == TerminatorKind::IndirectBranch;
-		    });
-		graph.failure_block = indirect != graph.blocks.end() ? indirect->id : graph.entry_block;
-		graph.unsupported_reason = "indirect S_SETPC_B64 jump table requires dispatcher fallback";
+	// Structurize lowers an indexed jump table to a goto chain. Any other indirect branch
+	// still needs the dispatcher.
+	if (std::ranges::any_of(graph.blocks, [](const auto& block) {
+		    return block.terminator.kind == TerminatorKind::IndirectBranch &&
+		           !IsIndexedJumpTable(block.terminator);
+	    })) {
+		ForceJumpTableDispatcher(graph,
+		                         "indirect S_SETPC_B64 jump table requires dispatcher fallback");
 	}
 
 	if (graph.irreducible) {
@@ -1798,6 +1803,24 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 
 	return graph;
+}
+
+bool HasJumpTable(const Graph& graph) {
+	return std::ranges::any_of(graph.blocks, [](const auto& block) {
+		return block.terminator.kind == TerminatorKind::IndirectBranch;
+	});
+}
+
+void ForceJumpTableDispatcher(Graph& graph, const std::string& reason) {
+	graph.irreducible  = true;
+	graph.unsupported  = false;
+	graph.failure_kind = FailureKind::IrreducibleControlFlow;
+	const auto indirect =
+	    std::find_if(graph.blocks.begin(), graph.blocks.end(), [](const auto& block) {
+		    return block.terminator.kind == TerminatorKind::IndirectBranch;
+	    });
+	graph.failure_block = indirect != graph.blocks.end() ? indirect->id : graph.entry_block;
+	graph.unsupported_reason = reason;
 }
 
 Graph Structurize(const Graph& graph) {

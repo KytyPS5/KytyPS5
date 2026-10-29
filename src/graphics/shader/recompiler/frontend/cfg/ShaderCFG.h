@@ -120,6 +120,11 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uin
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                               uint32_t before, uint32_t code, uint32_t wave_size,
                               std::vector<uint32_t>& crossed_calls);
+// True when a block of the graph ends with an S_SETPC_B64 jump table.
+bool HasJumpTable(const Graph& graph);
+// Sends a graph with a jump table to the dispatcher. It marks the graph irreducible,
+// which later passes such as ResourceTracking treat as having no usable loop structure.
+void ForceJumpTableDispatcher(Graph& graph, const std::string& reason);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

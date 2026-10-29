@@ -12209,24 +12209,19 @@ std::vector<uint32_t> TraceJumpTableGraph(const ShaderRecompiler::CFG::Graph &gr
   return executed;
 }
 
-// Builds the native graph of a jump-table shader. BuildGraph still sends every jump table
-// to the dispatcher by marking the graph irreducible, so the test checks that the graph
-// really is reducible and clears that flag.
+// Builds the native graph of a jump-table shader. BuildGraph leaves an indexed table to
+// Structurize, so the graph must resolve its table and stay reducible.
 ShaderRecompiler::CFG::Graph NativeJumpTableGraph(const std::vector<uint32_t> &shader,
                                                   ShaderRecompiler::Decoder::Program &decoded) {
   namespace CFG = ShaderRecompiler::CFG;
   ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
   auto native = CFG::BuildGraph(decoded);
-  Check(native.irreducible &&
-            native.failure_kind == CFG::FailureKind::IrreducibleControlFlow,
-        "jump-table fixture did not resolve its table");
-  Check(std::ranges::all_of(native.back_edges, [](const auto &edge) { return edge.natural; }) &&
+  Check(CFG::HasJumpTable(native), "jump-table fixture did not resolve its table");
+  Check(!native.irreducible && !native.unsupported &&
+            std::ranges::all_of(native.back_edges, [](const auto &edge) { return edge.natural; }) &&
             std::ranges::none_of(native.components,
                                  [](const auto &component) { return component.irreducible; }),
         "jump-table fixture is not reducible");
-  native.irreducible = false;
-  native.failure_kind = CFG::FailureKind::None;
-  native.unsupported_reason.clear();
   return native;
 }
 
@@ -12408,6 +12403,142 @@ void TestCfgJumpTableFallbacks() {
         "jump table with a repeated selector value did not fail structurization");
 }
 
+// A jump table that enters a cycle at two blocks makes the graph irreducible, and a table
+// over the target cap fails structurization. Both must still compile on the dispatcher.
+void TestNewShaderRecompilerJumpTableDispatcherFallbacks() {
+  namespace CFG = ShaderRecompiler::CFG;
+  const std::vector<uint32_t> irreducible = {
+      EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
+      EncodeSop2(0x1e, 0, 0, 131), // s_lshl_b32 s0, s0, 3
+      EncodeSop1(0x1f, 8, 0),      // s_getpc_b64 s[8:9]
+      EncodeSop2(0x00, 8, 8, 255), // s_add_u32 s8, s8, literal
+      0x0000003cu,
+      EncodeSop2(0x04, 9, 9, 128), // s_addc_u32 s9, s9, 0
+      EncodeSmem0(0x01, 4, 4),
+      0u,                          // s_load_dwordx2 s[4:5], s[8:9], s0
+      EncodeSopp(0x0c, 0),         // s_waitcnt 0
+      EncodeSop1(0x1f, 10, 0),     // s_getpc_b64 s[10:11]
+      EncodeSop2(0x00, 10, 10, 4), // s_add_u32 s10, s10, s4
+      EncodeSop2(0x04, 11, 11, 5), // s_addc_u32 s11, s11, s5
+      EncodeSop1(0x20, 0, 10),     // s_setpc_b64 s[10:11]
+      EncodeSMovB32(1, 129),       // case 0 enters the cycle here
+      EncodeSMovB32(2, 129),       // case 1 enters the cycle here
+      EncodeSopc(0x06, 2, 128),    // s_cmp_eq_u32 s2, 0
+      EncodeSopp(0x05, 0xfffcu),   // s_cbranch_scc1 case 0
+      EncodeSopp(0x01, 0),
+      0x0000000cu,
+      0x00000000u, // table: case 0 relative to pc 0x28
+      0x00000010u,
+      0x00000000u, // table: case 1 relative to pc 0x28
+  };
+  {
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(std::span{irreducible}, decoded);
+    const auto native = CFG::BuildGraph(decoded);
+    Check(CFG::HasJumpTable(native) && native.irreducible &&
+              std::ranges::any_of(native.components,
+                                  [](const auto &component) { return component.irreducible; }),
+          "two-entry jump-table cycle was not found irreducible");
+  }
+  constexpr uint32_t too_many = 65u;
+  JumpTableShape over_cap{std::vector<uint32_t>(too_many), too_many};
+  for (uint32_t entry = 0; entry < too_many; ++entry) over_cap.entry_bodies[entry] = entry;
+  // The irreducible graph falls back when it is built, the large table when structurized.
+  const std::pair<std::vector<uint32_t>, CFG::FailureKind> fallbacks[] = {
+      {irreducible, CFG::FailureKind::IrreducibleControlFlow},
+      {MakeJumpTableShader(over_cap), CFG::FailureKind::StructuredControlFlow},
+  };
+  for (const auto &[shader, failure] : fallbacks) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    auto result = RecompileForTest(shader, options);
+    Check((result.ir_dump.find("mode=dispatcher") != std::string::npos) &&
+              SpirvContainsOpcode(result.spirv, 251) &&
+              result.program.cfg_failure_kind == failure,
+          "jump table the goto chain cannot express did not use the dispatcher");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+// Builds a shader that bit scans a nonzero mask into a 33-entry table. Entries 0 to 31 load
+// a literal image descriptor, and entry 32, the zero-input sentinel, jumps straight to the
+// sample with a GPU-valued descriptor.
+std::vector<uint32_t> MakeBitScanJumpTableShader() {
+  constexpr uint32_t descriptor_dwords = 8u;
+  constexpr uint32_t entries = 33u;
+  constexpr uint32_t sentinel = entries - 1u;
+  constexpr uint32_t literal = 255u;
+  std::vector<uint32_t> code{
+      EncodeSopc(0x07, 4, 128), // s_cmp_lg_u32 s4, 0
+      0u,                       // s_cbranch_scc0 to the end
+      EncodeVop1(0x02, 8, 256), // v_readfirstlane_b32 s8, v0
+  };
+  const auto guard = size_t{1};
+  for (uint32_t dword = 1; dword < descriptor_dwords; ++dword)
+    code.push_back(EncodeSMovB32(8 + dword, 8)); // the sentinel descriptor is GPU valued
+  for (uint32_t dword = 0; dword < 4u; ++dword)
+    code.push_back(EncodeSMovB32(16 + dword, 128)); // an all-zero inline sampler
+  code.push_back(EncodeSop1(0x13, 0, 4));               // s_ff1_i32_b32 s0, s4
+  code.push_back(EncodeSop2(0x07, 0, 0, 128 + sentinel)); // s_min_u32 s0, s0, 32
+  code.push_back(EncodeSop2(0x1e, 0, 0, 131));          // s_lshl_b32 s0, s0, 3
+  code.push_back(EncodeSop1(0x1f, 26, 0));              // s_getpc_b64 s[26:27]
+  const auto table_base = static_cast<uint32_t>(code.size()) * 4u;
+  code.push_back(EncodeSop2(0x00, 26, 26, literal)); // s_add_u32 s26, s26, literal
+  const auto table_literal = code.size();
+  code.push_back(0u);
+  code.push_back(EncodeSop2(0x04, 27, 27, 128)); // s_addc_u32 s27, s27, 0
+  code.push_back(EncodeSmem0(0x01, 28, 13));
+  code.push_back(0u);                            // s_load_dwordx2 s[28:29], s[26:27], s0
+  code.push_back(EncodeSopp(0x0c, 0));           // s_waitcnt 0
+  code.push_back(EncodeSop1(0x1f, 30, 0));       // s_getpc_b64 s[30:31]
+  const auto target_base = static_cast<uint32_t>(code.size()) * 4u;
+  code.push_back(EncodeSop2(0x00, 30, 30, 28)); // s_add_u32 s30, s30, s28
+  code.push_back(EncodeSop2(0x04, 31, 31, 29)); // s_addc_u32 s31, s31, s29
+  code.push_back(EncodeSop1(0x20, 0, 30));      // s_setpc_b64 s[30:31]
+  const auto body_pc = static_cast<uint32_t>(code.size()) * 4u;
+  for (uint32_t dword = 0; dword < descriptor_dwords; ++dword) {
+    code.push_back(EncodeSMovB32(8 + dword, literal)); // a literal descriptor
+    code.push_back(100u + dword);
+  }
+  const auto join_pc = static_cast<uint32_t>(code.size()) * 4u;
+  code.push_back(EncodeMimg0(0x20, 0x1));
+  code.push_back(EncodeMimg1(3, 2, 4, 1)); // image_sample v3, v[1:2], s[8:15], s[16:19]
+  code.push_back(EncodeMubuf0(0x1c, 0, false));
+  code.push_back(EncodeMubuf1(3, 5, 0)); // buffer_store_dword v3, off, s[20:23], 0
+  code[guard] = EncodeSopp(0x04, static_cast<uint32_t>(code.size() - guard - 1));
+  code.push_back(EncodeSopp(0x01, 0)); // s_endpgm
+  code[table_literal] = static_cast<uint32_t>(code.size()) * 4u - table_base;
+  for (uint32_t entry = 0; entry < entries; ++entry) {
+    code.push_back((entry == sentinel ? join_pc : body_pc) - target_base);
+    code.push_back(0u);
+  }
+  return code;
+}
+
+// The bit-scan sentinel must be pruned in both modes. Structured, it reaches the sample on
+// a goto-chain edge after translation and SSA. On the dispatcher it is a switch case.
+void TestNewShaderRecompilerJumpTableBitScanSentinel() {
+  const auto code = MakeBitScanJumpTableShader();
+  std::array<uint32_t, 24> user_data{};
+  for (const bool structured : {true, false}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    options.user_data = user_data;
+    options.structured_jump_tables = structured;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    const auto &program = translated.program;
+    Check(program.info.images.size() == 1u,
+          "bit-scan jump table did not keep its one sampled image");
+    const auto &finite =
+        program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+    Check(finite && finite->sources.size() == 1u,
+          "bit-scan jump table kept its impossible sentinel descriptor");
+    const bool has_switch = std::ranges::any_of(
+        program.blocks, [](const auto *block) { return !block->terminator.cases.empty(); });
+    Check(has_switch != structured, "bit-scan jump table compiled in the wrong control-flow mode");
+  }
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -12433,26 +12564,50 @@ void TestNewShaderRecompilerSetpcJumpTable() {
       0x00000000u, // table: target case 1 relative to pc 0x28
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
+  namespace CFG = ShaderRecompiler::CFG;
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto native = CFG::BuildGraph(decoded);
+  const auto table = std::ranges::find_if(native.blocks, [](const auto &block) {
+    return block.terminator.kind == CFG::TerminatorKind::IndirectBranch;
+  });
+  Check(table != native.blocks.end() &&
+            table->terminator.indirect_selector_values == std::vector<uint32_t>{0u, 8u} &&
+            table->terminator.indirect_selector_targets.size() == 2 &&
+            table->terminator.indirect_selector_targets[0] !=
+                table->terminator.indirect_selector_targets[1],
+        "S_SETPC_B64 jump table did not retain its selector mapping");
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "S_SETPC_B64 jump table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.blocks.begin(), result.program.blocks.end(),
-      [](const auto *block) { return !block->terminator.cases.empty(); });
-  Check(jump != result.program.blocks.end() &&
-            (*jump)->ImmSuccessors().size() == 2,
-        "S_SETPC_B64 jump table did not retain both targets");
-  Check((*jump)->terminator.cases.size() == 2,
-        "S_SETPC_B64 jump table did not retain selector mapping");
-  Check(
-      (result.ir_dump.find("LoadAddressU32") == std::string::npos),
-      "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "dispatcher SPIR-V lacks OpSwitch");
-  CheckSpirvBinaryValidates(result.spirv);
+  // The kill switch keeps the dispatcher, which must still lower the table as a switch.
+  for (const bool structured : {true, false}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    options.structured_jump_tables = structured;
+    auto result = RecompileForTest(shader, options);
+    Check(
+        (result.ir_dump.find("LoadAddressU32") == std::string::npos),
+        "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
+    CheckSpirvBinaryValidates(result.spirv);
+    if (structured) {
+      Check((result.ir_dump.find("mode=structured") != std::string::npos) &&
+                !SpirvContainsOpcode(result.spirv, 251) &&
+                !SpirvContainsOpcode(result.spirv, 246),
+            "S_SETPC_B64 jump table did not compile as structured control flow");
+      continue;
+    }
+    Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
+          "S_SETPC_B64 jump table did not select dispatcher fallback");
+    const auto jump = std::find_if(
+        result.program.blocks.begin(), result.program.blocks.end(),
+        [](const auto *block) { return !block->terminator.cases.empty(); });
+    Check(jump != result.program.blocks.end() &&
+              (*jump)->ImmSuccessors().size() == 2,
+          "S_SETPC_B64 jump table did not retain both targets");
+    Check((*jump)->terminator.cases.size() == 2,
+          "S_SETPC_B64 jump table did not retain selector mapping");
+    Check(SpirvContainsOpcode(result.spirv, 251),
+          "dispatcher SPIR-V lacks OpSwitch");
+  }
 }
 
 void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
@@ -12537,34 +12692,59 @@ void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
       0x00000010u, // table at pc 0x4c, targets relative backward from pc 0x48
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-
-  auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "subtractive S_SETPC_B64 table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.blocks.begin(), result.program.blocks.end(),
-      [](const auto *block) { return !block->terminator.cases.empty(); });
-  Check(jump != result.program.blocks.end() &&
-            (*jump)->ImmSuccessors().size() == 2 &&
-            (*jump)->terminator.indexed &&
-            (*jump)->terminator.cases.size() == 3 &&
-            (*jump)->terminator.cases[0].value == 0u &&
-            (*jump)->terminator.cases[0].target->start_pc == 0x38u &&
-            (*jump)->terminator.cases[1].value == 4u &&
-            (*jump)->terminator.cases[1].target->start_pc == 0x40u &&
-            (*jump)->terminator.cases[2].value == 8u &&
-            (*jump)->terminator.cases[2].target->start_pc == 0x38u &&
-            std::ranges::none_of(
-                result.program.blocks,
-                [](const auto *block) { return block->start_pc == 0x04u; }),
+  namespace CFG = ShaderRecompiler::CFG;
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto native = CFG::BuildGraph(decoded);
+  const auto table = std::ranges::find_if(native.blocks, [](const auto &block) {
+    return block.terminator.kind == CFG::TerminatorKind::IndirectBranch;
+  });
+  Check(table != native.blocks.end(), "subtractive S_SETPC_B64 table was not resolved");
+  const auto target_pc = [&](size_t index) {
+    return native.blocks.at(table->terminator.indirect_selector_targets.at(index)).start_pc;
+  };
+  Check(table->terminator.indirect_selector_values == std::vector<uint32_t>{0u, 4u, 8u} &&
+            target_pc(0) == 0x38u && target_pc(1) == 0x40u && target_pc(2) == 0x38u,
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
-  Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
-        "subtractive S_SETPC_B64 table load reached normal IR");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
-  CheckSpirvBinaryValidates(result.spirv);
+
+  // The kill switch keeps the dispatcher, which must still lower the table as a switch.
+  for (const bool structured : {true, false}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    options.structured_jump_tables = structured;
+    auto result = RecompileForTest(shader, options);
+    Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
+          "subtractive S_SETPC_B64 table load reached normal IR");
+    Check(std::ranges::none_of(result.program.blocks,
+                               [](const auto *block) { return block->start_pc == 0x04u; }),
+          "subtractive S_SETPC_B64 table kept its unreachable block");
+    CheckSpirvBinaryValidates(result.spirv);
+    if (structured) {
+      Check((result.ir_dump.find("mode=structured") != std::string::npos) &&
+                !SpirvContainsOpcode(result.spirv, 251) &&
+                !SpirvContainsOpcode(result.spirv, 246),
+            "subtractive S_SETPC_B64 table did not compile as structured control flow");
+      continue;
+    }
+    Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
+          "subtractive S_SETPC_B64 table did not select dispatcher fallback");
+    const auto jump = std::find_if(
+        result.program.blocks.begin(), result.program.blocks.end(),
+        [](const auto *block) { return !block->terminator.cases.empty(); });
+    Check(jump != result.program.blocks.end() &&
+              (*jump)->ImmSuccessors().size() == 2 &&
+              (*jump)->terminator.indexed &&
+              (*jump)->terminator.cases.size() == 3 &&
+              (*jump)->terminator.cases[0].value == 0u &&
+              (*jump)->terminator.cases[0].target->start_pc == 0x38u &&
+              (*jump)->terminator.cases[1].value == 4u &&
+              (*jump)->terminator.cases[1].target->start_pc == 0x40u &&
+              (*jump)->terminator.cases[2].value == 8u &&
+              (*jump)->terminator.cases[2].target->start_pc == 0x38u,
+          "subtractive S_SETPC_B64 table targets or selector mapping changed");
+    Check(SpirvContainsOpcode(result.spirv, 251),
+          "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
+  }
 }
 
 void TestNewShaderRecompilerExpVertexOutputs() {
@@ -17756,6 +17936,8 @@ int main() {
   TestCfgJumpTableGotoChain();
   TestCfgJumpTableFallbacks();
   TestCfgJumpTableJoinEdgeIsDirect();
+  TestNewShaderRecompilerJumpTableDispatcherFallbacks();
+  TestNewShaderRecompilerJumpTableBitScanSentinel();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable(6);
   TestNewShaderRecompilerSetpcDwordJumpTable(106);

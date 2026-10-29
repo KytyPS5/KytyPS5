@@ -787,6 +787,11 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+	// A table BuildGraph already sent to the dispatcher keeps its more precise reason.
+	if (!options.structured_jump_tables && CFG::HasJumpTable(native_cfg) &&
+	    !native_cfg.irreducible) {
+		CFG::ForceJumpTableDispatcher(native_cfg, "jump-table structurization is disabled");
+	}
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
@@ -798,6 +803,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			native_cfg.failure_kind = structured_cfg.failure_kind;
 			native_cfg.failure_block = structured_cfg.failure_block;
 			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
+			// A jump table on the dispatcher keeps the irreducible flag BuildGraph used to
+			// set. ResourceTracking reads it before bounding a packed ReadFirstLane key, which
+			// has no IR cycle check, so the dispatcher loop is analysed exactly as before.
+			native_cfg.irreducible |= CFG::HasJumpTable(native_cfg);
 			LogDispatcherFallback(options, native_cfg, "structurize");
 		} else {
 			selected_cfg = &structured_cfg;

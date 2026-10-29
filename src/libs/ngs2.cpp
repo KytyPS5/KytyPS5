@@ -2181,6 +2181,11 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 		                       : ((skip + num_samples + frame_samples - 1) / frame_samples) *
 		                             codec.superframeSize;
 		block->num_skip_samples = num_samples == 0 ? 0 : static_cast<uint32_t>(skip);
+	} else if (format->waveform_type == 0x12) {
+		// 16-bit PCM has fixed-size frames, so the block starts exactly at the sample.
+		const uint64_t frame_size = uint64_t(format->num_channels) * sizeof(int16_t);
+		block->data_offset        = uint64_t(sample_pos) * frame_size;
+		block->data_size          = uint64_t(num_samples) * frame_size;
 	} else {
 		return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
 	}

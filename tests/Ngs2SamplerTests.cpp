@@ -651,6 +651,11 @@ void TestWaveformBlockGeometry() {
 	Check(Ngs2CalcWaveformBlock(&format, 0, 0, &block) == OK && block.data_size == 0 &&
 	          block.num_samples == 0,
 	      "empty ATRAC9 block acquired encoded data");
+	const Ngs2WaveformFormat pcm {0x12, 2, 48000};
+	Check(Ngs2CalcWaveformBlock(&pcm, 4096, 4096, &block) == OK &&
+	          block.data_offset == 16384 && block.data_size == 16384 &&
+	          block.num_skip_samples == 0 && block.num_samples == 4096,
+	      "PCM block calculation omitted the sample frames");
 	Fixture f(24000);
 	const int16_t silence = 0;
 	f.Queue(&silence, 0, 0, UINT32_MAX);

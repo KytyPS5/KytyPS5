@@ -7,6 +7,7 @@
 #include <bit>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -773,14 +774,33 @@ IR::U1 Translator::SelectorInCondition(const CFG::Graph& graph, uint32_t block_i
 	if (candidates.empty()) {
 		EXIT("block %u has an empty jump-table selector list", block_id);
 	}
-	const auto selector = ReadScalarCode(value.lhs);
-	IR::U1     any_match;
+	const auto          selector = ReadScalarCode(value.lhs);
+	std::vector<IR::U1> matches;
+	matches.reserve(candidates.size());
 	for (const auto candidate: candidates) {
-		const auto match = ir.IEqual(selector, IR::U32(IR::Value(candidate)));
-		any_match        = any_match.IsEmpty() ? match : ir.LogicalOr(any_match, match);
+		matches.push_back(ir.IEqual(selector, IR::U32(IR::Value(candidate))));
 	}
-	return IR::U1(
-	    ir.Emit(IR::ValueOpcode::ConditionRef, {any_match}, CFG::BranchCondition::SccNonZero));
+	return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {JoinBalancedOr(std::move(matches))},
+	                      CFG::BranchCondition::SccNonZero));
+}
+
+// Joins conditions with OR as a balanced tree. A target can own many table offsets, and a long
+// one-sided chain would exceed the depth to which SelectorPredicateFalse in ResourceTracking can
+// prove an impossible edge false.
+IR::U1 Translator::JoinBalancedOr(std::vector<IR::U1> terms) {
+	EXIT_IF(terms.empty());
+	while (terms.size() > 1u) {
+		std::vector<IR::U1> joined;
+		joined.reserve((terms.size() + 1u) / 2u);
+		for (size_t pair = 0; pair + 1u < terms.size(); pair += 2u) {
+			joined.push_back(ir.LogicalOr(terms[pair], terms[pair + 1u]));
+		}
+		if (terms.size() % 2u != 0u) {
+			joined.push_back(terms.back());
+		}
+		terms = std::move(joined);
+	}
+	return terms.front();
 }
 
 // Builds the IR value of a structurizer condition expression at the end of a block.

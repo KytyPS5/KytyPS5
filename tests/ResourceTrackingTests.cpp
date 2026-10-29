@@ -8122,7 +8122,17 @@ void TestFiniteImageBitScanSentinelChain() {
     bool negate = true;
     std::optional<CFG::BranchCondition> nested_vote;
     bool immediate_left = false;
+    // Joins the offsets as a balanced tree, as the translator does.
+    bool balanced = false;
+    // Marks the row that shows a one-sided chain over many offsets goes past the proof depth.
+    bool depth_control = false;
   };
+  // More impossible offsets than the pruning depth limit would allow in a one-sided chain.
+  constexpr uint32_t entry_bytes = 4u;
+  constexpr uint32_t many_offset_count = 40u;
+  std::vector<uint32_t> many_offsets;
+  for (uint32_t entry = 0; entry < many_offset_count; ++entry)
+    many_offsets.push_back(sentinel_offset + entry_bytes * entry);
   const Variant variants[] = {
       {false, {sentinel_offset}, false},
       {true, {sentinel_offset}, true},
@@ -8134,6 +8144,11 @@ void TestFiniteImageBitScanSentinelChain() {
       {true, {sentinel_offset, sentinel_offset + 4u}, false, true,
        CFG::BranchCondition::VccNonZero},
       {true, {sentinel_offset}, true, true, std::nullopt, true},
+      {.nonzero = true, .merge_offsets = many_offsets, .pruned = true, .balanced = true},
+      // Control. A one-sided chain over 40 offsets goes past the depth to which the edge can be
+      // proven impossible, so the arm is kept. It shows the balanced row above really needs the
+      // balancing. If that depth is raised or made to scale, this row prunes, so flip it or drop it.
+      {.nonzero = true, .merge_offsets = many_offsets, .pruned = false, .depth_control = true},
   };
   for (const auto &variant : variants) {
     Fixture fixture;
@@ -8170,16 +8185,28 @@ void TestFiniteImageBitScanSentinelChain() {
     // emits it, so the target is the false edge of a negated vote.
     const auto skip_unless = [&](const std::vector<uint32_t> &offsets, Block *block,
                                  bool negate) {
-      Value any;
+      std::vector<Value> matches;
       for (const auto offset : offsets) {
         auto match = variant.immediate_left
                          ? fixture.Emit(ValueOpcode::IEqual32, {Value(offset), selector}, 0, block)
                          : fixture.Emit(ValueOpcode::IEqual32, {selector, Value(offset)}, 0, block);
         if (variant.nested_vote && block == dispatch)
           match = fixture.Emit(ValueOpcode::ConditionRef, {match}, *variant.nested_vote, block);
-        any = any.IsEmpty() ? match
-                            : fixture.Emit(ValueOpcode::LogicalOr, {any, match}, 0, block);
+        matches.push_back(match);
       }
+      // The balanced form copies the shape Translator::JoinBalancedOr emits, pairing neighbours
+      // level by level. The other rows keep the one-sided chain.
+      while (variant.balanced && matches.size() > 1u) {
+        std::vector<Value> joined;
+        for (size_t pair = 0; pair + 1u < matches.size(); pair += 2u)
+          joined.push_back(
+              fixture.Emit(ValueOpcode::LogicalOr, {matches[pair], matches[pair + 1u]}, 0, block));
+        if (matches.size() % 2u != 0u) joined.push_back(matches.back());
+        matches = std::move(joined);
+      }
+      Value any = matches.front();
+      for (size_t rest = 1; rest < matches.size(); ++rest)
+        any = fixture.Emit(ValueOpcode::LogicalOr, {any, matches[rest]}, 0, block);
       const auto vote = fixture.Emit(ValueOpcode::ConditionRef, {any},
                                      CFG::BranchCondition::SccNonZero, block);
       return negate ? fixture.Emit(ValueOpcode::LogicalNot, {vote}, 0, block) : vote;
@@ -8203,7 +8230,9 @@ void TestFiniteImageBitScanSentinelChain() {
                  fixture.AddMemory(memory, 4));
     if (!variant.pruned) {
       CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-                 "a possible jump-table chain edge silently dropped its descriptor arm");
+                 variant.depth_control
+                     ? "a one-sided chain past the proof depth was pruned, so update this control"
+                     : "a possible jump-table chain edge silently dropped its descriptor arm");
       continue;
     }
     fixture.PlanAndTrack();

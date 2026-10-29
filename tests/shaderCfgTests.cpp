@@ -5492,6 +5492,82 @@ void TestNewShaderRecompilerSelectorInCondition() {
         "GraphToString did not print the SelectorIn assignment");
 }
 
+// Counts the LogicalOr instructions of a translated program and the distinct IEqual32 compares
+// they join, and returns the depth of its deepest OR tree. Counting joined compares, not emitted
+// ones, catches a compare that is made but left out of the tree. Instructions appear after their
+// operands, so each OR's depth is known when it is reached.
+uint32_t MaxLogicalOrDepth(const auto &program, uint32_t *ors, uint32_t *joined_compares) {
+  namespace IR = ShaderRecompiler::IR;
+  std::unordered_map<const IR::Inst *, uint32_t> depth;
+  std::unordered_set<const IR::Inst *> compares;
+  uint32_t deepest = 0;
+  *ors = 0;
+  for (const auto *block : program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() != IR::ValueOpcode::LogicalOr) continue;
+      uint32_t below = 0;
+      for (uint32_t arg = 0; arg < 2u; ++arg) {
+        const auto *operand = inst.Arg(arg).Resolve().TryInstruction();
+        if (operand != nullptr && operand->GetOpcode() == IR::ValueOpcode::IEqual32)
+          compares.insert(operand);
+        const auto found = operand != nullptr ? depth.find(operand) : depth.end();
+        below = std::max(below, found != depth.end() ? found->second : 0u);
+      }
+      depth[&inst] = below + 1u;
+      deepest = std::max(deepest, below + 1u);
+      ++*ors;
+    }
+  }
+  *joined_compares = static_cast<uint32_t>(compares.size());
+  return deepest;
+}
+
+// A target that owns many table offsets joins its compares as a balanced OR tree. Impossible-edge
+// pruning only proves a condition false to a limited depth, and a one-sided chain over every
+// offset would exceed it.
+void TestNewShaderRecompilerSelectorInBalancedOr() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  namespace CFG = ShaderRecompiler::CFG;
+  namespace Frontend = ShaderRecompiler::Frontend;
+  using Op = CFG::ConditionExpression::Op;
+  constexpr uint32_t selector_sgpr = 6u;
+  constexpr uint32_t offset_count = 40u;
+  constexpr uint32_t entry_bytes = 4u;
+  // A balanced tree over 40 leaves is 6 deep, where a one-sided chain is 39.
+  const uint32_t max_depth = static_cast<uint32_t>(std::bit_width(offset_count - 1u));
+
+  Decoder::Program decoded;
+  CFG::Graph cfg;
+  std::vector<uint32_t> offsets;
+  for (uint32_t entry = 0; entry < offset_count; ++entry) offsets.push_back(entry * entry_bytes);
+  cfg.selector_value_lists = {offsets};
+  cfg.expressions = {{Op::SelectorIn, selector_sgpr, 0u}};
+  cfg.blocks.resize(3);
+  for (uint32_t id = 0; id < cfg.blocks.size(); ++id) cfg.blocks[id].id = id;
+  auto &jump = cfg.blocks[0];
+  jump.successors = {1u, 2u};
+  jump.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  jump.terminator.expression = 0u;
+  jump.terminator.true_block = 1u;
+  jump.terminator.false_block = 2u;
+  cfg.blocks[1].predecessors = {0u};
+  cfg.blocks[2].predecessors = {0u};
+  cfg.entry_block = 0u;
+
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions options{};
+  options.stage = ShaderType::Compute;
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  const auto ir = Frontend::TranslateProgram(decoded, cfg, options);
+  uint32_t ors = 0;
+  uint32_t compares = 0;
+  const auto deepest = MaxLogicalOrDepth(ir, &ors, &compares);
+  Check(compares == offset_count, "SelectorIn left an offset's compare out of its OR tree");
+  Check(ors == offset_count - 1u, "SelectorIn did not join every offset exactly once");
+  Check(deepest <= max_depth, "SelectorIn joined its offsets as a deep one-sided chain");
+}
+
 void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   namespace Decoder = ShaderRecompiler::Decoder;
   namespace CFG = ShaderRecompiler::CFG;
@@ -17853,6 +17929,7 @@ int main() {
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerSelectorInCondition();
+  TestNewShaderRecompilerSelectorInBalancedOr();
   TestNewShaderRecompilerInteger64CompareEncodings();
   TestFloatComparisonInputModes();
   TestPsInputCountRegisterDecode();

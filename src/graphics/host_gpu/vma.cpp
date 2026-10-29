@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -58,7 +60,87 @@ bool SameCreateInfo(const vk::ImageCreateInfo& a, const vk::ImageCreateInfo& b) 
 	       a.samples == b.samples && a.usage == b.usage;
 }
 
+// Retired images are destroyed on a worker thread. Releasing the memory of a large render target
+// takes 0.2 to 0.4 ms in the driver, and a game that scales its resolution every frame (PPSA30528)
+// retires about ten of them per frame on the thread that records the draws.
+class ImageGraveyard {
+public:
+	ImageGraveyard() = default;
+	~ImageGraveyard() {
+		Flush();
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	ImageGraveyard(const ImageGraveyard&)            = delete;
+	ImageGraveyard& operator=(const ImageGraveyard&) = delete;
+
+	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+			m_items.push_back({allocator, image, allocation});
+		}
+		m_wake.notify_one();
+	}
+
+	// Returns once every image pushed so far is destroyed.
+	void Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_items.empty() && !m_busy; });
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkImage       image;
+		VmaAllocation allocation;
+	};
+
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_items.empty(); });
+			if (m_items.empty()) {
+				return;
+			}
+			batch.swap(m_items);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) {
+				vmaDestroyImage(item.allocator, item.image, item.allocation);
+			}
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	std::vector<Item>       m_items;
+	bool                    m_busy = false;
+	bool                    m_stop = false;
+	std::thread             m_thread;
+};
+
+ImageGraveyard& Graveyard() {
+	static ImageGraveyard graveyard;
+	return graveyard;
+}
+
 void DestroyRecycledImages(VmaAllocator allocator) {
+	Graveyard().Flush();
 	std::lock_guard lock(g_recycled_mutex);
 	for (const auto& entry: g_recycled) {
 		vmaDestroyImage(allocator, entry.image, entry.allocation);
@@ -273,12 +355,12 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		g_recycled_bytes += allocation_info.size;
 		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > RecycledImageBytesMax) {
 			const auto& oldest = g_recycled.front();
-			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+			Graveyard().Push(allocator, oldest.image, oldest.allocation);
 			g_recycled_bytes -= oldest.size;
 			g_recycled.erase(g_recycled.begin());
 		}
 	} else {
-		vmaDestroyImage(allocator, image.image, image.allocation);
+		Graveyard().Push(allocator, image.image, image.allocation);
 	}
 	image.image      = nullptr;
 	image.allocation = nullptr;

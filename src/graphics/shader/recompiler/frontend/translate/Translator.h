@@ -21,6 +21,10 @@ public:
 	                        IR::Block& info);
 
 private:
+	IR::U1 NativeBranchCondition(uint32_t block_id, CFG::BranchCondition kind);
+	IR::U1 SelectorInCondition(const CFG::Graph& graph, uint32_t block_id,
+	                           const CFG::ConditionExpression& value);
+	IR::U1 ConditionExpressionValue(const CFG::Graph& graph, uint32_t block_id, uint32_t index);
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);

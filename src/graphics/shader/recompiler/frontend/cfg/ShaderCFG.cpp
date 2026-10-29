@@ -1832,6 +1832,14 @@ std::string GraphToString(const Graph& graph) {
 			const auto& expression = graph.expressions[assignment.expression];
 			if (expression.op == ConditionExpression::Op::Native)
 				text += fmt::format(" condition={}", BranchConditionToString(static_cast<BranchCondition>(expression.lhs)));
+			if (expression.op == ConditionExpression::Op::SelectorIn) {
+				// A dump must print a damaged graph, so a bad list index is shown, not thrown.
+				const auto& lists  = graph.selector_value_lists;
+				const auto  values = expression.rhs < lists.size()
+				                         ? VectorToString(lists[expression.rhs])
+				                         : std::string("invalid");
+				text += fmt::format(" selector={} values=[{}]", expression.lhs, values);
+			}
 			text += "\n";
 		}
 	}

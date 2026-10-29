@@ -5421,6 +5421,75 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16() {
         "V_CMPX_LT_U16 accepted an unsupported DPP encoding");
 }
 
+// A SelectorIn condition must become a scalar compare against each table offset,
+// voted through an SCC-kind ConditionRef so both wave halves branch together.
+void TestNewShaderRecompilerSelectorInCondition() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  namespace CFG = ShaderRecompiler::CFG;
+  namespace Frontend = ShaderRecompiler::Frontend;
+  namespace IR = ShaderRecompiler::IR;
+  using Op = CFG::ConditionExpression::Op;
+  constexpr uint32_t selector_sgpr = 6u;
+
+  Decoder::Program decoded;
+  CFG::Graph cfg;
+  cfg.selector_value_lists = {{0u, 8u}, {16u}};
+  cfg.expressions = {{Op::SelectorIn, selector_sgpr, 0u},
+                     {Op::SelectorIn, selector_sgpr, 1u}};
+  cfg.blocks.resize(3);
+  for (uint32_t id = 0; id < cfg.blocks.size(); ++id) cfg.blocks[id].id = id;
+  auto &jump = cfg.blocks[0];
+  jump.assignments.push_back({0u, 1u});
+  jump.successors = {1u, 2u};
+  jump.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  jump.terminator.expression = 0u;
+  jump.terminator.true_block = 1u;
+  jump.terminator.false_block = 2u;
+  cfg.blocks[1].predecessors = {0u};
+  cfg.blocks[2].predecessors = {0u};
+  cfg.entry_block = 0u;
+
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions options{};
+  options.stage = ShaderType::Compute;
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  const auto ir = Frontend::TranslateProgram(decoded, cfg, options);
+
+  std::vector<uint32_t> compared;
+  uint32_t ors = 0;
+  uint32_t scc_votes = 0;
+  for (const auto *typed_block : ir.blocks) {
+    for (const auto &typed_inst : *typed_block) {
+      const auto opcode = typed_inst.GetOpcode();
+      if (opcode == IR::ValueOpcode::IEqual32) {
+        const auto value = typed_inst.Arg(1).Resolve();
+        Check(value.IsImmediate(), "selector compare is not against an immediate");
+        compared.push_back(value.U32());
+        const auto *read = typed_inst.Arg(0).Resolve().TryInstruction();
+        Check(read != nullptr &&
+                  read->GetOpcode() == IR::ValueOpcode::GetScalarRegister &&
+                  read->Arg(0).ScalarRegister() ==
+                      static_cast<IR::ScalarReg>(selector_sgpr),
+              "selector compare does not read the selector register");
+      }
+      ors += opcode == IR::ValueOpcode::LogicalOr ? 1u : 0u;
+      scc_votes += opcode == IR::ValueOpcode::ConditionRef &&
+                           typed_inst.Flags<CFG::BranchCondition>() ==
+                               CFG::BranchCondition::SccNonZero
+                       ? 1u
+                       : 0u;
+    }
+  }
+  std::ranges::sort(compared);
+  Check(compared == std::vector<uint32_t>{0u, 8u, 16u},
+        "SelectorIn did not compare the selector with every table offset");
+  Check(ors == 1u, "SelectorIn did not join a target's offsets with one OR");
+  Check(scc_votes == 2u, "SelectorIn did not vote each target through ConditionRef");
+  Check(CFG::GraphToString(cfg).find("selector=6 values=[16]") != std::string::npos,
+        "GraphToString did not print the SelectorIn assignment");
+}
+
 void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   namespace Decoder = ShaderRecompiler::Decoder;
   namespace CFG = ShaderRecompiler::CFG;
@@ -9916,6 +9985,7 @@ void TestCfgSiblingSharedExit() {
       case CFG::ConditionExpression::Op::Constant: return value.lhs != 0;
       case CFG::ConditionExpression::Op::Variable: return variables.at(value.lhs);
       case CFG::ConditionExpression::Op::Native: std::abort();
+      case CFG::ConditionExpression::Op::SelectorIn: std::abort();
       case CFG::ConditionExpression::Op::Not: return !self(self, value.lhs);
       case CFG::ConditionExpression::Op::Or:
         return self(self, value.lhs) || self(self, value.rhs);
@@ -17257,6 +17327,7 @@ int main() {
   TestVopcCmpxClassF16Decoder();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
+  TestNewShaderRecompilerSelectorInCondition();
   TestNewShaderRecompilerInteger64CompareEncodings();
   TestFloatComparisonInputModes();
   TestPsInputCountRegisterDecode();

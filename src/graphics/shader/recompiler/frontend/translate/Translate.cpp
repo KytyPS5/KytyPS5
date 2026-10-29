@@ -742,44 +742,75 @@ void Translator::WriteVectorMask(const Decoder::Operand& operand, IR::U1 value) 
 	WriteMask(operand, active, VectorMask(active));
 }
 
+// Votes a native branch condition so both wave halves take the same branch.
+IR::U1 Translator::NativeBranchCondition(uint32_t block_id, CFG::BranchCondition kind) {
+	// A zero kind negates the vote of the nonzero kind that follows it in the enum.
+	const bool zero = kind == CFG::BranchCondition::SccZero ||
+	                  kind == CFG::BranchCondition::VccZero ||
+	                  kind == CFG::BranchCondition::ExecZero;
+	if (zero) kind = static_cast<CFG::BranchCondition>(static_cast<int>(kind) + 1);
+	IR::U1 condition;
+	switch (kind) {
+		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
+		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
+		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
+		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::ScalarInstruction:
+			EXIT_IF(instruction_branch_condition.IsEmpty());
+			condition = instruction_branch_condition;
+			break;
+		default: EXIT("block %u has an invalid native branch condition", block_id);
+	}
+	const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+	return zero ? ir.LogicalNot(vote) : vote;
+}
+
+// Tests whether a jump-table selector register holds any of one target's table offsets.
+// The selector is scalar, so the SCC-kind vote only joins the two wave halves.
+IR::U1 Translator::SelectorInCondition(const CFG::Graph& graph, uint32_t block_id,
+                                       const CFG::ConditionExpression& value) {
+	const auto& candidates = graph.selector_value_lists.at(value.rhs);
+	if (candidates.empty()) {
+		EXIT("block %u has an empty jump-table selector list", block_id);
+	}
+	const auto selector = ReadScalarCode(value.lhs);
+	IR::U1     any_match;
+	for (const auto candidate: candidates) {
+		const auto match = ir.IEqual(selector, IR::U32(IR::Value(candidate)));
+		any_match        = any_match.IsEmpty() ? match : ir.LogicalOr(any_match, match);
+	}
+	return IR::U1(
+	    ir.Emit(IR::ValueOpcode::ConditionRef, {any_match}, CFG::BranchCondition::SccNonZero));
+}
+
+// Builds the IR value of a structurizer condition expression at the end of a block.
+IR::U1 Translator::ConditionExpressionValue(const CFG::Graph& graph, uint32_t block_id,
+                                            uint32_t index) {
+	const auto& value = graph.expressions.at(index);
+	switch (value.op) {
+		case CFG::ConditionExpression::Op::Constant: return IR::U1(IR::Value(value.lhs != 0));
+		case CFG::ConditionExpression::Op::Variable: return ir.GetGotoVariable(value.lhs);
+		case CFG::ConditionExpression::Op::Native:
+			return NativeBranchCondition(block_id, static_cast<CFG::BranchCondition>(value.lhs));
+		case CFG::ConditionExpression::Op::Not:
+			return ir.LogicalNot(ConditionExpressionValue(graph, block_id, value.lhs));
+		case CFG::ConditionExpression::Op::Or: {
+			// Named operands fix the IR order, which argument evaluation order does not.
+			const auto lhs = ConditionExpressionValue(graph, block_id, value.lhs);
+			const auto rhs = ConditionExpressionValue(graph, block_id, value.rhs);
+			return ir.LogicalOr(lhs, rhs);
+		}
+		case CFG::ConditionExpression::Op::SelectorIn:
+			return SelectorInCondition(graph, block_id, value);
+	}
+	EXIT("invalid CFG condition expression");
+}
+
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
                                     IR::Block& info) {
-	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
-		// A zero kind negates the vote of the nonzero kind that follows it in the enum.
-		const bool zero = kind == CFG::BranchCondition::SccZero ||
-		                  kind == CFG::BranchCondition::VccZero ||
-		                  kind == CFG::BranchCondition::ExecZero;
-		if (zero) kind = static_cast<CFG::BranchCondition>(static_cast<int>(kind) + 1);
-		IR::U1 condition;
-		switch (kind) {
-			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
-			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-			case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
-			case CFG::BranchCondition::ScalarInstruction:
-				EXIT_IF(instruction_branch_condition.IsEmpty());
-				condition = instruction_branch_condition;
-				break;
-			default: EXIT("block %u has an invalid native branch condition", source.id);
-		}
-		const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
-		return zero ? ir.LogicalNot(vote) : vote;
-	};
-	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
-		const auto& value = graph.expressions.at(index);
-		switch (value.op) {
-			case CFG::ConditionExpression::Op::Constant: return IR::U1(IR::Value(value.lhs != 0));
-			case CFG::ConditionExpression::Op::Variable: return ir.GetGotoVariable(value.lhs);
-			case CFG::ConditionExpression::Op::Native:
-				return native_condition(static_cast<CFG::BranchCondition>(value.lhs));
-			case CFG::ConditionExpression::Op::Not: return ir.LogicalNot(self(self, value.lhs));
-			case CFG::ConditionExpression::Op::Or:
-				return ir.LogicalOr(self(self, value.lhs), self(self, value.rhs));
-		}
-		EXIT("invalid CFG condition expression");
-	};
 	for (const auto& assignment: source.assignments) {
-		ir.SetGotoVariable(assignment.variable, expression(expression, assignment.expression));
+		ir.SetGotoVariable(assignment.variable,
+		                   ConditionExpressionValue(graph, source.id, assignment.expression));
 	}
 	const auto& term = source.terminator;
 	if (term.kind == CFG::TerminatorKind::IndirectBranch) {
@@ -795,8 +826,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	}
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
 		const auto condition = term.expression != UINT32_MAX
-		                           ? expression(expression, term.expression)
-		                           : native_condition(term.condition);
+		                           ? ConditionExpressionValue(graph, source.id, term.expression)
+		                           : NativeBranchCondition(source.id, term.condition);
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
 	}

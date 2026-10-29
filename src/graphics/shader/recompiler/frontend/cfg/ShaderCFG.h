@@ -22,8 +22,10 @@ enum class BranchCondition {
 	Unknown
 };
 
+// SelectorIn is true when scalar operand code lhs holds any value in
+// Graph::selector_value_lists[rhs]. It picks one target of a jump table.
 struct ConditionExpression {
-	enum class Op { Constant, Variable, Native, Not, Or };
+	enum class Op { Constant, Variable, Native, Not, Or, SelectorIn };
 	Op       op;
 	uint32_t lhs;
 	uint32_t rhs = UINT32_MAX;
@@ -94,6 +96,7 @@ struct StronglyConnectedComponent {
 struct Graph {
 	std::vector<BasicBlock>                 blocks;
 	std::vector<ConditionExpression>        expressions;
+	std::vector<std::vector<uint32_t>>      selector_value_lists;
 	std::vector<BackEdge>                   back_edges;
 	std::vector<NaturalLoop>                natural_loops;
 	std::vector<StronglyConnectedComponent> components;

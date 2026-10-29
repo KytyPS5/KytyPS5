@@ -1964,10 +1964,23 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	// write can happen.
 	m_buffer_cache.WriteWatches().NotifyWrite(range.address, range.size);
 	image.download_tick = m_scheduler.CurrentTick();
-	m_scheduler.DeferPriorityOperation([&reusable, temporary, range, mapped, offset] {
-		(temporary ? *temporary : reusable).Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	// The two end pages of an image that it shares with other data are left out on purpose, whether
+	// or not they are write-watched now: this write lands later, and by then the CPU may own those
+	// pages (see UntrackImageHead and UntrackImageTail) and write them without a fault. The GPU's
+	// stale bytes must not land on that data. Only whole pages are published, unless the image has
+	// none.
+	auto publish_begin = Common::AlignUp(range.address, TRACKER_PAGE_SIZE);
+	auto publish_end   = Common::AlignDown(range.address + range.size, TRACKER_PAGE_SIZE);
+	if (publish_end <= publish_begin) {
+		publish_begin = range.address;
+		publish_end   = range.address + range.size;
+	}
+	m_scheduler.DeferPriorityOperation(
+	    [&reusable, temporary, range, mapped, offset, publish_begin, publish_end] {
+		    (temporary ? *temporary : reusable).Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(publish_begin, mapped + (publish_begin - range.address),
+		                                    publish_end - publish_begin);
+	    });
 	if (temporary) {
 		// Also every command buffer committed while it lived holds it (see queueCommits.h).
 		m_scheduler.DeferDestruction([held = std::move(temporary)] {});

@@ -29,6 +29,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
+class PendingLabels;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -131,6 +132,9 @@ public:
 	// guest memory that do not go through the buffer cache, such as image downloads, notify it
 	// themselves.
 	[[nodiscard]] WriteWatchSet& WriteWatches() noexcept { return m_write_watches; }
+	// The end-of-pipe labels the host GPU has not completed: a GPU read recorded after a label
+	// sees its value (ApplyPendingLabels), though guest memory gets it only on completion.
+	void SetPendingLabels(PendingLabels* labels) noexcept { m_labels = labels; }
 	void               ProcessFaultBuffer();
 	// Between Begin and End, uploads share one barrier before the first copy and one after the
 	// last. A barrier between two copies makes the Metal backend start a new blit encoder for
@@ -170,6 +174,8 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// Writes the labels pending over [vaddr, vaddr + size) into `buffer`, in GPU order.
+	void ApplyPendingLabels(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -239,6 +245,7 @@ private:
 	bool                                              m_read_back_through_gpu = false;
 	MemoryTracker                                     m_memory_tracker;
 	WriteWatchSet                                      m_write_watches;
+	PendingLabels*                                     m_labels = nullptr;
 	bool                                              m_upload_batch_open    = false;
 	bool                                              m_upload_batch_started = false;
 	// See TakeGuestWrites. Written by the fault thread and the GPU thread.

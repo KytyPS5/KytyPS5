@@ -818,6 +818,34 @@ private:
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
+// The address space's lock, which knows whether the calling thread holds it. A guest thread runs
+// on a guest stack, and the GPU tracker can write-protect that memory: a stack write under the
+// lock faults, and the fault handler protects pages again (ProtectTransient) on the same thread.
+class AddressSpaceMutex final {
+public:
+	void lock() {
+		m_mutex.lock();
+		t_depth++;
+	}
+	void unlock() {
+		t_depth--;
+		m_mutex.unlock();
+	}
+	void lock_shared() {
+		m_mutex.lock_shared();
+		t_depth++;
+	}
+	void unlock_shared() {
+		t_depth--;
+		m_mutex.unlock_shared();
+	}
+	[[nodiscard]] static bool HeldByThisThread() noexcept { return t_depth != 0; }
+
+private:
+	std::shared_mutex             m_mutex;
+	static inline thread_local int t_depth = 0;
+};
+
 class GuestAddressSpace {
 public:
 	explicit GuestAddressSpace(uint64_t backing_size) {
@@ -969,7 +997,19 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-
+		if (AddressSpaceMutex::HeldByThisThread()) {
+			// A fault while this thread holds the lock (see AddressSpaceMutex): the mappings may be
+			// half changed, so the pages are protected without them, reserved holes in the range
+			// included. Host pages that are not mapped at all are left out.
+			if (VirtualMemory::Protect(vaddr, size, mode)) {
+				return true;
+			}
+			bool any = false;
+			for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < vaddr + size; page += 0x1000) {
+				any |= VirtualMemory::Protect(page, 0x1000, mode);
+			}
+			return any;
+		}
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
@@ -1581,7 +1621,7 @@ private:
 #endif
 	}
 
-	std::shared_mutex                          m_mutex;
+	AddressSpaceMutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

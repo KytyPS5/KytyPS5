@@ -539,8 +539,7 @@ struct Context {
 	}
 };
 
-#if !defined(__APPLE__)
-
+// SHA-NI: the console's CPU has it and games use it unchecked; Rosetta 2 does not.
 static bool TryEmulateShaNi(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	ShaNiInsn   insn {};
@@ -587,8 +586,6 @@ static bool TryEmulateShaNi(Context& context) {
 	context.Advance(insn.length);
 	return true;
 }
-
-#endif
 
 static bool TryEmulateSse4a(Context& context) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -884,11 +881,7 @@ bool TryEmulate(void* native_context) {
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
 	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) ||
-#if !defined(__APPLE__)
-	       TryEmulateShaNi(context) ||
-#endif
-	       TryEmulateCpuExtensions(context);
+	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
 }
 
 const char* UnsupportedReason(const void* code) {

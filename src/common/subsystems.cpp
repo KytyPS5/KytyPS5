@@ -1,8 +1,11 @@
 #include "common/subsystems.h"
 
+#include <atomic>
+
 namespace Common {
 
-static Subsystems* g_active_subsystems = nullptr;
+static Subsystems*       g_active_subsystems = nullptr;
+static std::atomic<bool> g_exiting {false};
 
 Subsystems::Subsystems(bool print): m_print(print) {
 	m_active.reserve(16);
@@ -35,9 +38,16 @@ void Subsystems::EmergencyShutdown() {
 }
 
 void Subsystems::EmergencyShutdownActive() {
+	if (g_exiting.exchange(true)) {
+		return;
+	}
 	if (g_active_subsystems != nullptr) {
 		g_active_subsystems->EmergencyShutdown();
 	}
+}
+
+bool Subsystems::Exiting() {
+	return g_exiting.load(std::memory_order_acquire);
 }
 
 } // namespace Common

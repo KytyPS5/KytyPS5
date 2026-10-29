@@ -27,7 +27,12 @@ public:
 	void Destroy();
 	void EmergencyShutdown();
 
+	// Once per process: a second caller (a thread that fails while the first shuts down) returns
+	// at once.
 	static void EmergencyShutdownActive();
+	// The process is ending: an emergency shutdown has begun. Guest threads still run then, and
+	// one that fails on a subsystem already shut down is no crash of the game.
+	[[nodiscard]] static bool Exiting();
 
 	KYTY_CLASS_NO_COPY(Subsystems);
 

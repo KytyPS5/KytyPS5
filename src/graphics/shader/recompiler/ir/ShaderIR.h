@@ -498,9 +498,17 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// After the byte offsets of the storage buffers (8 bits each), the bytes that the last dword
+	// of each binding's range pads (2 bits each). A driver may round a storage buffer's range up
+	// to whole dwords; with the pad the shader knows the exact end, which matters where a buffer
+	// is guest memory itself and a store past the end would reach other guest data.
+	[[nodiscard]] uint32_t MemoryPadDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemoryPadDword() +
+		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 15u) / 16u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

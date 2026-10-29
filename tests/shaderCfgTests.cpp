@@ -17529,8 +17529,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeMubuf1(0, 0, 1), // buffer_store_dwordx4 v[0:3]
       EncodeSopp(0x01),
   };
+  // The store's binding computes its exact end (Bindings::MemoryPadDword).
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 807,
+                                   {.words = 862,
                                     .instructions = 211,
                                     .runtime_arrays = 1,
                                     .variables = 2,

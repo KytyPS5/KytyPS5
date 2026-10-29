@@ -25,6 +25,10 @@ namespace Libs::Graphics {
 // they were recorded (TakeCompleted), writes them to guest memory with their interrupts, and
 // retires them (Retire). A label without bytes is an interrupt alone, kept in order with the
 // labels.
+//
+// GPU commands recorded after a label read it too: the buffer cache writes the pending labels
+// over the bytes a command reads (PendingForGpu), in GPU order, until a GPU write recorded
+// after a label replaces it (WrittenByGpu).
 class PendingLabels final {
 public:
 	struct Label {
@@ -35,6 +39,7 @@ public:
 		int      interrupt_event   = 0;
 		uint32_t interrupt_context = 0;
 		uint64_t serial            = 0;
+		bool     replaced_on_gpu   = false; // a GPU write recorded after it covers its bytes
 	};
 
 	// GPU thread. Returns the label's serial.
@@ -142,6 +147,27 @@ public:
 		return value;
 	}
 
+	// GPU thread. The labels not retired yet over [begin, end) that GPU commands recorded now
+	// must see, oldest first.
+	[[nodiscard]] std::vector<Label> PendingForGpu(uint64_t begin, uint64_t end) {
+		std::vector<Label> labels;
+		std::scoped_lock   lock {m_mutex};
+		ForOverlapping(begin, end, [&](Label& label) {
+			if (!label.replaced_on_gpu) {
+				labels.push_back(label);
+			}
+		});
+		std::sort(labels.begin(), labels.end(),
+		          [](const Label& a, const Label& b) { return a.serial < b.serial; });
+		return labels;
+	}
+
+	// GPU thread. A GPU write to [begin, end) is recorded: GPU commands after it read its bytes.
+	void WrittenByGpu(uint64_t begin, uint64_t end) {
+		std::scoped_lock lock {m_mutex};
+		ForOverlapping(begin, end, [](Label& label) { label.replaced_on_gpu = true; });
+	}
+
 	// The GPU thread's wake-up for completions; null when it no longer takes them.
 	void SetWake(std::function<void()> wake) {
 		std::scoped_lock lock {m_mutex};
@@ -154,6 +180,16 @@ public:
 	}
 
 private:
+	template <typename Visit>
+	void ForOverlapping(uint64_t begin, uint64_t end, Visit&& visit) {
+		for (auto it = m_latest.lower_bound(begin >= 7 ? begin - 7 : 0);
+		     it != m_latest.end() && it->first < end; ++it) {
+			if (it->first + it->second.bytes > begin) {
+				visit(it->second);
+			}
+		}
+	}
+
 	struct Entry {
 		Label label;
 		bool  completed = false;

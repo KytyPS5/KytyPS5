@@ -136,6 +136,7 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 void EmitMemoryOffsets(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
+	state.memory_byte_pads.resize(count);
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
 		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
@@ -153,6 +154,25 @@ void EmitMemoryOffsets(EmitterState& state) {
 			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
+		}
+	}
+	// Only stores need the exact end (see Bindings::MemoryPadDword).
+	std::vector<bool> exact_end(count);
+	for (const auto& buffer: state.program.info.buffers) {
+		if (buffer.written && buffer.descriptor_index < count && !dynamic_offsets[buffer.descriptor_index]) {
+			exact_end[buffer.descriptor_index] = true;
+		}
+	}
+	for (uint32_t i = 0; i < count; i += 16u) {
+		const auto lanes = std::min(16u, count - i);
+		if (std::none_of(exact_end.begin() + i, exact_end.begin() + i + lanes,
+		                 [](bool exact) { return exact; })) continue;
+		const auto word =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.MemoryPadDword() + i / 16u);
+		for (uint32_t lane = 0; lane < lanes; ++lane) {
+			if (!exact_end[i + lane]) continue;
+			state.memory_byte_pads[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			    state, word, ConstantU32(state, lane * 2u), ConstantU32(state, 2u));
 		}
 	}
 }
@@ -222,6 +242,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	}
 	const bool non_uniform = array_index != 0u;
 	const auto static_index = state.program.info.buffers.at(mem.resource).descriptor_index;
+	const bool exact_end    = state.program.info.buffers.at(mem.resource).written;
 	if (!non_uniform) array_index = ConstantU32(state, static_index);
 	MemoryResourceAccess access {.kind             = mem.kind,
 	                             .descriptor_index = array_index,
@@ -231,6 +252,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
 	                          buffer.variable, array_index);
+	uint32_t pad = 0;
 	if (non_uniform) {
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
@@ -246,12 +268,58 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    ConstantU32(state, 3));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 		    state, word, shift, ConstantU32(state, 8));
-	} else {
-		access.byte_offset = state.memory_byte_offsets[static_index];
 	}
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
+	if (non_uniform && exact_end) {
+		const auto offsets_start = state.program.bindings.memory_offset_dword +
+		    (state.program.bindings.UsesPushData() ? state.program.bindings.push_data_start_dword : 0u);
+		const auto pads_start = offsets_start + state.program.bindings.MemoryPadDword() -
+		                        state.program.bindings.memory_offset_dword;
+		// Up to 16 bindings share one pad dword, which is then loaded at a constant index.
+		const auto binding_count = state.program.bindings.descriptor_counts[
+		    static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
+		const auto pad_word = EmitShaderDataDwordLoadAt(state,
+		    binding_count <= 16u
+		        ? ConstantU32(state, pads_start)
+		        : EmitAddU32(state, ConstantU32(state, pads_start),
+		                     Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index,
+		                            ConstantU32(state, 4))));
+		const auto pad_shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 15)),
+		    ConstantU32(state, 1));
+		pad = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(state, pad_word, pad_shift,
+		                                                         ConstantU32(state, 2));
+	} else if (!non_uniform) {
+		access.byte_offset = state.memory_byte_offsets[static_index];
+		if (exact_end) pad = state.memory_byte_pads[static_index];
+	}
+	if (exact_end && pad == 0u) pad = ConstantU32(state, 0); // an offset the indirect path loads
+	const auto length = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), length, access.object_pointer, 0);
+	if (!exact_end) {
+		access.length = length;
+		return access;
+	}
+	// The exact end: the range rounded up to whole dwords, as a driver may report it, less the
+	// bytes its last dword pads.
+	const uint32_t element_bytes = &buffer == &state.storage_buffers[0]   ? 1u
+	                               : &buffer == &state.storage_buffers[1] ? 2u
+	                                                                      : 4u;
+	const auto bytes = element_bytes == 1u
+	                       ? length
+	                       : Binary(state, spv::OpIMul, TypeU32(state), length,
+	                                ConstantU32(state, element_bytes));
+	const auto dwords_end = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                               EmitAddU32(state, bytes, ConstantU32(state, 3)),
+	                               ConstantU32(state, ~3u));
+	// A binding of no bytes has no pad to take off.
+	const auto taken = Select(state, TypeU32(state),
+	                          Binary(state, spv::OpULessThanEqual, TypeBool(state), pad, dwords_end),
+	                          pad, dwords_end);
+	const auto exact = Binary(state, spv::OpISub, TypeU32(state), dwords_end, taken);
+	access.length = element_bytes == 1u
+	                    ? exact
+	                    : Binary(state, spv::OpShiftRightLogical, TypeU32(state), exact,
+	                             ConstantU32(state, element_bytes == 2u ? 1u : 2u));
 	return access;
 }
 

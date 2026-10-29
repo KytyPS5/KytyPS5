@@ -1469,6 +1469,48 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+void TestFloatClampDepthDescriptor() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Use the raw hardware format from HFW's failing descriptor, rather than
+  // constructing it from the enum under test.
+  for (bool compare : {false, true}) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    const uint32_t words[8] = {0x10000u, 140u << 20u, 0u,
+                              (9u << 28u) | DstSel(4, 4, 4, 4),
+                              0u, 0u, 0u, 0u};
+    for (uint32_t i = 0; i < 8; ++i) source.dwords[i] = Value(words[i]);
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back({
+        .source = 0,
+        .resource_class = ImageResourceClass::Sampled,
+        .dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+        .read = true,
+        .depth_compare = compare,
+    });
+    auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization),
+          "format 140 depth descriptor failed specialization");
+    Check(specialization.images[0].numeric_class ==
+              Prospero::TextureNumericClass::Float &&
+              specialization.images[0].conversion_format ==
+                  Prospero::BufferFormat::kInvalid,
+          "format 140 did not retain native float depth sampling");
+    plan.info.images[0].resource_class = ImageResourceClass::Storage;
+    plan.info.images[0].depth_compare = false;
+    Check(!MaterializeResources(plan, {}, snapshot, specialization),
+          "image-only format 140 was accepted for storage");
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -1496,6 +1538,7 @@ int main() {
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
+  TestFloatClampDepthDescriptor();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();

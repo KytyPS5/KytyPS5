@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <deque>
@@ -671,6 +672,7 @@ struct UniformFillPlan {
 
 class SrtTape;
 class SrtNodes;
+class SrtTrace;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -687,13 +689,94 @@ struct ResourcePlan {
 			uint64_t generation = 0;
 		};
 
+		// A context under an EXEC mask evaluates a few values of the plan: it keeps them in a
+		// small open-addressed table (`slots`), not a dense entry per value (`values`). An entry
+		// of an older generation is free; a reset one keeps its slot (generation | 3).
+		struct Slot {
+			uint32_t key = UINT32_MAX;
+			Entry    entry;
+		};
+
+		Entry& Memo(uint32_t index, uint32_t count) {
+			if (!sparse && index < values.size()) return values[index];
+			return MemoSlow(index, count);
+		}
+
+		Entry& MemoSlow(uint32_t index, uint32_t count) {
+			if (!sparse) {
+				values.resize(std::max<size_t>(count, index + 1u));
+				return values[index];
+			}
+			if (slot_generation != generation) {
+				slot_generation = generation;
+				slots_used      = 0;
+			}
+			if (slots.empty() || 2u * (slots_used + 1u) > slots.size()) GrowSlots();
+			const auto mask = static_cast<uint32_t>(slots.size() - 1u);
+			for (auto at = (index * 0x9e3779b1u) >> 7u;; ++at) {
+				auto& slot = slots[at & mask];
+				const bool free = (slot.entry.generation & ~uint64_t {3}) != generation;
+				if (slot.key == index) {
+					// The caller marks the entry at once, so it is counted as taken.
+					if (free) slots_used++;
+					return slot.entry;
+				}
+				if (free || slot.key == UINT32_MAX) {
+					slot.key   = index;
+					slot.entry = {};
+					slots_used++;
+					return slot.entry;
+				}
+			}
+		}
+
+		void GrowSlots() {
+			auto old = std::move(slots);
+			slots.assign(old.empty() ? 64u : old.size() * 2u, Slot {});
+			slots_used = 0;
+			const auto mask = static_cast<uint32_t>(slots.size() - 1u);
+			for (const auto& slot: old) {
+				if (slot.key == UINT32_MAX || (slot.entry.generation & ~uint64_t {3}) != generation)
+					continue;
+				for (auto at = (slot.key * 0x9e3779b1u) >> 7u;; ++at) {
+					auto& free = slots[at & mask];
+					if (free.key == UINT32_MAX) {
+						free = slot;
+						slots_used++;
+						break;
+					}
+				}
+			}
+		}
+
 		std::vector<Entry> values;
+		std::vector<Slot>  slots;
+		uint32_t           slots_used      = 0;
+		uint64_t           slot_generation = 0;
+		bool               sparse          = false;
 		// The entries marked unknown in this generation (SrtWalker::ResetUnknowns).
 		std::vector<uint32_t> unknowns;
 		uint64_t           generation = 0;
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
 		uint8_t            read_policy = 0;
+		// The next context of the same key, and of the same session (SrtWalker::AcquireContext).
+		uint32_t next_of_key     = UINT32_MAX;
+		uint32_t next_of_session = UINT32_MAX;
+	};
+
+	struct EvaluationKey {
+		Value   active_mask;
+		uint8_t read_policy = 0;
+
+		bool operator==(const EvaluationKey& other) const = default;
+	};
+
+	struct EvaluationKeyHash {
+		size_t operator()(const EvaluationKey& key) const {
+			return (reinterpret_cast<uintptr_t>(key.active_mask.TryInstruction()) >> 4u) * 4u +
+			       key.read_policy;
+		}
 	};
 
 	ResourcePlan();
@@ -727,8 +810,18 @@ struct ResourcePlan {
 	// Null when the walker walks the values themselves (SrtWalker.h).
 	std::shared_ptr<const SrtNodes>     srt_nodes;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// The last walk over the nodes, which the next walk replays (SrtTrace, SrtWalker.h); null
+	// before the first walk and while the plan's path changes from walk to walk.
+	mutable std::shared_ptr<SrtTrace>     srt_trace;
+	mutable uint32_t                      srt_trace_failures = 0;
+	mutable uint32_t                      srt_trace_pause    = 0;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
+	// The first context of each key; a key has one context per session that uses it.
+	mutable std::unordered_map<EvaluationKey, uint32_t, EvaluationKeyHash> evaluation_keys;
+	// The same heads by node reference and read policy, for walkers over SrtNodes: entry
+	// ref * 4 + policy, the root mask at ref evaluation_value_count (SrtWalker::AcquireContext).
+	mutable std::vector<uint32_t>          evaluation_ref_keys;
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;

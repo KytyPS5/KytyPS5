@@ -1596,6 +1596,91 @@ void TestNodesMatchWalker() {
   SrtNodes::SetVerify(previous);
 }
 
+// A walk replayed from the last walk's trace gives what the walker gives, for plans with every
+// kind of runtime choice: the same input again replays, and an input that takes another side of
+// a choice leaves the trace and walks.
+void TestTracesMatchWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto cases = RuntimeChoiceCases();
+  cases.insert(cases.begin(), {"a plain program", [](Program &) {}});
+  std::array<uint32_t, 8> memory{0x11u, 4u, 0x33u, 0x44u, 0u, 1u, 2u, 3u};
+  const auto base = reinterpret_cast<uint64_t>(memory.data());
+  struct Reads {
+    const std::array<uint32_t, 8> *memory = nullptr;
+    std::vector<uint64_t> addresses;
+  };
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &reads = *static_cast<Reads *>(data);
+    const auto start = reinterpret_cast<uint64_t>(reads.memory->data());
+    if (address < start || address + words.size_bytes() > start + sizeof(*reads.memory)) {
+      return false;
+    }
+    reads.addresses.push_back(address);
+    std::memcpy(words.data(), reinterpret_cast<const void *>(address), words.size_bytes());
+    return true;
+  };
+  const std::array<std::pair<uint32_t, uint32_t>, 7> inputs{
+      {{0x11u, 0u}, {0x11u, 0u}, {4u, 0u}, {4u, 0u}, {0x11u, 1u}, {4u, 1u}, {0x11u, 1u}}};
+  for (const auto &test : cases) {
+    auto program = TapeProgram();
+    test.change(program);
+    auto plan = ExtractResourcePlan(program);
+    if (plan.srt_tape != nullptr) {
+      plan.srt_tape = nullptr;
+      plan.srt_nodes = SrtNodes::Build(plan);
+    }
+    bool traced = false;
+    bool succeeded = false;
+    for (size_t at = 0; at < inputs.size(); ++at) {
+      const auto [first, carry_in] = inputs[at];
+      memory[0] = first;
+      const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(base),
+                                              static_cast<uint32_t>(base >> 32u), 5u, carry_in};
+      std::array<ResourceSnapshot, 2> snapshots;
+      std::array<ResourceSpecialization, 2> specializations;
+      std::array<Reads, 2> reads{Reads{&memory}, Reads{&memory}};
+      std::array<bool, 2> results{};
+      for (const int trace : {0, 1}) {
+        SrtTraceSession::SetEnabled(trace != 0);
+        results[trace] = MaterializeResources(plan,
+            {.user_data = user_data, .read_memory = read, .userdata = &reads[trace],
+             .read_specialization_memory = read},
+            snapshots[trace], specializations[trace]);
+      }
+      traced = traced || plan.srt_trace != nullptr;
+      succeeded = succeeded || results[0];
+      // A replay that leaves the trace has read a prefix of the walk's reads, which the walk
+      // that follows reads again.
+      const auto &walked = reads[0].addresses;
+      const auto &replayed = reads[1].addresses;
+      const bool same_reads = replayed.size() >= walked.size() &&
+          std::equal(walked.begin(), walked.end(), replayed.end() - walked.size()) &&
+          std::equal(replayed.begin(), replayed.end() - walked.size(), walked.begin());
+      const bool repeated = at > 0 && inputs[at - 1] == inputs[at];
+      const bool same = results[0] == results[1] && same_reads &&
+          (!repeated || replayed == walked) &&
+          (!results[0] ||
+           (snapshots[0].flattened_srt == snapshots[1].flattened_srt &&
+            snapshots[0].buffers == snapshots[1].buffers &&
+            snapshots[0].images == snapshots[1].images &&
+            snapshots[0].samplers == snapshots[1].samplers &&
+            snapshots[0].specialization_reads == snapshots[1].specialization_reads &&
+            snapshots[0].uniform_fill == snapshots[1].uniform_fill &&
+            specializations[0] == specializations[1]));
+      if (!same) {
+        std::fprintf(stderr, "ResourceMaterializationTests: case: %s, input %zu\n", test.name, at);
+        Check(false, "a replayed walk differs from the walker");
+      }
+    }
+    // A walk that fails leaves no trace.
+    if (plan.srt_nodes != nullptr && succeeded && !traced) {
+      std::fprintf(stderr, "ResourceMaterializationTests: case: %s\n", test.name);
+      Check(false, "a walk over nodes left no trace");
+    }
+  }
+  SrtTraceSession::SetEnabled(false);
+}
+
 // Every operation on scalar values that the walker evaluates, the tape builds too, with the same
 // result. Only the operations whose walk depends on runtime values keep the walker. An operation
 // added to the walker but not to the tape fails here.
@@ -1887,6 +1972,8 @@ void TestSpecializationFitsTheShader() {
 }
 
 int main() {
+  // The cases below count the walker's own reads; TestTracesMatchWalker covers replays.
+  Libs::Graphics::ShaderRecompiler::IR::SrtTraceSession::SetEnabled(false);
   TestNodesMatchWalker();
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
@@ -1916,6 +2003,7 @@ int main() {
   TestTapeBuildsEveryOperationTheWalkerEvaluates();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestTracesMatchWalker();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

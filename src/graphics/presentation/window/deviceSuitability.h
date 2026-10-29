@@ -50,6 +50,11 @@ struct DeviceFacts {
 	bool shader_float64                            = false;
 	bool shader_float16                            = false;
 	bool draw_indirect_first_instance              = false;
+	// An AMD GPU with an AMD shader compiler (RADV, AMDVLK, AMD's driver): see
+	// HostCapabilities::guest_float_min_max.
+	bool amd_shader_compiler                       = false;
+	// VkPhysicalDeviceVulkan12Properties::shaderSignedZeroInfNanPreserveFloat32.
+	bool float32_preserves_special_values          = false;
 
 	// Vulkan 1.1 features.
 	bool storage_buffer_16bit_access = false;

@@ -119,6 +119,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.block_texel_view          = facts.block_texel_view;
 	caps.maintenance8              = with_extension(facts.maintenance8, kMaintenance8Extension);
 	caps.draw_indirect_first_instance = facts.draw_indirect_first_instance;
+	caps.guest_float_min_max = facts.amd_shader_compiler && facts.float32_preserves_special_values;
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
 	caps.max_stage_samplers            = facts.max_per_stage_samplers;

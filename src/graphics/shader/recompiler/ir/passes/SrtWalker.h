@@ -181,12 +181,28 @@ private:
 	std::vector<uint8_t>                 m_read_clean;
 	std::vector<std::array<uint32_t, 8>> m_descriptor_refs;
 	std::vector<uint32_t>                m_condition_refs;
+	// The control flow and the reads again, packed for RefreshFlatBuffer: block b's successors,
+	// sources and reads are [begin[b], begin[b + 1]) of each list. Empty when a block names a
+	// source outside the plan (the walker walks the plan's blocks then).
+	bool                                 m_flow = false;
+	std::vector<uint32_t>                m_successor_begin;
+	std::vector<uint32_t>                m_successors;
+	std::vector<uint32_t>                m_source_begin;
+	std::vector<uint32_t>                m_sources;
+	std::vector<uint32_t>                m_block_read_begin;
+	std::vector<uint32_t>                m_block_reads;
+	std::vector<uint32_t>                m_read_offsets;
+	// Per descriptor source: 1 unless a block decides it.
+	std::vector<uint8_t>                 m_active_template;
 };
+
+class SrtTraceSession;
 
 class SrtWalker {
 public:
+	// `trace`: the walk is recorded, or replayed, in it (SrtTrace).
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-	          SrtWalker* clean_evaluator = nullptr);
+	          SrtWalker* clean_evaluator = nullptr, SrtTraceSession* trace = nullptr);
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -195,6 +211,16 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+
+private:
+	// RefreshFlatBuffer over the packed flow of SrtNodes.
+	bool RefreshFlatBufferNodes(std::vector<uint32_t>& flat);
+	bool RefreshFlatBufferWalk(std::vector<uint32_t>& flat);
+	bool EvaluateDescriptorWalk(uint32_t source, DescriptorValue& result);
+	// Recording: the guard for the outcome `ok` of the value EvaluateRef returned last.
+	bool Taken(bool ok);
+
+public:
 
 private:
 	// `active_ref`: the mask's node reference, when the caller has it (SrtNodes::NoRef: found).
@@ -217,11 +243,16 @@ private:
 
 	const ResourcePlan&              m_program;
 	const SrtNodes*                 m_nodes = nullptr;
+	// Recording or replaying the walk; the role tells the trace's two walkers apart.
+	SrtTraceSession*                m_trace      = nullptr;
+	uint8_t                         m_trace_role = 0;
 	uint32_t                        m_active_ref = SrtNodes::NoRef;
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
+	// The session's contexts, linked by next_of_session (the session's own walker keeps them).
+	mutable uint32_t                m_session_contexts = UINT32_MAX;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
@@ -264,13 +295,152 @@ private:
 
 	bool Root(uint32_t slot, uint32_t& value) const;
 
+	// In order of read depth (the raw reads on a step's longest chain of arguments): at each
+	// depth the reads come first, as m_read_groups, then the steps that use them.
 	std::vector<Step>                    m_steps;
+	// [begin, end) of the reads of each depth: a run asks for their memory before it reads any
+	// of it, so that the reads wait together and not one after another.
+	std::vector<std::pair<uint32_t, uint32_t>> m_read_groups;
 	// Per srt_reads entry, and per descriptor source dword (NoSlot: not a root).
 	std::vector<uint32_t>                m_srt_slots;
 	std::vector<std::array<uint32_t, 8>> m_descriptor_slots;
 	// Constant slots are written once by Build; step slots by every run.
 	mutable std::vector<uint64_t>        m_values;
 	mutable std::vector<uint8_t>         m_ok;
+};
+
+// A walk over a plan's nodes as it went: the steps it took in order, with a guard at every
+// decision a value made (a branch, a short circuit, a value that failed). The next walk of the
+// plan replays the steps while every guard holds: the same path, with the same reads in the same
+// order, without recursion or memos. A guard that fails ends the replay, and the walker walks.
+// Values are kept by slot: constants are written once, when recorded, and step outputs by each
+// replay. The walk answers queries (RefreshFlatBuffer, EvaluateDescriptor, Evaluate) one after
+// another; each query runs its own steps, so a replay reads nothing for a query never asked.
+class SrtTrace {
+private:
+	friend class SrtTraceSession;
+	friend class SrtWalker;
+
+	enum class Op : uint8_t {
+		UserData,     // aux: user data index
+		ShaderBase,
+		Pure,         // args[0, aux): ApplyPure(op, flags)
+		ExtractHalf,  // args[0], aux: component
+		AddCarryHalf, // args[0], args[1], aux: component
+		RawRead,      // args: low, high, offset, records, word3; flags: memory index;
+		              // aux: ReadVector | ReadClean (the reader); expect: the address outcome
+		GuardOk,      // args[0] evaluated (expect 1) or failed (0)
+		GuardTruth,   // args[0] is nonzero (expect 1) or zero (0)
+		GuardDecided, // DecidedByArgument(op, aux, args[0]) == expect
+		GuardEqual,   // args[0] == args[1] is expect
+	};
+	// RawRead address outcomes.
+	static constexpr uint8_t ReadFails = 0;
+	static constexpr uint8_t ReadZero  = 1;
+	static constexpr uint8_t ReadWord  = 2;
+	// RawRead reader bits in aux.
+	static constexpr uint32_t ReaderVector = 1u;
+	static constexpr uint32_t ReaderClean  = 2u;
+
+	struct Step {
+		uint64_t                flags  = 0;
+		ValueOpcode             op     = ValueOpcode::Identity;
+		Op                      kind   = Op::GuardOk;
+		uint8_t                 expect = 0;
+		uint32_t                aux    = 0;
+		uint32_t                out    = 0;
+		std::array<uint32_t, 5> args {};
+	};
+
+	enum class QueryKind : uint8_t { FlatBuffer, Descriptor, Value };
+	struct Query {
+		QueryKind kind   = QueryKind::Value;
+		uint8_t   role   = 0;
+		bool      result = false;
+		// The descriptor source, or the evaluated value's node reference.
+		uint64_t key           = 0;
+		uint32_t steps_end     = 0;
+		uint32_t outputs_begin = 0;
+		uint32_t outputs_end   = 0;
+		// FlatBuffer: the buffer's size and the active sources (m_actives) after the walk.
+		uint32_t flat_size = 0;
+		uint32_t active    = 0;
+	};
+
+	std::vector<Step>                          m_steps;
+	std::vector<Query>                         m_queries;
+	// (flat buffer offset, descriptor dword, or 0 for a value; slot) per query output.
+	std::vector<std::pair<uint32_t, uint32_t>> m_outputs;
+	std::vector<std::vector<uint8_t>>          m_actives;
+	std::vector<uint64_t>                      m_values;
+	std::vector<uint8_t>                       m_ok;
+	std::vector<uint8_t>                       m_constant;
+	uint32_t                                   m_fail_slot = 0;
+};
+
+// One MaterializeResources walk with a trace: it replays the plan's trace, or records one.
+class SrtTraceSession {
+public:
+	// SetEnabled(false): every walk walks (tests of the walker's own reads). KYTY_SRT_TRACE=0
+	// turns traces off from the start.
+	static void SetEnabled(bool enabled);
+	[[nodiscard]] static bool Enabled();
+
+	// Replays `trace`, or records when it is null.
+	SrtTraceSession(const ResourcePlan& program, std::shared_ptr<SrtTrace> trace);
+	~SrtTraceSession();
+	SrtTraceSession(const SrtTraceSession&)            = delete;
+	SrtTraceSession& operator=(const SrtTraceSession&) = delete;
+
+	// The runtime the walkers read through, once the walk has made it.
+	void Attach(const SrtRuntime& runtime);
+	[[nodiscard]] bool Replaying() const noexcept { return m_replay != nullptr; }
+	// A guard failed or a query differed: the walk's answers are void, and the walker walks.
+	[[nodiscard]] bool Aborted() const noexcept { return m_aborted; }
+	// The recorded trace; null when the walk took a path the trace cannot hold.
+	[[nodiscard]] std::shared_ptr<SrtTrace> Finish();
+
+private:
+	friend class SrtWalker;
+	struct Recording;
+
+	// Recording.
+	[[nodiscard]] uint32_t Constant(uint64_t bits);
+	[[nodiscard]] uint32_t Fail() const;
+	uint32_t               Step(SrtTrace::Step step);
+	void                   Guard(SrtTrace::Op kind, uint32_t slot, bool expect, uint32_t aux = 0,
+	                             ValueOpcode op = ValueOpcode::Identity, uint32_t other = 0);
+	void                   Bind(const void* context, uint32_t ref, uint32_t slot);
+	[[nodiscard]] uint32_t Bound(const void* context, uint32_t ref);
+	void                   Unbind(const void* context, uint32_t ref);
+	void                   Unsupported() noexcept { m_supported = false; }
+	void BeginQuery(SrtTrace::QueryKind kind, uint8_t role, uint64_t key);
+	void Output(uint32_t index, uint32_t slot);
+	void EndQuery(bool result, uint32_t flat_size = 0, const std::vector<uint8_t>* active = nullptr);
+	[[nodiscard]] uint32_t Reader(const SrtRuntime& runtime, bool vector);
+
+	// Replay: the next query, if it is this one, with its steps run. Null: aborted.
+	const SrtTrace::Query* Replay(SrtTrace::QueryKind kind, uint8_t role, uint64_t key);
+	bool                   ReplayFlatBuffer(uint8_t role, std::vector<uint32_t>& flat,
+	                                        std::vector<uint8_t>& active);
+	bool                   ReplayDescriptor(uint8_t role, uint32_t source, uint32_t dword_count,
+	                                        DescriptorValue& result);
+	bool                   ReplayValue(uint8_t role, uint64_t key, uint64_t& result);
+	[[nodiscard]] uint64_t Value(uint32_t slot) const { return m_replay->m_values[slot]; }
+
+	const ResourcePlan&        m_program;
+	SrtRuntime                 m_runtime;
+	SrtRuntime                 m_clean_runtime;
+	std::shared_ptr<SrtTrace>  m_replay;
+	std::unique_ptr<Recording> m_recording;
+	// Top-level walkers made so far: a walker's role is its place in that order.
+	uint8_t                    m_roles = 0;
+	uint32_t                   m_query = 0;
+	uint32_t                   m_step  = 0;
+	bool                       m_aborted   = false;
+	bool                       m_supported = true;
+	// Recording: the slot of the value the last EvaluateRef returned.
+	uint32_t last = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

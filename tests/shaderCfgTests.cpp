@@ -11019,27 +11019,24 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   CheckSpirvBinaryValidates(result.spirv);
 
   // A binding's exact end, from its length, is computed once in the entry block; the length
-  // reads no buffer data. The element is reached only through the EXEC guard and then the
-  // bounds branch.
+  // reads no buffer data. The load needs no branch (robustBufferAccess keeps it inside the
+  // binding): the EXEC and bounds conditions select its value afterwards.
   const auto source = DisassembleSpirvBinary(result.spirv);
-  const auto exec_branch =
-      source.find("OpBranchConditional", 0);
-  const auto array_length =
-      source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", exec_branch + 1);
+  const auto array_length = source.find("OpArrayLength", 0);
+  const auto bounds = source.find("OpULessThan", array_length);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
-  Check(exec_branch != std::string::npos,
-        "buffer load SPIR-V lacks EXEC guard branch");
+  const auto load = source.find("OpLoad %uint", element_access);
+  const auto select = source.find("OpSelect %uint", load);
   Check(array_length != std::string::npos,
         "buffer load SPIR-V lacks storage buffer array-length bounds check");
-  Check(bounds_branch != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
-  Check(element_access != std::string::npos,
-        "buffer load SPIR-V lacks storage element access");
-  Check(array_length < bounds_branch && exec_branch < bounds_branch,
-        "buffer load bounds branch does not follow the EXEC guard and the binding's length");
-  Check(bounds_branch < element_access,
-        "buffer load storage element pointer was formed before bounds guard");
+  Check(bounds != std::string::npos, "buffer load SPIR-V lacks storage buffer bounds test");
+  Check(element_access != std::string::npos && load != std::string::npos,
+        "buffer load SPIR-V lacks storage element load");
+  // The shader's store after the load keeps its guard branch.
+  Check(source.find("OpBranchConditional") > select,
+        "buffer load SPIR-V branches around the load");
+  Check(select != std::string::npos && source.find("OpSelect %uint", select + 1) != std::string::npos,
+        "buffer load value is not selected by its bounds and EXEC");
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {

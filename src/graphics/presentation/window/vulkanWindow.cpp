@@ -208,6 +208,13 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	facts.driver =
 	    properties12.driverID == vk::DriverId::eMoltenvk ? HostDriver::MoltenVk : HostDriver::Other;
 	facts.apple_gpu = properties2.properties.vendorID == 0x106bu;
+	facts.amd_shader_compiler =
+	    properties2.properties.vendorID == 0x1002u &&
+	    (properties12.driverID == vk::DriverId::eMesaRadv ||
+	     properties12.driverID == vk::DriverId::eAmdOpenSource ||
+	     properties12.driverID == vk::DriverId::eAmdProprietary);
+	facts.float32_preserves_special_values =
+	    properties12.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
 	facts.subgroup_supported_stages =
 	    static_cast<vk::ShaderStageFlags::MaskType>(properties11.subgroupSupportedStages);
 	facts.subgroup_supported_operations =

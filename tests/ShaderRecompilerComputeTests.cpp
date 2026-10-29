@@ -39958,6 +39958,8 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   options.input_info.compute = &test.compute_info;
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto plan = ExtractResourcePlan(translated.program);
+  // The walker's own reads are counted: a replay that leaves its trace would read again.
+  SrtTraceSession::SetEnabled(false);
   struct CountMemory { u32 value = 72; u32 reads = 0; bool clean = true; } memory;
   SrtRuntime runtime{.user_data = test.user_data, .userdata = &memory};
   ResourceSnapshot snapshot;
@@ -40011,6 +40013,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
       CompareWords(test, "record capacity and padded invocation bounds", test.expected, actual);
     }
   }
+  SrtTraceSession::SetEnabled(true);
   std::printf("[compute] %-32s ok\n", test.name);
 }
 

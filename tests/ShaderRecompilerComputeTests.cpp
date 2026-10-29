@@ -17712,6 +17712,17 @@ public:
         storage_resource.read = false;
         storage_resource.written = true;
         program.info.images[0] = storage_resource;
+        // Guest writes may dirty only the stencil association, leaving native depth clean.
+        const auto association_id = texture_cache.GetImage(depth_id).stencil_ids.front();
+        const uint8_t guest_stencil = 0x57u;
+        Require(name, "guest stencil write", LibKernel::Memory::TryWriteBacking(
+                    stencil_address, &guest_stencil, sizeof(guest_stencil)),
+                "could not update guest stencil backing");
+        texture_cache.GetImage(association_id).MarkCpuDirty();
+        Require(name, "independent stencil dirtiness",
+                !texture_cache.GetImage(depth_id).IsCpuDirty() &&
+                    texture_cache.GetImage(association_id).IsCpuDirty(),
+                "fixture did not isolate a dirty stencil association");
         PreparedBindings storage_binding;
         executor.PrepareBindings(runtime, storage_binding);
         executor.RebindImages(storage_binding);
@@ -17728,7 +17739,7 @@ public:
         texture_cache.GetImage(storage_id).Download(color_copy, initial_stencil.buffer, 0, 4);
         scheduler.Finish();
         Require(name, "stencil color alias preserves existing data",
-                (ReadBuffer(name, initial_stencil, 1)[0] & 0xffu) == 0x35u,
+                (ReadBuffer(name, initial_stencil, 1)[0] & 0xffu) == guest_stencil,
                 "materializing stencil storage discarded stencil contents");
         DestroyBuffer(&initial_stencil);
         vk::ClearValue value{};

@@ -1494,7 +1494,7 @@ void TestFloatClampDepthDescriptor() {
         .read = true,
         .depth_compare = compare,
     });
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, {}, snapshot, specialization),

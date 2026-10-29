@@ -1254,6 +1254,8 @@ ImageId TextureCache::MaterializeStencilStorage(ImageId id, const ImageDesc& des
 	const auto depth_id = association.depth_id;
 	const auto range    = association.stencil_subresources;
 	RefreshImage(depth_id);
+	// Guest writes can dirty the association independently of its depth owner.
+	RefreshImage(id);
 	const auto color_id = InsertImage(desc.info);
 	CopyStencilStorage(m_slot_images[depth_id], m_slot_images[color_id], range, false);
 	m_slot_images[color_id].stencil_storage = true;

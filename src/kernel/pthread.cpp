@@ -2173,7 +2173,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
+	if (param->sched_priority <= 460) {
 		pparam.sched_priority = +2;
 	} else if (param->sched_priority >= 733) {
 		pparam.sched_priority = -2;
@@ -3168,6 +3168,17 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 		return 700;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (thread->attr == nullptr) {
+		return 700;
+	}
+	if (thread->attr->guest_priority >= 733) {
+		return 767;
+	}
+	if (thread->attr->guest_priority <= 478) {
+		return 256;
+	}
+#else
 	sched_param param {};
 	int         pol = 0;
 
@@ -3181,6 +3192,7 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 	if (param.sched_priority >= +2) {
 		return 256;
 	}
+#endif
 	return 700;
 }
 
@@ -3531,7 +3543,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
+	if (prio <= 460) {
 		param.sched_priority = +2;
 	} else if (prio >= 733) {
 		param.sched_priority = -2;

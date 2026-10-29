@@ -934,6 +934,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	bool written_ranges_built = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -942,15 +943,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		// The written ranges do not depend on the read, so gather them once per commit.
+		if (!written_ranges_built) {
+			written_ranges_built = true;
+			m_written_ranges.clear();
 			for (const auto id: m_bound_images) {
 				const auto& image = m_context.GetTextureCache().m_slot_images[id];
 				if (!image.binding.shader_write && !image.binding.is_target) continue;
 				for (const auto written: {image.info.data, image.info.stencil,
 				                          image.info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						m_written_ranges.push_back({written.address, written.size, true});
 					}
 				}
 			}
@@ -963,11 +966,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
 					const auto written_size =
 					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written_size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					if (written_size != 0) {
+						m_written_ranges.push_back({written.address, written_size, false});
 					}
 				}
+			}
+		}
+		for (const auto [address, size]: reads) {
+			for (const auto& written: m_written_ranges) {
+				if (!ImageRangeOverlaps(address, size, written.address, written.size)) continue;
+				if (written.image) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+				EXIT("scalar resource reads overlap a shader buffer write\n");
 			}
 		}
 	}

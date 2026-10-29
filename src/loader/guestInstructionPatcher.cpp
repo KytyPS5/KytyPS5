@@ -185,6 +185,23 @@ uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
 	return 0;
 }
 
+// Record the red-zone bytes of a memory operand that starts at access_start relative to RSP.
+void MarkRedZoneAccess(DecodedCodeInstruction& decoded, const ZydisDecodedOperand& operand,
+                       s64 access_start) {
+	const s64 access_size = std::max<s64>(operand.size / 8, 1);
+	const s64 range_start = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
+	const s64 range_end   = std::min<s64>(access_start + access_size, 0);
+	for (s64 offset = range_start; offset < range_end; ++offset) {
+		const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
+		if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
+			decoded.red_zone_use.set(bit);
+		}
+		if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
+			decoded.red_zone_def.set(bit);
+		}
+	}
+}
+
 DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 	DecodedCodeInstruction decoded {.address = address};
 	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address),
@@ -279,19 +296,7 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 			continue;
 		}
 
-		const s64 access_start = operand.mem.disp.value;
-		const s64 access_size  = std::max<s64>(operand.size / 8, 1);
-		const s64 range_start  = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
-		const s64 range_end    = std::min<s64>(access_start + access_size, 0);
-		for (s64 offset = range_start; offset < range_end; ++offset) {
-			const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
-			if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
-				decoded.red_zone_use.set(bit);
-			}
-			if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
-				decoded.red_zone_def.set(bit);
-			}
-		}
+		MarkRedZoneAccess(decoded, operand, operand.mem.disp.value);
 	}
 	return decoded;
 }
@@ -579,6 +584,179 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
 	return function;
+}
+
+bool IsFramePointerRegister(ZydisRegister reg) {
+	return reg != ZYDIS_REGISTER_NONE &&
+	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) == ZYDIS_REGISTER_RBP;
+}
+
+// Functions built with a frame pointer address their red zone through RBP as well: a leaf that
+// runs "push rbp; mov rbp, rsp; push rbx" keeps locals at [rbp-0x18] and below, under RSP.
+// Track RBP - RSP through the function and treat those operands like RSP-relative ones.
+void AnalyzeFramePointerRedZone(DecodedFunction& function) {
+	struct FrameState {
+		bool               visited = false;
+		std::optional<s64> offset; // RBP - RSP before the instruction, when known.
+	};
+
+	std::vector<DecodedCodeInstruction*> instructions;
+	instructions.reserve(function.instructions.size());
+	std::map<uintptr_t, size_t> indices;
+	for (auto& [address, decoded]: function.instructions) {
+		indices.emplace(address, instructions.size());
+		instructions.push_back(&decoded);
+	}
+	if (instructions.empty() ||
+	    !std::ranges::any_of(instructions, [](const DecodedCodeInstruction* decoded) {
+		    return WritesRegister(*decoded, ZYDIS_REGISTER_RBP);
+	    })) {
+		return;
+	}
+
+	const auto frame_relative_operand = [](const DecodedCodeInstruction& decoded) {
+		const ZydisDecodedOperand* result = nullptr;
+		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			    IsFramePointerRegister(operand.mem.base)) {
+				result = &operand;
+			}
+		}
+		return result;
+	};
+
+	// The RBP - RSP offset after the instruction, and the RSP change of an instruction that moves
+	// RSP relative to RBP ("mov rsp, rbp", "lea rsp, [rbp - n]", "leave").
+	const auto transfer = [](const DecodedCodeInstruction& decoded, std::optional<s64> offset,
+	                         std::optional<s64>* rsp_delta) -> std::optional<s64> {
+		const auto& instruction = decoded.instruction;
+		const auto& operands    = decoded.operands;
+		*rsp_delta              = decoded.stack_pointer_delta;
+		if (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value()) {
+			if (offset.has_value() && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    IsStackPointerRegister(operands[0].reg.value) &&
+			    operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    IsFramePointerRegister(operands[1].reg.value)) {
+				*rsp_delta = *offset;
+			} else if (offset.has_value() && instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+			           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			           IsStackPointerRegister(operands[0].reg.value) &&
+			           IsFramePointerRegister(operands[1].mem.base) &&
+			           operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+				*rsp_delta = *offset + operands[1].mem.disp.value;
+			} else if (offset.has_value() && instruction.mnemonic == ZYDIS_MNEMONIC_LEAVE) {
+				*rsp_delta = *offset + static_cast<s64>(sizeof(u64));
+			}
+		}
+		std::optional<s64> next = offset;
+		if (decoded.changes_stack_pointer) {
+			next = next.has_value() && rsp_delta->has_value()
+			           ? std::optional<s64> {*next - **rsp_delta}
+			           : std::nullopt;
+		}
+		if (WritesRegister(decoded, ZYDIS_REGISTER_RBP)) {
+			next = std::nullopt;
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    operands[0].reg.value == ZYDIS_REGISTER_RBP &&
+			    operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    operands[1].reg.value == ZYDIS_REGISTER_RSP) {
+				next = 0;
+			} else if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+			           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			           operands[0].reg.value == ZYDIS_REGISTER_RBP &&
+			           IsStackPointerRegister(operands[1].mem.base) &&
+			           operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+				next = operands[1].mem.disp.value;
+			}
+		}
+		return next;
+	};
+
+	std::vector<FrameState> states(instructions.size());
+	std::vector<size_t>     worklist {0};
+	states[0].visited = true;
+	const auto merge  = [&](uintptr_t address, std::optional<s64> offset) {
+		const auto successor = indices.find(address);
+		if (successor == indices.end()) {
+			return;
+		}
+		auto& state = states[successor->second];
+		if (!state.visited) {
+			state = {.visited = true, .offset = offset};
+		} else if (state.offset.has_value() && state.offset != offset) {
+			state.offset = std::nullopt;
+		} else {
+			return;
+		}
+		worklist.push_back(successor->second);
+	};
+	while (!worklist.empty()) {
+		const size_t index = worklist.back();
+		worklist.pop_back();
+		const auto&        decoded = *instructions[index];
+		std::optional<s64> rsp_delta;
+		const auto         next = transfer(decoded, states[index].offset, &rsp_delta);
+
+		const uintptr_t next_address  = decoded.address + decoded.instruction.length;
+		const uintptr_t branch_target = GetRelativeTarget(decoded);
+		if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+			merge(next_address, next);
+			merge(branch_target, next);
+		} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+			if (branch_target != 0) {
+				merge(branch_target, next);
+			} else {
+				// A resolved jump table: its cases share the frame of the dispatching block.
+				for (const uintptr_t target: function.branch_targets) {
+					merge(target, next);
+				}
+			}
+		} else if (!IsControlFlowTerminator(decoded.instruction)) {
+			merge(next_address, next);
+		}
+	}
+
+	bool requires_conservative_tracking = false;
+	for (size_t index = 0; index < instructions.size(); ++index) {
+		auto&              decoded = *instructions[index];
+		const auto&        offset  = states[index].offset;
+		std::optional<s64> rsp_delta;
+		transfer(decoded, offset, &rsp_delta);
+		if (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value() &&
+		    rsp_delta.has_value()) {
+			decoded.stack_pointer_delta = rsp_delta;
+		}
+		requires_conservative_tracking |=
+		    decoded.has_unmodeled_red_zone_operand ||
+		    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
+
+		const auto* operand = frame_relative_operand(decoded);
+		if (operand == nullptr || !offset.has_value() ||
+		    decoded.instruction.mnemonic == ZYDIS_MNEMONIC_NOP) {
+			continue;
+		}
+		// Like an RSP-relative operand, it addresses the guest stack and never needs protection.
+		decoded.accesses_memory = false;
+		const s64 access_start  = *offset + operand->mem.disp.value;
+		if (access_start >= 0) {
+			continue;
+		}
+		decoded.has_red_zone_operand = true;
+		function.uses_red_zone       = true;
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
+			if (!decoded.changes_stack_pointer) {
+				// A pointer into the red zone escapes the bounded analysis.
+				decoded.has_unmodeled_red_zone_operand = true;
+				requires_conservative_tracking         = true;
+			}
+			continue;
+		}
+		MarkRedZoneAccess(decoded, *operand, access_start);
+	}
+	function.requires_conservative_red_zone_tracking = requires_conservative_tracking;
 }
 
 std::optional<RedZoneMask> TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
@@ -1578,6 +1756,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		++result.function_count;
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
 		if (analyze_red_zone) {
+			AnalyzeFramePointerRedZone(function);
 			AnalyzeRedZoneLiveness(function);
 		}
 		result.instruction_count += function.instructions.size();

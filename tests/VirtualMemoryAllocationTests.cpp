@@ -314,6 +314,50 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 		            static_cast<unsigned long long>(result.patched_memory_instruction_count), intact);
 	}
 
+	// Frame-pointer leaves address the same red-zone slot through RBP: after "push rbp; mov rbp,
+	// rsp; push rbx", [rbp-0x20] is [rsp-0x18]. GTA San Andreas DE kept a TSet element pointer
+	// there across a faulting store. Exit through pops, "lea rsp, [rbp-8]" and "leave".
+	for (const int epilogue: {0, 1, 2}) {
+		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.push(code.rbx);
+		code.mov(code.rax, SENTINEL);
+		code.mov(code.qword[code.rbp - 0x20], code.rax);
+		code.mov(code.rax, code.ptr[code.rdi]); // Faultable three-byte instruction.
+		code.mov(code.rax, code.qword[code.rbp - 0x20]);
+		code.mov(code.rcx, SENTINEL);
+		code.cmp(code.rax, code.rcx);
+		code.sete(code.al);
+		code.movzx(code.eax, code.al);
+		if (epilogue == 1) {
+			code.lea(code.rsp, code.ptr[code.rbp - 8]);
+		}
+		code.pop(code.rbx);
+		if (epilogue == 2) {
+			code.leave();
+		} else {
+			code.pop(code.rbp);
+		}
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate frame-pointer red-zone fixture");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated test code");
+		reproduced &= !run_fault();
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+		    TRAMPOLINE_SIZE);
+		const auto result = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, true, false);
+		const bool intact = run_fault();
+		covered &= result.red_zone_function_count == 1 && result.memory_instruction_count == 1 &&
+		           result.patched_memory_instruction_count == 1 &&
+		           result.unrelocatable_memory_instruction_count == 0;
+		preserved &= intact;
+		std::printf("[host]    frame-pointer red-zone epilogue=%d patched=%llu preserved=%d\n", epilogue,
+		            static_cast<unsigned long long>(result.patched_memory_instruction_count), intact);
+	}
+
 	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
 	RemoveVectoredExceptionHandler(handler);
 	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);

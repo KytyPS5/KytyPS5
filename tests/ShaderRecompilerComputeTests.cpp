@@ -1371,6 +1371,7 @@ struct TestCase {
   vk::Format sampled_image_format = vk::Format::eR32G32B32A32Sfloat;
   vk::Filter sampler_filter = vk::Filter::eNearest;
   u32 sampled_image_dwords_per_pixel = 4;
+  u32 sampled_image_depth = 1;
   vk::ImageType sampled_image_type = vk::ImageType::e2D;
   vk::ImageViewType sampled_image_view_type = vk::ImageViewType::e2D;
   u32 sampled_image_layers = 1;
@@ -2114,6 +2115,7 @@ public:
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     u32 width = 0;
     u32 height = 0;
+    u32 depth = 1;
     u32 layers = 1;
     u32 mip_levels = 1;
   };
@@ -17701,6 +17703,56 @@ public:
           "stencil clear altered depth, lost its scalar value, or used a storage view");
       DestroyBuffer(&stencil_readback);
 
+      // General IMAGE_STORE bindings need a real R8 storage view, rather than a
+      // storage view of the depth/stencil attachment. Copy both directions without
+      // changing the depth aspect, including after native rendering resumes.
+      {
+        auto storage_resource = stencil_resource;
+        storage_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+        storage_resource.read = false;
+        storage_resource.written = true;
+        program.info.images[0] = storage_resource;
+        PreparedBindings storage_binding;
+        executor.PrepareBindings(runtime, storage_binding);
+        executor.RebindImages(storage_binding);
+        const auto storage_id = storage_binding.images[0].image_id;
+        Require(name, "stencil storage uses color backing",
+                storage_id != depth_id && !texture_cache.GetImage(storage_id).depth_id &&
+                    texture_cache.GetImage(storage_id).backing.format == vk::Format::eR8Uint &&
+                    static_cast<bool>(texture_cache.GetImage(storage_id).backing.usage & vk::ImageUsageFlagBits::eStorage) &&
+                    storage_binding.images[0].image_view != nullptr,
+                "stencil compute store reused a non-storage depth image");
+        auto initial_stencil = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array color_copy {vk::BufferImageCopy {0, 0, 0,
+            {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {}, {1, 1, 1}}};
+        texture_cache.GetImage(storage_id).Download(color_copy, initial_stencil.buffer, 0, 4);
+        scheduler.Finish();
+        Require(name, "stencil color alias preserves existing data",
+                (ReadBuffer(name, initial_stencil, 1)[0] & 0xffu) == 0x35u,
+                "materializing stencil storage discarded stencil contents");
+        DestroyBuffer(&initial_stencil);
+        vk::ClearValue value{};
+        value.color.uint32[0] = 0x6au;
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), storage_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, value);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        (void)texture_cache.FindDepthTarget(depth_id, depth);
+        auto result = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
+        texture_cache.GetImage(depth_id).Download(stencil_copies, result.buffer, 0, 8);
+        scheduler.Finish();
+        const auto bytes = ReadBuffer(name, result, 2);
+        Require(name, "stencil storage publishes back without changing depth",
+                bytes[0] == std::bit_cast<uint32_t>(0.625f) && (bytes[1] & 0xffu) == 0x6au,
+                "stencil storage lost writes or changed depth during reassociation");
+        DestroyBuffer(&result);
+        // Restore the fixture's clear value for the following alias tests.
+        vk::ClearValue clear{};
+        clear.depthStencil = vk::ClearDepthStencilValue {0.0f, 0x35u};
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), depth_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, clear);
+        program.info.images[0] = stencil_resource;
+      }
+
       // Buffer writes to the independent tiled stencil plane must reach the
       // combined native attachment, including values that are not a clear.
       {
@@ -17993,12 +18045,13 @@ public:
                         u32 view_layers = 0,
                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
                         vk::Format view_format = vk::Format::eUndefined,
-                        u32 view_base_mip = 0) {
+                        u32 view_base_mip = 0, u32 volume_depth = 1) {
     Image ret;
     ret.format = format;
     ret.width = width;
     ret.height = height;
     ret.layers = layers;
+    ret.depth = image_type == vk::ImageType::e3D ? volume_depth : 1u;
     ret.mip_levels = std::max<u32>(static_cast<u32>(initial_mips.size()), 1u);
     Require(shader_name, "image format size", dwords_per_pixel == (vk::blockSize(format) + 3u) / 4u,
             "image fixture word size disagrees with its native format");
@@ -18009,7 +18062,7 @@ public:
     image_info.format = format;
     image_info.extent.width = width;
     image_info.extent.height = height;
-    image_info.extent.depth = 1;
+    image_info.extent.depth = ret.depth;
     image_info.mipLevels = ret.mip_levels;
     image_info.arrayLayers = layers;
     image_info.samples = samples;
@@ -18074,13 +18127,13 @@ public:
       size_t total_dwords = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         total_dwords +=
-            ImageMipDwordCount(width, height, format, level, layers);
+            ImageMipDwordCount(width, height, format, level, layers * MipExtent(ret.depth, level));
       }
       std::vector<u32> contents(total_dwords, 0);
       size_t offset = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         const auto level_dwords =
-            ImageMipDwordCount(width, height, format, level, layers);
+            ImageMipDwordCount(width, height, format, level, layers * MipExtent(ret.depth, level));
         const auto &src = initial_mips[level];
         for (size_t i = 0; i < src.size() && i < level_dwords; i++) {
           contents[offset + i] = src[i];
@@ -18121,7 +18174,7 @@ public:
 
   std::vector<u32> ReadImage(const char *shader_name, Image *image) {
     const auto dword_count = ImageMipDwordCount(image->width, image->height,
-                                               image->format, 0, image->layers);
+                                               image->format, 0, image->layers * image->depth);
     auto staging = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
                                    vk::BufferUsageFlagBits::eTransferDst, {});
 
@@ -18140,7 +18193,7 @@ public:
     copy.imageSubresource.layerCount = image->layers;
     copy.imageExtent.width = image->width;
     copy.imageExtent.height = image->height;
-    copy.imageExtent.depth = 1;
+    copy.imageExtent.depth = image->depth;
     cmd.copyImageToBuffer(image->image, vk::ImageLayout::eTransferSrcOptimal,
                           staging.buffer, 1, &copy);
     EndSubmitAndFree(shader_name, "readback", cmd);
@@ -22393,11 +22446,11 @@ private:
       copy.imageSubresource.layerCount = image->layers;
       copy.imageExtent.width = MipExtent(image->width, level);
       copy.imageExtent.height = MipExtent(image->height, level);
-      copy.imageExtent.depth = 1;
+      copy.imageExtent.depth = MipExtent(image->depth, level);
       copies.push_back(copy);
       offset += static_cast<vk::DeviceSize>(
           ImageMipDwordCount(image->width, image->height,
-                             image->format, level, image->layers) *
+                             image->format, level, image->layers * MipExtent(image->depth, level)) *
           sizeof(u32));
     }
     cmd.copyBufferToImage(staging, image->image,
@@ -22660,7 +22713,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         test.sampled_image_type, test.sampled_image_view_type,
         test.sampled_image_layers, test.sampled_image_view_base_layer,
         test.sampled_image_view_layers, vk::SampleCountFlagBits::e1,
-        vk::Format::eUndefined, test.sampled_image_view_base_mip);
+        vk::Format::eUndefined, test.sampled_image_view_base_mip, test.sampled_image_depth);
   }
   if (needs_storage_image) {
     const bool atomic64 = std::ranges::any_of(
@@ -39950,6 +40003,52 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   return test;
 }
 
+TestCase ImageGather3DIntegerLz() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageGather3DIntegerLz";
+  test.image_width = test.image_height = test.sampled_image_depth = 2;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.sampled_image_type = vk::ImageType::e3D;
+  test.sampled_image_view_type = vk::ImageViewType::e3D;
+  for (u32 z = 0; z < 2u; ++z)
+    for (u32 y = 0; y < 2u; ++y)
+      for (u32 x = 0; x < 2u; ++x) test.sampled_image_rgba.push_back(100u * z + 10u * y + x);
+  constexpr float coordinates[][3] {{0.5f, 0.5f, 0.25f}, {0.5f, 0.5f, 0.75f},
+                                    {-0.25f, 0.75f, 0.75f}, {1.25f, -0.25f, -0.25f},
+                                    {0.5f, 0.5f, 1.25f}};
+  constexpr int offsets[4][2] {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+  for (const auto& coordinate : coordinates) {
+    for (u32 axis = 0; axis < 3u; ++axis)
+      AppendVMovLiteral(&test.code, 20u + axis, std::bit_cast<u32>(coordinate[axis]));
+    test.code.push_back(EncodeMimg0(0x47, 0x1, 0, false, 2));
+    test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    for (u32 i = 0; i < 4u; ++i) {
+      AppendStoreVgpr(&test.code, i, test.expected.size());
+      const auto x = std::clamp(int(std::floor(coordinate[0] * 2.0f - 0.5f)) + offsets[i][0], 0, 1);
+      const auto y = std::clamp(int(std::floor(coordinate[1] * 2.0f - 0.5f)) + offsets[i][1], 0, 1);
+      const auto z = std::clamp(int(std::floor(coordinate[2] * 2.0f)), 0, 1);
+      test.expected.push_back(100u * z + 10u * y + x);
+    }
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  test.user_data[2] = 1u | (1u << 14u);
+  test.user_data[3] = static_cast<u32>(Prospero::ImageType::kColor3D) << 28u;
+  test.user_data[4] = 1u;
+  test.user_data[8] = 0x92u;
+  test.user_data[9] = 0xfff000u;
+  test.user_data[10] = 0x05000000u;
+  test.user_data[50] = test.expected.size() * 4u;
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageQuerySizeLod", "OpImageSampleExplicitLod", "Floor"};
+  test.forbidden_spirv = {"OpImageGather"};
+  return test;
+}
+
 TestCase ImageGather2DInstructionWith1DDescriptor() {
   using O = ShaderOpcode;
 
@@ -46915,6 +47014,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
+  AddCase(ImageGather3DIntegerLz);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);
@@ -53446,6 +53546,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-gather-lod-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckComparisonDepthTexture();
+    RunCase(&vulkan, ImageGather3DIntegerLz());
     RunCase(&vulkan, ImageGatherExplicitLod());
     RunCase(&vulkan, ImageSampleLodClamp());
     RunCase(&vulkan, ImageGatherLodPerLane<0>());

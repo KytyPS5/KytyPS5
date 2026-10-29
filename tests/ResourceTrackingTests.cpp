@@ -59,7 +59,6 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
   Check(false, message);
 }
 
-// Shader translation runs on a worker thread whose native stack does not grow.
 template <typename F> void RunOnStack(size_t bytes, F &&function) {
   struct Context {
     F &function;
@@ -5966,8 +5965,6 @@ void TestDeepScalarReadDependencies() {
   entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = use};
   use->terminator.kind = CFG::TerminatorKind::Return;
 
-  // ReadConstBuffer is not a root in the scalar-data pass. The address
-  // descriptor below must make the planner discover this read.
   const auto buffer = fixture.Buffer(
       {fixture.UserData(0), fixture.UserData(1),
        fixture.UserData(2), fixture.UserData(3)}, 4);
@@ -5982,13 +5979,10 @@ void TestDeepScalarReadDependencies() {
   const auto low = fixture.Emit(ValueOpcode::BitCastU32F32, {value});
 
   fixture.block = use;
-  // This single incoming edge needs only one Phi operand. LowerDescriptorValue
-  // leaves this non-pattern Phi shallow; CollectScalarRead walks its operand.
   auto &phi = use->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
   phi.AddPhiOperand(entry, low);
   const auto address = fixture.Address(Value(&phi), Value(0u), 8);
   MemoryInfo global;
-  // Global keeps this consumer out of the scalar-data root/validation pass.
   global.kind = ResourceKind::Global;
   const auto load = fixture.Emit(ValueOpcode::LoadAddressU32,
       {address, Value(0u), Value(0u), Value(true)},

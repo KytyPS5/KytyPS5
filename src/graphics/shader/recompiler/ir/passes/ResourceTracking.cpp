@@ -825,8 +825,6 @@ private:
 	}
 
 	void CollectScalarRead(Value root, uint32_t root_pc) {
-		// The walk follows every operand, so it goes as deep as the longest dependency chain.
-		// Pending operands wait on the heap, in the order of a recursive walk.
 		struct Frame {
 			Inst*             inst;
 			uint32_t          use_pc;
@@ -845,31 +843,29 @@ private:
 			const auto cycle = std::ranges::find(m_srt_visiting, inst);
 			if (cycle != m_srt_visiting.end()) {
 				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-					    return value->GetOpcode() == ValueOpcode::Phi;
-				    }))
-					return;
+					return value->GetOpcode() == ValueOpcode::Phi;
+				})) return;
 				Fail(use_pc, "cyclic typed planning value without a phi");
 			}
 			if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
 			m_srt_visiting.push_back(inst);
 			uint32_t memory_index = 0;
-			auto&    frame        = frames.emplace_back(
-			    Frame {inst, use_pc, ScalarReadMemory(*inst, memory_index), 0u, {}, 0u});
-			if (frame.memory == nullptr) return;
+			const auto* memory = ScalarReadMemory(*inst, memory_index);
+			auto& frame = frames.emplace_back(Frame {inst, use_pc, memory, 0u, {}, 0u});
+			if (memory == nullptr) return;
 			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			frame.width        = frame.memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr ||
-			    handle->GetOpcode() != (frame.width == 4u ? ValueOpcode::GetBufferResource
-			                                              : ValueOpcode::GetAddressResource))
+			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+			if (handle == nullptr || handle->GetOpcode() !=
+			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
 				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, frame.width, false, false, ScalarReadBase(*inst), frame.source,
+			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), frame.source,
 			           inst->Flags<MemoryFlags>().pc);
+			frame.width = width;
 		};
 		enter(root, root_pc);
 		while (!frames.empty()) {
 			auto& frame = frames.back();
 			auto* inst  = frame.inst;
-			// A scalar read walks its descriptor dwords, then its operands after the handle.
 			const size_t first_arg = frame.memory != nullptr ? 1u : 0u;
 			if (frame.next < frame.width + inst->NumArgs() - first_arg) {
 				const auto next = frame.next++;

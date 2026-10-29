@@ -645,7 +645,8 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			// console's error for this case is unknown, so both modes keep the non-blocking result.
 			return AUDIO_OUT2_ERROR_NOT_READY;
 		}
-		const bool use_device_clock = blocking != 0 && audioout2_context_has_queueable_device(*state);
+		const bool use_device_clock =
+		    blocking != 0 && audioout2_context_has_queueable_device(*state);
 		audioout2_update_context_locked(state);
 		sleep_micros = audioout2_grain_micros(state->num_grains);
 		if (state->queued < state->queue_depth || use_device_clock) {

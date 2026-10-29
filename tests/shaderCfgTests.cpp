@@ -14688,6 +14688,97 @@ void TestNewShaderRecompilerScalarBufferLoadSelectsDefault() {
   CheckSpirvBinaryValidates(fallback.spirv);
 }
 
+// Storage classes of the loads that an OpSelect picks over a constant zero, which is how a
+// load guarded by a select reads, and of the loads whose value flows into an OpPhi, which is
+// how a load guarded by a branch reads.
+struct SpirvLoadGuards {
+  std::unordered_set<uint32_t> selected_classes;
+  std::unordered_set<uint32_t> phi_classes;
+};
+
+SpirvLoadGuards FindSpirvLoadGuards(const std::vector<uint32_t> &binary) {
+  constexpr size_t header_words = 5;
+  std::unordered_map<uint32_t, uint32_t> pointer_class; // pointer type to storage class
+  std::unordered_map<uint32_t, uint32_t> value_type;    // pointer value to its type
+  std::unordered_map<uint32_t, uint32_t> load_class;    // load result to storage class
+  std::unordered_set<uint32_t> zeros;
+  std::vector<std::pair<uint32_t, uint32_t>> selects;
+  std::vector<uint32_t> phi_inputs;
+  for (size_t pos = header_words; pos < binary.size();) {
+    const auto opcode = binary[pos] & 0xffffu;
+    const auto count = binary[pos] >> 16u;
+    if (count == 0u || pos + count > binary.size()) break;
+    const auto word = [&](size_t index) { return index < count ? binary[pos + index] : 0u; };
+    if (opcode == spv::OpTypePointer) pointer_class[word(1)] = word(2);
+    if (opcode == spv::OpVariable || opcode == spv::OpAccessChain) value_type[word(2)] = word(1);
+    if (opcode == spv::OpLoad && value_type.contains(word(3)))
+      load_class[word(2)] = pointer_class[value_type[word(3)]];
+    if (opcode == spv::OpConstant && count == 4u && word(3) == 0u) zeros.insert(word(2));
+    if (opcode == spv::OpSelect && count >= 6u) selects.emplace_back(word(4), word(5));
+    for (size_t index = 3; opcode == spv::OpPhi && index < count; index += 2)
+      phi_inputs.push_back(word(index));
+    pos += count;
+  }
+  SpirvLoadGuards guards;
+  for (const auto &[value, fallback] : selects)
+    if (load_class.contains(value) && zeros.contains(fallback))
+      guards.selected_classes.insert(load_class[value]);
+  for (const auto input : phi_inputs)
+    if (load_class.contains(input)) guards.phi_classes.insert(load_class[input]);
+  return guards;
+}
+
+// A raw buffer_load_dword runs unguarded under robustBufferAccess and selects zero past its
+// bounds, while a coherent one is volatile and keeps its bounds branch.
+void TestNewShaderRecompilerBufferLoadSelectsDefault() {
+  constexpr uint32_t mubuf = 0x38u << 26u;
+  constexpr uint32_t offen = 1u << 12u;
+  constexpr uint32_t glc = 1u << 14u;
+  constexpr uint32_t load_dword = 0x0cu << 18u;
+  for (const bool coherent : {false, true}) {
+    const uint32_t shader[] = {
+        mubuf | load_dword | offen | (coherent ? glc : 0u),
+        EncodeMubuf1(1, 0, 0), // buffer_load_dword v1, v0, s[0:3] offen
+        EncodeMubuf0(0x1c, 0, false),
+        EncodeMubuf1(1, 0, 0), // buffer_store_dword v1, s[0:3]
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto guards = FindSpirvLoadGuards(result.spirv);
+    const bool selected = guards.selected_classes.contains(spv::StorageClassStorageBuffer);
+    // The coherent load must still exist behind its branch, not just be absent from a select.
+    const bool branched = guards.phi_classes.contains(spv::StorageClassStorageBuffer);
+    Check(selected == !coherent && (!coherent || branched),
+          coherent ? "coherent buffer load lost its bounds branch"
+                   : "buffer load was not guarded by a select of zero");
+  }
+}
+
+// An LDS read past the workgroup's shared memory is not covered by robustBufferAccess, so its
+// bounds check must stay a branch even though buffer loads now select.
+void TestNewShaderRecompilerLdsLoadKeepsBranch() {
+  constexpr uint32_t lds_dwords = 64u;
+  const uint32_t shader[] = {
+      EncodeDs0(0x36),
+      EncodeDs1(2, 0, 1), // ds_read_b32 v2, v1
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(2, 0, 0), // buffer_store_dword v2, s[0:3]
+      EncodeSopp(0x01),
+  };
+  ShaderComputeInputInfo compute{};
+  compute.lds_size_dwords = lds_dwords;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto guards = FindSpirvLoadGuards(result.spirv);
+  Check(!guards.selected_classes.contains(spv::StorageClassWorkgroup) &&
+            guards.phi_classes.contains(spv::StorageClassWorkgroup),
+        "LDS load lost its bounds branch");
+}
+
 void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
@@ -17448,6 +17539,8 @@ int main() {
   TestDirectTranslationResetsAnalysisState();
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerScalarBufferLoadSelectsDefault();
+  TestNewShaderRecompilerBufferLoadSelectsDefault();
+  TestNewShaderRecompilerLdsLoadKeepsBranch();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestVop3F16InterpolationTranslation();

@@ -376,12 +376,33 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
+// Picks how a load through a prepared buffer resource is guarded. robustBufferAccess makes any
+// index into a bound storage buffer safe to load, so such a load may run unguarded and be
+// selected afterwards. That holds only for a constant descriptor slot, because the device does
+// not bound a descriptor array index, and non_uniform marks a slot chosen by a GPU value.
+// Callers guard one element load through an already resolved resource, so this resource is
+// enough here. A slot picked by a GPU value is non_uniform, and a coherent pair is volatile.
+// The guard around a whole vector access still needs the indirect root and pair checks. The
+// profile can force branches.
+static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
+                                       const MemoryResourceAccess& resource) {
+	const bool robust_kind = resource.kind == IR::ResourceKind::Buffer ||
+	                         resource.kind == IR::ResourceKind::ScalarBuffer;
+	const bool coherent = (resource.memory_access & spv::MemoryAccessVolatileMask) != 0;
+	return !state.profile.branch_guarded_loads && robust_kind && resource.object_pointer != 0u &&
+	               !resource.non_uniform && !coherent
+	           ? GuardStrategy::Select
+	           : GuardStrategy::Branch;
+}
+
+// Loads one dword through a prepared resource, or zero when it lies past the checked length.
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
-	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	return EmitGuardedValue(ctx.state, LoadGuardStrategy(ctx.state, resource),
+	                        EmitMemoryElementInBounds(ctx.state, resource, index),
+	                        ValueShape {TypeU32(ctx.state), 1u}, ConstantU32(ctx.state, 0),
+	                        [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -391,6 +412,8 @@ uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 	});
 }
 
+// Loads one byte or short through a prepared resource, or zero when it lies past the checked
+// length.
 uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                              const MemoryResourceAccess& resource, uint32_t bits,
                              bool sign_extend) {
@@ -398,10 +421,12 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	return EmitGuardedValue(ctx.state, LoadGuardStrategy(ctx.state, resource),
+	                        EmitMemoryElementInBounds(ctx.state, resource, index),
+	                        ValueShape {TypeU32(ctx.state), 1u}, ConstantU32(ctx.state, 0), [&]() {
+		                        return LoadSubwordInBounds(ctx, resource, address, index, bits,
+		                                                   sign_extend);
+	                        });
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -1583,22 +1608,6 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                          state.flattened_srt_variable, ConstantU32(state, 0),
 	                          ctx.Arg(inst, 1));
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
-}
-
-// Picks how a load through a prepared buffer resource is guarded. robustBufferAccess makes any
-// index into a bound storage buffer safe to load, so such a load may run unguarded and be
-// selected afterwards. That holds only for a constant descriptor slot, because the device does
-// not bound a descriptor array index, and non_uniform marks a slot chosen by a GPU value.
-// Only scalar buffers qualify so far. Vector buffer loads also need indirect roots and coherent
-// pairs excluded, which this resource alone does not show. The profile can force branches.
-static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
-                                       const MemoryResourceAccess& resource) {
-	const bool coherent = (resource.memory_access & spv::MemoryAccessVolatileMask) != 0;
-	return !state.profile.branch_guarded_loads &&
-	               resource.kind == IR::ResourceKind::ScalarBuffer &&
-	               resource.object_pointer != 0u && !resource.non_uniform && !coherent
-	           ? GuardStrategy::Select
-	           : GuardStrategy::Branch;
 }
 
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {

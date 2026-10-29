@@ -33990,6 +33990,74 @@ TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
   return test;
 }
 
+// One buffer load past or near the end of the checked range, and the dwords it should yield.
+struct CheckedRangeLoad {
+  u32 opcode;
+  u32 byte_address;
+  std::vector<u32> results;
+};
+
+// Loads for BufferLoadPastCheckedRange around a checked length of checked_bytes. The last checked
+// dword is canary + 15 = 0xc0de000f, so its top byte is 0xc0 and its top short is 0xc0de, which
+// the signed loads sign-extend. Wrapped addresses past 2 GiB now really load under
+// robustBufferAccess, so they also show the device survives them.
+std::vector<CheckedRangeLoad> CheckedRangeLoads(bool subword, u32 checked_bytes, u32 canary) {
+  constexpr u32 ubyte = 0x08u, sbyte = 0x09u, ushort = 0x0au, sshort = 0x0bu;
+  constexpr u32 dword = 0x0cu, dwordx4 = 0x0eu;
+  constexpr u32 wrapped = 0xfffffffcu, high = 0x80000000u, far_tail = 20u;
+  const u32 last = canary + checked_bytes / 4u - 1u;
+  if (subword)
+    return {{ubyte, checked_bytes, {0u}},          {sbyte, checked_bytes, {0u}},
+            {ubyte, checked_bytes - 1u, {0xc0u}},  {sbyte, checked_bytes - 1u, {0xffffffc0u}},
+            {ushort, checked_bytes - 2u, {0xc0deu}}, {sshort, checked_bytes - 2u, {0xffffc0deu}},
+            {ushort, checked_bytes, {0u}}};
+  return {{dword, checked_bytes - 4u, {last}}, {dword, checked_bytes, {0u}},
+          {dword, checked_bytes + 4u, {0u}},   {dword, checked_bytes + far_tail, {0u}},
+          {dwordx4, checked_bytes - 8u, {last - 1u, last, 0u, 0u}},
+          {dword, wrapped, {0u}},              {dword, high, {0u}}};
+}
+
+// Vector buffer loads past the length the shader checks must read zero, now that each element
+// load runs unguarded and its bounds check only selects. The whole backing buffer stays bound
+// and holds non-zero canaries, so only the select keeps those out. A dwordx4 that straddles
+// the end keeps its in-range dwords, and byte and short loads keep their in-range bytes.
+TestCase BufferLoadPastCheckedRange(u32 wave_size, bool subword) {
+  using O = ShaderOpcode;
+  // Results land in dwords 0 to 9, below every dword the loads read, so lanes never race.
+  constexpr u32 checked_bytes = 64u, backing_dwords = 24u, canary = 0xc0de0000u;
+  constexpr u32 address_vgpr = 20u;
+  static const std::array<const char *, 4> names{
+      "BufferLoadPastCheckedRangeWave32", "BufferLoadPastCheckedRangeWave64",
+      "BufferSubwordLoadPastCheckedRangeWave32", "BufferSubwordLoadPastCheckedRangeWave64"};
+  TestCase test;
+  test.name = names[(subword ? 2u : 0u) + (wave_size == 64u ? 1u : 0u)];
+  for (u32 i = 0; i < backing_dwords; ++i) test.initial.push_back(canary + i);
+  test.expected = test.initial;
+  u32 dst = 0;
+  for (const auto &load : CheckedRangeLoads(subword, checked_bytes, canary)) {
+    AppendVMovLiteral(&test.code, address_vgpr, load.byte_address);
+    AppendBufferLoadOpcode(&test.code, load.opcode, dst, address_vgpr);
+    for (const auto value : load.results) test.expected[dst++] = value;
+  }
+  for (u32 i = 0; i < dst; ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.storage_buffer_shader_size_bytes = checked_bytes;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes.insert(test.opcodes.end(),
+                      subword ? std::initializer_list<ShaderOpcode>{O::BUFFER_LOAD_UBYTE,
+                                                                    O::BUFFER_LOAD_SBYTE,
+                                                                    O::BUFFER_LOAD_USHORT,
+                                                                    O::BUFFER_LOAD_SSHORT}
+                              : std::initializer_list<ShaderOpcode>{O::BUFFER_LOAD_DWORD,
+                                                                    O::BUFFER_LOAD_DWORDX4});
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -46696,6 +46764,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarMemoryLoadVariants);
   cases.push_back(ScalarBufferLoadPastCheckedRange(32));
   cases.push_back(ScalarBufferLoadPastCheckedRange(64));
+  cases.push_back(BufferLoadPastCheckedRange(32, false));
+  cases.push_back(BufferLoadPastCheckedRange(64, false));
+  cases.push_back(BufferLoadPastCheckedRange(32, true));
+  cases.push_back(BufferLoadPastCheckedRange(64, true));
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);

@@ -473,7 +473,7 @@ public:
 				           " left_size=0x%016" PRIx64 " right_size=0x%016" PRIx64
 				           " error=0x%08" PRIx32 "\n",
 				           old.vaddr, old.size, vaddr, size, left_size, right_size, error);
-				EXIT("guest placeholder recovery coalesce failed\n");
+				EXIT_IF(true);
 			}
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;

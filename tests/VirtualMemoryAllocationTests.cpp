@@ -1869,6 +1869,31 @@ void TestPartialFlexibleMunmapAndFindNext() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestUnalignedFlexibleMunmapLengthRoundsToGuestPage() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test         = "UnalignedFlexibleMunmapLengthRoundsToGuestPage";
+	constexpr uint64_t page         = SceKernelPageSize;
+	constexpr uint64_t mapped_size  = 34 * page;
+	constexpr uint64_t unmap_size   = 0x800a0;
+	constexpr uint64_t rounded_size = 33 * page;
+	const auto         baseline     = AvailableFlexibleMemory(test);
+	const auto         base         = MapNamedFlexible(test, mapped_size, SceKernelProtCpuRw,
+	                                                  "prospero_unaligned_munmap");
+
+	CheckOk(test, KernelMunmap(base, unmap_size), "KernelMunmap(unaligned length)");
+	ExpectUnmapped(test, base);
+	ExpectRange(test, Query(test, base + rounded_size), base + rounded_size, base + mapped_size,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "prospero_unaligned_munmap");
+	Check(test, AvailableFlexibleMemory(test) + page == baseline,
+	      "unaligned munmap length should round up to the next guest page");
+
+	CheckOk(test, KernelMunmap(base + rounded_size, page), "KernelMunmap(final page cleanup)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "cleanup should return all flexible memory to Prospero-reported budget");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleRangeEditsCoalesce() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "FlexibleRangeEditsCoalesce";
@@ -5840,6 +5865,7 @@ int main(int argc, char** argv) {
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
+	RunTest(TestUnalignedFlexibleMunmapLengthRoundsToGuestPage);
 	RunTest(TestFlexibleRangeEditsCoalesce);
 	RunTest(TestPageTableStatsTrackRangeEdits);
 	RunTest(TestReserveMapFixedAndNoOverwrite);

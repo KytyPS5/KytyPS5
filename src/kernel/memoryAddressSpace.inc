@@ -463,8 +463,18 @@ public:
 			if (right_size != 0 && Contains(right_addr, right_size)) {
 				EXIT_IF(!UnmapOne(right_addr, right_size));
 			}
-			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
-			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
+			if (VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
+			                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0) {
+				const auto error = static_cast<uint32_t>(GetLastError());
+				LOGF_COLOR(Log::Color::Red,
+				           "\t guest placeholder recovery coalesce failed:"
+				           " old_base=0x%016" PRIx64 " old_size=0x%016" PRIx64
+				           " unmap_base=0x%016" PRIx64 " unmap_size=0x%016" PRIx64
+				           " left_size=0x%016" PRIx64 " right_size=0x%016" PRIx64
+				           " error=0x%08" PRIx32 "\n",
+				           old.vaddr, old.size, vaddr, size, left_size, right_size, error);
+				EXIT("guest placeholder recovery coalesce failed\n");
+			}
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
@@ -598,8 +608,16 @@ private:
 		if (size == 0) {
 			return true;
 		}
-		return VirtualFree(reinterpret_cast<void*>(vaddr), size,
-		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
+		if (VirtualFree(reinterpret_cast<void*>(vaddr), size,
+		                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0) {
+			return true;
+		}
+		const auto error = static_cast<uint32_t>(GetLastError());
+		LOGF_COLOR(Log::Color::Red,
+		           "\t guest placeholder split failed: base=0x%016" PRIx64
+		           " size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
+		           vaddr, size, error);
+		return false;
 	}
 
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,

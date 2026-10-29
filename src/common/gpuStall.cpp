@@ -34,6 +34,9 @@ std::atomic<uint32_t> g_active_scopes {0};
 // A thread that owns a Scope would wait on its own release, so it never waits.
 thread_local uint32_t t_owned_scopes = 0;
 
+// Whether this thread's most recent WaitWhileStalled call waited.
+thread_local bool t_resumed_from_hold = false;
+
 int64_t ElapsedMs(Clock::time_point since) {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count();
 }
@@ -86,7 +89,10 @@ Scope::~Scope() {
 	state.released.SignalAll();
 }
 
-bool WaitWhileStalled() {
+namespace {
+
+// Waits while a Scope is past the threshold and holding is on, and reports whether it waited.
+bool HoldWhileStalled() {
 	if (!g_enabled.load(std::memory_order_relaxed) ||
 	    g_active_scopes.load(std::memory_order_relaxed) == 0 || t_owned_scopes != 0) {
 		return false;
@@ -115,6 +121,18 @@ bool WaitWhileStalled() {
 		     static_cast<long long>(ElapsedMs(hold_start)));
 	}
 	return held;
+}
+
+} // namespace
+
+bool WaitWhileStalled() {
+	// Set on every call, so only the first submit after a hold is treated as resuming from it.
+	t_resumed_from_hold = HoldWhileStalled();
+	return t_resumed_from_hold;
+}
+
+bool ResumedFromHold() {
+	return t_resumed_from_hold;
 }
 
 bool IsStalled() {

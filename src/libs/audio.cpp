@@ -405,7 +405,9 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
 		if (queued < static_cast<int>(prepared_size)) {
-			if (port->queue_primed) {
+			// A hold for a long pipeline compile drains the host queue on purpose, so the first
+			// submit after it re-primes without counting an underrun.
+			if (port->queue_primed && !Common::GpuStall::ResumedFromHold()) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
 			}
 			port->queue_primed = false;

@@ -150,6 +150,33 @@ void TestDisableReleasesWaiter() {
                       "a waiter did not hold before the module was disabled");
 }
 
+// Only the call that waited reports resuming from a hold. The next call on the same thread, with
+// no stall, clears it again.
+void TestResumedFromHold() {
+  Check(!Common::GpuStall::ResumedFromHold(), "a thread with no call that waited reported a hold");
+  Common::GpuStall::Configure(true, milliseconds(0));
+  auto scope = std::make_unique<Common::GpuStall::Scope>();
+  std::atomic<bool> held_once {false};
+  bool resumed = false;
+  bool cleared = false;
+  std::thread waiter([&] {
+    Common::GpuStall::WaitWhileStalled();
+    resumed = Common::GpuStall::ResumedFromHold();
+    held_once = true;
+    Common::GpuStall::WaitWhileStalled(); // The Scope has ended, so this does not wait.
+    cleared = !Common::GpuStall::ResumedFromHold();
+  });
+  const auto park_deadline = Clock::now() + kParkLimit;
+  while (Common::GpuStall::WaiterCount() == 0 && !held_once && Clock::now() < park_deadline)
+    std::this_thread::yield();
+  Check(!held_once && Common::GpuStall::WaiterCount() == 1, "the waiter did not hold");
+  scope.reset();
+  waiter.join();
+  Common::GpuStall::Configure(false);
+  Check(resumed, "a call that waited did not report resuming from a hold");
+  Check(cleared, "a call with no stall reported resuming from a hold");
+}
+
 } // namespace
 
 int main() {
@@ -163,6 +190,7 @@ int main() {
   TestEnableWithActiveScope();
   TestScopeEndReleasesWaiter();
   TestDisableReleasesWaiter();
+  TestResumedFromHold();
   std::puts("GpuStallTests: all cases passed");
   return 0;
 }

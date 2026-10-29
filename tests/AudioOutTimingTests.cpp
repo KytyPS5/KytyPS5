@@ -640,6 +640,59 @@ void TestNoHoldWhenDisabled() {
 	Check(submit.Result() >= 0, "output failed with the hold switched off");
 	Check(streams.front()->frames != 0, "output did not reach the queue with the hold switched off");
 }
+
+// A hold drains the host queue on purpose, so the first submit after it is not an underrun. A
+// real underrun on the same thread afterwards still counts, so only that one submit is exempt.
+void TestHoldIsNotAnUnderrun() {
+	using Common::DebugCounters::Counter;
+	constexpr uint32_t gap_us        = 1000000;
+	constexpr int      prime_outputs = 8; // Enough to fill the 40 ms cushion again.
+	Fixture            f;
+	const auto         port = f.Open();
+	f.Prime(port);
+	Common::DebugCounters::SetEnabled(true);
+	const auto  before     = Common::DebugCounters::Get(Counter::AudioUnderruns);
+	uint64_t    after_hold = 0;
+	uint64_t    after_real = 0;
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() {
+		const auto output = [&]() {
+			return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), f.pcm.data());
+		};
+		const int result = output();
+		after_hold       = Common::DebugCounters::Get(Counter::AudioUnderruns);
+		for (int i = 0; i < prime_outputs; i++) {
+			output();
+		}
+		now += gap_us; // A real gap with no compile behind it.
+		output();
+		after_real = Common::DebugCounters::Get(Counter::AudioUnderruns);
+		return result;
+	});
+	submit.CheckHeld();
+	now += gap_us; // The game is frozen for the whole compile.
+	compile.Finish();
+	Check(submit.Result() >= 0, "held output failed after release");
+	Common::DebugCounters::SetEnabled(false);
+	Check(after_hold == before, "the first output after a hold counted an underrun");
+	Check(after_real == before + 1, "a real underrun after a hold was not counted");
+}
+
+// A queue that drains with no hold behind it still counts as an underrun.
+void TestUnderrunCountedWithoutHold() {
+	using Common::DebugCounters::Counter;
+	constexpr uint32_t gap_us = 1000000;
+	Fixture            f;
+	const auto         port = f.Open();
+	f.Prime(port);
+	Common::DebugCounters::SetEnabled(true);
+	const auto before = Common::DebugCounters::Get(Counter::AudioUnderruns);
+	now += gap_us;
+	f.Output(port);
+	const auto after = Common::DebugCounters::Get(Counter::AudioUnderruns);
+	Common::DebugCounters::SetEnabled(false);
+	Check(after == before + 1, "a drained queue with no hold did not count an underrun");
+}
 } // namespace
 
 int main() {
@@ -659,6 +712,8 @@ int main() {
 	TestBatchOutputHeld();
 	TestCloseDuringHold();
 	TestNoHoldWhenDisabled();
+	TestHoldIsNotAnUnderrun();
+	TestUnderrunCountedWithoutHold();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

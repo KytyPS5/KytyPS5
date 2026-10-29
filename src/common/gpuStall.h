@@ -54,8 +54,13 @@ private:
 /// Returns true when it waited. Guest audio submit entry points call this before anything else,
 /// and must not hold a lock the GPU command thread could need, or the compile could never end.
 /// There is no time limit. A compile that never ends has already frozen the game, and stalls
-/// of over 30 s are real, so giving up early would bring back the skipped scene.
+/// of over 30 s are real, so giving up early would bring back the skipped scene. Each call also
+/// records whether it waited, which ResumedFromHold reports.
 bool WaitWhileStalled();
+
+/// True when this thread's most recent WaitWhileStalled call waited. The first audio submit after a
+/// hold finds the host queue drained on purpose, and uses this to keep that out of underrun counts.
+[[nodiscard]] bool ResumedFromHold();
 
 /// True when holding is on and a Scope has lasted at least the threshold. Unlike
 /// WaitWhileStalled it does not exempt the thread that owns the Scope.

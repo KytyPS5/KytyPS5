@@ -590,6 +590,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	const auto undefined_spills = IR::MarkUndefinedLaneSpills(ir);
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
@@ -598,6 +599,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	};
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	IR::ReleaseUndefinedLaneSpills(undefined_spills);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
 		LOGF("ShaderRecompiler %s read-lane elimination: reads=%" PRIu32
 		     " reductions=%" PRIu32 "\n",

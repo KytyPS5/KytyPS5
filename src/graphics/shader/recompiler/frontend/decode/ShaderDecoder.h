@@ -893,6 +893,13 @@ struct Instruction {
 	std::string_view unsupported_reason;
 };
 
+// The code an inlined call target occupies in an expanded program, by byte pc, and its address.
+struct InlinedCallBody {
+	uint32_t begin   = 0;
+	uint32_t end     = 0;
+	uint64_t address = 0;
+};
+
 // A direct branch of an expanded program whose target is beyond the reach of its 16-bit offset,
 // by byte pc: its encoding holds offset 0 and the decoded branch takes this target.
 struct LongBranch {
@@ -906,6 +913,8 @@ struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
+	// Set on programs expanded by ShaderFunctionExpander.
+	std::vector<InlinedCallBody> call_bodies;
 	std::vector<LongBranch>      long_branches; // ascending pc
 };
 

@@ -29,10 +29,26 @@ struct ImageHeapView {
 	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
 };
 
+// The candidates of a sampled root that selects descriptors through records (tables that
+// GPU-chosen records name, see ResourceMaterialization): the host keeps them resident in device
+// slot words, a leading null slot and then one slot per candidate, as a table view keeps its
+// table's descriptors, so the host can replace an element whose image changed.
+struct ImageHeapList {
+	const void*                      owner    = nullptr; // With resource, names the root's list.
+	uint32_t                         resource = 0;
+	const ImageResource*             root     = nullptr;
+	std::span<const DescriptorValue> values;
+};
+
 class ImageHeapSource {
 public:
 	// False when the host does not keep the table resident.
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
+	// Fills view: value i selects slot i + 1, slot 0 and the slots past the values are null. False
+	// when the host does not keep the descriptors resident.
+	virtual bool AcquireList(const ImageHeapList& /*list*/, ImageHeapView& /*view*/) {
+		return false;
+	}
 
 protected:
 	~ImageHeapSource() = default;

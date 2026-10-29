@@ -177,15 +177,17 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 			return source.decoded;
 		}
 		if (source.linked &&
-		    std::ranges::equal(std::span(source.linked->code).subspan(source.code.size()), expanded)) {
+		    std::ranges::equal(std::span(source.linked->code).subspan(source.code.size()), expanded) &&
+		    source.linked->decoded.long_branches == source.expander->LongBranches()) {
 			return source.linked->decoded;
 		}
 		ShaderSource::Linked linked;
 		linked.code = source.code;
 		linked.code.insert(linked.code.end(), expanded.begin(), expanded.end());
 		const auto expanded_code = std::span<const uint32_t>(linked.code).subspan(source.code.size());
-		Decoder::DecodeProgram(expanded_code, linked.decoded);
+		Decoder::DecodeProgram(expanded_code, linked.decoded, source.expander->LongBranches());
 		linked.decoded.code = expanded_code;
+		linked.decoded.call_bodies = source.expander->Bodies();
 		source.linked = std::move(linked);
 		++source.revision;
 		return source.linked->decoded;

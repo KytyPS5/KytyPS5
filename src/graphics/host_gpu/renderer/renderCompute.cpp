@@ -619,6 +619,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	m_context.GetImageHeap().BeginDraw();
 	const ShaderModule*    compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		input_info.async_compute              = async_compute;
@@ -652,6 +653,10 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		}
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
+	// The heap resolves the elements this dispatch acquired before its descriptors are written.
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
+	}
 	RebindImages(bindings);
 	(void)PrepareIndirectWriteTargets(m_context, bindings);
 	constexpr uint64_t ArgsSize = 3 * sizeof(uint32_t);

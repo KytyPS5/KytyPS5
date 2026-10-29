@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
+#include <map>
+#include <optional>
 #include <queue>
 
 #include <unordered_map>
@@ -14,6 +16,12 @@ struct ChainResult {
 	Value value;
 	Inst* write = nullptr;
 };
+
+// The initial contents of a VGPR that only v_writelane writes (MarkUndefinedLaneSpills).
+bool IsUndefinedSpill(Value value) {
+	const auto* inst = value.Resolve().TryInstruction();
+	return inst != nullptr && inst->GetOpcode() == ValueOpcode::UndefU32;
+}
 
 ChainResult SearchChain(Value value, uint32_t lane, uint32_t wave_size) {
 	for (;;) {
@@ -37,11 +45,17 @@ bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size) {
 	std::queue<Value>         queue;
 	std::unordered_set<Inst*> visited;
 	queue.push(source);
+	bool written = false;
 
 	while (!queue.empty()) {
 		const auto chain = SearchChain(queue.front(), lane, wave_size);
 		queue.pop();
 		if (chain.write != nullptr) {
+			written = true;
+			continue;
+		}
+		if (IsUndefinedSpill(chain.value)) {
+			// A path on which the lane was never written reads an undefined value.
 			continue;
 		}
 		auto* inst = chain.value.TryInstruction();
@@ -55,7 +69,7 @@ bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size) {
 			queue.push(inst->Arg(index));
 		}
 	}
-	return true;
+	return written;
 }
 
 using PhiMap = std::unordered_map<Inst*, Inst*>;
@@ -64,6 +78,9 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 	const auto chain = SearchChain(source, lane, wave_size);
 	if (chain.write != nullptr) {
 		return chain.write->Arg(1);
+	}
+	if (IsUndefinedSpill(chain.value)) {
+		return chain.value;
 	}
 
 	auto* inst = chain.value.ResolveInstruction();
@@ -86,6 +103,8 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 	for (size_t index = 0; index < inst->NumArgs(); index++) {
 		arguments.push_back(GetRealValue(phi_map, inst->Arg(index), lane, wave_size));
 	}
+	// An undefined argument stays undefined: the written value of the other paths need not be
+	// available on its edge. The Phi then names the spilled value wherever it was written.
 	const auto first = arguments.front().Resolve();
 	if (std::ranges::all_of(arguments,
 	                        [&](Value argument) { return argument.Resolve() == first; })) {
@@ -201,6 +220,50 @@ bool IsWaveReduction(ValueOpcode operation) {
 }
 
 } // namespace
+
+std::vector<Inst*> MarkUndefinedLaneSpills(Program& program) {
+	std::vector<Inst*> undefined;
+	if (program.blocks.empty() || !program.blocks.front()->ImmPredecessors().empty()) {
+		return undefined;
+	}
+	// Registers whose every write is a v_writelane of their own value: SGPR spills.
+	std::map<uint32_t, bool> lane_only;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::SetVectorRegister) {
+				continue;
+			}
+			const auto  reg   = inst.Arg(0).VectorRegister();
+			const auto* write = inst.Arg(1).Resolve().TryInstruction();
+			const auto* read  = write != nullptr && write->GetOpcode() == ValueOpcode::WriteLane
+			                        ? write->Arg(0).Resolve().TryInstruction()
+			                        : nullptr;
+			const bool lane_write = read != nullptr &&
+			                        read->GetOpcode() == ValueOpcode::GetVectorRegister &&
+			                        read->Arg(0).VectorRegister() == reg;
+			const auto [entry, inserted] = lane_only.try_emplace(static_cast<uint32_t>(reg), lane_write);
+			entry->second = entry->second && lane_write;
+		}
+	}
+	auto* entry_block = program.blocks.front();
+	const auto start  = entry_block->begin();
+	for (const auto& [reg, only_lanes]: lane_only) {
+		if (!only_lanes) {
+			continue;
+		}
+		auto& value = *entry_block->PrependNewInst(start, ValueOpcode::UndefU32);
+		entry_block->PrependNewInst(start, ValueOpcode::SetVectorRegister,
+		                            {Value(static_cast<VectorReg>(reg)), Value(&value)});
+		undefined.push_back(&value);
+	}
+	return undefined;
+}
+
+void ReleaseUndefinedLaneSpills(const std::vector<Inst*>& undefined) {
+	for (auto* value: undefined) {
+		value->ReplaceUsesWith(Value(0u));
+	}
+}
 
 ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	ReadLaneStats stats;

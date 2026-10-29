@@ -748,7 +748,17 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}
 	if (image.heap) {
-		const auto entry = EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
+		// The blocks a record-table root's records name hold slots of its list, whose slot count
+		// and address precede the mapping.
+		const auto entry = IsRecordTableSource(state, image.source)
+		    ? EmitImageHeapEntry(state,
+		                         Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                                EmitRecordTableIndex(state, key, ctx.Def(handle->Arg(1)),
+		                                                     image.indirect_mapping_offset,
+		                                                     image.indirect_search_iterations),
+		                                ConstantU32(state, 2u)),
+		                         image.indirect_mapping_offset - 3u)
+		    : EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
 		const auto kinds = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
 		// One kind leaves every slot word a bare element.
 		if (kinds == 1u) return emit(image.indirect_resources[1], entry);
@@ -762,8 +772,11 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		                              ConstantU32(state, IR::ImageHeapKindShift)),
 		                       kinds, result_type, EmitKind);
 	}
-	const auto selected = EmitIndirectResourceIndex(
-	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	const auto selected = IsRecordTableSource(state, image.source)
+	    ? EmitRecordTableIndex(state, key, ctx.Def(handle->Arg(1)), image.indirect_mapping_offset,
+	                           image.indirect_search_iterations)
+	    : EmitIndirectResourceIndex(state, key, image.indirect_mapping_offset,
+	                                image.indirect_search_iterations, 0u);
 	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
 		const auto& first = state.program.info.images[lhs];
 		const auto& second = state.program.info.images[rhs];
@@ -909,9 +922,13 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 				ctx.Fail(inst, "has invalid finite sampler key provenance");
 			auto selected = ctx.Def(handle->Arg(0));
 			if (samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler)
-				selected = EmitIndirectResourceIndex(state, selected,
-				    samplers[index].indirect_mapping_offset,
-				    samplers[index].indirect_search_iterations, 0u);
+				selected = IsRecordTableSource(state, samplers[index].source)
+				    ? EmitRecordTableIndex(state, selected, ctx.Def(handle->Arg(1)),
+				                           samplers[index].indirect_mapping_offset,
+				                           samplers[index].indirect_search_iterations)
+				    : EmitIndirectResourceIndex(state, selected,
+				          samplers[index].indirect_mapping_offset,
+				          samplers[index].indirect_search_iterations, 0u);
 			array_index = SamplerArrayIndex(state, selected, candidates);
 		}
 		sampler = {LoadSamplerDescriptor(state, index, array_index), array_index != 0u};

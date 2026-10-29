@@ -714,6 +714,15 @@ struct DescriptorSource {
 			uint32_t stride = 0;
 			uint32_t count = 1;
 			bool indexed = false; // Parent pointers use raw MUBUF record addressing.
+			// The parent pointer names a record that holds, at `offset`, the V# of a descriptor
+			// table chosen by the GPU: its descriptors are at element_offset + key *
+			// element_stride (element_stride 0: one descriptor). Keys are row << 16 | element.
+			bool     buffer         = false;
+			uint32_t element_stride = 0;
+			uint32_t element_offset = 0;
+			// The inlined call target whose code reads the descriptor: only the rows that name it
+			// hold records of its layout (0 when the read is outside inlined code).
+			uint64_t function       = 0;
 
 			bool operator==(const PointerTable& other) const = default;
 		};

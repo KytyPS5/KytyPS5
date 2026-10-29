@@ -311,6 +311,10 @@ struct ImageHeapTestAccess {
   static const auto &Element(const ImageHeap &heap, uint32_t entry) {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
+  static const std::vector<uint32_t> &ListSlots(const ImageHeap &heap, const void *owner,
+                                                uint32_t resource) {
+    return heap.m_lists.at({owner, resource}).slots;
+  }
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
     return Element(heap, entry).image;
   }
@@ -6755,6 +6759,130 @@ public:
               "an alias kept a heap image unused for 17 frames");
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Record-table candidates (ImageHeap::AcquireList): each root owns slots, a null slot, one per
+  // candidate and a trailing null slot; equal descriptors share an element, nulls select element
+  // 0, roots of one profile share elements and kinds, a root's previous list is released when it
+  // acquires a new one, and an unmapped texture leaves every list.
+  void CheckResidentImageHeapLists() {
+    constexpr const char *name = "ResidentImageHeapLists";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto descriptor = [](uint32_t texture) {
+      const uint64_t address = base + 0x10000u + texture * 0x1000u;
+      IR::DescriptorValue value{.dword_count = 8u};
+      value.dwords[0] = static_cast<uint32_t>(address >> 8u);
+      value.dwords[1] = static_cast<uint32_t>(address >> 40u) |
+                        (static_cast<uint32_t>(Format::k8_8_8_8UNorm) << 20u);
+      value.dwords[2] = 3u | (3u << 14u);
+      value.dwords[3] = DstSel(4, 5, 6, 7) |
+                        (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return value;
+    };
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+      const auto draw = [&] {
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+      };
+
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      const int owner = 0;
+      const std::vector values{descriptor(0), descriptor(0), IR::DescriptorValue{.dword_count = 8u},
+                               descriptor(1)};
+      IR::ImageHeapView first{};
+      Require(name, "first list",
+              heap.AcquireList({&owner, 0u, &sampled, values}, first) && first.slots != 0u &&
+                  first.slot_count == 5u && first.kinds.size() == 1u,
+              "the list did not get a null slot, a slot per candidate and a trailing null slot");
+      const auto slots = [&](uint32_t resource) {
+        return ImageHeapTestAccess::ListSlots(heap, &owner, resource);
+      };
+      const auto a = slots(0u)[1];
+      const auto b = slots(0u)[4];
+      Require(name, "first list slots",
+              slots(0u).size() == 6u && slots(0u)[0] == 0u && a != 0u && slots(0u)[2] == a &&
+                  slots(0u)[3] == 0u && b != 0u && b != a && slots(0u)[5] == 0u &&
+                  ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "equal candidates did not share an element, or a null got one");
+      IR::ImageHeapView shared{};
+      Require(name, "second root",
+              heap.AcquireList({&owner, 1u, &sampled, std::span(values).first(1u)}, shared) &&
+                  shared.slots != first.slots && slots(1u).size() == 3u && slots(1u)[1] == a &&
+                  ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "a second root of the same profile did not share the element");
+      draw();
+      Require(name, "resolved",
+              ImageHeapTestAccess::ImageOf(heap, a) && ImageHeapTestAccess::ImageOf(heap, b),
+              "list elements were not resolved by the draw");
+      IR::ImageHeapView again{};
+      Require(name, "replaced list",
+              heap.AcquireList({&owner, 0u, &sampled, std::span(values).last(1u)}, again) &&
+                  again.slots == first.slots && again.slot_count == 2u && slots(0u).size() == 3u &&
+                  slots(0u)[1] == b && ImageHeapTestAccess::Element(heap, a).refs == 1u &&
+                  ImageHeapTestAccess::Element(heap, b).refs == 1u,
+              "acquiring a new list did not release the previous references");
+      draw();
+      // An element whose image is unmapped leaves every list that selects it.
+      context.UnmapMemory(base + 0x11000u, 0x1000u);
+      heap.BeginDraw();
+      Require(name, "buried list element",
+              slots(0u)[1] == 0u && ImageHeapTestAccess::Element(heap, b).refs == 0u &&
+                  slots(1u)[1] == a,
+              "an unmapped texture stayed in a list");
+      draw();
       device.destroyPipelineLayout(layout, nullptr);
       device.destroyDescriptorSetLayout(empty, nullptr);
     }
@@ -58795,6 +58923,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckResidentImageHeapLists();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -58989,6 +59118,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckResidentImageHeapLists();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

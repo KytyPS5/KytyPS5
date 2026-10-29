@@ -642,6 +642,9 @@ public:
 			} else if (plan.handle->NumArgs() == 4u) {
 				plan.handle->SetArg(0, key);
 				for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
+				// Record tables carry the element next to the record's key.
+				if (const auto& pointer = m_sources[plan.source].indirect_descriptor->pointer_table;
+				    pointer && pointer->buffer) plan.handle->SetArg(1, plan.roots[4]);
 			} else {
 				if (plan.reads[0] == nullptr) plan.handle->SetArg(0, key);
 				for (uint32_t dword = 0; dword < 4u; dword++) {
@@ -733,7 +736,11 @@ private:
 		std::abort();
 	}
 
-	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
+	// follow_copies: a reaching S_MOV_B32/S_MOV_B64 from another SGPR continues the search at
+	// its source register (inlined calls pass their arguments in copies), and a V_READLANE_B32 of
+	// a spilled lane at the SGPR the V_WRITELANE_B32 of that lane stored.
+	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc,
+	                             bool follow_copies = false) const {
 		value = value.Resolve();
 		const auto* phi = value.TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
@@ -824,6 +831,16 @@ private:
 				--write;
 				if (write->pc < block.start_pc) break;
 				if (RegIndex(write->reg) != reg) continue;
+				if (const auto copied = follow_copies ? CopiedRegister(write->pc, reg) : std::nullopt) {
+					const auto source = NativeDescriptorSource(value, copied->first, copied->second, true);
+					if (source == value.Resolve() || source.IsEmpty() ||
+					    (!selected.IsEmpty() && !EquivalentValue(m_program, selected, source)))
+						return value;
+					selected    = source;
+					selected_pc = write->pc;
+					found       = true;
+					break;
+				}
 				if (!select(write->pc)) return value;
 				found = true;
 				break;
@@ -927,7 +944,7 @@ private:
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
 			const auto value = base_reg != UINT32_MAX
-			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc, true) : handle.Arg(i);
 			descriptor.dwords[i] = LowerDescriptorValue(value);
 		}
 		if (sample_adjust) {
@@ -940,6 +957,123 @@ private:
 			descriptor.dwords[3] = Value(0u);
 		}
 		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
+	}
+
+	// The native instructions whose write of a scalar operand (an SGPR or VCC_LO/VCC_HI) reaches
+	// use_pc; empty when the entry value reaches it on some path.
+	std::vector<const Decoder::Instruction*> ReachingNativeWrites(const Decoder::Operand& operand,
+	                                                              uint32_t use_pc) const {
+		const auto writes = [&](const Decoder::Instruction& inst) {
+			for (const auto* dst: {&inst.dst, &inst.dst2}) {
+				if (dst->kind != operand.kind) continue;
+				if (operand.kind != Decoder::OperandKind::Sgpr) return true;
+				const auto width = inst.family == Decoder::Family::SMEM ? std::max(inst.data_dwords, 1u) : 2u;
+				if (operand.reg >= dst->reg && operand.reg < dst->reg + width) return true;
+			}
+			return false;
+		};
+		std::vector<const Decoder::Instruction*> found;
+		const auto use = std::ranges::find_if(m_native_cfg.blocks, [&](const auto& block) {
+			return block.start_pc <= use_pc && use_pc < block.end_pc;
+		});
+		if (use == m_native_cfg.blocks.end()) return {};
+		struct Position { uint32_t block; uint32_t before; };
+		std::vector<Position> positions {{use->id, use_pc}};
+		std::vector<bool> reached(m_native_cfg.blocks.size());
+		while (!positions.empty()) {
+			const auto position = positions.back();
+			positions.pop_back();
+			const auto& block = m_native_cfg.blocks[position.block];
+			if (position.before == block.end_pc) {
+				if (reached[block.id]) continue;
+				reached[block.id] = true;
+			}
+			auto inst = std::ranges::lower_bound(m_decoded.instructions, position.before, {},
+			                                     &Decoder::Instruction::pc);
+			bool written = false;
+			while (inst != m_decoded.instructions.begin()) {
+				--inst;
+				if (inst->pc < block.start_pc) break;
+				if (!writes(*inst)) continue;
+				if (std::ranges::find(found, &*inst) == found.end()) found.push_back(&*inst);
+				written = true;
+				break;
+			}
+			if (written) continue;
+			if (block.id == m_native_cfg.entry_block) return {};
+			for (const auto pred: block.predecessors)
+				positions.push_back({pred, m_native_cfg.blocks[pred].end_pc});
+		}
+		return found;
+	}
+
+	// The SGPR whose value the write of reg at pc copies, and where it holds it: an
+	// S_MOV_B32/S_MOV_B64 from another SGPR, or a V_READLANE_B32 of a lane that one
+	// V_WRITELANE_B32 of a constant lane stored on every path to it.
+	std::optional<std::pair<uint32_t, uint32_t>> CopiedRegister(uint32_t pc, uint32_t reg) const {
+		const auto native = std::ranges::lower_bound(m_decoded.instructions, pc, {},
+		                                            &Decoder::Instruction::pc);
+		if (native == m_decoded.instructions.end() || native->pc != pc ||
+		    native->dst.kind != Decoder::OperandKind::Sgpr || reg < native->dst.reg) return {};
+		const auto lane = reg - native->dst.reg;
+		if (native->src0.kind == Decoder::OperandKind::Sgpr &&
+		    ((native->opcode == Decoder::Opcode::S_MOV_B32 && lane == 0u) ||
+		     (native->opcode == Decoder::Opcode::S_MOV_B64 && lane < 2u))) {
+			const auto source = native->src0.reg + lane;
+			if (source != reg) return std::pair {source, pc};
+			return {};
+		}
+		const auto constant = [](const Decoder::Operand& operand) {
+			return operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
+			       operand.kind == Decoder::OperandKind::LiteralConstant;
+		};
+		if (native->opcode != Decoder::Opcode::V_READLANE_B32 || lane != 0u ||
+		    native->src0.kind != Decoder::OperandKind::Vgpr || !constant(native->src1)) return {};
+		const auto vgpr      = native->src0.reg;
+		const auto read_lane = native->src1.value % m_program.wave_size;
+		// The V_WRITELANE_B32 of that lane that reaches the read on every path.
+		const Decoder::Instruction* spill = nullptr;
+		const auto use = std::ranges::find_if(m_native_cfg.blocks, [&](const auto& block) {
+			return block.start_pc <= pc && pc < block.end_pc;
+		});
+		if (use == m_native_cfg.blocks.end()) return {};
+		struct Position { uint32_t block; uint32_t before; };
+		std::vector<Position> positions {{use->id, pc}};
+		std::vector<bool> reached(m_native_cfg.blocks.size());
+		while (!positions.empty()) {
+			const auto position = positions.back();
+			positions.pop_back();
+			const auto& block = m_native_cfg.blocks[position.block];
+			if (position.before == block.end_pc) {
+				if (reached[block.id]) continue;
+				reached[block.id] = true;
+			}
+			auto inst = std::ranges::lower_bound(m_decoded.instructions, position.before, {},
+			                                     &Decoder::Instruction::pc);
+			bool written = false;
+			while (inst != m_decoded.instructions.begin()) {
+				--inst;
+				if (inst->pc < block.start_pc) break;
+				// Writes of unknown width count as two registers.
+				const auto width = inst->opcode == Decoder::Opcode::V_WRITELANE_B32
+				                       ? 1u : std::max(inst->data_dwords, 2u);
+				if (inst->dst.kind != Decoder::OperandKind::Vgpr || inst->dst.reg > vgpr ||
+				    vgpr >= inst->dst.reg + width) continue;
+				if (inst->opcode != Decoder::Opcode::V_WRITELANE_B32 || inst->dst.reg != vgpr ||
+				    !constant(inst->src1) || inst->src0.kind != Decoder::OperandKind::Sgpr) return {};
+				if (inst->src1.value % m_program.wave_size != read_lane) continue; // Another lane.
+				if (spill != nullptr && spill != &*inst) return {};
+				spill   = &*inst;
+				written = true;
+				break;
+			}
+			if (written) continue;
+			if (block.id == m_native_cfg.entry_block) return {};
+			for (const auto pred: block.predecessors)
+				positions.push_back({pred, m_native_cfg.blocks[pred].end_pc});
+		}
+		if (spill == nullptr) return {};
+		return std::pair {spill->src0.reg, spill->pc};
 	}
 
 	uint32_t ScalarReadBase(const Inst& read) const {
@@ -3393,6 +3527,277 @@ private:
 		return UINT32_MAX;
 	}
 
+	// A T# or S# read from a descriptor table whose V# a record holds, the record being the one
+	// a key selects from a pointer table: table V# -> pointer row -> record V# -> descriptor.
+	// Marvel's Wolverine's ray-tracing compute 0xe6d76d24f59f8015 reads the textures of a hit
+	// group this way: the call table row of the hit gives its record, the record the V# of its
+	// T# table, and the material key the T# in that table. Its calls are inlined, so the
+	// registers of every callee meet in Phis: the native reaching definitions name the reads
+	// each step uses, and the key follows the same Phis (UINT32_MAX, which maps nothing, on
+	// the edges of the other callees).
+	bool TryMakeRecordTableDescriptor(Inst& handle, const DescriptorSource& descriptor,
+	                                  IndirectDescriptorPlan& plan) {
+		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
+		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
+		    handle.NumArgs() != (sampler ? 4u : 8u)) return false;
+		// The descriptor: reads of one table V# at element_offset + key * element_stride. The
+		// offset register may itself meet in Phis: its key then follows them.
+		std::array<Inst*, 8> element_reads {};
+		for (uint32_t dword = 0; dword < plan.read_dwords; ++dword) {
+			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
+			uint32_t index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(index, *read) ||
+			    (dword != 0u &&
+			     (!EquivalentValue(m_program, read->Arg(0), element_reads[0]->Arg(0)) ||
+			      !EquivalentValue(m_program, read->Arg(1), element_reads[0]->Arg(1)) ||
+			      memory->offset != m_program.memory_info[element_reads[0]->Flags<MemoryFlags>().index].offset +
+			                            dword * 4u))) return false;
+			element_reads[dword] = read;
+		}
+		const uint32_t element_immediate =
+		    m_program.memory_info[element_reads[0]->Flags<MemoryFlags>().index].offset;
+		Value element_key;
+		uint32_t element_offset = 0, element_stride = 0;
+		const auto offset_value = element_reads[0]->Arg(1).Resolve();
+		if (!ImmediateU32(offset_value, element_offset) &&
+		    !MatchTableOffset(offset_value, element_key, element_offset, element_stride)) {
+			// A Phi of key * stride + offset terms: the shifts that write the offset register and
+			// reach the read give the stride, so terms of other callees' paths do not count.
+			uint32_t native_stride = 0;
+			{
+				const auto element_pc = element_reads[0]->Flags<MemoryFlags>().pc;
+				const auto native = std::ranges::lower_bound(m_decoded.instructions, element_pc, {},
+				                                            &Decoder::Instruction::pc);
+				if (native == m_decoded.instructions.end() || native->pc != element_pc) return false;
+				for (const auto* write: ReachingNativeWrites(native->src1, element_pc)) {
+					if (write->opcode != Decoder::Opcode::S_LSHL_B32 ||
+					    (write->src1.kind != Decoder::OperandKind::IntegerInlineConstant &&
+					     write->src1.kind != Decoder::OperandKind::LiteralConstant) ||
+					    write->src1.value >= 32u ||
+					    (native_stride != 0u && native_stride != (1u << write->src1.value))) return false;
+					native_stride = 1u << write->src1.value;
+				}
+				if (native_stride == 0u) return false;
+			}
+			std::vector<const Inst*> pending {offset_value.TryInstruction()};
+			std::unordered_set<const Inst*> seen;
+			bool found = false;
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				if (inst == nullptr || !seen.insert(inst).second) continue;
+				if (inst->GetOpcode() == ValueOpcode::Phi) {
+					for (size_t arm = 0; arm < inst->NumArgs(); ++arm)
+						pending.push_back(inst->Arg(arm).Resolve().TryInstruction());
+					continue;
+				}
+				Value key;
+				uint32_t offset = 0, stride = 0;
+				// Terms of a descriptor-sized stride name the table layout; any other offset gets
+				// its key computed (see the projection below).
+				// A shift has no offset of its own.
+				if (!MatchTableOffset(Value(const_cast<Inst*>(inst)), key, offset, stride) || key.IsEmpty() ||
+				    stride != native_stride || offset != 0u)
+					continue;
+				if (found && (offset != element_offset || stride != element_stride)) return false;
+				element_offset = offset;
+				element_stride = stride;
+				found = true;
+			}
+			if (!found || !std::has_single_bit(element_stride)) return false;
+			element_key = offset_value; // Projected below, once the projection helper exists.
+		}
+		if (element_key.IsEmpty() ? element_stride != 0u
+		                          : element_stride < plan.read_dwords * 4u || (element_stride & 3u) != 0u)
+			return false;
+		const bool element_phi = !element_key.IsEmpty() && element_key == offset_value;
+		auto* element_read = element_reads[0];
+		const auto* table = element_read->Arg(0).Resolve().TryInstruction();
+		const auto table_reg = ScalarReadBase(*element_read);
+		if (table == nullptr || table->GetOpcode() != ValueOpcode::GetBufferResource ||
+		    table->NumArgs() != 4u || table_reg == UINT32_MAX) return false;
+		// The table V#: four scalar-address reads of one record at a fixed offset.
+		const auto element_pc = element_read->Flags<MemoryFlags>().pc;
+		std::array<const Inst*, 4> record_reads {};
+		const Inst* pointer = nullptr;
+		uint32_t record_offset = 0;
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			const auto* read =
+			    NativeDescriptorSource(table->Arg(dword), table_reg + dword, element_pc, true).TryInstruction();
+			uint32_t index = 0, immediate = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
+			    !ImmediateU32(read->Arg(1), immediate) || memory->offset > INT32_MAX) return false;
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			const auto offset = immediate + memory->offset;
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    current->NumArgs() < 2u ||
+			    (dword == 0u ? (offset & 3u) != 0u
+			                 : !EquivalentValue(m_program, Value(const_cast<Inst*>(pointer)),
+			                                    Value(const_cast<Inst*>(current))) ||
+			                       offset != record_offset + dword * 4u)) return false;
+			if (dword == 0u) {
+				pointer = current;
+				record_offset = offset;
+			}
+			record_reads[dword] = read;
+		}
+		// The record pointer: two scalar-buffer reads of one pointer table row.
+		const auto pointer_reg = ScalarReadBase(*record_reads[0]);
+		const auto record_pc   = record_reads[0]->Flags<MemoryFlags>().pc;
+		if (pointer_reg == UINT32_MAX) return false;
+		const auto* low =
+		    NativeDescriptorSource(pointer->Arg(0), pointer_reg, record_pc, true).TryInstruction();
+		const auto* high =
+		    NativeDescriptorSource(pointer->Arg(1), pointer_reg + 1u, record_pc, true).TryInstruction();
+		uint32_t low_index, high_index;
+		const auto* low_memory = low != nullptr ? ScalarReadMemory(*low, low_index) : nullptr;
+		const auto* high_memory = high != nullptr ? ScalarReadMemory(*high, high_index) : nullptr;
+		DescriptorSource::IndirectDescriptor indirect;
+		DescriptorSource table_source;
+		Value row_key;
+		if (low_memory == nullptr || high_memory == nullptr ||
+		    low_memory->kind != ResourceKind::ScalarBuffer ||
+		    high_memory->kind != ResourceKind::ScalarBuffer ||
+		    low_memory->offset > INT32_MAX || high_memory->offset > INT32_MAX ||
+		    (low_memory->offset & ~3u) + 4u != (high_memory->offset & ~3u) ||
+		    !EquivalentValue(m_program, low->Arg(0), high->Arg(0)) ||
+		    !EquivalentValue(m_program, low->Arg(1), high->Arg(1)) ||
+		    !MatchTableOffset(low->Arg(1), row_key, indirect.table_offset, indirect.table_stride) ||
+		    row_key.IsEmpty() || indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
+		    !MakeRuntimeTableSource(*low, table_source) || table_source.dword_count != 4u) return false;
+		indirect.table_immediate = low_memory->offset & ~3u;
+		indirect.table_source = InternSource(table_source);
+		indirect.table_scalar = true;
+		uint64_t function = 0;
+		for (const auto& body: m_decoded.call_bodies) {
+			if (body.begin <= element_pc && element_pc < body.end) function = body.address;
+		}
+		indirect.pointer_table = DescriptorSource::IndirectDescriptor::PointerTable {
+		    .offset = record_offset,
+		    .buffer = true,
+		    .element_stride = element_stride,
+		    .element_offset = (element_offset & ~3u) + (element_immediate & ~3u),
+		    .function = function};
+		DescriptorSource source;
+		source.dword_count = handle.NumArgs();
+		source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), 4u, source.dwords.begin());
+		source.indirect_descriptor = indirect;
+		// Mirrors a register's Phi web: leaf(inst) where it names a value, UINT32_MAX elsewhere.
+		// Only the Phis that some named value reaches are mirrored; the webs of inlined calls
+		// span the whole program.
+		const auto project = [&](Value root, auto&& leaf) -> Value {
+			std::unordered_map<const Inst*, Value> leaves;
+			const auto leaf_value = [&](const Inst* inst) -> Value {
+				const auto [found, inserted] = leaves.try_emplace(inst);
+				if (inserted) found->second = leaf(inst);
+				return found->second;
+			};
+			root = root.Resolve();
+			const auto* top = root.TryInstruction();
+			if (const auto named = leaf_value(top); !named.IsEmpty()) return named;
+			if (top == nullptr || top->GetOpcode() != ValueOpcode::Phi) return Value(UINT32_MAX);
+			// The web, and for each Phi the Phis it is an operand of.
+			std::vector<const Inst*> web {top};
+			std::unordered_map<const Inst*, std::vector<const Inst*>> users {{top, {}}};
+			std::vector<const Inst*> reaching;
+			for (size_t next = 0; next < web.size(); ++next) {
+				const auto* phi = web[next];
+				bool direct = false;
+				for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
+					const auto* arg = phi->Arg(arm).Resolve().TryInstruction();
+					if (arg != nullptr && arg->GetOpcode() == ValueOpcode::Phi) {
+						const auto [found, inserted] = users.try_emplace(arg);
+						found->second.push_back(phi);
+						if (inserted) web.push_back(arg);
+					} else if (!leaf_value(arg).IsEmpty()) {
+						direct = true;
+					}
+				}
+				if (direct) reaching.push_back(phi);
+			}
+			std::unordered_set<const Inst*> relevant(reaching.begin(), reaching.end());
+			for (size_t next = 0; next < reaching.size(); ++next) {
+				for (const auto* user: users[reaching[next]]) {
+					if (relevant.insert(user).second) reaching.push_back(user);
+				}
+			}
+			if (!relevant.contains(top)) return Value(UINT32_MAX);
+			std::unordered_map<const Inst*, Inst*> mirror;
+			for (const auto* phi: reaching) {
+				auto* parent = phi->Parent();
+				const auto position = std::ranges::find_if(parent->Instructions(),
+				    [&](const Inst& candidate) { return &candidate == phi; });
+				auto& selected = *parent->PrependNewInst(position, ValueOpcode::Phi);
+				selected.SetFlags(Type::U32);
+				mirror.emplace(phi, &selected);
+			}
+			for (const auto& [phi, selected]: mirror) {
+				for (uint32_t arm = 0; arm < phi->NumArgs(); ++arm) {
+					const auto* arg = phi->Arg(arm).Resolve().TryInstruction();
+					Value operand(UINT32_MAX);
+					if (const auto found = mirror.find(arg); found != mirror.end()) {
+						operand = Value(found->second);
+					} else if (arg == nullptr || arg->GetOpcode() != ValueOpcode::Phi) {
+						if (const auto named = leaf_value(arg); !named.IsEmpty()) operand = named;
+					}
+					selected->AddPhiOperand(phi->PhiBlock(arm), operand);
+				}
+			}
+			return Value(mirror.at(top));
+		};
+		if (element_phi) {
+			element_key = project(offset_value, [&](const Inst* inst) -> Value {
+				if (inst == nullptr || inst->GetOpcode() == ValueOpcode::Phi) return {};
+				Value key;
+				uint32_t offset = 0, stride = 0;
+				if (MatchTableOffset(Value(const_cast<Inst*>(inst)), key, offset, stride) && !key.IsEmpty() &&
+				    offset == element_offset && stride == element_stride)
+					return key;
+				// Any other offset selects the element it is aligned to, and none if it is not.
+				auto* parent = const_cast<Inst*>(inst)->Parent();
+				auto next = std::ranges::find_if(parent->Instructions(),
+				    [&](const Inst& candidate) { return &candidate == inst; });
+				++next;
+				const Value value(const_cast<Inst*>(inst));
+				const auto relative = Value(&*parent->PrependNewInst(next, ValueOpcode::ISub32,
+				                                                      {value, Value(element_offset)}));
+				const auto index = Value(&*parent->PrependNewInst(next, ValueOpcode::ShiftRightLogical32,
+				    {relative, Value(static_cast<uint32_t>(std::countr_zero(element_stride)))}));
+				const auto rest = Value(&*parent->PrependNewInst(next, ValueOpcode::BitwiseAnd32,
+				                                                  {relative, Value(element_stride - 1u)}));
+				const auto aligned = Value(&*parent->PrependNewInst(next, ValueOpcode::IEqual32, {rest, Value(0u)}));
+				return Value(&*parent->PrependNewInst(next, ValueOpcode::SelectU32,
+				                                      {aligned, index, Value(UINT32_MAX)}));
+			});
+		}
+		// The key is the first word of the table V# the descriptor is read through, the word the
+		// GPU itself uses: its value where the record is read when that read reaches the
+		// descriptor read on every structured path, else the table V# word at the descriptor
+		// read. Mirroring the record's address through the Phis instead gave every descriptor
+		// read its own copy of the register's Phi web across the inlined callees (699 K Phis
+		// for 0xe6d76d24f59f8015); the element travels in the handle's second word.
+		const auto record_at_table = AvailableBefore(*record_reads[0], *element_read)
+		                                 ? Value(const_cast<Inst*>(record_reads[0]))
+		                                 : table->Arg(0).Resolve();
+		const auto element_value = element_key.IsEmpty() ? Value(0u) : element_key;
+		const auto key = project(handle.Arg(0), [&](const Inst* inst) -> Value {
+			return inst == element_read ? record_at_table : Value {};
+		});
+		const auto element_at_handle = project(handle.Arg(0), [&](const Inst* inst) -> Value {
+			return inst == element_read ? element_value : Value {};
+		});
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		plan.key = key;
+		plan.roots = source.dwords;
+		plan.roots[4] = element_at_handle;
+		return true;
+	}
+
 	bool TryMakeTableDescriptor(Inst& handle, const DescriptorSource& descriptor,
 	                            IndirectDescriptorPlan& plan) {
 		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
@@ -4216,6 +4621,7 @@ private:
 						plan.read_dwords = 4u;
 					}
 					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
+					    TryMakeRecordTableDescriptor(*handle, descriptor, plan) ||
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
 					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
 					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||

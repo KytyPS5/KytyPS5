@@ -2227,6 +2227,43 @@ void TestCallTableExpansionLongBranches() {
     Check(returns == expander.Bodies().size(), "a body does not return to the caller");
   }
 }
+void TestReadLaneOfSkippedLaneSpill() {
+  // v1 only holds a spilled SGPR. On the path that skips the spill its lane 3 is undefined, so
+  // the lane read after the join is the spilled s2 (Wolverine's CS 0xe6d76d24f59f8015 reads a V#
+  // spilled this way past a structured early exit).
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),                 // s_cmp_eq_u32 s0, 0
+      EncodeSopp(0x05, 2),                      // s_cbranch_scc1 past the spill
+      EncodeVop3Word0(0x361, 1),
+      EncodeVop3Word1(2, 131, 0),               // v_writelane_b32 v1, s2, 3
+      EncodeVop3Word0(0x360, 4),
+      EncodeVop3Word1(1 + 256, 131, 0),         // v_readlane_b32 s4, v1, 3
+      EncodeSopp(0x01, 0),                      // s_endpgm
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto cfg = ShaderRecompiler::CFG::BuildGraph(decoded);
+  ShaderComputeInputInfo compute;
+  ShaderRecompiler::Frontend::TranslateOptions options{};
+  options.stage = ShaderType::Compute;
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  for (const bool mark : {false, true}) {
+    auto ir = ShaderRecompiler::Frontend::TranslateProgram(decoded, cfg, options);
+    std::vector<ShaderRecompiler::IR::Inst *> undefined;
+    if (mark) undefined = ShaderRecompiler::IR::MarkUndefinedLaneSpills(ir);
+    ShaderRecompiler::IR::RewriteToSsa(ir.blocks);
+    ShaderRecompiler::IR::ConstantPropagationPass(ir.blocks);
+    ShaderRecompiler::IR::RemoveIdentities(ir);
+    const auto stats = ShaderRecompiler::IR::EliminateReadLane(ir, ir.wave_size);
+    ShaderRecompiler::IR::ReleaseUndefinedLaneSpills(undefined);
+    Check(undefined.size() == (mark ? 1u : 0u), "the lane spill register was not found");
+    Check(stats.rewritten_reads == (mark ? 1u : 0u),
+          mark ? "a lane read past a skipped spill was not resolved"
+               : "a lane read with an initial zero on one path was resolved");
+  }
+}
+
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   // Lane-read instructions have scalar results, but their VOP3A destination is
   // encoded in VDST [7:0], not the VOP3B SDST field [14:8].
@@ -11243,12 +11280,14 @@ void BuildTypedPlan(const uint32_t *code, uint32_t words,
   options.wave_size = 64u;
   options.input_info.compute = &compute;
   ir = ShaderRecompiler::Frontend::TranslateProgram(decoded, cfg, options);
+  const auto undefined_spills = ShaderRecompiler::IR::MarkUndefinedLaneSpills(ir);
   ShaderRecompiler::IR::RewriteToSsa(ir.blocks);
   ShaderRecompiler::IR::ConstantPropagationPass(ir.blocks);
   ShaderRecompiler::IR::RemoveIdentities(ir);
   ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   const auto read_lane =
       ShaderRecompiler::IR::EliminateReadLane(ir, ir.wave_size);
+  ShaderRecompiler::IR::ReleaseUndefinedLaneSpills(undefined_spills);
   if (read_lane.rewritten_reads != 0) {
     ShaderRecompiler::IR::ConstantPropagationPass(ir.blocks);
     ShaderRecompiler::IR::RemoveIdentities(ir);
@@ -13916,6 +13955,7 @@ int main() {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+  TestReadLaneOfSkippedLaneSpill();
   TestCallTableExpansionLongBranches();
 
   return 0;

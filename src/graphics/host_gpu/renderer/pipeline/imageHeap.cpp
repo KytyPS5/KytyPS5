@@ -210,6 +210,58 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	return true;
 }
 
+bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
+	KYTY_PROFILER_FUNCTION();
+	if (list.root == nullptr) {
+		return false;
+	}
+	const auto root    = IR::ImageHeapResource(*list.root, 0u);
+	const auto profile = static_cast<uint32_t>(std::ranges::find(m_profiles, root) -
+	                                           m_profiles.begin());
+	if (profile == m_profiles.size()) m_profiles.push_back(root);
+	auto memory = std::ranges::find_if(m_list_memories, [&](const auto& candidate) {
+		return candidate->views.front()->profile == profile;
+	});
+	if (memory == m_list_memories.end()) {
+		auto created = std::make_unique<Memory>();
+		created->views.push_back(
+		    std::make_unique<View>(View {.memory = *created, .profile = profile}));
+		memory = m_list_memories.insert(m_list_memories.end(), std::move(created));
+	}
+	auto& view = *(*memory)->views.front();
+	auto& held = m_lists[{list.owner, list.resource}];
+	held.view  = &view;
+	// The new references come first, so elements both lists select stay alive.
+	m_scratch.clear();
+	m_scratch.reserve(list.values.size());
+	for (auto value: list.values) {
+		const auto kind = IR::ImageHeapKind(m_profiles[profile], value);
+		m_scratch.push_back(kind == 0u ? 0u : Intern(view, kind, {.value = value, .profile = profile}));
+	}
+	const auto slots = list.values.size() + 2u;
+	for (auto slot = slots - 1u; slot < held.slots.size(); ++slot) Assign(held, slot, 0u);
+	const auto previous = held.slots.size();
+	held.slots.resize(slots, 0u);
+	if (previous < slots) Widen(held.dirty_begin, held.dirty_end, previous, slots);
+	held.dirty_end   = std::min(held.dirty_end, slots);
+	held.dirty_begin = std::min(held.dirty_begin, held.dirty_end);
+	for (size_t value = 0; value < m_scratch.size(); ++value) Assign(held, value + 1u, m_scratch[value]);
+	if (held.buffer == nullptr || slots * sizeof(uint32_t) > held.buffer->Size()) {
+		if (held.buffer != nullptr && m_context.GetCommandScheduler().Active()) {
+			m_context.GetCommandScheduler().DeferOperation([buffer = std::move(held.buffer)] {});
+		}
+		held.buffer = SlotBuffer(m_context, (slots - 1u) * sizeof(uint32_t));
+		Widen(held.dirty_begin, held.dirty_end, 0u, slots);
+	}
+	if (std::ranges::find(m_active_lists, &held) == m_active_lists.end()) {
+		m_active_lists.push_back(&held);
+	}
+	result = {.slots      = held.buffer->BufferDeviceAddress(),
+	          .slot_count = static_cast<uint32_t>(slots - 1u),
+	          .kinds      = view.kinds};
+	return true;
+}
+
 bool ImageHeap::Refresh(Memory& memory) {
 	// GPU writes leave no fault; reading the table downloads them.
 	const bool gpu_dirty = m_context.GetBufferCache().HasGpuDirtyBytes(memory.base, memory.size);
@@ -327,6 +379,22 @@ void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 	if (previous != entry) Widen(view.dirty_begin, view.dirty_end, slot, slot + 1u);
 }
 
+void ImageHeap::Assign(List& list, size_t slot, uint32_t entry) {
+	const auto previous = std::exchange(list.slots[slot], entry);
+	Release(previous);
+	if (previous != entry) Widen(list.dirty_begin, list.dirty_end, slot, slot + 1u);
+}
+
+void ImageHeap::Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
+                       size_t& dirty_begin, size_t& dirty_end) {
+	if (dirty_begin == dirty_end) return;
+	const auto words  = std::span(slots).subspan(dirty_begin, dirty_end - dirty_begin);
+	auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	const auto offset = stream.Copy(words.data(), words.size_bytes(), sizeof(uint32_t));
+	device.CopyFrom(buffer, stream, offset, dirty_begin * sizeof(uint32_t), words.size_bytes());
+	dirty_begin = dirty_end = 0;
+}
+
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
 	const auto arm = static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) -
 	                                       view.kind_keys.begin());
@@ -411,6 +479,20 @@ void ImageHeap::Repoint() {
 					const auto key = element.key; // Intern may grow m_elements.
 					Assign(*view, slot, Intern(*view, element.kind, key));
 				}
+			}
+		}
+	}
+	// Record-table candidates of freed images read null until a later list resolves them again;
+	// changed ones take new elements, as table slots do.
+	for (auto& [owner, list]: m_lists) {
+		for (size_t slot = 1; slot + 1u < list.slots.size(); ++slot) {
+			const auto& element = m_elements[list.slots[slot] & ElementMask];
+			if (element.state == State::Buried) {
+				Assign(list, slot, 0u);
+			} else if (element.state == State::Stale) {
+				const auto key  = element.key; // Intern may grow m_elements.
+				const auto kind = element.kind;
+				Assign(list, slot, Intern(*list.view, kind, key));
 			}
 		}
 	}
@@ -581,6 +663,10 @@ void ImageHeap::WriteDescriptors() {
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();
+	for (auto* list: m_active_lists) {
+		Upload(buffer, list->slots, *list->buffer, list->dirty_begin, list->dirty_end);
+	}
+	m_active_lists.clear();
 	for (auto* view: m_active) {
 		if (view->dirty_begin == view->dirty_end) continue;
 		const auto slots  = std::span(view->slots).subspan(view->dirty_begin,

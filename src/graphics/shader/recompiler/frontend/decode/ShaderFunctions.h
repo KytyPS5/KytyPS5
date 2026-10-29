@@ -1,6 +1,8 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERFUNCTIONS_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERFUNCTIONS_H_
 
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -45,6 +47,8 @@ public:
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size, uint64_t code_hash = 0);
+	// Where the last successful Expand() placed each call target's code.
+	[[nodiscard]] const std::vector<InlinedCallBody>& Bodies() const;
 	// The long branches of the last successful Expand(): its code decodes correctly only with them.
 	[[nodiscard]] const std::vector<LongBranch>& LongBranches() const;
 	// Whether the code Expand last analyzed at this address contains calls (true when unknown).

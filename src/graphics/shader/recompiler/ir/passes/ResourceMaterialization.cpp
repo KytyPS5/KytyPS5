@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -8,6 +9,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <atomic>
 #include <utility>
@@ -24,8 +26,47 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+
+struct DescriptorValueHash {
+	size_t operator()(const DescriptorValue& value) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull ^ value.dword_count;
+		for (const auto dword: value.dwords) {
+			hash = (hash ^ dword) * 0x100000001b3ull;
+			hash ^= hash >> 29u;
+		}
+		return static_cast<size_t>(hash);
+	}
+};
+
+// With stable layouts, image table mappings round up to this many words, so the offsets after
+// them, which shaders take as constants, stay the same when the game resizes a table a little.
+constexpr size_t StableSrtWords = 4096u;
+// Record-table blocks of the current materialization (see MaterializeIndirectDescriptor()): mapping
+// words name them by their offset within the root's blocks until FlushRecordBlocks() appends them.
+struct RecordBlocks {
+	size_t                mapping_offset = 0;
+	size_t                entries        = 0;
+	std::vector<uint32_t> blocks;
+};
+thread_local std::vector<RecordBlocks> t_record_blocks;
+
+void FlushRecordBlocks(std::vector<uint32_t>& flattened_srt) {
+	for (auto& record: t_record_blocks) {
+		// A block's flattened SRT word; 0 (no block) never names one.
+		const auto base = static_cast<uint32_t>(flattened_srt.size());
+		for (size_t entry = 0; entry < record.entries; ++entry) {
+			flattened_srt[record.mapping_offset + 2u + entry * 2u] += base;
+		}
+		flattened_srt.insert(flattened_srt.end(), record.blocks.begin(), record.blocks.end());
+	}
+	t_record_blocks.clear();
+}
+
 // Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
 constexpr size_t MinIndirectMappingCapacity = 8u;
+// Elements of one table that a GPU-chosen record names (see MaterializeIndirectDescriptor()):
+// scene-wide tables hold hundreds of thousands of them.
+constexpr uint64_t MaxRecordTableElements = uint64_t {1} << 21u;
 // See SetComputeIndirectFloors().
 std::atomic<size_t> g_compute_indirect_keys {MinIndirectMappingCapacity};
 std::atomic<size_t> g_compute_indirect_images {1u};
@@ -218,6 +259,13 @@ bool ReadTable(uint64_t base, uint64_t size, uint64_t offset,
 bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
                      const SrtRuntime& runtime, std::span<uint32_t> words) {
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
+}
+
+// The first and the last word of a table are in guest memory.
+bool TableInGuestMemory(uint64_t base, uint64_t size, const SrtRuntime& runtime) {
+	std::array<uint32_t, 1> word {};
+	return base != 0u && size >= 4u && ReadScalarTable(base, size, 0u, runtime, word) &&
+	       ReadScalarTable(base, size, size - 4u, runtime, word);
 }
 
 bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
@@ -572,17 +620,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	// Ordinals of the distinct candidates: tables of tens of thousands of descriptors (the material
+	// tables of ray tracing hit groups) make a linear search quadratic.
+	std::unordered_map<DescriptorValue, uint32_t, DescriptorValueHash> ordinals;
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		const auto ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
+		const auto [found, inserted] = ordinals.try_emplace(
+		    candidate, static_cast<uint32_t>(descriptors.size() - children_begin + 1u));
+		if (inserted) {
 			descriptors.push_back(candidate);
 			auto child = root_resource;
 			child.indirect_root = resource_index;
 			specializations.push_back(child);
 		}
-		return ordinal;
+		return found->second;
 	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -616,6 +667,222 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		return failed("candidate", fmt::format("candidate_offset={:#x} {}={} stride={} step={}",
 		    offset & ~uint64_t {3}, key_kind, key, indirect.table_stride, step));
 	};
+	if (indirect.pointer_table && indirect.pointer_table->buffer) {
+		// Records named by the rows of a pointer table hold the V# of a descriptor table. The
+		// mapping searches the first word of that V# (the shader keys on the word it reads) for
+		// the block of its table's elements: [count, ordinal of element 0, 1, ...]. Rows name few
+		// distinct records, and records may share one table.
+		const auto& pointer = *indirect.pointer_table;
+		if (!WalkedDescriptor(program, indirect.table_source, table_value) ||
+		    !DecodeBufferDescriptor(table_value, table)) return false;
+		table_base = table.Base48();
+		table_size = table.GetSize();
+		descriptors[resource_index] = {.dword_count = dword_count};
+		const uint64_t first = uint64_t {indirect.table_offset & ~3u} + (indirect.table_immediate & ~3u);
+		const uint64_t rows = table_size >= first + 8u
+		    ? (table_size - first - 8u) / indirect.table_stride + 1u : 0u;
+		std::vector<uint32_t> words(table_size / 4u);
+		if (rows != 0u && !ReadScalarTable(table_base, table_size, 0u, runtime, words))
+			return read_failed("pointer table read", 0u, 0u, table_base, 0u, table_size);
+		// Only rows that name the reading function hold records of its layout. The function's
+		// address is in one other aligned pointer slot of the row.
+		const auto row_word = [&](uint64_t row, uint64_t byte) {
+			const auto word = (row * indirect.table_stride + byte) / 4u;
+			return (uint64_t {words[word + 1u]} << 32u) | words[word];
+		};
+		std::optional<uint64_t> function_slot;
+		if (pointer.function != 0u) {
+			for (uint64_t slot = 0; slot + 8u <= indirect.table_stride && !function_slot; slot += 8u) {
+				if (slot == (indirect.table_immediate & ~7u)) continue;
+				for (uint64_t row = 0; row < rows; ++row) {
+					if (((indirect.table_offset & ~3u) + row * indirect.table_stride + slot + 8u) > table_size) break;
+					if ((row_word(row, (indirect.table_offset & ~3u) + slot) & AddressMask) ==
+					    (pointer.function & AddressMask)) {
+						function_slot = slot;
+						break;
+					}
+				}
+			}
+			if (!function_slot) return failed("record function", fmt::format("function={:#x}", pointer.function));
+		}
+		std::vector<uint64_t> records;
+		for (uint64_t row = 0; row < rows; ++row) {
+			if (function_slot &&
+			    ((indirect.table_offset & ~3u) + row * indirect.table_stride + *function_slot + 8u > table_size ||
+			     (row_word(row, (indirect.table_offset & ~3u) + *function_slot) & AddressMask) !=
+			         (pointer.function & AddressMask))) continue;
+			const auto word = (first + row * indirect.table_stride) / 4u;
+			const auto record = ((uint64_t {words[word + 1u]} << 32u) | words[word]) & AddressMask;
+			if (record != 0u) records.push_back(record);
+		}
+		std::ranges::sort(records);
+		records.erase(std::unique(records.begin(), records.end()), records.end());
+		std::vector<std::pair<uint32_t, uint32_t>> entries; // V# first word, block offset.
+		struct KeyedTable {
+			uint64_t base  = 0;
+			uint64_t count = 0;
+			size_t   entry = 0;
+		};
+		std::unordered_map<uint32_t, KeyedTable> keyed_tables;
+		std::unordered_set<DescriptorValue, DescriptorValueHash> tables; // the V# of each entry
+		std::vector<uint32_t> blocks;
+		// Sampled roots keep their candidates in the host's resident image heap: the blocks hold
+		// heap entries instead of ordinals of materialized descriptors, so neither the number of
+		// candidates nor their order reaches the shader's descriptor layout.
+		bool heap_list = false;
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			const auto& image = program.info.images[resource_index];
+			heap_list = runtime.image_heap != nullptr && dword_count == 8u &&
+			            image.resource_class == ImageResourceClass::Sampled &&
+			            image.mip_mode != ImageMipMode::Dynamic;
+		}
+		std::vector<uint32_t>        element_words;
+		std::vector<DescriptorValue> heap_values;
+		std::vector<size_t>          heap_blocks; // The block word of each heap value.
+		for (const auto record: records) {
+			DescriptorValue record_table {.dword_count = 4u};
+			if (!ReadScalarTable(record, UINT64_MAX, pointer.offset, runtime,
+			                     std::span(record_table.dwords).first(4u)))
+				return read_failed("record table read", 0u, 0u, record, pointer.offset, 16u);
+			const std::array<uint32_t, 4> table_words {record_table.dwords[0], record_table.dwords[1],
+			                                           record_table.dwords[2], record_table.dwords[3]};
+			if (!tables.insert(record_table).second) continue;
+			ShaderBufferResource elements;
+			if (!DecodeBufferDescriptor(record_table, elements)) return false;
+			const uint64_t element_base = elements.Base48();
+			const uint64_t element_size = elements.GetSize();
+			const uint64_t count = pointer.element_stride == 0u ? 1u
+			    : element_size >= pointer.element_offset + descriptor_bytes
+			        ? (element_size - pointer.element_offset - descriptor_bytes) / pointer.element_stride + 1u
+			        : 0u;
+			// Rows of scene-wide pointer tables can name records that hold no table any more (the GPU
+			// never selects them): a table outside guest memory gives the shader no elements, and its
+			// key reads the null descriptor like any other key without a table.
+			if (count != 0u && !TableInGuestMemory(element_base, element_size, runtime)) continue;
+			if (count > MaxRecordTableElements)
+				return failed("record table elements", fmt::format("record={:#x} count={}", record, count));
+			const auto block = static_cast<uint32_t>(blocks.size());
+			blocks.push_back(static_cast<uint32_t>(count));
+			// One read of the whole table: large ones (a scene-wide sampler table of 720 thousand
+			// entries) would otherwise take one capture entry per element.
+			if (element_base != 0u && count > 1u) {
+				element_words.resize((element_size + 3u) / 4u);
+				if (!ReadScalarTable(element_base, element_size, 0u, runtime, element_words))
+					return read_failed("record table read", 0u, 0u, element_base, 0u, element_size);
+			}
+			for (uint32_t element = 0; element < count; ++element) {
+				const auto offset = pointer.element_offset + uint64_t {element} * pointer.element_stride;
+				DescriptorValue candidate {.dword_count = dword_count};
+				if (element_base != 0u && offset + descriptor_bytes <= element_size && count > 1u) {
+					std::copy_n(element_words.begin() + static_cast<std::ptrdiff_t>(offset / 4u),
+					            read_dwords, candidate.dwords.begin());
+				} else if (element_base != 0u && offset + descriptor_bytes <= element_size &&
+				    !ReadScalarTable(element_base, element_size, offset, runtime,
+				                     std::span(candidate.dwords).first(read_dwords)))
+					return read_failed("record descriptor read", 0u, element, element_base, offset, descriptor_bytes);
+				if (!normalize(candidate)) return normalization_failed(offset, element, pointer.element_stride, "element");
+				if (heap_list) {
+					heap_blocks.push_back(blocks.size());
+					heap_values.push_back(candidate);
+					blocks.push_back(0u);
+				} else {
+					blocks.push_back(intern_candidate(candidate));
+				}
+			}
+			// Tables at one base (a scene-wide table and a range of it) give the shader the same
+			// elements for the keys both cover: the longer one serves both.
+			const auto [same_key, inserted] =
+			    keyed_tables.try_emplace(table_words[0], KeyedTable {element_base, count, entries.size()});
+			if (inserted) {
+				entries.emplace_back(table_words[0], block);
+			} else if (same_key->second.base != element_base) {
+				return failed("record tables", "two record tables share the first word of their V#");
+			} else if (count > same_key->second.count) {
+				same_key->second.count                 = count;
+				entries[same_key->second.entry].second = block;
+			}
+		}
+		ImageHeapView heap_view;
+		if (heap_list) {
+			heap_list = runtime.image_heap->AcquireList(
+			    {.owner = &program, .resource = resource_index,
+			     .root = &program.info.images[resource_index], .values = heap_values},
+			    heap_view);
+			const auto heap_kinds = heap_view.kinds;
+			// Candidate i selects slot i + 1 of the root's list.
+			for (size_t i = 0; i < heap_blocks.size(); ++i) {
+				blocks[heap_blocks[i]] = heap_list ? static_cast<uint32_t>(i + 1u)
+				                                   : intern_candidate(heap_values[i]);
+			}
+			if (heap_list) {
+				for (const auto& kind: heap_kinds) {
+					descriptors.push_back(kind);
+					auto child          = root_resource;
+					child.indirect_root = resource_index;
+					specializations.push_back(child);
+				}
+			}
+		}
+		// Every element null: the root's null descriptor serves every key.
+		if (descriptors.size() == children_begin) return true;
+		std::ranges::sort(entries);
+		for (size_t i = 1; i < entries.size(); ++i) {
+			if (entries[i].first == entries[i - 1u].first)
+				return failed("record tables", "two record tables share the first word of their V#");
+		}
+		if (entries.empty()) return true;
+		const bool stable_layout = g_stable_indirect_layouts.load(std::memory_order_relaxed);
+		const auto key_capacity  = !stable_layout ? entries.size() : std::max<size_t>(
+		    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
+		                                         : MinIndirectMappingCapacity,
+		    std::bit_ceil(entries.size()));
+		// A list's slot count and device address precede the mapping (see EmitImageHeapEntry()).
+		const auto list_offset    = snapshot.flattened_srt.size();
+		const auto mapping_offset = list_offset + (heap_list ? 3u : 0u);
+		snapshot.flattened_srt.resize(mapping_offset + 1u + key_capacity * 2u, 0u);
+		if (heap_list) {
+			snapshot.flattened_srt[list_offset]      = heap_view.slot_count;
+			snapshot.flattened_srt[list_offset + 1u] = static_cast<uint32_t>(heap_view.slots);
+			snapshot.flattened_srt[list_offset + 2u] = static_cast<uint32_t>(heap_view.slots >> 32u);
+		}
+		snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(entries.size());
+		for (size_t entry = 0; entry < entries.size(); ++entry) {
+			snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = entries[entry].first;
+			// The block's offset in the root's blocks until FlushRecordBlocks() adds where they land.
+			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = entries[entry].second;
+		}
+		// The blocks follow the candidate counts, which streaming changes, while flattened SRT
+		// offsets reach the shader as constants: they go after every other region, so their size
+		// moves no constant (mapping entries name them by data).
+		t_record_blocks.push_back({mapping_offset, entries.size(), std::move(blocks)});
+		// Padded children keep the descriptor arrays the same size while candidate counts change.
+		if (((std::is_same_v<Specialization, ResourceSpecialization::Image> && !heap_list) ||
+		     std::is_same_v<Specialization, ResourceSpecialization::Sampler>) && stable_layout) {
+			const auto children = descriptors.size() - children_begin;
+			const auto total    = std::max<size_t>(
+                program.stage == ShaderType::Compute
+                    ? g_compute_indirect_images.load(std::memory_order_relaxed)
+                    : 1u,
+                std::bit_ceil(children + 1u));
+			for (auto padded = children; padded + 1u < total; ++padded) {
+				descriptors.push_back(descriptors.back());
+				specializations.push_back(specializations.back());
+			}
+		}
+		auto& root                      = specializations[resource_index];
+		root.indirect_root              = resource_index;
+		root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+		root.indirect_search_iterations = std::bit_width(key_capacity);
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			root.heap = heap_list;
+			if (heap_list) {
+				for (auto child = children_begin; child < specializations.size(); ++child) {
+					specializations[child].heap = true;
+				}
+			}
+		}
+		return true;
+	}
 	if (sources.empty()) {
 		if (selector == nullptr) keys.clear();
 		DescriptorValue material_value;
@@ -1015,6 +1282,13 @@ bool MaterializeImageTable(const ResourcePlan& program,
 		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
 		const auto& mapping = snapshot.image_tables.back().mapping;
 		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), mapping.begin(), mapping.end());
+		// The mapping follows the table's size, and later flattened SRT offsets reach the shader
+		// as constants: a size rounded up to StableSrtWords keeps the program when the game
+		// resizes the table a little.
+		if (g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
+			snapshot.flattened_srt.resize(
+			    mapping_offsets.back() + Common::AlignUp(mapping.size(), StableSrtWords), 0u);
+		}
 		found = snapshot.image_tables.end() - 1;
 	}
 	const auto table_index     = static_cast<uint32_t>(found - snapshot.image_tables.begin());
@@ -1775,6 +2049,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	t_record_blocks.clear();
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1994,6 +2269,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	FlushRecordBlocks(snapshot.flattened_srt);
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }

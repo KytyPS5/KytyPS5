@@ -425,6 +425,12 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
+// Record tables (PointerTable::buffer): the record's key finds its block of elements,
+// [count, ordinal...], and the element its ordinal; anything else selects the root (0).
+uint32_t EmitRecordTableIndex(EmitterState& state, uint32_t key, uint32_t element,
+                              uint32_t mapping_offset, uint32_t search_iterations);
+// Whether a descriptor source is a record table.
+bool IsRecordTableSource(const EmitterState& state, uint32_t source);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,

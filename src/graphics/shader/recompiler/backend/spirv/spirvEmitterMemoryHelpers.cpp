@@ -114,6 +114,27 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	return Select(state, TypeU32(state), match, resource, ConstantU32(state, default_resource));
 }
 
+uint32_t EmitRecordTableIndex(EmitterState& state, uint32_t key, uint32_t element,
+                              uint32_t mapping_offset, uint32_t search_iterations) {
+	const auto block = EmitIndirectResourceIndex(state, key, mapping_offset, search_iterations, 0u);
+	const auto found = Binary(state, spv::OpINotEqual, TypeBool(state), block, ConstantU32(state, 0u));
+	const auto count = LoadFlattenedSrt(state, Select(state, TypeU32(state), found, block,
+	                                                   ConstantU32(state, mapping_offset)));
+	const auto valid = Binary(state, spv::OpLogicalAnd, TypeBool(state), found,
+	                          Binary(state, spv::OpULessThan, TypeBool(state), element, count));
+	const auto at = Binary(state, spv::OpIAdd, TypeU32(state), block,
+	                       Binary(state, spv::OpIAdd, TypeU32(state), element, ConstantU32(state, 1u)));
+	const auto ordinal = LoadFlattenedSrt(state, Select(state, TypeU32(state), valid, at,
+	                                                     ConstantU32(state, mapping_offset)));
+	return Select(state, TypeU32(state), valid, ordinal, ConstantU32(state, 0u));
+}
+
+bool IsRecordTableSource(const EmitterState& state, uint32_t source) {
+	if (source >= state.program.descriptor_sources.size()) return false;
+	const auto& indirect = state.program.descriptor_sources[source].indirect_descriptor;
+	return indirect && indirect->pointer_table && indirect->pointer_table->buffer;
+}
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,

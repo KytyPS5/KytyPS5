@@ -1940,7 +1940,7 @@ std::string GraphToString(const Graph& graph) {
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "
-		    "expression={}\n",
+		    "selector_targets=[{}] expression={}\n",
 		    static_cast<uint32_t>(block.terminator.kind),
 		    BranchConditionToString(block.terminator.condition).c_str(),
 		    block.terminator.true_block, block.terminator.false_block, block.terminator.merge_block,
@@ -1948,6 +1948,7 @@ std::string GraphToString(const Graph& graph) {
 		    block.terminator.indirect_pc_sgpr, block.terminator.indirect_selector_code,
 		    VectorToString(block.terminator.indirect_targets).c_str(),
 		    VectorToString(block.terminator.indirect_selector_values).c_str(),
+		    VectorToString(block.terminator.indirect_selector_targets).c_str(),
 		    block.terminator.expression);
 		for (const auto& assignment: block.assignments) {
 			text += fmt::format("  variable_{} = expression_{}", assignment.variable, assignment.expression);

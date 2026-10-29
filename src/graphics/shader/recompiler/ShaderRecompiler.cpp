@@ -57,6 +57,30 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
 }
 
+// Logs each S_SETPC_B64 jump table with the mode it compiled in, so a run shows which
+// shaders left the dispatcher, how long their goto chains are, and whether the shader has
+// linked calls, whose execution-order reorder BuildGraph skips when a table is present.
+void LogJumpTables(const CompileOptions& options, const Decoder::Program& decoded,
+                   const CFG::Graph& native, const char* mode) {
+	if (!CFG::HasJumpTable(native)) return;
+	const bool linked_calls = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
+	});
+	for (const auto& block: native.blocks) {
+		const auto& term = block.terminator;
+		if (term.kind != CFG::TerminatorKind::IndirectBranch) continue;
+		// The pc of the S_SETPC_B64 itself, which the decoded dump and CFG errors also print.
+		const bool has_jump = block.inst_begin < block.inst_end &&
+		                      block.inst_end <= decoded.instructions.size();
+		const auto jump_pc  = has_jump ? decoded.instructions[block.inst_end - 1u].pc : UINT32_MAX;
+		LOGF("ShaderRecompiler %s jump table: hash=0x%016" PRIx64 " mode=%s block=%" PRIu32
+		     " pc=0x%08" PRIx32 " targets=%" PRIu64 " cases=%" PRIu64 " linked_calls=%u\n",
+		     StageName(options.stage), options.shader_hash, mode, block.id, jump_pc,
+		     static_cast<uint64_t>(term.indirect_targets.size()),
+		     static_cast<uint64_t>(term.indirect_selector_values.size()), linked_calls ? 1u : 0u);
+	}
+}
+
 enum class EmbeddedFetchValueType {
 	Unknown,
 	Constant,
@@ -794,6 +818,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
+		LogJumpTables(options, decoded, native_cfg, "dispatcher");
 	} else {
 		LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG Structurize\n", stage,
 		     options.shader_hash);
@@ -808,10 +833,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			// has no IR cycle check, so the dispatcher loop is analysed exactly as before.
 			native_cfg.irreducible |= CFG::HasJumpTable(native_cfg);
 			LogDispatcherFallback(options, native_cfg, "structurize");
+			LogJumpTables(options, decoded, native_cfg, "dispatcher");
 		} else {
 			selected_cfg = &structured_cfg;
 			LOGF("ShaderRecompiler %s structured CFG success: blocks=%" PRIu64 "\n", stage,
 			     static_cast<uint64_t>(selected_cfg->blocks.size()));
+			LogJumpTables(options, decoded, native_cfg, "structured");
 		}
 		LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",

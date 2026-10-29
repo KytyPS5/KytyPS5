@@ -15,6 +15,8 @@ struct Profile {
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
+	// Kill switch that emits every guarded load as a branch, as before loads were selected.
+	bool branch_guarded_loads = false;
 };
 
 inline constexpr Profile DefaultProfile {};

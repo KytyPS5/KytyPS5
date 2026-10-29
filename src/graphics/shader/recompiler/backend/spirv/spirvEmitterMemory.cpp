@@ -1590,11 +1590,13 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 // selected afterwards. That holds only for a constant descriptor slot, because the device does
 // not bound a descriptor array index, and non_uniform marks a slot chosen by a GPU value.
 // Only scalar buffers qualify so far. Vector buffer loads also need indirect roots and coherent
-// pairs excluded, which this resource alone does not show.
-static GuardStrategy LoadGuardStrategy(const MemoryResourceAccess& resource) {
+// pairs excluded, which this resource alone does not show. The profile can force branches.
+static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
+                                       const MemoryResourceAccess& resource) {
 	const bool coherent = (resource.memory_access & spv::MemoryAccessVolatileMask) != 0;
-	return resource.kind == IR::ResourceKind::ScalarBuffer && resource.object_pointer != 0u &&
-	               !resource.non_uniform && !coherent
+	return !state.profile.branch_guarded_loads &&
+	               resource.kind == IR::ResourceKind::ScalarBuffer &&
+	               resource.object_pointer != 0u && !resource.non_uniform && !coherent
 	           ? GuardStrategy::Select
 	           : GuardStrategy::Branch;
 }
@@ -1622,7 +1624,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitGuardedValue(state, LoadGuardStrategy(access), condition,
+	ctx.Define(inst, EmitGuardedValue(state, LoadGuardStrategy(state, access), condition,
 	                                  ValueShape {TypeU32(state), 1u}, ConstantU32(state, 0),
 	                                  [&]() {
 		                                  return EmitNative<spv::OpLoad, IR::Type::U32>(

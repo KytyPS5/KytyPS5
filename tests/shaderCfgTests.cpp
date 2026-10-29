@@ -14675,6 +14675,17 @@ void TestNewShaderRecompilerScalarBufferLoadSelectsDefault() {
             SpirvInstructionOpcodeCount(result.spirv, spv::OpBranchConditional) == 0u,
         "scalar buffer load kept a branch around its bounds check");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // The kill switch brings back the branch and its phi.
+  ShaderRecompiler::Spirv::Profile branched{};
+  branched.branch_guarded_loads = true;
+  options.profile = &branched;
+  const auto fallback = RecompileForTest(shader, options);
+  Check(!SpirvSelectGuardsLoad(fallback.spirv) &&
+            SpirvInstructionOpcodeCount(fallback.spirv, spv::OpPhi) != 0u &&
+            SpirvInstructionOpcodeCount(fallback.spirv, spv::OpBranchConditional) != 0u,
+        "branch_guarded_loads did not restore the branch around a scalar buffer load");
+  CheckSpirvBinaryValidates(fallback.spirv);
 }
 
 void TestNewShaderRecompilerNativeBindingPlan() {

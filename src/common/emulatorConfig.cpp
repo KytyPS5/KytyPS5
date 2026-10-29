@@ -165,6 +165,10 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
+bool BranchGuardedLoadsEnabled() {
+	return g_config->branch_guarded_loads;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

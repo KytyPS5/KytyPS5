@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -293,6 +294,42 @@ bool ApplyBuiltIn(const std::string& json, Program* main_program, const std::vec
 		return false;
 	}
 	return ApplyLoaded(std::move(plan), main_program, programs);
+}
+
+bool ApplyKnownFixes(Program* main_program, const std::vector<Program*>& programs) {
+	const char* switch_value = std::getenv("KYTY_GAME_FIXES");
+	if (switch_value != nullptr && std::string(switch_value) == "0") {
+		return false;
+	}
+	std::string title_id;
+	std::string version;
+	if (main_program == nullptr || main_program->file_name.empty() ||
+	    !SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
+	    !SystemContentParamSfoGetString("APP_VER", &version)) {
+		return false;
+	}
+	// Marvel's Spider-Man 2 (PPSA08338). When the game turns its depth-reprojection culling on (its
+	// first 3D frame), the main thread waits for a result that only the render thread's frame can
+	// produce, and the render thread's frame waits for the main thread: the game stops on its
+	// logo. On a console the render thread is ahead of the main thread, and the wait is not
+	// entered; here the first 3D frames are slower and the order flips. The jump into the wait
+	// (jmp +0x15) becomes a jump past it (jmp +0x72): the culling uses the last frame's result,
+	// as it does while that result is not ready anyway. The old bytes (the lea before the jump
+	// included) are unique in the game's eboot.
+	if (title_id == "PPSA08338") {
+		const Json plan = {
+		    {"id", title_id},
+		    {"version", version},
+		    {"process", main_program->file_name.filename().string()},
+		    {"mods",
+		     Json::array({Json {
+		         {"name", "Reprojection wait"},
+		         {"memory", Json::array({Json {{"offset", "437ea50"},
+		                                       {"off", "4989c64c8d3d6dc15103eb15"},
+		                                       {"on", "4989c64c8d3d6dc15103eb72"}}})}}})}};
+		return ApplyBuiltIn(plan.dump(), main_program, programs);
+	}
+	return false;
 }
 
 bool ContainsBytes(const std::vector<Program*>& programs, const std::vector<uint8_t>& bytes) {

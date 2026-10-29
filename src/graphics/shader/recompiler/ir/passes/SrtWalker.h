@@ -57,6 +57,12 @@ void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// A replay that read memory and failed leaves the plain walk after it to decide what the failure
+// means; the walk must not try the same address again (one failing read, one attempt). The
+// reads that fail while `remember` is true are remembered until SrtForgetFailedRead.
+void SrtRememberFailedReads(bool remember);
+void SrtForgetFailedRead();
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>

@@ -979,9 +979,47 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
-	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
+	// The copy below puts the smaller image over the same levels and layers of the expanded one: a
+	// texture array a game fills layer by layer grows at every step, and uploading the layers the
+	// copy overwrites made the bytes grow with the square of the layer count.
+	{
+		auto& expanded = m_slot_images[expanded_id];
+		const auto same_extent = [](const vk::Extent3D& a, const vk::Extent3D& b) {
+			return a.width == b.width && a.height == b.height && a.depth == b.depth;
+		};
+		if (layer < 0 && !source.IsBufferModified() && !source.depth_id && !expanded.depth_id &&
+		    source.backing.samples == 1 && expanded.backing.samples == 1 &&
+		    source.backing.image_type == vk::ImageType::e2D &&
+		    expanded.backing.image_type == vk::ImageType::e2D &&
+		    same_extent(source.backing.extent, expanded.backing.extent) &&
+		    source.backing.mip_levels == expanded.backing.mip_levels &&
+		    source.backing.format == expanded.backing.format &&
+		    source.info.GetColorTransform() == expanded.info.GetColorTransform() &&
+		    !source.info.IsDepth() && !expanded.info.IsDepth() &&
+		    UploadBinding(expanded) != BindingType::DepthTarget) {
+			m_upload_skip = {std::min(source.backing.layers, expanded.backing.layers),
+			                 std::min(source.backing.mip_levels, expanded.backing.mip_levels)};
+		}
+		static const bool trace_expand = std::getenv("KYTY_TRACE_UPLOADS") != nullptr;
+		if (trace_expand && source.info.data.size >= (1u << 20u)) {
+			static std::atomic<uint32_t> count {0};
+			if (count.fetch_add(1) < 40) {
+				fprintf(stderr,
+				        "[expand] addr=0x%" PRIx64 " layers %u -> %u skip=%u mip=%d layer=%d "
+				        "bufmod=%d type=%d/%d fmt=%d/%d depth=%d/%d\n",
+				        info.data.address, source.backing.layers, expanded.backing.layers,
+				        m_upload_skip.layers, mip, layer, source.IsBufferModified() ? 1 : 0,
+				        static_cast<int>(source.backing.image_type),
+				        static_cast<int>(expanded.backing.image_type),
+				        static_cast<int>(source.backing.format), static_cast<int>(expanded.backing.format),
+				        static_cast<int>(source.depth_id ? 1 : 0), static_cast<int>(expanded.depth_id ? 1 : 0));
+			}
+		}
+	}
+	InitializeImage(expanded_id);
+	m_upload_skip = {};
 	if (layer >= 0) {
 		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
@@ -1023,7 +1061,45 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			EXIT("TextureCache: invalid video-out upload\n");
 		}
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
-		const auto copies = info.BufferCopies(linear.offset);
+		auto copies = info.BufferCopies(linear.offset);
+		if (m_upload_skip.layers != 0 && !image.depth_id) {
+			std::vector<vk::BufferImageCopy> kept;
+			kept.reserve(copies.size());
+			for (auto copy: copies) {
+				const auto first = copy.imageSubresource.baseArrayLayer;
+				const auto end   = first + copy.imageSubresource.layerCount;
+				if (copy.imageSubresource.mipLevel >= m_upload_skip.levels ||
+				    first >= m_upload_skip.layers) {
+					kept.push_back(copy);
+				} else if (end > m_upload_skip.layers && info.linear_slice_stride != 0) {
+					// One copy holds the layers one after another: keep the ones past the skipped.
+					const auto skipped = m_upload_skip.layers - first;
+					copy.bufferOffset += skipped * info.linear_slice_stride;
+					copy.imageSubresource.baseArrayLayer = m_upload_skip.layers;
+					copy.imageSubresource.layerCount     = end - m_upload_skip.layers;
+					kept.push_back(copy);
+				} else if (end > m_upload_skip.layers) {
+					kept.push_back(copy);
+				}
+			}
+			copies.swap(kept);
+			if (copies.empty()) {
+				return;
+			}
+		}
+		static const bool trace_uploads = std::getenv("KYTY_TRACE_UPLOADS") != nullptr;
+		if (trace_uploads && linear.size >= (1u << 20u)) {
+			static std::atomic<uint32_t> count {0};
+			if (count.fetch_add(1) < 60) {
+				fprintf(stderr,
+				        "[upload] addr=0x%" PRIx64 " guest=%" PRIu64 " KB linear=%" PRIu64 " KB %ux%ux%u levels=%u "
+				        "layers=%u fmt=%u samples=%u binding=%d\n",
+				        info.data.address, info.data.size >> 10u, linear.size >> 10u, info.extent.width,
+				        info.extent.height, info.extent.depth, info.resources.levels,
+				        info.resources.layers, static_cast<unsigned>(info.pixel_format),
+				        static_cast<unsigned>(info.samples), static_cast<int>(binding));
+			}
+		}
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
@@ -1089,7 +1165,12 @@ void TextureCache::InitializeImage(ImageId id) {
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    m_buffer_cache.ObtainBufferForImage(
+		        image.info.data.address, image.info.data.size,
+		        m_upload_skip.layers != 0 && image.info.resources.layers != 0 &&
+		                image.info.data.size % image.info.resources.layers == 0
+		            ? image.info.data.size / image.info.resources.layers * m_upload_skip.layers
+		            : 0);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1531,7 +1612,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* plain)
 			const auto& image = m_slot_images[id];
 			// Stencil descriptors name the associated plane; its depth owner supplies
 			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+			if (desc.type == BindingType::Texture &&
 			    image.depth_id && image.info.data == desc.info.data &&
 			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
 			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&

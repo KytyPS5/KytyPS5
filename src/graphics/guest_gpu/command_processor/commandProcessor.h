@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/command_processor/constRam.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -28,6 +29,8 @@ struct IndirectDrawRegisters {
 	uint32_t vertex_offset;
 	uint32_t instance_offset;
 	uint32_t index_offset;
+	// Multi-draws only: the register that gets the index of each draw in the packet.
+	uint32_t draw_index = Pm4::SH_NOP;
 };
 
 class Pm4Execution {

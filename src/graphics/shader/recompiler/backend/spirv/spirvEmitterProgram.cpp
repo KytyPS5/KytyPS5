@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <bit>
 #include <functional>
@@ -173,7 +174,21 @@ void EmitReturn(ValueEmitContext& ctx) {
 // whole emulator stops. Correct shaders end their loops; one fed corrupt data may not. Every
 // invocation may run LoopBudget iterations of its loops in all, and then each loop leaves at
 // its next exit. Exits keep their edges, only their conditions change, so the structure holds.
-constexpr uint32_t LoopBudget = 1u << 20u;
+// The budget is small on purpose: a loop that spends it on a full-screen draw keeps the GPU busy
+// for seconds, and on a GPU that also draws the desktop the whole screen freezes (FC 27). Games
+// tested (FC 25, TEKKEN 8) render the same with it.
+constexpr uint32_t DefaultLoopBudget = 1u << 16u;
+
+// KYTY_LOOP_BUDGET replaces it, to test whether a hang is a loop fed bad data (it changes the
+// shader: use a pipeline cache folder of its own).
+uint32_t LoopBudget() {
+	static const uint32_t budget = [] {
+		const char* text = std::getenv("KYTY_LOOP_BUDGET");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
+		                       : DefaultLoopBudget;
+	}();
+	return budget;
+}
 
 // In a loop header: one iteration of the budget is spent, until none is left.
 void SpendLoopBudget(EmitterState& state) {
@@ -883,7 +898,7 @@ void EmitProgram(EmitterState& state) {
 		                          ConstantU32(state, 1));
 	}
 	if (state.loop_budget_variable != 0) {
-		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, LoopBudget));
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, LoopBudget()));
 	}
 	if (state.subgroup_local_invocation_id_variable != 0 && LaneIndexFromScan(state)) {
 		// The lane index is the number of active invocations below this one, here where all

@@ -1319,6 +1319,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
 		}
+	} else if (!m_programs.empty()) {
+		// A fix the emulator knows for this game (loader/gamePatch.cpp), if it has one.
+		GamePatch::ApplyKnownFixes(m_programs.front(), m_programs);
 	}
 	// Apart from any patch above: the EA plan changes only the bytes of EA's authority key.
 	if (GamePatch::ContainsBytes(m_programs, Libs::EaEmulation::AuthorityModulus())) {

@@ -28532,7 +28532,7 @@ TestCase EndlessLoopEndsAfterLoopBudget() {
   TestCase test;
   test.name = "EndlessLoopEndsAfterLoopBudget";
   test.code = std::move(code);
-  test.expected = {1u << 20u};
+  test.expected = {1u << 16u}; // DefaultLoopBudget (spirvEmitterProgram.cpp)
   test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::V_MOV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
@@ -50003,11 +50003,39 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   multi_packet[4] &= ~(1u << 28u);
   check_offsets(multi_packet, gs, {41, 7, 8}, "multi-draw enable word and count clamp");
 
+  // Word 4 bit 31 enables DRAW_INDEX_LOC: the CP writes each draw's index in the multi-draw to
+  // that user SGPR (Spider-Man 2 picks per-draw records with it).
+  const auto check_draw_index = [&](auto &commands, const auto &sgprs, uint32_t expected,
+                                    const char *label) {
+    Require("Pm4DrawIndirectMulti", label,
+            execute(commands.data(), commands.size()) && sgprs[12] == expected,
+            "indirect multi-draw did not write the expected draw index");
+  };
+  // What the guest left in the register before the packet (text Spider-Man 2 left there).
+  constexpr uint32_t stale_sgpr = 0x4f206572u;
+  shaders.SetGsUserSgpr(12, stale_sgpr, HW::UserSgprType::Unknown);
+  multi_packet[4] = (1u << 31u) | (Pm4::SPI_SHADER_USER_DATA_GS_0 + 12);
+  multi_packet[5] = 3;
+  check_draw_index(multi_packet, gs, 2, "multi-draw index of the last draw");
+  shaders.SetGsUserSgpr(12, stale_sgpr, HW::UserSgprType::Unknown);
+  multi_packet[5] = 1;
+  check_draw_index(multi_packet, gs, 0, "multi-draw index of a single draw");
+  shaders.SetGsUserSgpr(12, stale_sgpr, HW::UserSgprType::Unknown);
+  multi_packet[5] = 0;
+  check_draw_index(multi_packet, gs, stale_sgpr, "multi-draw index without draws");
+  multi_packet[5] = 3;
+  multi_packet[4] &= ~(1u << 31u);
+  check_draw_index(multi_packet, gs, stale_sgpr, "multi-draw index disabled");
+
   arguments = {0, 1, 51, 13, 0, 1, 53, 15};
   std::array<uint32_t, 10> auto_multi_packet{
       KYTY_PM4(10, Pm4::IT_DRAW_INDIRECT_MULTI, 0), 0,
       auto_packet[2], auto_packet[3], Pm4::SH_NOP, 2, 0, 0, 16, 2};
   check_offsets(auto_multi_packet, hs, {53, 15}, "non-indexed multi-draw offsets");
+  shaders.SetHsUserSgpr(12, stale_sgpr, HW::UserSgprType::Unknown);
+  auto_multi_packet[4] = (1u << 31u) | (Pm4::SPI_SHADER_USER_DATA_HS_0 + 12);
+  check_draw_index(auto_multi_packet, hs, 1, "non-indexed multi-draw index");
+  auto_multi_packet[4] = Pm4::SH_NOP;
   arguments = {0, 1, 99, 101};
   auto_packet[2] = Pm4::SH_NOP;
   check_offsets(auto_packet, hs, {53, 101}, "independent destinations");

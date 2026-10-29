@@ -139,6 +139,13 @@ private:
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
 	void                      FreeImage(ImageId id);
+	// While an expanded image is first filled: the levels and layers the copy from the smaller
+	// image overwrites right after, which the upload leaves out.
+	struct UploadSkip {
+		uint32_t layers = 0;
+		uint32_t levels = 0;
+	};
+	UploadSkip m_upload_skip;
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);

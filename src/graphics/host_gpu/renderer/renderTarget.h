@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
@@ -30,8 +31,48 @@ struct RenderState {
 	uint32_t                                                   height                = 0;
 	uint32_t                                                   num_layers            = 1;
 	uint32_t                                                   num_color_attachments = 0;
+	// The part of the target the pass loads, draws and stores; an empty one is the whole target. A
+	// pass that a draw ends again and again (an image has to change its layout) would otherwise
+	// load and store a large target (a shadow atlas) in full each time.
+	int32_t                                                    area_x      = 0;
+	int32_t                                                    area_y      = 0;
+	uint32_t                                                   area_width  = 0;
+	uint32_t                                                   area_height = 0;
 
 	bool operator==(const RenderState&) const = default;
+
+	// The area as a rectangle: the whole target when it is empty.
+	[[nodiscard]] int32_t Left() const { return area_width != 0u ? area_x : 0; }
+	[[nodiscard]] int32_t Top() const { return area_width != 0u ? area_y : 0; }
+	[[nodiscard]] int32_t Right() const {
+		return area_width != 0u ? area_x + static_cast<int32_t>(area_width) : static_cast<int32_t>(width);
+	}
+	[[nodiscard]] int32_t Bottom() const {
+		return area_width != 0u ? area_y + static_cast<int32_t>(area_height) : static_cast<int32_t>(height);
+	}
+	// Whether a pass begun with this state can take the draws of `other`: the same attachments, and
+	// an area that holds the other's.
+	[[nodiscard]] bool Covers(const RenderState& other) const {
+		RenderState a = *this;
+		RenderState b = other;
+		a.area_x = b.area_x = 0;
+		a.area_y = b.area_y = 0;
+		a.area_width = b.area_width = 0;
+		a.area_height = b.area_height = 0;
+		return a == b && Left() <= other.Left() && Top() <= other.Top() && Right() >= other.Right() &&
+		       Bottom() >= other.Bottom();
+	}
+	// The same state with an area that holds the other's as well.
+	void Grow(const RenderState& other) {
+		const int32_t left   = std::min(Left(), other.Left());
+		const int32_t top    = std::min(Top(), other.Top());
+		const int32_t right  = std::max(Right(), other.Right());
+		const int32_t bottom = std::max(Bottom(), other.Bottom());
+		area_x      = left;
+		area_y      = top;
+		area_width  = static_cast<uint32_t>(right - left);
+		area_height = static_cast<uint32_t>(bottom - top);
+	}
 };
 
 [[nodiscard]] inline constexpr uint32_t render_sample_count(uint32_t encoded_samples) {

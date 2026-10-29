@@ -323,6 +323,50 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+// Limits the pass of a draw to what the draw can touch: the scissors of the viewports it uses, as
+// UpdateGraphicsDynamicState sets them. Not when an attachment is cleared: a clear covers the whole
+// attachment.
+static void LimitRenderArea(RenderState& rendering, const CommandBuffer& buffer,
+                            const ShaderVertexInputInfo& vs_input_info) {
+	const auto& depth = rendering.depth_stencil_attachment;
+	if (depth.depth_clear || depth.stencil_clear ||
+	    std::any_of(rendering.color_attachments.begin(), rendering.color_attachments.end(),
+	                [](const RenderAttachment& color) { return color.is_clear; })) {
+		return;
+	}
+	const auto& ctx = buffer.GetRegisters();
+	const auto& vp  = ctx.GetScreenViewport();
+	const auto& outputs = vs_input_info.stage.program->info.outputs;
+	const bool  indexed_viewports =
+	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+	    });
+	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	const uint32_t     viewport_count = indexed_viewports ? viewport_slots : 1;
+	int32_t left = INT32_MAX, top = INT32_MAX, right = INT32_MIN, bottom = INT32_MIN;
+	for (uint32_t i = 0; i < viewport_count; i++) {
+		if (!ctx.GetClipControl().clip_disable && vp.viewports[i].xscale == 0.0f) continue;
+		const auto scissor = calc_final_scissor(
+		    vp, ctx.GetScanModeControl(), vk::Extent2D {rendering.width, rendering.height}, i);
+		left   = std::min<int32_t>(left, scissor.left);
+		top    = std::min<int32_t>(top, scissor.top);
+		right  = std::max<int32_t>(right, scissor.right);
+		bottom = std::max<int32_t>(bottom, scissor.bottom);
+	}
+	left   = std::max(left, 0);
+	top    = std::max(top, 0);
+	right  = std::min<int32_t>(right, static_cast<int32_t>(rendering.width));
+	bottom = std::min<int32_t>(bottom, static_cast<int32_t>(rendering.height));
+	if (right <= left || bottom <= top) return;
+	// Most of the target: a smaller area gains nothing, and a draw outside it would restart the pass.
+	if (uint64_t {static_cast<uint32_t>(right - left)} * static_cast<uint32_t>(bottom - top) * 2u >=
+	    uint64_t {rendering.width} * rendering.height) return;
+	rendering.area_x      = left;
+	rendering.area_y      = top;
+	rendering.area_width  = static_cast<uint32_t>(right - left);
+	rendering.area_height = static_cast<uint32_t>(bottom - top);
+}
+
 static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState& dynamic_state,
                                        const ShaderVertexInputInfo& vs_input_info,
                                        const RenderDepthInfo& depth, const RenderState& rendering) {
@@ -1468,7 +1512,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// no pixel shader input for them: the triangles are drawn as patches, through tessellation
 	// shaders that hand the values over (see triangleVertexValueShader.h).
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
+	auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 
@@ -1615,6 +1659,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
+	LimitRenderArea(rendering, buffer, vertex_stages.back());
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);

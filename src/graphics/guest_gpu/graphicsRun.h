@@ -87,6 +87,12 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		// Of the commands when they were submitted (a failure tells if the guest changed them).
+		uint64_t                  commands_hash     = 0;
+		uint64_t                  submitted_ms      = 0;
+		uint64_t                  trace_id          = 0;
+		// A copy of the commands, to say what changed (KYTY_DCB_SNAPSHOT=1).
+		std::shared_ptr<std::vector<uint32_t>> snapshot;
 	};
 
 	void              Enqueue(Submission submission);

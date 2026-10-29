@@ -1620,11 +1620,17 @@ bool MaterializeResourcesTraced(const ResourcePlan& program, const SrtRuntime& r
 		program.srt_trace_pause--;
 		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
 	}
+	// A failing read in a replay is not tried again by the walk that follows its abort.
+	struct ForgetFailedRead {
+		~ForgetFailedRead() { SrtForgetFailedRead(); }
+	} forget;
 	if (program.srt_trace != nullptr) {
 		SrtTraceSession replay(program, program.srt_trace);
+		SrtRememberFailedReads(true);
 		t_quiet_failures = true;
 		const bool result = MaterializeResourcesOnce(program, runtime, snapshot, specialization, &replay);
 		t_quiet_failures = false;
+		SrtRememberFailedReads(false);
 		if (!replay.Aborted()) {
 			program.srt_trace_failures = 0;
 			if (VerifyTraces()) {

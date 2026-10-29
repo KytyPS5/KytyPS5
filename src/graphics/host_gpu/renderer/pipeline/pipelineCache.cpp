@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -143,6 +144,33 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+
+// Translates a program. A compute program that tracking cannot follow gives false and the reason,
+// instead of ending the emulator: its dispatch is skipped (what a call the translator cannot link
+// gets as well), and the game goes on without that pass. The setjmp frame holds nothing that has a
+// destructor.
+[[nodiscard]] bool TranslateRecoverable(const ShaderRecompiler::Decoder::Program* decoded,
+                                        std::span<const uint32_t> code,
+                                        const ShaderRecompiler::CompileOptions& options,
+                                        bool recoverable, ShaderRecompiler::TranslateResult& result,
+                                        std::string& reason) {
+	if (!recoverable) {
+		result = decoded != nullptr ? ShaderRecompiler::TranslateProgram(*decoded, options)
+		                            : ShaderRecompiler::TranslateProgram(code, options);
+		return true;
+	}
+	ShaderRecompiler::IR::TrackingRecovery recovery;
+	if (setjmp(recovery.point) != 0) {
+		ShaderRecompiler::IR::SetTrackingRecovery(nullptr);
+		reason = std::move(recovery.message);
+		return false;
+	}
+	ShaderRecompiler::IR::SetTrackingRecovery(&recovery);
+	result = decoded != nullptr ? ShaderRecompiler::TranslateProgram(*decoded, options)
+	                            : ShaderRecompiler::TranslateProgram(code, options);
+	ShaderRecompiler::IR::SetTrackingRecovery(nullptr);
+	return true;
+}
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
@@ -586,16 +614,33 @@ struct PipelineCache::ProgramCache {
 		}
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
+		const bool recoverable = stage == ShaderType::Compute;
+		std::string failure;
+		bool        tracked = true;
 		if (current != nullptr) {
 			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				tracked = TranslateRecoverable(&current->linked->decoded, {}, options, recoverable,
+				                               translated, failure);
 				translated.program.source_reads = current->reads;
 			} else {
-				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+				tracked = TranslateRecoverable(&current->decoded, {}, options, recoverable, translated,
+				                               failure);
 			}
 		} else {
-			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			tracked = TranslateRecoverable(nullptr, params.code, options, recoverable, translated,
+			                               failure);
+		}
+		if (!tracked) {
+			PipelineCacheLog("!!! COMPUTE DISPATCH SKIP !!! shader=0x{:016x} reason={}; rendering is "
+			                 "incomplete", params.hash, failure);
+			if (entry == programs.end()) {
+				programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan{}, nullptr)
+				    .first->second.skip_dispatch = true;
+			} else {
+				entry->second.skip_dispatch = true;
+			}
+			return {};
 		}
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;

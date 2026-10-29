@@ -33,6 +33,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -469,6 +470,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
+	// The emulator's work is heavy and long (a frame of a big game can keep the GPU busy for
+	// seconds): at a low global priority the desktop's own GPU work goes first, and the screen stays
+	// usable. KYTY_GPU_PRIORITY=normal leaves the queue at the default.
+	vk::DeviceQueueGlobalPriorityCreateInfoKHR queue_global_priority {};
+	if (graphics.low_queue_priority) {
+		queue_global_priority.globalPriority = vk::QueueGlobalPriorityKHR::eLow;
+		queue_create_info.pNext              = &queue_global_priority;
+	}
 
 	// An optional capability is on only when its extension is among the enabled ones.
 	auto& caps = graphics.host.capabilities;
@@ -707,6 +716,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::Device device = nullptr;
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
+	if (result != vk::Result::eSuccess && graphics.low_queue_priority) {
+		// The host refuses the low priority (or the extension): the default one.
+		LOGF("vkCreateDevice with a low queue priority failed: %s; trying the default\n",
+		     vk::to_string(result).c_str());
+		graphics.low_queue_priority = false;
+		queue_create_info.pNext     = nullptr;
+		std::vector<const char*> without;
+		for (const auto* extension: device_extensions) {
+			if (std::string_view(extension) != VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) without.push_back(extension);
+		}
+		create_info.enabledExtensionCount   = static_cast<uint32_t>(without.size());
+		create_info.ppEnabledExtensionNames = without.data();
+		result = physical_device.createDevice(&create_info, nullptr, &device);
+	}
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		return nullptr;
@@ -1099,6 +1122,12 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back("VK_KHR_portability_subset");
 		}
 
+		if (const char* priority = std::getenv("KYTY_GPU_PRIORITY");
+		    (priority == nullptr || std::string_view(priority) != "normal") &&
+		    HasExtension(available_extensions, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+			graphic_ctx.low_queue_priority = true;
+		}
 		if (std::getenv("KYTY_GPU_BREADCRUMBS") != nullptr &&
 		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);

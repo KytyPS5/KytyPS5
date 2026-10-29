@@ -1168,7 +1168,8 @@ void BufferCache::ApplyPendingLabels(Buffer& buffer, uint64_t vaddr, uint64_t si
 	}
 }
 
-std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size,
+                                                               uint64_t skip_prefix) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -1188,7 +1189,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+		skip_prefix = std::min(skip_prefix, size);
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr + skip_prefix, mapped + skip_prefix,
+		                                                   size - skip_prefix)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}
 	});

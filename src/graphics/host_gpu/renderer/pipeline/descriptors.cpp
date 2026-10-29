@@ -467,8 +467,13 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto& slot = m_decoded_slots[(reinterpret_cast<uintptr_t>(&resource) * 0x9e3779b97f4a7c15ull) >>
-	                             51u];
+	// The slot depends on the descriptor too: one resource read through many descriptors would
+	// otherwise replace its own slot at every draw and take the table lookup each time.
+	uint64_t slot_hash = reinterpret_cast<uintptr_t>(&resource);
+	for (uint32_t i = 0; i < value.dword_count; i++) {
+		slot_hash = Common::Fnv64Step(slot_hash, value.dwords[i]);
+	}
+	auto& slot = m_decoded_slots[(slot_hash * 0x9e3779b97f4a7c15ull) >> 51u];
 	if (slot.epoch != m_decoded_epoch || slot.slot != &resource || !(slot.value == value) ||
 	    !(slot.resource == resource)) {
 		auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});

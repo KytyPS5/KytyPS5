@@ -12,6 +12,7 @@ struct Push {
 	std::array<uint32_t, 4> group_size {};
 	uint32_t                args_dword   = 0;
 	uint32_t                extent_dword = 0;
+	float                   max_groups   = 0.0f;
 };
 
 } // namespace
@@ -58,7 +59,7 @@ ThreadDimensionDispatch::~ThreadDimensionDispatch() {
 
 void ThreadDimensionDispatch::Record(vk::CommandBuffer command, vk::Buffer args_buffer, uint64_t args_offset,
                                      std::array<uint32_t, 3> group_size, const Target& groups,
-                                     const Target& extent, uint32_t extent_dword) {
+                                     const Target& extent, uint32_t extent_dword, float max_groups) {
 	EXIT_IF((args_offset & 3u) != 0);
 	// The arguments need not be at an offset a storage descriptor can start at.
 	const auto args_start = args_offset / m_graphics.StorageMinAlignment() * m_graphics.StorageMinAlignment();
@@ -78,6 +79,7 @@ void ThreadDimensionDispatch::Record(vk::CommandBuffer command, vk::Buffer args_
 	push.group_size   = {group_size[0], group_size[1], group_size[2], 1u};
 	push.args_dword   = static_cast<uint32_t>((args_offset - args_start) / sizeof(uint32_t));
 	push.extent_dword = extent_dword;
+	push.max_groups   = max_groups;
 
 	// Earlier commands may have written the arguments.
 	vk::MemoryBarrier before {};

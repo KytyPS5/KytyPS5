@@ -1582,6 +1582,9 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		auto*    index_addr =
 		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 		uint32_t max_instance_count = buffer[3];
+		// TODO: words 4 and 5 are the address of one object id per instance
+		// (AgcDcbDrawIndexMultiInstanced). Every instance gets VGT_OBJECT_ID's id instead, which a
+		// pixel shader that reads the object id sees as wrong for all instances but those it matches.
 		uint32_t instance_count     = buffer[6];
 		uint32_t flags              = buffer[7];
 
@@ -1644,10 +1647,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
-	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3.
+	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 4 also
+	// holds the draw index destination, enabled by bit 31.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
+	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
+	    (buffer[3] & (1u << 31u)) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;

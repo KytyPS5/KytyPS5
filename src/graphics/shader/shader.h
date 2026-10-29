@@ -233,6 +233,9 @@ struct ShaderPixelInputInfo {
 	bool                                           flat_aliases_copied = false;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
+	// DB_SHADER_CONTROL.CONSERVATIVE_Z_EXPORT: 0 any depth, 1 never above the interpolated depth,
+	// 2 never below it. The host can then keep its early depth tests.
+	uint8_t                                        ps_conservative_z_export     = 0;
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;

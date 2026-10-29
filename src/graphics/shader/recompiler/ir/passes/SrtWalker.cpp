@@ -689,11 +689,32 @@ bool RawReadAddress(ValueOpcode op, const MemoryInfo& mem, uint64_t low, uint64_
 	return true;
 }
 
+struct FailedRead {
+	bool        remember = false;
+	bool        valid    = false;
+	uint64_t    address  = 0;
+	const void* reader   = nullptr;
+	const void* userdata = nullptr;
+};
+thread_local FailedRead t_failed_read;
+
 bool ReadRawWord(const SrtRuntime& runtime, bool vector, uint64_t address, uint64_t& result) {
 	uint32_t   word   = 0;
 	const auto reader = vector ? runtime.read_specialization_memory : runtime.read_memory;
 	if (reader != nullptr) {
+		auto& failed = t_failed_read;
+		if (failed.valid && failed.address == address &&
+		    failed.reader == reinterpret_cast<const void*>(reader) &&
+		    failed.userdata == runtime.userdata) {
+			return false;
+		}
 		if (!reader(runtime.userdata, address, {&word, 1})) {
+			if (failed.remember) {
+				failed.valid    = true;
+				failed.address  = address;
+				failed.reader   = reinterpret_cast<const void*>(reader);
+				failed.userdata = runtime.userdata;
+			}
 			return false;
 		}
 	} else {
@@ -705,6 +726,14 @@ bool ReadRawWord(const SrtRuntime& runtime, bool vector, uint64_t address, uint6
 }
 
 } // namespace
+
+void SrtRememberFailedReads(bool remember) {
+	t_failed_read.remember = remember;
+}
+
+void SrtForgetFailedRead() {
+	t_failed_read = {};
+}
 
 void CompileSrtWalker(ResourcePlan& program) {
 	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
@@ -2516,12 +2545,14 @@ void SrtTraceSession::EndQuery(bool result, uint32_t flat_size, const std::vecto
 
 uint32_t SrtTraceSession::Reader(const SrtRuntime& runtime, bool vector) {
 	const auto bits = vector ? SrtTrace::ReaderVector : 0u;
-	if (runtime.read_memory == m_runtime.read_memory && runtime.userdata == m_runtime.userdata) {
-		return bits;
-	}
+	// The same function can serve both readers; the clean one is the one a later replay can lack,
+	// so a read that either could have made is recorded as the clean one.
 	if (runtime.read_memory == m_clean_runtime.read_memory &&
 	    runtime.userdata == m_clean_runtime.userdata) {
 		return bits | SrtTrace::ReaderClean;
+	}
+	if (runtime.read_memory == m_runtime.read_memory && runtime.userdata == m_runtime.userdata) {
+		return bits;
 	}
 	Unsupported();
 	return bits;

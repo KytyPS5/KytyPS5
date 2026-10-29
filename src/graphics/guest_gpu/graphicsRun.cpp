@@ -3,7 +3,9 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/hash.h"
 #include "common/logging/log.h"
+#include "loader/timer.h"
 #include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -40,6 +42,110 @@ namespace Libs::Graphics {
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
+struct CurrentSubmission {
+	std::span<const uint32_t>              commands;
+	uint64_t                               hash         = 0;
+	uint64_t                               submitted_ms = 0;
+	std::shared_ptr<std::vector<uint32_t>> snapshot;
+};
+static thread_local CurrentSubmission g_current_submission;
+
+static uint64_t HashCommands(std::span<const uint32_t> commands) {
+	uint64_t hash = commands.size();
+	for (const auto dword: commands) {
+		hash = Common::Fnv64Step(hash, dword);
+	}
+	return hash;
+}
+
+// KYTY_TRACE_DCB=1: when each command buffer is submitted, started, finished and first changed by
+// the guest, and when the end-of-pipe labels are added and completed (stderr, in ms).
+namespace {
+
+struct DcbTrace {
+	uint64_t           id;
+	const uint32_t*    data;
+	size_t             size;
+	uint64_t           hash;
+	uint64_t           submitted;
+	int                state    = 0; // 0 queued, 1 started, 2 finished
+	bool               reported = false;
+};
+
+bool TraceDcbEnabled() {
+	static const bool enabled = std::getenv("KYTY_TRACE_DCB") != nullptr;
+	return enabled;
+}
+
+std::mutex                              g_dcb_trace_mutex;
+std::vector<std::unique_ptr<DcbTrace>>  g_dcb_traces;
+uint64_t                                g_dcb_trace_next = 1;
+thread_local uint64_t                   g_trace_current_id = 0;
+
+uint64_t TraceNowMs() {
+	return static_cast<uint64_t>(Loader::Timer::GetTimeMs());
+}
+
+void DcbTraceMonitor() {
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		std::lock_guard lock(g_dcb_trace_mutex);
+		for (auto& t: g_dcb_traces) {
+			if (t->reported || t->state == 2) {
+				continue;
+			}
+			if (HashCommands({t->data, t->size}) != t->hash) {
+				t->reported = true;
+				fprintf(stderr, "[dcb] #%" PRIu64 " (%zu dw at 0x%" PRIx64 ") CHANGED by the guest at %" PRIu64
+				                " ms: %s, submitted %" PRIu64 " ms ago\n",
+				        t->id, t->size, reinterpret_cast<uint64_t>(t->data), TraceNowMs(),
+				        t->state == 0 ? "not started" : "started, not finished",
+				        TraceNowMs() - t->submitted);
+			}
+		}
+	}
+}
+
+uint64_t TraceDcbSubmitted(std::span<const uint32_t> commands, uint64_t hash) {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		Common::DebugCounters::SetEnabled(true);
+		std::thread(DcbTraceMonitor).detach();
+	});
+	std::lock_guard lock(g_dcb_trace_mutex);
+	const auto id = g_dcb_trace_next++;
+	g_dcb_traces.push_back(std::make_unique<DcbTrace>(
+	    DcbTrace {id, commands.data(), commands.size(), hash, TraceNowMs()}));
+	fprintf(stderr, "[dcb] #%" PRIu64 " submitted: %zu dw at 0x%" PRIx64 " t=%" PRIu64 " ms\n", id,
+	        commands.size(), reinterpret_cast<uint64_t>(commands.data()), TraceNowMs());
+	return id;
+}
+
+void TraceDcbState(uint64_t id, int state) {
+	std::lock_guard lock(g_dcb_trace_mutex);
+	for (auto& t: g_dcb_traces) {
+		if (t->id == id) {
+			t->state = state;
+			using C = Common::DebugCounters::Counter;
+			fprintf(stderr,
+			        "[dcb] #%" PRIu64 " %s t=%" PRIu64 " ms (so far: texture %" PRIu64 " MB, buffer %" PRIu64
+			        " MB, gpu waits %" PRIu64 " for %" PRIu64 " ms, draws %" PRIu64 ", dispatches %" PRIu64 ")\n",
+			        id, state == 1 ? "started" : "finished", TraceNowMs(),
+			        Common::DebugCounters::Get(C::TextureUploadBytes) >> 20u,
+			        Common::DebugCounters::Get(C::BufferUploadBytes) >> 20u,
+			        Common::DebugCounters::Get(C::GpuWaits),
+			        Common::DebugCounters::Get(C::GpuWaitNs) / 1000000u,
+			        Common::DebugCounters::Get(C::Draws), Common::DebugCounters::Get(C::Dispatches));
+			if (state == 2) {
+				// Keep the list short: finished buffers are not watched.
+			}
+			return;
+		}
+	}
+}
+
+} // namespace
+
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
 struct DrawIndirectArgs {
@@ -529,6 +635,17 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	submission.commands_hash = HashCommands(submission.commands);
+	submission.submitted_ms  = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
+	if (TraceDcbEnabled() && submission.type != SubmissionType::SuspendPoint &&
+	    submission.type != SubmissionType::FlipPreparation) {
+		submission.trace_id = TraceDcbSubmitted(submission.commands, submission.commands_hash);
+	}
+	static const bool snapshot = std::getenv("KYTY_DCB_SNAPSHOT") != nullptr;
+	if (snapshot) {
+		submission.snapshot = std::make_shared<std::vector<uint32_t>>(submission.commands.begin(),
+		                                                              submission.commands.end());
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -675,8 +792,14 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	KYTY_TRACE_SCOPE("gpu", "ProcessSubmission");
+	g_current_submission = {submission.commands, submission.commands_hash, submission.submitted_ms,
+	                        submission.snapshot};
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
+	g_trace_current_id     = submission.trace_id;
+	if (first_slice && submission.trace_id != 0) {
+		TraceDcbState(submission.trace_id, 1);
+	}
 
 	if (first_slice) {
 		submission.started = true;
@@ -888,6 +1011,50 @@ static bool LeavesComputeChainOpen(uint32_t packet_header) {
 	}
 }
 
+namespace {
+
+// The last packets the command processor took, for the message of a failure: a desynchronised
+// stream shows which packet it started to differ after.
+struct RecentPacket {
+	uint32_t offset;
+	uint32_t header;
+	uint32_t total;
+	uint32_t pad;
+	uint64_t address;
+};
+thread_local RecentPacket g_recent_packets[24];
+thread_local uint32_t     g_recent_packet_count = 0;
+
+std::string RecentPacketsText() {
+	std::string text;
+	if (!g_current_submission.commands.empty()) {
+		const auto& submission = g_current_submission;
+		text += fmt::format("\n\t  submitted {} ms ago, {} dwords, commands {} since",
+		                    static_cast<uint64_t>(Loader::Timer::GetTimeMs()) - submission.submitted_ms,
+		                    submission.commands.size(),
+		                    submission.hash == HashCommands(submission.commands) ? "unchanged" : "CHANGED");
+		if (submission.snapshot != nullptr) {
+			uint32_t shown = 0;
+			for (size_t i = 0; i < submission.commands.size() && shown < 24; i++) {
+				if (submission.commands[i] != (*submission.snapshot)[i]) {
+					text += fmt::format("\n\t  dword 0x{:05x}: was 0x{:08x} now 0x{:08x}", i,
+					                    (*submission.snapshot)[i], submission.commands[i]);
+					shown++;
+				}
+			}
+		}
+	}
+	const auto  count = std::min<uint32_t>(g_recent_packet_count, 24);
+	for (uint32_t i = 0; i < count; i++) {
+		const auto& p = g_recent_packets[(g_recent_packet_count - count + i) % 24];
+		text += fmt::format("\n\t  off=0x{:05x}/0x{:05x} hdr=0x{:08x} at 0x{:x}", p.offset, p.total,
+		                    p.header, p.address);
+	}
+	return text;
+}
+
+} // namespace
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -906,6 +1073,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+		g_recent_packets[g_recent_packet_count++ % 24] = {total_dw - remaining_dw, packet_header,
+		                                                  total_dw, 0,
+		                                                  reinterpret_cast<uint64_t>(packet)};
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;
@@ -962,8 +1132,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
-			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
-			     total_dw - remaining_dw, packet_header);
+			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n\tbuffer at 0x%" PRIx64
+			     ", recent packets:%s\n",
+			     total_dw - remaining_dw, packet_header, reinterpret_cast<uint64_t>(packet - (total_dw - remaining_dw)),
+			     RecentPacketsText().c_str());
 		}
 
 		if (!KeepsWorkPending(packet)) {
@@ -984,7 +1156,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		// Whatever the packet prepared buffers for has been recorded by now.
 		m_renderer.GetBufferCache().SettleGpuWrites();
 		GetScheduler().SubmitIfDue(CommandScheduler::SubmitPoint::Packet);
-		EXIT_IF(packet_dw > remaining_dw);
+		if (packet_dw > remaining_dw) {
+			const auto offset = total_dw - remaining_dw;
+			EXIT("PM4 packet overruns its buffer: header=0x%08" PRIx32 " opcode=0x%02" PRIx32
+			     " packet_dw=%" PRIu64 " remaining_dw=%" PRIu64 " total_dw=%" PRIu64
+			     " offset=0x%05" PRIx64 "\n\twords: %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+			     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n\trecent packets:%s\n",
+			     packet_header, opcode, static_cast<uint64_t>(packet_dw),
+			     static_cast<uint64_t>(remaining_dw), static_cast<uint64_t>(total_dw),
+			     static_cast<uint64_t>(offset), packet[0], remaining_dw > 1 ? packet[1] : 0,
+			     remaining_dw > 2 ? packet[2] : 0, remaining_dw > 3 ? packet[3] : 0,
+			     remaining_dw > 4 ? packet[4] : 0, remaining_dw > 5 ? packet[5] : 0,
+			     RecentPacketsText().c_str());
+		}
 		if (execution.m_suspended) {
 			return;
 		}
@@ -1109,20 +1293,20 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+static void WriteIndirectDrawRegister(CommandProcessor& cp, uint32_t location, uint32_t value) {
+	if (location == Pm4::SH_NOP) {
+		return;
+	}
+	EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM || g_hw_sh_indirect_func[location] == nullptr);
+	g_hw_sh_indirect_func[location](cp, location, value);
+}
+
 static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters registers,
                                      uint32_t vertex_offset, uint32_t instance_offset,
                                      uint32_t first_index) {
-	const auto write = [&](uint32_t location, uint32_t value) {
-		if (location == Pm4::SH_NOP) {
-			return;
-		}
-		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
-		                     g_hw_sh_indirect_func[location] == nullptr);
-		g_hw_sh_indirect_func[location](cp, location, value);
-	};
-	write(registers.vertex_offset, vertex_offset);
-	write(registers.instance_offset, instance_offset);
-	write(registers.index_offset, first_index);
+	WriteIndirectDrawRegister(cp, registers.vertex_offset, vertex_offset);
+	WriteIndirectDrawRegister(cp, registers.instance_offset, instance_offset);
+	WriteIndirectDrawRegister(cp, registers.index_offset, first_index);
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
@@ -1154,6 +1338,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (GuestRange {args_address, args_size}.Valid() &&
 		    (executor.HasPendingWork() ||
 		     m_renderer.GetBufferCache().IsRegionGpuModified(args_address, args_size))) {
+			WriteIndirectDrawRegister(*this, registers.draw_index, 0);
 			const bool drawn =
 			    indexed ? DrawIndex({.index_count = m_index_buffer_size,
 			                         .index_addr  = reinterpret_cast<const void*>(m_index_base_addr),
@@ -1201,6 +1386,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
+		WriteIndirectDrawRegister(*this, registers.draw_index, i);
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
@@ -1524,7 +1710,19 @@ void CommandProcessor::WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t
 	                                  .interrupt         = interrupt,
 	                                  .interrupt_event   = m_interrupt_event_id,
 	                                  .interrupt_context = interrupt_context_id});
-	GetScheduler().DeferPriorityOperation([labels, serial] { labels->Complete(serial); });
+	if (TraceDcbEnabled()) {
+		fprintf(stderr, "[dcb] #%" PRIu64 " label add serial=%" PRIu64 " dst=0x%" PRIx64 " value=0x%" PRIx64
+		                " irq=%d ctx=%u t=%" PRIu64 " ms\n",
+		        g_trace_current_id, static_cast<uint64_t>(serial), reinterpret_cast<uint64_t>(dst), value,
+		        interrupt ? 1 : 0, interrupt_context_id, TraceNowMs());
+	}
+	GetScheduler().DeferPriorityOperation([labels, serial, id = g_trace_current_id] {
+		if (TraceDcbEnabled()) {
+			fprintf(stderr, "[dcb] #%" PRIu64 " label complete serial=%" PRIu64 " t=%" PRIu64 " ms\n", id,
+			        static_cast<uint64_t>(serial), TraceNowMs());
+		}
+		labels->Complete(serial);
+	});
 }
 
 uint32_t CommandProcessor::ReadLabel(const uint32_t* address) {

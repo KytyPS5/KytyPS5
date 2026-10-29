@@ -21,6 +21,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+thread_local TrackingRecovery* t_recovery = nullptr;
+
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
@@ -576,6 +578,10 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (t_recovery != nullptr) {
+			t_recovery->message = message;
+			std::longjmp(t_recovery->point, 1);
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -4148,6 +4154,10 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 }
 
 } // namespace
+
+void SetTrackingRecovery(TrackingRecovery* recovery) noexcept {
+	t_recovery = recovery;
+}
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
                     ShaderStageInputInfo input) {

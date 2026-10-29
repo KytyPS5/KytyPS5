@@ -977,9 +977,22 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
+			// The guest promises how the exported depth relates to the rasterized one.
+			if (state.input_info.pixel->ps_conservative_z_export == 1u) {
+				state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthLess);
+			} else if (state.input_info.pixel->ps_conservative_z_export == 2u) {
+				state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthGreater);
+			}
 		}
 		// Not with the depth-bounds test in the shader: early tests would write stencil and count
 		// occlusion for fragments the test then discards.
+		// KYTY_FAST_DEPTH_EXPORT=1 (not exact): a shader that exports depth and never discards gets
+		// early depth tests on the rasterized depth. A big shadow pass then skips hidden fragments
+		// instead of running the shader for each one (Spider-Man 2: about 2.5 times faster).
+		static const bool fast_depth_export = std::getenv("KYTY_FAST_DEPTH_EXPORT") != nullptr;
+		if (fast_depth_export && state.depth_variable != 0 && !state.input_info.pixel->ps_pixel_kill_enable) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		}
 		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable && !UsesDepthBounds(state)) {

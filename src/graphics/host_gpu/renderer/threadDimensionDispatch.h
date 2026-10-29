@@ -35,7 +35,13 @@ public:
 	// extent by any shader.
 	void Record(vk::CommandBuffer command, vk::Buffer args_buffer, uint64_t args_offset,
 	            std::array<uint32_t, 3> group_size, const Target& groups, const Target& extent,
-	            uint32_t extent_dword);
+	            uint32_t extent_dword, float max_groups = 0.0f);
+	// A copy of group counts that dispatches nothing when they ask for more than `max_groups` in
+	// all. Written to `groups`; the arguments are left as they are.
+	void RecordLimited(vk::CommandBuffer command, vk::Buffer args_buffer, uint64_t args_offset,
+	                   const Target& groups, const Target& unused_extent, float max_groups) {
+		Record(command, args_buffer, args_offset, {1u, 1u, 1u}, groups, unused_extent, 0u, max_groups);
+	}
 
 private:
 	GraphicContext&         m_graphics;

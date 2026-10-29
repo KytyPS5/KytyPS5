@@ -79,6 +79,7 @@ static void PrintUsage() {
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
+	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
@@ -206,6 +207,7 @@ static constexpr Flag FLAGS[] = {
     {"--vr", &ConfigOptions::vr_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
+    {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},

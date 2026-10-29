@@ -133,6 +133,10 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
+bool PsnEmulationEnabled() {
+	return g_config->psn_emulation_enabled;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }

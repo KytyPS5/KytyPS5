@@ -298,6 +298,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
+	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
 	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
@@ -533,6 +534,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
+	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
 	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();

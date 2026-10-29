@@ -407,6 +407,14 @@ private:
 	void               DisarmLazyReadback(Image& image);
 	void               FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images);
 	[[nodiscard]] static uint64_t ReadbackConsumerKey(const ImageInfo& info) noexcept;
+	// A render or depth target the GPU wrote is freed without its pixels ever reaching guest
+	// memory (the game changed its resolution and the replacement has another extent): its range
+	// is noted, so that a target created over that memory within a few frames is not initialized
+	// from the stale bytes the guest memory still holds, which only the target's first write
+	// would overwrite.
+	void                      NoteDiscardedTarget(ImageId id, const Image& image);
+	[[nodiscard]] static bool IsTargetImage(const Image& image) noexcept;
+	[[nodiscard]] bool        WasDiscardedTarget(const Image& image) const;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -432,6 +440,14 @@ private:
 	std::unordered_set<uint64_t>                      m_readback_consumers;
 	// The number of images read back lazily right now.
 	std::atomic<uint32_t>                             m_lazy_images {0};
+	struct DiscardedTarget {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	static constexpr size_t DiscardedTargetCount = 32;
+	std::array<DiscardedTarget, DiscardedTargetCount> m_discarded_targets {};
+	size_t                                            m_discarded_next = 0;
 	// Color image -> its depth copies, one per depth format (see FindDepthCopy).
 	std::unordered_map<ImageId, std::vector<ImageId>> m_depth_copies;
 	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).

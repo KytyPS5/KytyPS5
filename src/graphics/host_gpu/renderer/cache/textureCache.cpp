@@ -457,8 +457,43 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 }
 
 void TextureCache::FreeImage(ImageId id) {
-	m_slot_images[id].ClearGpuModified();
+	auto& image = m_slot_images[id];
+	if (image.IsGpuModified()) {
+		NoteDiscardedTarget(id, image);
+		// The stencil planes of a depth target are written with it.
+		for (const auto association: image.stencil_ids) {
+			NoteDiscardedTarget(association, m_slot_images[association]);
+		}
+	}
+	image.ClearGpuModified();
 	DeleteImage(id);
+}
+
+void TextureCache::NoteDiscardedTarget(ImageId id, const Image& image) {
+	// Images that are read back after every submission hold their pixels in guest memory.
+	if (!IsTargetImage(image) || image.info.data.Empty() || m_download_images.contains(id) ||
+	    m_readback_consumers.contains(ReadbackConsumerKey(image.info))) {
+		return;
+	}
+	m_discarded_targets[m_discarded_next] = {image.info.data.address, image.info.data.End(),
+	                                         m_gc_tick};
+	m_discarded_next                      = (m_discarded_next + 1) % DiscardedTargetCount;
+}
+
+bool TextureCache::IsTargetImage(const Image& image) noexcept {
+	// A stencil plane of a depth target is its own image.
+	return image.usage.render_target || image.info.IsDepth() ||
+	       image.info.pixel_format == vk::Format::eS8Uint;
+}
+
+bool TextureCache::WasDiscardedTarget(const Image& image) const {
+	constexpr uint64_t MaxAgeTicks = 4;
+	const auto         begin       = image.info.data.address;
+	const auto         end         = image.info.data.End();
+	return std::ranges::any_of(m_discarded_targets, [&](const DiscardedTarget& target) {
+		return target.end != 0 && target.begin <= begin && end <= target.end &&
+		       target.tick + MaxAgeTicks >= m_gc_tick;
+	});
 }
 
 void TextureCache::PinImage(ImageId id) {
@@ -1281,6 +1316,14 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	// A new render or depth target over memory the GPU rendered a target into a moment ago holds
+	// nothing the game wrote: reading the stale bytes (a full-resolution copy of guest memory
+	// and a detile pass per target) only delays the first write that replaces them.
+	if (upload && !image.IsBufferModified() && image.write_count == 0 && IsTargetImage(image) &&
+	    WasDiscardedTarget(image)) {
+		image.RefreshComplete();
+		return;
+	}
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);

@@ -682,6 +682,8 @@ if(BUILD_TESTING)
 	set_tests_properties(gpu_stall PROPERTIES TIMEOUT 30)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	# A push or query wrongly held by GpuStall hangs, so fail fast instead of at the default timeout.
+	set_tests_properties(audio_out2_port PROPERTIES TIMEOUT 60)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	# A submit or query wrongly held by GpuStall hangs, so fail fast instead of at the default timeout.
 	set_tests_properties(audio_out_timing PROPERTIES TIMEOUT 60)

@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -629,6 +630,10 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
+		// Waits out a long pipeline compile on every pass, not only on entry. A push already
+		// waiting for queue space would otherwise slip through mid-compile once the modelled queue
+		// drains by wall-clock time, and the context is looked up again after the wait.
+		Common::GpuStall::WaitWhileStalled();
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
 		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
 		// vibration/failed-open handle) has no downstream operation that can block this call.

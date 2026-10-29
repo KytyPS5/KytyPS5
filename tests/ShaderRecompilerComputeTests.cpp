@@ -1399,6 +1399,9 @@ struct TestCase {
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
   size_t storage_buffer_range_bytes = 0;
+  // Length the shader checks, when smaller than the bound range. Memory between the two is
+  // readable, so only the shader's own bounds check keeps it out.
+  size_t storage_buffer_shader_size_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
@@ -18418,7 +18421,10 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
-        shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(
+            test.storage_buffer_shader_size_bytes != 0
+                ? std::min<vk::DeviceSize>(info.range, test.storage_buffer_shader_size_bytes)
+                : info.range);
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -33385,6 +33391,42 @@ TestCase ScalarMemoryLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// A scalar buffer load past the length the shader checks must read zero, now that the load
+// runs unguarded and the bounds check only selects. The whole backing buffer stays bound and
+// holds non-zero canaries, so only the select keeps those out of the result.
+TestCase ScalarBufferLoadPastCheckedRange(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 guest_dwords = 10u;
+  constexpr u32 backing_dwords = 16u;
+  constexpr u32 canary_base = 0xc0de0000u;
+  constexpr std::array byte_offsets{36u, 40u, 44u, 60u};
+  constexpr u32 first_dst = 20u;
+  TestCase test;
+  test.name = wave_size == 64u ? "ScalarBufferLoadPastCheckedRangeWave64"
+                               : "ScalarBufferLoadPastCheckedRangeWave32";
+  auto &code = test.code;
+  code.push_back(EncodeSMovB32(0, InlineU32(0)));
+  for (u32 i = 0; i < byte_offsets.size(); ++i)
+    AppendSmemLoadOpcode(&code, 0x08, first_dst + i, byte_offsets[i]); // s_buffer_load_dword
+  for (u32 i = 0; i < byte_offsets.size(); ++i) AppendStoreSgpr(&code, first_dst + i, i);
+  AppendEnd(&code);
+  for (u32 i = 0; i < backing_dwords; ++i) test.initial.push_back(canary_base + i);
+  test.expected = test.initial;
+  for (u32 i = 0; i < byte_offsets.size(); ++i) {
+    const auto dword = byte_offsets[i] / 4u;
+    test.expected[i] = dword < guest_dwords ? canary_base + dword : 0u;
+  }
+  test.storage_buffer_shader_size_bytes = guest_dwords * 4u;
+  test.opcodes = {O::S_MOV_B32, O::S_BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarBufferOffsetAlignmentAndCarry() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -46652,6 +46694,8 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(std::move(test));
   }
   AddCase(ScalarMemoryLoadVariants);
+  cases.push_back(ScalarBufferLoadPastCheckedRange(32));
+  cases.push_back(ScalarBufferLoadPastCheckedRange(64));
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);

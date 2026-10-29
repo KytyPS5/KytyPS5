@@ -14626,6 +14626,57 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   CheckSpirvBinaryValidates(ordinary_result.spirv);
 }
 
+// True when some OpSelect picks an OpLoad result over a constant zero, which is how a load
+// guarded by a select reads.
+bool SpirvSelectGuardsLoad(const std::vector<uint32_t> &binary) {
+  constexpr size_t header_words = 5;
+  std::unordered_set<uint32_t> loads;
+  std::unordered_set<uint32_t> zeros;
+  std::vector<std::pair<uint32_t, uint32_t>> selects;
+  for (size_t pos = header_words; pos < binary.size();) {
+    const auto opcode = binary[pos] & 0xffffu;
+    const auto count = binary[pos] >> 16u;
+    if (count == 0u || pos + count > binary.size()) return false;
+    if (opcode == spv::OpLoad) loads.insert(binary[pos + 2]);
+    if (opcode == spv::OpConstant && count == 4u && binary[pos + 3] == 0u)
+      zeros.insert(binary[pos + 2]);
+    if (opcode == spv::OpSelect) selects.emplace_back(binary[pos + 4], binary[pos + 5]);
+    pos += count;
+  }
+  return std::ranges::any_of(selects, [&](const auto &select) {
+    return loads.contains(select.first) && zeros.contains(select.second);
+  });
+}
+
+// A scalar buffer load at a constant descriptor slot runs unguarded under robustBufferAccess
+// and selects zero when out of range, so it adds no branch or merge for the driver to compile.
+void TestNewShaderRecompilerScalarBufferLoadSelectsDefault() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x08, 12, 4),
+      0u, // s_buffer_load_dword s12, s[8:11], s0
+      EncodeVop1(0x01, 0, 12),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> user_data{};
+  user_data[8] = 0x2000u;
+  user_data[10] = 4u;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].scalar &&
+            !result.program.info.uses_dma,
+        "scalar buffer load did not stay in the buffer domain");
+  Check(SpirvSelectGuardsLoad(result.spirv),
+        "scalar buffer load was not guarded by a select of zero");
+  Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpPhi) == 0u &&
+            SpirvInstructionOpcodeCount(result.spirv, spv::OpSelectionMerge) == 0u &&
+            SpirvInstructionOpcodeCount(result.spirv, spv::OpBranchConditional) == 0u,
+        "scalar buffer load kept a branch around its bounds check");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
@@ -17385,6 +17436,7 @@ int main() {
   TestResourceTrackingRealDensePatching();
   TestDirectTranslationResetsAnalysisState();
   TestNewShaderRecompilerNativeBindingPlan();
+  TestNewShaderRecompilerScalarBufferLoadSelectsDefault();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestVop3F16InterpolationTranslation();

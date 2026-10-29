@@ -626,6 +626,33 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	                                     std::forward<Fn>(fn));
 }
 
+// How a guarded value is emitted. Branch runs the computation only when its condition holds.
+// Select runs it unconditionally and picks the result, which keeps the module free of control
+// flow that drivers are slow to compile. Select is only safe for a computation with no side
+// effects whose memory reads are safe at any index.
+enum class GuardStrategy { Branch, Select };
+
+// Result type of a guarded value with its component count, kept together so a call site states both.
+struct ValueShape {
+	uint32_t type;
+	uint32_t components;
+};
+
+// Emits fn() so that the result is its value when condition holds and default_value otherwise.
+template <typename Fn>
+uint32_t EmitGuardedValue(EmitterState& state, GuardStrategy strategy, uint32_t condition,
+                          ValueShape shape, uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) return fn();
+	if (strategy == GuardStrategy::Branch) {
+		return EmitValueOrDefaultIfCondition(state, condition, shape.type, default_value,
+		                                     std::forward<Fn>(fn));
+	}
+	// SPIR-V 1.3 selects a vector only with a bool vector condition, which no caller needs yet.
+	EXIT_IF(shape.components != 1u);
+	const auto value = fn();
+	return Select(state, shape.type, condition, value, default_value);
+}
+
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

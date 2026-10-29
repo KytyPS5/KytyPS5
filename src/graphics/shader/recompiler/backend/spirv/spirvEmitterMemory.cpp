@@ -1585,6 +1585,20 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
+// Picks how a load through a prepared buffer resource is guarded. robustBufferAccess makes any
+// index into a bound storage buffer safe to load, so such a load may run unguarded and be
+// selected afterwards. That holds only for a constant descriptor slot, because the device does
+// not bound a descriptor array index, and non_uniform marks a slot chosen by a GPU value.
+// Only scalar buffers qualify so far. Vector buffer loads also need indirect roots and coherent
+// pairs excluded, which this resource alone does not show.
+static GuardStrategy LoadGuardStrategy(const MemoryResourceAccess& resource) {
+	const bool coherent = (resource.memory_access & spv::MemoryAccessVolatileMask) != 0;
+	return resource.kind == IR::ResourceKind::ScalarBuffer && resource.object_pointer != 0u &&
+	               !resource.non_uniform && !coherent
+	           ? GuardStrategy::Select
+	           : GuardStrategy::Branch;
+}
+
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
@@ -1608,10 +1622,12 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
-	           }));
+	ctx.Define(inst, EmitGuardedValue(state, LoadGuardStrategy(access), condition,
+	                                  ValueShape {TypeU32(state), 1u}, ConstantU32(state, 0),
+	                                  [&]() {
+		                                  return EmitNative<spv::OpLoad, IR::Type::U32>(
+		                                      state, EmitMemoryElementPointer(state, access, element));
+	                                  }));
 }
 
 uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst) {

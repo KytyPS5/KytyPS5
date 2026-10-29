@@ -336,7 +336,7 @@ sudo dnf install -y \
   mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
   libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
   alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
-  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+  wayland-devel wayland-protocols-devel qt6-qtbase-devel renderdoc
 ```
 
 From the repository root, follow the launcher configure, build and install steps in

@@ -26,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
@@ -518,9 +519,40 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	}
 }
 
+// KYTY_INPUT_LOG=<file>: the player's key and gamepad button presses, one per line with the time
+// and the presented frame, to learn a route through a game from someone playing it.
+static void LogInput(const SDL_Event& event, uint64_t frame) {
+	static std::FILE* const file = [] {
+		const char* path = std::getenv("KYTY_INPUT_LOG");
+		return path != nullptr ? std::fopen(path, "a") : nullptr;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	const char* name = nullptr;
+	bool        down = false;
+	if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+	    event.key.repeat == 0) {
+		name = SDL_GetKeyName(event.key.key);
+		down = event.key.down;
+	} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	           event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+		name = SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
+		down = event.gbutton.down;
+	}
+	if (name == nullptr) {
+		return;
+	}
+	std::fprintf(file, "%llu ms frame %llu %s %s\n",
+	             static_cast<unsigned long long>(SDL_GetTicks()),
+	             static_cast<unsigned long long>(frame), name, down ? "down" : "up");
+	std::fflush(file);
+}
+
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	LogInput(*event, game.presented_frames.load(std::memory_order_relaxed));
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
 		switch (event->key.key) {
@@ -836,6 +868,12 @@ void WindowContext::Run() {
 	// KYTY_BENCH_LIVE=<file>: key names appended to the file, one per line, are tapped as they
 	// arrive, to steer a run from what its screenshots show.
 	const char*   live_path = std::getenv("KYTY_BENCH_LIVE");
+	// KYTY_BENCH_LIVE_HOLD_MS: how long a tap holds the key (default 150): a game that draws a
+	// frame in half a second sees nothing of a shorter one.
+	const uint64_t live_hold_ms = [] {
+		const char* value = std::getenv("KYTY_BENCH_LIVE_HOLD_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {150};
+	}();
 	std::ifstream live_file;
 	std::string   live_partial;
 	std::vector<std::pair<uint64_t, std::string>> live_releases; // key ups due at a time
@@ -914,14 +952,25 @@ void WindowContext::Run() {
 						live_partial += c;
 						continue;
 					}
-					const auto key = live_partial;
+					// "KEY:MS" holds this tap MS milliseconds: a fast menu repeats a long hold.
+					auto key  = live_partial;
+					auto hold = live_hold_ms;
 					live_partial.clear();
+					if (const auto colon = key.rfind(':'); colon != std::string::npos && colon + 1 < key.size()) {
+						hold = std::strtoull(key.c_str() + colon + 1, nullptr, 10);
+						key.resize(colon);
+					}
 					if (key.empty() || SDL_GetKeyFromName(key.c_str()) == SDLK_UNKNOWN) continue;
 					std::printf("Bench: %llu ms, live tap %s\n", static_cast<unsigned long long>(live_now), key.c_str());
 					std::fflush(stdout);
+					if (SDL_GetKeyFromName(key.c_str()) == SDLK_F1) {
+						// As on the keyboard: F1 captures the next frame in RenderDoc.
+						RenderDocRequestCapture();
+						continue;
+					}
 					HostInputKey(SDL_GetKeyFromName(key.c_str()), true);
-					live_releases.emplace_back(live_now + 150, key);
-					live_next_ms = live_now + 400; // one tap at a time, as a player would
+					live_releases.emplace_back(live_now + hold, key);
+					live_next_ms = live_now + hold + 250; // one tap at a time, as a player would
 					break;
 				}
 			}

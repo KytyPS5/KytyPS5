@@ -621,6 +621,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
+	device_features.pipelineStatisticsQuery  = supported_features2.features.pipelineStatisticsQuery;
 	device_features.depthBounds                           = caps.depth_bounds ? VK_TRUE : VK_FALSE;
 	device_features.depthClamp                            = caps.depth_clamp ? VK_TRUE : VK_FALSE;
 	device_features.drawIndirectFirstInstance = caps.draw_indirect_first_instance ? VK_TRUE : VK_FALSE;

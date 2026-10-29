@@ -51269,6 +51269,57 @@ int RunSelectedCases(int argc, char **argv) {
                 vulkan.RuntimeRenderer().GetGraphics().host.capabilities.float16 ? "yes" : "no");
     return g_wrong_results.empty() ? 0 : 1;
   }
+  if (argc == 3 && std::strcmp(argv[1], "--translate-pixel") == 0) {
+    // A guest pixel shader binary (KYTY_DUMP_SHADERS writes them): how many lane reads with a
+    // constant lane and how many wave reductions are left once it is translated. A lane read can
+    // name a lane that a fragment wave lacks on the host.
+    std::FILE *file = std::fopen(argv[2], "rb");
+    if (file == nullptr) {
+      std::printf("ShaderRecompilerComputeTests: cannot open %s\n", argv[2]);
+      return 1;
+    }
+    std::vector<u32> code(1u << 20u);
+    code.resize(std::fread(code.data(), sizeof(u32), code.size(), file));
+    std::fclose(file);
+    const auto user_data = MakeNativeUserData(nullptr);
+    ShaderPixelInputInfo pixel_info{};
+    pixel_info.input_num = 1;
+    pixel_info.ps_system_input_base = 2;
+    VulkanHarness vulkan;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Pixel;
+    options.host = vulkan.Host();
+    options.input_info.pixel = &pixel_info;
+    options.user_data = user_data;
+    const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    uint32_t lane_reads = 0, reductions = 0;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadLane &&
+            inst.Arg(1).Resolve().IsImmediate() && !inst.Uses().empty()) {
+          lane_reads++;
+        }
+        reductions += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::WaveReduceU32 ? 1u : 0u;
+      }
+    }
+    std::printf("ShaderRecompilerComputeTests: %s: %u constant-lane reads, %u wave reductions\n",
+                argv[2], lane_reads, reductions);
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--graphics-cases") == 0) {
+    // The graphics cases whose name contains the text.
+    VulkanHarness vulkan;
+    uint32_t run = 0;
+    for (const auto &test : MakeGraphicsCases()) {
+      if (std::string_view(test.name).find(argv[2]) != std::string_view::npos) {
+        RunGraphicsCase(&vulkan, test);
+        run++;
+      }
+    }
+    std::printf("ShaderRecompilerComputeTests: %u graphics cases matching \"%s\" run, %zu wrong\n",
+                run, argv[2], g_wrong_results.size());
+    return g_wrong_results.empty() ? 0 : 1;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : MakeCases()) {

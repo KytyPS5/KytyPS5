@@ -540,6 +540,19 @@ void CommandScheduler::StartGpuProfile() {
 		info.queryCount = ProfileBlocks * ProfileBlockQueries;
 		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_profile_pool),
 		                     "create the GPU profile query pool");
+		vk::QueryPoolCreateInfo occ {};
+		occ.queryType  = vk::QueryType::eOcclusion;
+		occ.queryCount = ProfileBlocks * ProfileBlockQueries / 2;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&occ, nullptr, &m_profile_occ),
+		                     "create the GPU profile occlusion pool");
+		vk::QueryPoolCreateInfo stats {};
+		stats.queryType          = vk::QueryType::ePipelineStatistics;
+		stats.queryCount         = ProfileBlocks * ProfileBlockQueries / 2;
+		stats.pipelineStatistics = vk::QueryPipelineStatisticFlagBits::eInputAssemblyPrimitives |
+		                           vk::QueryPipelineStatisticFlagBits::eClippingPrimitives |
+		                           vk::QueryPipelineStatisticFlagBits::eFragmentShaderInvocations;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&stats, nullptr, &m_profile_stats),
+		                     "create the GPU profile statistics pool");
 	}
 	// A block still in flight is skipped this time: the profile loses those spans.
 	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
@@ -553,6 +566,12 @@ void CommandScheduler::StartGpuProfile() {
 	m_command.Handle().resetQueryPool(m_profile_pool,
 	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries,
 	                                  ProfileBlockQueries);
+	m_command.Handle().resetQueryPool(m_profile_occ,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2,
+	                                  ProfileBlockQueries / 2);
+	m_command.Handle().resetQueryPool(m_profile_stats,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2,
+	                                  ProfileBlockQueries / 2);
 }
 
 void CommandScheduler::GpuProfileBegin() {
@@ -561,12 +580,16 @@ void CommandScheduler::GpuProfileBegin() {
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
 	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
 	                                      block.used);
+	m_command.Handle().beginQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
+	m_command.Handle().beginQuery(m_profile_stats, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
 	block.used++;
 }
 
 void CommandScheduler::GpuProfileEnd(uint64_t key) {
 	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
 	if ((block.used & 1u) == 0u || block.used + 1 > ProfileBlockQueries) return;
+	m_command.Handle().endQuery(m_profile_stats, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
+	m_command.Handle().endQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
 	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
 	                                      block.used);
@@ -594,7 +617,15 @@ void CommandScheduler::CollectGpuProfile(uint64_t tick) {
 			                                          count * sizeof(uint64_t), stamps.data(),
 			                                          sizeof(uint64_t), vk::QueryResultFlagBits::e64) ==
 			    vk::Result::eSuccess) {
+				std::vector<uint64_t> samples(block.keys.size());
+				(void)m_graphics.device.getQueryPoolResults(m_profile_occ, index * ProfileBlockQueries / 2, static_cast<uint32_t>(samples.size()),
+				                                      samples.size() * sizeof(uint64_t), samples.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+				std::vector<std::array<uint64_t, 3>> st(block.keys.size());
+				(void)m_graphics.device.getQueryPoolResults(m_profile_stats, index * ProfileBlockQueries / 2, static_cast<uint32_t>(st.size()),
+				                                      st.size() * sizeof(st[0]), st.data(), sizeof(st[0]), vk::QueryResultFlagBits::e64);
 				for (size_t i = 0; i < block.keys.size(); i++) {
+					for (int k = 0; k < 3; k++) m_profile_stat_totals[block.keys[i]][k] += st[i][k];
+					m_profile_samples[block.keys[i]] += samples[i];
 					if (stamps[2 * i + 1] < stamps[2 * i]) continue;
 					auto& total = m_profile_totals[block.keys[i]];
 					total.first += static_cast<double>(stamps[2 * i + 1] - stamps[2 * i]) * period;
@@ -614,11 +645,13 @@ void CommandScheduler::CollectGpuProfile(uint64_t tick) {
 			for (size_t i = 0; i < std::min<size_t>(top.size(), 25); i++) {
 				const auto key = top[i].second;
 				const auto& total = m_profile_totals[key];
-				std::printf("GPUPROF %5.1f%% %8.1f ms %7llu calls %6.1f us/call  a %016llx b %016llx\n", 100.0 * total.first / sum,
-				            total.first / 1e6, (unsigned long long)total.second, total.first / 1e3 / static_cast<double>(total.second),
+				std::printf("GPUPROF %5.1f%% %8.1f ms %7llu calls %6.1f us/call  passing samples/call %.0f prims/call %.0f clipped/call %.0f fsinv/call %.0f a %016llx b %016llx\n", 100.0 * total.first / sum,
+				            total.first / 1e6, (unsigned long long)total.second, total.first / 1e3 / static_cast<double>(total.second), static_cast<double>(m_profile_samples[key]) / static_cast<double>(total.second), static_cast<double>(m_profile_stat_totals[key][0]) / static_cast<double>(total.second), static_cast<double>(m_profile_stat_totals[key][1]) / static_cast<double>(total.second), static_cast<double>(m_profile_stat_totals[key][2]) / static_cast<double>(total.second),
 				            (unsigned long long)name(key >> 32u), (unsigned long long)name(key & 0xffffffffu));
 			}
 			m_profile_totals.clear();
+			m_profile_samples.clear();
+			m_profile_stat_totals.clear();
 		}
 	}
 }

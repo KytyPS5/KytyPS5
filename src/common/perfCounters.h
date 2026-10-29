@@ -35,6 +35,8 @@ enum class Counter : uint8_t {
 	GpuMicroseconds,   // host GPU time of the command buffers that completed (KYTY_GPU_TIME)
 	HostArgsDraws,     // indirect draws whose arguments the host GPU reads (copied, behind barriers)
 	CpuArgsDraws,      // indirect draws whose arguments the CPU reads
+	AudioUnderruns,    // audio output blocks that found the host stream empty
+	AudioDrops,        // host audio queues emptied because they did not drain for 200 ms
 	Count,
 };
 
@@ -83,6 +85,8 @@ using Gauges                       = std::array<int64_t, GaugeCount>;
 		case Counter::GpuMicroseconds: return "gpu_us";
 		case Counter::HostArgsDraws: return "host_args_draws";
 		case Counter::CpuArgsDraws: return "cpu_args_draws";
+		case Counter::AudioUnderruns: return "audio_underruns";
+		case Counter::AudioDrops: return "audio_drops";
 		case Counter::Count: break;
 	}
 	return "?";

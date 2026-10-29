@@ -498,6 +498,10 @@ void Initialize() {
 	state->start_ns = NowNs();
 	state->screenshot_ns =
 	    static_cast<uint64_t>(Config::GetTraceScreenshotSeconds()) * 1'000'000'000;
+	// KYTY_TRACE_SCREENSHOT_MS=<ms> replaces the seconds: to catch a glitch of a frame or two.
+	if (const char* ms = std::getenv("KYTY_TRACE_SCREENSHOT_MS"); ms != nullptr) {
+		state->screenshot_ns = static_cast<uint64_t>(std::strtoull(ms, nullptr, 10)) * 1'000'000;
+	}
 	state->hang_ns = static_cast<uint64_t>(Config::GetTraceHangSeconds()) * 1'000'000'000;
 	state->frames  = std::fopen((dir / "frames.csv").string().c_str(), "wb");
 	if (state->frames != nullptr) {
@@ -627,7 +631,7 @@ std::string KeyedText() {
 } // namespace
 
 void AddKeyed(const char* table, uint64_t key, uint64_t value) {
-	if (!Enabled()) {
+	if (!ProfEnabled()) {
 		return;
 	}
 	std::lock_guard lock(g_keyed_mutex);

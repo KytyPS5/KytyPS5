@@ -167,6 +167,10 @@ private:
 		std::vector<uint64_t>                       keys;
 	};
 	vk::QueryPool                                m_profile_pool = nullptr;
+	vk::QueryPool                                m_profile_occ = nullptr;
+	vk::QueryPool                                m_profile_stats = nullptr;
+	std::unordered_map<uint64_t, std::array<uint64_t, 3>> m_profile_stat_totals;
+	std::unordered_map<uint64_t, uint64_t>       m_profile_samples;
 	std::array<ProfileBlock, ProfileBlocks>      m_profile_blocks {};
 	uint32_t                                     m_profile_block = 0;
 	std::deque<uint32_t>                         m_profile_pending;

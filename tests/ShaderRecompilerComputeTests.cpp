@@ -22023,6 +22023,9 @@ private:
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    // The emulator requires robustBufferAccess, and shaders may load out of bounds under it.
+    Require("VulkanHarness", "dispatch", available_features.robustBufferAccess == true,
+            "robustBufferAccess is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -22162,6 +22165,8 @@ private:
     conditional_rendering.pNext = &robustness2;
     device_info.pNext = &conditional_rendering;
     vk::PhysicalDeviceFeatures device_features{};
+    // Matches the emulator device. Only version 1 is enabled, the guarantee shaders rely on.
+    device_features.robustBufferAccess = true;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;

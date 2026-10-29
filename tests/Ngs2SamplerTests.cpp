@@ -29,16 +29,21 @@ struct Fixture {
 		rack.type                 = type;
 		voice.rack                = &rack;
 		SetCapacity(4);
-		struct Setup {
+		Setup(rate, channels);
+		voice.state = Ngs2VoicePlayState::Playing;
+	}
+
+	// Sends the sampler setup control, as a game does before a voice plays a new sound.
+	void Setup(uint32_t rate, uint32_t channels) {
+		struct SetupParam {
 			Ngs2VoiceParamHeader header {40, 0, 0x10000000};
 			Ngs2WaveformFormat   format;
 			uint32_t             flags = 0, reserved = 0;
 		} setup;
-		setup.header.id = type == Ngs2RackType::Sampler ? 0x10000000 : 0x40010000;
+		setup.header.id = rack.type == Ngs2RackType::Sampler ? 0x10000000 : 0x40010000;
 		setup.format    = {0x12, channels, rate};
 		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
 		      "sampler setup failed");
-		voice.state = Ngs2VoicePlayState::Playing;
 	}
 
 	void SetCapacity(uint32_t capacity) {
@@ -939,6 +944,90 @@ void TestPitchClamps() {
 	      "pitch was not clamped to four times playback speed");
 }
 
+// Id of a sampler rack voice control. The rack id 0x1000 sits in the high half.
+constexpr uint32_t SamplerControlId(uint32_t control) {
+	return 0x10000000u | control;
+}
+
+// The sampler voice peak meter control as a game sends it.
+struct PeakMeterControl {
+	Ngs2VoiceParamHeader      header {static_cast<uint16_t>(sizeof(Ngs2VoiceParamHeader) +
+	                                                        sizeof(Ngs2SamplerPeakMeterParam)),
+	                                  0, SamplerControlId(NGS2_SAMPLER_CONTROL_PEAK_METER)};
+	Ngs2SamplerPeakMeterParam param {1, 0};
+};
+
+// The peak is the largest absolute sample, kept above full scale, with NaN and infinite samples
+// skipped so the game always gets a usable level.
+void TestPeakHeightHelper() {
+	constexpr float infinity = std::numeric_limits<float>::infinity();
+	constexpr float quiet_nan = std::numeric_limits<float>::quiet_NaN();
+	const float     mixed_signs[] = {0.25f, -0.75f, 0.5f};
+	const float     loud[] = {1.5f, -2.0f};
+	const float     invalid[] = {0.125f, quiet_nan, infinity, -infinity, -0.0625f};
+	const float     only_invalid[] = {quiet_nan, infinity, -infinity};
+	Check(Ngs2PeakHeight({}) == 0.0f, "an empty buffer has a nonzero peak");
+	Check(Ngs2PeakHeight(mixed_signs) == 0.75f, "the peak ignored the sign of a sample");
+	Check(Ngs2PeakHeight(loud) == 2.0f, "the peak was clamped at full scale");
+	Check(Ngs2PeakHeight(invalid) == 0.125f, "a NaN or infinite sample reached the peak");
+	Check(Ngs2PeakHeight(only_invalid) == 0.0f, "a buffer of only invalid samples has a nonzero peak");
+}
+
+// While the peak meter is enabled, the voice state reports the largest absolute sample of the
+// last render, and 0 otherwise.
+void TestPeakMeter() {
+	Fixture       f(48000);
+	const int16_t pcm[] = {8192, -16384, 4096, 0, 2048, 0};
+	f.Queue(pcm, 6, 0);
+	PeakMeterControl meter;
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "peak height reported while the peak meter is disabled");
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Render(2);
+	Check(f.State().peak_height == 0.125f, "peak height is not the largest sample of the render");
+	// A deferred sampler setup can leave the voice without channels, so it renders nothing.
+	const auto channels = f.voice.channels;
+	f.voice.channels    = 0;
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "peak height kept while the voice rendered nothing");
+	f.voice.channels = channels;
+	f.Render(2);
+	Check(f.State().peak_height == 0.0625f, "peak height kept a sample from an earlier render");
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "peak height not cleared once the voice ran out of data");
+	meter.param.enable_flag = 0;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK &&
+	          f.State().peak_height == 0.0f,
+	      "disabling the peak meter did not clear the peak height");
+}
+
+// A killed or reset voice and a voice set up again start a new sound, so neither reports the old
+// sound's peak. Setup also turns the meter off, as it clears the voice's other controls.
+void TestPeakMeterReset() {
+	Fixture       f(48000);
+	const int16_t pcm[] = {16384, 0, 16384, 0, 16384, 0};
+	PeakMeterControl meter;
+	const auto voice = reinterpret_cast<uintptr_t>(&f.voice);
+	Check(Ngs2VoiceControl(voice, &meter.header) == OK, "peak meter control failed");
+	f.Queue(pcm, 6, 0);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "peak meter did not report the first render's peak");
+	f.voice.SetEvent(8);
+	Check(f.State().peak_height == 0.0f, "a reset voice kept the previous sound's peak");
+	f.voice.SetEvent(1);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "the peak meter stopped after a voice reset");
+	f.Setup(48000, 1);
+	Check(f.voice.peak_height == 0.0f, "a voice set up again kept the previous sound's peak");
+	f.voice.state = Ngs2VoicePlayState::Playing;
+	f.Queue(pcm, 6, 0);
+	f.Render(2);
+	// The voice must really have rendered, so the 0 below comes from the disabled meter.
+	Check(f.voice.samples[0] == 0.5f, "the voice did not render after setup");
+	Check(f.State().peak_height == 0.0f, "setup left the peak meter enabled");
+}
+
 void TestStarvationAndPause() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {16384, 8192};
@@ -1794,6 +1883,69 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+// The meter takes the largest sample across every channel, so a stereo voice whose right channel
+// is louder reports the right channel's peak. Reading the peak doesn't reset it.
+void TestPeakMeterStereo() {
+	Fixture f(48000, 2);
+	// Interleaved left and right frames. The right channel holds the largest sample.
+	const int16_t    pcm[] = {1024, 4096, -2048, -16384};
+	PeakMeterControl meter;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Queue(pcm, 2, 0);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "the peak missed the louder right channel");
+	Check(f.State().peak_height == 0.5f, "reading the peak reset it");
+}
+
+// The meter reads the voice after its filters. Alternating samples sit at the Nyquist frequency,
+// far above a 100 Hz low-pass cutoff, so the reported peak is the small filtered level and not the
+// source's 0.5.
+void TestPeakMeterAfterFilter() {
+	constexpr uint32_t   frames = 64;
+	constexpr float      cutoff = 100.0f;
+	constexpr int16_t    level  = 16384;
+	Fixture              f(48000);
+	PeakMeterControl     meter;
+	std::vector<int16_t> pcm(frames);
+	for (uint32_t i = 0; i < frames; ++i) {
+		pcm[i] = i % 2 == 0 ? level : static_cast<int16_t>(-level);
+	}
+	SetLowPass(f, cutoff);
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Queue(pcm.data(), frames, 0);
+	f.Render(frames);
+	const float filtered_peak = Ngs2PeakHeight(f.voice.samples);
+	Check(filtered_peak < 0.25f, "the low-pass filter did not attenuate the test signal");
+	Check(filtered_peak > 0.0f, "the low-pass filter silenced the test signal");
+	Check(f.State().peak_height == filtered_peak, "the peak was not read after the filter");
+}
+
+// A voice that stops rendering, here by pausing, reports 0 from its next render, since the meter
+// holds no peak from an earlier grain.
+void TestPeakMeterPaused() {
+	Fixture          f(48000);
+	const int16_t    pcm[] = {16384, 0, 16384, 0};
+	PeakMeterControl meter;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &meter.header) == OK,
+	      "peak meter control failed");
+	f.Queue(pcm, 4, 0);
+	f.Render(2);
+	Check(f.State().peak_height == 0.5f, "the paused-voice fixture did not report its peak");
+	f.voice.SetEvent(16);
+	f.Render(2);
+	Check(f.State().peak_height == 0.0f, "a paused voice kept its last peak");
+}
+
+// The default sampler rack asks for the one peak meter block seen in games.
+void TestPeakMeterDefaultBlocks() {
+	Ngs2RackOptionUnion defaults {};
+	Ngs2FillDefaultRackOption(0x1000, &defaults);
+	Check(defaults.sampler.num_peak_meter_blocks == NGS2_SAMPLER_PEAK_METER_BLOCKS,
+	      "the default sampler rack does not ask for one peak meter block");
+}
+
 } // namespace
 
 int main() {
@@ -1832,6 +1984,13 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestPeakHeightHelper();
+	TestPeakMeter();
+	TestPeakMeterReset();
+	TestPeakMeterStereo();
+	TestPeakMeterAfterFilter();
+	TestPeakMeterPaused();
+	TestPeakMeterDefaultBlocks();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

@@ -18,6 +18,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <numbers>
+#include <span>
 #include <vector>
 
 #include "libatrac9.h"
@@ -44,6 +45,11 @@ constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
     static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
+// Sampler voice control that turns the voice's peak meter on or off.
+constexpr uint32_t NGS2_SAMPLER_CONTROL_PEAK_METER = 9;
+// Peak meter blocks a sampler rack asks for in every game seen so far (Trails in the Sky 1st
+// Chapter). What other counts mean is unknown, so the meter always reports each grain's peak.
+constexpr uint32_t NGS2_SAMPLER_PEAK_METER_BLOCKS = 1;
 
 struct Ngs2SystemOption {
 	size_t    size                     = 0;
@@ -437,6 +443,13 @@ static_assert(offsetof(Ngs2SamplerFilterParam, type) == 8 &&
               offsetof(Ngs2SamplerFilterParam, channel_mask) == 16 &&
               offsetof(Ngs2SamplerFilterParam, frequency) == 24);
 
+// The SDK's SamplerVoicePeakMeterParam, sent after the control header.
+struct Ngs2SamplerPeakMeterParam {
+	uint32_t enable_flag;
+	uint32_t reserved;
+};
+static_assert(sizeof(Ngs2SamplerPeakMeterParam) == 8);
+
 struct Ngs2SamplerFilter {
 	struct History {
 		double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
@@ -590,6 +603,10 @@ struct Ngs2VoiceInternal {
 	uint32_t                            skip_remaining     = 0;
 	const uint8_t*                      waveform_end       = nullptr;
 	std::vector<Ngs2SamplerFilter>      filters;
+	// The sampler voice peak meter. While it is enabled, peak_height holds the largest absolute
+	// sample of the voice's last render, which the sampler voice state reports.
+	bool                                peak_meter_enabled = false;
+	float                               peak_height        = 0.0f;
 
 	const uint8_t* WaveformData() const {
 		if (blocks.empty()) {
@@ -644,6 +661,9 @@ struct Ngs2VoiceInternal {
 			matrix.clear();
 		}
 		filters.clear();
+		// Setup starts a new sound and clears the voice's other controls above, so the peak meter
+		// starts off too. SetEvent(4) has already cleared the last peak.
+		peak_meter_enabled = false;
 	}
 
 	void ClearWaveformBlocks() {
@@ -780,7 +800,12 @@ struct Ngs2VoiceInternal {
 				}
 				break;
 			case 4:
-			case 8: state = Ngs2VoicePlayState::Empty; break;
+			case 8:
+				state = Ngs2VoicePlayState::Empty;
+				// A killed or reset voice starts its next sound from silence, so its last peak must
+				// not be reported before it renders again.
+				peak_height = 0.0f;
+				break;
 			case 16:
 				if (state == Ngs2VoicePlayState::Playing) {
 					state = Ngs2VoicePlayState::Paused;
@@ -1025,7 +1050,8 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 			option->sampler.max_atrac9_decoders                = 256;
 			option->sampler.max_atrac9_channel_works           = 256;
 			option->sampler.max_ajm_atrac9_decoders            = 0;
-			option->sampler.num_peak_meter_blocks              = 8;
+			// The SDK's default is not known, so this uses the only count seen in a game.
+			option->sampler.num_peak_meter_blocks              = NGS2_SAMPLER_PEAK_METER_BLOCKS;
 			break;
 		case 0x2000:
 			option->submixer.rack_option.size                   = sizeof(Ngs2SubmixerRackOption);
@@ -1323,6 +1349,14 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SamplerRackOption));
 			rack->option.sampler = *reinterpret_cast<const Ngs2SamplerRackOption*>(option);
 			rack->type           = Ngs2RackType::Sampler;
+			// Another count could mean a longer window, shorter sub-blocks or an allocation size.
+			// Logging it lets the first game that asks for one show which.
+			if (rack->option.sampler.num_peak_meter_blocks != NGS2_SAMPLER_PEAK_METER_BLOCKS) {
+				Log::WriteToConsoleAndLog(fmt::sprintf(
+				    "warning: NGS2 sampler rack asks for %u peak meter blocks, using 1 (the peak of "
+				    "the last grain only)\n",
+				    rack->option.sampler.num_peak_meter_blocks));
+			}
 			break;
 		case 0x2000:
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SubmixerRackOption));
@@ -1800,11 +1834,28 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	voice.has_samples = output != 0;
 }
 
+// Largest absolute sample in a voice's rendered output, as a linear level where 1.0 is full scale.
+// Levels above full scale are kept, since float sources and resonant filters can exceed it. A NaN
+// or infinite sample from a misbehaving filter is skipped, so the game never gets a peak it can't
+// turn into a level.
+static float Ngs2PeakHeight(std::span<const float> samples) {
+	float peak = 0.0f;
+	for (const float sample: samples) {
+		if (std::isfinite(sample)) {
+			peak = std::max(peak, std::abs(sample));
+		}
+	}
+	return peak;
+}
+
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
 		return;
 	}
+	// A voice renders silence unless it plays below, including one left without channels by a
+	// deferred sampler setup.
+	voice.peak_height = 0.0f;
 	if (voice.channels == 0) {
 		voice.has_samples = false;
 		voice.rendered    = true;
@@ -1824,6 +1875,14 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					filter.Process(voice.samples, voice.channels, grain);
 					voice.has_samples = true;
 				}
+			}
+			// The meter reads the voice after its filters and before port volume and routing, so
+			// muting or attenuating a port doesn't hide the voice's level. It should move after
+			// the envelope once envelopes are implemented. The peak is already 0 from the start of
+			// this render when the voice produced nothing.
+			if (voice.peak_meter_enabled && voice.has_samples) {
+				voice.peak_height =
+				    Ngs2PeakHeight({voice.Buffer(0, grain), size_t {grain} * voice.channels});
 			}
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
 			    voice.frame_cursor == voice.frame_samples &&
@@ -2572,6 +2631,19 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							    static_cast<double>(voice->sample_rate) * clamped_ratio * 4294967296.0));
 						break;
 					}
+					case NGS2_SAMPLER_CONTROL_PEAK_METER: {
+						EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler);
+						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
+						                                        sizeof(Ngs2SamplerPeakMeterParam));
+						const auto& meter =
+						    *reinterpret_cast<const Ngs2SamplerPeakMeterParam*>(param + 1);
+						voice->peak_meter_enabled = meter.enable_flag != 0;
+						if (!voice->peak_meter_enabled) {
+							voice->peak_height = 0.0f;
+						}
+						LOGF("\t peak meter enable flag = 0x%08" PRIx32 "\n", meter.enable_flag);
+						break;
+					}
 					case 0xa: {
 						EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler);
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
@@ -2735,7 +2807,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 
 			auto* sampler                = reinterpret_cast<Ngs2SamplerVoiceState*>(state);
 			sampler->envelope_height     = 1.0f;
-			sampler->peak_height         = 0.0f;
+			sampler->peak_height         = voice->peak_meter_enabled ? voice->peak_height : 0.0f;
 			sampler->reserved            = 0;
 			Ngs2FillSamplerState(*voice, *sampler);
 			break;

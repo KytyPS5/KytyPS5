@@ -59,6 +59,12 @@ public:
 
 	// GPU thread: runs the commands other threads sent (SendCommand), as between packets.
 	void ServiceCommands() { ProcessCommands(); }
+	// GPU thread: writes the labels the host GPU completed, as a wait that needs them does.
+	void ServiceLabels() {
+		if (m_labels_ready.load(std::memory_order_acquire)) {
+			WriteCompletedLabels();
+		}
+	}
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

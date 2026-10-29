@@ -1810,7 +1810,11 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
 
 	cp.SetFlip(f);
-	cp.Flip();
+	// A Gen5 flip (AgcDcbSetFlip) raises the end-of-pipe interrupt when the game raised none of its
+	// own since the last flip: Minecraft waits for it on its graphics event queue while a flip is
+	// pending, and Contra, which has its own, would count a second one per frame and reuse buffers
+	// the GPU still reads.
+	cp.Flip(!cp.HadInterruptSinceFlip());
 	return 5;
 }
 

@@ -141,6 +141,9 @@ void GuestGpu::WriteCompletedLabels() {
 			buffer_cache.RecordGpuThreadWrite(label.address, label.bytes);
 			m_labels->Retire(label);
 		}
+		if (label.action) {
+			label.action();
+		}
 		if (label.interrupt) {
 			m_renderer.TriggerInterrupt(label.interrupt_event, label.interrupt_context);
 		}
@@ -1287,11 +1290,18 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
+// A GPU-thread wait for a flip writes the completed labels this often.
+constexpr uint32_t FlipWaitSliceMicros = 1000;
+
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	// The flips complete with the labels this thread writes (CompleteFlipInOrder).
+	while (!m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
+	                                              static_cast<int>(display_buffer_index),
+	                                              FlipWaitSliceMicros)) {
+		m_renderer.GetGpu().ServiceLabels();
+	}
 }
 
 template <typename T>
@@ -1360,6 +1370,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					              value >> 16u);
 					NoteGuestWrite(dst, uint64_t {value >> 16u} * sizeof(uint32_t));
 					if (with_interrupt) {
+						m_interrupt_since_flip = true;
 						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 					}
 					return;
@@ -1492,6 +1503,7 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 void CommandProcessor::WriteLabelAtEndOfPipe(void* dst, uint64_t value, uint32_t bytes,
                                              bool interrupt, uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
+	m_interrupt_since_flip |= interrupt;
 	if (!GuestGpu::IsGpuThread()) {
 		// Without the GPU thread nothing writes the label later (a processor of a test).
 		if (bytes != 0) {
@@ -1606,7 +1618,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 }
 
-void CommandProcessor::Flip() {
+void CommandProcessor::Flip(bool interrupt) {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1615,11 +1627,8 @@ void CommandProcessor::Flip() {
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request, frame = m_renderer.GetGpu().RecordFrame()] {
-		    renderer.GetVideoOut().CompleteFlip(request);
-		    frame->FrameCompleted();
-	    });
+	m_interrupt_since_flip = false;
+	CompleteFlipInOrder(request, interrupt);
 	GetScheduler().Flush();
 }
 
@@ -1638,11 +1647,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request, frame = m_renderer.GetGpu().RecordFrame()] {
-		    renderer.GetVideoOut().CompleteFlip(request);
-		    frame->FrameCompleted();
-	    });
+	CompleteFlipInOrder(request, false);
 	GetScheduler().Flush();
 }
 
@@ -1667,14 +1672,36 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request,
-	     frame = m_renderer.GetGpu().RecordFrame()] {
-		    renderer.GetVideoOut().CompleteFlip(request);
-		    renderer.TriggerInterrupt(event_id, 0);
-		    frame->FrameCompleted();
-	    });
+	CompleteFlipInOrder(request, true);
 	GetScheduler().Flush();
+}
+
+// The flip completes, with the interrupt, in order with the labels recorded before it (a label
+// with the completion as its action): a game reuses what those labels are in once it sees the
+// flip done, and Minecraft keeps them in its command buffers.
+void CommandProcessor::CompleteFlipInOrder(uint64_t request, bool interrupt) {
+	auto frame = m_renderer.GetGpu().RecordFrame();
+	if (!GuestGpu::IsGpuThread()) {
+		// Without the GPU thread nothing writes the labels (a processor of a test).
+		GetScheduler().DeferPriorityOperation(
+		    [&renderer = m_renderer, request, frame, event_id = interrupt ? m_interrupt_event_id : -1] {
+			    renderer.GetVideoOut().CompleteFlip(request);
+			    if (event_id >= 0) {
+				    renderer.TriggerInterrupt(event_id, 0);
+			    }
+			    frame->FrameCompleted();
+		    });
+		return;
+	}
+	const auto& labels = m_renderer.GetLabels();
+	const auto  serial = labels->Add(
+        {.interrupt       = interrupt,
+         .interrupt_event = m_interrupt_event_id,
+         .action = [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); }});
+	GetScheduler().DeferPriorityOperation([labels, serial, frame] {
+		labels->Complete(serial);
+		frame->FrameCompleted();
+	});
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

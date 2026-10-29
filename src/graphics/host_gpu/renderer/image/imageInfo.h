@@ -57,8 +57,8 @@ struct ImageSubresourceRange {
 struct ImageMipInfo {
 	// Guest mip chains run backwards within each layer or volume block-slice.
 	// Tail levels share an offset and use tail_x/tail_y within that block.
-	uint64_t offset                                 = 0;
-	uint64_t size                                   = 0;
+	uint64_t offset = 0;
+	uint64_t size   = 0;
 	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
@@ -76,10 +76,10 @@ struct ImageInfo {
 	GuestRange                   stencil;
 	ImageMetadataInfo            metadata;
 	bool                         htile_initial_clear = true;
-	vk::Format                   pixel_format     = vk::Format::eUndefined;
-	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;
-	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
-	vk::Extent3D                 extent           = {1, 1, 1};
+	vk::Format                   pixel_format        = vk::Format::eUndefined;
+	Prospero::BufferFormat       guest_format        = Prospero::BufferFormat::kInvalid;
+	Prospero::ImageType          type                = Prospero::ImageType::kColor2D;
+	vk::Extent3D                 extent              = {1, 1, 1};
 	ImageSubresources            resources;
 	uint32_t                     pitch           = 0;
 	uint32_t                     bytes_per_block = 0;
@@ -103,10 +103,8 @@ struct ImageInfo {
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
 		if (bgra16) return ColorTransform::SwapBgra16;
 		switch (guest_format) {
-			case Prospero::BufferFormat::k10_11_11Float:
-				return ColorTransform::Reverse10_11_11;
-			case Prospero::BufferFormat::k2_10_10_10UNorm:
-				return ColorTransform::Rotate2_10_10_10;
+			case Prospero::BufferFormat::k10_11_11Float: return ColorTransform::Reverse10_11_11;
+			case Prospero::BufferFormat::k2_10_10_10UNorm: return ColorTransform::Rotate2_10_10_10;
 			default: return ColorTransform::None;
 		}
 	}
@@ -203,6 +201,9 @@ FindDepthFormatPolicy(Prospero::DepthFormat depth_format) noexcept {
 
 [[nodiscard]] inline constexpr const DepthFormatPolicy*
 FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
+	if (guest_format == Prospero::BufferFormat::k32FloatClamp) {
+		guest_format = Prospero::BufferFormat::k32Float;
+	}
 	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
 		if (policy.guest_format == guest_format) {
 			return &policy;
@@ -382,7 +383,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 [[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint64_t clear_words,
                                                  vk::ClearColorValue& clear) {
 	vk::ClearColorValue next {};
-	const auto packed = static_cast<uint32_t>(clear_words);
+	const auto          packed = static_cast<uint32_t>(clear_words);
 	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
 	const auto srgb8  = [](uint32_t value) {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
@@ -392,7 +393,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		return static_cast<float>(value & 0xffffu) / 65535.0f;
 	};
 	const auto float16 = [](uint32_t value) {
-		const auto sign = (value & 0x8000u) << 16u;
+		const auto sign     = (value & 0x8000u) << 16u;
 		const auto exponent = (value >> 10u) & 0x1fu;
 		const auto mantissa = value & 0x3ffu;
 		if (exponent == 0) {
@@ -412,17 +413,13 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[2] = float16(static_cast<uint32_t>(clear_words >> 32u));
 			next.float32[3] = float16(static_cast<uint32_t>(clear_words >> 48u));
 			[[fallthrough]];
-		case vk::Format::eR16G16Sfloat:
-			next.float32[1] = float16(packed >> 16u);
-			[[fallthrough]];
+		case vk::Format::eR16G16Sfloat: next.float32[1] = float16(packed >> 16u); [[fallthrough]];
 		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
 		case vk::Format::eR16G16B16A16Unorm:
 			next.float32[2] = unorm16(clear_words >> 32u);
 			next.float32[3] = unorm16(clear_words >> 48u);
 			[[fallthrough]];
-		case vk::Format::eR16G16Unorm:
-			next.float32[1] = unorm16(packed >> 16u);
-			[[fallthrough]];
+		case vk::Format::eR16G16Unorm: next.float32[1] = unorm16(packed >> 16u); [[fallthrough]];
 		case vk::Format::eR16Unorm: next.float32[0] = unorm16(packed); break;
 		case vk::Format::eR16G16B16A16Uint:
 			for (uint32_t i = 0; i < 4; i++) {

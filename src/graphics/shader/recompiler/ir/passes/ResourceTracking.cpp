@@ -32,13 +32,17 @@ constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 // value and every value reaching it through Phi arms, each once, in depth-first order.
 std::vector<Value> PhiWeb(Value value) {
 	std::vector<Value> web;
+	// A set for instructions: inlined calls merge registers in Phi webs of thousands of nodes.
+	std::unordered_set<const Inst*> seen;
 	std::vector<Value> pending {value};
 	while (!pending.empty()) {
 		const auto current = pending.back().Resolve();
 		pending.pop_back();
-		if (std::ranges::find(web, current) != web.end()) continue;
-		web.push_back(current);
 		const auto* phi = current.TryInstruction();
+		if (phi != nullptr ? !seen.insert(phi).second
+		                   : std::ranges::find(web, current) != web.end())
+			continue;
+		web.push_back(current);
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) continue;
 		for (size_t arm = 0; arm < phi->NumArgs(); ++arm)
 			pending.push_back(phi->Arg(arm));
@@ -498,8 +502,11 @@ public:
 		}
 		ForwardPrivateLds();
 		FoldBoundedLoopSelectors();
+		// The planning passes add no memory operations, but dead code elimination removes some.
+		m_memory_index_uses.clear();
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
+		m_memory_index_uses.clear();
 		PlanIndirectDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {

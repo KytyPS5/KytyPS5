@@ -1,10 +1,13 @@
 #include "common/gpuStall.h"
 
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
+#include <utility>
 
 namespace Common::GpuStall {
 
@@ -17,6 +20,9 @@ struct State {
 	Clock::duration threshold = GPU_STALL_AUDIO_HOLD_THRESHOLD;
 	bool            enabled   = false;
 	uint32_t        waiters   = 0;
+	// When the first submit of the current stall was held, so a stall that held several audio
+	// threads is counted once.
+	std::optional<Clock::time_point> first_hold;
 };
 
 // Built on first use, so a Scope or audio push during static initialization finds it ready. It is
@@ -79,14 +85,25 @@ Scope::Scope(): m_start(Clock::now()) {
 }
 
 Scope::~Scope() {
-	auto& state = GetState();
+	auto&                            state = GetState();
+	std::optional<Clock::time_point> stall_first_hold;
 	{
 		LockGuard lock(state.mutex);
 		state.tracker.End(m_start);
-		g_active_scopes.fetch_sub(1, std::memory_order_relaxed);
+		// Overlapping Scopes make one stall, which ends with the last of them.
+		if (g_active_scopes.fetch_sub(1, std::memory_order_relaxed) == 1) {
+			stall_first_hold = std::exchange(state.first_hold, std::nullopt);
+		}
 		t_owned_scopes--;
 	}
 	state.released.SignalAll();
+	if (stall_first_hold.has_value()) {
+		const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    Clock::now() - *stall_first_hold);
+		DebugCounters::Add(DebugCounters::Counter::AudioHolds);
+		DebugCounters::Add(DebugCounters::Counter::AudioHoldNs,
+		                   static_cast<uint64_t>(held_ns.count()));
+	}
 }
 
 namespace {
@@ -108,6 +125,9 @@ bool HoldWhileStalled() {
 				held       = true;
 				hold_start = Clock::now();
 				state.waiters++;
+				if (!state.first_hold.has_value()) {
+					state.first_hold = hold_start;
+				}
 			}
 			state.released.Wait(&state.mutex);
 		}

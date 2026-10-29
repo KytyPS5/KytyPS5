@@ -1,3 +1,4 @@
+#include "common/debugCounters.h"
 #include "common/gpuStall.h"
 
 #include <atomic>
@@ -6,6 +7,7 @@
 #include <cstdlib>
 #include <memory>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -177,6 +179,52 @@ void TestResumedFromHold() {
   Check(cleared, "a call with no stall reported resuming from a hold");
 }
 
+// Starts the given number of waiter threads during a stall and waits until all are parked.
+std::vector<std::thread> StartParkedWaiters(uint32_t count) {
+  std::vector<std::thread> waiters;
+  for (uint32_t waiter = 0; waiter < count; ++waiter)
+    waiters.emplace_back([] { Common::GpuStall::WaitWhileStalled(); });
+  const auto park_deadline = Clock::now() + kParkLimit;
+  while (Common::GpuStall::WaiterCount() < count && Clock::now() < park_deadline)
+    std::this_thread::yield();
+  Check(Common::GpuStall::WaiterCount() == count, "waiters did not park during the stall");
+  return waiters;
+}
+
+// Holds are counted once per stall, however many audio threads waited, and only when one did.
+// Overlapping Scopes form a single stall.
+void TestHoldCounters() {
+  using Common::DebugCounters::Counter;
+  const auto holds = [] { return Common::DebugCounters::Get(Counter::AudioHolds); };
+  Common::DebugCounters::SetEnabled(true);
+  Common::GpuStall::Configure(true, milliseconds(0));
+  const auto before = holds();
+  const auto held_ns_before = Common::DebugCounters::Get(Counter::AudioHoldNs);
+  {
+    auto scope = std::make_unique<Common::GpuStall::Scope>();
+    auto waiters = StartParkedWaiters(2);
+    scope.reset();
+    for (auto &waiter : waiters) waiter.join();
+  }
+  Check(holds() == before + 1, "one stall holding two threads was not counted once");
+  Check(Common::DebugCounters::Get(Counter::AudioHoldNs) > held_ns_before,
+        "a counted hold added no held time");
+  { Common::GpuStall::Scope scope; }
+  Check(holds() == before + 1, "a stall that held nothing was counted");
+  {
+    auto outer = std::make_unique<Common::GpuStall::Scope>();
+    auto inner = std::make_unique<Common::GpuStall::Scope>();
+    auto waiters = StartParkedWaiters(1);
+    inner.reset();
+    Check(holds() == before + 1, "a stall was counted before its last Scope ended");
+    outer.reset();
+    for (auto &waiter : waiters) waiter.join();
+  }
+  Check(holds() == before + 2, "overlapping Scopes were not counted as one stall");
+  Common::GpuStall::Configure(false);
+  Common::DebugCounters::SetEnabled(false);
+}
+
 } // namespace
 
 int main() {
@@ -191,6 +239,7 @@ int main() {
   TestScopeEndReleasesWaiter();
   TestDisableReleasesWaiter();
   TestResumedFromHold();
+  TestHoldCounters();
   std::puts("GpuStallTests: all cases passed");
   return 0;
 }

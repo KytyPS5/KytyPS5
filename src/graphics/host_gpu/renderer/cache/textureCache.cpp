@@ -1258,7 +1258,8 @@ ImageId TextureCache::MaterializeStencilStorage(ImageId id, const ImageDesc& des
 	RefreshImage(id);
 	const auto color_id = InsertImage(desc.info);
 	CopyStencilStorage(m_slot_images[depth_id], m_slot_images[color_id], range, false);
-	m_slot_images[color_id].stencil_storage = true;
+	m_slot_images[color_id].stencil_storage      = true;
+	m_slot_images[color_id].stencil_subresources = range;
 	FreeImage(id);
 	return color_id;
 }
@@ -1292,7 +1293,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		// Publish its bytes back to the stencil aspect before restoring the association.
 		if (record.stencil_storage) {
 			RefreshImage(association);
-			CopyStencilStorage(depth, record, depth.stencil_subresources, true);
+			CopyStencilStorage(depth, record, record.stencil_subresources, true);
 			record.stencil_storage = false;
 		}
 

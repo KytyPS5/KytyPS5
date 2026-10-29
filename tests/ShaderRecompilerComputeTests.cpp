@@ -17747,6 +17747,16 @@ public:
         TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), storage_id,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, value);
         RenderExecutorTestAccess::ResetBindings(executor);
+        // A new association may request a wider range than this storage image held.
+        // Publish exactly the original range, then restore the fixture's view.
+        const auto original_range = texture_cache.GetImage(depth_id).stencil_subresources;
+        Require(name, "storage retains original stencil range",
+                texture_cache.GetImage(storage_id).stencil_subresources == original_range,
+                "storage alias lost its original subresource range");
+        texture_cache.GetImage(depth_id).stencil_subresources.layer_count = 2;
+        TextureCacheTestAccess::AssociateStencil(texture_cache, depth_id, depth.info.stencil);
+        texture_cache.GetImage(depth_id).stencil_subresources = original_range;
+        TextureCacheTestAccess::AssociateStencil(texture_cache, depth_id, depth.info.stencil);
         (void)texture_cache.FindDepthTarget(depth_id, depth);
         auto result = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
         texture_cache.GetImage(depth_id).Download(stencil_copies, result.buffer, 0, 8);

@@ -1523,6 +1523,8 @@ int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
 
 int DbgExitIfHandler(const char *, const char *, int) { return 1; }
 
+int DbgNotImplementedHandler(const char *, const char *, int) { return 1; }
+
 void DbgExit(int) { std::abort(); }
 
 } // namespace Common

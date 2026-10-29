@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -989,6 +990,10 @@ int KYTY_SYSV_ABI AudioOutSetVolume(int handle, uint32_t flag, int* vol) {
 }
 
 int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
+	// Waits out a long pipeline compile before anything else, so a game that paces its scenes
+	// by audio does not run ahead of its frozen frames. Holding first also means a port closed
+	// during the wait is seen as invalid below.
+	Common::GpuStall::WaitWhileStalled();
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(param == nullptr);
@@ -1013,6 +1018,8 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 }
 
 int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr) {
+	// Held first for the same reason as AudioOutOutputs.
+	Common::GpuStall::WaitWhileStalled();
 	// EXIT_NOT_IMPLEMENTED(ptr == nullptr);
 
 	Audio::OutputParam params[1];

@@ -198,6 +198,10 @@ public:
 	// Bindless table bindings that keep binding the image without looking it up again (see
 	// TextureCache::PinImage()).
 	uint32_t         table_pins         = 0;
+	// The pages whose access is watched while the image is read back lazily (see
+	// TextureCache::ArmLazyReadback()); both zero while it is not.
+	uint64_t         readback_begin     = 0;
+	uint64_t         readback_end       = 0;
 	// The texture cache's version counter of the image's slot (see StateChanged()); null outside
 	// a texture cache.
 	std::atomic<uint32_t>* version = nullptr;

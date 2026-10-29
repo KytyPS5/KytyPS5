@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -15,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -36,6 +38,11 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+// Smallest GPU-written linear image (in bytes) that is only written back to guest memory once
+// the guest CPU touched it. Reading back after every submission costs time proportional to the
+// size (PPSA30528 writes about ten 4K storage images per frame, 300 MB of readback that no CPU
+// code ever reads); below this size the readback is cheaper than watching the pages.
+constexpr uint64_t LazyReadbackBytes = 256 * 1024;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -351,6 +358,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	DisarmLazyReadback(image);
 	ReleaseDepthCopies(id);
 	ReleaseDepthFeedbackCopy(id);
 	if (image.depth_id) {
@@ -600,7 +608,96 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	                     info.extent.depth * info.resources.layers;
 	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
 	                   : m_readback_linear_images) {
+		if (!info.IsTiled() && info.data.size >= LazyReadbackBytes &&
+		    !m_readback_consumers.contains(ReadbackConsumerKey(info))) {
+			ArmLazyReadback(image);
+			return;
+		}
 		m_download_images.insert(id);
+	}
+}
+
+uint64_t TextureCache::ReadbackConsumerKey(const ImageInfo& info) noexcept {
+	return info.data.address ^ (info.data.size * 0x9e3779b97f4a7c15ull);
+}
+
+void TextureCache::ArmLazyReadback(Image& image) {
+	if (image.readback_begin != 0) {
+		return;
+	}
+	const auto begin     = Common::AlignDown(image.info.data.address, TRACKER_PAGE_SIZE);
+	const auto end       = Common::AlignUp(image.info.data.End(), TRACKER_PAGE_SIZE);
+	image.readback_begin = begin;
+	image.readback_end   = end;
+	m_lazy_images.fetch_add(1, std::memory_order_relaxed);
+	m_page_manager.UpdatePageWatchers<true, true>(begin, end - begin);
+}
+
+void TextureCache::DisarmLazyReadback(Image& image) {
+	if (image.readback_begin == 0) {
+		return;
+	}
+	const auto begin     = image.readback_begin;
+	const auto end       = image.readback_end;
+	image.readback_begin = 0;
+	image.readback_end   = 0;
+	m_lazy_images.fetch_sub(1, std::memory_order_relaxed);
+	m_page_manager.UpdatePageWatchers<false, true>(begin, end - begin);
+}
+
+void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
+	if (m_lazy_images.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::vector<std::pair<ImageId, uint64_t>> armed;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		ForEachImageInRegion(page_begin, page_end - page_begin, [&](ImageId id, Image& image) {
+			if (image.readback_begin != 0 && image.readback_begin < address + size &&
+			    address < image.readback_end) {
+				armed.emplace_back(id, image.serial);
+			}
+		});
+	}
+	if (armed.empty()) {
+		return;
+	}
+	// Like the buffer readback of a faulting access: the GPU work the access needs was recorded
+	// before it, not after the backlog of operations queued since.
+	m_scheduler.Context().GetGpu().SendUrgentCommandSync(
+	    [this, armed = std::move(armed)] { FlushLazyImages(armed); });
+}
+
+void TextureCache::FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images) {
+	bool downloaded = false;
+	{
+		std::scoped_lock lock {m_lock};
+		for (const auto& [id, serial]: images) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || image->serial != serial || image->readback_begin == 0) {
+				continue;
+			}
+			// The CPU reads this image: from now on it is read back after every submission.
+			m_readback_consumers.insert(ReadbackConsumerKey(image->info));
+			if (image->IsGpuModified() && DownloadImageMemory(id)) {
+				downloaded = true;
+			}
+		}
+	}
+	if (downloaded) {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+	// The pages stay watched until the bytes are in guest memory: another thread faulting on
+	// them meanwhile waits for this command as well.
+	std::scoped_lock lock {m_lock};
+	for (const auto& [id, serial]: images) {
+		if (auto* image = m_slot_images.try_get(id); image != nullptr && image->serial == serial) {
+			DisarmLazyReadback(*image);
+		}
 	}
 }
 
@@ -2336,6 +2433,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
 		return;
 	}
+	FlushLazyReadback(address, size);
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);

@@ -20,8 +20,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -102,6 +104,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// Before the guest CPU reads or writes [address, address + size): writes the images read
+	// back lazily on those pages to guest memory (see ArmLazyReadback()) and watches them no
+	// longer. May wait for the GPU, so the caller holds none of the cache's locks.
+	void               FlushLazyReadback(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.
@@ -392,6 +398,15 @@ private:
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	[[nodiscard]] bool DownloadQueuedImages();
+	// Readback of a large linear image is lazy until the guest CPU touches its memory: the pages
+	// are access-watched while the GPU writes the image, and the first CPU access writes the
+	// image to guest memory and from then on reads it back after every submission, as for
+	// smaller images. Games that never read such an image (full-screen post-processing
+	// targets) then cost no readback at all.
+	void               ArmLazyReadback(Image& image);
+	void               DisarmLazyReadback(Image& image);
+	void               FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images);
+	[[nodiscard]] static uint64_t ReadbackConsumerKey(const ImageInfo& info) noexcept;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -412,6 +427,11 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
+	// Linear images the guest CPU read while they were read back lazily, by address and size:
+	// they are read back after every submission.
+	std::unordered_set<uint64_t>                      m_readback_consumers;
+	// The number of images read back lazily right now.
+	std::atomic<uint32_t>                             m_lazy_images {0};
 	// Color image -> its depth copies, one per depth format (see FindDepthCopy).
 	std::unordered_map<ImageId, std::vector<ImageId>> m_depth_copies;
 	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).

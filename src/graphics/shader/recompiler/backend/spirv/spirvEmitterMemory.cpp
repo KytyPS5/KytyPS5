@@ -383,13 +383,13 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 // Callers guard one element load through an already resolved resource, so this resource is
 // enough here. A slot picked by a GPU value is non_uniform, and a coherent pair is volatile.
 // The outer exec guard around a whole access still needs the indirect root and pair checks.
-// The profile can force branches.
+// Selecting is opt-in through the profile.
 static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
                                        const MemoryResourceAccess& resource) {
 	const bool robust_kind = resource.kind == IR::ResourceKind::Buffer ||
 	                         resource.kind == IR::ResourceKind::ScalarBuffer;
 	const bool coherent = (resource.memory_access & spv::MemoryAccessVolatileMask) != 0;
-	return !state.profile.branch_guarded_loads && robust_kind && resource.object_pointer != 0u &&
+	return state.profile.select_guarded_loads && robust_kind && resource.object_pointer != 0u &&
 	               !resource.non_uniform && !coherent
 	           ? GuardStrategy::Select
 	           : GuardStrategy::Branch;
@@ -402,8 +402,8 @@ static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
 static GuardStrategy AccessGuardStrategy(const EmitterState& state, const IR::MemoryInfo& mem) {
 	const bool direct_buffer = mem.kind == IR::ResourceKind::Buffer && !mem.coherent &&
 	                           state.program.info.buffers.at(mem.resource).indirect_root != mem.resource;
-	return !state.profile.branch_guarded_loads && direct_buffer ? GuardStrategy::Select
-	                                                            : GuardStrategy::Branch;
+	return state.profile.select_guarded_loads && direct_buffer ? GuardStrategy::Select
+	                                                           : GuardStrategy::Branch;
 }
 
 // Loads one dword through a prepared resource, or zero when it lies past the checked length.

@@ -1356,6 +1356,9 @@ struct BdaMapping {
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
 constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
+// Selected guarded loads are opt-in, so the tests of the select form ask for it.
+constexpr ShaderProfile SelectGuardedLoadsProfile{.maintenance8 = true,
+                                                  .select_guarded_loads = true};
 
 struct TestCase {
   const char *name = "";
@@ -33391,9 +33394,9 @@ TestCase ScalarMemoryLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-// A scalar buffer load past the length the shader checks must read zero, now that the load
-// runs unguarded and the bounds check only selects. The whole backing buffer stays bound and
-// holds non-zero canaries, so only the select keeps those out of the result.
+// When loads are selected, a scalar buffer load past the length the shader checks runs unguarded
+// and must read zero. The whole backing buffer stays bound and holds non-zero canaries, so only
+// the select keeps those out of the result.
 TestCase ScalarBufferLoadPastCheckedRange(u32 wave_size) {
   using O = ShaderOpcode;
   constexpr u32 guest_dwords = 10u;
@@ -33424,6 +33427,9 @@ TestCase ScalarBufferLoadPastCheckedRange(u32 wave_size) {
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
+  // The branch form merges each guarded load with a phi, so none proves the select form ran.
+  test.forbidden_spirv.push_back("OpPhi");
   return test;
 }
 
@@ -33999,8 +34005,8 @@ struct CheckedRangeLoad {
 
 // Loads for BufferLoadPastCheckedRange around a checked length of checked_bytes. The last checked
 // dword is canary + 15 = 0xc0de000f, so its top byte is 0xc0 and its top short is 0xc0de, which
-// the signed loads sign-extend. Wrapped addresses past 2 GiB now really load under
-// robustBufferAccess, so they also show the device survives them.
+// the signed loads sign-extend. When loads are selected, wrapped addresses past 2 GiB really
+// load under robustBufferAccess, so they also show the device survives them.
 std::vector<CheckedRangeLoad> CheckedRangeLoads(bool subword, u32 checked_bytes, u32 canary) {
   constexpr u32 ubyte = 0x08u, sbyte = 0x09u, ushort = 0x0au, sshort = 0x0bu;
   constexpr u32 dword = 0x0cu, dwordx4 = 0x0eu;
@@ -34017,10 +34023,10 @@ std::vector<CheckedRangeLoad> CheckedRangeLoads(bool subword, u32 checked_bytes,
           {dword, wrapped, {0u}},              {dword, high, {0u}}};
 }
 
-// Vector buffer loads past the length the shader checks must read zero, now that each element
-// load runs unguarded and its bounds check only selects. The whole backing buffer stays bound
-// and holds non-zero canaries, so only the select keeps those out. A dwordx4 that straddles
-// the end keeps its in-range dwords, and byte and short loads keep their in-range bytes.
+// When loads are selected, vector buffer loads past the length the shader checks run each element
+// unguarded and must read zero. The whole backing buffer stays bound and holds non-zero canaries,
+// so only the select keeps those out. A dwordx4 that straddles the end keeps its in-range dwords,
+// and byte and short loads keep their in-range bytes.
 TestCase BufferLoadPastCheckedRange(u32 wave_size, bool subword) {
   using O = ShaderOpcode;
   // Results land in dwords 0 to 9, below every dword the loads read, so lanes never race.
@@ -34055,6 +34061,9 @@ TestCase BufferLoadPastCheckedRange(u32 wave_size, bool subword) {
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
+  // The branch form merges each guarded load with a phi, so none proves the select form ran.
+  test.forbidden_spirv.push_back("OpPhi");
   return test;
 }
 
@@ -34099,6 +34108,7 @@ TestCase BufferFormatLoadPastCheckedRange(u32 wave_size) {
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
   return test;
 }
 
@@ -35024,9 +35034,10 @@ const char *BranchlessInactiveLoadName(u32 wave_size, u32 components, InactiveLa
   return names[row][column];
 }
 
-// A buffer load under EXEC now runs for every lane and selects zero for the inactive ones. Active
-// lanes must read their own dwords and inactive lanes keep their old registers, for one, two and
-// four components. Wave64 also checks a host subgroup of 32 whose lanes are all inactive.
+// When loads are selected, a buffer load under EXEC runs for every lane and selects zero for
+// the inactive ones. Active lanes must read their own dwords and inactive lanes keep their old
+// registers, for one, two and four components. Wave64 also checks a host subgroup of 32 whose
+// lanes are all inactive.
 TestCase BufferLoadBranchlessInactiveLanes(u32 wave_size, u32 components, InactiveLanes inactive) {
   using O = ShaderOpcode;
   constexpr u32 canary = 0xc0de0000u, untouched = 0xdeadbeefu, value_vgpr = 1u;
@@ -35058,10 +35069,15 @@ TestCase BufferLoadBranchlessInactiveLanes(u32 wave_size, u32 components, Inacti
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
+  // The branch form merges each guarded load with a phi, so none proves the select form ran.
+  test.forbidden_spirv.push_back("OpPhi");
   return test;
 }
 
 // The formatted load with EXEC cleared, run as wave64, which a host subgroup of 32 splits in two.
+// Its EXEC is a constant that folds away, so no guard is emitted and the select opt-in would
+// change nothing. It runs with the default profile.
 TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64() {
   constexpr u32 wave_size = 64u;
   auto test = BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress();

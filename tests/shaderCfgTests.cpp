@@ -14648,9 +14648,12 @@ bool SpirvSelectGuardsLoad(const std::vector<uint32_t> &binary) {
   });
 }
 
+// Selected guarded loads are opt-in, so the tests of the select form ask for it.
+constexpr ShaderRecompiler::Spirv::Profile SelectGuardedLoadsProfile{.select_guarded_loads = true};
+
 // A scalar buffer load at a constant descriptor slot runs unguarded under robustBufferAccess
 // and selects zero when out of range, so it adds no branch or merge for the driver to compile.
-void TestNewShaderRecompilerScalarBufferLoadSelectsDefault() {
+void TestNewShaderRecompilerScalarBufferLoadSelectsWhenOptedIn() {
   const uint32_t shader[] = {
       EncodeSmem0(0x08, 12, 4),
       0u, // s_buffer_load_dword s12, s[8:11], s0
@@ -14664,6 +14667,7 @@ void TestNewShaderRecompilerScalarBufferLoadSelectsDefault() {
   user_data[10] = 4u;
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data;
+  options.profile = &SelectGuardedLoadsProfile;
   const auto result = RecompileForTest(shader, options);
   Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].scalar &&
             !result.program.info.uses_dma,
@@ -14676,15 +14680,13 @@ void TestNewShaderRecompilerScalarBufferLoadSelectsDefault() {
         "scalar buffer load kept a branch around its bounds check");
   CheckSpirvBinaryValidates(result.spirv);
 
-  // The kill switch brings back the branch and its phi.
-  ShaderRecompiler::Spirv::Profile branched{};
-  branched.branch_guarded_loads = true;
-  options.profile = &branched;
+  // Without opting in, the load keeps its branch and phi.
+  options.profile = &ShaderRecompiler::Spirv::DefaultProfile;
   const auto fallback = RecompileForTest(shader, options);
   Check(!SpirvSelectGuardsLoad(fallback.spirv) &&
             SpirvInstructionOpcodeCount(fallback.spirv, spv::OpPhi) != 0u &&
             SpirvInstructionOpcodeCount(fallback.spirv, spv::OpBranchConditional) != 0u,
-        "branch_guarded_loads did not restore the branch around a scalar buffer load");
+        "the default profile did not keep the branch around a scalar buffer load");
   CheckSpirvBinaryValidates(fallback.spirv);
 }
 
@@ -14730,7 +14732,7 @@ SpirvLoadGuards FindSpirvLoadGuards(const std::vector<uint32_t> &binary) {
 
 // A raw buffer_load_dword runs unguarded under robustBufferAccess and selects zero past its
 // bounds, while a coherent one is volatile and keeps its bounds branch.
-void TestNewShaderRecompilerBufferLoadSelectsDefault() {
+void TestNewShaderRecompilerBufferLoadSelectsWhenOptedIn() {
   constexpr uint32_t mubuf = 0x38u << 26u;
   constexpr uint32_t offen = 1u << 12u;
   constexpr uint32_t glc = 1u << 14u;
@@ -14744,6 +14746,7 @@ void TestNewShaderRecompilerBufferLoadSelectsDefault() {
         EncodeSopp(0x01),
     };
     auto options = MakeCompileOptions(ShaderType::Compute);
+    options.profile = &SelectGuardedLoadsProfile;
     const auto result = RecompileForTest(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
     const auto guards = FindSpirvLoadGuards(result.spirv);
@@ -14757,7 +14760,8 @@ void TestNewShaderRecompilerBufferLoadSelectsDefault() {
 }
 
 // An LDS read past the workgroup's shared memory is not covered by robustBufferAccess, so its
-// bounds check must stay a branch even though buffer loads now select.
+// bounds check must stay a branch even when buffer loads select. The test opts in to selecting,
+// since by default every load keeps its branch and the check would prove nothing.
 void TestNewShaderRecompilerLdsLoadKeepsBranch() {
   constexpr uint32_t lds_dwords = 64u;
   const uint32_t shader[] = {
@@ -14771,6 +14775,7 @@ void TestNewShaderRecompilerLdsLoadKeepsBranch() {
   compute.lds_size_dwords = lds_dwords;
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.input_info.compute = &compute;
+  options.profile = &SelectGuardedLoadsProfile;
   const auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto guards = FindSpirvLoadGuards(result.spirv);
@@ -14780,9 +14785,9 @@ void TestNewShaderRecompilerLdsLoadKeepsBranch() {
 }
 
 // Formatted loads select each component against its out-of-range value, with no phi for the
-// driver to merge, and the kill switch brings the branch back. The xy record uses a two-word
+// driver to merge, and without opting in they keep the branch. The xy record uses a two-word
 // array type that a vector select could not take, so it checks the scalar selects validate.
-void TestNewShaderRecompilerFormattedLoadSelectsDefault() {
+void TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x01, 0),
       EncodeMubuf1(88, 0, 1), // buffer_load_format_xy
@@ -14805,24 +14810,24 @@ void TestNewShaderRecompilerFormattedLoadSelectsDefault() {
           (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << format_shift)};
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
+  options.profile = &SelectGuardedLoadsProfile;
   const auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpPhi) == 0u &&
             SpirvInstructionOpcodeCount(result.spirv, spv::OpSelect) >= selected_components,
         "formatted loads were not selected per component");
-  ShaderRecompiler::Spirv::Profile branched{};
-  branched.branch_guarded_loads = true;
-  options.profile = &branched;
+  options.profile = &ShaderRecompiler::Spirv::DefaultProfile;
   const auto fallback = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(fallback.spirv);
   Check(SpirvInstructionOpcodeCount(fallback.spirv, spv::OpPhi) != 0u,
-        "branch_guarded_loads did not restore the branch around a formatted load");
+        "the default profile did not keep the branch around a formatted load");
 }
 
 // Compiles a buffer load followed by a second load of the given width, with EXEC written from
 // the first load's value either before the second load, which guards it, or after it, which does
 // not. Both orders contain the same instructions, so they differ only in that one guard.
-TestCompileResult CompileExecOrderShader(uint32_t load, bool coherent, bool exec_before_load) {
+TestCompileResult CompileExecOrderShader(uint32_t load, bool coherent, bool exec_before_load,
+                                         const ShaderRecompiler::Spirv::Profile &profile) {
   constexpr uint32_t mubuf = 0x38u << 26u;
   constexpr uint32_t offen = 1u << 12u;
   constexpr uint32_t glc = 1u << 14u;
@@ -14850,6 +14855,7 @@ TestCompileResult CompileExecOrderShader(uint32_t load, bool coherent, bool exec
       EncodeSopp(s_endpgm),
   });
   auto options = MakeCompileOptions(ShaderType::Compute);
+  options.profile = &profile;
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   return result;
@@ -14861,14 +14867,21 @@ TestCompileResult CompileExecOrderShader(uint32_t load, bool coherent, bool exec
 // Each shader is compared with the same instructions with EXEC written after the second load.
 // The shader starts with every lane active, so in that order the second load has no runtime EXEC
 // guard, and the only extra phis or selects are the ones guarding it by EXEC. A second load that
-// lost that guard, or kept it on only one word, would leave too few extra selects.
+// lost that guard, or kept it on only one word, would leave too few extra selects. Without
+// opting in to selected loads, the same EXEC guard must stay a branch and add a phi.
 void TestNewShaderRecompilerExecGuardedLoadSelects() {
   constexpr uint32_t load_dword = 0x0cu, load_dwordx2 = 0x0du;
   for (const uint32_t load : {load_dword, load_dwordx2}) {
     const uint32_t loaded_words = load == load_dwordx2 ? 2u : 1u;
     for (const bool coherent : {false, true}) {
-      const auto guarded = CompileExecOrderShader(load, coherent, true);
-      const auto unguarded = CompileExecOrderShader(load, coherent, false);
+      const auto guarded = CompileExecOrderShader(load, coherent, true, SelectGuardedLoadsProfile);
+      const auto unguarded = CompileExecOrderShader(load, coherent, false, SelectGuardedLoadsProfile);
+      const auto &default_profile = ShaderRecompiler::Spirv::DefaultProfile;
+      const auto branched = CompileExecOrderShader(load, coherent, true, default_profile);
+      const auto branched_baseline = CompileExecOrderShader(load, coherent, false, default_profile);
+      Check(SpirvInstructionOpcodeCount(branched.spirv, spv::OpPhi) >
+                SpirvInstructionOpcodeCount(branched_baseline.spirv, spv::OpPhi),
+            "without opting in, the EXEC-guarded load lost its branch");
       const auto guarded_phis = SpirvInstructionOpcodeCount(guarded.spirv, spv::OpPhi);
       const auto unguarded_phis = SpirvInstructionOpcodeCount(unguarded.spirv, spv::OpPhi);
       const auto guarded_selects = SpirvInstructionOpcodeCount(guarded.spirv, spv::OpSelect);
@@ -17646,10 +17659,10 @@ int main() {
   TestResourceTrackingRealDensePatching();
   TestDirectTranslationResetsAnalysisState();
   TestNewShaderRecompilerNativeBindingPlan();
-  TestNewShaderRecompilerScalarBufferLoadSelectsDefault();
-  TestNewShaderRecompilerBufferLoadSelectsDefault();
+  TestNewShaderRecompilerScalarBufferLoadSelectsWhenOptedIn();
+  TestNewShaderRecompilerBufferLoadSelectsWhenOptedIn();
   TestNewShaderRecompilerLdsLoadKeepsBranch();
-  TestNewShaderRecompilerFormattedLoadSelectsDefault();
+  TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn();
   TestNewShaderRecompilerExecGuardedLoadSelects();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();

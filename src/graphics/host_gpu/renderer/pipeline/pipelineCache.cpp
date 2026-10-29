@@ -240,7 +240,7 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	return {.maintenance8           = graphics.maintenance8_enabled,
 	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
-	        .branch_guarded_loads   = Config::BranchGuardedLoadsEnabled()};
+	        .select_guarded_loads   = Config::SelectGuardedLoadsEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {

@@ -25,6 +25,11 @@ struct ShaderStageRuntime;
 struct DecodedTexture {
 	TextureCache::ImageDesc desc;
 	bool                    null_descriptor   = false;
+	// Rebased onto the mips that have backing (a PRT texture streams): decoded again when guest
+	// backing changes (kernel BackingGeneration).
+	bool                    sparse            = false;
+	uint64_t                backing_generation = 0;
+	uint64_t                probe_address     = 0; // the first page after the backed ones
 	bool                    shader_conversion = false;
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;

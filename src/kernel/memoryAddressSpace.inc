@@ -329,6 +329,8 @@ public:
 		return true;
 	}
 
+	uint64_t Generation() const { return m_generation.load(std::memory_order_acquire); }
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -982,6 +984,8 @@ public:
 			    }
 		    });
 	}
+
+	uint64_t BackingGeneration() const { return m_backing->Generation(); }
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 

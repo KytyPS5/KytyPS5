@@ -76,6 +76,8 @@ struct ShaderSource {
 		// the data each function gets, change nothing. observed_ranges are the functions' code.
 		std::vector<std::pair<uint32_t, uint32_t>> table_targets;
 		std::vector<std::pair<uint64_t, uint32_t>> observed_ranges;
+		// Names this linking for as long as it lives, parked or not.
+		uint64_t id = 0;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
@@ -84,6 +86,10 @@ struct ShaderSource {
 	uint32_t unsupported_call_pc = UINT32_MAX;
 	uint32_t wave_size = 64; // Of the shader: a vector compare writes one scalar register in wave32.
 	std::optional<Linked> linked;
+	// A table call links what one dispatch's table holds; dispatches with other tables take turns.
+	// The linkings they left are kept, so that the next dispatch of a known table links nothing.
+	std::vector<Linked> parked_links;
+	uint64_t link_count = 0;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };

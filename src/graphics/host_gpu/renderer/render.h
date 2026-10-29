@@ -389,8 +389,9 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 	// Dropped whole at the end of a frame when full (bindings point into it): a frame of Crash
-	// Bandicoot 4 decodes about 1,500 different ones.
-	static constexpr size_t                MaxDecodedTextures = 4096;
+	// Bandicoot 4 decodes about 1,500 different ones, and one image heap of Marvel's Spider-Man 2
+	// holds about 9,000 (a limit below that decoded the whole heap again in every frame).
+	static constexpr size_t                MaxDecodedTextures = 16384;
 	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash, TextureDecodeKeyEqual>
 	    m_decoded_textures;
 	// The entry each shader image slot found last, by the slot's address: a draw that binds the
@@ -403,7 +404,9 @@ private:
 		const DecodedTexture*                      texture = nullptr;
 		uint64_t                                   epoch   = 0;
 	};
-	std::array<DecodedSlot, 8192> m_decoded_slots {};
+	static constexpr uint32_t              DecodedSlotBits = 15;
+	// On the heap: inline, its 5 MB made every RenderContext on a stack overflow an 8 MB stack.
+	std::vector<DecodedSlot> m_decoded_slots = std::vector<DecodedSlot>(size_t {1} << DecodedSlotBits);
 	uint64_t                      m_decoded_epoch = 1;
 
 	friend class CommandProcessor;

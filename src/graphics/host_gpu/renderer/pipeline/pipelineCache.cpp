@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <fmt/format.h>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -355,6 +356,32 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
+		// The plan was extracted from the linking `plan_link`. A linking taken back from the parked
+		// ones has its plan parked too, and needs no translation.
+		bool TakeParkedPlan() {
+			const auto id = call_source->linked->id;
+			if (id == plan_link) return true;
+			const auto it = parked_plans.find(id);
+			if (it == parked_plans.end()) return false;
+			ParkPlan();
+			resource_plan = std::move(it->second);
+			parked_plans.erase(it);
+			plan_link = id;
+			resource_plan.source_reads = call_source->reads;
+			return true;
+		}
+		void ParkPlan() {
+			constexpr size_t MaxParkedPlans = 64u;
+			if (plan_link == 0u) return;
+			if (parked_plans.size() >= MaxParkedPlans) parked_plans.clear();
+			parked_plans.insert_or_assign(plan_link, std::move(resource_plan));
+		}
+		void SetPlan(ShaderRecompiler::IR::ResourcePlan plan) {
+			ParkPlan();
+			resource_plan = std::move(plan);
+			plan_link     = call_source && call_source->linked ? call_source->linked->id : 0u;
+		}
+
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor,
@@ -385,6 +412,8 @@ struct PipelineCache::ProgramCache {
 
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+		uint64_t                                     plan_link = 0;
+		std::map<uint64_t, ShaderRecompiler::IR::ResourcePlan> parked_plans;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		// A deque: a worker that builds a pipeline points to a permutation, and a new one must
@@ -579,7 +608,7 @@ struct PipelineCache::ProgramCache {
 			auto&        snapshot    = storage != nullptr ? *storage : cached.resources;
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
-				source_changed = cached.RefreshCallSource(runtime);
+				source_changed = cached.RefreshCallSource(runtime) && !cached.TakeParkedPlan();
 				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor, snapshot);
 			} else {
 				permutation = cached.FindPermutation<false>(runtime, push_data_cursor, snapshot);
@@ -646,12 +675,14 @@ struct PipelineCache::ProgramCache {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			entry->second.plan_link = entry->second.call_source && entry->second.call_source->linked
+			                              ? entry->second.call_source->linked->id : 0u;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 			if (storage != nullptr) *storage = entry->second.resources;
 		} else if (source_changed) {
-			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			entry->second.SetPlan(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
 			auto& snapshot = storage != nullptr ? *storage : entry->second.resources;
 			std::unique_lock plan_lock(entry->second.lock);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, snapshot)) {

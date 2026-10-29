@@ -465,6 +465,71 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+// A streamed (PRT) texture keeps its descriptor for the full chain while only the small mips have
+// backing: the guest stores the mips smallest first, so they are a prefix of the range. Rebases the
+// image onto the first mip whose data is all backed, as the hardware would sample it (the finest
+// mip with data); the finer mips would need a host image of tens of megabytes that holds zeros.
+// Returns false when no mip has backing, true otherwise (rebased or not); `sparse` is set when
+// the range has unbacked pages.
+static bool RebaseOnBackedMips(ImageInfo& info, uint32_t& view_base, uint32_t& view_levels,
+                               bool& sparse, uint32_t& shift, uint64_t& probe) {
+	sparse = false;
+	shift  = 0;
+	probe  = 0;
+	if (!info.IsTiled() || info.HasMetadata() || info.samples != 1 || info.IsVolume() ||
+	    info.resources.layers != 1 || info.resources.levels < 2 || info.data.size == 0) {
+		return true;
+	}
+	const auto backed = Libs::LibKernel::Memory::BackedPrefix(info.data.address, info.data.size);
+	if (backed >= info.data.size) {
+		return true;
+	}
+	sparse = true;
+	probe  = info.data.address + backed;
+	const auto levels = info.resources.levels;
+	uint32_t   first  = levels;
+	for (uint32_t level = levels; level-- > 0;) {
+		const auto& mip = info.mip_layout[level];
+		if (mip.offset + mip.size > backed) {
+			break;
+		}
+		first = level;
+	}
+	if (first == levels) {
+		return false;
+	}
+	if (first == 0) {
+		return true;
+	}
+	ImageInfo rebased        = info;
+	rebased.extent.width     = std::max(info.extent.width >> first, 1u);
+	rebased.extent.height    = std::max(info.extent.height >> first, 1u);
+	rebased.resources.levels = levels - first;
+	rebased.data.size        = 0;
+	rebased.pitch            = 0;
+	rebased.UpdateSize();
+	bool matches = true;
+	for (uint32_t i = 0; i < rebased.resources.levels && matches; ++i) {
+		const auto& left  = rebased.mip_layout[i];
+		const auto& right = info.mip_layout[first + i];
+		matches = left.offset == right.offset && left.size == right.size &&
+		          left.pitch == right.pitch && left.height == right.height &&
+		          left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
+		          rebased.MipExtent(i) == info.MipExtent(first + i) &&
+		          (i >= rebased.first_tail_level) == (first + i >= info.first_tail_level);
+	}
+	if (!matches || rebased.data.size > backed) {
+		return true; // keep the full image: its missing mips read as zeros, as they did before
+	}
+	info  = std::move(rebased);
+	shift = first;
+	const auto view_end = view_base + view_levels;
+	view_base           = view_base > first ? view_base - first : 0;
+	view_levels = view_end > first + view_base ? view_end - first - view_base : 1u;
+	view_levels = std::min(view_levels, info.resources.levels - view_base);
+	return true;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	// The slot depends on the descriptor too: one resource read through many descriptors would
@@ -473,7 +538,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	for (uint32_t i = 0; i < value.dword_count; i++) {
 		slot_hash = Common::Fnv64Step(slot_hash, value.dwords[i]);
 	}
-	auto& slot = m_decoded_slots[(slot_hash * 0x9e3779b97f4a7c15ull) >> 51u];
+	auto& slot = m_decoded_slots[(slot_hash * 0x9e3779b97f4a7c15ull) >> (64u - DecodedSlotBits)];
 	if (slot.epoch != m_decoded_epoch || slot.slot != &resource || !(slot.value == value) ||
 	    !(slot.resource == resource)) {
 		auto decoded = m_decoded_textures.find(TextureDecodeView {value, resource});
@@ -483,6 +548,21 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			              .first;
 		}
 		slot = {&resource, resource, value, &decoded->second, m_decoded_epoch};
+	}
+	if (slot.texture->sparse) {
+		// A streamed texture: it was rebased onto the pages with backing; decoded again once the
+		// first page after them has backing (the generation says when mappings changed at all).
+		const auto generation = Libs::LibKernel::Memory::BackingGeneration();
+		if (slot.texture->backing_generation != generation) {
+			uint32_t probe_value = 0;
+			auto&    cached      = *const_cast<DecodedTexture*>(slot.texture);
+			if (Libs::LibKernel::Memory::TryReadBacking(cached.probe_address, &probe_value,
+			                                            sizeof(probe_value))) {
+				cached = DecodeTexture(resource, value);
+			} else {
+				cached.backing_generation = generation;
+			}
+		}
 	}
 	const auto& texture       = *slot.texture;
 	auto&       texture_cache = m_context.GetTextureCache();
@@ -670,6 +750,19 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	bool     sparse = false;
+	uint32_t shift  = 0;
+	uint64_t probe  = 0;
+	const auto generation = Libs::LibKernel::Memory::BackingGeneration();
+	if (!storage && !multisampled &&
+	    !RebaseOnBackedMips(desc.info, view_base, view_levels, sparse, shift, probe)) {
+		DecodedTexture empty {};
+		empty.null_descriptor    = true;
+		empty.sparse             = true;
+		empty.backing_generation = generation;
+		empty.probe_address      = probe;
+		return empty;
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -684,9 +777,15 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
+	if (shift != 0) {
+		// The descriptor's minimum LOD counts from its own level 0; the view starts `shift` levels on.
+		const auto base_lod = (view_base + shift) * 256u;
+		desc.view_info.min_lod = descriptor.MinLod() > base_lod ? descriptor.MinLod() - base_lod : 0u;
+	}
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	return {std::move(desc), false, shader_conversion, pixel_format, view_format};
+	DecodedTexture result {std::move(desc), false, sparse, generation, probe, shader_conversion, pixel_format, view_format};
+	return result;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                                  context,

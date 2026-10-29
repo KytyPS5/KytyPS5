@@ -864,21 +864,32 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		if (!entries.empty()) reads.emplace_back(base + first, entries.size() * 4u);
 	};
 
-	if (source.linked && source.linked->table_targets == targets) {
-		auto& linked = *source.linked;
+	// A linking holds if the targets are those of the table and every function still reads the same.
+	const auto holds = [&](const ShaderSource::Linked& linked) {
+		if (linked.table_targets != targets) return false;
 		std::vector<uint32_t> observed;
 		for (const auto& [low, high]: targets) observed.insert(observed.end(), {low, high});
-		bool readable = true;
 		for (const auto& [address, count]: linked.observed_ranges) {
 			const auto at = observed.size();
 			observed.resize(at + count);
-			readable = readable && clean.read_memory(clean.userdata, address, std::span(observed).subspan(at));
+			if (!clean.read_memory(clean.userdata, address, std::span(observed).subspan(at))) return false;
 		}
-		if (readable && observed == linked.observed_function) {
-			read_table();
-			for (const auto& [address, count]: linked.observed_ranges) reads.emplace_back(address, uint64_t {count} * 4u);
-			return linked.decoded;
-		}
+		return observed == linked.observed_function;
+	};
+	const auto read_linked = [&](const ShaderSource::Linked& linked) {
+		read_table();
+		for (const auto& [address, count]: linked.observed_ranges) reads.emplace_back(address, uint64_t {count} * 4u);
+	};
+	if (source.linked && holds(*source.linked)) {
+		read_linked(*source.linked);
+		return source.linked->decoded;
+	}
+	for (auto& parked: source.parked_links) {
+		if (!holds(parked)) continue;
+		std::swap(*source.linked, parked);
+		++source.revision;
+		read_linked(*source.linked);
+		return source.linked->decoded;
 	}
 
 	// Read every function first: the chain before them needs their count.
@@ -1009,6 +1020,12 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 	linked.table_targets     = targets;
 	read_table();
 	for (const auto& [address, count]: ranges) reads.emplace_back(address, uint64_t {count} * 4u);
+	linked.id = ++source.link_count;
+	if (source.linked) {
+		constexpr size_t MaxParkedLinks = 64u;
+		if (source.parked_links.size() >= MaxParkedLinks) source.parked_links.erase(source.parked_links.begin());
+		source.parked_links.push_back(std::move(*source.linked));
+	}
 	source.linked = std::move(linked);
 	++source.revision;
 	return source.linked->decoded;

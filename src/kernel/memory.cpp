@@ -1025,6 +1025,23 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	return false;
 }
 
+uint64_t BackedPrefix(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t Page = 0x4000;
+	uint64_t           done = 0;
+	while (done < size) {
+		uint32_t value = 0;
+		if (!TryReadBacking(vaddr + done, &value, sizeof(value))) {
+			break;
+		}
+		done += std::min<uint64_t>(Page - ((vaddr + done) & (Page - 1u)), size - done);
+	}
+	return done;
+}
+
+uint64_t BackingGeneration() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->BackingGeneration() : 0;
+}
+
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->CopySparseMemory<false>(vaddr, data, size);
 }

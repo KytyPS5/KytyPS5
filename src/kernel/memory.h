@@ -133,6 +133,11 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// How many bytes from vaddr have backing, page by page (0x4000), stopping at the first page without.
+// Sparse (PRT) ranges read as zeros where this stops, so only this tells resident pages from empty ones.
+[[nodiscard]] uint64_t BackedPrefix(uint64_t vaddr, uint64_t size);
+// Changes when guest backing is mapped or unmapped.
+[[nodiscard]] uint64_t BackingGeneration();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

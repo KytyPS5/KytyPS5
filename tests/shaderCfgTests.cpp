@@ -14819,6 +14819,55 @@ void TestNewShaderRecompilerFormattedLoadSelectsDefault() {
         "branch_guarded_loads did not restore the branch around a formatted load");
 }
 
+// A buffer load under a runtime EXEC mask runs for every lane and selects zero for the inactive
+// ones, so the EXEC guard adds no phi. A coherent load keeps the branch around the whole access.
+// The dwordx2 load returns a two-word array, which must be selected one component at a time.
+// Each shader is compared with the same shader writing VCC instead of EXEC, so only phis the
+// EXEC guard adds are counted.
+void TestNewShaderRecompilerExecGuardedLoadSelects() {
+  constexpr uint32_t mubuf = 0x38u << 26u;
+  constexpr uint32_t offen = 1u << 12u;
+  constexpr uint32_t glc = 1u << 14u;
+  constexpr uint32_t opcode_shift = 18u;
+  constexpr uint32_t load_dword = 0x0cu, load_dwordx2 = 0x0du, store_dword = 0x1cu;
+  constexpr uint32_t v_cmp_gt_u32 = 0xc4u, v_cmpx_gt_u32 = 0xd4u;
+  constexpr uint32_t s_endpgm = 0x01u;
+  constexpr uint32_t vgpr_base = 256u;
+  const auto compile = [&](uint32_t load, bool coherent, bool exec_guard) {
+    const uint32_t shader[] = {
+        mubuf | (load_dword << opcode_shift) | offen,
+        EncodeMubuf1(2, 0, 0), // buffer_load_dword v2, v0 offen
+        // EXEC from a loaded value stays runtime. The VCC form leaves the load unguarded.
+        EncodeVopc(exec_guard ? v_cmpx_gt_u32 : v_cmp_gt_u32, vgpr_base + 2, 0),
+        mubuf | (load << opcode_shift) | offen | (coherent ? glc : 0u),
+        EncodeMubuf1(3, 0, 0), // buffer_load_dword or dwordx2 v3, v0 offen
+        EncodeMubuf0(store_dword, 0, false),
+        EncodeMubuf1(3, 0, 0), // buffer_store_dword v3
+        EncodeSopp(s_endpgm),
+    };
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return result;
+  };
+  for (const uint32_t load : {load_dword, load_dwordx2}) {
+    for (const bool coherent : {false, true}) {
+      const auto guarded = compile(load, coherent, true);
+      const auto unguarded = compile(load, coherent, false);
+      const auto guarded_phis = SpirvInstructionOpcodeCount(guarded.spirv, spv::OpPhi);
+      const auto unguarded_phis = SpirvInstructionOpcodeCount(unguarded.spirv, spv::OpPhi);
+      const auto guards = FindSpirvLoadGuards(guarded.spirv);
+      if (coherent) {
+        Check(guarded_phis > unguarded_phis, "coherent EXEC-guarded load lost its branch");
+      } else {
+        Check(guarded_phis == unguarded_phis, "EXEC-guarded buffer load kept a branch");
+        Check(guards.selected_classes.contains(spv::StorageClassStorageBuffer),
+              "EXEC-guarded buffer load was not selected");
+      }
+    }
+  }
+}
+
 void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
@@ -17582,6 +17631,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadSelectsDefault();
   TestNewShaderRecompilerLdsLoadKeepsBranch();
   TestNewShaderRecompilerFormattedLoadSelectsDefault();
+  TestNewShaderRecompilerExecGuardedLoadSelects();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestVop3F16InterpolationTranslation();

@@ -639,6 +639,7 @@ struct ValueShape {
 };
 
 // Emits fn() so that the result is its value when condition holds and default_value otherwise.
+// A select of several components assumes a dword composite, as every multi-component caller has.
 template <typename Fn>
 uint32_t EmitGuardedValue(EmitterState& state, GuardStrategy strategy, uint32_t condition,
                           ValueShape shape, uint32_t default_value, Fn&& fn) {
@@ -647,10 +648,24 @@ uint32_t EmitGuardedValue(EmitterState& state, GuardStrategy strategy, uint32_t 
 		return EmitValueOrDefaultIfCondition(state, condition, shape.type, default_value,
 		                                     std::forward<Fn>(fn));
 	}
-	// SPIR-V 1.3 selects a vector only with a bool vector condition, which no caller needs yet.
-	EXIT_IF(shape.components != 1u);
+	if (condition == ConstantBool(state, false)) return default_value;
 	const auto value = fn();
-	return Select(state, shape.type, condition, value, default_value);
+	if (shape.components == 1u) return Select(state, shape.type, condition, value, default_value);
+	// A two-dword result is an array, which OpSelect cannot take, and a vector needs a bool vector
+	// condition, so each component is selected on its own.
+	EXIT_IF(shape.components > 4u || shape.type != TypeU32Composite(state, shape.components));
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> words {spv::OpCompositeConstruct, shape.type, result};
+	for (uint32_t component = 0; component < shape.components; component++) {
+		const auto part     = state.builder.AllocateId();
+		const auto fallback = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), part, value, component);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), fallback, default_value,
+		                          component);
+		words.push_back(Select(state, TypeU32(state), condition, part, fallback));
+	}
+	state.builder.AddFunction(words);
+	return result;
 }
 
 template <typename Fn>

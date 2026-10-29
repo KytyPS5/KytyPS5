@@ -34971,6 +34971,109 @@ TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress() {
   return test;
 }
 
+// Which lanes a branchless buffer load test disables.
+enum class InactiveLanes { Odd, UpperHalf };
+
+// Lanes at or above this index form the upper half that a wave64 test disables.
+constexpr u32 kHalfWaveShift = 5u;
+
+// Emits a load of components dwords per lane with the chosen lanes disabled by EXEC. Disabled lanes
+// also get an address far past the end of the buffer. It is low enough that adding a component
+// offset cannot wrap it back into range, so every dword they now read is out of range.
+void AppendBranchlessInactiveLoad(std::vector<u32> *code, u32 components, InactiveLanes inactive) {
+  constexpr u32 value_vgpr = 1u, address_vgpr = 20u, flag_vgpr = 21u, bad_vgpr = 22u;
+  constexpr u32 saved_exec = 30u, exec = 126u, untouched = 0xdeadbeefu, past_end = 0x80000000u;
+  constexpr u32 v_cndmask_b32 = 0x01u, v_lshrrev_b32 = 0x16u, v_lshlrev_b32 = 0x1au;
+  constexpr u32 v_and_b32 = 0x1bu, v_cmp_eq_u32 = 0xc2u, v_cmpx_eq_u32 = 0xd2u, s_mov_b64 = 0x04u;
+  // Opcodes for one, two and four dwords, indexed by log2 of the component count.
+  constexpr std::array<u32, 3> load_opcodes = {0x0cu, 0x0du, 0x0eu};
+  const u32 log2_components = components == 4u ? 2u : components - 1u;
+  for (u32 component = 0; component < components; ++component)
+    AppendVMovLiteral(code, value_vgpr + component, untouched + component);
+  // A flag of zero marks an active lane.
+  if (inactive == InactiveLanes::Odd)
+    code->push_back(EncodeVop2(v_and_b32, flag_vgpr, InlineU32(1), 0));
+  else
+    code->push_back(EncodeVop2(v_lshrrev_b32, flag_vgpr, InlineU32(kHalfWaveShift), 0));
+  code->push_back(EncodeVop2(v_lshlrev_b32, address_vgpr, InlineU32(2u + log2_components), 0));
+  AppendVMovLiteral(code, bad_vgpr, past_end);
+  code->push_back(EncodeVopc(v_cmp_eq_u32, InlineU32(0), flag_vgpr));
+  code->push_back(EncodeVop2(v_cndmask_b32, address_vgpr, Vgpr(bad_vgpr), address_vgpr));
+  code->push_back(EncodeSop1(s_mov_b64, saved_exec, exec));
+  code->push_back(EncodeVopc(v_cmpx_eq_u32, InlineU32(0), flag_vgpr));
+  AppendBufferLoadOpcode(code, load_opcodes[log2_components], value_vgpr, address_vgpr);
+  code->push_back(EncodeSop1(s_mov_b64, exec, saved_exec));
+}
+
+// Names one variant of the branchless inactive-lane test. TestCase keeps a plain string pointer,
+// so every name is a literal.
+const char *BranchlessInactiveLoadName(u32 wave_size, u32 components, InactiveLanes inactive) {
+  // Only a wave64 has an upper half spanning a whole host subgroup.
+  EXIT_IF(inactive == InactiveLanes::UpperHalf && wave_size != 64u);
+  // Rows are odd wave32, odd wave64 and upper half wave64. Columns are one, two and four dwords.
+  static constexpr const char *names[3][3] = {
+      {"BufferLoadBranchlessInactiveOddX1Wave32", "BufferLoadBranchlessInactiveOddX2Wave32",
+       "BufferLoadBranchlessInactiveOddX4Wave32"},
+      {"BufferLoadBranchlessInactiveOddX1Wave64", "BufferLoadBranchlessInactiveOddX2Wave64",
+       "BufferLoadBranchlessInactiveOddX4Wave64"},
+      {"BufferLoadBranchlessInactiveUpperHalfX1Wave64",
+       "BufferLoadBranchlessInactiveUpperHalfX2Wave64",
+       "BufferLoadBranchlessInactiveUpperHalfX4Wave64"}};
+  const u32 row = inactive == InactiveLanes::UpperHalf ? 2u : (wave_size == 64u ? 1u : 0u);
+  const u32 column = components == 4u ? 2u : components - 1u;
+  return names[row][column];
+}
+
+// A buffer load under EXEC now runs for every lane and selects zero for the inactive ones. Active
+// lanes must read their own dwords and inactive lanes keep their old registers, for one, two and
+// four components. Wave64 also checks a host subgroup of 32 whose lanes are all inactive.
+TestCase BufferLoadBranchlessInactiveLanes(u32 wave_size, u32 components, InactiveLanes inactive) {
+  using O = ShaderOpcode;
+  constexpr u32 canary = 0xc0de0000u, untouched = 0xdeadbeefu, value_vgpr = 1u;
+  const u32 loaded_dwords = wave_size * components;
+  TestCase test;
+  test.name = BranchlessInactiveLoadName(wave_size, components, inactive);
+  AppendBranchlessInactiveLoad(&test.code, components, inactive);
+  // Results go after the loaded dwords, so no lane reads what another writes.
+  for (u32 component = 0; component < components; ++component)
+    AppendStoreVgprAtLaneDwordOffset(&test.code, value_vgpr + component, 0,
+                                     loaded_dwords + component * wave_size);
+  AppendEnd(&test.code);
+  for (u32 index = 0; index < loaded_dwords + components * wave_size; ++index)
+    test.initial.push_back(canary + index);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const bool active =
+        inactive == InactiveLanes::Odd ? lane % 2u == 0u : lane < (1u << kHalfWaveShift);
+    for (u32 component = 0; component < components; ++component)
+      test.expected[loaded_dwords + component * wave_size + lane] =
+          active ? canary + lane * components + component : untouched + component;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_AND_B32, O::V_LSHRREV_B32, O::V_LSHLREV_B32,
+                  O::V_CMP_EQ_U32, O::V_CNDMASK_B32, O::S_MOV_B64, O::V_CMPX_EQ_U32,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX4,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+// The formatted load with EXEC cleared, run as wave64, which a host subgroup of 32 splits in two.
+TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64() {
+  constexpr u32 wave_size = 64u;
+  auto test = BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress();
+  test.name = "BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64";
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferFormatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -46814,6 +46917,12 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferLoadPastCheckedRange(64, true));
   cases.push_back(BufferFormatLoadPastCheckedRange(32));
   cases.push_back(BufferFormatLoadPastCheckedRange(64));
+  for (const u32 components : {1u, 2u, 4u}) {
+    cases.push_back(BufferLoadBranchlessInactiveLanes(32, components, InactiveLanes::Odd));
+    cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::Odd));
+    cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::UpperHalf));
+  }
+  cases.push_back(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64());
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);

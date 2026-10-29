@@ -395,6 +395,17 @@ static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
 	           : GuardStrategy::Branch;
 }
 
+// Picks how the exec guard around a whole buffer access is emitted. Running the access for
+// inactive lanes is safe when it reads robust storage buffers through a constant slot and every
+// element load inside still selects its own bounds. An indirect root picks its slot from a GPU
+// value and a coherent access may read an atomic pair, so both keep the branch.
+static GuardStrategy AccessGuardStrategy(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const bool direct_buffer = mem.kind == IR::ResourceKind::Buffer && !mem.coherent &&
+	                           state.program.info.buffers.at(mem.resource).indirect_root != mem.resource;
+	return !state.profile.branch_guarded_loads && direct_buffer ? GuardStrategy::Select
+	                                                            : GuardStrategy::Branch;
+}
+
 // Loads one dword through a prepared resource, or zero when it lies past the checked length.
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
@@ -405,11 +416,14 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	                        [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
+// Loads one dword for the active lanes, and zero for the others.
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadWordPrepared(ctx, inst, mem, resource);
-	});
+	return EmitGuardedValue(ctx.state, AccessGuardStrategy(ctx.state, mem),
+	                        ctx.Arg(inst, inst.NumArgs() - 1), ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0), [&]() {
+		                        const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		                        return LoadWordPrepared(ctx, inst, mem, resource);
+	                        });
 }
 
 // Loads one byte or short through a prepared resource, or zero when it lies past the checked
@@ -465,12 +479,16 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	              ConstantU32(ctx.state, 32u - bits));
 }
 
+// Loads one byte or short for the active lanes, and zero for the others.
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
-	});
+	return EmitGuardedValue(ctx.state, AccessGuardStrategy(ctx.state, mem),
+	                        ctx.Arg(inst, inst.NumArgs() - 1), ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0), [&]() {
+		                        const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		                        return LoadSubwordPrepared(ctx, inst, mem, resource, bits,
+		                                                   sign_extend);
+	                        });
 }
 
 Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::MemoryInfo& mem) {
@@ -1194,31 +1212,34 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+// Loads a multi-dword or formatted buffer access for the active lanes, and zero for the others.
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
-	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
-	    ConstantU32CompositeZero(state, components), [&]() {
-		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
-			    const auto function = state.indirect_buffer_load_functions.at(
-			        {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
-			    const auto args = IndirectBufferArgs(ctx, inst);
-			    const auto result = state.builder.AllocateId();
-			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
-			                              result, function, args);
-			    return result;
-		    }
-		    return EmitBufferAccess(ctx, inst, mem, components, [&](const auto& selected, const auto& resource) {
-			    const auto info = Format::GetFormatInfo(
-			        selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
-			    if (info.type != Format::ComponentType::Unknown) {
-				    return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
-			    }
-			    if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
-			    return LoadRawBuffer(ctx, inst, selected, resource, components);
-		    });
-	    });
+	const auto active = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto access = [&]() {
+		if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+			const auto function = state.indirect_buffer_load_functions.at(
+			    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+			const auto args = IndirectBufferArgs(ctx, inst);
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
+			                          result, function, args);
+			return result;
+		}
+		return EmitBufferAccess(ctx, inst, mem, components, [&](const auto& selected, const auto& resource) {
+			const auto info = Format::GetFormatInfo(
+			    selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
+			if (info.type != Format::ComponentType::Unknown) {
+				return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
+			}
+			if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
+			return LoadRawBuffer(ctx, inst, selected, resource, components);
+		});
+	};
+	return EmitGuardedValue(state, AccessGuardStrategy(state, mem), active,
+	                        ValueShape {TypeU32Composite(state, components), components},
+	                        ConstantU32CompositeZero(state, components), access);
 }
 
 void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {

@@ -70,7 +70,7 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	Writer header;
 	// The jump-table mode changes recompiler output, so a store written in the other mode
 	// is discarded.
-	IoAll(header, stamp, Config::DispatcherJumpTablesEnabled(), SpirvProfile(graphics),
+	IoAll(header, stamp, Config::StructuredJumpTablesEnabled(), SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }

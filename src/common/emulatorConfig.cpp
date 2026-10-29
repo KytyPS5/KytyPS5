@@ -165,8 +165,8 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
-bool DispatcherJumpTablesEnabled() {
-	return g_config->dispatcher_jump_tables;
+bool StructuredJumpTablesEnabled() {
+	return g_config->structured_jump_tables;
 }
 
 LogDirection GetPrintfDirection() {

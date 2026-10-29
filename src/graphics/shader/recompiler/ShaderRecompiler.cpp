@@ -814,7 +814,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	// A table BuildGraph already sent to the dispatcher keeps its more precise reason.
 	if (!options.structured_jump_tables && CFG::HasJumpTable(native_cfg) &&
 	    !native_cfg.irreducible) {
-		CFG::ForceJumpTableDispatcher(native_cfg, "jump-table structurization is disabled");
+		CFG::ForceJumpTableDispatcher(native_cfg, "structured jump tables are not enabled");
 	}
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");

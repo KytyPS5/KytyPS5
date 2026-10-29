@@ -12527,6 +12527,8 @@ void TestNewShaderRecompilerJumpTableDispatcherFallbacks() {
   for (const auto &[shader, failure] : fallbacks) {
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
+    // The large table falls back while structurizing, which only runs once structured tables are on.
+    options.structured_jump_tables = true;
     auto result = RecompileForTest(shader, options);
     Check((result.ir_dump.find("mode=dispatcher") != std::string::npos) &&
               SpirvContainsOpcode(result.spirv, 251) &&
@@ -12593,14 +12595,17 @@ std::vector<uint32_t> MakeBitScanJumpTableShader() {
 
 // The bit-scan sentinel must be pruned in both modes. Structured, it reaches the sample on
 // a goto-chain edge after translation and SSA. On the dispatcher it is a switch case.
+// Structured jump tables are opt-in, so options left at their defaults must give the dispatcher.
 void TestNewShaderRecompilerJumpTableBitScanSentinel() {
   const auto code = MakeBitScanJumpTableShader();
   std::array<uint32_t, 24> user_data{};
-  for (const bool structured : {true, false}) {
+  for (const std::optional<bool> requested : {std::optional<bool>{true}, std::optional<bool>{false},
+                                              std::optional<bool>{}}) {
+    const bool structured = requested.value_or(false);
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
     options.user_data = user_data;
-    options.structured_jump_tables = structured;
+    if (requested) options.structured_jump_tables = *requested;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
     const auto &program = translated.program;
     Check(program.info.images.size() == 1u,
@@ -12654,7 +12659,7 @@ void TestNewShaderRecompilerSetpcJumpTable() {
                 table->terminator.indirect_selector_targets[1],
         "S_SETPC_B64 jump table did not retain its selector mapping");
 
-  // The kill switch keeps the dispatcher, which must still lower the table as a switch.
+  // The dispatcher is the default, and it must still lower the table as a switch.
   for (const bool structured : {true, false}) {
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
@@ -12783,7 +12788,7 @@ void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
             target_pc(0) == 0x38u && target_pc(1) == 0x40u && target_pc(2) == 0x38u,
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
 
-  // The kill switch keeps the dispatcher, which must still lower the table as a switch.
+  // The dispatcher is the default, and it must still lower the table as a switch.
   for (const bool structured : {true, false}) {
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;

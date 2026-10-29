@@ -74,8 +74,8 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_cache_enabled        = false;
-	// Compiles S_SETPC_B64 jump tables with the dispatcher, as before they were structurized.
-	bool                   dispatcher_jump_tables      = false;
+	// Opts in to compiling S_SETPC_B64 jump tables as structured control flow.
+	bool                   structured_jump_tables      = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -147,8 +147,8 @@ std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
 
-// True when jump tables should use the dispatcher instead of structured control flow.
-bool DispatcherJumpTablesEnabled();
+// True when jump tables should be compiled as structured control flow.
+bool StructuredJumpTablesEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

@@ -5769,7 +5769,13 @@ public:
     constexpr uint64_t piece = 0x8000;
     constexpr uint32_t pieces = 6; // 192 KiB through a 64 KiB staging ring
     EnsureRuntimeContext();
+    // Buffers are copies through the staging ring here, also on a host that imports guest
+    // memory (guestMemoryImport.h).
+    auto copy_config = HarnessConfig();
+    copy_config.gpu_guest_memory_import = false;
+    Config::Load(copy_config);
     RenderContext context(m_runtime_context);
+    Config::Load(HarnessConfig());
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -11402,8 +11408,10 @@ public:
     return result;
   }
 
-  void CheckNullTextureDescriptors() {
-    constexpr const char *name = "NullTextureDescriptors";
+  // With `placeholders`, the device's null descriptor is left unused, as on a device without
+  // one (MoltenVK), and null textures are bound as NullTextures' zero-filled placeholders.
+  void CheckNullTextureDescriptors(bool placeholders = false) {
+    const char *name = placeholders ? "NullTexturePlaceholders" : "NullTextureDescriptors";
     constexpr uintptr_t base = 0x0000000204900000ull;
     constexpr uint64_t size = 0x10000;
     std::vector<u32> reader{
@@ -11433,6 +11441,8 @@ public:
            .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
 
     EnsureRuntimeContext();
+    const bool null_descriptor = m_runtime_context.null_descriptor_enabled;
+    if (placeholders) m_runtime_context.null_descriptor_enabled = false;
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
         0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
@@ -11502,6 +11512,7 @@ public:
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
+    m_runtime_context.null_descriptor_enabled = null_descriptor;
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
             "null texture output release failed");
     std::printf("[gpu]     %-32s ok\n", name);
@@ -18162,6 +18173,13 @@ public:
                                                  &pipeline),
                 "vkCreateGraphicsPipelines");
     } else {
+      // As the renderer does (CreatePipelineInternal): the guest wave size where the device can.
+      vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{};
+      const auto wave_size = compiled.program.wave_size;
+      if (wave_size >= m_min_subgroup_size && wave_size <= m_max_subgroup_size) {
+        subgroup_size.requiredSubgroupSize = wave_size;
+        stage.pNext = &subgroup_size;
+      }
       vk::ComputePipelineCreateInfo pipeline_info{};
       pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
       pipeline_info.stage = stage;
@@ -18288,6 +18306,12 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        // The bytes the range's last dword pads, packed as the renderer does (RebindBuffers):
+        // a store ends at the range's exact byte.
+        const auto pad_dword = layout.MemoryPadDword() + index / 16u;
+        if (pad_dword < shader_data.size())
+          shader_data[pad_dword] |= static_cast<u32>((4u - info.range % 4u) % 4u)
+                                    << ((index % 16u) * 2u);
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -21470,6 +21494,9 @@ private:
   HostGpu m_host;
   bool m_dma_buf_import = false;
   bool m_null_descriptor = false;
+  // The compute subgroup sizes a pipeline can require (0: it cannot).
+  u32 m_min_subgroup_size = 0;
+  u32 m_max_subgroup_size = 0;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -21505,6 +21532,8 @@ private:
     m_runtime_context.host = m_host;
     m_runtime_context.dma_buf_import_enabled = m_dma_buf_import;
     m_runtime_context.null_descriptor_enabled = m_null_descriptor;
+    m_runtime_context.min_subgroup_size = m_min_subgroup_size;
+    m_runtime_context.max_subgroup_size = m_max_subgroup_size;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -21538,6 +21567,8 @@ private:
   }
 
   void Init() {
+    // As the emulator does before its instance (main.cpp).
+    PrepareVulkanDriverEnvironment();
     static vk::detail::DynamicLoader loader;
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
@@ -21674,7 +21705,17 @@ private:
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    // As the renderer does: a compute pipeline runs in subgroups of the guest wave size.
+    device_features13.subgroupSizeControl = caps.compute_subgroup_size_control;
     link(device_features13);
+    if (caps.compute_subgroup_size_control) {
+      vk::PhysicalDeviceSubgroupSizeControlProperties size_control{};
+      vk::PhysicalDeviceProperties2 properties{};
+      properties.pNext = &size_control;
+      m_physical_device.getProperties2(&properties);
+      m_min_subgroup_size = size_control.minSubgroupSize;
+      m_max_subgroup_size = size_control.maxSubgroupSize;
+    }
     std::vector<const char *> device_extensions{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
     if (portability_subset) {
       device_extensions.push_back("VK_KHR_portability_subset");
@@ -26597,14 +26638,15 @@ TestCase Vop3Med3I16Captured() {
 TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
+  // The second operands come from user data, so the minimum is not folded away.
   std::vector<u32> code;
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 7);
+  code.push_back(EncodeVop1(0x01, 12, 4));
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 0);
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 64);
+  code.push_back(EncodeVop1(0x01, 12, 5));
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 1);
@@ -26613,6 +26655,10 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   TestCase test;
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
+  test.has_user_data = true;
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[4] = 7;
+  test.user_data[5] = 64;
   test.expected = {0xa1b20007u, 0xa1b2001fu};
   test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -28052,8 +28098,8 @@ TestCase VectorFractF16CapturedAndEdges() {
                   O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  // The fraction is taken in F32 and rounded to F16 by a conversion (EmitPackHalf2x16).
+  test.required_spirv = {" Fract ", "OpFConvert", " UnpackHalf2x16 "};
   return test;
 }
 
@@ -28095,7 +28141,7 @@ TestCase VectorFractF16Modifiers() {
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {{"V_FRACT_F16", 10}};
   test.ir_counts = {{" = FPFract32 ", 10}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", "OpFConvert"};
   return test;
 }
 
@@ -28133,8 +28179,9 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  // The cos runs in F32; only the result is converted to F16.
+  test.required_spirv = {" Fract ", " Cos ", "OpFConvert"};
+  test.forbidden_spirv = {"OpExtInst %half"};
   return test;
 }
 
@@ -28179,8 +28226,9 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
-  test.forbidden_spirv = {"OpCapability Float16"};
+  // The sin runs in F32; only the result is converted to F16.
+  test.required_spirv = {" Fract ", " Sin ", "OpFConvert"};
+  test.forbidden_spirv = {"OpExtInst %half"};
   return test;
 }
 
@@ -30065,7 +30113,7 @@ TestCase VectorFractF64CapturedAndEdges() {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F64,
                   O::V_AND_B32, O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F64 v4, v4", cases.size() + 1}};
-  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Fract"};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", " Trunc ", "OpFSub"};
   test.soft_float64 = {"soft_f64_fract"};
   return test;
 }
@@ -30268,7 +30316,7 @@ TestCase VectorFractF64CapturedChainRuntimeExec() {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
-  test.required_spirv = {"OpCapability Float64", "OpFDiv", "Fma", "Fract"};
+  test.required_spirv = {"OpCapability Float64", "OpFDiv", "Fma", " Trunc "};
   test.soft_float64 = {"soft_f64_from_s32", "soft_f64_from_f32", "soft_f64_fma", "soft_f64_fract", "soft_f64_to_f32"};
   test.forbidden_spirv = {"RoundingModeRTE"};
   test.ir_counts = {{"FPRecip32", 1}, {"ConvertF64S32", 1}, {"ConvertF64F32", 3},
@@ -34224,7 +34272,8 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
       8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
-  test.required_spirv = {"PackHalf2x16"};
+  // F16 rounds to nearest: a conversion, not PackHalf2x16 (EmitPackHalf2x16).
+  test.required_spirv = {"OpFConvert"};
   return test;
 }
 
@@ -38668,7 +38717,7 @@ template <bool d16, bool sparse> TestCase ImageLoadPackedUnorm() {
                       : std::vector<u32>{0x3f800000u, green, 0u, 0u};
   test.expected.resize(words);
   test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract", "OpConvertUToF"};
-  if constexpr (d16) test.required_spirv.emplace_back("PackHalf2x16");
+  if constexpr (d16) test.required_spirv.emplace_back("OpFConvert");
   test.forbidden_spirv = {"OpTypeSampler", "OpImageGather"};
   return test;
 }
@@ -39398,7 +39447,7 @@ TestCase ImageD16GatherPacksHalfPairs() {
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.required_spirv = {"OpImageGather", "PackHalf2x16"};
+  test.required_spirv = {"OpImageGather", "OpFConvert"};
   return test;
 }
 
@@ -40834,8 +40883,12 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                                    {Value(&overflow), Value(0x40000000u), Value(&lane)});
   auto &data = block->AppendNewInst(ValueOpcode::IAdd32,
                                   {Value(&lane), Value(0x1000u)});
-  auto &exec = block->AppendNewInst(ValueOpcode::INotEqual32,
-                                  {Value(&lane), Value(4u)});
+  // EXEC leaves out two lanes. With one lane out, Mesa 26.2's ACO clears that lane's bit in EXEC
+  // itself instead of in the branch condition (an s_bitset0 retargeted to EXEC after register
+  // allocation), so the null-child layouts stored from every other lane.
+  auto &not4 = block->AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(4u)});
+  auto &not5 = block->AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(5u)});
+  auto &exec = block->AppendNewInst(ValueOpcode::LogicalAnd, {Value(&not4), Value(&not5)});
   auto &store = block->AppendNewInst(ValueOpcode::StoreBufferU32,
                       {Value(&handle), Value(0u), Value(&offset), Value(0u),
                        Value(&data), Value(&exec)});
@@ -40946,7 +40999,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                                          14u, swapped ? 0u : 1u};
       test.expected = test.initial;
       for (u32 lane = 0; lane < 16u; ++lane) {
-        if (lane == 4u || lane == 6u) continue;
+        if (lane == 4u || lane == 5u || lane == 6u) continue;
         if (layout == Layout::IndexedSingle) {
           test.expected[test.storage_buffer_offsets[0] / 4u + lane] = 0x1000u + lane;
           continue;
@@ -43870,6 +43923,147 @@ GraphicsCase GraphicsAncillarySampleId() {
   return test;
 }
 
+// The light-loop bounds of EA SPORTS FC 27's tiled lighting (pixel shader 5762271b): a wave max and
+// a wave min of the live pixels, built from DPP row shifts, V_PERMLANEX16 and V_READLANE of lanes 31
+// and 63. A fragment wave with one pixel has no host invocation for those lanes: unless the shader
+// computes them as subgroup reductions, the bound is whatever the host returns for a missing lane.
+GraphicsCase GraphicsWaveBoundsOfLivePixels() {
+  GraphicsCase test;
+  test.name = "GraphicsWaveBoundsOfLivePixels";
+  auto &code = test.fragment_code;
+  code.push_back(EncodeSop1(0x04, 84, 126));                          // s_mov_b64 s[84:85], exec
+  code.push_back(EncodeSop1(0x0a, 126, 126));                         // s_wqm_b64 exec, exec
+  AppendVop3(&code, 0x365, 9, InlineU32(65), InlineU32(0));           // v_mbcnt_lo v9, -1, 0
+  AppendVop3(&code, 0x366, 9, InlineU32(65), Vgpr(9));                // v_mbcnt_hi v9, -1, v9
+  code.push_back(EncodeVop2(0x25, 1, 255u, 9));                       // v1 = lane + 100
+  code.push_back(100u);
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(16), 1));              // v1 <<= 16
+  code.push_back(EncodeVop2(0x25, 2, 255u, 9));                       // v2 = lane + 1000
+  code.push_back(1000u);
+  code.push_back(EncodeVop2(0x1c, 15, Vgpr(1), 2));                   // v15 = v1 | v2
+  code.push_back(EncodeSop2(0x0f, 20, 126, 84));                      // s_and_b64 s[20:21], exec, s[84:85]
+  code.push_back(EncodeSop2(0x0f, 22, 126, 84));                      // s_and_b64 s[22:23], exec, s[84:85]
+  // The game's words, pc 0x868..0x95c of 5762271b without its unrelated float math: v84/v83 =
+  // low/high half of v15; S_ORN2_SAVEEXEC; V_CNDMASK v16 = s[20:21] ? v83 : 0; V_MAX_U32 DPP
+  // row_shr 1/2/4/8; V_PERMLANEX16; V_READLANE 31 and 63 into S_MAX_U32 s18; the same with V_MIN_U32,
+  // identity -1 and s[22:23], into S_MIN_U32 s19.
+  code.insert(code.end(), {0x36a81effu, 0x0000ffffu, 0x2ca61e90u, 0xbeea287eu, 0xd5010010u,
+                           0x0052a680u, 0x282020fau, 0xff011110u, 0x282020fau, 0xff011210u,
+                           0x282020fau, 0xff011410u, 0x282020fau, 0xff011810u, 0xd778100fu,
+                           0x03058310u, 0x28201f10u, 0xbefe046au, 0xbf800000u, 0xbeea286au,
+                           0xd5010011u, 0x005aa8c1u, 0xd7600010u, 0x00013f10u, 0xd7600011u,
+                           0x00017f10u, 0x262222fau, 0xff011111u, 0x84921110u, 0x262222fau,
+                           0xff011211u, 0x262222fau, 0xff011411u, 0x262222fau, 0xff011811u,
+                           0xd7781012u, 0x03058311u, 0x26222511u, 0xbefe046au, 0xd7600014u,
+                           0x00013f11u, 0xd7600015u, 0x00017f11u, 0x83931514u});
+  code.push_back(EncodeVop1(0x06, 0, 18));                            // v0 = float(max)
+  code.push_back(EncodeVop1(0x06, 1, 19));                            // v1 = float(min)
+  AppendVMovLiteral(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&code);
+  using O = ShaderOpcode;
+  test.opcodes = {O::S_MOV_B64, O::S_WQM_B64, O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32,
+                  O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::V_OR_B32, O::S_AND_B64, O::V_AND_B32,
+                  O::V_LSHRREV_B32, O::S_ORN2_SAVEEXEC_B64, O::V_CNDMASK_B32, O::V_MAX_U32,
+                  O::V_MIN_U32, O::V_PERMLANEX16_B32, O::S_NOP, O::V_READLANE_B32, O::S_MAX_U32,
+                  O::S_MIN_U32, O::V_CVT_F32_U32, O::V_MOV_B32, O::EXP, O::S_ENDPGM};
+  test.expected_pixel = {0x42c80000u, 0x447a0000u, 0, 0x3f800000u};
+  return test;
+}
+
+// The light mask of one 32-light word in EA SPORTS FC 27's tiled lighting (pixel shader b99a727d):
+// a wave OR of the live pixels' masks. The guest saves EXEC in s[0:1] and reads it back from there,
+// and every read of an SGPR pair as a lane mask is a select of its own; before constant propagation
+// the all-lanes EXEC of S_ORN2_SAVEEXEC must still be recognized through them, or the reduction
+// reads lanes 31 and 63 that a fragment wave with one pixel lacks.
+GraphicsCase GraphicsWaveOrOfLivePixelMasks() {
+  GraphicsCase test;
+  test.name = "GraphicsWaveOrOfLivePixelMasks";
+  auto &code = test.fragment_code;
+  code.push_back(EncodeSop1(0x04, 96, 126));                          // s_mov_b64 s[96:97], exec
+  code.push_back(EncodeSop1(0x0a, 126, 126));                         // s_wqm_b64 exec, exec
+  AppendVop3(&code, 0x365, 9, InlineU32(65), InlineU32(0));           // v_mbcnt_lo v9, -1, 0
+  AppendVop3(&code, 0x366, 9, InlineU32(65), Vgpr(9));                // v_mbcnt_hi v9, -1, v9
+  AppendVMovU32(&code, 40, 1);
+  code.push_back(EncodeVop2(0x1a, 40, Vgpr(9), 40));                  // v40 = 1 << lane
+  AppendVMovU32(&code, 90, 31);                                       // last light of the pixel
+  AppendVMovU32(&code, 91, 0);                                        // first light of the pixel
+  AppendVMovU32(&code, 67, 0);
+  code.push_back(EncodeSMovB32(35, InlineU32(0)));
+  code.push_back(EncodeSMovB32(84, InlineU32(0)));                    // 32-light word 0
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));
+  code.push_back(EncodeSop1(0x04, 98, 126));                          // s_mov_b64 s[98:99], exec
+  // Two passes of a loop, as the game runs it once per 32-light word: EXEC, restored from an SGPR
+  // pair at the end of a pass, is a phi of that pair's per-lane form.
+  const auto loop = code.size();
+  // The game's words, pc 0x7f74..0x8048 of b99a727d; its light-mask buffer load reads v40 here. The
+  // saved EXEC goes through s[0:1], and every read of an SGPR pair as a lane mask is a new select.
+  code.insert(code.end(), {0x8f558554u,                               // s_lshl_b32 s85, s84, 5
+                           0x816aa055u,                               // s_add_i32 vcc_lo, s85, 32
+                           0x4e08b655u,                               // v_subrev_nc_u32 v4, s85, v91
+                           0x7d86b6f9u, 0x0686806au,                  // v_cmp_le_u32_sdwa s0, vcc_lo, v91
+                           0x7d88b455u,                               // v_cmp_gt_u32 vcc_lo, s85, v90
+                           0x81865580u,                               // s_sub_i32 s6, 0, s85
+                           0xd5580004u, 0x027d0104u,                  // v_med3_i32 v4, v4, 0, 31
+                           0x8dea6a00u,                               // s_nor_b64 vcc, s[0:1], vcc
+                           0xbe80246au,                               // s_and_saveexec_b64 s[0:1], vcc
+                           0xbf880008u,                               // s_cbranch_execz 8
+                           0x4a0cb406u,                               // v_add_nc_u32 v6, s6, v90
+                           0x4c0a0880u,                               // v_sub_nc_u32 v5, 0, v4
+                           0xd5580006u, 0x027d0106u,                  // v_med3_i32 v6, v6, 0, 31
+                           0xd76d0005u, 0x04160c81u,                  // v_add3_u32 v5, 1, v6, v5
+                           0xd5580006u, 0x02810105u,                  // v_med3_i32 v6, v5, 0, 32
+                           0xbefe0400u,                               // s_mov_b64 exec, s[0:1]
+                           0x7e0a02c1u,                               // v_mov_b32 v5, -1
+                           0x7daa0ca0u,                               // v_cmpx_ne_u32 32, v6
+                           0xd7630005u, 0x00020906u,                  // v_bfm_b32 v5, v6, v4
+                           0xbefe0400u,                               // s_mov_b64 exec, s[0:1]
+                           0x87866000u,                               // s_and_b64 s[6:7], s[0:1], s[96:97]
+                           0xd76d0004u, 0x01528623u,                  // v_add3_u32 v4, s35, v67, s84
+                           0xbf8cc07fu,                               // s_waitcnt lgkmcnt(0)
+                           EncodeVop1(0x01, 4, Vgpr(40)),             // (buffer_load_dword v4 ...)
+                           EncodeSopp(0x00),
+                           0xbf8c3f70u,                               // s_waitcnt vmcnt(0)
+                           0x36080b04u,                               // v_and_b32 v4, v4, v5
+                           0xbeea2800u,                               // s_orn2_saveexec_b64 vcc, s[0:1]
+                           0xd5010005u, 0x001a0880u,                  // v_cndmask_b32 v5, 0, v4, s[6:7]
+                           0x380a0afau, 0xff011105u,                  // v_or_b32_dpp v5 row_shr:1
+                           0x380a0afau, 0xff011205u,                  // row_shr:2
+                           0x380a0afau, 0xff011405u,                  // row_shr:4
+                           0x380a0afau, 0xff011805u,                  // row_shr:8
+                           0xd7781004u, 0x03058305u,                  // v_permlanex16_b32 v4, v5, -1, -1
+                           0x380a0905u,                               // v_or_b32 v5, v5, v4
+                           0xbefe046au,                               // s_mov_b64 exec, vcc
+                           0xd7600006u, 0x00013f05u,                  // v_readlane_b32 s6, v5, 31
+                           0xd7600007u, 0x00017f05u,                  // v_readlane_b32 s7, v5, 63
+                           0x88560706u});                             // s_or_b32 s86, s6, s7
+  code.push_back(EncodeSop1(0x04, 126, 98));                          // s_mov_b64 exec, s[98:99]
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));             // s_add_u32 s20, s20, 1
+  code.push_back(EncodeSopc(0x0a, 20, InlineU32(2)));                 // s_cmp_lt_u32 s20, 2
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(loop - code.size() - 1u) & 0xffffu));
+  code.push_back(EncodeVop1(0x06, 0, 86));                            // v0 = float(mask)
+  AppendVMovLiteral(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&code);
+  using O = ShaderOpcode;
+  test.opcodes = {O::S_MOV_B64, O::S_WQM_B64, O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32,
+                  O::V_MOV_B32, O::V_LSHLREV_B32, O::S_MOV_B32, O::S_LSHL_B32, O::S_ADD_I32,
+                  O::V_SUBREV_NC_U32, O::V_CMP_LE_U32, O::V_CMP_GT_U32, O::S_SUB_I32,
+                  O::V_MED3_I32, O::S_NOR_B64, O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_EXECZ,
+                  O::V_ADD_NC_U32, O::V_SUB_NC_U32, O::V_ADD3_U32, O::V_CMPX_NE_U32, O::V_BFM_B32,
+                  O::S_AND_B64, O::S_NOP, O::S_WAITCNT, O::V_AND_B32, O::S_ORN2_SAVEEXEC_B64,
+                  O::V_CNDMASK_B32, O::V_OR_B32, O::V_PERMLANEX16_B32, O::V_READLANE_B32,
+                  O::S_OR_B32, O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::V_CVT_F32_U32,
+                  O::EXP, O::S_ENDPGM};
+  test.expected_pixel = {0x3f800000u, 0, 0, 0x3f800000u};
+  return test;
+}
+
 // SPI_BARYC_CNTL[24] selects all-bits mode for uint/bool S_FRONT_FACE;
 // float S_FRONT_FACE and __getSpecialVgprFloat(__v_front_face) leave it clear.
 GraphicsCase GraphicsFrontFaceBits(bool reversed, bool all_bits) {
@@ -44847,6 +45041,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
+      GraphicsWaveBoundsOfLivePixels(),
+      GraphicsWaveOrOfLivePixelMasks(),
       GraphicsFrontFaceBits(false, false),
       GraphicsFrontFaceBits(true, false),
       GraphicsFrontFaceBits(false, true),
@@ -51407,6 +51603,7 @@ int RunSelectedCases(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     vulkan.CheckNullTextureDescriptors();
+    vulkan.CheckNullTextureDescriptors(true);
     CheckCountedRowImageSelector(vulkan);
     CheckPointerImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
@@ -51601,6 +51798,7 @@ int RunSelectedCases(int argc, char **argv) {
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
+  vulkan.CheckNullTextureDescriptors(true);
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUploadBatchStagingWait();
   vulkan.CheckTextureDecodeMemo();

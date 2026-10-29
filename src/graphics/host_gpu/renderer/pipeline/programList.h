@@ -127,6 +127,10 @@ inline void AppendProgramRecord(std::vector<uint8_t>& out, const ProgramRecord& 
 		write.Value(static_cast<uint32_t>(buffer.descriptor_format));
 		write.Value(buffer.descriptor_swizzle);
 		write.Value(static_cast<uint8_t>(buffer.zero_stride_oob));
+		write.Value(static_cast<uint8_t>(buffer.scalar_empty));
+		write.Value(buffer.indirect_root);
+		write.Value(buffer.indirect_mapping_offset);
+		write.Value(buffer.indirect_search_iterations);
 	}
 	write.Value(static_cast<uint32_t>(record.specialization.images.size()));
 	for (const auto& image: record.specialization.images) {
@@ -140,6 +144,12 @@ inline void AppendProgramRecord(std::vector<uint8_t>& out, const ProgramRecord& 
 		write.Value(image.indirect_search_iterations);
 		write.Value(static_cast<uint8_t>(image.cube));
 		write.Value(static_cast<uint8_t>(image.fmask));
+	}
+	write.Value(static_cast<uint32_t>(record.specialization.samplers.size()));
+	for (const auto& sampler: record.specialization.samplers) {
+		write.Value(sampler.indirect_root);
+		write.Value(sampler.indirect_mapping_offset);
+		write.Value(sampler.indirect_search_iterations);
 	}
 	ProgramListDetail::Out file(out);
 	file.Value(static_cast<uint32_t>(body.size()));
@@ -165,7 +175,7 @@ inline std::vector<ProgramRecord> ReadProgramRecords(std::span<const uint8_t> by
 		}
 		ProgramRecord         record;
 		ProgramListDetail::In read(body);
-		uint32_t              stage = 0, buffers = 0, images = 0;
+		uint32_t              stage = 0, buffers = 0, images = 0, samplers = 0;
 		bool ok      = read.Value(stage) && read.Value(record.hash) &&
 		               read.Value(record.user_data_count) && read.Value(record.push_data_start) &&
 		               read.Array(record.code) && read.Array(record.back_code) &&
@@ -175,10 +185,15 @@ inline std::vector<ProgramRecord> ReadProgramRecords(std::span<const uint8_t> by
 			auto&    buffer          = record.specialization.buffers.emplace_back();
 			uint32_t format          = 0;
 			uint8_t  oob             = 0;
+			uint8_t  scalar_empty    = 0;
 			ok                       = read.Value(buffer.packed_stride) && read.Value(format) &&
-			                           read.Value(buffer.descriptor_swizzle) && read.Value(oob);
+			                           read.Value(buffer.descriptor_swizzle) && read.Value(oob) &&
+			                           read.Value(scalar_empty) && read.Value(buffer.indirect_root) &&
+			                           read.Value(buffer.indirect_mapping_offset) &&
+			                           read.Value(buffer.indirect_search_iterations);
 			buffer.descriptor_format = static_cast<Prospero::BufferFormat>(format);
 			buffer.zero_stride_oob   = oob != 0;
+			buffer.scalar_empty      = scalar_empty != 0;
 		}
 		ok = ok && read.Value(images);
 		for (uint32_t i = 0; ok && i < images; i++) {
@@ -196,6 +211,12 @@ inline std::vector<ProgramRecord> ReadProgramRecords(std::span<const uint8_t> by
 			image.conversion_format = static_cast<Prospero::BufferFormat>(format);
 			image.cube              = cube != 0;
 			image.fmask             = fmask != 0;
+		}
+		ok = ok && read.Value(samplers);
+		for (uint32_t i = 0; ok && i < samplers; i++) {
+			auto& sampler = record.specialization.samplers.emplace_back();
+			ok = read.Value(sampler.indirect_root) && read.Value(sampler.indirect_mapping_offset) &&
+			     read.Value(sampler.indirect_search_iterations);
 		}
 		if (!ok || !read.Done()) {
 			break;

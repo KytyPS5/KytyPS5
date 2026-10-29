@@ -715,6 +715,7 @@ struct PipelineCache::ProgramCache {
 		    c.draw_indirect_first_instance,
 		    c.subgroup_supported_stages,
 		    c.subgroup_supported_operations,
+		    c.max_stage_samplers,
 		    f.pushed_buffers_have_no_size,
 		    f.no_per_vertex_inputs,
 		    f.no_centroid_barycentric,

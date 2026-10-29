@@ -23,6 +23,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <map>
+#include <set>
 #include <span>
 #include <utility>
 
@@ -502,12 +503,13 @@ bool ConstantOperand(const Decoder::Operand& operand, uint32_t& value) {
 // The call's target comes from a table when its two halves are adjacent dwords of one scalar
 // buffer load whose offset is a register: the entry each call picks.
 std::optional<ShaderSource::Call::Table> FindCallTable(const Decoder::Program& program,
-                                                       const CFG::Graph& graph, uint32_t call_index) {
+                                                       const CFG::Graph& graph, uint32_t call_index,
+                                                       uint32_t wave_size) {
 	using Decoder::Opcode;
 	const auto& call      = program.instructions[call_index];
 	const auto  source_of = [&](uint32_t before, uint32_t code) -> std::optional<std::pair<uint32_t, uint32_t>> {
 		for (uint32_t depth = 0; depth < 16u; ++depth) {
-			const auto found = CFG::TryFindScalarDefinition(program, graph, before, code);
+			const auto found = CFG::TryFindScalarDefinition(program, graph, before, code, nullptr, wave_size);
 			if (!found.has_value() || *found == UINT32_MAX) return std::nullopt;
 			const auto& inst = program.instructions[*found];
 			if ((inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOV_B64) &&
@@ -537,7 +539,7 @@ std::optional<ShaderSource::Call::Table> FindCallTable(const Decoder::Program& p
 	                                 .stride = load.data_dwords * 4u,
 	                                 .offset = static_cast<int32_t>(load.offset)};
 	// The entry's index is scaled to its offset: that scale is the stride of the table.
-	if (const auto scale = CFG::TryFindScalarDefinition(program, graph, low->first, index_code);
+	if (const auto scale = CFG::TryFindScalarDefinition(program, graph, low->first, index_code, nullptr, wave_size);
 	    scale.has_value() && *scale != UINT32_MAX) {
 		const auto& inst  = program.instructions[*scale];
 		uint32_t    value = 0;
@@ -590,7 +592,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
+		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls, options.wave_size);
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
@@ -640,7 +642,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
 		// A target from a table of functions is a buffer read: before the check below, which
 		// gives up on calls whose target the scalar walk cannot follow into a buffer.
-		site.table = FindCallTable(source.decoded, graph, site.instruction);
+		site.table = FindCallTable(source.decoded, graph, site.instruction, options.wave_size);
 		if (auto& table = site.table) {
 			EXIT_NOT_IMPLEMENTED(source.calls.size() != 1u);
 			const auto& load = source.decoded.instructions[table->load];
@@ -685,7 +687,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 // table of functions (as ray tracing calls its any-hit and intersection shaders) links them all;
 // any other such call has no single target to link, so it is skipped: it still writes its return
 // address, as S_GETPC_B64 does, and the loop sees the registers as they were before the call.
-bool SkipCallsInLoops(Decoder::Program& program, uint64_t shader_hash) {
+bool SkipCallsInLoops(Decoder::Program& program, uint64_t shader_hash, uint32_t wave_size) {
 	const auto graph = CFG::BuildGraph(program);
 	bool       skipped_all = true;
 	for (uint32_t i = 0; i < program.instructions.size(); ++i) {
@@ -708,7 +710,7 @@ bool SkipCallsInLoops(Decoder::Program& program, uint64_t shader_hash) {
 			in_loop     = block->id == home->id;
 			pending.insert(pending.end(), block->successors.begin(), block->successors.end());
 		}
-		if (!in_loop || FindCallTable(program, graph, i).has_value()) {
+		if (!in_loop || FindCallTable(program, graph, i, wave_size).has_value()) {
 			skipped_all = false;
 			continue;
 		}
@@ -724,6 +726,7 @@ bool SkipCallsInLoops(Decoder::Program& program, uint64_t shader_hash) {
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
+	source.wave_size = options.wave_size;
 	if (!options.back_code.empty()) {
 		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
 	} else if (options.stage == ShaderType::Local) {
@@ -734,7 +737,7 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 	}
-	if (source.decoded.has_swap_pc && SkipCallsInLoops(source.decoded, options.shader_hash)) {
+	if (source.decoded.has_swap_pc && SkipCallsInLoops(source.decoded, options.shader_hash, options.wave_size)) {
 		source.decoded.has_swap_pc = false;
 	}
 	if (source.decoded.has_swap_pc) {
@@ -750,8 +753,8 @@ namespace {
 // Reads a function the table points to, up to the return that ends it: past every branch it
 // makes. Nothing when it is not code a linked call can run.
 bool ReadTableFunction(const IR::SrtRuntime& clean, uint64_t address, const Decoder::Instruction& call,
-                       uint32_t descriptor_code, std::vector<Decoder::Instruction>& function,
-                       std::vector<uint32_t>& words) {
+                       uint32_t descriptor_code, uint32_t wave_size,
+                       std::vector<Decoder::Instruction>& function, std::vector<uint32_t>& words) {
 	constexpr uint32_t MaxWords = 64u * 1024u;
 	constexpr uint32_t Chunk    = 256u;
 	function.clear();
@@ -786,7 +789,7 @@ bool ReadTableFunction(const IR::SrtRuntime& clean, uint64_t address, const Deco
 		    inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || inst.opcode == Decoder::Opcode::S_GETPC_B64)
 			return false;
 		for (uint32_t i = 0; i < 4u; ++i) {
-			if (CFG::MayWriteScalarRegister(inst, descriptor_code + i)) return false;
+			if (CFG::MayWriteScalarRegister(inst, descriptor_code + i, wave_size)) return false;
 		}
 		const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
 		if (returns && (inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg))
@@ -893,7 +896,7 @@ const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime
 		const auto address = ((uint64_t {target.second} << 32u) | target.first) & ~uint64_t {3};
 		if (std::ranges::find(functions, address, &Function::address) != functions.end()) continue;
 		Function function {.address = address};
-		if (!ReadTableFunction(clean, address, call, load.src0.reg, function.code, function.words)) {
+		if (!ReadTableFunction(clean, address, call, load.src0.reg, source.wave_size, function.code, function.words)) {
 			++failed;
 			continue;
 		}
@@ -1099,10 +1102,10 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		EXIT_IF(function_pc > UINT32_MAX - function_size);
 		const auto function_offset = static_cast<uint32_t>(linked.code.size());
 		for (auto inst: function) {
-			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
-			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg, source.wave_size) ||
+			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u, source.wave_size));
 			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
-				if (site.preserved_registers[code] && CFG::MayWriteScalarRegister(inst, code))
+				if (site.preserved_registers[code] && CFG::MayWriteScalarRegister(inst, code, source.wave_size))
 					EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
 			}
 			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
@@ -1240,8 +1243,19 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	};
+	// Wave reductions are recognized before constant propagation too. In a pixel shader, constant
+	// propagation folds away the select that puts the identity outside the live pixels, because
+	// EXEC is true in every invocation the host has. Without that select the reduction cannot be
+	// proven, and lane-by-lane it reads lanes the host lacks: EA SPORTS FC 27's light loop got a
+	// garbage bound. The run after constant propagation finds the forms that folding makes visible.
+	// The subgroup reduction combines every host invocation; whether the driver counts the helper
+	// pixels of a quad in it is up to the driver (the guest leaves them out through its live mask).
+	const bool lane_model = !Spirv::UsesSingleLaneModel(options.stage, options.host);
+	if (lane_model) {
+		(void)IR::RecognizeWaveReductions(ir);
+	}
 	simplify();
-	if (!Spirv::UsesSingleLaneModel(options.stage, options.host) && IR::RecognizeWaveReductions(ir) != 0u) {
+	if (lane_model && IR::RecognizeWaveReductions(ir) != 0u) {
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
@@ -1258,10 +1272,22 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
 	if (decoded.has_swap_pc) {
-		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
-		for (const auto* block: ir.blocks)
-			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
+		// Leaf returns are resolved CFG edges; the return address of a call (the pc after its
+		// S_SWAPPC_B64) must not escape into GPU data. A shader base from S_GETPC_B64 may stay: it
+		// is shader-relative in SPIR-V, and the resource plan reads the descriptors built on it
+		// (constants the shader keeps in its own code).
+		std::set<uint64_t> return_addresses;
+		for (const auto& inst: decoded.instructions)
+			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64) return_addresses.insert(uint64_t {inst.pc} + 4u);
+		for (const auto* block: ir.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != IR::ValueOpcode::IAdd64) continue;
+				const auto* base = inst.Arg(0).Resolve().TryInstruction();
+				const auto  step = inst.Arg(1).Resolve();
+				EXIT_NOT_IMPLEMENTED(base != nullptr && base->GetOpcode() == IR::ValueOpcode::GetShaderBase &&
+				                     step.IsImmediate() && return_addresses.contains(step.U64()));
+			}
+		}
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;

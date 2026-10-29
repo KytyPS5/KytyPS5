@@ -520,10 +520,8 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 	}
 
 	if (descriptor.IsNull()) {
-		// Bound as the device's null descriptor (VK_EXT_robustness2's nullDescriptor).
-		if (!m_context.GetGraphics().null_descriptor_enabled) {
-			EXIT("a null texture needs VK_EXT_robustness2's nullDescriptor\n");
-		}
+		// Bound as the device's null descriptor (VK_EXT_robustness2's nullDescriptor), or where
+		// the device has none, as a zero-filled placeholder (see NullTextures).
 		return {.null_descriptor = true};
 	}
 
@@ -597,7 +595,11 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	auto pixel_format = surface_format.vk_format;
-	if (resource.depth_compare) {
+	// A 1D image cannot be a depth attachment (Contra: Operation Galuga compares against a 1D
+	// k16UNorm texture): it keeps its color format.
+	const bool one_dimensional = type == Prospero::ImageType::kColor1D ||
+	                             type == Prospero::ImageType::kColor1DArray;
+	if (resource.depth_compare && !one_dimensional) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
 			pixel_format = depth_format->depth_attachment_format;
 		}
@@ -1052,7 +1054,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& binding = descriptors.images[i];
-			if (!binding.image_id) continue;
+			if (!binding.image_id) {
+				// A null storage texture drops its writes: its placeholder reads zero again.
+				const auto& resource = program.info.images[i];
+				if (!m_context.GetGraphics().null_descriptor_enabled &&
+				    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage) {
+					buffer.EndRendering();
+					m_context.GetNullTextures().Reset(
+					    *ShaderRecompiler::IR::DescriptorBindingForImage(resource), vk_buffer);
+				}
+				continue;
+			}
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
@@ -1164,8 +1176,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
+			const bool placeholder =
+			    !texture.image_id && !m_context.GetGraphics().null_descriptor_enabled;
 			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
-				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
+				m_descriptor_images[start + mip] =
+				    placeholder ? m_context.GetNullTextures().ImageInfo(kind)
+				                : MakeImageInfo(texture, mip);
 			}
 		}
 

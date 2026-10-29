@@ -135,6 +135,29 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
+void DeclareFloat16(EmitterState& state) {
+	if (state.float16_declared) return;
+	state.float16_declared = true;
+	state.builder.RequireCapability(spv::CapabilityFloat16);
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
+}
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair) {
+	if (!state.host.capabilities.float16) {
+		return EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32>(state, pair);
+	}
+	DeclareFloat16(state);
+	if (state.f16x2_type == 0) {
+		const auto half  = state.builder.Type(spv::OpTypeFloat, 16);
+		state.f16x2_type = state.builder.Type(spv::OpTypeVector, half, 2);
+	}
+	const auto halves = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFConvert, state.f16x2_type, halves, pair);
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), packed, halves);
+	return packed;
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.single_lane) {
 		return ConstantU32(state, 0);

@@ -212,6 +212,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	    static_cast<vk::ShaderStageFlags::MaskType>(properties11.subgroupSupportedStages);
 	facts.subgroup_supported_operations =
 	    static_cast<vk::SubgroupFeatureFlags::MaskType>(properties11.subgroupSupportedOperations);
+	facts.max_per_stage_samplers = properties2.properties.limits.maxPerStageDescriptorSamplers;
 	facts.float64_preserves_special_values =
 	    properties12.shaderSignedZeroInfNanPreserveFloat64 == VK_TRUE;
 	facts.float16_preserves_special_values =

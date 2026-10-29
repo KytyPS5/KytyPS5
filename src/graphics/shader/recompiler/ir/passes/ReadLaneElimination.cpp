@@ -558,16 +558,47 @@ std::optional<uint32_t> Identity(ValueOpcode op) {
 	}
 }
 
+// A constant lane index, also before constant propagation has folded the mask that V_READLANE's
+// translation puts on its lane operand.
+std::optional<uint32_t> ConstantLane(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 ? std::optional<uint32_t>(value.U32()) : std::nullopt;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseAnd32) return std::nullopt;
+	const auto lhs = inst->Arg(0).Resolve(), rhs = inst->Arg(1).Resolve();
+	if (!lhs.IsImmediate() || !rhs.IsImmediate() || lhs.GetType() != Type::U32 ||
+	    rhs.GetType() != Type::U32) {
+		return std::nullopt;
+	}
+	return lhs.U32() & rhs.U32();
+}
+
+// A lane mask without the selects that pick one side by a constant: a mask read back from an SGPR
+// pair selects its per-lane form by the pair's mask tag, and before constant propagation two reads
+// of one register are two selects of the same value.
+Value PeelConstantSelects(Value mask) {
+	for (;;) {
+		mask = mask.Resolve();
+		const auto* inst = mask.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU1) return mask;
+		const auto condition = inst->Arg(0).Resolve();
+		if (!condition.IsImmediate() || condition.GetType() != Type::U1) return mask;
+		mask = condition.U1() ? inst->Arg(1) : inst->Arg(2);
+	}
+}
+
 // EXEC with every lane on, as S_ORN2_SAVEEXEC leaves it.
 bool AllLanes(Value exec) {
-	exec = exec.Resolve();
+	exec = PeelConstantSelects(exec);
 	if (exec.IsImmediate()) return exec.GetType() == Type::U1 && exec.U1();
 	const auto* inst = exec.TryInstruction();
 	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LogicalOr) return false;
 	const auto is_not_of = [](Value value, Value of) {
-		const auto* inst = value.Resolve().TryInstruction();
+		const auto* inst = PeelConstantSelects(value).TryInstruction();
 		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalNot &&
-		       inst->Arg(0).Resolve() == of.Resolve();
+		       PeelConstantSelects(inst->Arg(0)) == PeelConstantSelects(of);
 	};
 	return is_not_of(inst->Arg(0), inst->Arg(1)) || is_not_of(inst->Arg(1), inst->Arg(0));
 }
@@ -667,11 +698,11 @@ private:
 		if (inst == nullptr) return std::nullopt;
 		switch (const auto op = inst->GetOpcode()) {
 			case ValueOpcode::ReadLane: {
-				const auto lane = inst->Arg(1).Resolve();
-				if (!lane.IsImmediate() || lane.GetType() != Type::U32) return std::nullopt;
+				const auto lane = ConstantLane(inst->Arg(1));
+				if (!lane) return std::nullopt;
 				auto sets = Analyze(inst->Arg(0), depth + 1u);
 				if (!sets || sets->op == ValueOpcode::Void) return std::nullopt;
-				const auto index = lane.U32() % wave_size;
+				const auto index = *lane % wave_size;
 				if ((sets->poisoned >> index) & 1u) return std::nullopt;
 				const auto mask = sets->lanes[index];
 				sets->lanes.fill(0);

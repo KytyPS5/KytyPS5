@@ -121,6 +121,7 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.draw_indirect_first_instance = facts.draw_indirect_first_instance;
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
+	caps.max_stage_samplers            = facts.max_per_stage_samplers;
 
 	decision.faults = FaultsOf(facts.driver);
 	// Metal runs SIMD-group functions in a vertex function on an Apple GPU, and MoltenVK passes

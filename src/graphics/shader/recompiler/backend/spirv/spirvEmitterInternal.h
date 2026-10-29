@@ -148,6 +148,8 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          f32_vector_types {};
 	// Packed FP16 runs on two-lane half vectors (TypeF16x2) when the host has native FP16.
 	bool                                             native_float16 = false;
+	// The Float16 capability and its float controls are declared (DeclareFloat16).
+	bool                                             float16_declared = false;
 	uint32_t                                         f16x2_type     = 0;
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
@@ -157,6 +159,10 @@ struct EmitterState {
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_pads; // see Bindings::MemoryPadDword
+	// Each binding's exact end in bytes and in whole dwords, from the entry block (0: computed at
+	// each access).
+	std::vector<uint32_t>                           memory_exact_ends;
+	std::vector<uint32_t>                           memory_exact_dwords;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -370,6 +376,8 @@ uint32_t CopyVariableForExport(const EmitterState& state, const IR::ExportInfo& 
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
+// Declares the Float16 capability with the float controls GCN/RDNA arithmetic needs, once.
+void DeclareFloat16(EmitterState& state);
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,

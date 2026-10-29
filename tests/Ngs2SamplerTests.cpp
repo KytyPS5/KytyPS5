@@ -704,6 +704,429 @@ void TestSubmixerSetupAndRouting() {
 	}
 }
 
+// A submixer's inputs after the first key its compressor (PPSA28465 routes voices to input 1 of
+// the music submixer for ducking). They must not be mixed into the output, and must not abort.
+void TestSubmixerSideChainInput() {
+	Fixture f(48000, 1);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs                          = &f.system;
+	submixer_rack.type                         = Ngs2RackType::Submixer;
+	submixer_rack.option.submixer.max_channels = 8;
+	submixer_rack.option.submixer.max_inputs   = 2;
+	Ngs2VoiceInternal submixer;
+	submixer.rack     = &submixer_rack;
+	submixer.channels = 1;
+	submixer.state    = Ngs2VoicePlayState::Playing;
+	f.voice.ports.push_back({&submixer, 1, 1.0f, -1});
+	const int16_t pcm[] = {8192, 8192};
+	f.Queue(pcm, 2, 0);
+	const std::vector<Ngs2VoiceInternal*> voices {&f.voice};
+	Ngs2RenderVoice(submixer, voices, 1);
+	Check(!submixer.has_samples && submixer.samples[0] == 0.0f,
+	      "a side-chain input was mixed into the submixer output");
+	f.voice.ports[0].input = 0;
+	f.voice.rendered = submixer.rendered = false;
+	Ngs2RenderVoice(submixer, voices, 1);
+	Check(submixer.has_samples && submixer.samples[0] == 0.25f,
+	      "the submixer's main input was not mixed");
+}
+
+Ngs2SubmixerCompressorParam CompressorParam(uint32_t flags, float threshold, float ratio,
+                                            float knee, float attack, float release) {
+	return {flags, threshold, ratio, knee, attack, release, 1.0f, 0};
+}
+
+bool Near(double value, double expected, double tolerance) {
+	return std::abs(value - expected) <= tolerance;
+}
+
+// Checks the submixer compressor's curve (see Ngs2Compressor) as a limiter and with a soft knee.
+void TestCompressorCurveAndKnee() {
+	constexpr uint32_t Rate = 1000;
+	Ngs2Compressor     compressor;
+	Check(!compressor.Enabled(), "a reset compressor was enabled");
+
+	// As a limiter (flags 0x1), 6 dB over a threshold of 1.0 at ratio 0.01 comes out 0.06 dB over.
+	compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 0.0f), Rate);
+	float loud[] = {2.0f};
+	compressor.Process(loud, nullptr, 1, 1);
+	Check(Near(loud[0], std::pow(2.0, 0.01), 1e-4), "the limiter curve is wrong");
+	float quiet[] = {0.5f};
+	compressor.Process(quiet, nullptr, 1, 1);
+	Check(quiet[0] == 0.5f, "the limiter changed a signal under its threshold");
+
+	// At the threshold, a 6 dB soft knee gives (1 - ratio) * 3^2 / 12 dB of reduction.
+	compressor.Configure(CompressorParam(0x1, 0.5f, 0.0f, 6.0f, 0.0f, 0.0f), Rate);
+	float knee[] = {0.5f};
+	compressor.Process(knee, nullptr, 1, 1);
+	Check(Near(knee[0], 0.5 * std::pow(10.0, -0.75 / 20.0), 1e-5), "the soft knee is wrong");
+}
+
+// Side-chain RMS keying (flags 0x0a, as PPSA28465 ducks music under voices). The RMS detector
+// compares power with the threshold, so a key of 0.1 (power 0.01) is 10 dB over 0.001 and
+// reduces the signal by 10 * (1 - ratio) dB once the RMS window fills. The main signal's own
+// level is ignored. The power is summed across channels, so the same key in both channels of
+// a stereo bus is 3 dB louder (13 dB over), and a key in only one channel ducks like mono.
+void TestCompressorSideChainRms() {
+	constexpr uint32_t Rate = 1000;
+	Ngs2Compressor     compressor;
+	compressor.Reset();
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+	const double       ducked        = 0.5 * std::pow(10.0, -7.5 / 20.0);
+	const double       stereo_over   = 10.0 * std::log10(2 * 0.1 * 0.1 / 0.001); // About 13 dB.
+	const double       stereo_ducked = 0.5 * std::pow(10.0, -stereo_over * (1.0 - 0.25) / 20.0);
+	std::vector<float> stereo(size_t(Rate) * 2, 0.5f);
+	std::vector<float> stereo_key(size_t(Rate) * 2, 0.1f);
+	std::fill(stereo_key.begin() + Rate, stereo_key.end(), -0.1f);
+	compressor.Process(stereo.data(), stereo_key.data(), 2, Rate);
+	Check(Near(stereo[Rate - 1], stereo_ducked, 1e-5) &&
+	          Near(stereo[2 * Rate - 1], stereo_ducked, 1e-5),
+	      "the side-chain key did not duck the signal");
+	compressor.Reset();
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+	std::fill(stereo.begin(), stereo.end(), 0.5f);
+	std::fill(stereo_key.begin() + Rate, stereo_key.end(), 0.0f);
+	compressor.Process(stereo.data(), stereo_key.data(), 2, Rate);
+	Check(Near(stereo[Rate - 1], ducked, 1e-5) && Near(stereo[2 * Rate - 1], ducked, 1e-5),
+	      "a key in one stereo channel did not duck like mono");
+	std::vector<float> signal(Rate, 0.5f);
+	compressor.Process(signal.data(), nullptr, 1, Rate);
+	Check(signal[Rate - 1] == 0.5f, "the compressor did not recover without a key");
+}
+
+// Attack and release smooth the reduction, so the key takes time to duck the signal, and the
+// signal returns gradually once the key stops. Flags 0 then turn the compressor off.
+void TestCompressorAttackRelease() {
+	constexpr uint32_t Rate   = 1000;
+	const double       ducked = 0.5 * std::pow(10.0, -7.5 / 20.0);
+	Ngs2Compressor     compressor;
+	std::vector<float> signal(Rate, 0.5f);
+	compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.1f, 1.0f), Rate);
+	std::fill(signal.begin(), signal.end(), 0.5f);
+	std::vector<float> keyed(Rate, 0.1f);
+	compressor.Process(signal.data(), keyed.data(), 1, 2);
+	Check(signal[1] < 0.5f && signal[1] > ducked * 1.5, "the attack was not gradual");
+	compressor.Process(signal.data() + 2, keyed.data() + 2, 1, Rate - 2);
+	Check(Near(signal[Rate - 1], ducked, 1e-3), "the attack did not settle");
+	std::fill(signal.begin(), signal.end(), 0.5f);
+	compressor.Process(signal.data(), nullptr, 1, Rate / 2);
+	Check(signal[Rate / 2 - 1] > ducked * 1.2 && signal[Rate / 2 - 1] < 0.45f,
+	      "the release was not gradual");
+	for (int i = 0; i < 30; ++i) {
+		std::fill(signal.begin(), signal.end(), 0.5f);
+		compressor.Process(signal.data(), nullptr, 1, Rate);
+	}
+	Check(Near(signal[Rate - 1], 0.5, 1e-3), "the release did not recover");
+
+	compressor.Configure(CompressorParam(0, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+	Check(!compressor.Enabled(), "flags 0 did not disable the compressor");
+}
+
+// A NaN or infinite sample in the detected signal is skipped, so it can't leave the compressor
+// stuck. The limiter (peak detection, instant times) and the ducking setup (side-chain RMS) both
+// keep working afterwards.
+void TestCompressorNonFinite() {
+	constexpr uint32_t Rate = 1000;
+	constexpr float    Inf  = std::numeric_limits<float>::infinity();
+	constexpr float    NaN  = std::numeric_limits<float>::quiet_NaN();
+	Ngs2Compressor     compressor;
+
+	for (const float bad: {Inf, NaN}) {
+		compressor.Reset();
+		compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 0.0f), Rate);
+		float limited[] = {bad, 0.5f};
+		compressor.Process(limited, nullptr, 1, 2);
+		Check(limited[1] == 0.5f, "a non-finite sample broke the limiter");
+
+		compressor.Reset();
+		compressor.Configure(CompressorParam(0x1, 1.0f, 0.01f, 0.0f, 0.0f, 1.0f), Rate);
+		float released[] = {bad, 0.5f};
+		compressor.Process(released, nullptr, 1, 2);
+		Check(released[1] == 0.5f, "a non-finite sample left the limiter reducing");
+
+		// A key of 0.1 is 10 dB over the RMS threshold, so at ratio 0.25 it ducks by 7.5 dB.
+		compressor.Reset();
+		compressor.Configure(CompressorParam(0x0a, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f), Rate);
+		std::vector<float> signal(Rate, 0.5f);
+		std::vector<float> key(Rate, bad);
+		compressor.Process(signal.data(), key.data(), 1, Rate);
+		Check(signal[Rate - 1] == 0.5f, "a non-finite key ducked the signal");
+		std::fill(signal.begin(), signal.end(), 0.5f);
+		std::fill(key.begin(), key.end(), 0.1f);
+		compressor.Process(signal.data(), key.data(), 1, Rate);
+		Check(Near(signal[Rate - 1], 0.5 * std::pow(10.0, -7.5 / 20.0), 1e-5),
+		      "a non-finite key stopped the ducking");
+	}
+}
+
+// Attack and release times are one-pole time constants, so about a third (1/e) of the change
+// remains once the time is up and half remains after ln 2 of it. Peak detection on a side-chain
+// key (flags 0x09) gives a target with no RMS tail, so the reduction follows the curve exactly.
+void TestCompressorTimeConstant() {
+	constexpr uint32_t Rate           = 1000;
+	constexpr uint32_t ReleaseSamples = 2000; // A 2 s release.
+	const auto         reduction_db   = [](const Ngs2Compressor& compressor) {
+		return -20.0 * std::log10(double(compressor.Gain()));
+	};
+	Ngs2Compressor compressor;
+
+	// An instant attack lands on the full reduction, then the key stops.
+	compressor.Configure(CompressorParam(0x09, 0.01f, 0.5f, 0.0f, 0.0f, 2.0f), Rate);
+	float key[]    = {0.1f};
+	float sample[] = {0.5f};
+	compressor.Process(sample, key, 1, 1);
+	const double       start     = reduction_db(compressor);
+	const uint32_t     half_life = uint32_t(std::lround(ReleaseSamples * std::log(2.0)));
+	std::vector<float> signal(ReleaseSamples, 0.5f);
+	compressor.Process(signal.data(), nullptr, 1, half_life);
+	Check(Near(reduction_db(compressor), start * std::exp(-double(half_life) / ReleaseSamples),
+	           1e-5),
+	      "the release time is not a one-pole time constant");
+	compressor.Process(signal.data(), nullptr, 1, ReleaseSamples - half_life);
+	Check(Near(reduction_db(compressor), start * std::exp(-1.0), 1e-5),
+	      "the release time is not a one-pole time constant");
+
+	// A 0.1 s attack covers 1 - 1/e of the way to the target in 0.1 s.
+	compressor.Reset();
+	compressor.Configure(CompressorParam(0x09, 0.01f, 0.5f, 0.0f, 0.1f, 0.0f), Rate);
+	const double       target = 0.5 * 20.0 * std::log10(double(0.1f) / double(0.01f));
+	std::vector<float> attack_key(Rate / 10, 0.1f);
+	compressor.Process(signal.data(), attack_key.data(), 1, Rate / 10);
+	Check(Near(reduction_db(compressor), target * (1.0 - std::exp(-1.0)), 1e-5),
+	      "the attack time is not a one-pole time constant");
+}
+
+// Killing (event 4) or resetting (event 8) a voice clears its compressor's duck but keeps the
+// settings, so the same key ducks by the same amount again. A stop (event 2) clears it once the
+// render finishes the voice. Pause and resume keep the duck. A make-up level of 2 checks that a
+// cleared compressor goes back to that level and not to 1.
+void TestCompressorVoiceEvents() {
+	constexpr uint32_t Rate  = 1000;
+	constexpr float    Level = 2.0f;
+	Ngs2VoiceInternal  voice;
+	voice.compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 0.0f, 2.0f, Level, 0}, Rate);
+	float      key[] = {0.1f};
+	const auto duck  = [&] {
+		float sample[] = {0.5f};
+		voice.compressor.Process(sample, key, 1, 1);
+		return voice.compressor.Gain();
+	};
+	const float ducked = duck();
+	Check(ducked < Level, "the key did not duck the voice's compressor");
+
+	voice.state = Ngs2VoicePlayState::Playing;
+	voice.SetEvent(16);
+	voice.SetEvent(32);
+	voice.FinishStop();
+	Check(voice.state == Ngs2VoicePlayState::Playing && voice.compressor.Gain() == ducked,
+	      "pause or resume changed the duck");
+	// Playing again before the render finishes the stop means the voice never ended.
+	voice.SetEvent(2);
+	voice.SetEvent(1);
+	voice.FinishStop();
+	Check(voice.state == Ngs2VoicePlayState::Playing && voice.compressor.Gain() == ducked,
+	      "playing again before a stop finished cleared the duck");
+
+	const auto finish_stop = [&] {
+		voice.SetEvent(2);
+		Check(voice.compressor.Gain() == ducked,
+		      "a stop cleared the duck before the voice finished");
+		voice.FinishStop();
+	};
+	for (const uint32_t event: {4u, 8u, 2u}) {
+		voice.state = Ngs2VoicePlayState::Playing;
+		if (event == 2u) {
+			finish_stop();
+		} else {
+			voice.SetEvent(event);
+		}
+		Check(voice.state == Ngs2VoicePlayState::Empty && voice.compressor.Gain() == Level &&
+		          voice.compressor.Enabled(),
+		      "kill, reset or a finished stop did not clear the duck, or lost the settings");
+		Check(duck() == ducked, "kill, reset or stop changed the compressor's settings");
+	}
+}
+
+// Runs one sample through a freshly configured peak compressor (flags 0x1) and returns it.
+float CompressOneSample(const Ngs2SubmixerCompressorParam& param, float sample) {
+	constexpr uint32_t Rate = 1000;
+	Ngs2Compressor     compressor;
+	compressor.Configure(param, Rate);
+	compressor.Process(&sample, nullptr, 1, 1);
+	return sample;
+}
+
+// The make-up level is applied to the output, and values a game should never send are clamped
+// or replaced by defaults instead of inverting, blowing up or silencing the signal.
+void TestCompressorLevelAndCurveLimits() {
+	constexpr float NaN = std::numeric_limits<float>::quiet_NaN();
+	// Under the threshold only the make-up level applies.
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 2.0f, 0}, 0.25f) == 0.5f,
+	      "the make-up level was not applied");
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, -1.0f, 0}, 0.25f) == 0.0f,
+	      "a negative level was not clamped to 0");
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 100.0f, 0}, 0.25f) == 4.0f,
+	      "a huge level was not capped at 16");
+	Check(CompressOneSample({0x1, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, NaN, 0}, 0.25f) == 0.25f,
+	      "a NaN level did not default to 1");
+
+	// A ratio above 1 is clamped to 1 (no reduction), and one below 0 to 0 (a hard limit at the
+	// threshold).
+	Check(CompressOneSample({0x1, 0.25f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a ratio above 1 expanded or reduced the signal");
+	Check(Near(CompressOneSample({0x1, 0.25f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f), 0.25,
+	           1e-6),
+	      "a negative ratio was not clamped to 0");
+	Check(CompressOneSample({0x1, 0.25f, NaN, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a NaN ratio did not default to 1");
+
+	// A NaN threshold defaults to 1, and one of 0 or less becomes 1e-9, so a signal is still
+	// reduced by a finite amount.
+	Check(Near(CompressOneSample({0x1, NaN, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0}, 2.0f), 1.0, 1e-6),
+	      "a NaN threshold did not default to 1");
+	// A 0.5 sample is 20 * log10(0.5 / 1e-9) dB over, and ratio 0.5 takes half of that away.
+	const double sample             = 0.5;
+	const double over_db            = 20.0 * std::log10(sample / 1e-9);
+	const double tiny_threshold_out = sample * std::pow(10.0, -(1.0 - 0.5) * over_db / 20.0);
+	for (const float threshold: {0.0f, -1.0f}) {
+		const float out = CompressOneSample({0x1, threshold, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0},
+		                                    float(sample));
+		Check(std::isfinite(out) && Near(out, tiny_threshold_out, 1e-9),
+		      "a threshold of 0 or less was not raised to 1e-9");
+	}
+
+	// At the threshold a knee of k dB gives (1 - ratio) * (k / 2)^2 / (2 * k) dB of reduction. A
+	// knee of 100 is capped at 60, so ratio 0 gives 7.5 dB. A negative knee is a hard knee.
+	Check(Near(CompressOneSample({0x1, 0.5f, 0.0f, 100.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f),
+	           0.5 * std::pow(10.0, -7.5 / 20.0), 1e-6),
+	      "a huge knee was not capped at 60 dB");
+	Check(CompressOneSample({0x1, 0.5f, 0.0f, -6.0f, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a negative knee was not treated as a hard knee");
+	Check(CompressOneSample({0x1, 0.5f, 0.0f, NaN, 0.0f, 0.0f, 1.0f, 0}, 0.5f) == 0.5f,
+	      "a NaN knee did not default to a hard knee");
+}
+
+// Negative times mean an instant change, and very long ones are capped (attack at 10 s, release
+// at 60 s), so the first sample moves the reduction by exactly the capped one-pole step.
+void TestCompressorTimeLimits() {
+	constexpr uint32_t Rate              = 1000;
+	constexpr double   AttackCapSeconds  = 10.0;
+	constexpr double   ReleaseCapSeconds = 60.0;
+	constexpr float    NaN               = std::numeric_limits<float>::quiet_NaN();
+	const auto         target            = 0.5 * 20.0 * std::log10(double(0.1f) / double(0.01f));
+	const auto         reduction_db      = [](const Ngs2Compressor& compressor) {
+		return -20.0 * std::log10(double(compressor.Gain()));
+	};
+	float          key[]    = {0.1f};
+	float          sample[] = {0.5f};
+	Ngs2Compressor compressor;
+
+	// A NaN time defaults to 0, which is also instant.
+	for (const float time: {-1.0f, NaN}) {
+		compressor.Reset();
+		compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, time, time, 1.0f, 0}, Rate);
+		compressor.Process(sample, key, 1, 1);
+		Check(Near(reduction_db(compressor), target, 1e-5),
+		      "a negative or NaN attack was not instant");
+		compressor.Process(sample, nullptr, 1, 1);
+		Check(compressor.Gain() == 1.0f, "a negative or NaN release was not instant");
+	}
+
+	compressor.Reset();
+	compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 1e6f, 0.0f, 1.0f, 0}, Rate);
+	compressor.Process(sample, key, 1, 1);
+	Check(Near(reduction_db(compressor),
+	           target * (1.0 - std::exp(-1.0 / (AttackCapSeconds * Rate))), 1e-6),
+	      "a long attack was not capped at 10 s");
+
+	compressor.Reset();
+	compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 0.0f, 1e6f, 1.0f, 0}, Rate);
+	compressor.Process(sample, key, 1, 1);
+	compressor.Process(sample, nullptr, 1, 1);
+	// One step of a 60 s release takes about 1.7e-4 dB off the 10 dB reduction, which the float
+	// gain still resolves.
+	Check(Near(reduction_db(compressor), target * std::exp(-1.0 / (ReleaseCapSeconds * Rate)),
+	           2e-6) &&
+	          reduction_db(compressor) < target - 2e-5,
+	      "a long release was not capped at 60 s");
+}
+
+// A submixer with a side-chain compressor (peak-keyed here, so one sample settles it) ducks
+// input 0 while input 1 has signal.
+void TestSubmixerCompressorVoice() {
+	Fixture          music(48000, 1), speech(48000, 1);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs                          = &music.system;
+	submixer_rack.type                         = Ngs2RackType::Submixer;
+	submixer_rack.option.submixer.max_channels = 8;
+	submixer_rack.option.submixer.max_inputs   = 2;
+	Ngs2VoiceInternal submixer;
+	submixer.rack     = &submixer_rack;
+	submixer.channels = 1;
+	submixer.state    = Ngs2VoicePlayState::Playing;
+	struct {
+		Ngs2VoiceParamHeader        header {sizeof(Ngs2VoiceParamHeader) +
+                                               sizeof(Ngs2SubmixerCompressorParam),
+                                           0, 0x20000002};
+		Ngs2SubmixerCompressorParam param = CompressorParam(0x09, 0.001f, 0.25f, 0.0f, 0.0f, 0.0f);
+	} control;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&submixer), &control.header) == OK,
+	      "the submixer rejected compressor settings");
+	Check(submixer.compressor.Enabled(), "the compressor settings were not applied");
+	music.voice.ports.push_back({&submixer, 0, 1.0f, -1});
+	speech.voice.ports.push_back({&submixer, 1, 1.0f, -1});
+	const int16_t pcm[] = {8192, 8192};
+	music.Queue(pcm, 2, 0);
+	speech.Queue(pcm, 2, 0);
+	const std::vector<Ngs2VoiceInternal*> voices {&music.voice, &speech.voice};
+	Ngs2RenderVoice(submixer, voices, 1);
+	// The key is 250 times the threshold, and above it the level rises by 0.25 per input dB.
+	Check(submixer.has_samples && Near(submixer.samples[0], 0.25 * std::pow(250.0, -0.75), 1e-6),
+	      "the side-chain input did not duck the submixer");
+	Ngs2SubmixerVoiceState state {};
+	Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&submixer), &state.voice_state,
+	                        sizeof(state)) == OK &&
+	          Near(state.compressor_height, std::pow(250.0, -0.75), 1e-6),
+	      "the submixer state did not report the compressor gain");
+	speech.voice.ports.clear();
+	music.voice.rendered = speech.voice.rendered = submixer.rendered = false;
+	Ngs2RenderVoice(submixer, voices, 1);
+	Check(submixer.has_samples && submixer.samples[0] == 0.25f,
+	      "the submixer stayed ducked without a key");
+	Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&submixer), &state.voice_state,
+	                        sizeof(state)) == OK &&
+	          state.compressor_height == 1.0f,
+	      "the submixer state kept a gain reduction without a key");
+}
+
+// A submixer reports its compressor height as the gain of the reduction alone, without the
+// make-up level, and 0 while the compressor is off.
+void TestSubmixerCompressorHeight() {
+	Fixture          f(48000, 1);
+	Ngs2RackInternal submixer_rack {};
+	submixer_rack.ngs  = &f.system;
+	submixer_rack.type = Ngs2RackType::Submixer;
+	Ngs2VoiceInternal submixer;
+	submixer.rack = &submixer_rack;
+	const auto height = [&] {
+		Ngs2SubmixerVoiceState state {};
+		Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&submixer), &state.voice_state,
+		                        sizeof(state)) == OK,
+		      "the submixer state could not be read");
+		return state.compressor_height;
+	};
+	Check(height() == 0.0f, "a submixer without a compressor reported a height");
+
+	constexpr float Level = 2.0f;
+	submixer.compressor.Configure({0x09, 0.01f, 0.5f, 0.0f, 0.0f, 0.0f, Level, 0}, 48000);
+	float key[]    = {0.1f};
+	float sample[] = {0.5f};
+	submixer.compressor.Process(sample, key, 1, 1);
+	Check(submixer.compressor.Gain() < Level &&
+	          Near(height(), submixer.compressor.Gain() / Level, 1e-6),
+	      "the compressor height included the make-up level");
+}
+
 uint32_t g_side_chain_flags = 0;
 
 void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
@@ -1832,6 +2255,17 @@ int main() {
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
+	TestSubmixerSideChainInput();
+	TestCompressorCurveAndKnee();
+	TestCompressorSideChainRms();
+	TestCompressorAttackRelease();
+	TestCompressorNonFinite();
+	TestCompressorTimeConstant();
+	TestCompressorVoiceEvents();
+	TestCompressorLevelAndCurveLimits();
+	TestCompressorTimeLimits();
+	TestSubmixerCompressorVoice();
+	TestSubmixerCompressorHeight();
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();

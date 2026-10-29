@@ -531,6 +531,281 @@ struct Ngs2SamplerFilter {
 	}
 };
 
+// Submixer compressor settings (Ngs2SubmixerVoiceCompressorParam without its header).
+struct Ngs2SubmixerCompressorParam {
+	// Which signal is measured and how (the Ngs2Compressor::Flag* bits). 0 turns the compressor
+	// off and leaves the submixer's output untouched.
+	uint32_t flags;
+	// The level where compression starts, as a linear amplitude for peak detection or a mean
+	// square for RMS detection. Nothing below it changes the output, so a lower threshold
+	// compresses, or ducks, quieter material.
+	float threshold;
+	// How much the output rises per dB that the measured level is over the threshold. 1 leaves
+	// the output unchanged, 0.25 (4 to 1) turns 8 dB over into 2 dB, and a ratio near 0 holds the
+	// output at the threshold like a limiter. With side-chain keying, a lower ratio ducks the
+	// submixer further while the key is loud.
+	float ratio;
+	// The width in dB of the soft knee around the threshold. 0 starts compressing abruptly at the
+	// threshold, and a wider knee eases the compression in gradually.
+	float knee;
+	// How long, in seconds, the gain takes to drop when the compression increases. 0 reacts at
+	// once and catches every peak, and a longer attack lets the start of a sound through.
+	float attack_time;
+	// How long, in seconds, the output takes to recover once the level falls back below the
+	// threshold. With side-chain keying, this is how quickly music returns after dialogue.
+	float release_time;
+	// A linear gain applied to the submixer's output while the compressor is on, to make up the
+	// level that compression takes away. 1 leaves the level unchanged.
+	float level;
+	// Unused.
+	uint32_t reserved;
+};
+static_assert(sizeof(Ngs2SubmixerCompressorParam) == 32);
+
+// A model of the submixer's compressor. For each sample it measures how loud the detected
+// signal is and how far that is above the threshold. From that it works out how many dB to turn
+// the signal down, smooths that over time with the attack and release, and applies it to every
+// channel.
+//
+// The NGS2 submixer compressor is undocumented, so this model is inferred from the settings
+// PPSA28465 sends and may need tuning.
+//
+// Flags 0x1 detects peaks on the submixer's own signal. With a threshold of 1.0, a ratio of 0.01
+// and instant attack and release, the game uses it as a limiter. Flags 0x8 keys the compressor
+// from the side-chain inputs instead, and 0x2 selects RMS detection. The game sends 0x0a to duck
+// music under voices, with a 0.1 s attack and a 4 s release. Flags 0 disables the compressor.
+//
+// The RMS detector compares the power with the threshold, so a threshold of 0.001 is -30 dB. The
+// power is summed across the channels and averaged over RmsWindow. Summing (and not averaging)
+// the channels matches the depth of the ducking in a PS5 capture of PPSA28465. That capture only
+// had stereo buses, so the depth on mono and surround buses is unverified.
+//
+// Above the threshold the output level rises by `ratio` dB per input dB, and `knee` softens the
+// transition over that many dB. `level` is applied to the compressed signal. Attack and release
+// smooth the gain reduction exponentially and are time constants. After that time about a third
+// (1/e) of the change remains, so a 4 s release brings back half the duck in about 2.8 s. This
+// matched the release in a PS5 capture of PPSA28465, where faster readings recovered too soon.
+// The attack follows the same rule, which matches the quick fade heard on hardware when a voice
+// starts but has not been measured.
+//
+// The work is done in dB because loudness is heard on a log scale. A level `x` (1 is full
+// scale) is 20 * log10(x) dB, so halving a level takes away about 6 dB. A power (a level
+// squared) is 10 * log10(p) dB, which gives the same dB figure for the same one-channel signal.
+class Ngs2Compressor {
+public:
+	static constexpr uint32_t FlagPeak      = 0x1;
+	static constexpr uint32_t FlagRms       = 0x2;
+	static constexpr uint32_t FlagSideChain = 0x8;
+	static constexpr double   RmsWindow     = 0.01; // In seconds.
+	static constexpr uint32_t KnownFlags    = FlagPeak | FlagRms | FlagSideChain;
+	// Limits on values a game should never send. Configure explains each one.
+	static constexpr double MaxAttackSeconds  = 10.0;
+	static constexpr double MaxReleaseSeconds = 60.0;
+	static constexpr double MinThreshold      = 1e-9;
+	static constexpr double MaxKneeDb         = 60.0;
+	static constexpr double MaxLevel          = 16.0; // +24 dB.
+	// Below these the running power and reduction are flushed to 0. See the end of Process.
+	static constexpr double PowerFlushFloor       = 1e-20;
+	static constexpr double ReductionFlushFloorDb = 1e-9;
+
+	// Applies the game's settings. The running level and reduction are kept, so a change of
+	// settings carries the current duck over instead of restarting it.
+	void Configure(const Ngs2SubmixerCompressorParam& param, uint32_t rate) {
+		// The NGS2 documentation gives no valid range for these values, so these limits are our
+		// own. They only guard against values a game should never send, which could otherwise
+		// produce NaN, invert the signal or freeze the gain. In our testing with PPSA28465, the
+		// values passed stay well inside the limits, so they never changed the calculated result
+		// or what was heard.
+		//
+		// A negative attack or release time means an instant change. Attack is capped at 10 s and
+		// release at 60 s, since the gain would barely move with anything longer. The game uses
+		// 0.1 s and 4 s.
+		const double attack_seconds =
+		    std::clamp(OrDefault(param.attack_time, 0.0f), 0.0, MaxAttackSeconds);
+		const double release_seconds =
+		    std::clamp(OrDefault(param.release_time, 0.0f), 0.0, MaxReleaseSeconds);
+
+		m_flags = param.flags;
+		// Unknown bits are kept, since any nonzero flags turn the compressor on, but nothing reads
+		// them. Peak and RMS together have no known meaning, and OverThresholdDb then detects RMS.
+		// Warn once about either so a game that relies on them can be found.
+		const bool peak_and_rms = (m_flags & (FlagPeak | FlagRms)) == (FlagPeak | FlagRms);
+		if (((m_flags & ~KnownFlags) != 0 || peak_and_rms) && !m_flags_warned) {
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "warning: NGS2 submixer compressor flags 0x%x are not fully supported\n",
+			    m_flags));
+			m_flags_warned = true;
+		}
+		// A threshold of 0 or less has no level in dB, so it becomes a tiny positive one instead.
+		m_threshold = std::max(MinThreshold, OrDefault(param.threshold, 1.0f));
+		// The compressor only ever reduces the gain. A ratio above 1 would expand the signal
+		// instead, and one below 0 would make louder input come out quieter.
+		m_ratio = std::clamp(OrDefault(param.ratio, 1.0f), 0.0, 1.0);
+		// A negative knee has no meaning, and 60 dB already spans the whole useful range.
+		m_knee_db = std::clamp(OrDefault(param.knee, 0.0f), 0.0, MaxKneeDb);
+		// A negative level would invert the signal. 16 (+24 dB) is a cap that keeps a bad value
+		// from blowing up the mix.
+		m_level   = std::clamp(OrDefault(param.level, 1.0f), 0.0, MaxLevel);
+		m_attack  = TimeConstantCoefficient(attack_seconds, rate);
+		m_release = TimeConstantCoefficient(release_seconds, rate);
+		// The RMS detector averages the power over roughly the last 10 ms. With this coefficient
+		// a burst of power fades to about a third (1/e) of its weight 10 ms later.
+		m_rms_window = std::exp(-1.0 / (RmsWindow * rate));
+		m_gain       = m_level * DbToGain(-m_reduction_db);
+	}
+
+	// Turns the compressor off and drops its settings and running state, as a submixer setup
+	// does.
+	void Reset() { *this = {}; }
+
+	// Drops the running level and reduction but keeps the settings, so a voice that ends, or
+	// whose state went NaN or infinite, starts again with no duck instead of one left over.
+	void ClearEnvelope() {
+		m_power        = 0.0;
+		m_reduction_db = 0.0;
+		m_gain         = m_level;
+	}
+
+	// Whether the game turned the compressor on. Any nonzero flags do.
+	[[nodiscard]] bool Enabled() const { return m_flags != 0; }
+	[[nodiscard]] bool UsesSideChain() const { return (m_flags & FlagSideChain) != 0; }
+	// The gain currently applied to the signal, the make-up level less the reduction.
+	[[nodiscard]] float Gain() const { return static_cast<float>(m_gain); }
+	// The gain the reduction alone applies (1 means no reduction), without the make-up level.
+	// The submixer reports it as its compressor height.
+	[[nodiscard]] float ReductionGain() const {
+		return static_cast<float>(DbToGain(-m_reduction_db));
+	}
+
+	// Compresses `samples` (channel-major, `grain` samples per channel). `key` holds the
+	// side-chain inputs in the same layout, or is null when they are silent.
+	void Process(float* samples, const float* key, uint32_t channels, uint32_t grain) {
+		// With side-chain keying the gain follows the key, so a loud key ducks `samples` even
+		// when they are quiet themselves.
+		const float* detect = UsesSideChain() ? key : samples;
+		for (uint32_t i = 0; i < grain; ++i) {
+			const double target = GainReduction(OverThresholdDb(detect, i, channels, grain));
+			// Move the reduction part of the way toward its target. Each sample closes
+			// (1 - coefficient) of the remaining distance, using the attack coefficient while the
+			// reduction grows and the release coefficient while it shrinks. Because the dB figure
+			// is smoothed, and not the gain itself, the same fraction of the reduction is left
+			// after a given time, however deep it was. A deeper duck still takes longer to become
+			// inaudible.
+			if (target != 0.0 || m_reduction_db != 0.0) {
+				const double coefficient = target > m_reduction_db ? m_attack : m_release;
+				m_reduction_db = coefficient * m_reduction_db + (1.0 - coefficient) * target;
+				m_gain         = m_level * DbToGain(-m_reduction_db);
+			}
+			for (uint32_t ch = 0; ch < channels; ++ch) {
+				samples[ch * grain + i] = static_cast<float>(samples[ch * grain + i] * m_gain);
+			}
+		}
+		// The smoothing only ever approaches its target, so flush values too small to matter.
+		// That lets the envelope reach exactly no reduction and skip the gain update again.
+		if (m_power < PowerFlushFloor) {
+			m_power = 0.0;
+		}
+		if (m_reduction_db < ReductionFlushFloorDb && m_reduction_db != 0.0) {
+			m_reduction_db = 0.0;
+			m_gain         = m_level;
+		}
+		// The detector skips samples that are not finite, so this should never happen. If the
+		// state still turns NaN or infinite, start again from no reduction instead of muting or
+		// corrupting the bus for good. The settings are kept.
+		if (!std::isfinite(m_power) || !std::isfinite(m_reduction_db)) {
+			ClearEnvelope();
+		}
+	}
+
+private:
+	// Returns `value`, or `fallback` when the game sent a value that is not finite.
+	static double OrDefault(float value, float fallback) {
+		return std::isfinite(value) ? value : fallback;
+	}
+
+	// Turns a change in dB into the factor to multiply a level by. For example -6 dB gives about
+	// 0.5 and 0 dB gives 1.
+	static double DbToGain(double db) { return std::pow(10.0, db / 20.0); }
+
+	// The smoothing coefficient `c` for a time constant of `seconds`. Each sample keeps `c` of
+	// the distance left to the target, so after n samples c^n of it remains. With
+	// c = exp(-1 / (seconds * rate)) about a third (1/e) of the change remains when the time is
+	// up, and half remains after about 0.69 (ln 2) of it. Zero seconds gives a `c` of 0, which
+	// jumps straight to the target.
+	static double TimeConstantCoefficient(double seconds, uint32_t rate) {
+		return seconds <= 0.0 ? 0.0 : std::exp(-1.0 / (seconds * rate));
+	}
+
+	// How far the detected signal at sample `i` is above the threshold in dB. The result is
+	// negative below the threshold and minus infinity for silence. `detect` may be null, which
+	// is silence.
+	//
+	// Peak detection takes the loudest channel at this one sample. RMS detection adds up the
+	// power of all the channels and averages it over time, so it follows how loud the signal
+	// sounds and ignores short spikes. A stereo signal with the same level in both channels
+	// detects 3 dB louder than mono.
+	double OverThresholdDb(const float* detect, uint32_t i, uint32_t channels, uint32_t grain) {
+		const bool rms   = (m_flags & FlagRms) != 0;
+		double     level = 0.0;
+		if (detect != nullptr) {
+			for (uint32_t ch = 0; ch < channels; ++ch) {
+				const double value = detect[ch * grain + i];
+				// A NaN or infinite sample has no level, so it is skipped. Otherwise it would
+				// stay in the running average, or in the reduction, for good.
+				if (!std::isfinite(value)) {
+					continue;
+				}
+				level = rms ? level + value * value : std::max(level, std::abs(value));
+			}
+		}
+		if (rms) {
+			// Mix this sample's total power into the running average.
+			m_power = m_rms_window * m_power + (1.0 - m_rms_window) * level;
+			// A power is compared in dB with 10 * log10 where a level uses 20 * log10.
+			return m_power > 0.0 ? 10.0 * std::log10(m_power / m_threshold)
+			                     : -std::numeric_limits<double>::infinity();
+		}
+		return level > 0.0 ? 20.0 * std::log10(level / m_threshold)
+		                   : -std::numeric_limits<double>::infinity();
+	}
+
+	// How many dB to turn the signal down when the detected level is `over` dB above the
+	// threshold.
+	//
+	// Above the threshold the output only rises by `m_ratio` dB for each dB of input, and the
+	// rest is taken away. With a ratio of 0.25 (4 to 1), 8 dB over comes out 2 dB over, so the
+	// reduction is 6 dB. That is `slope` (1 - ratio) times `over`.
+	//
+	// A soft knee eases into that slope instead of starting it all at once at the threshold.
+	// The knee spans half its width either side of the threshold (a 6 dB knee runs from 3 dB
+	// under to 3 dB over). Across it the reduction rises along a curve from 0 at the bottom
+	// edge to meet the straight line at the top edge.
+	[[nodiscard]] double GainReduction(double over) const {
+		const double slope = 1.0 - m_ratio;
+		if (m_knee_db > 0.0 && std::abs(over) < m_knee_db / 2.0) {
+			// How far into the knee the level is, from 0 at its bottom edge to `m_knee_db` at
+			// its top edge.
+			const double into = over + m_knee_db / 2.0;
+			return slope * into * into / (2.0 * m_knee_db);
+		}
+		return over > 0.0 ? slope * over : 0.0;
+	}
+
+	uint32_t m_flags        = 0;   // FlagPeak, FlagRms and FlagSideChain bits. 0 is off.
+	double   m_threshold    = 1.0; // Detected level where compression starts.
+	double   m_ratio        = 1.0; // Output dB per input dB above the threshold.
+	double   m_knee_db      = 0.0; // Width of the soft knee.
+	double   m_level        = 1.0; // Output gain.
+	double   m_attack       = 0.0; // Smoothing coefficient while the reduction grows.
+	double   m_release      = 0.0; // Smoothing coefficient while the reduction shrinks.
+	double   m_rms_window   = 0.0; // Smoothing coefficient of the RMS detector.
+	double   m_power        = 0.0; // Smoothed power summed across channels, for RMS detection.
+	double   m_reduction_db = 0.0; // Current gain reduction.
+	double   m_gain         = 1.0; // Current gain, `m_level` less the reduction.
+	// The flags warning has been given, for unknown bits or peak with RMS.
+	bool m_flags_warned = false;
+};
+
 struct Ngs2VoiceInternal {
 	struct Port {
 		Ngs2VoiceInternal* dest   = nullptr;
@@ -571,6 +846,10 @@ struct Ngs2VoiceInternal {
 	bool                            rendering       = false;
 	bool                            rendered        = false;
 	bool                            has_samples     = false;
+	Ngs2Compressor                  compressor; // standard submixers
+	std::vector<float>              side_chain; // side-chain inputs of this render
+	// An ignored submixer control has been reported.
+	bool                            submixer_control_warned = false;
 
 	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
 	std::vector<float>                  decoded_frame;
@@ -765,6 +1044,15 @@ struct Ngs2VoiceInternal {
 		EXIT_NOT_IMPLEMENTED(index >= ports.size());
 		ports[index].matrix = matrix;
 	}
+	// No release envelope is configured, so a stop finishes at the end of the render it was
+	// issued in. The voice is then done, so its compressor starts again with no duck, as after a
+	// kill.
+	void FinishStop() {
+		if (state == Ngs2VoicePlayState::Stopped) {
+			state = Ngs2VoicePlayState::Empty;
+			compressor.ClearEnvelope();
+		}
+	}
 	void SetEvent(uint32_t id) {
 		switch (id) {
 			case 1:
@@ -780,7 +1068,12 @@ struct Ngs2VoiceInternal {
 				}
 				break;
 			case 4:
-			case 8: state = Ngs2VoicePlayState::Empty; break;
+			case 8:
+				// Kill and reset discard the voice, so its compressor starts again with no duck.
+				// A paused voice keeps its duck. A stopped one clears it in FinishStop.
+				state = Ngs2VoicePlayState::Empty;
+				compressor.ClearEnvelope();
+				break;
 			case 16:
 				if (state == Ngs2VoicePlayState::Playing) {
 					state = Ngs2VoicePlayState::Paused;
@@ -1800,6 +2093,30 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	voice.has_samples = output != 0;
 }
 
+// A standard submixer voice has max_inputs inputs. Input 0 is mixed, and the others are
+// side-chain inputs for its compressor.
+static bool Ngs2IsSideChainInput(const Ngs2VoiceInternal& voice, uint32_t input) {
+	return voice.rack->type == Ngs2RackType::Submixer && input >= 1 &&
+	       input < voice.rack->option.submixer.max_inputs;
+}
+
+// Runs a standard submixer's compressor on the mixed input, then drops this grain's side-chain
+// key. The submixer's modules are assumed to run as the input mix, then envelope, filter and EQ
+// (not emulated), then this compressor, then distortion and the peak meter (not emulated), then
+// the output ports. A future submixer peak meter should read the samples after this call.
+//
+// It runs on silent grains too, so the release carries on between voice lines. The key is
+// cleared even when the compressor is off, because the port loop only zeroes it when it is
+// empty, so a kept key would add onto the next grain's.
+static void Ngs2ApplySubmixerCompressor(Ngs2VoiceInternal& voice, uint32_t grain) {
+	if (voice.rack->type == Ngs2RackType::Submixer && voice.compressor.Enabled()) {
+		voice.compressor.Process(voice.samples.data(),
+		                         voice.side_chain.empty() ? nullptr : voice.side_chain.data(),
+		                         voice.channels, grain);
+	}
+	voice.side_chain.clear();
+}
+
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
@@ -1844,10 +2161,17 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				if (!source->has_samples) {
 					continue;
 				}
+				// Submixer inputs after the first only key the compressor (e.g. voices ducking
+				// music), so they are mixed into a separate side-chain buffer, not the output.
+				const bool side_chain = Ngs2IsSideChainInput(voice, port.input);
 				// Input N of a custom rack voice feeds its buffer N.
-				EXIT_NOT_IMPLEMENTED(port.input >= voice.rack->NumBuffers());
+				EXIT_NOT_IMPLEMENTED(!side_chain && port.input >= voice.rack->NumBuffers());
+				if (side_chain && voice.side_chain.empty()) {
+					voice.side_chain.assign(size_t(grain) * voice.channels, 0.0f);
+				}
 				const auto* input  = source->Buffer(source->rack->PortBufferId(p), grain);
-				auto*       output = voice.Buffer(port.input, grain);
+				auto*       output =
+				    side_chain ? voice.side_chain.data() : voice.Buffer(port.input, grain);
 				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
 				const size_t output_channels =
 				    matrix == nullptr
@@ -1864,9 +2188,10 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 						}
 					}
 				}
-				voice.has_samples = true;
+				voice.has_samples = voice.has_samples || !side_chain;
 			}
 		}
+		Ngs2ApplySubmixerCompressor(voice, grain);
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
@@ -2004,10 +2329,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 	}
 	for (auto* voice: voices) {
-		// No envelope is configured, so a release stop finishes in this render.
-		if (voice->state == Ngs2VoicePlayState::Stopped) {
-			voice->state = Ngs2VoicePlayState::Empty;
-		}
+		voice->FinishStop();
 		voice->state_flags = static_cast<uint32_t>(voice->state);
 	}
 	++ngs->render_count;
@@ -2452,7 +2774,27 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					    setup.num_io_channels > voice->rack->option.submixer.max_channels ||
 					    setup.flags != 0);
 					voice->ResetSetupState();
+					voice->compressor.Reset();
 					voice->channels = setup.num_io_channels;
+				} else if ((param->id & 0xffffu) == 2) {
+					// Ngs2SubmixerVoiceCompressorParam. Ngs2Compressor describes the inferred
+					// model.
+					EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
+					                                        sizeof(Ngs2SubmixerCompressorParam));
+					const auto& compressor =
+					    *reinterpret_cast<const Ngs2SubmixerCompressorParam*>(param + 1);
+					LOGF("\t compressor: flags = 0x%x, threshold = %f, ratio = %f, knee = %f, "
+					     "attack = %f, release = %f, level = %f\n",
+					     compressor.flags, compressor.threshold, compressor.ratio, compressor.knee,
+					     compressor.attack_time, compressor.release_time, compressor.level);
+					voice->compressor.Configure(compressor, voice->rack->ngs->option.sample_rate);
+				} else if (!voice->submixer_control_warned) {
+					// PPSA28465 sends 0x20000006 with an all-zero filter payload, which as a filter
+					// means off, so ignoring it is harmless there. Warn once per voice so a game
+					// that needs another submixer control can be found.
+					Log::WriteToConsoleAndLog(fmt::sprintf(
+					    "warning: NGS2 submixer control 0x%08" PRIx32 " is ignored\n", param->id));
+					voice->submixer_control_warned = true;
 				}
 				break;
 			}
@@ -2699,6 +3041,10 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			auto* submixer                    = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
 			*submixer                         = {};
 			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
+			// The gain the compressor's reduction currently applies, without the make-up level.
+			// It stays 0 when the compressor is off, as before the compressor was emulated.
+			submixer->compressor_height =
+			    voice->compressor.Enabled() ? voice->compressor.ReductionGain() : 0.0f;
 			break;
 		}
 		case Ngs2RackType::CustomMastering:

@@ -28,6 +28,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -64,11 +65,43 @@ private:
 		uint32_t offset  = 0;
 		bool     strict  = false;
 	};
-	void                 Append(uint64_t address, const void* data, uint32_t size, bool strict);
-	std::vector<Entry>   m_entries;
-	std::vector<uint8_t> m_bytes;
-	bool                 m_failed      = false;
-	bool                 m_gpu_written = false;
+	// A load of one descriptor word with refreshable bits.
+	struct Word {
+		uint32_t offset = 0; // Of its bytes in m_bytes.
+		uint32_t stage  = 0;
+		uint32_t source = 0;
+		uint32_t word   = 0;
+		uint32_t mask   = 0;
+	};
+	// Reads the entry's bytes now, as StillValid() does.
+	void ReadNow(const Entry& entry, uint8_t* bytes) const;
+	// Whether the entry's bytes differ from the recorded ones only in refreshable bits.
+	[[nodiscard]] bool OnlyRefreshableBitsChanged(const Entry& entry) const;
+	// Consecutive dwords of one page that fill consecutive flattened SRT dwords of a stage.
+	struct FlatLoad {
+		uint64_t address = 0;
+		uint32_t stage   = 0;
+		uint32_t slot    = 0;
+		uint32_t count   = 1;
+	};
+	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict);
+	std::vector<Entry>    m_entries;
+	std::vector<uint8_t>  m_bytes;
+	std::vector<FlatLoad> m_flat_loads;
+	std::vector<Word>     m_words;
+	// Entries whose refreshable bits changed (found by StillValid()).
+	mutable std::vector<uint32_t> m_refresh;
+	// The pages StillValid() found GPU-owned or not, by page % size, for RefreshFlatLoads().
+	struct CheckedPage {
+		uint64_t       page    = UINT64_MAX;
+		bool           owned   = false;
+		const uint8_t* backing = nullptr;
+	};
+	mutable std::array<CheckedPage, 8> m_checked {};
+	uint32_t              m_stage       = 0;
+	const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
+	bool                  m_failed      = false;
+	bool                  m_gpu_written = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots

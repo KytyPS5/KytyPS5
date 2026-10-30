@@ -916,6 +916,31 @@ bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+const uint8_t* FindAroundBackingPage(uint64_t vaddr) {
+	constexpr uint64_t PageSize = 4096;
+	const auto         page     = vaddr & ~(PageSize - 1);
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(page, PageSize) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return nullptr;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (!buffers.MayBeGpuModified(page, PageSize) || !buffers.IsRegionGpuModified(page, PageSize) ||
+	    GetGpuResources().GetTextureCache().IsRegionGpuModified(page, PageSize)) {
+		return nullptr;
+	}
+	return static_cast<const uint8_t*>(FindBackingPointer(page, PageSize));
+}
+
+bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
+                                  const uint8_t* page_backing) {
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
+	}
+	std::memcpy(data, page_backing + (vaddr & 0xfffu), size);
+	return true;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Backed pages lie in committed ranges, so a fully backed buffer needs no range walk. Up to
 	// 16 MiB (1024 pages) the page walk costs about as much as the locked range walk.

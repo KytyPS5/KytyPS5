@@ -289,6 +289,17 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// By page, the bytes of the GPU-written ranges (one bit per byte): reads around the GPU's writes
+	// ask HasGpuDirtyBytes() a hundred thousand times a frame, mostly on the same few pages. A page's
+	// mask is built on its first query in slot page % 128 and follows the ranges as they grow or
+	// shrink over it.
+	struct DirtyPageMask {
+		uint64_t                 page = UINT64_MAX;
+		std::array<uint64_t, 64> bits {};
+	};
+	std::array<DirtyPageMask, 128> m_dirty_masks {};
+	// After m_gpu_modified_ranges gained (dirty) or lost [vaddr, vaddr + size).
+	void NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirty);
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;

@@ -349,6 +349,143 @@ void GuestReadLog::RecordLoad(uint64_t address, uint32_t value) {
 	Append(address, &value, sizeof(value), false);
 }
 
+void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
+                                    bool gpu_copies) const {
+	for (auto& snapshot: resources) {
+		snapshot.gpu_flat_loads.clear();
+	}
+	// As the execution thread's own walk loads: around the GPU's writes on the pages it owns,
+	// directly elsewhere.
+	// The loads of a draw alternate between a few pages, mostly those StillValid() just decided:
+	// its answers still hold. A page it read back since no longer faults, and reading it around
+	// the GPU's writes then finds no dirty bytes and takes the backing, which holds them.
+	auto& checked = m_checked;
+	for (const auto& load: m_flat_loads) {
+		if (load.stage >= resources.size() ||
+		    uint64_t {load.slot} + load.count > resources[load.stage].flattened_srt.size()) {
+			continue;
+		}
+		const auto page_index = load.address >> 12u;
+		auto&      page       = checked[page_index % checked.size()];
+		if (page.page != page_index) {
+			page.page    = page_index;
+			page.owned   = Libs::LibKernel::Memory::MayFaultOnGpuRead(load.address & ~0xfffull, 4096);
+			page.backing = page.owned ? Libs::LibKernel::Memory::FindAroundBackingPage(load.address)
+			                          : nullptr;
+		}
+		auto*      values = resources[load.stage].flattened_srt.data() + load.slot;
+		const auto bytes  = load.count * sizeof(uint32_t);
+		// Bytes the GPU wrote to a cached buffer (no GPU-written image covers the page): reading
+		// them here waits for the GPU (through the mirror or a readback). The shader reads them
+		// when it runs, after the work that writes them: a copy on the GPU puts them there in time.
+		if (gpu_copies && page.owned && page.backing != nullptr &&
+		    Libs::LibKernel::Memory::HasGpuWrittenBytes(load.address, bytes)) {
+			resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
+			continue;
+		}
+		const bool around =
+		    page.owned &&
+		    (page.backing != nullptr ? Libs::LibKernel::Memory::TryReadAroundGpuWritesOnPage(
+		                                   load.address, values, bytes, page.backing)
+		                             : Libs::LibKernel::Memory::TryReadAroundGpuWrites(
+		                                   load.address, values, bytes));
+		if (!around) {
+			// The mirror did not hold them yet: the same copy instead of a readback.
+			if (gpu_copies && page.owned && page.backing != nullptr) {
+				resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
+				continue;
+			}
+			std::memcpy(values, reinterpret_cast<const void*>(load.address), bytes);
+		}
+	}
+}
+
+void GuestReadLog::ReadNow(const Entry& entry, uint8_t* bytes) const {
+	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size) ||
+	    !Libs::LibKernel::Memory::TryReadAroundGpuWrites(entry.address, bytes, entry.size)) {
+		std::memcpy(bytes, reinterpret_cast<const void*>(entry.address), entry.size);
+	}
+}
+
+bool GuestReadLog::OnlyRefreshableBitsChanged(const Entry& entry) const {
+	static thread_local std::vector<uint8_t> now;
+	now.resize(entry.size);
+	ReadNow(entry, now.data());
+	const auto* recorded = m_bytes.data() + entry.offset;
+	auto        word     = entry.words_begin;
+	for (uint32_t done = 0; done < entry.size; done += sizeof(uint32_t)) {
+		uint32_t current  = 0;
+		uint32_t previous = 0;
+		const auto bytes  = std::min<uint32_t>(entry.size - done, sizeof(uint32_t));
+		std::memcpy(&current, now.data() + done, bytes);
+		std::memcpy(&previous, recorded + done, bytes);
+		while (word < entry.words_end && m_words[word].offset < entry.offset + done) {
+			word++;
+		}
+		const auto mask = word < entry.words_end && m_words[word].offset == entry.offset + done
+		                      ? m_words[word].mask
+		                      : 0u;
+		if (((current ^ previous) & ~mask) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void GuestReadLog::RefreshDescriptorWords(
+    std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
+    std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const {
+	using ShaderRecompiler::IR::DescriptorRefresh;
+	static thread_local std::vector<uint8_t> now;
+	for (const auto index: m_refresh) {
+		const auto& entry = m_entries[index];
+		now.resize(entry.size);
+		ReadNow(entry, now.data());
+		for (uint32_t w = entry.words_begin; w < entry.words_end; w++) {
+			const auto& load = m_words[w];
+			uint32_t    value    = 0;
+			uint32_t    previous = 0;
+			std::memcpy(&value, now.data() + (load.offset - entry.offset), sizeof(value));
+			std::memcpy(&previous, m_bytes.data() + load.offset, sizeof(previous));
+			if (value == previous || load.stage >= resources.size() || load.stage >= plans.size() ||
+			    plans[load.stage] == nullptr) {
+				continue;
+			}
+			const auto& plan     = *plans[load.stage];
+			auto&       snapshot = resources[load.stage];
+			// The shader reads the same dword from the flattened SRT.
+			const auto flat_word = uint64_t {load.source} * 8u + load.word;
+			if (flat_word < plan.descriptor_word_flat.size() &&
+			    plan.descriptor_word_flat[flat_word] < snapshot.flattened_srt.size()) {
+				snapshot.flattened_srt[plan.descriptor_word_flat[flat_word]] = value;
+			}
+			// Descriptors the materialization cleared (invalid, unreached or of another type)
+			// stay cleared: the refreshed bits do not decide that.
+			const auto refresh = [&](ShaderRecompiler::IR::DescriptorValue& descriptor) {
+				if (load.word >= descriptor.dword_count ||
+				    std::ranges::all_of(descriptor.dwords, [](uint32_t dword) { return dword == 0; })) {
+					return;
+				}
+				descriptor.dwords[load.word] =
+				    (descriptor.dwords[load.word] & ~load.mask) | (value & load.mask);
+			};
+			const auto kind = load.source < plan.descriptor_refresh.size()
+			                      ? plan.descriptor_refresh[load.source]
+			                      : DescriptorRefresh::None;
+			if (kind == DescriptorRefresh::Buffer) {
+				for (uint32_t k = 0; k < plan.info.buffers.size() && k < snapshot.buffers.size(); ++k) {
+					if (plan.info.buffers[k].source == load.source) refresh(snapshot.buffers[k]);
+				}
+			} else if (kind == DescriptorRefresh::Image) {
+				for (uint32_t k = 0; k < plan.info.images.size() && k < snapshot.images.size(); ++k) {
+					if (plan.info.images[k].source == load.source) refresh(snapshot.images[k]);
+				}
+			}
+		}
+	}
+	m_refresh.clear();
+}
+
 // Most logged reads are a few dwords: compare those without a call.
 static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t size) {
 	const auto load = [](const void* address, uint32_t offset, auto value) {
@@ -375,31 +512,51 @@ bool GuestReadLog::StillValid() const {
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
-	// Most entries lie on pages the GPU does not own: decide that once per page.
-	uint64_t checked_page  = UINT64_MAX;
-	bool     checked_owned = false;
+	// Most entries lie on pages the GPU does not own: decide that once per page. The entries of
+	// a draw alternate between a few pages (its descriptor tables and the GPU-owned pages around
+	// them), so the last pages are kept, with the backing bytes of the GPU-owned ones for reading
+	// around the GPU's writes there (see FindAroundBackingPage()). RefreshFlatLoads() reuses them.
+	auto& checked = m_checked;
+	checked.fill({});
+	// An entry with descriptor words compares its other bits.
+	const auto refreshable = [&](const Entry& entry) {
+		if (entry.words_begin == entry.words_end || !OnlyRefreshableBitsChanged(entry)) {
+			return false;
+		}
+		m_refresh.push_back(static_cast<uint32_t>(&entry - m_entries.data()));
+		return true;
+	};
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (!entry.strict) {
-			const auto first_page = entry.address >> 12u;
-			const auto last_page  = (entry.address + entry.size - 1) >> 12u;
-			bool       gpu_owned  = false;
-			if (first_page == last_page && first_page == checked_page) {
-				gpu_owned = checked_owned;
+			const auto  first_page   = entry.address >> 12u;
+			const auto  last_page    = (entry.address + entry.size - 1) >> 12u;
+			bool        gpu_owned    = false;
+			const auto* page_backing = static_cast<const uint8_t*>(nullptr);
+			if (first_page == last_page) {
+				auto& page = checked[first_page % checked.size()];
+				if (page.page != first_page) {
+					page.page    = first_page;
+					page.owned   = Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size);
+					page.backing = page.owned
+					                   ? Libs::LibKernel::Memory::FindAroundBackingPage(entry.address)
+					                   : nullptr;
+				}
+				gpu_owned    = page.owned;
+				page_backing = page.backing;
 			} else {
 				gpu_owned = Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, entry.size);
-				if (first_page == last_page) {
-					checked_page  = first_page;
-					checked_owned = gpu_owned;
-				}
 			}
 			// On GPU-owned pages a direct load faults and reads back all the GPU's queued work:
 			// bytes the GPU did not write compare from the backing store.
 			bool around = gpu_owned;
 			for (uint32_t done = 0; around && done < entry.size; done += sizeof(buffer)) {
 				const auto bytes = std::min<uint32_t>(entry.size - done, sizeof(buffer));
-				around           = Libs::LibKernel::Memory::TryReadAroundGpuWrites(
-                    entry.address + done, buffer.data(), bytes);
+				around           = page_backing != nullptr
+				                       ? Libs::LibKernel::Memory::TryReadAroundGpuWritesOnPage(
+				                             entry.address + done, buffer.data(), bytes, page_backing)
+				                       : Libs::LibKernel::Memory::TryReadAroundGpuWrites(
+				                             entry.address + done, buffer.data(), bytes);
 				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
 					return false;
 				}
@@ -1233,8 +1390,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const auto stage_index    = ahead.stages++;
 	auto&      resources      = ahead.resources[stage_index];
 	auto&      specialization = ahead.specializations[stage_index];
-	// The walker's loads that fault ahead of execution fail the walk instead of downloading
-	// GPU-written bytes; the others are logged with the value they read.
+	// The walker's loads of GPU-owned pages read the backing store instead of downloading
+	// GPU-written bytes, and the loads that still fault fail the walk; every load is logged with
+	// the value it read, for the execution thread to check.
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 	    .shader_base                = params.Base(),

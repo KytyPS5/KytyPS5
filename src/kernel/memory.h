@@ -152,6 +152,14 @@ bool                   MayBeGpuWritten(uint64_t vaddr, uint64_t size);
 // but the GPU wrote none of its bytes, where a direct load would fault and read back everything
 // the GPU has queued. False when the caller should load the bytes directly.
 bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size);
+// GPU threads: the backing store's bytes of the GPU-owned 4 KiB page holding vaddr when no
+// GPU-written image covers the page, for TryReadAroundGpuWritesOnPage(); null otherwise (also when
+// the GPU does not own the page). The answer holds until the GPU thread records more work.
+[[nodiscard]] const uint8_t* FindAroundBackingPage(uint64_t vaddr);
+// TryReadAroundGpuWrites() for a range within a page FindAroundBackingPage() gave `page_backing`
+// for: it only looks up which of the bytes the GPU wrote.
+bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
+                                  const uint8_t* page_backing);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // Whether TryReadBacking or TryReadSparseBacking can read the whole range.

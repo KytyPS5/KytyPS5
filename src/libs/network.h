@@ -182,6 +182,8 @@ struct NpCheckPremiumResult;
 
 using NpStateCallbackA = KYTY_SYSV_ABI void (*)(int user_id, uint32_t state, void* userdata);
 
+bool IsSignedIn(int user_id);
+
 int KYTY_SYSV_ABI  NpCheckCallback();
 int KYTY_SYSV_ABI  NpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret* title_secret);
 int KYTY_SYSV_ABI  NpSetContentRestriction(const NpContentRestriction* restriction);

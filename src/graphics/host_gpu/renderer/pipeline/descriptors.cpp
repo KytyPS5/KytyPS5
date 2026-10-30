@@ -934,43 +934,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	for (const auto* reader: prepared_bindings) {
-		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->module->info.has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
-			}
-		}
-		for (const auto [address, size]: reads) {
-			for (const auto id: m_bound_images) {
-				const auto& image = m_context.GetTextureCache().m_slot_images[id];
-				if (!image.binding.shader_write && !image.binding.is_target) continue;
-				for (const auto written: {image.info.data, image.info.stencil,
-				                          image.info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
-					}
-				}
-			}
-			for (const auto* writer: prepared_bindings) {
-				const auto& program = writer->runtime->module->info;
-				for (const auto& resource: program.info.buffers) {
-					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
-					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					// ADD_TID and swizzle move fixed-offset writes past write_extent.
-					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
-					const auto written_size =
-					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written_size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
-					}
-				}
-			}
-		}
-	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}

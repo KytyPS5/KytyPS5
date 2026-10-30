@@ -235,7 +235,8 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::SubgroupUMaxU32 || op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
+	     op == Op::SubgroupUMaxU32 || op == Op::SubgroupOrU32 || op == Op::ReadConstBuffer ||
+	     op == Op::ReadRealtimeClock ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
@@ -414,6 +415,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U32:
 		case IR::Type::F16: return TypeU32(state);
 		case IR::Type::U64: return TypeU64(state);
+		case IR::Type::Bvh8Result: return TypeBvh8Result(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
 		case IR::Type::F64: return TypeF64(state);
@@ -675,8 +677,8 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
-	DefineIndirectBufferFormats(ctx);
 	DefineBvhIntersect(state);
+	DefineTrinityFunctions(state);
 	if (program.info.uses_swizzle) {
 		ctx.scratch_u32_variable = state.builder.AllocateId();
 		if (state.lane_count == 2) {

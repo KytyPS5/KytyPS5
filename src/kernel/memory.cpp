@@ -1006,8 +1006,10 @@ void Initialize() {
 	const auto table_overhead = g_cpu_table_memory + g_gpu_table_memory +
 	                            std::max(params.amm_table_memory, INCLUDED_TABLE_MEMORY) -
 	                            3 * INCLUDED_TABLE_MEMORY;
-	EXIT_IF(g_flexible_memory_size + table_overhead >= GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE);
-	g_guest_memory_size = GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE - table_overhead;
+	const auto memory_budget = GUEST_MEMORY_BUDGET +
+	                           (Loader::SystemContentIsTrinityMode() ? 1216ull * 1024ull * 1024ull : 0);
+	EXIT_IF(g_flexible_memory_size + table_overhead >= memory_budget - RESERVED_CACHE_SIZE);
+	g_guest_memory_size = memory_budget - RESERVED_CACHE_SIZE - table_overhead;
 	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB\n",
 	     g_flexible_memory_size / (1024ull * 1024ull),
 	     (g_guest_memory_size - g_flexible_memory_size) / (1024ull * 1024ull));

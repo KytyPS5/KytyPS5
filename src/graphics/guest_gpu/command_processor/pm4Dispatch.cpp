@@ -226,6 +226,7 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_POP_MARKER]     = CpOpPopMarker;
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
+	g_cp_op_custom_func[Pm4::R_PSSR]           = CpOpPssr;
 
 	return g_cp_op_custom_func;
 }

@@ -148,14 +148,14 @@ template <class S, class T> void Io(S& io, T& value) {
 		IoAll(io, __VA_ARGS__);                                                                    \
 	}
 KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)
-KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
+KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
 KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
 KYTY_IO_FIELDS(StageOutput, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K)
+               A, B, C, D, E, F, G, H, I, J, K, L, M)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,

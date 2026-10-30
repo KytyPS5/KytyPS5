@@ -113,6 +113,10 @@ bool VrEnabled() {
 	return g_config->vr_enabled;
 }
 
+bool Ps5ProEnabled() {
+	return g_config->pro_enabled;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
@@ -131,6 +135,10 @@ bool VulkanValidationEnabled() {
 
 bool IsNetworkConnected() {
 	return g_config->network_connected;
+}
+
+bool PsnEmulationEnabled() {
+	return g_config->psn_emulation_enabled;
 }
 
 bool ShaderValidationEnabled() {

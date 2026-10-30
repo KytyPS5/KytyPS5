@@ -281,6 +281,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe5u: return Opcode::IMAGE_BVH8_INTERSECT_RAY;
 		case 0xe6u:
 		case 0xe7u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
@@ -297,6 +298,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
+		case 0xe5u:
 		case 0xe6u: return 11u;
 		case 0xe7u: return 12u;
 		case 0x0eu: return 1u;
@@ -425,6 +427,36 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
+	}
+
+	if (opcode == 0xe5u) {
+		inst.data_components = inst.data_dwords = 10;
+		if (a16 || d16 || !r128 || inst.dmask != 0xfu ||
+		    (nsa_dwords != 0u && nsa_dwords != 2u) || vdata > 246u ||
+		    (nsa_dwords == 0u && vaddr > 245u)) {
+			SetUnsupported(inst, Family::MIMG, opcode, "invalid BVH8 ray or destination encoding");
+		}
+		if (nsa_dwords == 2u) {
+			const auto origin = inst.image_nsa_addr[3], direction = inst.image_nsa_addr[4];
+			const auto node = inst.image_nsa_addr[5];
+			if (origin > 253u || direction > 253u)
+				SetUnsupported(inst, Family::MIMG, opcode, "BVH8 ray registers exceed VGPR range");
+			for (uint32_t i = 0; i < 3; ++i) {
+				inst.image_nsa_addr[3 + i] = origin + i;
+				inst.image_nsa_addr[6 + i] = direction + i;
+			}
+			inst.image_nsa_addr[9] = node;
+		}
+		const auto origin = nsa_dwords != 0 ? inst.image_nsa_addr[3] : vaddr + 4;
+		const auto direction = nsa_dwords != 0 ? inst.image_nsa_addr[6] : vaddr + 7;
+		bool overlapping = origin < direction + 3 && direction < origin + 3;
+		for (const auto output : {2u, 3u, 6u, 7u}) {
+			const auto reg = vdata + output;
+			overlapping |= (reg >= origin && reg < origin + 3) ||
+			               (reg >= direction && reg < direction + 3);
+		}
+		if (overlapping)
+			SetUnsupported(inst, Family::MIMG, opcode, "overlapping BVH8 instance outputs are unsupported");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

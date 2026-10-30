@@ -30,16 +30,7 @@ uint32_t NodeWord(EmitterState& s, uint32_t block, uint32_t word) {
 uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
                   Vec3 origin, Vec3 direction) {
 	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
-	const auto zero = ConstantF32Value(s, 0.0f);
-	const auto op = [&](spv::Op code, uint32_t x, uint32_t y) {
-		const auto value = Binary(s, code, f, x, y);
-		s.builder.AddAnnotation(spv::OpDecorate, value, spv::DecorationNoContraction);
-		return value;
-	};
 	const auto cmp = [&](spv::Op code, uint32_t x, uint32_t y) { return Binary(s, code, b, x, y); };
-	const auto either = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalOr, b, x, y); };
-	const auto both = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalAnd, b, x, y); };
-	const auto abs = [&](uint32_t x) { return EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, x); };
 	const auto is_kind = [&](uint32_t n) { return cmp(spv::OpIEqual, kind, ConstantU32(s, n)); };
 	// The four triangles are (0,1,2), (1,3,2), (2,3,4), (2,4,0).
 	const std::array vertices {
@@ -56,6 +47,28 @@ uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
 			    NodeWord(s, block, Binary(s, spv::OpIAdd, u, first, ConstantU32(s, axis))));
 	}
 	const auto flag = NodeWord(s, block, ConstantU32(s, 15));
+	const auto remap = Binary(s, spv::OpShiftRightLogical, u, flag,
+	    Binary(s, spv::OpIMul, u, kind, ConstantU32(s, 8)));
+	return EmitBvhTriangle(s, positions, origin, direction, remap,
+	    Binary(s, spv::OpIAdd, u, flag, kind), bary);
+}
+
+} // namespace
+
+uint32_t EmitBvhTriangle(EmitterState& s, const std::array<Vec3, 3>& positions,
+                         Vec3 origin, Vec3 direction, uint32_t remap,
+                         uint32_t triangle_id, uint32_t bary) {
+	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
+	const auto zero = ConstantF32Value(s, 0.0f);
+	const auto op = [&](spv::Op code, uint32_t x, uint32_t y) {
+		const auto value = Binary(s, code, f, x, y);
+		s.builder.AddAnnotation(spv::OpDecorate, value, spv::DecorationNoContraction);
+		return value;
+	};
+	const auto cmp = [&](spv::Op code, uint32_t x, uint32_t y) { return Binary(s, code, b, x, y); };
+	const auto either = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalOr, b, x, y); };
+	const auto both = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalAnd, b, x, y); };
+	const auto abs = [&](uint32_t x) { return EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, x); };
 	const auto y_largest = cmp(spv::OpFOrdLessThan, abs(direction[0]), abs(direction[1]));
 	const auto z_largest = cmp(spv::OpFOrdLessThan,
 	    Select(s, f, y_largest, abs(direction[1]), abs(direction[0])), abs(direction[2]));
@@ -112,8 +125,6 @@ uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
 		    cmp(spv::OpFOrdGreaterThan, projected[i][1], zero), right);
 		missed = either(missed, both(cmp(spv::OpFOrdEqual, edge[i], zero), excluded));
 	}
-	const auto remap = Binary(s, spv::OpShiftRightLogical, u, flag,
-	    Binary(s, spv::OpIMul, u, kind, ConstantU32(s, 8)));
 	const auto coordinate = [&](uint32_t shift) {
 		const auto index = Binary(s, spv::OpBitwiseAnd, u,
 		    Binary(s, spv::OpShiftRightLogical, u, remap, ConstantU32(s, shift)), ConstantU32(s, 3));
@@ -124,10 +135,12 @@ uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
 	const std::array result {
 		Unary(s, spv::OpBitcast, u, Select(s, f, missed, ConstantF32(s, 0x7f800000), numerator)),
 		Unary(s, spv::OpBitcast, u, Select(s, f, missed, ConstantF32Value(s, 1.0f), denominator)),
-		Select(s, u, bary, coordinate(0), Binary(s, spv::OpIAdd, u, flag, kind)),
+		Select(s, u, bary, coordinate(0), triangle_id),
 		Select(s, u, bary, coordinate(2), Select(s, u, missed, ConstantU32(s, 0), ConstantU32(s, 1))) };
 	return Vector(s, TypeU32Vector(s, 4), result);
 }
+
+namespace {
 
 std::array<uint32_t, 6> Box(EmitterState& s, uint32_t first, uint32_t second,
                            uint32_t half, uint32_t child) {

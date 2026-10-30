@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -90,6 +91,7 @@ private:
 };
 
 struct SystemContent {
+	bool                  trinity_mode = false;
 	std::filesystem::path psf_path;
 	Psf                   psf;
 	std::filesystem::path playgo_path;
@@ -603,6 +605,14 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 
 	sc->psf_path = file_name;
 	sc->psf.DbgPrint();
+	int32_t attribute3 = 0;
+	const bool title_supports_trinity = sc->psf.GetParamInt("ATTRIBUTE3", &attribute3) &&
+	                                    (static_cast<uint32_t>(attribute3) & (1u << 22u)) != 0;
+	sc->trinity_mode = Config::Ps5ProEnabled() && title_supports_trinity;
+	if (Config::Ps5ProEnabled()) {
+		Log::WriteToConsoleAndLog(fmt::format("[PS5] title Trinity support={}\n",
+		                                    title_supports_trinity ? "yes" : "no"));
+	}
 
 	sc->icon_path = file_name.parent_path() / "icon0.png";
 
@@ -624,6 +634,10 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 	if (sc->playgo.IsValid()) {
 		sc->playgo.DbgPrint();
 	}
+}
+
+bool SystemContentIsTrinityMode() {
+	return Common::Singleton<SystemContent>::Instance()->trinity_mode;
 }
 
 bool SystemContentParamSfoGetInt(const char* name, int32_t* value) {

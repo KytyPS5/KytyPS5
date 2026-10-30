@@ -73,6 +73,10 @@ namespace Libs::LibNpCommerce {
 void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibNpAuth {
+void InitNet_1_NpAuth(Loader::SymbolDatabase *symbols);
+}
+
 namespace Libs::LibNpEntitlementAccess {
 void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase *symbols);
 }
@@ -95,6 +99,17 @@ void WaitForMutexTest(Predicate ready) {
     Check(std::chrono::steady_clock::now() < deadline, "mutex waiter made progress");
     std::this_thread::yield();
   }
+}
+
+void TestStaticRwlockDestroy() {
+  using namespace Libs::LibKernel;
+  PthreadRwlock rwlock = nullptr;
+  Check(PthreadRwlockDestroy(nullptr) == KERNEL_ERROR_EINVAL &&
+            PthreadRwlockDestroy(&rwlock) == OK && rwlock == nullptr,
+        "destroy an untouched static rwlock without allocating it");
+  Check(PthreadRwlockRdlock(&rwlock) == OK && PthreadRwlockUnlock(&rwlock) == OK &&
+            PthreadRwlockDestroy(&rwlock) == OK,
+        "static rwlock remains usable after destroying its untouched initializer");
 }
 
 struct MutexWaiter {
@@ -573,17 +588,16 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, &info[3].label, &point) == OK &&
             !std::string_view(point.data).ends_with('/'),
         "mount owned add-on without trailing slash");
+  MountPoint repeated {};
+  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
+        "duplicate mount reports BUSY");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
   const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
   std::array<char, 11> payload {};
   Check(fd >= 3 && FileSystem::KernelRead(fd, payload.data(), payload.size()) == payload.size() &&
             std::string_view(payload.data(), payload.size()) == "DLC payload" &&
             FileSystem::KernelClose(fd) == OK,
-        "guest reads files from the selected title's add-on");
-  MountPoint repeated {};
-  Check(mount(0, &info[3].label, &repeated) == OK &&
-            std::strcmp(repeated.data, point.data) == 0,
-        "duplicate mount returns the same mount point");
+        "guest reads the original mount after a rejected duplicate mount");
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
             unmount(&point) == static_cast<int>(0x80d90004u),
         "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
@@ -2082,6 +2096,256 @@ void TestNetCtlHostIpv4() {
 }
 #endif
 
+template <int Mode>
+void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
+  auto& event = *static_cast<std::array<int, 3>*>(arg);
+  ++event[0];
+  event[1] = user_id;
+  event[2] = static_cast<int>(state);
+}
+
+void TestNpEmulation() {
+  using namespace Libs::Network::NpManager;
+  using namespace Libs::Network::NetCtl;
+  constexpr int SignedOut = static_cast<int>(0x80550006u);
+  constexpr int NetworkUnavailable = static_cast<int>(0x8055a02au);
+  constexpr int Aborted = static_cast<int>(0x80550012u);
+  struct AsyncParameters {
+    size_t size = sizeof(AsyncParameters);
+    uint64_t affinity = 0;
+    int priority = 0;
+    uint8_t padding[4] {};
+  } async_parameters;
+  struct PremiumParameters {
+    size_t size = sizeof(PremiumParameters);
+    int user_id = 0;
+    uint8_t padding[4] {};
+    uint64_t features = 1;
+    uint8_t reserved[32] {};
+  } premium_parameters;
+  struct PremiumResult {
+    bool authorized = true;
+    uint8_t reserved[32] {};
+  } premium_result;
+
+  const auto create_request = [&] (bool async) {
+    const int request = async
+        ? NpCreateAsyncRequest(reinterpret_cast<const NpCreateAsyncRequestParameter*>(
+              &async_parameters))
+        : NpCreateRequest();
+    Check(request > 0, "create NP request");
+    return request;
+  };
+  const auto check_request = [&] (bool async, int expected, auto operation) {
+    const int request = create_request(async);
+    Check(operation(request) == (async ? OK : expected),
+          "NP call separates asynchronous submission from its execution result");
+    if (async) {
+      int result = 123;
+      Check(NpPollAsync(request, &result) == OK && result == expected,
+            "NP polling reports the completed operation result");
+    }
+    Check(NpDeleteRequest(request) == OK, "release completed NP request");
+  };
+
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  Check(!options.network_connected && !options.psn_emulation_enabled,
+        "host networking and PSN emulation both require explicit opt-in");
+  static std::array<std::array<int, 3>, 4> events {};
+  const std::array<NpStateCallbackA, 4> callbacks {
+      RecordNpState<0>, RecordNpState<1>, RecordNpState<2>, RecordNpState<3>};
+  int mode = 0;
+  for (bool network : {false, true}) {
+    int previous_network_state = -1;
+    for (bool emulate : {false, true}) {
+      options.network_connected = network;
+      options.psn_emulation_enabled = emulate;
+      Config::Load(options);
+      Check(Config::IsNetworkConnected() == network && Config::PsnEmulationEnabled() == emulate,
+            "loading PSN emulation does not change the independent network option");
+      Check(NetCtlInit() == OK, "initialize network state for NP mode");
+      int network_state = -1;
+      Check(NetCtlGetState(&network_state) == OK && (network || network_state == 0),
+            "PSN emulation cannot connect disabled host networking");
+      Check(previous_network_state == -1 || previous_network_state == network_state,
+            "PSN emulation does not change host network connectivity");
+      previous_network_state = network_state;
+      const bool connected = network_state == 3;
+
+      Check(NpRegisterStateCallbackA(callbacks[mode], &events[mode]) > 0 &&
+                NpCheckCallback() == OK && events[mode][0] == 1 &&
+                events[mode][1] == Config::GetUserId() &&
+                events[mode][2] == (emulate ? 2 : 1),
+            "initial NP callback matches the selected emulated sign-in state");
+      ++mode;
+      for (int player = 0; player < Config::MAX_PLAYERS; ++player) {
+        const int user_id = Config::GetPlayerUserId(player);
+        const bool signed_in = emulate && player == 0;
+        const int identity_result = signed_in ? OK : SignedOut;
+        const int online_result = !signed_in ? SignedOut : connected ? OK : NetworkUnavailable;
+        uint32_t state = 99;
+        bool signed_up = false;
+        Check(NpGetState(user_id, &state) == OK && state == (signed_in ? 2u : 1u) &&
+                  NpHasSignedUp(user_id, &signed_up) == OK && signed_up == signed_in,
+              "only the primary emulated user has a persistent signed-in account");
+        Check(NpGetNpReachabilityState(user_id, &state) == OK &&
+                  state == (signed_in && connected ? 2u : 0u),
+              "NP reachability requires both the emulated account and host connectivity");
+
+        uint64_t account_id = 0;
+        std::array<char, 20> online_id {};
+        std::array<char, 36> np_id {};
+        std::array<char, 4> country {};
+        Check(NpGetAccountIdA(user_id, &account_id) == identity_result &&
+                  NpGetOnlineId(user_id, reinterpret_cast<NpOnlineId*>(online_id.data())) ==
+                      identity_result &&
+                  NpGetNpId(user_id, reinterpret_cast<NpId*>(np_id.data())) == identity_result &&
+                  NpGetAccountCountryA(user_id, country.data()) == identity_result,
+              "NP identity and account-country getters agree on primary and guest sign-in");
+        if (signed_in) {
+          Check(account_id != 0 && online_id[0] != 0 && online_id[16] == 0 &&
+                    std::strcmp(online_id.data(), np_id.data()) == 0 &&
+                    country[0] != 0 && country[1] != 0 && country[2] == 0,
+                "emulated account identity and country remain usable while disconnected");
+        }
+
+        for (bool async : {false, true}) {
+          check_request(async, online_result, [&] (int request) {
+            return NpCheckNpReachability(request, user_id);
+          });
+          uint8_t age = 0;
+          check_request(async, identity_result, [&] (int request) {
+            return NpGetAccountAge(request, user_id, &age);
+          });
+          std::array<char, 48> language {};
+          check_request(async, identity_result, [&] (int request) {
+            return NpGetAccountLanguage2(request, user_id, language.data());
+          });
+          Check(!signed_in || (age > 0 && language[0] != 0 && language[35] == 0),
+                "signed-in account metadata is available independently of host networking");
+          premium_parameters.user_id = user_id;
+          premium_result.authorized = true;
+          check_request(async, online_result, [&] (int request) {
+            return NpCheckPremium(request,
+                reinterpret_cast<const NpCheckPremiumParameter*>(&premium_parameters),
+                reinterpret_cast<NpCheckPremiumResult*>(&premium_result));
+          });
+          Check(!premium_result.authorized, "PSN emulation does not grant premium eligibility");
+          if (player == 0) {
+            check_request(async, online_result, [&] (int request) {
+              return NpCheckNpAvailability(request, "Kyty", nullptr);
+            });
+          }
+        }
+      }
+      const int aborted = create_request(true);
+      int result = 123;
+      Check(NpAbortRequest(aborted) == OK &&
+                NpCheckNpReachability(aborted, Config::GetUserId()) == Aborted &&
+                NpPollAsync(aborted, &result) == OK && result == Aborted &&
+                NpDeleteRequest(aborted) == OK,
+            "NP emulation does not turn an aborted request into a successful one");
+      NetCtlTerm();
+    }
+  }
+  Config::Load(Config::ConfigOptions {});
+}
+
+void TestNpAuthEmulation() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpAuth::InitNet_1_NpAuth(&symbols);
+  const auto resolve = [&] (const char* nid) {
+    const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "resolve NP authentication exports");
+    return symbol->vaddr;
+  };
+  const auto create = reinterpret_cast<int(KYTY_SYSV_ABI*)()>(resolve("6bwFkosYRQg"));
+  const auto create_async = reinterpret_cast<int(KYTY_SYSV_ABI*)(const void*)>(
+      resolve("N+mr7GjTvr8"));
+  const auto destroy = reinterpret_cast<int(KYTY_SYSV_ABI*)(int)>(resolve("H8wG9Bk-nPc"));
+  const auto poll = reinterpret_cast<int(KYTY_SYSV_ABI*)(int, int*)>(resolve("gjSyfzSsDcE"));
+  const auto get_code = reinterpret_cast<int(KYTY_SYSV_ABI*)(int, const void*, void*, int*)>(
+      resolve("KI4dHLlTNl0"));
+  const auto get_token = reinterpret_cast<int(KYTY_SYSV_ABI*)(int, const void*, void*)>(
+      resolve("RdsFVsgSpZY"));
+  constexpr int InvalidArgument = static_cast<int>(0x80550301u);
+  constexpr int InvalidSize = static_cast<int>(0x80550302u);
+  constexpr int ServiceUnavailable = static_cast<int>(0x80550401u);
+  constexpr int SignedOut = static_cast<int>(0x80550006u);
+  struct AuthorizationCodeParameters {
+    size_t size = sizeof(AuthorizationCodeParameters);
+    int user_id = 0;
+    uint8_t padding[4] {};
+    const void* client_id = "test-client";
+    const char* scope = "test-scope";
+  } code_parameters;
+  struct IdTokenParameters {
+    size_t size = sizeof(IdTokenParameters);
+    int user_id = 0;
+    uint8_t padding[4] {};
+    const void* client_id = "test-client";
+    const void* client_secret = "test-secret";
+    const char* scope = "test-scope";
+  } token_parameters;
+  std::array<uint8_t, 136> code {};
+  std::array<uint8_t, 4104> token {};
+  const std::array<uint64_t, 3> async_parameters {24, 0, 0};
+  int issuer = 0;
+  const int invalid_request = create();
+  code_parameters.size = 0;
+  token_parameters.size = 0;
+  Check(invalid_request > 0 &&
+            get_code(invalid_request, nullptr, code.data(), &issuer) == InvalidArgument &&
+            get_token(invalid_request, nullptr, token.data()) == InvalidArgument &&
+            get_code(invalid_request, &code_parameters, code.data(), &issuer) == InvalidSize &&
+            get_token(invalid_request, &token_parameters, token.data()) == InvalidSize &&
+            destroy(invalid_request) == OK,
+        "NP authentication rejects missing and undersized user parameters");
+  code_parameters.size = sizeof(code_parameters);
+  token_parameters.size = sizeof(token_parameters);
+
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  for (bool network : {false, true}) {
+    for (bool emulate : {false, true}) {
+      options.network_connected = network;
+      options.psn_emulation_enabled = emulate;
+      Config::Load(options);
+      for (int player = 0; player < Config::MAX_PLAYERS; ++player) {
+        code_parameters.user_id = Config::GetPlayerUserId(player);
+        token_parameters.user_id = code_parameters.user_id;
+        const int expected = emulate && player == 0 ? ServiceUnavailable : SignedOut;
+        for (bool async : {false, true}) {
+          for (bool id_token : {false, true}) {
+            const int request = async ? create_async(async_parameters.data()) : create();
+            Check(request > 0, "create NP authentication request");
+            code.fill(0xff);
+            token.fill(0xff);
+            issuer = -1;
+            const int result = id_token
+                ? get_token(request, &token_parameters, token.data())
+                : get_code(request, &code_parameters, code.data(), &issuer);
+            Check(result == (async ? OK : expected),
+                  "NP authentication distinguishes an unavailable service from sign-out");
+            if (async) {
+              int completion = 123;
+              Check(poll(request, &completion) == OK && completion == expected,
+                    "asynchronous NP authentication delivers the actual failure");
+            }
+            const auto zero = [] (uint8_t value) { return value == 0; };
+            Check(id_token ? std::all_of(token.begin(), token.end(), zero)
+                           : std::all_of(code.begin(), code.end(), zero) && issuer == 0,
+                  "PSN emulation does not fabricate authorization codes or ID tokens");
+            Check(destroy(request) == OK, "release NP authentication request");
+          }
+        }
+      }
+    }
+  }
+  Config::Load(Config::ConfigOptions {});
+}
+
 void CheckEtherAddressFormatting() {
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
@@ -2458,7 +2722,19 @@ int main(int argc, char** argv) {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
+  if (argc == 2 && std::string_view(argv[1]) == "--network-only") {
+#if defined(__linux__)
+    TestNetCtlHostIpv4();
+#endif
+    TestNpEmulation();
+    TestNpAuthEmulation();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: network cases passed\n");
+    return 0;
+  }
+
   TestMutexHandoff();
+  TestStaticRwlockDestroy();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
@@ -2503,6 +2779,8 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
   TestNetCtlHostIpv4();
 #endif
+  TestNpEmulation();
+  TestNpAuthEmulation();
   TestNpWebApi2Memory();
   TestNpCommerceDialog();
   graphics.reset();

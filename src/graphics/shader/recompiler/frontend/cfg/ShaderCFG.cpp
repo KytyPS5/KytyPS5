@@ -69,10 +69,6 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 	}
 }
 
-bool IsRegister(const Decoder::Operand& operand, Decoder::OperandKind kind, uint32_t reg) {
-	return operand.kind == kind && operand.reg == reg;
-}
-
 bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
@@ -516,24 +512,22 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 		return false;
 	}
 
-	const auto& setpc = program.instructions[setpc_index];
-	if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src0.kind != Decoder::OperandKind::Sgpr) {
+	const auto& setpc   = program.instructions[setpc_index];
+	uint32_t    pc_code = 0;
+	if (setpc.opcode != Opcode::S_SETPC_B64 || !ScalarOperandCode(setpc.src0, pc_code)) {
 		return false;
 	}
 
-	const auto pc_reg = setpc.src0.reg;
 	if (setpc_index >= 2u) {
 		const auto& arith = program.instructions[setpc_index - 1u];
 		const auto& getpc = program.instructions[setpc_index - 2u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
-		    getpc.dst.reg == pc_reg && arith.dst.kind == Decoder::OperandKind::Sgpr &&
-		    arith.dst.reg == pc_reg) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code) &&
+		    IsScalarCode(arith.dst, pc_code)) {
 			uint32_t imm  = 0;
 			bool     adds = arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_ADD_I32;
 			bool     subs = arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32;
 			if ((adds || subs) &&
-			    (IsRegister(arith.src0, Decoder::OperandKind::Sgpr, pc_reg) ||
-			     IsRegister(arith.src1, Decoder::OperandKind::Sgpr, pc_reg)) &&
+			    (IsScalarCode(arith.src0, pc_code) || IsScalarCode(arith.src1, pc_code)) &&
 			    (IsImmediate(arith.src0, imm) || IsImmediate(arith.src1, imm))) {
 				const auto base = InstructionEndPc(getpc);
 				target          = (adds ? base + imm : base - imm) & ~3u;
@@ -544,14 +538,14 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	if (setpc_index >= 1u) {
 		const auto& getpc = program.instructions[setpc_index - 1u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
-		    getpc.dst.reg == pc_reg) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code)) {
 			target = InstructionEndPc(getpc);
 			return true;
 		}
 	}
 
-	return false;
+	// Long jump: s_getpc_b64; s_add_u32 lo, imm; s_addc_u32 hi, 0.
+	return ResolvePcRelativeBase(program, setpc_index, pc_code, &target);
 }
 
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,

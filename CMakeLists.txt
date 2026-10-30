@@ -325,6 +325,7 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -631,6 +632,19 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
+	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
+target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
+target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
+target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
+
+add_executable(psml_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(psml_tests common kyty_test_gtest)
+target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -692,6 +706,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
+	add_test(NAME shader_recompiler_vop3_conversions
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_quadmask
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
+	add_test(NAME shader_recompiler_integer16_ternary
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
+	add_test(NAME shader_recompiler_mad_u16
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-u16-only)
+	add_test(NAME shader_recompiler_mul_hi24
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -700,6 +724,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME trinity_mode
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
+	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline

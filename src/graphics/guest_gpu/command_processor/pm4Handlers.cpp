@@ -1706,6 +1706,17 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	return 5;
 }
 
+KYTY_CP_OP_PARSER(CpOpPssr) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto packet_dw = KYTY_PM4_LEN(cmd_id) - 1;
+	EXIT_NOT_IMPLEMENTED(packet_dw < Pssr::RequestDwords || packet_dw > dw);
+	Pssr::Request request {};
+	std::memcpy(&request, buffer, sizeof(request));
+	cp.ProcessPssr(request);
+	return packet_dw;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndexType) {
 	KYTY_PROFILER_FUNCTION();
 

@@ -142,6 +142,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
     {0xb2u, Opcode::DS_PERMUTE_B32, 1, 32},     {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
     {0xdeu, Opcode::DS_WRITE_B96, 3, 32},        {0xdfu, Opcode::DS_WRITE_B128, 4, 32},
+    {0xe1u, Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32, 1, 32},
     {0xfeu, Opcode::DS_READ_B96, 3, 32},         {0xffu, Opcode::DS_READ_B128, 4, 32},
 };
 
@@ -232,6 +233,7 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 
 uint32_t DsSourceCount(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32: return 3u;
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
@@ -472,6 +474,13 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
+	}
+	if (inst.opcode == Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32 &&
+	    (inst.gds || inst.offset < 8u || inst.offset > 31u || data1 > 248u)) {
+		SetUnsupported(inst, Family::DS, opcode, "invalid BVH stack operands or capacity");
+	}
+	if (inst.opcode == Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32 && vdst == addr) {
+		SetUnsupported(inst, Family::DS, opcode, "overlapping BVH stack outputs are not implemented");
 	}
 	if (inst.gds && inst.opcode == Opcode::DS_CMPST_RTN_B32) {
 		SetUnsupported(inst, Family::DS, opcode, "DS compare-store return B32 GDS variant is not implemented");

@@ -276,6 +276,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
 	AddFlag(args, info.network_connected, "--network-connected");
+	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
 	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
@@ -291,6 +292,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
+	AddFlag(args, info.pro_enabled, "--trinity");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 #if defined(_WIN32)
 	AddFlag(args, info.red_zone_protection_enabled, "--redzone");

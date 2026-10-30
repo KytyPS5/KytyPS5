@@ -42,6 +42,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(perf_overlay_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(network_connected);
+	KYTY_CFG_SET(psn_emulation_enabled);
 	KYTY_CFG_SET(vblank_frequency);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
@@ -55,6 +56,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(printf_output_file);
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
+	KYTY_CFG_SET(pro_enabled);
 	KYTY_CFG_SET(amd_cpu_enabled);
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
@@ -96,6 +98,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(network_connected);
+	KYTY_CFG_GET(psn_emulation_enabled);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -112,6 +115,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(printf_output_file);
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
+	pro_enabled     = s.value("pro_enabled", false).toBool();
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
 	red_zone_protection_enabled =

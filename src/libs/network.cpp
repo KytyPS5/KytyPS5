@@ -4002,6 +4002,11 @@ struct NpCountryCode {
 	char padding[1];
 };
 
+struct NpLanguageCode {
+	char code[36];
+	char padding[12];
+};
+
 struct NpAgeRestriction {
 	NpCountryCode country_code;
 	int8_t        age;
@@ -4056,8 +4061,23 @@ constexpr int      np_error_aborted                     = -2141913070; /* 0x8055
 constexpr int      np_error_request_max                 = -2141913069; /* 0x80550013 */
 constexpr int      np_error_request_not_found           = -2141913068; /* 0x80550014 */
 constexpr int      np_error_invalid_id                  = -2141913067; /* 0x80550015 */
+constexpr int      np_error_network_not_available       = -2141872086; /* 0x8055a02a */
 constexpr int      np_request_max                       = 128;
 constexpr uint32_t np_state_signed_out                  = 1;
+constexpr uint32_t np_state_signed_in                   = 2;
+
+// A simulated account belongs only to the primary user and survives network loss.
+bool IsSignedIn(int user_id) {
+	return Config::PsnEmulationEnabled() && user_id == Config::GetUserId();
+}
+
+static int np_reachability_result(int user_id) {
+	if (!IsSignedIn(user_id)) {
+		return np_error_signed_out;
+	}
+	// This is an explicit compatibility simulation, not a connection to PSN.
+	return NetCtl::NetCtlConnected() ? OK : np_error_network_not_available;
+}
 
 struct NpStateCallback {
 	NpStateCallbackA callback = nullptr;
@@ -4117,7 +4137,7 @@ static NpRequest* np_get_request_locked(int req_id) {
 	return &g_np_requests[index];
 }
 
-static int np_complete_signed_out_locked(NpRequest* request) {
+static int np_complete_locked(NpRequest* request, int result) {
 	if (request->state == NpRequestState::Complete) {
 		request->result = np_error_invalid_argument;
 		return np_error_invalid_argument;
@@ -4128,9 +4148,9 @@ static int np_complete_signed_out_locked(NpRequest* request) {
 	}
 
 	request->state  = NpRequestState::Complete;
-	request->result = np_error_signed_out;
+	request->result = result;
 
-	return (request->async ? OK : np_error_signed_out);
+	return (request->async ? OK : result);
 }
 
 int KYTY_SYSV_ABI NpCheckCallback() {
@@ -4144,7 +4164,9 @@ int KYTY_SYSV_ABI NpCheckCallback() {
 		}
 	}
 	for (const auto& entry: pending) {
-		entry.callback(Config::GetUserId(), np_state_signed_out, entry.userdata);
+		entry.callback(Config::GetUserId(),
+		               IsSignedIn(Config::GetUserId()) ? np_state_signed_in : np_state_signed_out,
+		               entry.userdata);
 	}
 
 	return OK;
@@ -4239,12 +4261,13 @@ int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
 
 	EXIT_NOT_IMPLEMENTED(np_id == nullptr);
 
-	// int s = snprintf(np_id->handle.data, 16, "Kyty");
-	// EXIT_NOT_IMPLEMENTED(s >= 16);
-	// np_id->handle.term = 0;
 	std::memset(np_id, 0, sizeof(*np_id));
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		std::memcpy(np_id->handle.data, "Kyty", 4);
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4255,12 +4278,13 @@ int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
 
 	EXIT_NOT_IMPLEMENTED(online_id == nullptr);
 
-	// int s = snprintf(online_id->data, 16, "Kyty");
-	// EXIT_NOT_IMPLEMENTED(s >= 16);
-	// online_id->term = 0;
 	std::memset(online_id, 0, sizeof(*online_id));
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		std::memcpy(online_id->data, "Kyty", 4);
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4271,10 +4295,13 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 
 	EXIT_NOT_IMPLEMENTED(account_id == nullptr);
 
-	// *account_id = 0x00000000feedfaceull;
 	*account_id = 0;
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		*account_id = 0x00000000feedfaceull;
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4287,10 +4314,12 @@ int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
 
 	auto* code = static_cast<NpCountryCode*>(country_code);
 	std::memset(code, 0, sizeof(*code));
-	// code->data[0] = '';
-	// code->data[1] = 'S';
 
-	// return OK;
+	if (IsSignedIn(user_id)) {
+		std::memcpy(code->data, "US", 2);
+		return OK;
+	}
+
 	return np_error_signed_out;
 }
 
@@ -4305,11 +4334,14 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 		return np_error_invalid_argument;
 	}
 
-	// *age = 21;
-	*age = 0;
+	std::lock_guard lock(g_np_request_mutex);
+	auto* request = np_get_request_locked(req_id);
+	if (request == nullptr) {
+		return np_error_request_not_found;
+	}
 
-	// return OK;
-	return np_error_signed_out;
+	*age = IsSignedIn(user_id) ? 21 : 0;
+	return np_complete_locked(request, IsSignedIn(user_id) ? OK : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_code) {
@@ -4325,11 +4357,17 @@ int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_
 
 	std::lock_guard lock(g_np_request_mutex);
 
-	if (np_get_request_locked(req_id) == nullptr) {
+	auto* request = np_get_request_locked(req_id);
+	if (request == nullptr) {
 		return np_error_request_not_found;
 	}
 
-	return np_error_signed_out;
+	auto* code = static_cast<NpLanguageCode*>(language_code);
+	std::memset(code, 0, sizeof(*code));
+	if (IsSignedIn(user_id)) {
+		std::memcpy(code->code, "en-US", 5);
+	}
+	return np_complete_locked(request, IsSignedIn(user_id) ? OK : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCreateRequest() {
@@ -4428,8 +4466,9 @@ int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* resu
 		return np_error_request_not_found;
 	}
 
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_locked(request, std::strcmp(user, "Kyty") == 0
+	                                       ? np_reachability_result(Config::GetUserId())
+	                                       : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
@@ -4451,8 +4490,7 @@ int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
 		return np_error_request_not_found;
 	}
 
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_locked(request, np_reachability_result(user_id));
 }
 
 int KYTY_SYSV_ABI NpPollAsync(int req_id, int* result) {
@@ -4509,23 +4547,10 @@ int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* para
 		return np_error_request_not_found;
 	}
 
-	if (request->state == NpRequestState::Complete) {
-		request->result = np_error_invalid_argument;
-		return np_error_invalid_argument;
-	}
-
-	if (request->state == NpRequestState::Aborted) {
-		return np_error_aborted;
-	}
-
 	std::memset(result, 0, sizeof(*result));
-	// result->authorized = true;
 
-	// request->state  = NpRequestState::Complete;
-	// request->result = OK;
-
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	// The simulated account has no premium eligibility.
+	return np_complete_locked(request, np_reachability_result(param->user_id));
 }
 
 int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
@@ -4535,7 +4560,7 @@ int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*state = np_state_signed_out;
+	*state = IsSignedIn(user_id) ? np_state_signed_in : np_state_signed_out;
 
 	return OK;
 }
@@ -4549,8 +4574,7 @@ int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	// *state = 2; // SCE_NP_REACHABILITY_STATE_REACHABLE
-	*state = 0; // SCE_NP_REACHABILITY_STATE_UNAVAILABLE
+	*state = np_reachability_result(user_id) == OK ? 2 : 0; // REACHABLE / UNAVAILABLE
 
 	return OK;
 }
@@ -4564,7 +4588,7 @@ int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*has_signed_up = false;
+	*has_signed_up = IsSignedIn(user_id);
 
 	return OK;
 }

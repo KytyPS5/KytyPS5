@@ -105,6 +105,8 @@ private:
 	void WriteSharedU32(uint32_t width, IR::U32 address, const std::array<IR::Value, 4>& values,
 	                    const IR::MemoryInfo& memory, uint32_t pc);
 	void DS_READ(const Decoder::Instruction& inst);
+	void IMAGE_BVH8(const Decoder::Instruction& inst);
+	void DS_BVH_STACK(const Decoder::Instruction& inst);
 	void DS_READ2(const Decoder::Instruction& inst);
 	void DS_WRITE(const Decoder::Instruction& inst);
 	void DS_WRITE2(const Decoder::Instruction& inst);
@@ -167,7 +169,7 @@ private:
 	void Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
-	void V_MAD_I16(const Decoder::Instruction& inst);
+	void Integer16Mad(const Decoder::Instruction& inst, bool sign);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
@@ -187,7 +189,7 @@ private:
 	void V_XOR3_B32(const Decoder::Instruction& inst);
 	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb, bool sign);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
+	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
 	void V_ADD3_U32(const Decoder::Instruction& inst);
@@ -196,7 +198,7 @@ private:
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
 	void V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low);
 	void S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst);
-	void S_QUADMASK_B64(const Decoder::Instruction& inst);
+	void S_QUADMASK(const Decoder::Instruction& inst, bool is64);
 	void BFM_B32(const Decoder::Instruction& inst);
 	IR::U32 RightMask32(IR::U32 count);
 	void    S_BFM_B64(const Decoder::Instruction& inst);

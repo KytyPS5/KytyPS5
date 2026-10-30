@@ -2277,7 +2277,10 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
+	// SCE_PTHREAD_RWLOCK_INITIALIZER has no allocated resources until first use.
+	if (*rwlock == nullptr) {
+		return OK;
+	}
 
 	{
 		std::lock_guard lock((*rwlock)->m);

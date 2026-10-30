@@ -255,6 +255,12 @@
            <property name="title"><string>General</string></property>
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
+             <widget class="QCheckBox" name="checkBox_pro">
+              <property name="toolTip"><string>Enable experimental Pro mode for supported titles. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="text"><string>Pro mode (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
               <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
               <property name="text"><string>Run in fullscreen</string></property>
@@ -404,6 +410,11 @@
         <widget class="QCheckBox" name="checkBox_network_connected">
          <property name="toolTip"><string>Let games use your computer's local network connection.</string></property>
          <property name="text"><string>Enable network connection</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="checkBox_psn_emulation">
+         <property name="text"><string>Emulate PSN (compatibility)</string></property>
         </widget>
        </item>
        <item>

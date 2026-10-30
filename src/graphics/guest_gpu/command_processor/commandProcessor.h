@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -92,6 +93,7 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void WaitForRewind(bool valid);

@@ -1167,7 +1167,7 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 
 template <typename Predicate>
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, const Predicate& predicate) {
-	// The renderer checks captured scalar reads against final buffer and image write ranges.
+	// Address writes can change the values control flow reads.
 	if (program.has_address_writes) {
 		return {};
 	}

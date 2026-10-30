@@ -24,6 +24,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -839,8 +840,8 @@ static bool is_native_reg_indirect_packet(const uint32_t* cmd, RegIndirectPacket
 	return ((cmd[0] >> 8u) & 0xffu) == reg_indirect_native_op(type);
 }
 
-static constexpr bool is_trinity_mode() {
-	return false;
+static bool is_trinity_mode() {
+	return Loader::SystemContentIsTrinityMode();
 }
 
 static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {

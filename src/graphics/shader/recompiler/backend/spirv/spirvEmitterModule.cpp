@@ -402,47 +402,23 @@ uint32_t GlslStd450(EmitterState& state) {
 	return state.builder.Import("GLSL.std.450");
 }
 
-VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
+Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
 	if ((state.program.stage != ShaderType::Vertex && state.program.stage != ShaderType::Local) ||
 	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
-		return VertexInputScalarKind::Float;
+		return Format::ComponentType::Float;
 	}
-
-	switch (state.input_info.vertex->resources[location].Format()) {
-		case Prospero::BufferFormat::k8UInt:
-		case Prospero::BufferFormat::k16UInt:
-		case Prospero::BufferFormat::k8_8UInt:
-		case Prospero::BufferFormat::k32UInt:
-		case Prospero::BufferFormat::k16_16UInt:
-		case Prospero::BufferFormat::k8_8_8_8UInt:
-		case Prospero::BufferFormat::k32_32UInt:
-		case Prospero::BufferFormat::k16_16_16_16UInt:
-		case Prospero::BufferFormat::k32_32_32UInt:
-		case Prospero::BufferFormat::k32_32_32_32UInt: return VertexInputScalarKind::Uint;
-		case Prospero::BufferFormat::k8SInt:
-		case Prospero::BufferFormat::k16SInt:
-		case Prospero::BufferFormat::k8_8SInt:
-		case Prospero::BufferFormat::k32SInt:
-		case Prospero::BufferFormat::k16_16SInt:
-		case Prospero::BufferFormat::k8_8_8_8SInt:
-		case Prospero::BufferFormat::k32_32SInt:
-		case Prospero::BufferFormat::k16_16_16_16SInt:
-		case Prospero::BufferFormat::k32_32_32SInt:
-		case Prospero::BufferFormat::k32_32_32_32SInt: return VertexInputScalarKind::Sint;
-		default: return VertexInputScalarKind::Float;
-	}
+	return Format::GetFormatComponentType(state.input_info.vertex->resources[location].Format());
 }
 
 uint32_t VertexParameterComponentCount(const InputBinding& input) {
 	return std::clamp(input.component_count, 1u, 4u);
 }
 
-uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind) {
+uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind) {
 	switch (kind) {
-		case VertexInputScalarKind::Sint: return TypeI32(state);
-		case VertexInputScalarKind::Uint: return TypeU32(state);
-		case VertexInputScalarKind::Float:
+		case Format::ComponentType::Sint: return TypeI32(state);
+		case Format::ComponentType::Uint: return TypeU32(state);
 		default: return TypeF32(state);
 	}
 }

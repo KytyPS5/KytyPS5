@@ -515,6 +515,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
+		case ValueOpcode::Bvh8Intersect: info.bvh8 = true; break;
+		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
@@ -522,7 +524,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
 		case ValueOpcode::SubgroupUMinU32:
-		case ValueOpcode::SubgroupUMaxU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupUMaxU32:
+		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {

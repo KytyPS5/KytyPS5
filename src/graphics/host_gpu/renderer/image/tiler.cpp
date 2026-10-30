@@ -104,7 +104,8 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	    block.block_depth == 0 || block.block_size == 0 || info.tiling.texel_width == 0 ||
 	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0);
 	EXIT_IF((transform == ColorTransform::SwapBgra16 && block.bytes_per_element != 8u) ||
-	        (transform == ColorTransform::Reverse10_11_11 && block.bytes_per_element != 4u));
+	        ((transform == ColorTransform::Reverse10_11_11 ||
+	          transform == ColorTransform::Rotate2_10_10_10) && block.bytes_per_element != 4u));
 	const auto checked_multiply = [](uint64_t left, uint64_t right, uint64_t& result) {
 		return (left == 0 || right <= UINT64_MAX / left) && (result = left * right, true);
 	};
@@ -560,7 +561,8 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	uint32_t element_bytes = 0;
 	switch (transform) {
 		case ColorTransform::SwapBgra16: element_bytes = 8; break;
-		case ColorTransform::Reverse10_11_11: element_bytes = 4; break;
+		case ColorTransform::Reverse10_11_11:
+		case ColorTransform::Rotate2_10_10_10: element_bytes = 4; break;
 		default: EXIT("invalid color transform\n");
 	}
 	EXIT_IF(input.size == 0 || input.size % element_bytes != 0 ||
@@ -628,19 +630,20 @@ TileManager::Result TileManager::TransformColor(Result input, ColorTransform tra
 	return result;
 }
 
-vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
-                                        bool expand) {
+vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
+                                        uint32_t keys, bool expand) {
 	struct Check {
 		uint32_t metadata_base;
 		uint32_t words;
+		uint32_t stride;
 		uint32_t keys;
 		uint32_t expand;
 	};
 	static_assert(sizeof(Check) <= sizeof(Conversion));
 	const uint32_t max_slices =
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers;
-	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % (4ull * slices) != 0 ||
-	        metadata.size / 4 > UINT32_MAX);
+	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % 4 != 0 || stride % 4 != 0 ||
+	        metadata.size / 4 > UINT32_MAX || stride * (slices - 1) >= metadata.size);
 	if (m_color_clear == nullptr) {
 		m_color_clear      = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
 		m_clear_predicates = std::make_unique<Buffer>(
@@ -671,8 +674,9 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_clear);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const Check push {source.base, static_cast<uint32_t>(metadata.size / 4 / slices), keys,
-	                  expand};
+	const Check push {source.base,
+	                  static_cast<uint32_t>((metadata.size - stride * (slices - 1)) / 4),
+	                  static_cast<uint32_t>(stride / 4), keys, expand};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch(slices, 1, 1);

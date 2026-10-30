@@ -122,7 +122,6 @@ struct BufferResource {
 	uint32_t               descriptor_index   = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
-	uint32_t               write_extent       = 0; // UINT32_MAX once a write is runtime-addressed or formatted
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
@@ -543,6 +542,8 @@ struct ShaderInfo {
 	bool                            uses_image_heap               = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
+	bool                            bvh8                          = false;
+	bool                            bvh_stack                     = false;
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;
@@ -750,7 +751,7 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
-void  ValidateProgram(const Program& program, bool require_ssa);
+void  ValidateProgram(const Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,

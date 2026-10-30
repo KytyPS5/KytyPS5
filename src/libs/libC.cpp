@@ -25,6 +25,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -360,7 +361,12 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 	}
 
 	// Keep guest changes separate from the emulator process environment.
-	return SetGuestEnvironmentVariable(name, value, overwrite);
+	try {
+		return SetGuestEnvironmentVariable(name, value, overwrite);
+	} catch (const std::bad_alloc&) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		return -1;
+	}
 }
 
 static KYTY_SYSV_ABI int64_t libc_time(int64_t* timer) {

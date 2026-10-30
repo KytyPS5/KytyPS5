@@ -951,6 +951,17 @@ bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 
 namespace {
 
+// Each jump-table target nests one more If, so a larger table stays on the dispatcher.
+constexpr size_t MaxJumpTableTargets = 64;
+
+// True when an indirect branch reads its target from a table indexed by a selector
+// register, which is the only form the goto chain can express.
+bool IsIndexedJumpTable(const Terminator& term) {
+	return term.kind == TerminatorKind::IndirectBranch &&
+	       term.indirect_selector_code != UINT32_MAX && !term.indirect_selector_values.empty() &&
+	       term.indirect_selector_values.size() == term.indirect_selector_targets.size();
+}
+
 // Eliminate gotos by moving them through a structured statement tree. Every Code node
 // retains exactly one guest block; only Boolean route values cross construct boundaries.
 // This follows the outward/inward/lifting transformations used by shadPS4's GotoPass.
@@ -1002,19 +1013,30 @@ public:
 			return a.after != b.after ? a.after < b.after : a.body_size < b.body_size;
 		});
 		m_route_expressions.resize(labels.size(), UINT32_MAX);
+		m_next_jump_capture = CaptureVariable(static_cast<uint32_t>(source.blocks.size()));
 		for (const auto& block: source.blocks) {
 			auto* label = labels.at(block.id);
 			const auto end = std::next(label->position);
 			auto* code = Insert(m_root, end, Kind::Code);
 			code->id = block.id;
+			// A loop header with several latches is reached through its continue label after
+			// the loop body. Both the goto and the jump-table order use this one rule.
+			const auto redirect = [&](uint32_t target) -> const Continue* {
+				const auto found = std::ranges::find_if(continues, [&](const auto& value) {
+					return value.header == target && source.Dominates(target, block.id);
+				});
+				return found != continues.end() ? &*found : nullptr;
+			};
+			// Orders goto targets by where their labels sit in the statement tree.
+			const auto goto_position = [&](uint32_t target) {
+				const auto* value = redirect(target);
+				return value != nullptr ? uint64_t {value->after} * 2u + 1u : uint64_t {target} * 2u;
+			};
 			const auto add_goto = [&](uint32_t condition, uint32_t target) {
 				auto* node = Insert(m_root, end, Kind::Goto);
 				node->condition = condition;
-				node->target = labels.at(target);
-				for (const auto& value: continues) {
-					if (value.header == target && source.Dominates(target, block.id))
-						node->target = value.label;
-				}
+				const auto* value = redirect(target);
+				node->target = value != nullptr ? value->label : labels.at(target);
 				m_gotos.push_back(node);
 			};
 			const auto& term = block.terminator;
@@ -1026,6 +1048,10 @@ public:
 			} else if (term.kind == TerminatorKind::Branch) {
 				add_goto(1, term.true_block);
 			} else if (term.kind == TerminatorKind::Return) {
+				Insert(m_root, end, Kind::Return);
+			} else if (term.kind == TerminatorKind::IndirectBranch) {
+				// A selector outside the table returns, as the dispatcher's default does.
+				AddJumpTableGotos(block, add_goto, goto_position);
 				Insert(m_root, end, Kind::Return);
 			} else {
 				Fail("indirect control flow requires dispatcher lowering");
@@ -1074,6 +1100,64 @@ public:
 
 private:
 	void Fail(const char* reason) { m_failure = reason; }
+	// Returns why a jump table cannot become a goto chain, or nullptr when it can. The chain
+	// takes the first target whose values match, so every table value must be unique.
+	static const char* JumpTableFailure(const Terminator& term, size_t targets) {
+		if (!IsIndexedJumpTable(term)) {
+			return "jump table has no indexed selector";
+		}
+		auto values = term.indirect_selector_values;
+		SortUnique(values);
+		if (values.size() != term.indirect_selector_values.size()) {
+			return "jump table repeats a selector value";
+		}
+		return targets > MaxJumpTableTargets ? "jump table has too many targets" : nullptr;
+	}
+	// Orders the unique targets of a jump table for its goto chain. Forward targets come
+	// first, farthest first, so each later goto nests inside the region an earlier one skips.
+	// Backward targets follow. Positions come from goto_position, which counts a redirected
+	// loop header as a forward goto to its continue label.
+	template <typename GotoPosition>
+	static std::vector<uint32_t> JumpTableTargetOrder(uint32_t block, const Terminator& term,
+	                                                  const GotoPosition& goto_position) {
+		auto targets = term.indirect_selector_targets;
+		SortUnique(targets);
+		const auto jump = uint64_t {block} * 2u;
+		std::ranges::sort(targets, [&](uint32_t first, uint32_t second) {
+			const auto first_position  = goto_position(first);
+			const auto second_position = goto_position(second);
+			const bool first_back      = first_position <= jump;
+			const bool second_back     = second_position <= jump;
+			return first_back != second_back ? second_back : first_position > second_position;
+		});
+		return targets;
+	}
+	// Lowers a jump table to one goto per unique target. Each goto tests a SelectorIn
+	// over that target's table offsets, captured at the jump block like a native predicate.
+	template <typename AddGoto, typename GotoPosition>
+	void AddJumpTableGotos(const BasicBlock& block, AddGoto& add_goto,
+	                       const GotoPosition& goto_position) {
+		const auto& term    = block.terminator;
+		const auto  targets = JumpTableTargetOrder(block.id, term, goto_position);
+		if (const auto* failure = JumpTableFailure(term, targets.size()); failure != nullptr) {
+			Fail(failure);
+			return;
+		}
+		for (const auto target: targets) {
+			std::vector<uint32_t> values;
+			for (size_t index = 0; index < term.indirect_selector_values.size(); ++index) {
+				if (term.indirect_selector_targets[index] == target)
+					values.push_back(term.indirect_selector_values[index]);
+			}
+			SortUnique(values);
+			const auto list = static_cast<uint32_t>(m_graph.selector_value_lists.size());
+			m_graph.selector_value_lists.push_back(std::move(values));
+			const auto capture  = m_next_jump_capture++;
+			const auto selector = Expression(ExprOp::SelectorIn, term.indirect_selector_code, list);
+			m_jump_captures[block.id].push_back({capture, selector});
+			add_goto(Expression(ExprOp::Variable, capture), target);
+		}
+	}
 	Graph Failed() {
 		SetFailure(m_graph, FailureKind::StructuredControlFlow, UINT32_MAX, m_failure);
 		return std::move(m_graph);
@@ -1298,10 +1382,53 @@ private:
 	}
 	bool Modifies(Node* node, uint32_t expression) const {
 		if (node->kind == Kind::Set && RefersTo(expression, node->id)) return true;
-		if (node->kind == Kind::Code &&
-		    m_source.blocks[node->id].terminator.kind == TerminatorKind::ConditionalBranch &&
-		    RefersTo(expression, CaptureVariable(node->id))) return true;
+		if (node->kind == Kind::Code && CodeCaptures(node->id, expression)) return true;
 		return std::ranges::any_of(node->children, [&](auto* child) { return Modifies(child, expression); });
+	}
+	// True when a guest block captures a predicate that the expression reads. No If pairs on
+	// a jump capture today, but the check keeps pairing safe if the transformations change.
+	bool CodeCaptures(uint32_t block, uint32_t expression) const {
+		if (m_source.blocks[block].terminator.kind == TerminatorKind::ConditionalBranch &&
+		    RefersTo(expression, CaptureVariable(block))) return true;
+		const auto found = m_jump_captures.find(block);
+		return found != m_jump_captures.end() &&
+		       std::ranges::any_of(found->second, [&](const auto& capture) {
+			       return RefersTo(expression, capture.variable);
+		       });
+	}
+	// Appends one guest block to the current structured block, starting a new block when
+	// the current one already ends with other guest code or a captured guest predicate.
+	uint32_t VisitCode(Node* node, uint32_t current) {
+		const auto& source = m_source.blocks[node->id];
+		const auto& previous = m_graph.blocks[current];
+		// Route assignments cannot observe guest writes, but a guest predicate must be read
+		// where its Code ends. Goto elimination never places guest code right after a jump
+		// block today, and this keeps that true if the transformations change.
+		const bool captures_guest =
+		    std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
+			    const auto op = m_graph.expressions[assignment.expression].op;
+			    return op == ExprOp::Native || op == ExprOp::SelectorIn;
+		    });
+		if (captures_guest ||
+		    (previous.inst_begin != previous.inst_end && previous.inst_end != source.inst_begin)) {
+			current = Advance(current);
+		}
+		auto& block = m_graph.blocks[current];
+		if (block.inst_begin == block.inst_end) {
+			block.start_pc = source.start_pc;
+			block.inst_begin = source.inst_begin;
+		}
+		block.end_pc = source.end_pc;
+		block.inst_end = source.inst_end;
+		if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
+			block.assignments.push_back({CaptureVariable(source.id),
+			    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
+		}
+		if (const auto found = m_jump_captures.find(source.id); found != m_jump_captures.end()) {
+			block.assignments.insert(block.assignments.end(), found->second.begin(),
+			                         found->second.end());
+		}
+		return current;
 	}
 	bool Complements(uint32_t first, uint32_t second) const {
 		const auto& a = m_graph.expressions[first];
@@ -1318,30 +1445,7 @@ private:
 				Place(current);
 			}
 			switch (node->kind) {
-				case Kind::Code: {
-					const auto& source = m_source.blocks[node->id];
-					const auto& previous = m_graph.blocks[current];
-					// Route assignments cannot observe guest writes; native predicates must stay at their original Code.
-					const bool captures_native = std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
-						return m_graph.expressions[assignment.expression].op == ExprOp::Native;
-					});
-					if (captures_native ||
-					    (previous.inst_begin != previous.inst_end && previous.inst_end != source.inst_begin)) {
-						current = Advance(current);
-					}
-					auto& block = m_graph.blocks[current];
-					if (block.inst_begin == block.inst_end) {
-						block.start_pc = source.start_pc;
-						block.inst_begin = source.inst_begin;
-					}
-					block.end_pc = source.end_pc;
-					block.inst_end = source.inst_end;
-					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
-						block.assignments.push_back({CaptureVariable(source.id),
-						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
-					}
-					break;
-				}
+				case Kind::Code: current = VisitCode(node, current); break;
 				case Kind::Set: {
 					m_graph.blocks[current].assignments.push_back({node->id, node->condition});
 					break;
@@ -1437,6 +1541,8 @@ private:
 	std::vector<Node*> m_gotos;
 	std::vector<uint32_t> m_route_expressions;
 	std::vector<uint32_t> m_order;
+	uint32_t m_next_jump_capture = 0;
+	std::map<uint32_t, std::vector<BasicBlock::Assignment>> m_jump_captures;
 };
 
 } // namespace
@@ -1676,16 +1782,14 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	RecomputeAnalyses(graph);
 
-	if (indirect_setpc) {
-		graph.irreducible  = true;
-		graph.unsupported  = false;
-		graph.failure_kind = FailureKind::IrreducibleControlFlow;
-		const auto indirect =
-		    std::find_if(graph.blocks.begin(), graph.blocks.end(), [](const auto& block) {
-			    return block.terminator.kind == TerminatorKind::IndirectBranch;
-		    });
-		graph.failure_block = indirect != graph.blocks.end() ? indirect->id : graph.entry_block;
-		graph.unsupported_reason = "indirect S_SETPC_B64 jump table requires dispatcher fallback";
+	// Structurize lowers an indexed jump table to a goto chain. Any other indirect branch
+	// still needs the dispatcher.
+	if (std::ranges::any_of(graph.blocks, [](const auto& block) {
+		    return block.terminator.kind == TerminatorKind::IndirectBranch &&
+		           !IsIndexedJumpTable(block.terminator);
+	    })) {
+		ForceJumpTableDispatcher(graph,
+		                         "indirect S_SETPC_B64 jump table requires dispatcher fallback");
 	}
 
 	if (graph.irreducible) {
@@ -1693,6 +1797,24 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 
 	return graph;
+}
+
+bool HasJumpTable(const Graph& graph) {
+	return std::ranges::any_of(graph.blocks, [](const auto& block) {
+		return block.terminator.kind == TerminatorKind::IndirectBranch;
+	});
+}
+
+void ForceJumpTableDispatcher(Graph& graph, const std::string& reason) {
+	graph.irreducible  = true;
+	graph.unsupported  = false;
+	graph.failure_kind = FailureKind::IrreducibleControlFlow;
+	const auto indirect =
+	    std::find_if(graph.blocks.begin(), graph.blocks.end(), [](const auto& block) {
+		    return block.terminator.kind == TerminatorKind::IndirectBranch;
+	    });
+	graph.failure_block = indirect != graph.blocks.end() ? indirect->id : graph.entry_block;
+	graph.unsupported_reason = reason;
 }
 
 Graph Structurize(const Graph& graph) {
@@ -1812,7 +1934,7 @@ std::string GraphToString(const Graph& graph) {
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "
-		    "expression={}\n",
+		    "selector_targets=[{}] expression={}\n",
 		    static_cast<uint32_t>(block.terminator.kind),
 		    BranchConditionToString(block.terminator.condition).c_str(),
 		    block.terminator.true_block, block.terminator.false_block, block.terminator.merge_block,
@@ -1820,12 +1942,21 @@ std::string GraphToString(const Graph& graph) {
 		    block.terminator.indirect_pc_sgpr, block.terminator.indirect_selector_code,
 		    VectorToString(block.terminator.indirect_targets).c_str(),
 		    VectorToString(block.terminator.indirect_selector_values).c_str(),
+		    VectorToString(block.terminator.indirect_selector_targets).c_str(),
 		    block.terminator.expression);
 		for (const auto& assignment: block.assignments) {
 			text += fmt::format("  variable_{} = expression_{}", assignment.variable, assignment.expression);
 			const auto& expression = graph.expressions[assignment.expression];
 			if (expression.op == ConditionExpression::Op::Native)
 				text += fmt::format(" condition={}", BranchConditionToString(static_cast<BranchCondition>(expression.lhs)));
+			if (expression.op == ConditionExpression::Op::SelectorIn) {
+				// A dump must print a damaged graph, so a bad list index is shown, not thrown.
+				const auto& lists  = graph.selector_value_lists;
+				const auto  values = expression.rhs < lists.size()
+				                         ? VectorToString(lists[expression.rhs])
+				                         : std::string("invalid");
+				text += fmt::format(" selector={} values=[{}]", expression.lhs, values);
+			}
 			text += "\n";
 		}
 	}

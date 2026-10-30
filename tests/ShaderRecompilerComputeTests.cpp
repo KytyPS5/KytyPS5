@@ -1386,6 +1386,8 @@ struct TestCase {
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
   const ShaderProfile *profile = &Maintenance8Profile;
+  // Structured jump tables are opt-in, so a test of the structured form asks for it.
+  bool structured_jump_tables = false;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1738,6 +1740,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.profile = test.profile;
+  options.structured_jump_tables = test.structured_jump_tables;
   options.dump_ir = true;
   options.emit_debug_info = true; // Checks find variables and functions by OpName.
   auto compute_info = test.compute_info;
@@ -25403,6 +25406,111 @@ TestCase ScalarConditionalMoveB64() {
   return test;
 }
 
+// Marker a jump-table body stores, and the bodies each table entry selects. Two entries
+// share a body.
+constexpr u32 JumpTableMarkerBase = 0x100u;
+constexpr std::array<u32, 5> JumpTableEntryBodies = {0u, 1u, 2u, 1u, 3u};
+
+// Builds a shader that clamps the selector in s4 with s_min_u32, like real titles do, and
+// jumps through an S_SETPC_B64 table to a body that moves its marker into v1. The last
+// body falls through to the store of v1 at each lane's dword.
+std::vector<u32> MakeJumpTableMarkerShader() {
+  constexpr u32 literal = 255u;
+  constexpr u32 bodies = 4u;
+  constexpr auto entries = static_cast<u32>(JumpTableEntryBodies.size());
+  std::vector<u32> code;
+  code.push_back(EncodeSop2(0x07, 0, 4, InlineU32(entries - 1u))); // s_min_u32 s0, s4, 4
+  code.push_back(EncodeSop2(0x1e, 0, 0, InlineU32(3)));            // s_lshl_b32 s0, s0, 3
+  code.push_back(EncodeSop1(0x1f, 8, 0));                          // s_getpc_b64 s[8:9]
+  const auto table_base = static_cast<u32>(code.size()) * 4u;
+  code.push_back(EncodeSop2(0x00, 8, 8, literal)); // s_add_u32 s8, s8, literal
+  const auto table_literal = code.size();
+  code.push_back(0u);
+  code.push_back(EncodeSop2(0x04, 9, 9, InlineU32(0)));  // s_addc_u32 s9, s9, 0
+  code.push_back(EncodeSmem0(0x01, 12, 4));
+  code.push_back(EncodeSmem1(0, 0));                     // s_load_dwordx2 s[12:13], s[8:9], s0
+  code.push_back(EncodeSopp(0x0c, 0));                   // s_waitcnt 0
+  code.push_back(EncodeSop1(0x1f, 10, 0));               // s_getpc_b64 s[10:11]
+  const auto target_base = static_cast<u32>(code.size()) * 4u;
+  code.push_back(EncodeSop2(0x00, 10, 10, 12)); // s_add_u32 s10, s10, s12
+  code.push_back(EncodeSop2(0x04, 11, 11, 13)); // s_addc_u32 s11, s11, s13
+  code.push_back(EncodeSop1(0x20, 0, 10));      // s_setpc_b64 s[10:11]
+  std::vector<u32> body_pcs;
+  std::vector<size_t> exits;
+  for (u32 body = 0; body < bodies; ++body) {
+    body_pcs.push_back(static_cast<u32>(code.size()) * 4u);
+    AppendVMovLiteral(&code, 1, JumpTableMarkerBase + body);
+    if (body + 1u == bodies) continue; // falls through to the store
+    exits.push_back(code.size());
+    code.push_back(0u);
+  }
+  for (const auto exit : exits)
+    code[exit] = EncodeSopp(0x02, static_cast<u32>(code.size() - exit - 1u)); // s_branch
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+  code[table_literal] = static_cast<u32>(code.size()) * 4u - table_base;
+  for (const auto body : JumpTableEntryBodies) {
+    code.push_back(body_pcs[body] - target_base);
+    code.push_back(0u);
+  }
+  return code;
+}
+
+// Builds the wave64 jump-table marker test for one selector in one control-flow mode. Every lane
+// must store the marker of the body its entry selects. The structured form must have no switch or
+// loop, and the default dispatcher must lower the table to a switch, so each run proves which form
+// it executed.
+TestCase JumpTableTargetCase(const char *name, u32 selector, bool structured) {
+  using O = ShaderOpcode;
+  constexpr u32 wave_size = 64u;
+  constexpr auto entries = static_cast<u32>(JumpTableEntryBodies.size());
+  TestCase test;
+  test.name = name;
+  test.code = MakeJumpTableMarkerShader();
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[4] = selector;
+  test.has_user_data = true;
+  const auto body = JumpTableEntryBodies[std::min(selector, entries - 1u)];
+  test.expected.assign(wave_size, JumpTableMarkerBase + body);
+  test.initial.assign(wave_size, 0xdeadbeefu);
+  test.structured_jump_tables = structured;
+  if (structured) {
+    test.forbidden_spirv = {"OpSwitch", "OpLoopMerge"};
+  } else {
+    test.required_spirv = {"OpSwitch"};
+  }
+  test.opcodes = {O::S_MIN_U32, O::S_LSHL_B32, O::S_GETPC_B64, O::S_ADD_U32,
+                  O::S_ADDC_U32, O::S_LOAD_DWORDX2, O::S_WAITCNT, O::S_SETPC_B64,
+                  O::V_MOV_B32, O::S_BRANCH, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Runs the jump-table shader once per selector, including one past the table, both structured
+// and on the default dispatcher, since games run whichever the opt-in picks.
+std::vector<TestCase> JumpTableSelectsEachTarget() {
+  // One name per selector in each mode, the last one past the table.
+  constexpr std::array structured_names{
+      "JumpTableSelectsEachTarget0", "JumpTableSelectsEachTarget1",
+      "JumpTableSelectsEachTarget2", "JumpTableSelectsEachTarget3",
+      "JumpTableSelectsEachTarget4", "JumpTableSelectsEachTarget5"};
+  constexpr std::array dispatcher_names{
+      "JumpTableDispatcherSelectsEachTarget0", "JumpTableDispatcherSelectsEachTarget1",
+      "JumpTableDispatcherSelectsEachTarget2", "JumpTableDispatcherSelectsEachTarget3",
+      "JumpTableDispatcherSelectsEachTarget4", "JumpTableDispatcherSelectsEachTarget5"};
+  std::vector<TestCase> tests;
+  for (u32 selector = 0; selector < structured_names.size(); ++selector) {
+    tests.push_back(JumpTableTargetCase(structured_names[selector], selector, true));
+    tests.push_back(JumpTableTargetCase(dispatcher_names[selector], selector, false));
+  }
+  return tests;
+}
+
 TestCase ScalarConditionalMoveB64PreservesMasks() {
   using O = ShaderOpcode;
   TestCase test;
@@ -46582,6 +46690,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3AshrrevI64Operands);
   AddCase(ScalarConditionalMoveB64);
   AddCase(ScalarConditionalMoveB64PreservesMasks);
+  for (auto &test : JumpTableSelectsEachTarget()) cases.push_back(std::move(test));
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
   AddCase(ScalarMaskHighWriteInvalidatesProvenance);
   cases.push_back(ScalarSelectB64PreservesMaskProvenance(32));

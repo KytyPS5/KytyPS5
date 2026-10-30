@@ -23,6 +23,9 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        emit_debug_info            = false;
+	// Opts in to lowering S_SETPC_B64 jump tables to structured control flow, which NVIDIA
+	// builds far faster than the dispatcher. Off by default while it is new.
+	bool                        structured_jump_tables     = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

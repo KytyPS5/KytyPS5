@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -8115,6 +8116,144 @@ void TestFiniteImageBitScanSentinel() {
   }
 }
 
+// The structurizer lowers a jump table to a chain of conditional branches, so the
+// impossible bit-scan sentinel arm arrives on a conditional edge instead of a switch case.
+// It must still be pruned when every compare on that edge exceeds the selector maximum.
+void TestFiniteImageBitScanSentinelChain() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  constexpr uint32_t sentinel_offset = 128u; // 32 entries of 4 bytes
+  // Without negate the merge is the false edge of an impossible compare, which is always
+  // taken, so its arm must stay. A nested vote wraps each compare inside the Or, and only
+  // the SCC vote that the chain emits is looked through.
+  struct Variant {
+    bool nonzero;
+    std::vector<uint32_t> merge_offsets;
+    bool pruned;
+    bool negate = true;
+    std::optional<CFG::BranchCondition> nested_vote;
+    bool immediate_left = false;
+    // Joins the offsets as a balanced tree, as the translator does.
+    bool balanced = false;
+    // Marks the row that shows a one-sided chain over many offsets goes past the proof depth.
+    bool depth_control = false;
+  };
+  // More impossible offsets than the pruning depth limit would allow in a one-sided chain.
+  constexpr uint32_t entry_bytes = 4u;
+  constexpr uint32_t many_offset_count = 40u;
+  std::vector<uint32_t> many_offsets;
+  for (uint32_t entry = 0; entry < many_offset_count; ++entry)
+    many_offsets.push_back(sentinel_offset + entry_bytes * entry);
+  const Variant variants[] = {
+      {false, {sentinel_offset}, false},
+      {true, {sentinel_offset}, true},
+      {true, {sentinel_offset, sentinel_offset + 4u}, true},
+      {true, {sentinel_offset, 4u}, false},
+      {true, {sentinel_offset}, false, false},
+      {true, {sentinel_offset, sentinel_offset + 4u}, true, true,
+       CFG::BranchCondition::SccNonZero},
+      {true, {sentinel_offset, sentinel_offset + 4u}, false, true,
+       CFG::BranchCondition::VccNonZero},
+      {true, {sentinel_offset}, true, true, std::nullopt, true},
+      {.nonzero = true, .merge_offsets = many_offsets, .pruned = true, .balanced = true},
+      // Control. A one-sided chain over 40 offsets goes past the depth to which the edge can be
+      // proven impossible, so the arm is kept. It shows the balanced row above really needs the
+      // balancing. If that depth is raised or made to scale, this row prunes, so flip it or drop it.
+      {.nonzero = true, .merge_offsets = many_offsets, .pruned = false, .depth_control = true},
+  };
+  for (const auto &variant : variants) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *dispatch = fixture.AddBlock();
+    auto *inner = fixture.AddBlock();
+    auto *done = fixture.AddBlock();
+    auto *load = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(dispatch);
+    entry->AddBranch(exit);
+    dispatch->AddBranch(inner);
+    dispatch->AddBranch(merge);
+    inner->AddBranch(done);
+    inner->AddBranch(load);
+    load->AddBranch(merge);
+    const auto mask = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(uint32_t(StageInputKind::LocalInvocationIndex)), Value(0u)});
+    const auto condition = fixture.Emit(
+        variant.nonzero ? ValueOpcode::INotEqual32 : ValueOpcode::IEqual32, {mask, Value(0u)});
+    const auto branch = [&](Block *from, Value value, Block *taken, Block *other) {
+      from->condition = value;
+      from->terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      from->terminator.true_block = taken;
+      from->terminator.false_block = other;
+    };
+    branch(entry, condition, dispatch, exit);
+    const auto first = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, dispatch);
+    const auto minimum = fixture.Emit(ValueOpcode::UMin32, {first, Value(32u)}, 0, dispatch);
+    const auto selector =
+        fixture.Emit(ValueOpcode::ShiftLeftLogical32, {minimum, Value(2u)}, 0, dispatch);
+    // Each goto skips its If body when its target's SelectorIn holds, as the structurizer
+    // emits it, so the target is the false edge of a negated vote.
+    const auto skip_unless = [&](const std::vector<uint32_t> &offsets, Block *block,
+                                 bool negate) {
+      std::vector<Value> matches;
+      for (const auto offset : offsets) {
+        auto match = variant.immediate_left
+                         ? fixture.Emit(ValueOpcode::IEqual32, {Value(offset), selector}, 0, block)
+                         : fixture.Emit(ValueOpcode::IEqual32, {selector, Value(offset)}, 0, block);
+        if (variant.nested_vote && block == dispatch)
+          match = fixture.Emit(ValueOpcode::ConditionRef, {match}, *variant.nested_vote, block);
+        matches.push_back(match);
+      }
+      // The balanced form copies the shape Translator::JoinBalancedOr emits, pairing neighbours
+      // level by level. The other rows keep the one-sided chain.
+      while (variant.balanced && matches.size() > 1u) {
+        std::vector<Value> joined;
+        for (size_t pair = 0; pair + 1u < matches.size(); pair += 2u)
+          joined.push_back(
+              fixture.Emit(ValueOpcode::LogicalOr, {matches[pair], matches[pair + 1u]}, 0, block));
+        if (matches.size() % 2u != 0u) joined.push_back(matches.back());
+        matches = std::move(joined);
+      }
+      Value any = matches.front();
+      for (size_t rest = 1; rest < matches.size(); ++rest)
+        any = fixture.Emit(ValueOpcode::LogicalOr, {any, matches[rest]}, 0, block);
+      const auto vote = fixture.Emit(ValueOpcode::ConditionRef, {any},
+                                     CFG::BranchCondition::SccNonZero, block);
+      return negate ? fixture.Emit(ValueOpcode::LogicalNot, {vote}, 0, block) : vote;
+    };
+    branch(dispatch, skip_unless(variant.merge_offsets, dispatch, variant.negate), inner, merge);
+    branch(inner, skip_unless({0u}, inner, true), done, load);
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(dispatch, mask);
+      phi.AddPhiOperand(load, Value(100u + word));
+      words[word] = Value(&phi);
+    }
+    fixture.block = merge;
+    const auto image = fixture.Image(words);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 4));
+    if (!variant.pruned) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 variant.depth_control
+                     ? "a one-sided chain past the proof depth was pruned, so update this control"
+                     : "a possible jump-table chain edge silently dropped its descriptor arm");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &finite = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(finite && finite->sources.size() == 1 &&
+              image.Instruction()->Arg(0).Instruction()->NumPhiBlocks() == 2,
+          "jump-table chain kept its impossible sentinel or removed a Phi edge");
+  }
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -9063,6 +9202,7 @@ int main() {
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
+    Run("finite image bit scan sentinel chain", TestFiniteImageBitScanSentinelChain);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);

@@ -173,6 +173,10 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
+bool StructuredJumpTablesEnabled() {
+	return g_config->structured_jump_tables;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

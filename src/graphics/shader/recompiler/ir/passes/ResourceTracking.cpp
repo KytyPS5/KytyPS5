@@ -3567,6 +3567,15 @@ private:
 		if (inst->GetOpcode() == ValueOpcode::LogicalAnd)
 			return SelectorPredicateFalse(inst->Arg(0), bounds, depth + 1u, guard) ||
 			       SelectorPredicateFalse(inst->Arg(1), bounds, depth + 1u, guard);
+		// A jump-table chain tests one target's offsets as an Or of compares.
+		if (inst->GetOpcode() == ValueOpcode::LogicalOr)
+			return SelectorPredicateFalse(inst->Arg(0), bounds, depth + 1u, guard) &&
+			       SelectorPredicateFalse(inst->Arg(1), bounds, depth + 1u, guard);
+		// SCC is wave-uniform, so its vote equals the compare on every lane, even when a guard
+		// bounds the compare only on some lanes. A jump-table chain emits this vote.
+		if (inst->GetOpcode() == ValueOpcode::ConditionRef)
+			return inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::SccNonZero &&
+			       SelectorPredicateFalse(inst->Arg(0), bounds, depth + 1u, guard);
 		if (inst->GetOpcode() == ValueOpcode::IEqual32) {
 			for (uint32_t arg = 0; arg < 2u; ++arg) {
 				uint32_t target;
@@ -3773,8 +3782,16 @@ private:
 		return UINT32_MAX;
 	}
 
-	bool ImpossibleSwitchEdge(const Block* from, const Block* to) const {
+	// True when control can never take the edge from one block to another. The dispatcher
+	// form is a switch case whose value exceeds the selector's maximum. Any conditional
+	// edge, such as a jump-table chain edge, is impossible when it is taken only while a
+	// branch predicate holds that provably cannot.
+	bool ImpossibleSelectorEdge(const Block* from, const Block* to) const {
 		const auto& term = from->terminator;
+		if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+			const auto edge = ConditionalEdge(from, to);
+			return edge && edge->positive && SelectorPredicateFalse(edge->condition, {});
+		}
 		if (term.kind != CFG::TerminatorKind::IndirectBranch || !term.indexed) return false;
 		const auto maximum = SelectorMaximum(from->indirect_target);
 		bool found = false;
@@ -3851,9 +3868,9 @@ private:
 			// Later words may depend on choices computed after the first descriptor word.
 			choices[index].branch = anchor;
 			for (uint32_t arm = 0; arm < count; ++arm) {
-				// A nonzero bit scan cannot choose its zero-input switch sentinel.
+				// A nonzero bit scan cannot choose its zero-input switch or chain sentinel.
 				// Preserve the Phi edge; its ordinal is never observed at runtime.
-				if (phi && ImpossibleSwitchEdge(anchor->PhiBlock(arm), anchor->Parent())) {
+				if (phi && ImpossibleSelectorEdge(anchor->PhiBlock(arm), anchor->Parent())) {
 					choices[index].children.push_back(UINT32_MAX);
 					continue;
 				}

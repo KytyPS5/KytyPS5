@@ -385,10 +385,27 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
-  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+  // Registers an uncleared HTILE metadata surface at `address`, as a depth-target bind would.
+  // `size` is the surface's byte size; 0 leaves it unknown.
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
+                                uint64_t size = 0) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.clear_mask.reset();
+    metadata.size = size;
+  }
+
+  // Returns the size recorded for the metadata surface at `address`, or 0 if none is registered.
+  static uint64_t MetaSize(TextureCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_lock);
+    const auto found = cache.m_surface_metas.find(address);
+    return found == cache.m_surface_metas.end() ? 0 : found->second.size;
+  }
+
+  // Frees an image the way the cache retires one, dropping any GPU-written contents first.
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -5748,9 +5765,10 @@ public:
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     auto &texture_cache = context.GetTextureCache();
-    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
-    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
-    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
+    constexpr uint64_t meta_size = 0x100;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta, meta_size);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta, meta_size);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta, meta_size);
 
     // An empty dispatch must not inspect even an unreadable shader address.
     shaders.SetCsShader({.data_addr = 1});
@@ -5839,6 +5857,339 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+
+    // A game can free a depth target and reuse its HTILE memory for other data while the
+    // metadata entry remains. Writing that address is then not a clear unless the dispatch
+    // writes only metadata, within the surface, from constants (PPSA09809 scene-buffer copies).
+
+    // Wraps a shader and its bound resources as compute dispatch input.
+    const auto MakeDispatch = [](ShaderModule &module,
+                                 ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+      ShaderComputeInputInfo input{};
+      input.stage.module = &module;
+      input.stage.resources = &snapshot;
+      return input;
+    };
+    constexpr uint64_t reused_meta = 0x0000000204210000ull;
+    constexpr uint64_t scene_data = 0x0000000204300000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, reused_meta, 0xa0000);
+
+    ShaderModule copy_program;
+    ShaderRecompiler::IR::ResourceSnapshot copy_snapshot;
+    AddMetaClearBuffer(scene_data, true, false, 0x2400, copy_program, copy_snapshot);
+    AddMetaClearBuffer(reused_meta, false, true, 0x9000, copy_program, copy_snapshot);
+    const bool copy_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(copy_program, copy_snapshot), command);
+    Require(name, "data copy into reused HTile memory preserved",
+            !copy_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch copying data into reused HTile memory was replaced by a clear");
+
+    ShaderModule past_program;
+    ShaderRecompiler::IR::ResourceSnapshot past_snapshot;
+    AddMetaClearBuffer(reused_meta, false, true, 0xb000, past_program, past_snapshot);
+    const bool past_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(past_program, past_snapshot), command);
+    Require(name, "write past the HTile surface preserved",
+            !past_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch writing past the HTile surface was replaced by a clear");
+
+    ShaderModule mixed_program;
+    ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
+    AddMetaClearBuffer(reused_meta, false, true, 0x100, mixed_program, mixed_snapshot);
+    AddMetaClearBuffer(scene_data, false, true, 0x100, mixed_program, mixed_snapshot);
+    const bool mixed_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(mixed_program, mixed_snapshot), command);
+    Require(name, "write to HTile and other memory preserved",
+            !mixed_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch also writing non-metadata memory was replaced by a clear");
+
+    constexpr uint64_t unsized_meta = 0x0000000204280000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, unsized_meta);
+    ShaderModule unsized_program;
+    ShaderRecompiler::IR::ResourceSnapshot unsized_snapshot;
+    AddMetaClearBuffer(unsized_meta, false, true, 0x10, unsized_program, unsized_snapshot);
+    const bool unsized_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(unsized_program, unsized_snapshot), command);
+    Require(name, "write to metadata of unknown size preserved",
+            !unsized_consumed && !texture_cache.IsMetaCleared(unsized_meta, 0),
+            "a write to metadata of unknown size was replaced by a clear");
+
+    ShaderModule image_program;
+    ShaderRecompiler::IR::ResourceSnapshot image_snapshot;
+    AddMetaClearBuffer(scene_data, true, false, 0x10, image_program, image_snapshot);
+    AddMetaClearBuffer(reused_meta, false, true, 0xa000, image_program, image_snapshot);
+    ShaderRecompiler::IR::ImageResource storage_image{};
+    storage_image.written = true;
+    image_program.info.info.images.push_back(storage_image);
+    image_snapshot.images.push_back({});
+    const bool image_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(image_program, image_snapshot), command);
+    Require(name, "HTile clear that also writes a storage image preserved",
+            !image_consumed && !texture_cache.IsMetaCleared(reused_meta, 0),
+            "a dispatch also writing a storage image was replaced by a clear");
+
+    // A real clear targets HTILE that still belongs to a depth target. A constant fill of
+    // reused HTILE memory is still consumed today, because a metadata entry survives while its
+    // memory stays mapped, even after a game reuses it for other data. That gap is left to a
+    // follow-up, so this case uses metadata that was never reused.
+    constexpr uint64_t cleared_meta = 0x0000000204400000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, cleared_meta, 0xa0000);
+    ShaderModule clear_program;
+    ShaderRecompiler::IR::ResourceSnapshot clear_snapshot;
+    AddMetaClearBuffer(scene_data, true, false, 0x10, clear_program, clear_snapshot);
+    AddMetaClearBuffer(cleared_meta, false, true, 0xa000, clear_program, clear_snapshot);
+    const bool clear_consumed = RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+        executor, MakeDispatch(clear_program, clear_snapshot), command);
+    Require(name, "constant-driven HTile clear consumed",
+            clear_consumed && texture_cache.IsMetaCleared(cleared_meta, 0),
+            "a full HTile clear reading only constants was not consumed");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Element size of the k32_32_32_32UInt buffers the metadata clear tests bind.
+  static constexpr uint32_t MetaClearElementBytes = 16;
+
+  // Adds a formatted buffer binding of `records` elements at `address` to a compute shader's
+  // metadata and its descriptor to the resource snapshot. A null address models an unbound
+  // slot and UINT32_MAX records an unbounded descriptor.
+  static void AddMetaClearBuffer(uint64_t address, bool read, bool written, uint32_t records,
+                                 ShaderModule &module,
+                                 ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+    auto &program = module.info;
+    program.stage = ShaderType::Compute;
+    ShaderRecompiler::IR::BufferResource resource{};
+    resource.read = read;
+    resource.written = written;
+    resource.formatted = true;
+    // The classifier doesn't read write_extent. It is set as the recompiler sets it for a real
+    // clear, whose formatted, thread-addressed writes have no static extent.
+    resource.write_extent = written ? UINT32_MAX : 0;
+    program.info.buffers.push_back(resource);
+    ShaderBufferResource descriptor{};
+    descriptor.UpdateAddress48(address);
+    descriptor.fields[1] |= MetaClearElementBytes << 16u;
+    descriptor.fields[2] = records;
+    descriptor.fields[3] =
+        DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt) << 12u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 4;
+    std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
+    snapshot.buffers.push_back(value);
+  }
+
+  // Pins which inputs keep a compute metadata clear eligible. Each case uses its own HTILE
+  // entry, so a clear consumed by one case can't satisfy another.
+  void CheckComputeMetaClearInputs() {
+    constexpr const char *name = "ComputeMetaClearInputs";
+    constexpr uint64_t meta_size = 0xa0000;
+    constexpr uint64_t meta_spacing = 0x100000;
+    constexpr uint64_t first_meta = 0x0000000204500000ull;
+    constexpr uint64_t constants = 0x0000000204300000ull;
+    constexpr uint32_t unbounded = UINT32_MAX;
+    constexpr uint32_t clear_constants_records = 1;
+    constexpr uint32_t meta_records = 0x100;
+    // Mirrors MaxClearConstantsBytes in AddMetaClearTarget (renderCompute.cpp), so both
+    // change together.
+    constexpr uint32_t max_constants_bytes = 4096;
+    constexpr uint32_t max_constants_records = max_constants_bytes / MetaClearElementBytes;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    auto &command = scheduler.Current();
+    uint64_t next_meta = first_meta;
+    // Registers a fresh HTILE entry for one case.
+    const auto NewMeta = [&]() {
+      const auto address = next_meta;
+      next_meta += meta_spacing;
+      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, address, meta_size);
+      return address;
+    };
+    // Builds a dispatch that reads constants of `read_records` elements and writes `writes`,
+    // then reports whether it was consumed as a metadata clear.
+    const auto Consume = [&](uint32_t read_records,
+                             std::initializer_list<std::pair<uint64_t, uint32_t>> writes) {
+      ShaderModule module;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      AddMetaClearBuffer(constants, true, false, read_records, module, snapshot);
+      for (const auto &[address, records] : writes) {
+        AddMetaClearBuffer(address, false, true, records, module, snapshot);
+      }
+      ShaderComputeInputInfo input{};
+      input.stage.module = &module;
+      input.stage.resources = &snapshot;
+      return RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, input, command);
+    };
+
+    // Clear shaders commonly address the whole surface through an unbounded descriptor and a
+    // thread-indexed write with no static extent. Such a clear must stay a logical clear, or
+    // the depth target would keep stale HTILE.
+    const auto unbounded_meta = NewMeta();
+    Require(name, "unbounded HTile clear consumed",
+            Consume(clear_constants_records, {{unbounded_meta, unbounded}}) &&
+                texture_cache.IsMetaCleared(unbounded_meta, 0),
+            "an unbounded constant-driven HTile clear was not consumed");
+
+    // An unbounded read can be any amount of real data, so the dispatch is a copy.
+    const auto unbounded_read_meta = NewMeta();
+    Require(name, "unbounded read preserved",
+            !Consume(unbounded, {{unbounded_read_meta, meta_records}}) &&
+                !texture_cache.IsMetaCleared(unbounded_read_meta, 0),
+            "a dispatch with an unbounded read was replaced by a clear");
+
+    // Constants up to the limit keep a clear eligible, and one element more does not.
+    const auto at_limit_meta = NewMeta();
+    Require(name, "constants at the read limit consumed",
+            Consume(max_constants_records, {{at_limit_meta, meta_records}}) &&
+                texture_cache.IsMetaCleared(at_limit_meta, 0),
+            "a clear reading exactly the constant limit was not consumed");
+    const auto past_limit_meta = NewMeta();
+    Require(name, "read past the constant limit preserved",
+            !Consume(max_constants_records + 1, {{past_limit_meta, meta_records}}) &&
+                !texture_cache.IsMetaCleared(past_limit_meta, 0),
+            "a dispatch reading past the constant limit was replaced by a clear");
+
+    // An unbound slot has a null descriptor and touches no memory, so it doesn't block a
+    // clear. A dispatch with nothing but unbound slots writes no metadata and is not a clear.
+    const auto null_slot_meta = NewMeta();
+    Require(name, "null slot beside an HTile clear consumed",
+            Consume(clear_constants_records,
+                    {{0, meta_records}, {null_slot_meta, meta_records}}) &&
+                texture_cache.IsMetaCleared(null_slot_meta, 0),
+            "a null descriptor slot stopped an HTile clear from being consumed");
+    Require(name, "null-only dispatch preserved",
+            !Consume(clear_constants_records, {{0, meta_records}}),
+            "a dispatch writing only unbound slots was replaced by a clear");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Pins that TextureCache::ClearMetaSurfaces clears all of a dispatch's metadata targets or
+  // none. A partial clear would mark HTILE cleared for a dispatch that then runs and writes it.
+  void CheckMetaClearSurfacesAllOrNothing() {
+    constexpr const char *name = "MetaClearSurfacesAllOrNothing";
+    using Target = TextureCache::MetaClearTarget;
+    constexpr uint64_t meta_size = 0x1000;
+    constexpr uint64_t first_meta = 0x0000000204600000ull;
+    constexpr uint64_t second_meta = 0x0000000204610000ull;
+    constexpr uint64_t unregistered = 0x0000000204620000ull;
+    constexpr uint64_t constants = 0x0000000204630000ull;
+    constexpr uint64_t constants_size = 0x10;
+    // An unbounded descriptor reports a size past the surface, which must not reject it.
+    constexpr uint64_t unbounded_size = meta_size * 2;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, first_meta, meta_size);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, second_meta, meta_size);
+    // Reports whether neither registered surface has been marked cleared.
+    const auto NoneCleared = [&]() {
+      return !texture_cache.IsMetaCleared(first_meta, 0) &&
+             !texture_cache.IsMetaCleared(second_meta, 0);
+    };
+
+    // A later target that fails must leave an earlier passing target uncleared.
+    const std::array unregistered_last{Target{first_meta, meta_size, true, true},
+                                       Target{unregistered, meta_size, true, true}};
+    Require(name, "unregistered target clears nothing",
+            !texture_cache.ClearMetaSurfaces(unregistered_last) && NoneCleared(),
+            "a dispatch with an unregistered target still cleared another surface");
+
+    const std::array oversized{Target{first_meta, meta_size, true, true},
+                               Target{second_meta, meta_size + 1, true, true}};
+    Require(name, "oversized target clears nothing",
+            !texture_cache.ClearMetaSurfaces(oversized) && NoneCleared(),
+            "a dispatch writing past a surface still cleared another surface");
+
+    const std::array meta_input{Target{first_meta, meta_size, true, true},
+                                Target{second_meta, meta_size, true, false}};
+    Require(name, "metadata read as input clears nothing",
+            !texture_cache.ClearMetaSurfaces(meta_input) && NoneCleared(),
+            "a dispatch reading a metadata surface still cleared another surface");
+
+    const std::array only_constants{Target{constants, constants_size, true, false}};
+    Require(name, "dispatch writing no surface clears nothing",
+            !texture_cache.ClearMetaSurfaces(only_constants) && NoneCleared(),
+            "a dispatch that writes no metadata surface was accepted as a clear");
+
+    const std::array both{Target{constants, constants_size, true, false},
+                          Target{first_meta, meta_size, true, true},
+                          Target{second_meta, unbounded_size, false, true}};
+    Require(name, "every passing target cleared",
+            texture_cache.ClearMetaSurfaces(both) &&
+                texture_cache.IsMetaCleared(first_meta, 0) &&
+                texture_cache.IsMetaCleared(second_meta, 0),
+            "a dispatch whose targets all passed did not clear every surface");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Pins that a compute shader reaching memory outside its bound buffers is never consumed as a
+  // metadata clear, since a clear would drop those accesses. Each case is otherwise the shape real
+  // clears take, one small constant read and one metadata write.
+  void CheckComputeMetaClearShaderGuards() {
+    constexpr const char *name = "ComputeMetaClearShaderGuards";
+    constexpr uint64_t meta_size = 0xa0000;
+    constexpr uint64_t meta_spacing = 0x100000;
+    constexpr uint64_t first_meta = 0x0000000204700000ull;
+    constexpr uint64_t constants = 0x0000000204300000ull;
+    constexpr uint32_t clear_constants_records = 1;
+    constexpr uint32_t meta_records =
+        static_cast<uint32_t>(meta_size / MetaClearElementBytes);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    auto &command = scheduler.Current();
+    uint64_t next_meta = first_meta;
+    // Builds a clear-shaped dispatch over a fresh HTILE entry, lets `configure` set shader flags,
+    // and reports whether it was consumed and whether the entry was marked cleared.
+    const auto Consume = [&](const auto &configure) {
+      const auto meta = next_meta;
+      next_meta += meta_spacing;
+      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, meta, meta_size);
+      ShaderModule module;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      AddMetaClearBuffer(constants, true, false, clear_constants_records, module, snapshot);
+      AddMetaClearBuffer(meta, false, true, meta_records, module, snapshot);
+      configure(module.info);
+      ShaderComputeInputInfo input{};
+      input.stage.module = &module;
+      input.stage.resources = &snapshot;
+      const bool consumed =
+          RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, input, command);
+      return consumed || texture_cache.IsMetaCleared(meta, 0);
+    };
+
+    // Without any flag the dispatch is a clear, so each rejection below comes from its flag.
+    Require(name, "plain clear consumed", Consume([](auto &) {}),
+            "a clear-shaped dispatch with no extra memory access was not consumed");
+    Require(name, "address writes preserved",
+            !Consume([](auto &program) { program.has_address_writes = true; }),
+            "a dispatch writing through raw addresses was replaced by a clear");
+    Require(name, "indirect buffer access preserved",
+            !Consume([](auto &program) { program.info.uses_dma = true; }),
+            "a dispatch reading buffers through indirect descriptors was replaced by a clear");
+    Require(name, "GDS access preserved",
+            !Consume([](auto &program) { program.info.uses_gds = true; }),
+            "a dispatch using GDS was replaced by a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -8517,6 +8868,35 @@ public:
               texture_cache.IsMeta(base + metadata_b) &&
               texture_cache.IsMetaCleared(base + metadata_b, 0),
           "image discovery retired aliased metadata or its live depth image");
+      // Two live depth images can share an HTILE base. The recorded size stays the larger one,
+      // so a smaller image bound later doesn't turn away the larger image's clears. Once an image
+      // using the entry is freed, the next binding records its own size.
+      constexpr uint64_t shared_meta_data_large = 0x2f80000;
+      constexpr uint64_t shared_meta_data_small = 0x2f80100;
+      constexpr uint64_t shared_meta = 0x2f81000;
+      constexpr uint64_t large_meta_size = 0x80;
+      constexpr uint64_t small_meta_size = 0x40;
+      auto shared_large = MakeMetadataDepth(shared_meta_data_large, shared_meta);
+      shared_large.info.metadata.range.size = large_meta_size;
+      auto shared_small = MakeMetadataDepth(shared_meta_data_small, shared_meta);
+      shared_small.info.metadata.range.size = small_meta_size;
+      const auto shared_large_id = texture_cache.FindImage(shared_large);
+      (void)texture_cache.FindDepthTarget(shared_large_id, shared_large);
+      const auto shared_small_id = texture_cache.FindImage(shared_small);
+      (void)texture_cache.FindDepthTarget(shared_small_id, shared_small);
+      Require(name, "shared HTile base keeps the larger size",
+              shared_small_id != shared_large_id &&
+                  TextureCacheTestAccess::MetaSize(texture_cache, base + shared_meta) ==
+                      large_meta_size,
+              "a smaller depth image shrank the size of a shared, still-live HTile entry");
+      TextureCacheTestAccess::FreeImage(texture_cache, shared_large_id);
+      const bool shared_dropped = !texture_cache.IsMeta(base + shared_meta);
+      (void)texture_cache.FindDepthTarget(shared_small_id, shared_small);
+      Require(name, "freed HTile image releases its size",
+              shared_dropped &&
+                  TextureCacheTestAccess::MetaSize(texture_cache, base + shared_meta) ==
+                      small_meta_size,
+              "a freed depth image's metadata size outlived it");
       const bool touched_metadata = texture_cache.TouchMeta(base + metadata_a, 0, false);
       WriteMetadata(context, base + metadata_a, 0x80, 0);
       Require(
@@ -54097,6 +54477,9 @@ int main(int argc, char **argv) {
     CheckPs5GameExampleImageClearRuntimeShape();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckComputeMetaClearInputs();
+    vulkan.CheckMetaClearSurfacesAllOrNothing();
+    vulkan.CheckComputeMetaClearShaderGuards();
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();

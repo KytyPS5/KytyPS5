@@ -14,6 +14,7 @@
 
 #include <bitset>
 #include <map>
+#include <span>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -74,6 +75,16 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// One buffer binding of a compute dispatch that may be a metadata clear.
+	struct MetaClearTarget {
+		uint64_t address = 0;
+		uint64_t size    = 0;     // Bytes the descriptor covers.
+		bool     bounded = true;  // An unbounded descriptor's size says nothing about the write.
+		bool     written = false; // A binding that is not written must not be a metadata surface.
+	};
+	// Checks every target and, only if all pass, marks each written metadata surface cleared.
+	// Returns false and changes nothing otherwise.
+	[[nodiscard]] bool ClearMetaSurfaces(std::span<const MetaClearTarget> targets);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -84,6 +95,11 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// Largest metadata range registered at this address. Two live depth images can share an
+		// HTILE base, and keeping the larger size keeps the larger image's clears eligible. The
+		// entry is dropped when any image using it is freed, even if another still uses it, and the
+		// next binding registers it again with its own size.
+		uint64_t size = 0;
 	};
 
 	struct OverlapResult {

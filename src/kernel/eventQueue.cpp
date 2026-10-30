@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/guestWaits.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -419,6 +420,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     static_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
+
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Equeue, owner.get(),
+	                      owner->GetName().c_str());
 
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);

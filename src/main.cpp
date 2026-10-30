@@ -3,6 +3,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/guestWaits.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -444,6 +445,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
+	Common::GuestWaits::InitFromEnvironment();
 
 	RunOptions options;
 	bool       show_help = false;

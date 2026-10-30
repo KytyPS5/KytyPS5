@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/guestWaits.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -1879,6 +1880,7 @@ int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
                             LibKernel::KernelTimespec*       rmtp) {
 	PRINT_NAME();
 
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sleep, nullptr, nullptr);
 	return POSIX_CALL(LibKernel::KernelNanosleep(rqtp, rmtp));
 }
 
@@ -2081,6 +2083,9 @@ static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* f
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
                                           const uint32_t* timeout_micros) {
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Address,
+	                      reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(address)),
+	                      nullptr);
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
@@ -2089,6 +2094,9 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t
                                             const uint32_t* timeout_micros) {
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Address,
+	                      reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(address)),
+	                      nullptr);
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
@@ -2097,6 +2105,9 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t
                                             const uint32_t* timeout_micros) {
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Address,
+	                      reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(address)),
+	                      nullptr);
 	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
@@ -2972,6 +2983,7 @@ int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* stat
 	    (num != 1 && mode != KERNEL_AIO_WAIT_AND && mode != KERNEL_AIO_WAIT_OR)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Aio, ids, nullptr);
 
 	const auto collect_states = [&](bool notify) {
 		int32_t finished = 0;
@@ -3007,6 +3019,8 @@ int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* stat
 }
 
 int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec) {
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Aio,
+	                      reinterpret_cast<const void*>(static_cast<uintptr_t>(id)), nullptr);
 	return KernelAioWaitRequests(&id, 1, state, KERNEL_AIO_WAIT_AND, usec);
 }
 

@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/hostMemory.h"
 
+#include "common/hostMemory.h"
+
 #include <cinttypes>
 #include <cstdio>
 
@@ -31,6 +33,9 @@ bool IsAccessible(DWORD protect, HostMemoryAccess access) {
 
 bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAccess access,
                           uint64_t& accessible_size) {
+	if (access == HostMemoryAccess::Read) {
+		return Common::HostMemoryQueryReadable(addr, requested_size, accessible_size);
+	}
 	accessible_size = 0;
 	if (addr == 0 || requested_size == 0) {
 		return false;
@@ -89,7 +94,7 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 }
 
 bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t& readable_size) {
-	return HostMemoryQueryRange(addr, requested_size, HostMemoryAccess::Read, readable_size);
+	return Common::HostMemoryQueryReadable(addr, requested_size, readable_size);
 }
 
 bool HostMemoryIsReadable(uint64_t addr) {
@@ -97,11 +102,7 @@ bool HostMemoryIsReadable(uint64_t addr) {
 }
 
 bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
-	if (addr == 0 || size == 0 || UINT64_MAX - addr < size) {
-		return false;
-	}
-	uint64_t readable_size = 0;
-	return HostMemoryQueryReadable(addr, size, readable_size) && readable_size >= size;
+	return Common::HostMemoryRangeIsReadable(addr, size);
 }
 
 } // namespace Libs::Graphics

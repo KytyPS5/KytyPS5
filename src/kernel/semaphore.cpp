@@ -1,6 +1,7 @@
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
+#include "common/guestWaits.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -291,6 +292,7 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sema, sem, nullptr);
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;
@@ -624,6 +626,7 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sema, sem, nullptr);
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -639,6 +642,7 @@ int KYTY_SYSV_ABI sem_trywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sema, sem, nullptr);
 	const int result = SemTimedwaitImpl(sem, &usec);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -649,6 +653,7 @@ int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abst
 		return SetErrnoReturn(POSIX_EINVAL);
 	}
 
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sema, sem, nullptr);
 	const int result = SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -697,6 +702,7 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sema, sem, nullptr);
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
@@ -713,6 +719,7 @@ int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 
 int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
 	uint32_t  micros = usec;
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Sema, sem, nullptr);
 	const int result = Posix::SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }

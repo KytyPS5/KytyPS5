@@ -1,15 +1,19 @@
 #include "libs/dialog.h"
 
 #include "common/emulatorConfig.h"
+#include "common/hostMemory.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 
 // NOLINTNEXTLINE(modernize-concat-nested-namespaces)
 namespace Libs::Dialog {
@@ -626,6 +630,90 @@ int KYTY_SYSV_ABI MsgDialogInitialize() {
 	return OK;
 }
 
+// Layouts of the mode-specific parameter blocks, matching the PS4 SDK's SceMsgDialog*Param.
+struct MsgDialogUserMessageParam {
+	int32_t     button_type;
+	uint32_t    pad;
+	const char* msg;
+	void*       buttons_param;
+	uint8_t     reserved[24];
+};
+
+struct MsgDialogProgressBarParam {
+	int32_t     bar_type;
+	uint32_t    pad;
+	const char* msg;
+	uint8_t     reserved[64];
+};
+
+struct MsgDialogSystemMessageParam {
+	int32_t sys_msg_type;
+	uint8_t reserved[32];
+};
+
+constexpr int32_t MSG_DIALOG_MODE_USER_MSG     = 1;
+constexpr int32_t MSG_DIALOG_MODE_PROGRESS_BAR = 2;
+constexpr int32_t MSG_DIALOG_MODE_SYSTEM_MSG   = 3;
+constexpr size_t  MSG_DIALOG_TEXT_LOG_LIMIT    = 1024;
+
+static bool MsgDialogContentLoggingEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LOG_MSG_DIALOG_CONTENT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static std::string MsgDialogText(const char* msg) {
+	if (msg == nullptr) {
+		return "<null>";
+	}
+
+	uint64_t readable_size = 0;
+	if (!Common::HostMemoryQueryReadable(reinterpret_cast<uint64_t>(msg), MSG_DIALOG_TEXT_LOG_LIMIT,
+	                                    readable_size)) {
+		return "<unreadable>";
+	}
+	const auto safe_size = static_cast<size_t>(std::min<uint64_t>(readable_size, MSG_DIALOG_TEXT_LOG_LIMIT));
+	return std::string(msg, strnlen(msg, safe_size));
+}
+
+static void LogMsgDialogContent(const MsgDialogParam* p) {
+	if (!MsgDialogContentLoggingEnabled()) {
+		return;
+	}
+
+	if (p->mode == MSG_DIALOG_MODE_USER_MSG && p->user_msg_param != nullptr) {
+		if (!Common::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(p->user_msg_param),
+		                                       sizeof(MsgDialogUserMessageParam))) {
+			LOGF("\t user_msg_param = <unreadable>\n");
+			return;
+		}
+		const auto* user = static_cast<const MsgDialogUserMessageParam*>(p->user_msg_param);
+		LOGF("\t user_msg.button_type = %d\n"
+		     "\t user_msg.msg         = \"%s\"\n",
+		     user->button_type, MsgDialogText(user->msg).c_str());
+	} else if (p->mode == MSG_DIALOG_MODE_PROGRESS_BAR && p->prog_bar_param != nullptr) {
+		if (!Common::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(p->prog_bar_param),
+		                                       sizeof(MsgDialogProgressBarParam))) {
+			LOGF("\t prog_bar_param = <unreadable>\n");
+			return;
+		}
+		const auto* bar = static_cast<const MsgDialogProgressBarParam*>(p->prog_bar_param);
+		LOGF("\t prog_bar.bar_type = %d\n"
+		     "\t prog_bar.msg      = \"%s\"\n",
+		     bar->bar_type, MsgDialogText(bar->msg).c_str());
+	} else if (p->mode == MSG_DIALOG_MODE_SYSTEM_MSG && p->sys_msg_param != nullptr) {
+		if (!Common::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(p->sys_msg_param),
+		                                       sizeof(MsgDialogSystemMessageParam))) {
+			LOGF("\t sys_msg_param = <unreadable>\n");
+			return;
+		}
+		const auto* sys = static_cast<const MsgDialogSystemMessageParam*>(p->sys_msg_param);
+		LOGF("\t sys_msg.sys_msg_type = %d\n", sys->sys_msg_type);
+	}
+}
+
 int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 	PRINT_NAME();
 
@@ -641,6 +729,7 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     p->size, p->mode, reinterpret_cast<uint64_t>(p->user_msg_param),
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
+		LogMsgDialogContent(p);
 	}
 
 	g_status = STATUS_FINISHED;

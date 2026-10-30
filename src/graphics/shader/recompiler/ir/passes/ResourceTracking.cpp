@@ -17,6 +17,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
@@ -27,34 +28,57 @@ constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
 uint32_t PossibleU32Bits(Value value, const auto& normalize) {
+	struct Frame {
+		enum class Kind { Unknown, And, Or, ShiftLeft, ShiftRight, BitFieldInsert };
+
+	const Inst*       inst = nullptr;
+	std::vector<Value> children;
+	Kind              kind       = Kind::Unknown;
+	uint32_t          next_child = 0;
+	uint32_t          bits       = UINT32_MAX;
+	uint32_t          first      = UINT32_MAX;
+	uint32_t          shift      = 0;
+	uint32_t          field      = 0;
+	};
+
 	std::unordered_map<const Inst*, uint32_t> known;
-	const auto visit = [&](auto&& self, Value at) -> uint32_t {
-		at = normalize(at);
-		if (at.IsImmediate()) return at.GetType() == Type::U32 ? at.U32() : UINT32_MAX;
-		const auto* inst = at.TryInstruction();
-		if (inst == nullptr) return UINT32_MAX;
-		// Keep cycles unknown while sharing results across the SSA graph.
-		const auto [entry, inserted] = known.try_emplace(inst, UINT32_MAX);
-		if (!inserted) return entry->second;
-		auto& bits = entry->second;
-		const auto arg = [&](uint32_t index) { return self(self, inst->Arg(index)); };
+	std::vector<Frame>                    stack;
+	const auto make_frame = [](const Inst* inst) {
+		Frame frame;
+		frame.inst = inst;
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::BitwiseAnd32: bits = arg(0) & arg(1); break;
-			case ValueOpcode::BitwiseOr32:
-			case ValueOpcode::UMax32: bits = arg(0) | arg(1); break;
-			case ValueOpcode::SelectU32: bits = arg(1) | arg(2); break;
-			case ValueOpcode::Phi: {
-				uint32_t merged = 0u;
-				for (uint32_t index = 0; index < inst->NumArgs(); ++index) merged |= arg(index);
-				if (inst->NumArgs() != 0u) bits = merged;
+			case ValueOpcode::BitwiseAnd32:
+				frame.kind = Frame::Kind::And;
+				frame.children = {inst->Arg(0), inst->Arg(1)};
 				break;
-			}
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::UMax32:
+				frame.kind = Frame::Kind::Or;
+				frame.bits = 0u;
+				frame.children = {inst->Arg(0), inst->Arg(1)};
+				break;
+			case ValueOpcode::SelectU32:
+				frame.kind = Frame::Kind::Or;
+				frame.bits = 0u;
+				frame.children = {inst->Arg(1), inst->Arg(2)};
+				break;
+			case ValueOpcode::Phi:
+				frame.kind = Frame::Kind::Or;
+				frame.bits = 0u;
+				for (uint32_t index = 0; index < inst->NumArgs(); ++index) {
+					frame.children.push_back(inst->Arg(index));
+				}
+				if (frame.children.empty()) frame.bits = UINT32_MAX;
+				break;
 			case ValueOpcode::ShiftLeftLogical32:
 			case ValueOpcode::ShiftRightLogical32: {
 				const auto shift = inst->Arg(1).Resolve();
 				if (shift.IsImmediate() && shift.GetType() == Type::U32) {
-					bits = inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32
-					    ? arg(0) << (shift.U32() & 31u) : arg(0) >> (shift.U32() & 31u);
+					frame.kind = inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32
+					                 ? Frame::Kind::ShiftLeft
+					                 : Frame::Kind::ShiftRight;
+					frame.shift = shift.U32() & 31u;
+					frame.children.push_back(inst->Arg(0));
 				}
 				break;
 			}
@@ -63,17 +87,65 @@ uint32_t PossibleU32Bits(Value value, const auto& normalize) {
 				const auto count  = inst->Arg(3).Resolve();
 				if (offset.IsImmediate() && count.IsImmediate() && offset.U32() < 32u &&
 				    count.U32() <= 32u - offset.U32()) {
-					const auto field = (count.U32() == 32u ? UINT32_MAX : (1u << count.U32()) - 1u)
-					                   << offset.U32();
-					bits = (arg(0) & ~field) | ((arg(1) << offset.U32()) & field);
+					frame.kind = Frame::Kind::BitFieldInsert;
+					frame.shift = offset.U32();
+					frame.field = (count.U32() == 32u ? UINT32_MAX : (1u << count.U32()) - 1u)
+					              << offset.U32();
+					frame.children = {inst->Arg(0), inst->Arg(1)};
 				}
 				break;
 			}
 			default: break;
 		}
-		return bits;
+		return frame;
 	};
-	return visit(visit, value);
+	const auto root = normalize(value);
+	if (root.IsImmediate()) return root.GetType() == Type::U32 ? root.U32() : UINT32_MAX;
+	const auto* root_inst = root.TryInstruction();
+	if (root_inst == nullptr) return UINT32_MAX;
+	known.try_emplace(root_inst, UINT32_MAX);
+	stack.push_back(make_frame(root_inst));
+
+	while (!stack.empty()) {
+		auto& frame = stack.back();
+		if (frame.next_child < frame.children.size()) {
+			const auto child = normalize(frame.children[frame.next_child]);
+			uint32_t     child_bits = UINT32_MAX;
+			if (child.IsImmediate()) {
+				if (child.GetType() == Type::U32) child_bits = child.U32();
+			} else if (const auto* child_inst = child.TryInstruction(); child_inst != nullptr) {
+				auto [entry, inserted] = known.try_emplace(child_inst, UINT32_MAX);
+				if (inserted) {
+					stack.push_back(make_frame(child_inst));
+					continue;
+				}
+				child_bits = entry->second;
+			}
+			if (frame.kind == Frame::Kind::And) {
+				frame.bits &= child_bits;
+			} else if (frame.kind == Frame::Kind::Or) {
+				frame.bits |= child_bits;
+			} else if (frame.kind == Frame::Kind::BitFieldInsert) {
+				if (frame.next_child == 0u) {
+					frame.first = child_bits;
+				} else {
+					frame.bits = (frame.first & ~frame.field) |
+					             ((child_bits << frame.shift) & frame.field);
+				}
+			} else if (frame.kind == Frame::Kind::ShiftLeft) {
+				frame.bits = child_bits << frame.shift;
+			} else if (frame.kind == Frame::Kind::ShiftRight) {
+				frame.bits = child_bits >> frame.shift;
+			}
+			frame.next_child++;
+			continue;
+		}
+
+		known[frame.inst] = frame.bits;
+		stack.pop_back();
+	}
+
+	return known[root_inst];
 }
 
 uint32_t PossibleU32Bits(Value value) {
@@ -824,45 +896,79 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
-	void CollectScalarRead(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return;
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
-			Fail(use_pc, "cyclic typed planning value without a phi");
+	// Visits everything `root` depends on, children before parents, and records each scalar
+	// read with an immediate offset. Shader values can chain thousands of instructions deep,
+	// which overflowed the GPU thread's stack when this walk recursed, so it keeps its own
+	// stack. Each frame does what one recursive call did, in the same order.
+	void CollectScalarRead(Value root, uint32_t root_pc) {
+		struct Frame {
+			Inst*             inst;
+			const MemoryInfo* memory;
+			DescriptorSource  source;
+			uint32_t          width;
+			uint32_t          use_pc;
+			uint32_t          read_pc;
+			size_t            next; // Children visited so far.
+		};
+		std::vector<Frame> stack;
+		const auto enter = [&](Value value, uint32_t use_pc) {
+			value = value.Resolve();
+			if (value.IsImmediate()) return;
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+			const auto cycle = std::ranges::find(m_srt_visiting, inst);
+			if (cycle != m_srt_visiting.end()) {
+				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
+					return value->GetOpcode() == ValueOpcode::Phi;
+				})) return;
+				Fail(use_pc, "cyclic typed planning value without a phi");
+			}
+			if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
+			m_srt_visiting.push_back(inst);
+			uint32_t memory_index = 0;
+			Frame    frame {inst, ScalarReadMemory(*inst, memory_index), {}, 0u, use_pc, 0u, 0u};
+			if (frame.memory != nullptr) {
+				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				frame.width = frame.memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+				const auto expected = frame.width == 4u ? ValueOpcode::GetBufferResource
+				                                        : ValueOpcode::GetAddressResource;
+				if (handle == nullptr || handle->GetOpcode() != expected)
+					Fail(use_pc, "scalar read has an invalid resource handle");
+				frame.read_pc = inst->Flags<MemoryFlags>().pc;
+				MakeSource(*handle, frame.width, false, false, ScalarReadBase(*inst), frame.source,
+				           frame.read_pc);
+			}
+			stack.push_back(std::move(frame));
+		};
+		enter(root, root_pc);
+		while (!stack.empty()) {
+			// A scalar read's descriptor dwords come first, then its other arguments; any other
+			// instruction visits all of its arguments. `enter` may grow the stack, so copy the
+			// child out before calling it.
+			auto& frame = stack.back();
+			if (frame.next < frame.width) {
+				const auto child = frame.source.dwords[frame.next++];
+				enter(child, frame.read_pc);
+				continue;
+			}
+			const size_t arg = (frame.memory != nullptr ? 1u : 0u) + (frame.next - frame.width);
+			if (arg < frame.inst->NumArgs()) {
+				++frame.next;
+				const auto child  = frame.inst->Arg(arg);
+				const auto use_pc = frame.use_pc;
+				enter(child, use_pc);
+				continue;
+			}
+			auto* const       inst   = frame.inst;
+			const auto* const memory = frame.memory;
+			stack.pop_back();
+			m_srt_visiting.pop_back();
+			m_srt_visited.push_back(inst);
+			if (memory == nullptr) continue;
+			const auto offset = inst->Arg(1).Resolve();
+			if (!offset.IsImmediate() || offset.GetType() != Type::U32) continue;
+			m_scalar_reads.push_back(inst);
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
-		m_srt_visiting.push_back(inst);
-		uint32_t memory_index = 0;
-		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
-		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		m_scalar_reads.push_back(inst);
 	}
 
 	void PlanScalarReads() {

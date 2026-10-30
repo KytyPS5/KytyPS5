@@ -443,8 +443,10 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
     uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
     NpEntitlementAccessAddcontEntitlementInfo* info) {
 	PRINT_NAME();
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 	LOGF("\t service_label     = %" PRIu32 "\n", service_label);
+	LOGF("\t caller            = 0x%016" PRIx64 "\n", caller);
 	LOGF("\t entitlement_label = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(entitlement_label));
 	LOGF("\t info              = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
@@ -452,6 +454,10 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	if (entitlement_label == nullptr || info == nullptr) {
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
 	}
+
+	LOGF("\t entitlement_label.data = \"%.*s\"\n",
+	     static_cast<int>(strnlen(entitlement_label->data, sizeof(entitlement_label->data))),
+	     entitlement_label->data);
 
 	memset(info, 0, sizeof(*info));
 
@@ -469,6 +475,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 		return 0;
 	}
 
+	LOGF("\t result = no entitlement\n");
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 

@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/dateTime.h"
 #include "common/file.h"
+#include "common/guestWaits.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
@@ -564,6 +565,9 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void* command_buffer, uint3
 
 static int KYTY_SYSV_ABI WaitCommandBuffer(uint32_t submission_id) {
 	PRINT_NAME();
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Ampr,
+	                      reinterpret_cast<const void*>(static_cast<uintptr_t>(submission_id)),
+	                      nullptr);
 	return KernelSyscallResult(
 	    AprShared::CompleteSubmission(submission_id) ? OK : LibKernel::KERNEL_ERROR_ESRCH);
 }
@@ -2436,6 +2440,9 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void*    command_buf
 
 static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) {
 	PRINT_NAME();
+	KYTY_GUEST_WAIT_SCOPE(::Common::GuestWaits::Kind::Ampr,
+	                      reinterpret_cast<const void*>(static_cast<uintptr_t>(submission_id)),
+	                      nullptr);
 	return AprShared::CompleteSubmission(submission_id) ? OK : LibKernel::KERNEL_ERROR_ESRCH;
 }
 

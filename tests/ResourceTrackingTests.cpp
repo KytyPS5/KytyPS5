@@ -10,14 +10,23 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -5628,6 +5637,239 @@ void TestSampleAdjustSamplerScratch() {
                 "SampleAdjust canonicalization discarded border-mode bits");
 }
 
+// PossibleU32Bits walks SSA chains iteratively, preserving exact reserved-bit results for
+// deep chains without using one host stack frame per link.
+void TestDeepSampleAdjustScratchChain() {
+  constexpr uint32_t chain_length = 1024;
+  Fixture fixture(ShaderType::Pixel);
+  auto scratch = fixture.UserData(2);
+  for (uint32_t i = 0; i < chain_length; ++i) {
+    scratch = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                           {scratch, Value(0x3ffff000u)});
+  }
+  const auto word3 =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {fixture.UserData(3), scratch});
+  const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)},
+                                   0x1ec);
+  const auto sampler = fixture.Sampler(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), word3},
+      0x1ec);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(memory, 0x1ec));
+  fixture.PlanAndTrack();
+
+  const auto source = fixture.program.info.samplers[0].source;
+  const auto stored = fixture.program.descriptor_sources[source]
+                          .dwords[3]
+                          .Resolve()
+                          .TryInstruction();
+  Check(stored != nullptr && stored->GetOpcode() == ValueOpcode::GetUserData,
+        "deep reserved-only SampleAdjust scratch remained in sampler identity");
+}
+
+// An OR-with-zero chain that deep still proves its only possible bits are reserved.
+void TestDeepSampleAdjustReservedOnlyChain() {
+  constexpr uint32_t chain_length = 300;
+  Fixture fixture(ShaderType::Pixel);
+  auto chain = fixture.Emit(ValueOpcode::BitwiseOr32, {Value(0x1000u), Value(0u)});
+  for (uint32_t i = 1; i < chain_length; ++i) {
+    chain = fixture.Emit(ValueOpcode::BitwiseOr32, {chain, Value(0u)});
+  }
+  const auto word3 =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {fixture.UserData(3), chain});
+  const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)},
+                                   0x1ec);
+  const auto sampler = fixture.Sampler(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), word3},
+      0x1ec);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(memory, 0x1ec));
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+
+  const auto source = fixture.program.info.samplers[0].source;
+  const auto stored = fixture.program.descriptor_sources[source]
+                          .dwords[3]
+                          .Resolve()
+                          .TryInstruction();
+  Check(stored != nullptr && stored->GetOpcode() == ValueOpcode::GetUserData,
+        "deep reserved-only SampleAdjust chain remained in sampler identity");
+  std::array<uint32_t, 4> user_data{4u, 1u, 2u, 0x80000abcu};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  Check(EvaluateSrtDescriptor(plan, runtime, source, descriptor) &&
+            descriptor.dwords[3] == 0x80000abcu,
+        "deep reserved-only SampleAdjust chain changed the runtime sampler value");
+}
+
+// Appends `length` blocks after the fixture's current block, each holding a one-input
+// Phi of the previous one, starting from `base`. The fixture continues in the last
+// block. LowerDescriptorValue stops at one-input Phis and the SRT validator and walker
+// resolve them iteratively, so only the walks under test follow every link.
+Value AppendPhiChain(Fixture &fixture, Value base, uint32_t length) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  auto *previous = fixture.block;
+  Value chain = base;
+  for (uint32_t i = 0; i < length; ++i) {
+    auto *next = fixture.AddBlock();
+    previous->AddBranch(next);
+    previous->terminator = {.kind = CFG::TerminatorKind::Branch,
+                            .true_block = next};
+    auto &phi = next->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(previous, chain);
+    chain = Value(&phi);
+    previous = next;
+  }
+  previous->terminator.kind = CFG::TerminatorKind::Return;
+  fixture.block = previous;
+  return chain;
+}
+
+// A deep Phi chain ending at the reserved-only constant 0x1000 still has an exact result
+// and can be removed from sampler identity.
+void TestDeepSampleAdjustReservedOnlyPhiChain() {
+  constexpr uint32_t chain_length = 300;
+  Fixture fixture(ShaderType::Pixel);
+  const auto chain = AppendPhiChain(fixture, Value(0x1000u), chain_length);
+
+  const auto word3 =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {fixture.UserData(3), chain});
+  const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)},
+                                   0x1ec);
+  const auto sampler = fixture.Sampler(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), word3},
+      0x1ec);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(memory, 0x1ec));
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+
+  const auto source = fixture.program.info.samplers[0].source;
+  const auto stored = fixture.program.descriptor_sources[source]
+                          .dwords[3]
+                          .Resolve()
+                          .TryInstruction();
+  Check(stored != nullptr && stored->GetOpcode() == ValueOpcode::GetUserData,
+        "deep reserved-only SampleAdjust Phi chain remained in sampler identity");
+  Check(!plan.control_phi_predecessors.contains(chain.Instruction()),
+        "removed deep Phi chain remained a control-flow Phi");
+  std::array<uint32_t, 4> user_data{4u, 1u, 2u, 0x80000abcu};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  Check(EvaluateSrtDescriptor(plan, runtime, source, descriptor) &&
+            descriptor.dwords[3] == 0x80000abcu,
+        "deep reserved-only SampleAdjust Phi chain changed the runtime sampler value");
+}
+
+// The captured 0xC00000FD overflow was CollectScalarRead recursing once per link of a
+// value chain; at 640 bytes a frame, about 1,600 links fill a 1 MB stack. This length is
+// well past that.
+constexpr uint32_t DeepScalarReadOffsetLength = 3200;
+constexpr const char *DeepScalarReadOffsetMode = "--deep-scalar-read-offset";
+
+// A buffer's dword 0 is a scalar read whose offset is not an immediate: it is a chain of
+// one-input Phis starting at another scalar read with an immediate offset. Walking from
+// the buffer, CollectScalarRead follows that offset chain to the read at its bottom, which
+// must be the only planned SRT read. Nothing evaluates the descriptor at runtime here, the
+// SRT validator resolves one-input Phis iteratively, and LowerDescriptorValue stops at the
+// dynamic read, so the chain is followed link by link only by CollectScalarRead and the
+// capped PossibleU32Bits.
+void TestScalarReadOffsetChain(uint32_t length) {
+  const auto fail = [&](const char *what) {
+    return std::to_string(length) + "-link scalar read offset chain: " + what;
+  };
+  Fixture fixture;
+  const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  scalar.offset = 4;
+  const auto planned = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                    {base, Value(0u), Value(0u), Value(true)},
+                                    fixture.AddMemory(scalar, 4));
+  const auto offset = AppendPhiChain(fixture, planned, length);
+  const auto dynamic = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                    {base, offset, Value(0u), Value(true)},
+                                    fixture.AddMemory(scalar, 8));
+  const auto descriptor =
+      fixture.Buffer({dynamic, Value(0u), Value(64u), Value(0u)}, 12);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {descriptor, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 12));
+  fixture.PlanAndTrack();
+
+  const auto &program = fixture.program;
+  const auto memory_of = [&](Value read) -> const MemoryInfo & {
+    return program.memory_info[read.Instruction()->Flags<MemoryFlags>().index];
+  };
+  Check(program.srt_reads.size() == 1,
+        fail("expected exactly one planned SRT read").c_str());
+  Check(program.srt_reads[0].value.Resolve().TryInstruction() ==
+            planned.Instruction(),
+        fail("SRT slot 0 is not the immediate-offset read").c_str());
+  Check(memory_of(planned).planning_only,
+        fail("planned read was not marked planning-only").c_str());
+  Check(!memory_of(dynamic).planning_only,
+        fail("dynamic-offset read was planned").c_str());
+  // The dynamic read stays a real address read, so the shader still uses DMA.
+  Check(program.info.uses_dma, fail("dynamic-offset read was dropped").c_str());
+  Check(program.info.buffers.size() == 1,
+        fail("expected exactly one buffer").c_str());
+  Check(program.descriptor_sources[program.info.buffers[0].source]
+                .dwords[0]
+                .Resolve() == dynamic,
+        fail("buffer dword 0 is no longer the dynamic-offset read").c_str());
+}
+
+void TestShortScalarReadOffsetChain() { TestScalarReadOffsetChain(1); }
+
+// Other passes also look at a scalar read's offset, and not every one of them is proven
+// free of per-link recursion, so the deep case runs in a child process: an overflow there
+// fails this test instead of ending the suite.
+void TestDeepScalarReadOffsetChainInChild(const std::filesystem::path &executable) {
+  const auto path = executable.string();
+#ifdef _WIN32
+  // _spawnl joins its arguments into one unquoted command line; quote the path, which
+  // may contain spaces.
+  const auto quoted = "\"" + path + "\"";
+  const auto status = _spawnl(_P_WAIT, path.c_str(), quoted.c_str(),
+                              DeepScalarReadOffsetMode, static_cast<char *>(nullptr));
+  Check(status == 0, ("deep scalar read offset chain child exited with " +
+                      std::to_string(status)).c_str());
+#else
+  const pid_t pid = fork();
+  Check(pid >= 0, "could not start the deep scalar read offset chain child");
+  if (pid == 0) {
+    execl(path.c_str(), path.c_str(), DeepScalarReadOffsetMode,
+          static_cast<char *>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  Check(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "deep scalar read offset chain child failed");
+#endif
+}
+
 void TestFmaskLoadSpecialization() {
   namespace Prospero = Libs::Graphics::Prospero;
   Fixture fixture;
@@ -8992,7 +9234,17 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  // The mode is the last argument, so a child can never fall through to the full suite.
+  if (argc >= 2 && std::string_view(argv[argc - 1]) == DeepScalarReadOffsetMode) {
+    try {
+      TestScalarReadOffsetChain(DeepScalarReadOffsetLength);
+    } catch (const std::exception &exception) {
+      std::cerr << exception.what() << '\n';
+      return 1;
+    }
+    return 0;
+  }
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -9008,6 +9260,12 @@ int main() {
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
+    Run("deep SampleAdjust scratch chain", TestDeepSampleAdjustScratchChain);
+    Run("deep SampleAdjust reserved-only chain", TestDeepSampleAdjustReservedOnlyChain);
+    Run("deep SampleAdjust reserved-only Phi chain", TestDeepSampleAdjustReservedOnlyPhiChain);
+    Run("short scalar read offset chain", TestShortScalarReadOffsetChain);
+    Run("deep scalar read offset chain (child process)",
+        [&] { TestDeepScalarReadOffsetChainInChild(std::filesystem::absolute(argv[0])); });
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);

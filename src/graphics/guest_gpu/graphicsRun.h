@@ -68,6 +68,10 @@ public:
 	void                   WaitForExecution(uint64_t sequence) { m_executed.WaitFor(sequence); }
 	// Waits until every operation emitted so far executed.
 	void WaitForExecution() { m_executed.WaitFor(m_emitted); }
+	// Command processor thread: the queue being processed waits on this guest memory.
+	void NoteBlockedWait(uint64_t address, uint64_t size);
+	// Command processor thread: whether another queue waits on guest memory in the range.
+	[[nodiscard]] bool OtherQueueWaitsOn(uint64_t address, uint64_t size) const;
 	[[nodiscard]] const GpuRegisterState& NeutralState() const noexcept { return m_neutral_state; }
 
 private:
@@ -85,6 +89,7 @@ private:
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
 		bool                      blocked         = false;
+		bool                      yielded         = false;
 		uint64_t                  flip_request_id = 0;
 	};
 
@@ -123,6 +128,16 @@ private:
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
+
+	// Command processor thread: the guest memory the blocked front submission of each queue
+	// waits on (empty when it does not wait on memory).
+	struct WaitRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::array<WaitRange, QueueCount> m_wait_ranges {};
+	uint32_t                          m_waiting_queues = 0;
+	uint32_t                          m_current_queue  = 0;
 
 	// Pipelined execution. m_emitted is only used by the command processor thread.
 	struct GuestWrite {

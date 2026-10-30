@@ -22,7 +22,8 @@ class GuestGpu;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
-enum class Pm4ProcessResult { Complete, Blocked };
+// Yielded: the stream stopped after a packet that wrote memory another queue waits on.
+enum class Pm4ProcessResult { Complete, Blocked, Yielded };
 
 enum class ContextStateOperation : uint32_t {
 	Clear     = 0,
@@ -47,6 +48,7 @@ private:
 	std::span<const uint32_t> m_next_buffer;
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
+	bool                      m_yield         = false;
 	bool                      m_made_progress = false;
 };
 
@@ -132,6 +134,9 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);
+	// Stops the stream after the current packet when it writes guest memory another queue
+	// waits on, so that queue runs before this one goes on.
+	void YieldIfWaitedOn(uint64_t address, uint64_t size);
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);

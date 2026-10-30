@@ -565,6 +565,7 @@ uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 
 void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
                                       const void* value) {
+	YieldIfWaitedOn(address, size);
 	if (m_pipeline != nullptr && size != 0) {
 		m_pipeline->NoteGuestWrite(sequence, address, size, value);
 	}
@@ -751,7 +752,21 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	m_wait_since_operation = true;
 	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(addr), sizeof(T));
+		}
 		SuspendPm4();
+	}
+}
+
+void CommandProcessor::YieldIfWaitedOn(uint64_t address, uint64_t size) {
+	// A real GPU runs its queues side by side: one waiting on a label sees the write as soon
+	// as it lands, long before the writing queue reaches its end-of-work interrupt, after
+	// which the guest may reset the label for its next use (ASTRO BOT resets the handoff
+	// labels of a frame slot once the graphics queue finishes the frame that last used it).
+	if (g_gpu_state != nullptr && g_current_execution != nullptr &&
+	    g_gpu_state->OtherQueueWaitsOn(address, size)) {
+		g_current_execution->m_yield = true;
 	}
 }
 
@@ -763,7 +778,11 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
+		YieldIfWaitedOn(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
 	} else if (*counter == 0) {
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
+		}
 		SuspendPm4();
 	} else {
 		(*counter)--;
@@ -1081,8 +1100,17 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (submission.yielded) {
+			// It wrote memory another queue waits on: every queue retries before it goes on.
+			blocked_since.reset();
+			for (auto& queue: gpu->m_queues) {
+				if (!queue.empty()) {
+					queue.front().blocked = false;
+				}
+			}
+		}
 		if (!complete) {
-			submission.blocked = true;
+			submission.blocked = !submission.yielded;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -1103,20 +1131,52 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+void GuestGpu::NoteBlockedWait(uint64_t address, uint64_t size) {
+	auto& range = m_wait_ranges[m_current_queue];
+	if (range.begin == range.end) {
+		m_waiting_queues++;
+	}
+	range = {address, address + size};
+}
+
+bool GuestGpu::OtherQueueWaitsOn(uint64_t address, uint64_t size) const {
+	if (m_waiting_queues == 0) {
+		return false;
+	}
+	for (uint32_t queue = 0; queue < QueueCount; queue++) {
+		const auto& range = m_wait_ranges[queue];
+		if (queue != m_current_queue && range.begin < address + size && address < range.end) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool GuestGpu::Process(Submission& submission) {
-	auto& cp = GetProcessor(submission.queue_id);
+	// The queue retries its wait, if any: a new one is noted when it blocks again.
+	m_current_queue = submission.queue_id;
+	if (auto& range = m_wait_ranges[m_current_queue]; range.begin != range.end) {
+		range = {};
+		m_waiting_queues--;
+	}
+	submission.yielded = false;
+	auto& cp           = GetProcessor(submission.queue_id);
 
 	cp.BufferInit();
 	bool complete = true;
 
 	switch (submission.type) {
-		case SubmissionType::Commands:
-			complete =
-			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
-			if (submission.execution.MadeProgress()) {
+		case SubmissionType::Commands: {
+			const auto result  = cp.Process(submission.execution, submission.commands);
+			complete           = result == Pm4ProcessResult::Complete;
+			submission.yielded = result == Pm4ProcessResult::Yielded;
+			// A yielded slice does not wait for the GPU: its work goes on in the same command
+			// buffer, so submitting it would only add a queue submit per yield.
+			if (submission.execution.MadeProgress() && !submission.yielded) {
 				cp.BufferFlush();
 			}
 			break;
+		}
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
@@ -1146,6 +1206,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
+	execution.m_yield         = false;
 	execution.m_made_progress = false;
 
 	struct ExecutionScope {
@@ -1154,8 +1215,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(execution);
 
 	ProcessPm4(execution);
-	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
-	                                        : Pm4ProcessResult::Blocked;
+	if (execution.m_buffer_stack.empty()) {
+		return Pm4ProcessResult::Complete;
+	}
+	return execution.m_suspended ? Pm4ProcessResult::Blocked : Pm4ProcessResult::Yielded;
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
@@ -1243,6 +1306,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				execution.m_buffer_stack.push_back({execution.m_next_buffer});
 			}
 			execution.m_next_buffer = {};
+		}
+		if (execution.m_yield) {
+			return;
 		}
 	}
 }

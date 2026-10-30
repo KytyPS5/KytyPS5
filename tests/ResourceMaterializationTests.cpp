@@ -1033,7 +1033,8 @@ void TestBranchOnWrittenBufferNotCaptured(bool unsigned_bound, bool written) {
     words[0] = *static_cast<uint32_t *>(data);
     return true;
   };
-  const SrtRuntime runtime{.read_memory = read, .userdata = &count_value, .read_specialization_memory = read};
+  FakeGuestMemory fake(read, &count_value);
+  const SrtRuntime runtime{.userdata = &count_value, .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t value : {0u, 3u}) {

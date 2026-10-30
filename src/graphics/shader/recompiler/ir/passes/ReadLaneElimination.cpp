@@ -189,6 +189,7 @@ private:
 // The subgroup reduction that replaces a proven whole-wave scan of operation.
 std::optional<ValueOpcode> WaveReduction(ValueOpcode operation) {
 	switch (operation) {
+		case ValueOpcode::IAdd32: return ValueOpcode::SubgroupIAddU32;
 		case ValueOpcode::UMin32: return ValueOpcode::SubgroupUMinU32;
 		case ValueOpcode::UMax32: return ValueOpcode::SubgroupUMaxU32;
 		case ValueOpcode::BitwiseOr32: return ValueOpcode::SubgroupOrU32;

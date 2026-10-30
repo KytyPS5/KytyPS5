@@ -49145,6 +49145,20 @@ void CheckDepthTextureEncoding() {
           IsSupportedDepthTextureEncoding(first_use_depth),
           "captured comparison texture required tracked HTILE metadata");
 
+  const ShaderTextureResource counter_id_depth{{
+      0x027ac800u, 0xc1600000u, 0x021bc3bfu, 0x91800924u,
+      0x00000000u, 0x00700000u, 0x00000002u, 0x000000c8u,
+  }};
+  auto compressed_counter_id = compressed_descriptor;
+  compressed_counter_id.fields[6] |= 0x02u;
+  auto dcc_counter_id = counter_id_depth;
+  dcc_counter_id.fields[6] |= 1u << 22u;
+  Require("DepthTextureEncoding", "PPSA01341 depth with a mip statistics counter id",
+          IsSupportedDepthTextureEncoding(counter_id_depth) &&
+              IsSupportedDepthTextureEncoding(compressed_counter_id) &&
+              !IsSupportedDepthTextureEncoding(dcc_counter_id),
+          "the mip statistics counter id was read as metadata control");
+
   auto missing_metadata = compressed_descriptor;
   missing_metadata.fields[6] &= 0x00ffffffu;
   missing_metadata.fields[7] = 0;

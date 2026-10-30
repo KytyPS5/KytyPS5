@@ -1,0 +1,89 @@
+name: Guest Hang Diagnostics Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag/guest-hang-diagnostics
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  KYTY_BUILD_ORIGIN: Fork
+  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  windows-diagnostics:
+    name: Build Windows diagnostics emulator
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "port_hash=$portHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache glslang
+        id: glslang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
+          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
+          if ("${{ steps.glslang-cache.outputs.cache-hit }}" -ne "true") {
+            vcpkg install glslang[tools,opt]:x64-windows
+          }
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B _Build/windows-diagnostics -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DKYTY_BUILD_LAUNCHER=OFF
+          -DKYTY_BUILD_ORIGIN=$env:KYTY_BUILD_ORIGIN
+          -DKYTY_BUILD_REPOSITORY=$env:KYTY_BUILD_REPOSITORY
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build emulator and diagnostic tests
+        run: >-
+          cmake --build _Build/windows-diagnostics
+          --target kyty_emulator resource_tracking_tests guest_waits_tests --parallel
+
+      - name: Run diagnostic tests
+        run: >-
+          ctest --test-dir _Build/windows-diagnostics --output-on-failure
+          -R "^(resource_tracking|guest_waits)$"
+
+      - name: Install emulator package
+        run: cmake --install _Build/windows-diagnostics --prefix _Build/windows-diagnostics/install
+
+      - name: Upload Windows diagnostics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-Guest-Hang-Diagnostics
+          path: _Build/windows-diagnostics/install/**
+          if-no-files-found: error
+          retention-days: 14

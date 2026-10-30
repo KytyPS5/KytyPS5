@@ -556,7 +556,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
-	const bool meta_compress = block_bytes == 0 && !resource.r128 && descriptor.MetaCompress();
+	const bool meta_compress       = block_bytes == 0 && !resource.r128 && descriptor.MetaCompress();
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;

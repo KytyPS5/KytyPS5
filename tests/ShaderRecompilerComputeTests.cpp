@@ -1392,6 +1392,7 @@ struct TestCase {
     return info;
   }();
   bool has_compute_info = false;
+  bool requires_f32_denorm_preserve = false;
   u32 dispatch_x = 1;
   u32 dispatch_y = 1;
   u32 dispatch_z = 1;
@@ -1707,6 +1708,8 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+bool g_host_denorm_preserve_f32 = false;
+
 // The plan a restarted game loads from the shader cache, which saves back to the same bytes.
 ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char *name,
                                                       const ShaderRecompiler::IR::Program &program) {
@@ -1737,7 +1740,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
-  options.profile = test.profile;
+  ShaderProfile profile = *test.profile;
+  profile.denorm_preserve_f32 = g_host_denorm_preserve_f32;
+  options.profile = &profile;
   options.dump_ir = true;
   options.emit_debug_info = true; // Checks find variables and functions by OpName.
   auto compute_info = test.compute_info;
@@ -22074,6 +22079,15 @@ private:
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
             "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
+    {
+      vk::PhysicalDeviceFloatControlsProperties float_controls{};
+      vk::PhysicalDeviceProperties2 properties{};
+      properties.pNext = &float_controls;
+      m_physical_device.getProperties2(&properties);
+      g_host_denorm_preserve_f32 =
+          float_controls.shaderDenormPreserveFloat32 == VK_TRUE &&
+          float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
+    }
 
     vk::PhysicalDeviceFeatures available_features{};
     m_physical_device.getFeatures(&available_features);
@@ -22664,6 +22678,10 @@ void CompareGraphicsWords(const GraphicsCase &test,
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
+  if (test.requires_f32_denorm_preserve && !g_host_denorm_preserve_f32) {
+    std::printf("[compute] %s skipped: the host cannot preserve f32 denorms\n", test.name);
+    return;
+  }
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
@@ -29517,6 +29535,66 @@ TestCase VectorMadF32FlushesDenorms() {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   // Legacy MAD always flushes, even when the shader requests denorm preservation.
+  test.compute_info.float_mode = 0xf0;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorF32DenormsPreservedWhenRequested() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  constexpr u32 ops[] = {0x08u, 0x08u, 0x03u, 0x03u}; // V_MUL_F32, V_MUL_F32, V_ADD_F32, V_ADD_F32
+  for (u32 sample = 0; sample < 4; sample++) {
+    for (u32 source = 0; source < 2; source++) {
+      AppendVMovU32(&code, 30, (sample * 2 + source) * sizeof(u32));
+      AppendBufferLoadDword(&code, source, 30);
+    }
+    code.push_back(EncodeVop2(ops[sample], 10 + sample, 256 + 0, 1));
+  }
+  for (u32 sample = 0; sample < 4; sample++) {
+    AppendStoreVgpr(&code, 10 + sample, sample);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorF32DenormsPreservedWhenRequested";
+  test.code = std::move(code);
+  test.initial = {0x00800000u, 0x3f000000u, 0x00400000u, 0x40000000u,
+                  0x00400000u, 0x00400000u, 0x00000001u, 0x00000000u};
+  test.expected = {0x00400000u, 0x00800000u, 0x00800000u, 0x00000001u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MUL_F32, O::V_ADD_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.requires_f32_denorm_preserve = true;
+  test.required_spirv = {"DenormPreserve 32"};
+  test.compute_info.float_mode = 0xf0;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorF32TranscendentalsFlushDenorms() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  constexpr u32 ops[] = {0x2au, 0x25u, 0x2au}; // V_RCP_F32, V_EXP_F32, V_RCP_F32
+  for (u32 sample = 0; sample < 3; sample++) {
+    AppendVMovU32(&code, 30, sample * sizeof(u32));
+    AppendBufferLoadDword(&code, 0, 30);
+    code.push_back(EncodeVop1(ops[sample], 10 + sample, Vgpr(0)));
+  }
+  for (u32 sample = 0; sample < 3; sample++) {
+    AppendStoreVgpr(&code, 10 + sample, sample);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorF32TranscendentalsFlushDenorms";
+  test.code = std::move(code);
+  test.initial = {0x7f000000u, 0xc3020000u, 0x00400000u};
+  test.expected = {0u, 0u, 0x7f800000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_RCP_F32, O::V_EXP_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.requires_f32_denorm_preserve = true;
   test.compute_info.float_mode = 0xf0;
   test.has_compute_info = true;
   return test;
@@ -46653,6 +46731,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
+  AddCase(VectorF32DenormsPreservedWhenRequested);
+  AddCase(VectorF32TranscendentalsFlushDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);

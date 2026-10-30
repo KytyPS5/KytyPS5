@@ -222,6 +222,9 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, profile);
+	state.f32_denorms_preserved =
+	    profile.denorm_preserve_f32 && program.stage == ShaderType::Compute &&
+	    input_info.compute != nullptr && ((input_info.compute->float_mode >> 4u) & 3u) == 3u;
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",

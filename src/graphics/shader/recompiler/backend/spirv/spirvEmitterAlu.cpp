@@ -74,6 +74,10 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	              ConstantU32(state, 0), high);
 }
 
+uint32_t FlushF32DenormIfPreserved(EmitterState& state, uint32_t value) {
+	return state.f32_denorms_preserved ? EmitFlushF32DenormToSignedZero(state, value) : value;
+}
+
 } // namespace
 
 uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
@@ -121,17 +125,15 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
-	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
-	// a = EmitFlushF32DenormToSignedZero(state, a);
-	// b = EmitFlushF32DenormToSignedZero(state, b);
-	// c = EmitFlushF32DenormToSignedZero(state, c);
-	const auto product = EmitFPMul32(state, a, b);
+	// on NVIDIA RTX 5080 Laptop GPU, so they are only emitted when f32 denorms are preserved.
+	const auto flushed_a = FlushF32DenormIfPreserved(state, a);
+	const auto flushed_b = FlushF32DenormIfPreserved(state, b);
+	const auto flushed_c = FlushF32DenormIfPreserved(state, c);
+	const auto product   = EmitFPMul32(state, flushed_a, flushed_b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
-	const auto sum = EmitFPAdd32(state, product, c);
+	const auto sum = EmitFPAdd32(state, FlushF32DenormIfPreserved(state, product), flushed_c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	// return EmitFlushF32DenormToSignedZero(state, sum);
-	return sum;
+	return FlushF32DenormIfPreserved(state, sum);
 }
 
 uint32_t EmitConvertU16U32(EmitterState& state, uint32_t arg0) {
@@ -269,7 +271,8 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
-	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+	return FlushF32DenormIfPreserved(
+	    state, Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source));
 }
 
 uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
@@ -294,7 +297,7 @@ uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
 	// A denormal input already rounds to 1.0, the result for its flushed zero.
-	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0});
+	return FlushF32DenormIfPreserved(state, EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0}));
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {

@@ -239,6 +239,7 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
 	return {.maintenance8           = graphics.maintenance8_enabled,
 	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .denorm_preserve_f32    = graphics.denorm_preserve_f32,
 	        .device_clock_period_ps = graphics.device_clock_period_ps};
 }
 

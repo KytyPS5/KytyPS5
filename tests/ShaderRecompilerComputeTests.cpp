@@ -49150,14 +49150,21 @@ void CheckDepthTextureEncoding() {
       0x00000000u, 0x00700000u, 0x00000002u, 0x000000c8u,
   }};
   auto compressed_counter_id = compressed_descriptor;
-  compressed_counter_id.fields[6] |= 0x02u;
+  compressed_counter_id.fields[6] |= 0x82u;
+  auto msaa_counter_id = uncompressed_msaa;
+  msaa_counter_id.fields[6] |= 0x80u;
   auto dcc_counter_id = counter_id_depth;
   dcc_counter_id.fields[6] |= 1u << 22u;
   Require("DepthTextureEncoding", "PPSA01341 depth with a mip statistics counter id",
-          IsSupportedDepthTextureEncoding(counter_id_depth) &&
-              IsSupportedDepthTextureEncoding(compressed_counter_id) &&
-              !IsSupportedDepthTextureEncoding(dcc_counter_id),
+          IsSupportedDepthTextureEncoding(counter_id_depth),
           "the mip statistics counter id was read as metadata control");
+  Require("DepthTextureEncoding", "compressed and MSAA depth with a counter id",
+          IsSupportedDepthTextureEncoding(compressed_counter_id) &&
+              IsSupportedDepthTextureEncoding(msaa_counter_id),
+          "a counter id changed the accepted HTILE or MSAA control");
+  Require("DepthTextureEncoding", "DCC control with a counter id",
+          !IsSupportedDepthTextureEncoding(dcc_counter_id),
+          "a counter id hid an unsupported metadata control");
 
   auto missing_metadata = compressed_descriptor;
   missing_metadata.fields[6] &= 0x00ffffffu;

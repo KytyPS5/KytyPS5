@@ -5500,8 +5500,8 @@ public:
               resources.HandleFault(PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
-      // All four writes fall in the fault's window and share one wrapped batch.
-      uint64_t expected_packing_offset = 4 * 64;
+      // Both disjoint writes on the faulting page share one wrapped batch.
+      uint64_t expected_packing_offset = 2 * 64;
       uint64_t expected_packing_alignment = 1;
       if (!download.IsCoherent()) {
         Require(name, "fault-ring atom policy",
@@ -5531,17 +5531,27 @@ public:
       std::memcpy(&ring_fault_second_backing, memory + ring_fault_second_offset,
                   sizeof(ring_fault_second_backing));
       Require(name, "fault-ring wrapped contents",
-              first_page_backing == first_value &&
-                  second_page_backing == second_value &&
-                  !cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
-                  !cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)) &&
+              first_page_backing == first_stale &&
+                  second_page_backing == second_stale &&
+                  cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
+                  cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)) &&
                   ring_fault_first_backing == ring_fault_first_value &&
                   ring_fault_second_backing == ring_fault_second_value &&
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   download.Handle() == fixed_download_handle &&
                   download.Size() == (64ull << 20),
-              "wrapped fault batch lost contents of its download window");
+              "wrapped fault batch lost its page contents or published an unrelated page");
+      cache.ReadMemory(base + first_offset, sizeof(first_value));
+      Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
+          &first_page_backing, sizeof(first_page_backing));
+      Libs::LibKernel::Memory::TryReadBacking(base + second_offset,
+          &second_page_backing, sizeof(second_page_backing));
+      Require(name, "deferred neighboring page read",
+              first_page_backing == first_value && second_page_backing == second_value &&
+                  !cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
+                  !cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)),
+              "the earlier page did not publish its dirty ranges on its own read");
 
       constexpr uint64_t page_size = TRACKER_PAGE_SIZE;
       constexpr uint64_t page_owner_offset = 0x240000;
@@ -5549,17 +5559,12 @@ public:
       constexpr uint64_t page_fault_offset = page_owner_offset + 0x100;
       constexpr uint64_t page_inside_offset =
           page_owner_offset + page_size - sizeof(uint32_t);
-      // The 512 KiB readback window is clamped to the owner's start.
-      constexpr uint64_t download_window = 0x80000;
-      constexpr uint64_t page_window_offset =
-          page_owner_offset + download_window - sizeof(uint32_t);
       constexpr uint64_t page_outside_offset =
-          page_owner_offset + download_window;
+          page_owner_offset + page_size;
       constexpr uint32_t page_stale = 0x13579bdfu;
       constexpr uint32_t page_value = 0x2468ace0u;
       constexpr std::array page_offsets{
-          page_fault_offset, page_inside_offset, page_window_offset,
-          page_outside_offset};
+          page_fault_offset, page_inside_offset, page_outside_offset};
       static_assert((base + page_owner_offset) % page_size == 0);
       for (const auto offset : page_offsets) {
         Libs::LibKernel::Memory::WriteBacking(base + offset, &page_stale,
@@ -5596,35 +5601,26 @@ public:
       release_page_callback.join();
       scheduler.WaitPriorityOperations(page_publication_tick);
       uint32_t page_inside_backing = 0;
-      uint32_t page_window_backing = 0;
       uint32_t page_outside_backing = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + page_inside_offset,
                                               &page_inside_backing,
                                               sizeof(page_inside_backing));
-      Libs::LibKernel::Memory::TryReadBacking(base + page_window_offset,
-                                              &page_window_backing,
-                                              sizeof(page_window_backing));
       Libs::LibKernel::Memory::TryReadBacking(base + page_outside_offset,
                                               &page_outside_backing,
                                               sizeof(page_outside_backing));
       Require(name, "page publication order and boundary",
               page_inside_backing == page_value &&
-                  page_window_backing == page_value &&
                   page_outside_backing == page_stale &&
                   !cache.HasGpuDirtyBytes(base + page_inside_offset,
-                                          sizeof(page_value)) &&
-                  !cache.HasGpuDirtyBytes(base + page_window_offset,
                                           sizeof(page_value)) &&
                   cache.HasGpuDirtyBytes(base + page_outside_offset,
                                          sizeof(page_value)) &&
                   !cache.IsRegionGpuModified(base + page_inside_offset,
                                              sizeof(page_value)) &&
-                  !cache.IsRegionGpuModified(base + page_window_offset,
-                                             sizeof(page_value)) &&
                   cache.IsRegionGpuModified(base + page_outside_offset,
                                             sizeof(page_value)),
               "readback did not publish after the older overlapping callback "
-              "or mishandled its download window boundary");
+              "or retained ownership of the wrong page");
       cache.ReadMemory(base + page_outside_offset, sizeof(page_value));
       Libs::LibKernel::Memory::TryReadBacking(base + page_outside_offset,
           &page_outside_backing, sizeof(page_outside_backing));
@@ -5635,45 +5631,6 @@ public:
                   !cache.IsRegionGpuModified(base + page_outside_offset,
                                              sizeof(page_value)),
               "the next page did not publish and release ownership on its own read");
-
-      // A clean read publishes nothing; a window stops at its buffer's end.
-      constexpr uint64_t adjacent_offset = 0x380000;
-      constexpr uint64_t adjacent_size = 0x20000;
-      constexpr uint64_t adjacent_first = adjacent_offset + 0x100;
-      constexpr uint64_t adjacent_second = adjacent_first + adjacent_size;
-      const auto adjacent_first_owner =
-          cache.FindBuffer(base + adjacent_offset, adjacent_size);
-      const auto adjacent_second_owner = cache.FindBuffer(
-          base + adjacent_offset + adjacent_size, adjacent_size);
-      for (const auto offset : {adjacent_first, adjacent_second}) {
-        Libs::LibKernel::Memory::WriteBacking(base + offset, &page_stale,
-                                              sizeof(page_stale));
-        MarkGpuWrite(base + offset, sizeof(page_value));
-        cache.FillBuffer(base + offset, sizeof(page_value), page_value, false);
-      }
-      cache.ReadMemory(base + adjacent_offset + 0x10000, sizeof(page_value));
-      Require(name, "clean readback",
-              cache.HasGpuDirtyBytes(base + adjacent_first, sizeof(page_value)),
-              "a clean readback published its window's dirty bytes");
-      cache.ReadMemory(base + adjacent_first, sizeof(page_value));
-      uint32_t adjacent_first_backing = 0;
-      uint32_t adjacent_second_backing = 0;
-      Libs::LibKernel::Memory::TryReadBacking(base + adjacent_first,
-                                              &adjacent_first_backing,
-                                              sizeof(adjacent_first_backing));
-      Libs::LibKernel::Memory::TryReadBacking(base + adjacent_second,
-                                              &adjacent_second_backing,
-                                              sizeof(adjacent_second_backing));
-      Require(name, "download window buffer end",
-              adjacent_first_owner != adjacent_second_owner &&
-                  adjacent_first_backing == page_value &&
-                  adjacent_second_backing == page_stale &&
-                  cache.HasGpuDirtyBytes(base + adjacent_second,
-                                         sizeof(page_value)) &&
-                  cache.IsRegionGpuModified(base + adjacent_second,
-                                            sizeof(page_value)),
-              "readback window crossed into an adjacent buffer");
-      cache.ReadMemory(base + adjacent_second, sizeof(page_value));
 
       Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
                                             sizeof(first_stale));
@@ -5899,6 +5856,24 @@ public:
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
+      Require(
+          name, "partial-invalidation keeps disjoint bytes dirty",
+          resources.IsMapped(base + partial_unmap_survivor_offset,
+                             sizeof(partial_unmap_survivor_value)) &&
+              !cache.IsRegionCpuModified(
+                  base + partial_unmap_survivor_offset,
+                  sizeof(partial_unmap_survivor_value)) &&
+              cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
+                                        sizeof(partial_unmap_survivor_value)) &&
+              cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                     sizeof(partial_unmap_survivor_value)) &&
+              !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
+                                      sizeof(partial_unmap_value)),
+          "partial invalidation read back an unrelated mapped page");
+      Require(name, "partial-invalidation survivor read fault",
+              resources.HandleFault(PageFaultAccess::Read,
+                                    base + partial_unmap_survivor_offset),
+              "CPU read did not publish the retained GPU-dirty page");
       uint32_t partial_unmap_survivor_backing = 0;
       std::memcpy(&partial_unmap_survivor_backing,
                   memory + partial_unmap_survivor_offset,
@@ -5911,14 +5886,13 @@ public:
               !cache.IsRegionCpuModified(
                   base + partial_unmap_survivor_offset,
                   sizeof(partial_unmap_survivor_value)) &&
-              !cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
-                                         sizeof(partial_unmap_survivor_value)) &&
               !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
                                       sizeof(partial_unmap_value)) &&
               !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
                                       sizeof(partial_unmap_survivor_value)) &&
               partial_unmap_survivor_backing == partial_unmap_survivor_value,
-          "partial invalidation mishandled ownership or backing");
+          "partial invalidation or subsequent CPU read mishandled ownership or "
+          "backing");
       resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,

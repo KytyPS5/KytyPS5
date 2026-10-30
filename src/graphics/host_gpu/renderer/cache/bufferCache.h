@@ -62,13 +62,17 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// `guest_fault`: a guest write faulted on the range (see ReadMemory()).
+	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fault = false);
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	// A CPU write that already reached guest memory, from a thread that cannot read back:
 	// pages the GPU owns stay GPU-owned, the rest become CPU-modified.
 	void                   InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept;
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// `guest_fault`: a guest access faulted on the range; the readback also takes the GPU-written
+	// pages that follow it (see ReadAheadSize()).
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                  bool guest_fault = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// Caches memory a shader reached through a device address the host did not know beforehand.
@@ -243,6 +247,9 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	// Execution thread: the bytes from vaddr a guest fault on [vaddr, vaddr + size) reads back,
+	// with the GPU-written pages that follow it whose writes were submitted.
+	[[nodiscard]] uint64_t ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const;
 	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
 	// queue waits for those submissions only, not for the work queued after them.
 	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,

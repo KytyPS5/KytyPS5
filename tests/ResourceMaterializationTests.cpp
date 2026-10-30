@@ -1427,6 +1427,35 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   }
 }
 
+void TestEliminatedImageMemoryRemap() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const bool mixed : {false, true}) {
+    Program program;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 8u});
+    ResourceSpecialization specialization;
+    if (mixed) {
+      program.info.images.resize(2);
+      program.info.images[1].resource_class = ImageResourceClass::Storage;
+      specialization.images.resize(2);
+      specialization.images[0].fmask = true;
+      program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 1u});
+      block.AppendNewInst(ValueOpcode::ImageWrite,
+                          {Value(0u), Value(0u), Value(0u), Value(true)})
+          .SetFlags(MemoryFlags{.index = 1});
+    }
+    ApplyResourceSpecialization(program, specialization);
+    Check(program.memory_info[0].resource == 8u,
+          "eliminated image memory was remapped");
+    Check(program.info.images.size() == (mixed ? 1u : 0u),
+          "image compaction changed live bindings");
+    if (mixed)
+      Check(program.memory_info[1].resource == 0u,
+            "live image memory was not remapped");
+  }
+}
+
 void TestShaderCacheRecords() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Equivalent selector domains share one key group, which a load rebuilds.
@@ -1509,6 +1538,7 @@ int main() {
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestEliminatedImageMemoryRemap();
   TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

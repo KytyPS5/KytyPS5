@@ -851,27 +851,6 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	NoteGuestWrite(sequence, dst_address, num_bytes);
 }
 
-void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset) {
-	auto& counters = m_renderer.GetRenderExecutor().m_mip_stats;
-	// Each of up to 256 2-dword slots after the 16-dword header holds the clamped sample count
-	// (dword 0 bits 0-23), the slot id (bits 24-31), the unclamped sample count (dword 1 bits 0-23)
-	// and the finest mip sampled (bits 24-27, 15 for none). A non-zero header dword 0 then marks
-	// the report complete.
-	if (dst != nullptr && size >= 64) {
-		const auto slots = std::min((size - 64) / 8, 256u);
-		for (uint32_t slot = 0; slot < slots; slot++) {
-			const auto& counter = counters[slot];
-			dst[16 + slot * 2]  = (slot << 24u) | uint32_t {counter.clamped};
-			dst[16 + slot * 2 + 1] =
-			    (uint32_t {counter.finest_level} << 24u) | uint32_t {counter.unclamped};
-		}
-		dst[0] = 1;
-	}
-	if (reset) {
-		counters = {};
-	}
-}
-
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
 	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
@@ -2017,23 +1996,11 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 	}
 }
 
-void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
-	if (size < 64) {
-		return;
-	}
-	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
-	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
-	// samples. A non-zero dword 0 then marks the report complete.
-	const auto slots    = std::min((size - 64) / 8, 256u);
-	const auto sequence = EmitCallback([dst, slots] {
-		auto* report = static_cast<volatile uint32_t*>(dst);
-		for (uint32_t slot = 0; slot < slots; slot++) {
-			report[16 + slot * 2]     = slot << 24u;
-			report[16 + slot * 2 + 1] = 15u << 24u;
-		}
-		report[0] = 1;
+void CommandProcessor::WriteLodStats(void* dst, uint32_t size, uint32_t control) {
+	// The report reaches guest memory when the GPU completes it (LodStatsCounter::Report).
+	EmitCallback([this, dst, size, control] {
+		m_renderer.GetLodStats().Report(reinterpret_cast<uint64_t>(dst), size, control);
 	});
-	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), 64 + slots * 8);
 }
 
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {

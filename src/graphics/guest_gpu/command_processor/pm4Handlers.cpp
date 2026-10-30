@@ -487,15 +487,8 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
-	if (Config::LodStatsEnabled()) {
-		// Bit 18 or 19 resets the counters after the report.
-		cp.GetLodStats(static_cast<volatile uint32_t*>(dst), buffer_size, (buffer[3] & 0xc0000u) != 0);
-		return 4;
-	}
-
-	if (dst != nullptr && buffer_size != 0) {
-		cp.WriteLodStats(dst, buffer_size);
-	}
+	// A packet without a buffer resets or probes the counters.
+	cp.WriteLodStats(dst, buffer_size, buffer[3]);
 
 	return 4;
 }

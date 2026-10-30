@@ -29,6 +29,8 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Also emit CompileResult::spirv_plain for a pixel shader instrumented for GET_LOD_STATS.
+	bool                        plain_mip_stats_variant    = false;
 };
 
 struct TranslateResult {
@@ -39,6 +41,9 @@ struct TranslateResult {
 
 struct CompileResult {
 	std::vector<uint32_t>  spirv;
+	// The same program without the GET_LOD_STATS recording (Spirv::UsesMipStats): for draws in
+	// which no image has a mip-statistics counter. Empty unless requested and instrumented.
+	std::vector<uint32_t>  spirv_plain;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;

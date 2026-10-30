@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/hostCopyQueue.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/lodStatsReport.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
 #include <array>
@@ -496,6 +497,90 @@ struct OcclusionModel {
 	}
 };
 
+namespace LodStats = Libs::Graphics::LodStatsReport;
+
+// A T# with the mip-statistics fields set: counter enable and id, MIN_LOD (U4.8), BASE_LEVEL.
+std::array<uint32_t, 8> LodStatsTSharp(bool counter, uint32_t id, uint32_t min_lod,
+                                       uint32_t base_level) {
+	std::array<uint32_t, 8> t {};
+	t[1] = (min_lod & 0xfffu) << 8u;
+	t[3] = (base_level & 0xfu) << 12u;
+	t[5] = counter ? (1u << 25u) : 0u;
+	t[6] = id & 0xffu;
+	return t;
+}
+
+struct LodStatsCounters {
+	std::vector<uint32_t> words = std::vector<uint32_t>(LodStats::Entries * 2u, 0u);
+	LodStatsCounters() {
+		for (uint32_t i = 0; i < LodStats::Entries; i++) {
+			words[i] = LodStats::Unsampled;
+		}
+	}
+	[[nodiscard]] uint64_t Entry(uint32_t counter) const {
+		std::array<uint8_t, LodStats::ReportSize> report {};
+		LodStats::PackReport(words.data(), report.data());
+		uint32_t header = 0;
+		std::memcpy(&header, report.data(), sizeof(header));
+		Check(header == 1u, "a packed report is marked complete");
+		uint64_t entry = 0;
+		std::memcpy(&entry, report.data() + 64 + counter * sizeof(uint64_t), sizeof(entry));
+		return entry;
+	}
+};
+
+void TestLodStatsReport() {
+	const auto drawn     = [](uint64_t entry) { return ((entry >> 56u) & 0xfu) != 0xfu; };
+	const auto level     = [](uint64_t entry) { return (entry >> 56u) & 0xfu; };
+	const auto clamped   = [](uint64_t entry) { return (entry & 0xffffffu) != 0u; };
+	const auto counter_id = [](uint64_t entry) { return (entry >> 24u) & 0xffu; };
+
+	Check(LodStats::ImageField(LodStatsTSharp(false, 7, 1024, 0).data()) ==
+	          LodStats::NoCounterFlag,
+	      "a T# without MipStatsCntEn has no counter");
+	Check(LodStats::ImageField(LodStatsTSharp(true, 0xab, 1024, 0).data()) ==
+	          (0xabu | (1024u << 16u)),
+	      "the T# MIN_LOD is the counting threshold");
+	Check(LodStats::ImageField(LodStatsTSharp(true, 3, 768, 2).data()) ==
+	          (3u | (2u << 8u) | (768u << 16u)),
+	      "the field carries BASE_LEVEL and the absolute MIN_LOD");
+
+	// A streamed texture's head keeps only the coarse mips (MIN_LOD 4.0).
+	LodStatsCounters head;
+	const auto       head_field = LodStats::ImageField(LodStatsTSharp(true, 12, 1024, 0).data());
+	LodStats::RecordSample(head.words.data(), head_field, 5.25f);
+	LodStats::RecordSample(head.words.data(), head_field, 4.0f);
+	auto entry = head.Entry(12);
+	Check(drawn(entry) && level(entry) == 4u && !clamped(entry) && counter_id(entry) == 12u,
+	      "a head sampled at or above its MIN_LOD is drawn but not clamped");
+	LodStats::RecordSample(head.words.data(), head_field, 2.5f);
+	entry = head.Entry(12);
+	Check(drawn(entry) && level(entry) == 2u && (entry & 0xffffffu) == 1u,
+	      "a head sampled below its MIN_LOD reports the clamp and the finest wanted level");
+
+	// A fully resident texture (MIN_LOD 0) is never clamped, even when magnified.
+	LodStatsCounters full;
+	const auto       full_field = LodStats::ImageField(LodStatsTSharp(true, 200, 0, 0).data());
+	LodStats::RecordSample(full.words.data(), full_field, 3.0f);
+	LodStats::RecordSample(full.words.data(), full_field, -2.0f);
+	entry = full.Entry(200);
+	Check(drawn(entry) && level(entry) == 0u && !clamped(entry) && counter_id(entry) == 200u,
+	      "a resident texture is drawn at its finest level and not clamped");
+
+	// Levels are absolute: the view's BASE_LEVEL adds to the sampled LOD.
+	LodStatsCounters based;
+	LodStats::RecordSample(based.words.data(),
+	                       LodStats::ImageField(LodStatsTSharp(true, 5, 0, 3).data()), 1.5f);
+	Check(level(based.Entry(5)) == 4u, "BASE_LEVEL makes levels absolute");
+
+	LodStatsCounters idle;
+	entry = idle.Entry(99);
+	Check(!drawn(entry) && !clamped(entry) && counter_id(entry) == 99u,
+	      "an unsampled counter reports no level and no count");
+	LodStats::RecordSample(idle.words.data(), LodStats::NoCounterFlag, 0.0f);
+	Check(!drawn(idle.Entry(0)), "an image without a counter records nothing");
+}
+
 void TestOcclusionCounters() {
 	Check(Occlusion::DbValue(0, 5) == (Occlusion::ReadyBit | 5u), "DB 0 holds the count");
 	Check(Occlusion::DbValue(3, 5) == Occlusion::ReadyBit, "other DBs stay zero");
@@ -597,6 +682,7 @@ int main() {
 	TestHostCopyQueue();
 	TestHostCopyQueueInline();
 	TestOcclusionCounters();
+	TestLodStatsReport();
 	TestPackedColorClear16();
 	std::printf("GpuPipelineTests: all tests passed\n");
 	return 0;

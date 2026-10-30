@@ -939,6 +939,101 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 	return result;
 }
 
+// GET_LOD_STATS feedback. The per-draw shader data holds one field per image
+// (LodStatsReport::ImageField): counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no
+// counter, U4.8 count threshold (T# MIN_LOD) in bits 16..27. The mip_stats buffer holds 257
+// finest-level words followed by 257 counts. The field is uniform per draw, so one lane per
+// subgroup records the subgroup's finest level and whether any lane counts.
+constexpr uint32_t MipStatsEntries       = 257;
+constexpr uint32_t MipStatsNoCounterFlag = 0x8000u;
+
+uint32_t MipStatsElement(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.mip_stats_variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
+struct MipStatsSample {
+	uint32_t finest  = 0; // the lane's absolute mip level
+	uint32_t counted = 0; // 1 when the lane's level is below the field's threshold
+};
+
+// The finest mip a sample wanted, as an absolute level: floor of the unclamped LOD plus the view's
+// BASE_LEVEL, limited to 0..14. A lane counts when that level is below the T# MIN_LOD: the
+// resident-level clamp raised the sample. No subgroup operations: NVIDIA's shader compiler for
+// GeForce RTX 50 GPUs crashed on pixel shaders that reduced these over the subgroup.
+MipStatsSample EmitMipStatsSample(EmitterState& state, uint32_t field, uint32_t lod) {
+	const auto base_level = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), field, ConstantU32(state, 8)),
+	    ConstantU32(state, 0xfu));
+	// The queried LOD is relative to the view's base level.
+	const auto absolute = Binary(state, spv::OpFAdd, TypeF32(state), lod,
+	                             Unary(state, spv::OpConvertUToF, TypeF32(state), base_level));
+	const auto clamped  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FClamp, absolute, ConstantF32Value(state, 0.0f),
+	                          ConstantF32Value(state, 14.0f));
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450Floor, clamped);
+	const auto level = Unary(state, spv::OpConvertFToU, TypeU32(state), floored);
+	MipStatsSample sample;
+	sample.finest = level;
+	// Compared with the clamped level, so that magnification (a LOD below 0) of a texture whose
+	// MIN_LOD is 0 is not a clamp.
+	const auto threshold_fixed = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), field, ConstantU32(state, 16)),
+	    ConstantU32(state, 0xfffu));
+	const auto threshold =
+	    Binary(state, spv::OpFMul, TypeF32(state),
+	           Unary(state, spv::OpConvertUToF, TypeF32(state), threshold_fixed),
+	           ConstantF32Value(state, 1.0f / 256.0f));
+	const auto below = Binary(state, spv::OpFOrdLessThan, TypeBool(state), clamped, threshold);
+	sample.counted =
+	    Select(state, TypeU32(state), below, ConstantU32(state, 1), ConstantU32(state, 0));
+	return sample;
+}
+
+// Recording for an image whose T# has a counter (checked by the caller, uniformly per draw). Every
+// lane
+//  - issues the finest-level AtomicUMin only when a relaxed atomic load shows a larger value. The
+//    finest words only decrease between resets (UMin is their only shader writer, and the resets
+//    are transfer fills ordered against all shader access), so a skipped UMin would not change
+//    the word;
+//  - adds 1 to the count when it counted (the game only tests the count for zero).
+void EmitMipStatsRecord(EmitterState& state, uint32_t field, uint32_t lod) {
+	const auto counter =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), field, ConstantU32(state, 0xffu));
+	const auto sample         = EmitMipStatsSample(state, field, lod);
+	const auto finest_pointer = MipStatsElement(state, counter);
+	const auto current        = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	const auto lower = Binary(state, spv::OpULessThan, TypeBool(state), sample.finest, current);
+	EmitIfCondition(state, lower, [&]() {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), result, finest_pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), sample.finest);
+	});
+	const auto any =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), sample.counted, ConstantU32(state, 0));
+	EmitIfCondition(state, any, [&]() {
+		const auto count_index = Binary(state, spv::OpIAdd, TypeU32(state), counter,
+		                                ConstantU32(state, MipStatsEntries));
+		const auto result      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), result,
+		                          MipStatsElement(state, count_index),
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, 1));
+	});
+}
+
 } // namespace
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1209,6 +1304,51 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
 			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
+			// GET_LOD_STATS feedback for an image whose T# the draw supplies (a dynamically
+			// selected slot of a group of images has no single field).
+			if (state.mip_stats_variable != 0 && state.mip_stats_records && array_index == 0u &&
+			    !candidate.heap && candidate.table_capacity == 0u &&
+			    resource < state.program.bindings.mip_stats_count) {
+				// The field is uniform per draw: without a counter, the LOD query and the atomics
+				// are skipped.
+				const auto field = EmitShaderDataDwordLoad(
+				    state, state.program.bindings.MipStatsDword() + resource);
+				const auto has_counter = Binary(
+				    state, spv::OpIEqual, TypeBool(state),
+				    Binary(state, spv::OpBitwiseAnd, TypeU32(state), field,
+				           ConstantU32(state, MipStatsNoCounterFlag)),
+				    ConstantU32(state, 0));
+				EmitIfCondition(state, has_counter, [&]() {
+					auto lod = ZeroF32(state);
+					if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+						// Level 0 explicitly.
+					} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+					           layout.lod != NoImageComponent) {
+						lod = AddressF32(ctx, mem, *address, layout.lod);
+					} else {
+						// Implicit or gradient sampling: the unclamped LOD (before MIN_LOD and the
+						// resident range), which is what a texture streamer needs to know.
+						// OpSampledImage must sit in the block of its consumer.
+						state.builder.RequireCapability(spv::CapabilityImageQuery);
+						const auto query = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpImageQueryLod, TypeF32Vector(state, 2), query,
+						    MakeSampledImage(state, resource, sampler.id, 0u, 0u, sampler.dynamic),
+						    CoordF32(ctx, mem, *address, layout.coord,
+						             ImageDimensionInfoFor(candidate.dimension).spatial_components,
+						             candidate.cube, RowCenter(state, candidate.dimension)));
+						lod = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod,
+						                          query, 1u);
+						// IMAGE_SAMPLE_B: the shader bias adds to the computed LOD.
+						if (!explicit_lod && layout.bias != NoImageComponent) {
+							lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
+							             AddressF32(ctx, mem, *address, layout.bias));
+						}
+					}
+					EmitMipStatsRecord(state, field, lod);
+				});
+			}
 			return sample;
 		};
 		ctx.Define(inst, EmitImageResult(ctx, inst, EmitSample));

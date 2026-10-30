@@ -130,6 +130,10 @@ struct EmitterState {
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
+	// GET_LOD_STATS counters (DescriptorBindingKind::MipStats); mip_stats_records is false for the
+	// plain variant, which declares the binding but records nothing.
+	uint32_t                                         mip_stats_variable      = 0;
+	bool                                             mip_stats_records       = true;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;

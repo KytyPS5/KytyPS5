@@ -258,10 +258,6 @@ bool NativeRtEnabled() {
 	return g_config->native_rt;
 }
 
-bool LodStatsEnabled() {
-	return g_config->lod_stats_enabled;
-}
-
 bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }

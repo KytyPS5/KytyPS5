@@ -643,13 +643,15 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
                                        ShaderRecompiler::TranslateResult                  translated,
                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                        std::span<const uint32_t> function_code,
-                                       uint32_t push_data_cursor, std::vector<uint32_t>& spirv) const {
+                                       uint32_t push_data_cursor, std::vector<uint32_t>& spirv,
+                                       std::vector<uint32_t>& plain_spirv) const {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile         = SpirvProfile(m_graphics);
 	auto       compile_options = options;
 	compile_options.profile    = &profile;
+	compile_options.plain_mip_stats_variant = key.stage == ShaderType::Pixel;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
 	                                               specialization, push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
@@ -681,12 +683,38 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
 	}
-	spirv = std::move(result.spirv);
+	if (!result.spirv_plain.empty()) {
+		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);
+		module.plain = MakePlainModule(module, result.spirv_plain, m_graphics.device);
+		EXIT_IF(module.plain == nullptr);
+	}
+	spirv       = std::move(result.spirv);
+	plain_spirv = std::move(result.spirv_plain);
 	return module;
 }
 
+std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&       module,
+                                                    std::span<const uint32_t> spirv,
+                                                    vk::Device                device) {
+	auto plain = std::make_shared<ShaderModule>();
+	// Module ids are hashes: a fixed change of the instrumented module's id names its variant.
+	plain->id     = module.id ^ 0x9e3779b97f4a7c15ull;
+	plain->module = CompileSPV(spirv, device);
+	if (plain->module == nullptr) {
+		return nullptr;
+	}
+	plain->info            = module.info;
+	plain->specialization  = module.specialization;
+	plain->function_code   = module.function_code;
+	plain->vertex_formats  = module.vertex_formats;
+	plain->rect_parameters = module.rect_parameters;
+	plain->spirv_words     = static_cast<uint32_t>(spirv.size());
+	return plain;
+}
+
 void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
-                                const ShaderModule& module, const std::vector<uint32_t>& spirv) {
+                                const ShaderModule& module, const std::vector<uint32_t>& spirv,
+                                const std::vector<uint32_t>& plain_spirv) {
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -699,7 +727,14 @@ void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
-		StoreModule(key, program, module, spirv);
+		StoreModule(key, program, module, spirv, plain_spirv);
+	}
+}
+
+void PipelineCache::DestroyModule(const ShaderModule& module) const {
+	m_graphics.device.destroyShaderModule(module.module, nullptr);
+	if (module.plain != nullptr) {
+		m_graphics.device.destroyShaderModule(module.plain->module, nullptr);
 	}
 }
 
@@ -708,10 +743,11 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
                                            ShaderRecompiler::TranslateResult translated,
                                            uint32_t                          push_data_cursor) {
 	std::vector<uint32_t> spirv;
+	std::vector<uint32_t> plain_spirv;
 	auto& module = program.modules.emplace_back(
 	    BuildModule(key, options, std::move(translated), program.specialization,
-	                program.FunctionCode(), push_data_cursor, spirv));
-	AddedModule(key, program, module, spirv);
+	                program.FunctionCode(), push_data_cursor, spirv, plain_spirv));
+	AddedModule(key, program, module, spirv, plain_spirv);
 	return module;
 }
 
@@ -869,7 +905,7 @@ PipelineCache::~PipelineCache() {
 	destroy(m_async_ready_compute);
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
-			m_graphics.device.destroyShaderModule(module.module, nullptr);
+			DestroyModule(module);
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -1508,6 +1544,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	std::optional<ShaderModule>                       module;
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::vector<uint32_t>                             spirv;
+	std::vector<uint32_t>                             plain_spirv;
 	[&] {
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
 		ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
@@ -1565,7 +1602,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		}
 		if (specialization) {
 			module = BuildModule(job.key, options, std::move(translated), *specialization, {},
-			                     job.push_data_cursor, spirv);
+			                     job.push_data_cursor, spirv, plain_spirv);
 		}
 	}();
 	LockPrograms();
@@ -1582,10 +1619,10 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			       other.info.bindings.push_data_start_dword == layout.push_data_start_dword;
 		});
 		if (known) {
-			m_graphics.device.destroyShaderModule(module->module, nullptr);
+			DestroyModule(*module);
 		} else {
 			auto& added = modules.emplace_back(std::move(*module));
-			AddedModule(job.key, entry->second, added, spirv);
+			AddedModule(job.key, entry->second, added, spirv, plain_spirv);
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				if (!m_async_threads.empty()) {
 					CreateComputePipelineAhead(added);
@@ -1799,6 +1836,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	if (ps_active) {
 		stages[3] = ps_input_info.stage.module;
+		if (state.ps_plain && stages[3] != nullptr && stages[3]->plain != nullptr) {
+			stages[3] = stages[3]->plain.get();
+		}
 	}
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
 	const auto color_count = targets.color_count;

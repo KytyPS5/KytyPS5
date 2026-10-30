@@ -714,6 +714,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
+	if (options.plain_mip_stats_variant && Spirv::UsesMipStats(ir)) {
+		result.spirv_plain =
+		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+		                       options.emit_debug_info, false);
+	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);
 	if (options.dump_ir) {

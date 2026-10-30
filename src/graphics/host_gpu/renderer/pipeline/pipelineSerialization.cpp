@@ -81,8 +81,9 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle and the SPIR-V size come from the SPIR-V; stored programs have no function code.
+	// The plain variant is stored as its SPIR-V.
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task, spirv_words] = stage;
+	       mesh_task, spirv_words, plain] = stage;
 	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
@@ -230,10 +231,11 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			std::vector<uint8_t>  plan;
 			ShaderModule          module;
 			std::vector<uint32_t> spirv;
+			std::vector<uint32_t> plain_spirv;
 			IoKey(reader, key);
 			IoAll(reader, plan);
 			IoModule(reader, module);
-			IoAll(reader, spirv);
+			IoAll(reader, spirv, plain_spirv);
 			if (!complete()) {
 				return false;
 			}
@@ -245,6 +247,13 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
 			module.spirv_words = static_cast<uint32_t>(spirv.size());
+			if (!plain_spirv.empty()) {
+				module.plain = MakePlainModule(module, plain_spirv, m_graphics.device);
+				if (module.plain == nullptr) {
+					m_graphics.device.destroyShaderModule(module.module, nullptr);
+					return false;
+				}
+			}
 			program->second.modules.push_back(std::move(module));
 			break;
 		}
@@ -276,7 +285,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 
 // Records are encoded here, since programs and modules change later.
 void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
-                                const ShaderModule& module, const std::vector<uint32_t>& spirv) {
+                                const ShaderModule& module, const std::vector<uint32_t>& spirv,
+                                const std::vector<uint32_t>& plain_spirv) {
 	if (!m_store) {
 		return;
 	}
@@ -285,7 +295,7 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 	IoKey(record, key);
 	IoAll(record, ShaderRecompiler::IR::SaveResourcePlan(program.resource_plan));
 	IoModule(record, module);
-	IoAll(record, spirv);
+	IoAll(record, spirv, plain_spirv);
 	m_store.Append(std::move(record.bytes));
 }
 
@@ -313,6 +323,9 @@ PipelineCache::ModuleMap PipelineCache::MapModules() const {
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			modules.emplace(module.id, &module);
+			if (module.plain != nullptr) {
+				modules.emplace(module.plain->id, module.plain.get());
+			}
 		}
 	}
 	return modules;

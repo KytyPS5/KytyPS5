@@ -224,7 +224,17 @@ struct ShaderModule {
 	bool                                         mesh_task = false;
 	// The size of the module's SPIR-V: small pipelines compile at once (GetGraphicsPipeline).
 	uint32_t                                     spirv_words = 0;
+	// A pixel program instrumented for GET_LOD_STATS: the same program without the recording, for
+	// draws in which no image has a mip-statistics counter (DrawRenderState::ps_plain). Its storage
+	// buffer atomics alone make the driver run the depth and stencil tests after a shader that can
+	// discard.
+	std::shared_ptr<const ShaderModule>          plain;
 };
+
+// ShaderModule::plain of `module` from the variant's SPIR-V; null when the module fails.
+[[nodiscard]] std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&   module,
+                                                                  std::span<const uint32_t> spirv,
+                                                                  vk::Device            device);
 
 // Whether every color target the draw writes is at most 1024 pixels wide and
 // high (default 1024; 0 = off): glyph atlases and cached UI layers, which a game draws once.
@@ -245,6 +255,8 @@ struct DrawRenderState {
 	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
 	bool                                 primitive_restart_enable = false;
 	bool                                 ps_active                = false;
+	// The pixel program's plain variant replaces it (ShaderModule::plain).
+	bool                                 ps_plain                 = false;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
 	// Input: the user-data slots a GPU-read indirect draw patches.
@@ -428,15 +440,18 @@ private:
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
-	// Compiles a module without touching the cache; `spirv` receives its code.
+	// Compiles a module without touching the cache; `spirv` and `plain_spirv` receive its code and
+	// that of its plain variant (empty without one).
 	ShaderModule BuildModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
 	                         ShaderRecompiler::TranslateResult                   translated,
 	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                         std::span<const uint32_t> function_code, uint32_t push_data_cursor,
-	                         std::vector<uint32_t>& spirv) const;
+	                         std::vector<uint32_t>& spirv, std::vector<uint32_t>& plain_spirv) const;
 	// Under the program lock: counts a module added to `program` and records it in the store.
 	void AddedModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
-	                 const std::vector<uint32_t>& spirv);
+	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
+	// Destroys the Vulkan modules of `module` and of its plain variant.
+	void DestroyModule(const ShaderModule& module) const;
 	void LockPrograms();
 	void UnlockPrograms();
 	// Under the program lock (resolve thread): queues the program of m_ahead_key, or one of its
@@ -499,7 +514,7 @@ private:
 	void WarmUp(const std::filesystem::path& path);
 	bool LoadRecord(std::span<const uint8_t>& records);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
-	                 const std::vector<uint32_t>& spirv);
+	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);
 	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	// Every module by id, with id 0 naming an absent stage.

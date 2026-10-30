@@ -19,9 +19,42 @@ namespace {
 
 } // namespace
 
+bool UsesMipStats(const IR::Program& program) {
+	if (program.stage != ShaderType::Pixel) {
+		return false;
+	}
+	const auto& images = program.info.images;
+	// Images whose T# the draw supplies; table elements and heap images have no field.
+	const auto drawn = [&](uint32_t resource) {
+		return resource < images.size() && !images[resource].heap &&
+		       images[resource].table_capacity == 0u;
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::ImageSampleRaw) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto resource = program.memory_info[index].resource;
+			if (drawn(resource)) {
+				return true;
+			}
+			if (resource < images.size() &&
+			    std::ranges::any_of(images[resource].indirect_resources, drawn)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info,
+                                  bool mip_stats_records) {
 	using namespace Emitter;
 
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -38,6 +71,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.debug_source = state.builder.AddString(name);
 		state.builder.EnableNames();
 	}
+	state.mip_stats_records     = mip_stats_records;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

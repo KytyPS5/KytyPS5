@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/indirectWriteTables.h"
+#include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
@@ -59,6 +60,7 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
+	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
@@ -127,6 +129,7 @@ private:
 	ImageHeap                 m_image_heap;
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};
+	LodStatsCounter           m_lod_stats {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;

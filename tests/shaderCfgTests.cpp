@@ -140,6 +140,7 @@ struct TestCompileResult {
   std::string ir_dump;
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
+  std::vector<uint32_t> spirv_plain;
 };
 
 TestCompileResult RecompileForTest(
@@ -162,7 +163,7 @@ TestCompileResult RecompileForTest(
       std::move(translated), options, specialization, push_data_start_dword);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
-          std::move(resources)};
+          std::move(resources), std::move(compiled.spirv_plain)};
 }
 
 void CompilePixelRuntime(const ShaderParams &params,
@@ -3803,6 +3804,10 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   constexpr uint32_t OpImageSampleExplicitLod = 88;
   constexpr uint32_t OpImageSampleDrefImplicitLod = 89;
   constexpr uint32_t OpImageSampleDrefExplicitLod = 90;
+  constexpr uint32_t OpImageQueryLod = 105;
+  constexpr uint32_t OpAtomicLoad = 227;
+  constexpr uint32_t OpAtomicIAdd = 234;
+  constexpr uint32_t OpAtomicUMin = 237;
 
   auto compile = [](uint32_t opcode, uint32_t dmask) {
     const uint32_t shader[] = {
@@ -3820,15 +3825,29 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
     options.input_info.pixel = &ps_info;
     options.dump_ir = true;
     options.user_data = user_data;
+    options.plain_mip_stats_variant = true;
 
     auto result = RecompileForTest(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
+    // Every pixel sample records GET_LOD_STATS feedback; the plain variant does not.
+    Check(!result.spirv_plain.empty(), "pixel IMAGE_SAMPLE has no plain mip-statistics variant");
+    CheckSpirvBinaryValidates(result.spirv_plain);
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpAtomicIAdd) == 1 &&
+              SpirvInstructionOpcodeCount(result.spirv, OpAtomicUMin) == 1 &&
+              SpirvInstructionOpcodeCount(result.spirv, OpAtomicLoad) == 1,
+          "pixel IMAGE_SAMPLE did not record mip statistics once");
+    Check(SpirvInstructionOpcodeCount(result.spirv_plain, OpAtomicIAdd) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv_plain, OpAtomicUMin) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv_plain, OpImageQueryLod) == 0,
+          "the plain variant recorded mip statistics");
     return result;
   };
 
   {
     const auto result = compile(0x20, 0xf); // image_sample
-    const auto metrics = MeasureSpirv(result.spirv);
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageQueryLod) == 1,
+          "an implicit-LOD sample did not query its LOD for mip statistics");
+    const auto metrics = MeasureSpirv(result.spirv_plain);
     Check(metrics.type_images == 1u && metrics.type_samplers == 1u &&
               metrics.type_sampled_images == 1u &&
               metrics.sampled_1d_capabilities == 0u &&

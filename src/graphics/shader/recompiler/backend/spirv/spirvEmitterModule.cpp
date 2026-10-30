@@ -253,7 +253,7 @@ void DefineDescriptors(EmitterState& state) {
 	// (robustBufferAccess2), where a storage buffer read computes and checks the address.
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
 	for (auto& buffer: info.buffers) {
-		buffer.uniform_index = UniformBuffersEnabled() && state.robust_buffer_access2 &&
+		buffer.uniform_index = UniformBuffersEnabled() && state.profile.robust_buffer_access &&
 		                               buffer.descriptor_index != UINT32_MAX && buffer.constant_only
 		                           ? uniform_count++ : UINT32_MAX;
 	}
@@ -301,6 +301,10 @@ void DefineDescriptors(EmitterState& state) {
 	if (info.ray_query) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
+	}
+	if (UsesMipStats(state.program)) {
+		counts[static_cast<size_t>(Kind::MipStats)] = 1;
+		bindings.mip_stats_count = static_cast<uint32_t>(info.images.size());
 	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
@@ -364,6 +368,10 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				break;
+			case IR::DescriptorBindingKind::MipStats:
+				state.mip_stats_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "mip_stats");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable =

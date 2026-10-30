@@ -28,6 +28,7 @@ private:
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
 	std::array<IR::U32, 2> ExecMask();
+	std::array<IR::U32, 2> PresentMask();
 	std::array<IR::U32, 2> VectorMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);

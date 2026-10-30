@@ -129,6 +129,20 @@ std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	        program.wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
 }
 
+// The lanes this invocation's host subgroup really has: a written EXEC word keeps only those
+// (pixel EXEC words also leave the helpers out, as the initial words do).
+// The guest may enable every lane of its wave (S_MOV_B64 EXEC, -1, S_OR_SAVEEXEC with -1), but
+// a lane the host does not run never clears its bit, and a waterfall loop waiting for EXEC to
+// empty would spin forever (GT7's tessellation vertex shaders on a 32-lane host).
+std::array<IR::U32, 2> Translator::PresentMask() {
+	if (program.stage == ShaderType::Pixel) {
+		const auto mask = ir.Emit(IR::ValueOpcode::LiveMask);
+		return {ir.CompositeExtract(mask, 0),
+		        program.wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
+	}
+	return BallotMask(IR::U1(IR::Value(true)));
+}
+
 std::array<IR::U32, 2> Translator::ExecMask() {
 	return {ir.GetExecLo(), program.wave_size == 64u ? ir.GetExecHi() : IR::U32(IR::Value(0u))};
 }
@@ -356,14 +370,17 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetVcc(ThreadBit({ir.GetVccLo(), value}));
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExecLo(IR::U32(value));
+		case Decoder::OperandKind::ExecLo: {
+			// The per-lane EXEC takes the written word as is (pixel helpers stay enabled).
 			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
+			ir.SetExecLo(ir.BitwiseAnd(IR::U32(value), PresentMask()[0]));
 			break;
-		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
+		}
+		case Decoder::OperandKind::ExecHi: {
 			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
+			ir.SetExecHi(ir.BitwiseAnd(IR::U32(value), PresentMask()[1]));
 			break;
+		}
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
 			break;
@@ -594,11 +611,13 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 		return;
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
+		case Decoder::OperandKind::ExecLo: {
+			const auto present = PresentMask();
 			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
+			ir.SetExecLo(ir.BitwiseAnd(value[0], present[0]));
+			ir.SetExecHi(ir.BitwiseAnd(value[1], present[1]));
 			return;
+		}
 		case Decoder::OperandKind::VccLo:
 			ir.SetVcc(ThreadBit(value));
 			ir.SetVccLo(value[0]);

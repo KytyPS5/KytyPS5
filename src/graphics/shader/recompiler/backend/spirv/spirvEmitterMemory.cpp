@@ -376,21 +376,85 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
+// Picks how a load through a prepared buffer resource is guarded. robustBufferAccess makes any
+// index into a bound storage buffer safe to load, so such a load may run unguarded and be
+// selected afterwards. That holds only for a constant descriptor slot, because the device does
+// not bound a descriptor array index, and non_uniform marks a slot chosen by a GPU value.
+// Callers guard one element load through an already resolved resource, so this resource is
+// enough here. A slot picked by a GPU value is non_uniform, and a coherent pair is volatile.
+// The outer exec guard around a whole access still needs the indirect root and pair checks.
+// Selecting is opt-in through the profile.
+static GuardStrategy LoadGuardStrategy(const EmitterState&         state,
+                                       const MemoryResourceAccess& resource) {
+	const bool robust_kind = resource.kind == IR::ResourceKind::Buffer ||
+	                         resource.kind == IR::ResourceKind::ScalarBuffer;
+	const bool coherent = (resource.memory_access & spv::MemoryAccessVolatileMask) != 0;
+	return state.profile.select_guarded_loads && robust_kind && resource.object_pointer != 0u &&
+	               !resource.non_uniform && !coherent
+	           ? GuardStrategy::Select
+	           : GuardStrategy::Branch;
+}
+
+// Picks how the exec guard around a whole buffer access is emitted. Running the access for
+// inactive lanes is safe when it reads robust storage buffers through a constant slot and every
+// element load inside still selects its own bounds. An indirect root picks its slot from a GPU
+// value and a coherent access may read an atomic pair, so both keep the branch. Inactive lanes
+// then really read memory, which another invocation may be writing. The Vulkan memory model
+// counts that as a data race even though the value is discarded, so this relies on hardware
+// tolerating such reads, which is why selecting is opt-in.
+static GuardStrategy AccessGuardStrategy(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const bool direct_buffer = mem.kind == IR::ResourceKind::Buffer && !mem.coherent &&
+	                           state.program.info.buffers.at(mem.resource).indirect_root != mem.resource;
+	return state.profile.select_guarded_loads && direct_buffer ? GuardStrategy::Select
+	                                                           : GuardStrategy::Branch;
+}
+
+// The element a speculative load reads when its own index is out of range. Every storage buffer
+// is bound with a range at least as long as its checked length, and an empty one is bound to a
+// 16-byte null buffer, so element 0 is in range. A non-empty buffer smaller than one element of
+// the view stays out of range. That only matters for a narrower in-range read of the same few
+// bytes in the same shader, which is rare enough to leave. The discarded read of element 0 may
+// race with another invocation writing it, the same caveat as the exec guard above, so it too is
+// left to the opt-in.
+constexpr uint32_t SAFE_SPECULATIVE_ELEMENT = 0u;
+
+// Keeps a load that a select guards inside the bound range. Vulkan lets an out-of-range access
+// spoil in-range accesses to the same buffer within 16 bytes, so an out-of-range index reads the
+// safe element instead, and the guard still replaces that value with the default.
+static uint32_t SpeculativeElementIndex(EmitterState& state, GuardStrategy strategy,
+                                        uint32_t in_bounds, uint32_t index) {
+	if (strategy != GuardStrategy::Select || in_bounds == ConstantBool(state, true) ||
+	    in_bounds == ConstantBool(state, false)) {
+		return index;
+	}
+	return Select(state, TypeU32(state), in_bounds, index,
+	              ConstantU32(state, SAFE_SPECULATIVE_ELEMENT));
+}
+
+// Loads one dword through a prepared resource, or zero when it lies past the checked length.
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
-	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	const auto index     = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	const auto strategy  = LoadGuardStrategy(ctx.state, resource);
+	const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+	const auto safe      = SpeculativeElementIndex(ctx.state, strategy, in_bounds, index);
+	return EmitGuardedValue(ctx.state, strategy, in_bounds, ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0),
+	                        [&]() { return LoadWordInBounds(ctx, resource, safe); });
 }
 
+// Loads one dword for the active lanes, and zero for the others.
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadWordPrepared(ctx, inst, mem, resource);
-	});
+	return EmitGuardedValue(ctx.state, AccessGuardStrategy(ctx.state, mem),
+	                        ctx.Arg(inst, inst.NumArgs() - 1), ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0), [&]() {
+		                        const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		                        return LoadWordPrepared(ctx, inst, mem, resource);
+	                        });
 }
 
+// Loads one byte or short through a prepared resource, or zero when it lies past the checked
+// length.
 uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                              const MemoryResourceAccess& resource, uint32_t bits,
                              bool sign_extend) {
@@ -398,10 +462,15 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	const auto strategy  = LoadGuardStrategy(ctx.state, resource);
+	const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+	// Only the index addresses memory. The address supplies the byte within the loaded word.
+	const auto safe = SpeculativeElementIndex(ctx.state, strategy, in_bounds, index);
+	return EmitGuardedValue(ctx.state, strategy, in_bounds, ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0), [&]() {
+		                        return LoadSubwordInBounds(ctx, resource, address, safe, bits,
+		                                                   sign_extend);
+	                        });
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -440,12 +509,16 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	              ConstantU32(ctx.state, 32u - bits));
 }
 
+// Loads one byte or short for the active lanes, and zero for the others.
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
-	});
+	return EmitGuardedValue(ctx.state, AccessGuardStrategy(ctx.state, mem),
+	                        ctx.Arg(inst, inst.NumArgs() - 1), ValueShape {TypeU32(ctx.state), 1u},
+	                        ConstantU32(ctx.state, 0), [&]() {
+		                        const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		                        return LoadSubwordPrepared(ctx, inst, mem, resource, bits,
+		                                                   sign_extend);
+	                        });
 }
 
 Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::MemoryInfo& mem) {
@@ -696,6 +769,8 @@ struct PreparedFormattedMemory {
 	MemoryResourceAccess     resource;
 	uint32_t                 base = 0;
 	uint32_t                 in_bounds = 0;
+	// Set when the components are loaded speculatively and selected, so each stays in range.
+	bool                     speculative = false;
 };
 
 PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -726,8 +801,16 @@ std::pair<uint32_t, uint32_t> FormattedComponentAddress(EmitterState& state,
 	const auto offset = Format::GetFormatComponentByteOffset(plan.info, component);
 	const auto address = offset == 0u ? plan.base : Binary(
 	    state, spv::OpIAdd, TypeU32(state), plan.base, ConstantU32(state, offset));
-	return {address, Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
-	                        ConstantU32(state, std::countr_zero(plan.resource.element_bits / 8u)))};
+	const auto element_shift = std::countr_zero(plan.resource.element_bits / 8u);
+	const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
+	                          ConstantU32(state, element_shift));
+	// Each component is clamped, since a clamped base plus a component offset can still be out of
+	// range for a short buffer.
+	if (plan.speculative) {
+		return {address,
+		        SpeculativeElementIndex(state, GuardStrategy::Select, plan.in_bounds, index)};
+	}
+	return {address, index};
 }
 
 uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
@@ -755,14 +838,64 @@ uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
 	return result;
 }
 
-uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                   const PreparedFormattedMemory& plan, uint32_t components) {
+// Returns the constant each component of a formatted record reads when the record is out of
+// range.
+std::array<uint32_t, 4> FormattedOutOfBoundsComponents(ValueEmitContext& ctx,
+                                                       const IR::MemoryInfo& mem,
+                                                       const PreparedFormattedMemory& plan,
+                                                       uint32_t components) {
 	std::array<uint32_t, 4> values {};
 	for (uint32_t component = 0; component < components; component++) {
 		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
 		values[component] = FormattedConstant(ctx, plan.info, source.kind);
 	}
-	return ConstructU32Composite(ctx.state, components, values);
+	return values;
+}
+
+uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                   const PreparedFormattedMemory& plan, uint32_t components) {
+	return ConstructU32Composite(ctx.state, components,
+	                             FormattedOutOfBoundsComponents(ctx, mem, plan, components));
+}
+
+// Loads every component of a formatted record unguarded and selects each one against its
+// out-of-range default. Each component is its own element load, so a record past the end never
+// becomes one wide load straddling the bound range. Selecting each scalar also avoids the bool
+// vector a vector select needs under SPIR-V 1.3, and works for the two-word array type.
+uint32_t SelectFormattedComponents(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                   const PreparedFormattedMemory& plan, uint32_t count) {
+	auto&      state     = ctx.state;
+	const auto fallbacks = FormattedOutOfBoundsComponents(ctx, mem, plan, count);
+	auto       speculative = plan;
+	speculative.speculative = true;
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < count; component++) {
+		values[component] = EmitGuardedValue(
+		    state, GuardStrategy::Select, plan.in_bounds, ValueShape {TypeU32(state), 1u},
+		    fallbacks[component],
+		    [&]() { return LoadFormattedInBounds(ctx, mem, speculative, component); });
+	}
+	return ConstructU32Composite(state, count, values);
+}
+
+// Reads a formatted record, or its out-of-range value when the record lies past the checked
+// length or the resource is null. LoadGuardStrategy picks per-component selects or one branch.
+uint32_t GuardFormattedRecord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                              const PreparedFormattedMemory& plan,
+                              const MemoryResourceAccess& resource, uint32_t count) {
+	auto& state = ctx.state;
+	if (resource.object_pointer == 0u) return FormattedOutOfBoundsValue(ctx, mem, plan, count);
+	if (LoadGuardStrategy(state, resource) == GuardStrategy::Select)
+		return SelectFormattedComponents(ctx, mem, plan, count);
+	return EmitValueOrDefaultIfCondition(
+	    state, plan.in_bounds, TypeU32Composite(state, count),
+	    FormattedOutOfBoundsValue(ctx, mem, plan, count), [&]() {
+		    std::array<uint32_t, 4> values {};
+		    for (uint32_t component = 0; component < count; component++) {
+			    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
+		    }
+		    return ConstructU32Composite(state, count, values);
+	    });
 }
 
 uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -772,15 +905,7 @@ uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto count = mem.data_bits == 16u ? mem.component_count : components;
 	const auto plan = resource.object_pointer == 0u ? PreparedFormattedMemory{.info = info}
 	                                              : PrepareFormattedMemory(ctx, inst, mem, resource, info);
-	const auto out_of_bounds = FormattedOutOfBoundsValue(ctx, mem, plan, count);
-	const auto value = resource.object_pointer == 0u ? out_of_bounds : EmitValueOrDefaultIfCondition(
-	    state, plan.in_bounds, TypeU32Composite(state, count), out_of_bounds, [&]() {
-		    std::array<uint32_t, 4> values {};
-		    for (uint32_t component = 0; component < count; component++) {
-			    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
-		    }
-		    return ConstructU32Composite(state, count, values);
-	    });
+	const auto value = GuardFormattedRecord(ctx, mem, plan, resource, count);
 	if (mem.data_bits != 16u) return value;
 	const bool integer = info.type == Format::ComponentType::Uint ||
 	                     info.type == Format::ComponentType::Sint;
@@ -1129,31 +1254,34 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+// Loads a multi-dword or formatted buffer access for the active lanes, and zero for the others.
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
-	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
-	    ConstantU32CompositeZero(state, components), [&]() {
-		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
-			    const auto function = state.indirect_buffer_load_functions.at(
-			        {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
-			    const auto args = IndirectBufferArgs(ctx, inst);
-			    const auto result = state.builder.AllocateId();
-			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
-			                              result, function, args);
-			    return result;
-		    }
-		    return EmitBufferAccess(ctx, inst, mem, components, [&](const auto& selected, const auto& resource) {
-			    const auto info = Format::GetFormatInfo(
-			        selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
-			    if (info.type != Format::ComponentType::Unknown) {
-				    return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
-			    }
-			    if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
-			    return LoadRawBuffer(ctx, inst, selected, resource, components);
-		    });
-	    });
+	const auto active = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto access = [&]() {
+		if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+			const auto function = state.indirect_buffer_load_functions.at(
+			    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+			const auto args = IndirectBufferArgs(ctx, inst);
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
+			                          result, function, args);
+			return result;
+		}
+		return EmitBufferAccess(ctx, inst, mem, components, [&](const auto& selected, const auto& resource) {
+			const auto info = Format::GetFormatInfo(
+			    selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
+			if (info.type != Format::ComponentType::Unknown) {
+				return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
+			}
+			if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
+			return LoadRawBuffer(ctx, inst, selected, resource, components);
+		});
+	};
+	return EmitGuardedValue(state, AccessGuardStrategy(state, mem), active,
+	                        ValueShape {TypeU32Composite(state, components), components},
+	                        ConstantU32CompositeZero(state, components), access);
 }
 
 void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
@@ -1608,10 +1736,13 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
-	           }));
+	const auto strategy  = LoadGuardStrategy(state, access);
+	const auto safe      = SpeculativeElementIndex(state, strategy, condition, element);
+	ctx.Define(inst, EmitGuardedValue(state, strategy, condition, ValueShape {TypeU32(state), 1u},
+	                                  ConstantU32(state, 0), [&]() {
+		                                  return EmitNative<spv::OpLoad, IR::Type::U32>(
+		                                      state, EmitMemoryElementPointer(state, access, safe));
+	                                  }));
 }
 
 uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst) {

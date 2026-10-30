@@ -15,6 +15,9 @@ struct Profile {
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
+	// Opts in to running safe guarded loads unconditionally and selecting the result, instead of
+	// branching around them. Off by default while it is new.
+	bool select_guarded_loads = false;
 };
 
 inline constexpr Profile DefaultProfile {};

@@ -1357,6 +1357,9 @@ struct BdaMapping {
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
 constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
+// Selected guarded loads are opt-in, so the tests of the select form ask for it.
+constexpr ShaderProfile SelectGuardedLoadsProfile{.maintenance8 = true,
+                                                  .select_guarded_loads = true};
 
 struct TestCase {
   const char *name = "";
@@ -1400,6 +1403,9 @@ struct TestCase {
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
   size_t storage_buffer_range_bytes = 0;
+  // Length the shader checks, when smaller than the bound range. Memory between the two is
+  // readable, so only the shader's own bounds check keeps it out.
+  size_t storage_buffer_shader_size_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
@@ -18556,7 +18562,10 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
-        shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(
+            test.storage_buffer_shader_size_bytes != 0
+                ? std::min<vk::DeviceSize>(info.range, test.storage_buffer_shader_size_bytes)
+                : info.range);
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -22173,6 +22182,9 @@ private:
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    // The emulator requires robustBufferAccess, and shaders may load out of bounds under it.
+    Require("VulkanHarness", "dispatch", available_features.robustBufferAccess == true,
+            "robustBufferAccess is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -22312,6 +22324,8 @@ private:
     conditional_rendering.pNext = &robustness2;
     device_info.pNext = &conditional_rendering;
     vk::PhysicalDeviceFeatures device_features{};
+    // Matches the emulator device. Only version 1 is enabled, the guarantee shaders rely on.
+    device_features.robustBufferAccess = true;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
@@ -33530,6 +33544,45 @@ TestCase ScalarMemoryLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// When loads are selected, a scalar buffer load past the length the shader checks runs unguarded
+// and must read zero. The whole backing buffer stays bound and holds non-zero canaries, so only
+// the select keeps those out of the result.
+TestCase ScalarBufferLoadPastCheckedRange(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 guest_dwords = 10u;
+  constexpr u32 backing_dwords = 16u;
+  constexpr u32 canary_base = 0xc0de0000u;
+  constexpr std::array byte_offsets{36u, 40u, 44u, 60u};
+  constexpr u32 first_dst = 20u;
+  TestCase test;
+  test.name = wave_size == 64u ? "ScalarBufferLoadPastCheckedRangeWave64"
+                               : "ScalarBufferLoadPastCheckedRangeWave32";
+  auto &code = test.code;
+  code.push_back(EncodeSMovB32(0, InlineU32(0)));
+  for (u32 i = 0; i < byte_offsets.size(); ++i)
+    AppendSmemLoadOpcode(&code, 0x08, first_dst + i, byte_offsets[i]); // s_buffer_load_dword
+  for (u32 i = 0; i < byte_offsets.size(); ++i) AppendStoreSgpr(&code, first_dst + i, i);
+  AppendEnd(&code);
+  for (u32 i = 0; i < backing_dwords; ++i) test.initial.push_back(canary_base + i);
+  test.expected = test.initial;
+  for (u32 i = 0; i < byte_offsets.size(); ++i) {
+    const auto dword = byte_offsets[i] / 4u;
+    test.expected[i] = dword < guest_dwords ? canary_base + dword : 0u;
+  }
+  test.storage_buffer_shader_size_bytes = guest_dwords * 4u;
+  test.opcodes = {O::S_MOV_B32, O::S_BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
+  // The branch form merges each guarded load with a phi, so none proves the select form ran.
+  test.forbidden_spirv.push_back("OpPhi");
+  return test;
+}
+
 TestCase ScalarBufferOffsetAlignmentAndCarry() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -34090,6 +34143,122 @@ TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
                   O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(12, 2);
   test.has_user_data = true;
+  return test;
+}
+
+// One buffer load past or near the end of the checked range, and the dwords it should yield.
+struct CheckedRangeLoad {
+  u32 opcode;
+  u32 byte_address;
+  std::vector<u32> results;
+};
+
+// Loads for BufferLoadPastCheckedRange around a checked length of checked_bytes. The last checked
+// dword is canary + 15 = 0xc0de000f, so its top byte is 0xc0 and its top short is 0xc0de, which
+// the signed loads sign-extend. When loads are selected, wrapped addresses past 2 GiB really
+// load under robustBufferAccess, so they also show the device survives them.
+std::vector<CheckedRangeLoad> CheckedRangeLoads(bool subword, u32 checked_bytes, u32 canary) {
+  constexpr u32 ubyte = 0x08u, sbyte = 0x09u, ushort = 0x0au, sshort = 0x0bu;
+  constexpr u32 dword = 0x0cu, dwordx4 = 0x0eu;
+  constexpr u32 wrapped = 0xfffffffcu, high = 0x80000000u, far_tail = 20u;
+  const u32 last = canary + checked_bytes / 4u - 1u;
+  if (subword)
+    return {{ubyte, checked_bytes, {0u}},          {sbyte, checked_bytes, {0u}},
+            {ubyte, checked_bytes - 1u, {0xc0u}},  {sbyte, checked_bytes - 1u, {0xffffffc0u}},
+            {ushort, checked_bytes - 2u, {0xc0deu}}, {sshort, checked_bytes - 2u, {0xffffc0deu}},
+            {ushort, checked_bytes, {0u}}};
+  return {{dword, checked_bytes - 4u, {last}}, {dword, checked_bytes, {0u}},
+          {dword, checked_bytes + 4u, {0u}},   {dword, checked_bytes + far_tail, {0u}},
+          {dwordx4, checked_bytes - 8u, {last - 1u, last, 0u, 0u}},
+          {dword, wrapped, {0u}},              {dword, high, {0u}}};
+}
+
+// When loads are selected, vector buffer loads past the length the shader checks run each element
+// unguarded and must read zero. The whole backing buffer stays bound and holds non-zero canaries,
+// so only the select keeps those out. A dwordx4 that straddles the end keeps its in-range dwords,
+// and byte and short loads keep their in-range bytes.
+TestCase BufferLoadPastCheckedRange(u32 wave_size, bool subword) {
+  using O = ShaderOpcode;
+  // Results land in dwords 0 to 9, below every dword the loads read, so lanes never race.
+  constexpr u32 checked_bytes = 64u, backing_dwords = 24u, canary = 0xc0de0000u;
+  constexpr u32 address_vgpr = 20u;
+  static const std::array<const char *, 4> names{
+      "BufferLoadPastCheckedRangeWave32", "BufferLoadPastCheckedRangeWave64",
+      "BufferSubwordLoadPastCheckedRangeWave32", "BufferSubwordLoadPastCheckedRangeWave64"};
+  TestCase test;
+  test.name = names[(subword ? 2u : 0u) + (wave_size == 64u ? 1u : 0u)];
+  for (u32 i = 0; i < backing_dwords; ++i) test.initial.push_back(canary + i);
+  test.expected = test.initial;
+  u32 dst = 0;
+  for (const auto &load : CheckedRangeLoads(subword, checked_bytes, canary)) {
+    AppendVMovLiteral(&test.code, address_vgpr, load.byte_address);
+    AppendBufferLoadOpcode(&test.code, load.opcode, dst, address_vgpr);
+    for (const auto value : load.results) test.expected[dst++] = value;
+  }
+  for (u32 i = 0; i < dst; ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.storage_buffer_shader_size_bytes = checked_bytes;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes.insert(test.opcodes.end(),
+                      subword ? std::initializer_list<ShaderOpcode>{O::BUFFER_LOAD_UBYTE,
+                                                                    O::BUFFER_LOAD_SBYTE,
+                                                                    O::BUFFER_LOAD_USHORT,
+                                                                    O::BUFFER_LOAD_SSHORT}
+                              : std::initializer_list<ShaderOpcode>{O::BUFFER_LOAD_DWORD,
+                                                                    O::BUFFER_LOAD_DWORDX4});
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
+  // The branch form merges each guarded load with a phi, so none proves the select form ran.
+  test.forbidden_spirv.push_back("OpPhi");
+  return test;
+}
+
+// A formatted load of a record past the length the shader checks must read its out-of-range
+// value, now that its component loads run unguarded and each component is selected. The record
+// behind the checked length holds readable canaries, so only the select keeps them out. The w
+// lane selects a constant 1.0, so a fallback taken from the wrong component would show.
+TestCase BufferFormatLoadPastCheckedRange(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 stride = 16u, records = 8u, checked_records = 4u, canary = 0xc0de0000u;
+  constexpr u32 components = 4u, index_vgpr = 20u, one = 0x3f800000u, w = 3u;
+  constexpr u32 load_format_xyzw = 0x03u;
+  constexpr std::array loaded_records{checked_records - 1u, checked_records};
+  TestCase test;
+  test.name = wave_size == 64u ? "BufferFormatLoadPastCheckedRangeWave64"
+                               : "BufferFormatLoadPastCheckedRangeWave32";
+  for (u32 i = 0; i < records * components; ++i) test.initial.push_back(canary + i);
+  test.expected = test.initial;
+  u32 dst = 0;
+  for (const auto record : loaded_records) {
+    AppendVMovU32(&test.code, index_vgpr, record);
+    test.code.push_back(EncodeMubuf0(load_format_xyzw, 0, true, false));
+    test.code.push_back(EncodeMubuf1(dst, 0, index_vgpr));
+    const bool inside = record < checked_records;
+    for (u32 c = 0; c < components; ++c)
+      test.expected[dst++] = c == w ? one : inside ? canary + record * components + c : 0u;
+  }
+  for (u32 i = 0; i < dst; ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.user_data = MakeStructuredStorageBufferData(
+      stride, records, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(4, 5, 6, 1);
+  test.has_user_data = true;
+  test.storage_buffer_shader_size_bytes = checked_records * stride;
+  // A branched record merges its four components through a vector phi, which nothing else here
+  // produces.
+  test.required_spirv = {"OpSelect %uint"};
+  test.forbidden_spirv = {"OpPhi %v4uint"};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
   return test;
 }
 
@@ -34959,6 +35128,128 @@ TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress() {
   test.user_data = MakeStructuredStorageBufferData(
       16, 2, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
+  return test;
+}
+
+// Which lanes a branchless buffer load test disables.
+enum class InactiveLanes { Odd, UpperHalf };
+
+// Lanes at or above this index form the upper half that a wave64 test disables.
+constexpr u32 kHalfWaveShift = 5u;
+
+// Emits a load of components dwords per lane with the chosen lanes disabled by EXEC. Disabled lanes
+// also get an address far past the end of the buffer. It is low enough that adding a component
+// offset cannot wrap it back into range, so every dword they now read is out of range.
+void AppendBranchlessInactiveLoad(std::vector<u32> *code, u32 components, InactiveLanes inactive) {
+  constexpr u32 value_vgpr = 1u, address_vgpr = 20u, flag_vgpr = 21u, bad_vgpr = 22u;
+  constexpr u32 saved_exec = 30u, exec = 126u, untouched = 0xdeadbeefu, past_end = 0x80000000u;
+  constexpr u32 v_cndmask_b32 = 0x01u, v_lshrrev_b32 = 0x16u, v_lshlrev_b32 = 0x1au;
+  constexpr u32 v_and_b32 = 0x1bu, v_cmp_eq_u32 = 0xc2u, v_cmpx_eq_u32 = 0xd2u, s_mov_b64 = 0x04u;
+  // Opcodes for one, two and four dwords, indexed by log2 of the component count.
+  constexpr std::array<u32, 3> load_opcodes = {0x0cu, 0x0du, 0x0eu};
+  const u32 log2_components = components == 4u ? 2u : components - 1u;
+  for (u32 component = 0; component < components; ++component)
+    AppendVMovLiteral(code, value_vgpr + component, untouched + component);
+  // A flag of zero marks an active lane.
+  if (inactive == InactiveLanes::Odd)
+    code->push_back(EncodeVop2(v_and_b32, flag_vgpr, InlineU32(1), 0));
+  else
+    code->push_back(EncodeVop2(v_lshrrev_b32, flag_vgpr, InlineU32(kHalfWaveShift), 0));
+  code->push_back(EncodeVop2(v_lshlrev_b32, address_vgpr, InlineU32(2u + log2_components), 0));
+  AppendVMovLiteral(code, bad_vgpr, past_end);
+  code->push_back(EncodeVopc(v_cmp_eq_u32, InlineU32(0), flag_vgpr));
+  code->push_back(EncodeVop2(v_cndmask_b32, address_vgpr, Vgpr(bad_vgpr), address_vgpr));
+  code->push_back(EncodeSop1(s_mov_b64, saved_exec, exec));
+  code->push_back(EncodeVopc(v_cmpx_eq_u32, InlineU32(0), flag_vgpr));
+  AppendBufferLoadOpcode(code, load_opcodes[log2_components], value_vgpr, address_vgpr);
+  code->push_back(EncodeSop1(s_mov_b64, exec, saved_exec));
+}
+
+// Names one variant of the branchless inactive-lane test. TestCase keeps a plain string pointer,
+// so every name is a literal.
+const char *BranchlessInactiveLoadName(u32 wave_size, u32 components, InactiveLanes inactive) {
+  // Only a wave64 has an upper half spanning a whole host subgroup.
+  EXIT_IF(inactive == InactiveLanes::UpperHalf && wave_size != 64u);
+  // Rows are odd wave32, odd wave64 and upper half wave64. Columns are one, two and four dwords.
+  static constexpr const char *names[3][3] = {
+      {"BufferLoadBranchlessInactiveOddX1Wave32", "BufferLoadBranchlessInactiveOddX2Wave32",
+       "BufferLoadBranchlessInactiveOddX4Wave32"},
+      {"BufferLoadBranchlessInactiveOddX1Wave64", "BufferLoadBranchlessInactiveOddX2Wave64",
+       "BufferLoadBranchlessInactiveOddX4Wave64"},
+      {"BufferLoadBranchlessInactiveUpperHalfX1Wave64",
+       "BufferLoadBranchlessInactiveUpperHalfX2Wave64",
+       "BufferLoadBranchlessInactiveUpperHalfX4Wave64"}};
+  const u32 row = inactive == InactiveLanes::UpperHalf ? 2u : (wave_size == 64u ? 1u : 0u);
+  const u32 column = components == 4u ? 2u : components - 1u;
+  return names[row][column];
+}
+
+// When loads are selected, a buffer load under EXEC runs for every lane and selects zero for
+// the inactive ones. Active lanes must read their own dwords and inactive lanes keep their old
+// registers, for one, two and four components. Wave64 also checks a host subgroup of 32 whose
+// lanes are all inactive.
+TestCase BufferLoadBranchlessInactiveLanes(u32 wave_size, u32 components, InactiveLanes inactive) {
+  using O = ShaderOpcode;
+  constexpr u32 canary = 0xc0de0000u, untouched = 0xdeadbeefu, value_vgpr = 1u;
+  const u32 loaded_dwords = wave_size * components;
+  TestCase test;
+  test.name = BranchlessInactiveLoadName(wave_size, components, inactive);
+  AppendBranchlessInactiveLoad(&test.code, components, inactive);
+  // Results go after the loaded dwords, so no lane reads what another writes.
+  for (u32 component = 0; component < components; ++component)
+    AppendStoreVgprAtLaneDwordOffset(&test.code, value_vgpr + component, 0,
+                                     loaded_dwords + component * wave_size);
+  AppendEnd(&test.code);
+  for (u32 index = 0; index < loaded_dwords + components * wave_size; ++index)
+    test.initial.push_back(canary + index);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const bool active =
+        inactive == InactiveLanes::Odd ? lane % 2u == 0u : lane < (1u << kHalfWaveShift);
+    for (u32 component = 0; component < components; ++component)
+      test.expected[loaded_dwords + component * wave_size + lane] =
+          active ? canary + lane * components + component : untouched + component;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_AND_B32, O::V_LSHRREV_B32, O::V_LSHLREV_B32,
+                  O::V_CMP_EQ_U32, O::V_CNDMASK_B32, O::S_MOV_B64, O::V_CMPX_EQ_U32,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX4,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.profile = &SelectGuardedLoadsProfile;
+  // The branch form merges each guarded load with a phi, so none proves the select form ran.
+  test.forbidden_spirv.push_back("OpPhi");
+  return test;
+}
+
+// The formatted load with EXEC cleared, run as wave64, which a host subgroup of 32 splits in two.
+// Its EXEC is a constant that folds away, so no guard is emitted and the select opt-in would
+// change nothing. It runs with the default profile.
+TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64() {
+  constexpr u32 wave_size = 64u;
+  auto test = BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress();
+  test.name = "BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64";
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Binds a checked-range test with the Vulkan range ending exactly at the length the shader
+// checks, so a speculative load of an out-of-range element would really be out of the bound
+// range. Vulkan lets such an access spoil in-range ones within 16 bytes, and the selected loads
+// clamp their index to avoid it. The test GPU did not spoil neighbours, so these show the clamped
+// loads still give the right results and the device survives them. The CPU test proves the clamp
+// exists.
+TestCase TightCheckedRange(TestCase test, const char *name) {
+  test.name = name;
+  test.storage_buffer_range_bytes = test.storage_buffer_shader_size_bytes;
+  test.storage_buffer_shader_size_bytes = 0;
   return test;
 }
 
@@ -46813,6 +47104,36 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(std::move(test));
   }
   AddCase(ScalarMemoryLoadVariants);
+  cases.push_back(ScalarBufferLoadPastCheckedRange(32));
+  cases.push_back(ScalarBufferLoadPastCheckedRange(64));
+  cases.push_back(BufferLoadPastCheckedRange(32, false));
+  cases.push_back(BufferLoadPastCheckedRange(64, false));
+  cases.push_back(BufferLoadPastCheckedRange(32, true));
+  cases.push_back(BufferLoadPastCheckedRange(64, true));
+  cases.push_back(BufferFormatLoadPastCheckedRange(32));
+  cases.push_back(BufferFormatLoadPastCheckedRange(64));
+  cases.push_back(TightCheckedRange(ScalarBufferLoadPastCheckedRange(32),
+                                    "ScalarBufferLoadTightRangeWave32"));
+  cases.push_back(TightCheckedRange(ScalarBufferLoadPastCheckedRange(64),
+                                    "ScalarBufferLoadTightRangeWave64"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(32, false),
+                                    "BufferLoadTightRangeWave32"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(64, false),
+                                    "BufferLoadTightRangeWave64"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(32, true),
+                                    "BufferLoadSubwordTightRangeWave32"));
+  cases.push_back(TightCheckedRange(BufferLoadPastCheckedRange(64, true),
+                                    "BufferLoadSubwordTightRangeWave64"));
+  cases.push_back(TightCheckedRange(BufferFormatLoadPastCheckedRange(32),
+                                    "BufferFormatLoadTightRangeWave32"));
+  cases.push_back(TightCheckedRange(BufferFormatLoadPastCheckedRange(64),
+                                    "BufferFormatLoadTightRangeWave64"));
+  for (const u32 components : {1u, 2u, 4u}) {
+    cases.push_back(BufferLoadBranchlessInactiveLanes(32, components, InactiveLanes::Odd));
+    cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::Odd));
+    cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::UpperHalf));
+  }
+  cases.push_back(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64());
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);

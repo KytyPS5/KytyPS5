@@ -173,6 +173,10 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
+bool SelectGuardedLoadsEnabled() {
+	return g_config->select_guarded_loads;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

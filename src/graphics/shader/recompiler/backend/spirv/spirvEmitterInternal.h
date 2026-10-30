@@ -632,6 +632,50 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	                                     std::forward<Fn>(fn));
 }
 
+// How a guarded value is emitted. Branch runs the computation only when its condition holds.
+// Select runs it unconditionally and picks the result, which keeps the module free of control
+// flow that drivers are slow to compile. Select is only safe for a computation with no side
+// effects whose memory reads are safe at any index. Robust buffer access alone is not enough,
+// since Vulkan lets an out-of-range access spoil in-range ones within 16 bytes, so callers keep
+// each speculative load's index in range.
+enum class GuardStrategy { Branch, Select };
+
+// Result type of a guarded value with its component count, kept together so a call site states both.
+struct ValueShape {
+	uint32_t type;
+	uint32_t components;
+};
+
+// Emits fn() so that the result is its value when condition holds and default_value otherwise.
+// A select of several components assumes a dword composite, as every multi-component caller has.
+template <typename Fn>
+uint32_t EmitGuardedValue(EmitterState& state, GuardStrategy strategy, uint32_t condition,
+                          ValueShape shape, uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) return fn();
+	if (strategy == GuardStrategy::Branch) {
+		return EmitValueOrDefaultIfCondition(state, condition, shape.type, default_value,
+		                                     std::forward<Fn>(fn));
+	}
+	if (condition == ConstantBool(state, false)) return default_value;
+	const auto value = fn();
+	if (shape.components == 1u) return Select(state, shape.type, condition, value, default_value);
+	// A two-dword result is an array, which OpSelect cannot take, and a vector needs a bool vector
+	// condition, so each component is selected on its own.
+	EXIT_IF(shape.components > 4u || shape.type != TypeU32Composite(state, shape.components));
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> words {spv::OpCompositeConstruct, shape.type, result};
+	for (uint32_t component = 0; component < shape.components; component++) {
+		const auto part     = state.builder.AllocateId();
+		const auto fallback = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), part, value, component);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), fallback, default_value,
+		                          component);
+		words.push_back(Select(state, TypeU32(state), condition, part, fallback));
+	}
+	state.builder.AddFunction(words);
+	return result;
+}
+
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

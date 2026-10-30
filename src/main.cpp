@@ -86,6 +86,8 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
+	::printf("  --select-guarded-loads               Select bounds-checked shader loads instead of\n"
+	         "                                       branching around them (experimental).\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -215,6 +217,7 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
+    {"--select-guarded-loads", &ConfigOptions::select_guarded_loads},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

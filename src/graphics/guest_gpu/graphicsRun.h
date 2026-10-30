@@ -21,6 +21,24 @@ namespace Libs::Graphics {
 
 class RenderContext;
 
+/// An end-of-pipe label and/or interrupt held back behind image readbacks.
+struct DeferredSignal {
+	RenderContext*                         renderer             = nullptr;
+	void*                                  label                = nullptr; // Null for no label.
+	uint64_t                               value                = 0;
+	uint32_t                               size                 = 0;
+	bool                                   interrupt            = false;
+	int                                    event_id             = 0;
+	uint32_t                               interrupt_context_id = 0;
+	std::shared_ptr<std::atomic<uint32_t>> pending;
+
+	/// Writes the label, lets submissions blocked on it retry at once, and raises the interrupt.
+	/// GPU thread only, outside the queue lock.
+	void Land() const;
+	/// Gives the signal up without landing it, for when the GPU has stopped taking work.
+	void Drop() const;
+};
+
 class GuestGpu final {
 public:
 	explicit GuestGpu(RenderContext& renderer);
@@ -31,6 +49,17 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Lets blocked submissions retry on the GPU thread's next pass instead of after its stall poll
+	// (100 us, or a timer tick on Windows). GPU thread only, outside the queue lock.
+	void               RetryBlockedSubmissions();
+	// Like SendCommand, but returns false instead of exiting once the GPU thread has stopped taking
+	// work.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
+	/// Queues a deferred signal whose readbacks have landed, to land on the GPU thread in the order
+	/// signals are queued. Called from the priority thread.
+	void QueueReadySignal(const DeferredSignal& signal);
+	/// Lands every queued ready signal, oldest first. GPU thread only.
+	void LandReadySignals();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -77,10 +106,18 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	// Deferred signals whose readbacks have landed, waiting for the GPU thread to land them. A
+	// separate queue so an unmap can land them before removing their memory.
+	Common::Mutex                                  m_ready_mutex;
+	std::deque<DeferredSignal>                     m_ready_signals;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
+	// Commands are still accepted after m_accepting is cleared, until the GPU thread stops. A
+	// submission still running at shutdown can be blocked on a deferred label that lands through a
+	// command.
+	bool                                           m_accepting_commands = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.

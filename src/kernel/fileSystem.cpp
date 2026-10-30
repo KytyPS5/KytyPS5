@@ -191,6 +191,33 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	return bytes;
 }
 
+// Reads file bytes into guest memory through a host buffer. The host kernel cannot write a guest
+// page the GPU caches keep write-protected, and the GPU threads protect pages again whenever they
+// synchronize a buffer or an image with guest memory, so a read straight into the guest buffer
+// fails as a whole when one of them protects a page after InvalidateMemory(). The copy's writes
+// to such a page fault into the tracking handler instead, which releases it as for any guest
+// write.
+static uint32_t ReadFileToGuest(Common::File& f, void* buf, uint32_t size) {
+	constexpr uint32_t                       ChunkSize = 1024 * 1024;
+	static thread_local std::vector<uint8_t> staging;
+	auto*                                    destination = static_cast<uint8_t*>(buf);
+	uint32_t                                 total       = 0;
+	while (total < size) {
+		const auto request = std::min(ChunkSize, size - total);
+		if (staging.size() < request) {
+			staging.resize(ChunkSize);
+		}
+		uint32_t read = 0;
+		f.Read(staging.data(), request, &read);
+		std::memcpy(destination + total, staging.data(), read);
+		total += read;
+		if (read < request) {
+			break;
+		}
+	}
+	return total;
+}
+
 static int PosixToKernel(int posix_errno) {
 	return KERNEL_ERROR_UNKNOWN + posix_errno;
 }
@@ -711,8 +738,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const auto bytes_read = ReadFileToGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
@@ -838,9 +864,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const auto bytes_read = ReadFileToGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
@@ -941,8 +966,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		}
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
-		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		const auto bytes = ReadFileToGuest(file->f, buffer.iov_base, count);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
 		bytes_read += bytes;
 		remaining -= bytes;

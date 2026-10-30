@@ -841,6 +841,12 @@ struct AudioOutPortState {
 	uint64_t reserved2[2];
 };
 
+struct AudioOutSystemState {
+	float    loudness;
+	uint8_t  reserved8[4];
+	uint64_t reserved64[3];
+};
+
 int KYTY_SYSV_ABI AudioOutInit() {
 	PRINT_NAME();
 
@@ -948,6 +954,19 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 	LOGF("\t output  = %" PRIu16 "\n"
 	     "\t channel = %" PRIu8 "\n",
 	     state->output, state->channel);
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI AudioOutGetSystemState(AudioOutSystemState* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return AUDIO_OUT_ERROR_INVALID_POINTER;
+	}
+
+	// Loudness is undefined until measurement starts; no measurement is emulated.
+	*state = {};
 
 	return OK;
 }

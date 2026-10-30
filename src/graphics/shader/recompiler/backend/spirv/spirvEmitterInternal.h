@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -73,14 +74,14 @@ struct ImageDefinition {
 };
 
 struct EmitterState {
-	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, bool maintenance8_enabled_)
+	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_), maintenance8_enabled(maintenance8_enabled_) {
+	      program(program_), input_info(input_info_), profile(profile_) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
 		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
-		    input_info.compute != nullptr && input_info.compute->lds_storage) {
+		    input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
 	}
@@ -88,7 +89,7 @@ struct EmitterState {
 	Builder                                          builder;
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
-	bool                                            maintenance8_enabled;
+	const Profile&                                      profile;
 	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
@@ -104,21 +105,24 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          u32_vector_types {};
 	std::array<uint32_t, 3>                          i32_vector_types {};
 	std::array<uint32_t, 3>                          f32_vector_types {};
-	std::array<uint32_t, 6>                          tess_variables {};
+	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
-	uint32_t                                         tess_patch_base     = 0;
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	std::vector<uint32_t>                           memory_byte_sizes;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
-	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
+	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
+	uint32_t                                         bvh8_result_type       = 0;
+	uint32_t                                         bvh8_intersect_function = 0;
+	uint32_t                                         bvh_stack_function      = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -130,6 +134,7 @@ struct EmitterState {
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
+	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   sampler_type                          = 0;
 	uint32_t                   sampler_pointer_type                  = 0;
@@ -144,10 +149,12 @@ struct EmitterState {
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
+	uint32_t                   user_clip_planes                      = 0;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
@@ -165,6 +172,7 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
+uint32_t TypeBvh8Result(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
@@ -265,8 +273,6 @@ struct ValueEmitContext {
 	uint32_t                                                           half       = 0;
 };
 
-enum class VertexInputScalarKind { Float, Sint, Uint };
-
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 
 struct DppTargetLane {
@@ -280,12 +286,12 @@ struct ImageSampleLayout {
 	uint32_t bias   = NoImageComponent;
 	uint32_t coord  = 0;
 	uint32_t lod    = NoImageComponent;
+	uint32_t clamp  = NoImageComponent;
 	uint32_t grad_x = NoImageComponent;
 	uint32_t grad_y = NoImageComponent;
 };
 
 struct F32Class {
-	uint32_t bits = 0;
 	uint32_t nan  = 0;
 	uint32_t zero = 0;
 };
@@ -296,14 +302,14 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
-VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location);
+Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
 uint32_t VertexParameterComponentCount(const InputBinding& input);
 
-uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
-
+uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -339,8 +345,9 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
                           uint32_t mip = 0, uint32_t array_index = 0,
                           bool sampler_dynamic = false);
 
+// sample is 0 (no id) for single-sampled images.
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
-                           uint32_t texel, uint32_t array_index);
+                           uint32_t texel, uint32_t array_index, uint32_t sample);
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
@@ -412,7 +419,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
-void EmitMemoryOffsets(EmitterState& state);
+void EmitMemoryBindings(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
@@ -430,6 +437,8 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
+// Slot word of an image heap byte offset; offsets past the heap select the null element.
+uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 
@@ -510,8 +519,6 @@ inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Typ
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
-
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);
 
@@ -519,8 +526,6 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
-
-inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
 
@@ -531,13 +536,18 @@ inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F3
 inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, uint32_t>;
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
+uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
-void DefineIndirectBufferFormats(ValueEmitContext& ctx);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
+void DefineTrinityBvhIntersect(EmitterState& state);
+uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32_t, 3>, 3>& positions,
+                         std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
+                         uint32_t remap, uint32_t triangle_id, uint32_t bary);
+void DefineTrinityFunctions(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.
@@ -582,6 +592,10 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
@@ -595,6 +609,7 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) return fn();
 	const auto then_label  = state.builder.AllocateId();
 	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();

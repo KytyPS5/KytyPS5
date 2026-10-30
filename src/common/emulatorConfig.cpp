@@ -105,8 +105,16 @@ bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
 
+bool StretchEnabled() {
+	return g_config->stretch_enabled;
+}
+
 bool VrEnabled() {
 	return g_config->vr_enabled;
+}
+
+bool Ps5ProEnabled() {
+	return g_config->pro_enabled;
 }
 
 bool AmdCpuEnabled() {
@@ -129,8 +137,16 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
+bool PsnEmulationEnabled() {
+	return g_config->psn_emulation_enabled;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
+}
+
+bool ShaderCacheEnabled() {
+	return g_config->shader_cache_enabled;
 }
 
 ShaderOptimizationType GetShaderOptimizationType() {
@@ -185,16 +201,20 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool ReadbackTiledImagesEnabled() {
+	return g_config->readback_tiled_images;
+}
+
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
-bool SupportZmaskEnabled() {
-	return g_config->support_zmask;
-}
-
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
+}
+
+bool OcclusionQueriesEnabled() {
+	return g_config->occlusion_queries_enabled;
 }
 
 bool TrophyEnabled() {

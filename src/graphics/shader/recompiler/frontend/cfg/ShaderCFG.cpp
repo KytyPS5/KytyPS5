@@ -8,6 +8,8 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <optional>
+#include <set>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -65,10 +67,6 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
 	}
-}
-
-bool IsRegister(const Decoder::Operand& operand, Decoder::OperandKind kind, uint32_t reg) {
-	return operand.kind == kind && operand.reg == reg;
 }
 
 bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
@@ -468,8 +466,10 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 2u, &entry_count)) {
 		return false;
 	}
+	// Code-table loads are not translated, so a selector that is also the load destination
+	// keeps its scaled index at the branch.
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}
@@ -512,24 +512,22 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 		return false;
 	}
 
-	const auto& setpc = program.instructions[setpc_index];
-	if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src0.kind != Decoder::OperandKind::Sgpr) {
+	const auto& setpc   = program.instructions[setpc_index];
+	uint32_t    pc_code = 0;
+	if (setpc.opcode != Opcode::S_SETPC_B64 || !ScalarOperandCode(setpc.src0, pc_code)) {
 		return false;
 	}
 
-	const auto pc_reg = setpc.src0.reg;
 	if (setpc_index >= 2u) {
 		const auto& arith = program.instructions[setpc_index - 1u];
 		const auto& getpc = program.instructions[setpc_index - 2u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
-		    getpc.dst.reg == pc_reg && arith.dst.kind == Decoder::OperandKind::Sgpr &&
-		    arith.dst.reg == pc_reg) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code) &&
+		    IsScalarCode(arith.dst, pc_code)) {
 			uint32_t imm  = 0;
 			bool     adds = arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_ADD_I32;
 			bool     subs = arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32;
 			if ((adds || subs) &&
-			    (IsRegister(arith.src0, Decoder::OperandKind::Sgpr, pc_reg) ||
-			     IsRegister(arith.src1, Decoder::OperandKind::Sgpr, pc_reg)) &&
+			    (IsScalarCode(arith.src0, pc_code) || IsScalarCode(arith.src1, pc_code)) &&
 			    (IsImmediate(arith.src0, imm) || IsImmediate(arith.src1, imm))) {
 				const auto base = InstructionEndPc(getpc);
 				target          = (adds ? base + imm : base - imm) & ~3u;
@@ -540,14 +538,14 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	if (setpc_index >= 1u) {
 		const auto& getpc = program.instructions[setpc_index - 1u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
-		    getpc.dst.reg == pc_reg) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code)) {
 			target = InstructionEndPc(getpc);
 			return true;
 		}
 	}
 
-	return false;
+	// Long jump: s_getpc_b64; s_add_u32 lo, imm; s_addc_u32 hi, 0.
+	return ResolvePcRelativeBase(program, setpc_index, pc_code, &target);
 }
 
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
@@ -1650,6 +1648,32 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 	SortUnique(graph.code_table_load_pcs);
 
+	if (!indirect_setpc && std::ranges::any_of(program.instructions, [](const auto& inst) {
+		    return inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
+		})) {
+		// Linked leaf bodies follow the caller in native PC order. Visit them in
+		// execution order so returning to the caller does not manufacture goto loops.
+		std::vector<bool> visited(graph.blocks.size(), false);
+		std::vector<std::pair<uint32_t, bool>> pending {{graph.entry_block, false}};
+		std::vector<BasicBlock> ordered;
+		ordered.reserve(graph.blocks.size());
+		while (!pending.empty()) {
+			const auto [id, finished] = pending.back();
+			pending.pop_back();
+			if (finished) {
+				ordered.push_back(std::move(graph.blocks[id]));
+				continue;
+			}
+			if (visited[id]) continue;
+			visited[id] = true;
+			pending.emplace_back(id, true);
+			for (const auto successor: graph.blocks[id].successors)
+				pending.emplace_back(successor, false);
+		}
+		std::ranges::reverse(ordered);
+		ApplyBlockOrder(graph, std::move(ordered));
+	}
+
 	RecomputeAnalyses(graph);
 
 	if (indirect_setpc) {
@@ -1680,34 +1704,61 @@ Graph Structurize(const Graph& graph) {
 	return GotoStructurizer(graph).Run();
 }
 
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
-	uint32_t destination = UINT32_MAX;
-	// Scalar ALU pair widths are not all decoded. The typed producer must confirm this word.
-	return InstructionWritesScalarCode(inst, code) ||
-	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {
+	// A vector lane mask (comparison or carry) spans wave_size / 32 SGPRs; a lane read writes one.
+	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
+	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
+	    inst.family == Decoder::Family::VOP3P) {
+		const bool lane_read =
+		    inst.opcode == Opcode::V_READLANE_B32 || inst.opcode == Opcode::V_READFIRSTLANE_B32;
+		const uint32_t size = lane_read ? 1u : wave_size / 32u;
+		uint32_t destination = 0;
+		for (const auto* operand: {&inst.dst, &inst.dst2})
+			if (ScalarOperandCode(*operand, destination) && code >= destination && code < destination + size)
+				return true;
+	}
+	return InstructionWritesScalarCode(inst, code);
 }
 
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+                              uint32_t before, uint32_t code, uint32_t wave_size,
+                              std::vector<uint32_t>& crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
-			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
-			if (MayWriteScalarRegister(inst, code)) return i;
-		}
-		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
+	std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, before}};
+	std::set<std::pair<uint32_t, uint32_t>> visited;
+	std::optional<uint32_t> definition;
+	while (!pending.empty()) {
+		const auto point = pending.back();
+		pending.pop_back();
+		if (!visited.insert(point).second) continue;
+		const auto* block = graph.FindBlock(point.first);
 		EXIT_IF(block == nullptr);
-		before = block->inst_end;
+		uint32_t index = UINT32_MAX;
+		for (uint32_t i = point.second; i > block->inst_begin;) {
+			const auto& inst = program.instructions[--i];
+			if (inst.opcode == Opcode::S_SWAPPC_B64) {
+				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code, wave_size));
+				crossed_calls.push_back(i);
+				continue;
+			}
+			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
+		}
+		if (index != UINT32_MAX || block->id == graph.entry_block) {
+			EXIT_IF(definition && *definition != index);
+			definition = index;
+			continue;
+		}
+		EXIT_IF(block->predecessors.empty());
+		for (const auto predecessor: block->predecessors) {
+			pending.emplace_back(predecessor, graph.blocks[predecessor].inst_end);
+		}
 	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+	EXIT_IF(!definition);
+	return *definition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

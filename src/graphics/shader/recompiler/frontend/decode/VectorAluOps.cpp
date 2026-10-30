@@ -35,7 +35,9 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x05u, Opcode::V_SUBREV_F32},
     {0x08u, Opcode::V_MUL_F32, Vop2SdwaProfile::Float32},
     {0x09u, Opcode::V_MUL_I32_I24, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x0au, Opcode::V_MUL_HI_I32_I24, Vop2SdwaProfile::IntegerPartialDestination},
     {0x0bu, Opcode::V_MUL_U32_U24, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x0cu, Opcode::V_MUL_HI_U32_U24, Vop2SdwaProfile::IntegerPartialDestination},
     {0x0fu, Opcode::V_MIN_F32},
     {0x10u, Opcode::V_MAX_F32},
     {0x11u, Opcode::V_MIN_I32, Vop2SdwaProfile::IntegerFullDestination},
@@ -157,6 +159,10 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x04u, Opcode::V_CVT_F64_I32},
     {0x0fu, Opcode::V_CVT_F32_F64},
     {0x10u, Opcode::V_CVT_F64_F32},
+    {0x11u, Opcode::V_CVT_F32_UBYTE0},
+    {0x12u, Opcode::V_CVT_F32_UBYTE1},
+    {0x13u, Opcode::V_CVT_F32_UBYTE2},
+    {0x14u, Opcode::V_CVT_F32_UBYTE3},
     {0x16u, Opcode::V_CVT_F64_U32},
     {0x17u, Opcode::V_TRUNC_F64},
     {0x18u, Opcode::V_CEIL_F64},
@@ -167,6 +173,7 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x07u, Opcode::V_CVT_U32_F32},
     {0x08u, Opcode::V_CVT_I32_F32},
     {0x0au, Opcode::V_CVT_F16_F32},
+    {0x0bu, Opcode::V_CVT_F32_F16},
     {0x0cu, Opcode::V_CVT_RPI_I32_F32},
     {0x0du, Opcode::V_CVT_FLR_I32_F32},
     {0x0eu, Opcode::V_CVT_OFF_F32_I4},
@@ -334,16 +341,20 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x152u, Opcode::V_MIN3_I32},
     {0x153u, Opcode::V_MIN3_U32},
     {0x351u, Opcode::V_MIN3_F16},
+    {0x352u, Opcode::V_MIN3_I16},
     {0x353u, Opcode::V_MIN3_U16},
     {0x154u, Opcode::V_MAX3_F32},
     {0x155u, Opcode::V_MAX3_I32},
     {0x156u, Opcode::V_MAX3_U32},
     {0x354u, Opcode::V_MAX3_F16},
+    {0x355u, Opcode::V_MAX3_I16},
+    {0x356u, Opcode::V_MAX3_U16},
     {0x157u, Opcode::V_MED3_F32},
     {0x158u, Opcode::V_MED3_I32},
     {0x159u, Opcode::V_MED3_U32},
     {0x357u, Opcode::V_MED3_F16},
     {0x358u, Opcode::V_MED3_I16},
+    {0x359u, Opcode::V_MED3_U16},
     {0x15du, Opcode::V_SAD_U32},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
@@ -354,6 +365,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x16cu, Opcode::V_MUL_HI_I32},
     {0x2ffu, Opcode::V_LSHLREV_B64},
     {0x300u, Opcode::V_LSHRREV_B64},
+    {0x301u, Opcode::V_ASHRREV_I64},
     {0x303u, Opcode::V_ADD_NC_U16},
     {0x304u, Opcode::V_SUB_NC_U16},
     {0x305u, Opcode::V_MUL_LO_U16},
@@ -370,6 +382,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x311u, Opcode::V_PACK_B32_F16},
     {0x314u, Opcode::V_LSHLREV_B16},
     {0x319u, Opcode::V_SUBREV_I32},
+    {0x340u, Opcode::V_MAD_U16},
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},
@@ -391,6 +404,8 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x377u, Opcode::V_PERMLANE16_B32},
     {0x378u, Opcode::V_PERMLANEX16_B32},
     {0x34bu, Opcode::V_FMA_F16},
+    {0x342u, Opcode::V_INTERP_P1LL_F16},
+    {0x35au, Opcode::V_INTERP_P2_F16},
     {0x36du, Opcode::V_ADD3_U32},
     {0x14fu, Opcode::V_ALIGNBYTE_B32},
 };
@@ -486,8 +501,10 @@ bool IsNativeVop3F16TernaryOpcode(Opcode opcode) {
 }
 
 bool IsNativeVop3B16TernaryOpcode(Opcode opcode) {
-	return opcode == Opcode::V_MIN3_U16 || opcode == Opcode::V_MED3_I16 ||
-	       opcode == Opcode::V_MAD_I16;
+	return opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MIN3_U16 ||
+	       opcode == Opcode::V_MAX3_I16 || opcode == Opcode::V_MAX3_U16 ||
+	       opcode == Opcode::V_MED3_I16 || opcode == Opcode::V_MED3_U16 ||
+	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16;
 }
 
 bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
@@ -1333,6 +1350,7 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::V_SUB_NC_I16:
 		case Opcode::V_LSHLREV_B64:
 		case Opcode::V_LSHRREV_B64:
+		case Opcode::V_ASHRREV_I64:
 		case Opcode::V_LSHLREV_B16:
 		case Opcode::V_LSHRREV_B16:
 		case Opcode::V_ASHRREV_I16:
@@ -1521,7 +1539,10 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 
 bool SupportsNativeVop3Clamp(Opcode opcode) {
 	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
-	       opcode == Opcode::V_MAD_I16;
+	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16 ||
+	       opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MAX3_I16 ||
+	       opcode == Opcode::V_MAX3_U16 || opcode == Opcode::V_MED3_U16 ||
+	       opcode == Opcode::V_MUL_HI_I32_I24 || opcode == Opcode::V_MUL_HI_U32_U24;
 }
 
 bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,
@@ -1552,7 +1573,20 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return clamp != 0u || omod != 0u || neg != 0u;
 	}
 	switch (opcode) {
+		case Opcode::V_MUL_HI_I32_I24:
+		case Opcode::V_MUL_HI_U32_U24:
+			// The high product fits in 32 bits, so clamp has no effect.
+			return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
+		case Opcode::V_CVT_F32_UBYTE0:
+		case Opcode::V_CVT_F32_UBYTE1:
+		case Opcode::V_CVT_F32_UBYTE2:
+		case Opcode::V_CVT_F32_UBYTE3:
+			// Byte conversions ignore input modifiers and support all output modifiers.
+			return op_sel != 0u;
+		case Opcode::V_INTERP_P1LL_F16:
+		case Opcode::V_INTERP_P2_F16:
+			return abs != 0u || (op_sel & 0x7u) != 0u || clamp != 0u || omod != 0u || neg != 0u;
 		case Opcode::V_CNDMASK_B32:
 			return (abs & ~0x3u) != 0u || op_sel != 0u || clamp != 0u || omod != 0u ||
 			       (neg & ~0x3u) != 0u;
@@ -1662,6 +1696,17 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NLT_F16: return true;
 		default: return false;
 	}
+}
+
+// VINTRP and VOP3 interpolation share one layout: src0 = I/J VGPR, src1 = attr, src2 = chan.
+void SetInterpolationAttribute(Instruction& inst, uint32_t attr, uint32_t chan) {
+	inst.src1.kind       = OperandKind::IntegerInlineConstant;
+	inst.src1.value      = attr;
+	inst.src1.signed_val = static_cast<int32_t>(attr);
+	inst.src2.kind       = OperandKind::IntegerInlineConstant;
+	inst.src2.value      = chan;
+	inst.src2.signed_val = static_cast<int32_t>(chan);
+	inst.src_count       = 3;
 }
 
 } // namespace
@@ -1828,6 +1873,15 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::V_NOP) {
 		inst.dst.kind  = OperandKind::Null;
 		inst.src_count = 0;
+		return;
+	}
+	if (inst.opcode == Opcode::V_INTERP_P1LL_F16 || inst.opcode == Opcode::V_INTERP_P2_F16) {
+		// SRC0 packs {attr_word, attr_chan, attr}; attr_word selects the high f16 of the dword.
+		DecodeVectorGpr(vdst, inst.dst);
+		DecodeScalarSource(src1, pc, inst.src0);
+		SetInterpolationAttribute(inst, src0 & 0x3fu, (src0 >> 6u) & 0x3u);
+		inst.src1.op_sel  = (src0 & 0x100u) != 0u;
+		inst.dst.sdwa_sel = (op_sel & 0x8u) != 0u ? 5u : 4u;
 		return;
 	}
 	if (compare_exec) {
@@ -2004,13 +2058,7 @@ void DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_ind
 	} else {
 		DecodeVectorGpr(vsrc, inst.src0);
 	}
-	inst.src1.kind       = OperandKind::IntegerInlineConstant;
-	inst.src1.value      = attr;
-	inst.src1.signed_val = static_cast<int32_t>(attr);
-	inst.src2.kind       = OperandKind::IntegerInlineConstant;
-	inst.src2.value      = chan;
-	inst.src2.signed_val = static_cast<int32_t>(chan);
-	inst.src_count       = 3;
+	SetInterpolationAttribute(inst, attr, chan);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

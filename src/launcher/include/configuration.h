@@ -21,10 +21,7 @@ inline QStringList EnumToList() {
 	auto        me    = QMetaEnum::fromType<T>();
 	int         count = me.keyCount();
 	for (int i = 0; i < count; i++) {
-		auto key = QString(me.key(i));
-		ret << (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit()
-		            ? key.remove('R').toLower()
-		            : key);
+		ret << QString(me.key(i));
 	}
 	return ret;
 }
@@ -32,16 +29,12 @@ inline QStringList EnumToList() {
 template <class T>
 T TextToEnum(const QString& text) {
 	auto me = QMetaEnum::fromType<T>();
-	return static_cast<T>(me.keyToValue(
-	    ((text.size() > 1 && text.at(0).isDigit()) ? 'R' + text.toUpper() : text).toUtf8().data()));
+	return static_cast<T>(me.keyToValue(text.toUtf8().constData()));
 }
 
 template <class T>
 QString EnumToText(T value) {
-	auto me  = QMetaEnum::fromType<T>();
-	auto key = QString(me.valueToKey(static_cast<int>(value)));
-	return (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit() ? key.remove('R').toLower()
-	                                                                     : key);
+	return QString(QMetaEnum::fromType<T>().valueToKey(static_cast<int>(value)));
 }
 
 struct ControllerSettings {
@@ -80,13 +73,10 @@ public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
 
-	enum class Resolution {
-		R1280X720,
-		R1920X1080,
-		R2560X1440,
-		R3840X2160,
-	};
-	Q_ENUM(Resolution)
+	static constexpr int MIN_SCREEN_SIZE = 320;
+	static constexpr int MAX_SCREEN_SIZE = 16384;
+
+	static QString NormalizeResolution(const QString& text);
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
@@ -102,21 +92,22 @@ public:
 
 	Configuration() = default;
 
-	QString    name;
-	QString    title_id;    /* Serial / title id from sce_sys/param.json */
-	QString    gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
-	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
-	QString    basedir;     /* Game base directory */
-	QString    game_path;   /* Launcher-unique game path */
-	QString    addons_dir;  /* Global setting; not saved per game. */
-	bool       custom_settings = false;
-	GameStatus game_status     = GameStatus::Unknown;
-	QString    game_comment;
+	QString     name;
+	QString     title_id;    /* Serial / title id from sce_sys/param.json */
+	QString     gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
+	QString     firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
+	QString     basedir;     /* Game base directory */
+	QString     game_path;   /* Launcher-unique game path */
+	QString     addons_dir;  /* Global setting; not saved per game. */
+	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
+	bool        custom_settings = false;
+	GameStatus  game_status     = GameStatus::Unknown;
+	QString     game_comment;
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
+	QString                screen_resolution           = QStringLiteral("1280x720");
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
@@ -125,15 +116,19 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
+	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   support_zmask               = false;
 	bool                   tessellation_enabled        = false;
+	bool                   occlusion_queries_enabled   = false;
+	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
+	bool                   psn_emulation_enabled       = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -147,6 +142,7 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
+	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
@@ -165,15 +161,19 @@ public:
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
+		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
+		readback_tiled_images       = other.readback_tiled_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
-		support_zmask               = other.support_zmask;
 		tessellation_enabled        = other.tessellation_enabled;
+		occlusion_queries_enabled   = other.occlusion_queries_enabled;
+		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
+		psn_emulation_enabled       = other.psn_emulation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -187,6 +187,7 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		pro_enabled                 = other.pro_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;

@@ -32,6 +32,7 @@ namespace AppContent {
 
 constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL = 3;
 constexpr int      APP_CONTENT_ERROR_PARAMETER        = -2133262334; /* 0x80D90002 */
+constexpr int      APP_CONTENT_ERROR_BUSY             = -2133262333; /* 0x80D90003 */
 constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED      = -2133262332; /* 0x80D90004 */
 constexpr int      APP_CONTENT_ERROR_NOT_FOUND        = -2133262331; /* 0x80D90005 */
 constexpr int      APP_CONTENT_ERROR_MOUNT_FULL       = -2133262330; /* 0x80D90006 */
@@ -210,10 +211,8 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 
 	for (const auto& m: g_addcont_mounts) {
 		if (m.label == entry->entitlement_label) {
-			const auto guest_point = m.point.substr(0, m.point.size() - 1);
-			std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
-			LOGF("\t already mounted %s\n", guest_point.c_str());
-			return OK;
+			LOGF("\t already mounted %s\n", m.point.c_str());
+			return APP_CONTENT_ERROR_BUSY;
 		}
 	}
 

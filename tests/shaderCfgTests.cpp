@@ -2169,7 +2169,8 @@ void TestOrderedPsDoneEndsProgram() {
 void TestCallTableExpansionLongBranches() {
   // A call through a 10-row table whose targets are 4000-word functions: the returns to the
   // caller are beyond a 16-bit branch offset (Wolverine's CS 0xe6d76d24f59f8015 has 20 such
-  // targets). They must decode as long branches, not as islands inside other bodies.
+  // targets). They must decode as long branches, not as islands inside other bodies, and one
+  // decision tree serves both SCC values unless a target may read the SCC of the call.
   using namespace ShaderRecompiler::Decoder;
   constexpr uint64_t TableAddress = 0x100000000ull;
   constexpr uint64_t FunctionBase = 0x200000000ull;
@@ -2211,6 +2212,9 @@ void TestCallTableExpansionLongBranches() {
     const bool ok = expander.Expand(shader, 0x300000000ull, user_data, read, expanded, reason, 32u);
     Check(ok, ("the call table did not expand: " + reason).c_str());
     Check(!expander.LongBranches().empty(), "the far returns gave no long branches");
+    Check(expander.Bodies().size() == (reads_scc ? 2u : 1u) * Targets,
+          reads_scc ? "a target reading SCC lost its second decision tree"
+                    : "targets that never read SCC kept a decision tree per SCC value");
     Program decoded;
     DecodeProgram(expanded, decoded, expander.LongBranches());
     // Every return of a body reaches the code after the inlined call (the S_ENDPGM), directly.

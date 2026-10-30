@@ -49,6 +49,124 @@ struct Function {
 	std::vector<Instruction> instructions;
 };
 
+bool ReadsScc(const Instruction& inst) {
+	switch (inst.opcode) {
+		case Opcode::S_CSELECT_B32:
+		case Opcode::S_CSELECT_B64:
+		case Opcode::S_CMOV_B64:
+		case Opcode::S_ADDC_U32:
+		case Opcode::S_SUBB_U32:
+		case Opcode::S_CBRANCH_SCC0:
+		case Opcode::S_CBRANCH_SCC1: return true;
+		default: break;
+	}
+	for (const auto* operand: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
+		if (operand->kind == OperandKind::Scc) return true;
+	}
+	return false;
+}
+
+// Whether the instruction always writes SCC. Instructions missing here count as preserving it,
+// which can only keep an SCC live, never drop a live one.
+bool WritesScc(const Instruction& inst) {
+	if (inst.family == Family::SOPC) return true;
+	if (inst.family != Family::SOP1 && inst.family != Family::SOP2 && inst.family != Family::SOPK)
+		return false;
+	switch (inst.opcode) {
+		case Opcode::S_ADD_U32:
+		case Opcode::S_SUB_U32:
+		case Opcode::S_ADD_I32: // also S_ADDK_I32
+		case Opcode::S_SUB_I32:
+		case Opcode::S_ADDC_U32:
+		case Opcode::S_SUBB_U32:
+		case Opcode::S_MIN_I32:
+		case Opcode::S_MIN_U32:
+		case Opcode::S_MAX_I32:
+		case Opcode::S_MAX_U32:
+		case Opcode::S_AND_B32:
+		case Opcode::S_AND_B64:
+		case Opcode::S_OR_B32:
+		case Opcode::S_OR_B64:
+		case Opcode::S_XOR_B32:
+		case Opcode::S_XOR_B64:
+		case Opcode::S_ANDN2_B32:
+		case Opcode::S_ANDN2_B64:
+		case Opcode::S_ORN2_B32:
+		case Opcode::S_ORN2_B64:
+		case Opcode::S_NAND_B32:
+		case Opcode::S_NAND_B64:
+		case Opcode::S_NOR_B32:
+		case Opcode::S_NOR_B64:
+		case Opcode::S_XNOR_B32:
+		case Opcode::S_XNOR_B64:
+		case Opcode::S_LSHL_B32:
+		case Opcode::S_LSHL_B64:
+		case Opcode::S_LSHR_B32:
+		case Opcode::S_LSHR_B64:
+		case Opcode::S_ASHR_I32:
+		case Opcode::S_ASHR_I64:
+		case Opcode::S_BFE_U32:
+		case Opcode::S_BFE_I32:
+		case Opcode::S_BFE_U64:
+		case Opcode::S_ABSDIFF_I32:
+		case Opcode::S_LSHL1_ADD_U32:
+		case Opcode::S_LSHL2_ADD_U32:
+		case Opcode::S_LSHL3_ADD_U32:
+		case Opcode::S_LSHL4_ADD_U32:
+		case Opcode::S_NOT_B32:
+		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B32:
+		case Opcode::S_WQM_B64:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_BCNT1_I32_B32:
+		case Opcode::S_BCNT1_I32_B64:
+		case Opcode::S_AND_SAVEEXEC_B32:
+		case Opcode::S_AND_SAVEEXEC_B64:
+		case Opcode::S_ORN2_SAVEEXEC_B32:
+		case Opcode::S_ORN2_SAVEEXEC_B64:
+		case Opcode::S_ANDN1_SAVEEXEC_B32:
+		case Opcode::S_ANDN1_SAVEEXEC_B64:
+		case Opcode::S_QUADMASK_B32:
+		case Opcode::S_QUADMASK_B64:
+		case Opcode::S_ABS_I32: return true;
+		default: return false;
+	}
+}
+
+// Whether the SCC on entry to instructions[first] can be read: some path from there reaches an
+// SCC read before an SCC write. A return (S_SETPC_B64) gives `at_return`, a call or anything else
+// that leaves the instructions `true`; S_ENDPGM ends a path.
+bool SccLiveAt(const std::vector<Instruction>& instructions, size_t first, bool at_return) {
+	std::map<uint32_t, size_t> index_of_pc;
+	for (size_t i = 0; i < instructions.size(); i++)
+		index_of_pc[instructions[i].pc] = i;
+	std::vector<bool>   visited(instructions.size(), false);
+	std::vector<size_t> pending {first};
+	while (!pending.empty()) {
+		const auto at = pending.back();
+		pending.pop_back();
+		if (at >= instructions.size()) return true;
+		if (visited[at]) continue;
+		visited[at] = true;
+		const auto& inst = instructions[at];
+		if (ReadsScc(inst) || IsCall(inst.raw[0])) return true;
+		if (inst.opcode == Opcode::S_SETPC_B64) {
+			if (at_return) return true;
+			continue;
+		}
+		if (WritesScc(inst) || inst.opcode == Opcode::S_ENDPGM) continue;
+		if (IsDirectBranch(inst.opcode)) {
+			const auto target = index_of_pc.find(inst.branch_target);
+			if (target == index_of_pc.end()) return true;
+			pending.push_back(target->second);
+			if (inst.opcode == Opcode::S_BRANCH) continue;
+		}
+		pending.push_back(at + 1u);
+	}
+	return false;
+}
+
 bool ReadFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader& read,
                   Function& function, std::string& reason, uint32_t wave_size) {
 	uint32_t next            = 0;
@@ -554,13 +672,22 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				return true;
 			};
 			if (call.dynamic) {
-				// SWAPPC preserves SCC. Keep separate decision trees and callee
-				// bodies for its two incoming values, without borrowing a guest SGPR.
+				// SWAPPC preserves SCC, which the decision tree's compares overwrite. When a
+				// target, or the caller after a target that leaves SCC untouched, may read it,
+				// keep separate decision trees and callee bodies for its two incoming values
+				// (without borrowing a guest SGPR); otherwise one tree serves both.
 				// Group by the high address word so each low-word comparison has
 				// one failure edge, rather than two branches sharing a later arm.
+				const auto call_index = static_cast<size_t>(
+				    std::ranges::find(program.instructions, inst.pc, &Instruction::pc) -
+				    program.instructions.begin());
+				const bool after_call = SccLiveAt(program.instructions, call_index + 1u, true);
+				const bool keep_scc   = std::ranges::any_of(call.targets, [&](const CallTarget& target) {
+					return SccLiveAt(target.function.instructions, 0, after_call);
+				});
 				const auto select_scc = static_cast<uint32_t>(result.size());
-				result.push_back(0xbf850000u);
-				for (uint32_t scc = 0; scc < 2; ++scc) {
+				if (keep_scc) result.push_back(0xbf850000u);
+				for (uint32_t scc = 0; scc < (keep_scc ? 2u : 1u); ++scc) {
 					if (scc != 0) relocations.emplace_back(select_scc, result.size());
 					std::map<uint32_t, std::vector<const CallTarget*>> groups;
 					for (const auto& target: call.targets)
@@ -575,7 +702,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 							result.push_back(static_cast<uint32_t>(target->address));
 							const auto low_miss = static_cast<uint32_t>(result.size());
 							result.push_back(0xbf840000u);
-							result.push_back(scc != 0 ? 0xbf068080u : 0xbf068180u);
+							if (keep_scc) result.push_back(scc != 0 ? 0xbf068080u : 0xbf068180u);
 							if (!emit_target(*target)) return false;
 							relocations.emplace_back(low_miss, result.size());
 						}

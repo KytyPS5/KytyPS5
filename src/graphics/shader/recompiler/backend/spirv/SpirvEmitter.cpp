@@ -310,6 +310,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
 		}
+		if (image.heap) continue;
 		if (image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
 			Fail(program, "native shader plan has an invalid image mip descriptor count");
@@ -384,6 +385,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",
 		              program.shader_hash);
 		state.debug_source = state.builder.AddString(name);
+		state.builder.EnableNames();
 	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =

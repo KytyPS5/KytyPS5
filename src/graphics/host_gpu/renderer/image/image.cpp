@@ -30,15 +30,17 @@ namespace {
 	}
 }
 
-[[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
-                                                   const ImageInfo& info) {
+[[nodiscard]] vk::ImageCreateFlags
+ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::ImageUsageFlags usage) {
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
-		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
 		if (info.IsBlock() && graphics.host.capabilities.block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
 		}
+	}
+	if (usage & vk::ImageUsageFlagBits::eStorage) {
+		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
 	}
 	if (info.IsVolume()) {
 		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
@@ -59,7 +61,7 @@ namespace {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
 			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
 			                                      vk::ImageTiling::eOptimal, storage,
-			                                      ImageCreateFlags(graphics, info),
+			                                      ImageCreateFlags(graphics, info, storage),
 			                                      nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
@@ -88,11 +90,12 @@ namespace {
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
 	}
-	if (info.samples == 1) {
+	if (graphics.GetPhysicalDeviceProperties().limits.storageImageSampleCounts &
+	    static_cast<vk::SampleCountFlagBits>(info.samples)) {
 		const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
 		if (graphics.GetImageFormatProperties(
 		        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, storage,
-		        ImageCreateFlags(graphics, info), nullptr) == vk::Result::eSuccess) {
+		        ImageCreateFlags(graphics, info, storage), nullptr) == vk::Result::eSuccess) {
 			usage = storage;
 		}
 	}
@@ -254,6 +257,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
+	// Resident heaps sample their images in the read state; only leaving it invalidates them.
+	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
+		    return barrier.oldLayout == ReadLayout() &&
+		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+	    })) {
+		HeapChanged();
+	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
@@ -463,15 +473,15 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
 	const bool copy = source.backing.samples == 1;
-	EXIT_IF(layers == 0 || info.extent.width > source_width || info.extent.height > source_height ||
-	        info.extent.width > destination_width || info.extent.height > destination_height ||
+	EXIT_IF(layers == 0 ||
 	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
 	              : source.backing.format != backing.format));
 	auto resolved_source_range             = source_range;
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
-	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
+	const vk::Extent3D resolve_extent {std::min(source_width, destination_width),
+	                                   std::min(source_height, destination_height), 1};
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
@@ -752,7 +762,8 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	vk::ImageCreateInfo create {};
-	create.flags         = ImageCreateFlags(graphics, info);
+	create.usage         = ImageUsageFlags(graphics, info);
+	create.flags         = ImageCreateFlags(graphics, info, create.usage);
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
 	create.mipLevels     = info.resources.levels;
@@ -760,7 +771,6 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = ImageUsageFlags(graphics, info);
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};

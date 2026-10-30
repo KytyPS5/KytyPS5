@@ -30,6 +30,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/httpOfflineServices.h"
@@ -484,7 +485,7 @@ Network::Id Network::HttpCreateTemplate(Id http_ctx_id, const char* user_agent, 
 		HttpTemplate tn {};
 		tn.used               = true;
 		tn.http_ver           = http_ver;
-		tn.user_agent         = std::string(user_agent);
+		tn.user_agent         = user_agent != nullptr ? user_agent : "";
 		tn.is_auto_proxy_conf = is_auto_proxy_conf;
 		tn.http_ctx_id        = http_ctx_id.GetId();
 		tn.nonblock           = false;
@@ -2805,12 +2806,23 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
 	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
+	std::vector<std::pair<void*, int>> ready_files;
 	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
 		const bool read = GuestFdIsSet(readfds, fd);
 		const bool write = GuestFdIsSet(writefds, fd);
 		const bool except = GuestFdIsSet(exceptfds, fd);
 		if (!read && !write && !except) {
+			continue;
+		}
+		// FreeBSD polls files and devices ready to read and write at once.
+		if (!IsSocket(fd) && LibKernel::FileSystem::IsOpenDescriptor(fd)) {
+			if (read) {
+				ready_files.emplace_back(readfds, fd);
+			}
+			if (write) {
+				ready_files.emplace_back(writefds, fd);
+			}
 			continue;
 		}
 		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
@@ -2864,6 +2876,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		host_timeout.tv_usec = static_cast<decltype(host_timeout.tv_usec)>(guest_timeout->tv_usec);
 		host_timeout_ptr = &host_timeout;
 	}
+	if (!ready_files.empty()) {
+		host_timeout     = {};
+		host_timeout_ptr = &host_timeout;
+	}
 
 	int result = 0;
 #if defined(_WIN32)
@@ -2899,6 +2915,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			GuestFdSet(exceptfds, fd);
 			result++;
 		}
+	}
+	for (const auto& [fds, fd]: ready_files) {
+		GuestFdSet(fds, fd);
+		result++;
 	}
 	return result;
 }
@@ -4229,6 +4249,11 @@ struct NpCountryCode {
 	char padding[1];
 };
 
+struct NpLanguageCode {
+	char code[36];
+	char padding[12];
+};
+
 struct NpAgeRestriction {
 	NpCountryCode country_code;
 	int8_t        age;
@@ -4283,14 +4308,24 @@ constexpr int      np_error_aborted                     = -2141913070; /* 0x8055
 constexpr int      np_error_request_max                 = -2141913069; /* 0x80550013 */
 constexpr int      np_error_request_not_found           = -2141913068; /* 0x80550014 */
 constexpr int      np_error_invalid_id                  = -2141913067; /* 0x80550015 */
+constexpr int      np_error_network_not_available       = -2141872086; /* 0x8055a02a */
 constexpr int      np_request_max                       = 128;
 constexpr uint32_t np_state_signed_out                  = 1;
 constexpr uint32_t np_state_signed_in                   = 2;
 
-// EXPERIMENT: KYTY_PSN_SIGNED_IN=1 makes the local user look signed in to the network.
-static bool NpFakeSignedIn() {
-	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || EaEmulation::SignedInForTitle();
-	return enabled;
+// A simulated account belongs only to the primary user and survives network loss. A title whose
+// servers the emulator answers itself (libs/eaEmulation) has one too.
+bool IsSignedIn(int user_id) {
+	return (Config::PsnEmulationEnabled() || EaEmulation::SignedInForTitle()) &&
+	       user_id == Config::GetUserId();
+}
+
+static int np_reachability_result(int user_id) {
+	if (!IsSignedIn(user_id)) {
+		return np_error_signed_out;
+	}
+	// This is an explicit compatibility simulation, not a connection to PSN.
+	return NetCtl::NetCtlConnected() ? OK : np_error_network_not_available;
 }
 
 struct NpStateCallback {
@@ -4351,12 +4386,7 @@ static NpRequest* np_get_request_locked(int req_id) {
 	return &g_np_requests[index];
 }
 
-static int np_complete_signed_out_locked(NpRequest* request) {
-	if (NpFakeSignedIn() && request->state == NpRequestState::Ready) {
-		request->state  = NpRequestState::Complete;
-		request->result = OK;
-		return OK;
-	}
+static int np_complete_locked(NpRequest* request, int result) {
 	if (request->state == NpRequestState::Complete) {
 		request->result = np_error_invalid_argument;
 		return np_error_invalid_argument;
@@ -4367,9 +4397,9 @@ static int np_complete_signed_out_locked(NpRequest* request) {
 	}
 
 	request->state  = NpRequestState::Complete;
-	request->result = np_error_signed_out;
+	request->result = result;
 
-	return (request->async ? OK : np_error_signed_out);
+	return (request->async ? OK : result);
 }
 
 int KYTY_SYSV_ABI NpCheckCallback() {
@@ -4383,7 +4413,8 @@ int KYTY_SYSV_ABI NpCheckCallback() {
 		}
 	}
 	for (const auto& entry: pending) {
-		entry.callback(Config::GetUserId(), NpFakeSignedIn() ? np_state_signed_in : np_state_signed_out,
+		entry.callback(Config::GetUserId(),
+		               IsSignedIn(Config::GetUserId()) ? np_state_signed_in : np_state_signed_out,
 		               entry.userdata);
 	}
 
@@ -4479,13 +4510,10 @@ int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
 
 	EXIT_NOT_IMPLEMENTED(np_id == nullptr);
 
-	// int s = snprintf(np_id->handle.data, 16, "Kyty");
-	// EXIT_NOT_IMPLEMENTED(s >= 16);
-	// np_id->handle.term = 0;
 	std::memset(np_id, 0, sizeof(*np_id));
 
-	if (NpFakeSignedIn()) {
-		std::snprintf(np_id->handle.data, sizeof(np_id->handle.data), "KytyPlayer");
+	if (IsSignedIn(user_id)) {
+		std::memcpy(np_id->handle.data, "Kyty", 4);
 		return OK;
 	}
 
@@ -4499,13 +4527,10 @@ int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
 
 	EXIT_NOT_IMPLEMENTED(online_id == nullptr);
 
-	// int s = snprintf(online_id->data, 16, "Kyty");
-	// EXIT_NOT_IMPLEMENTED(s >= 16);
-	// online_id->term = 0;
 	std::memset(online_id, 0, sizeof(*online_id));
 
-	if (NpFakeSignedIn()) {
-		std::snprintf(online_id->data, sizeof(online_id->data), "KytyPlayer");
+	if (IsSignedIn(user_id)) {
+		std::memcpy(online_id->data, "Kyty", 4);
 		return OK;
 	}
 
@@ -4519,10 +4544,9 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 
 	EXIT_NOT_IMPLEMENTED(account_id == nullptr);
 
-	// *account_id = 0x00000000feedfaceull;
 	*account_id = 0;
 
-	if (NpFakeSignedIn()) {
+	if (IsSignedIn(user_id)) {
 		*account_id = 0x00000000feedfaceull;
 		return OK;
 	}
@@ -4539,9 +4563,9 @@ int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
 
 	auto* code = static_cast<NpCountryCode*>(country_code);
 	std::memset(code, 0, sizeof(*code));
-	if (NpFakeSignedIn()) {
-		code->data[0] = 'u';
-		code->data[1] = 's';
+
+	if (IsSignedIn(user_id)) {
+		std::memcpy(code->data, "US", 2);
 		return OK;
 	}
 
@@ -4559,14 +4583,14 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 		return np_error_invalid_argument;
 	}
 
-	*age = 0;
-
-	if (NpFakeSignedIn()) {
-		*age = 21;
-		return OK;
+	std::lock_guard lock(g_np_request_mutex);
+	auto* request = np_get_request_locked(req_id);
+	if (request == nullptr) {
+		return np_error_request_not_found;
 	}
 
-	return np_error_signed_out;
+	*age = IsSignedIn(user_id) ? 21 : 0;
+	return np_complete_locked(request, IsSignedIn(user_id) ? OK : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_code) {
@@ -4582,11 +4606,17 @@ int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_
 
 	std::lock_guard lock(g_np_request_mutex);
 
-	if (np_get_request_locked(req_id) == nullptr) {
+	auto* request = np_get_request_locked(req_id);
+	if (request == nullptr) {
 		return np_error_request_not_found;
 	}
 
-	return np_error_signed_out;
+	auto* code = static_cast<NpLanguageCode*>(language_code);
+	std::memset(code, 0, sizeof(*code));
+	if (IsSignedIn(user_id)) {
+		std::memcpy(code->code, "en-US", 5);
+	}
+	return np_complete_locked(request, IsSignedIn(user_id) ? OK : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCreateRequest() {
@@ -4685,8 +4715,9 @@ int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* resu
 		return np_error_request_not_found;
 	}
 
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_locked(request, std::strcmp(user, "Kyty") == 0
+	                                       ? np_reachability_result(Config::GetUserId())
+	                                       : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
@@ -4708,8 +4739,7 @@ int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
 		return np_error_request_not_found;
 	}
 
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_locked(request, np_reachability_result(user_id));
 }
 
 int KYTY_SYSV_ABI NpPollAsync(int req_id, int* result) {
@@ -4766,23 +4796,10 @@ int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* para
 		return np_error_request_not_found;
 	}
 
-	if (request->state == NpRequestState::Complete) {
-		request->result = np_error_invalid_argument;
-		return np_error_invalid_argument;
-	}
-
-	if (request->state == NpRequestState::Aborted) {
-		return np_error_aborted;
-	}
-
 	std::memset(result, 0, sizeof(*result));
-	// result->authorized = true;
 
-	// request->state  = NpRequestState::Complete;
-	// request->result = OK;
-
-	// return OK;
-	return np_complete_signed_out_locked(request);
+	// The simulated account has no premium eligibility.
+	return np_complete_locked(request, np_reachability_result(param->user_id));
 }
 
 int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
@@ -4792,7 +4809,7 @@ int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*state = NpFakeSignedIn() ? np_state_signed_in : np_state_signed_out;
+	*state = IsSignedIn(user_id) ? np_state_signed_in : np_state_signed_out;
 
 	return OK;
 }
@@ -4806,8 +4823,7 @@ int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	// 2: SCE_NP_REACHABILITY_STATE_REACHABLE, 0: SCE_NP_REACHABILITY_STATE_UNAVAILABLE
-	*state = NpFakeSignedIn() ? 2 : 0;
+	*state = np_reachability_result(user_id) == OK ? 2 : 0; // REACHABLE / UNAVAILABLE
 
 	return OK;
 }
@@ -4821,7 +4837,7 @@ int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*has_signed_up = NpFakeSignedIn();
+	*has_signed_up = IsSignedIn(user_id);
 
 	return OK;
 }

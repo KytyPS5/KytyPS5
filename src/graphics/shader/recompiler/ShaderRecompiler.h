@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
@@ -21,7 +22,6 @@ struct CompileOptions {
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
-	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
@@ -94,6 +94,7 @@ struct ShaderSource {
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
 
+[[nodiscard]] const char* StageName(ShaderType stage);
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

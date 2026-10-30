@@ -1,6 +1,7 @@
 #include "graphics/shader/triangleVertexValueShader.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -44,8 +45,8 @@ struct Interface {
 Interface GetInterface(const ShaderVertexInputInfo& vertex_info,
                        const ShaderPixelInputInfo& pixel_info, bool provoking_vertex_last) {
 	EXIT_IF(pixel_info.input_num > ShaderVertexInputInfo::RES_MAX);
-	EXIT_IF(pixel_info.stage.program == nullptr || vertex_info.stage.program == nullptr);
-	const auto& vertex_program = *vertex_info.stage.program;
+	EXIT_IF(pixel_info.stage.module == nullptr || vertex_info.stage.module == nullptr);
+	const auto& vertex_program = vertex_info.stage.module->info;
 
 	for (const auto& output: vertex_program.info.outputs) {
 		// These would have to pass through both shaders too. No draw has needed it yet.
@@ -56,7 +57,7 @@ Interface GetInterface(const ShaderVertexInputInfo& vertex_info,
 	}
 
 	std::vector<uint32_t> active_inputs;
-	for (const auto& input: pixel_info.stage.program->info.inputs) {
+	for (const auto& input: pixel_info.stage.module->info.info.inputs) {
 		if (input.kind == IR::StageInputKind::Parameter) {
 			active_inputs.push_back(input.location);
 		}
@@ -68,7 +69,7 @@ Interface GetInterface(const ShaderVertexInputInfo& vertex_info,
 	interface.provoking_last = provoking_vertex_last;
 	uint32_t used            = 0;
 	uint32_t per_vertex      = 0;
-	for (const auto& input: pixel_info.stage.program->info.inputs) {
+	for (const auto& input: pixel_info.stage.module->info.info.inputs) {
 		if (input.kind != IR::StageInputKind::Parameter) {
 			continue;
 		}
@@ -379,8 +380,8 @@ private:
 } // namespace
 
 bool ShaderPixelReadsVertexValues(const ShaderPixelInputInfo& pixel_info) {
-	EXIT_IF(pixel_info.stage.program == nullptr);
-	for (const auto& input: pixel_info.stage.program->info.inputs) {
+	EXIT_IF(pixel_info.stage.module == nullptr);
+	for (const auto& input: pixel_info.stage.module->info.info.inputs) {
 		if (input.kind == IR::StageInputKind::Parameter && input.per_vertex) {
 			return true;
 		}

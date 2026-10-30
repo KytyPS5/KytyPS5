@@ -54,7 +54,8 @@ public:
 	// KYTY_GPU_PROFILE: the host GPU's time of each draw and dispatch, added up by `key` (its
 	// programs) and printed now and then. Begin and End go around one draw or dispatch.
 	[[nodiscard]] static bool GpuProfileEnabled();
-	void                      GpuProfileBegin();
+	// count_samples: false while another occlusion query is open (Vulkan allows one at a time).
+	void                      GpuProfileBegin(bool count_samples = true);
 	void                      GpuProfileEnd(uint64_t key);
 	// The guest shader hash of a program id, for the profile's report.
 	static void NoteProgramHash(uint64_t program_id, uint64_t guest_hash);
@@ -168,6 +169,7 @@ private:
 	};
 	vk::QueryPool                                m_profile_pool = nullptr;
 	vk::QueryPool                                m_profile_occ = nullptr;
+	bool                                         m_profile_counts_samples = false;
 	vk::QueryPool                                m_profile_stats = nullptr;
 	std::unordered_map<uint64_t, std::array<uint64_t, 3>> m_profile_stat_totals;
 	std::unordered_map<uint64_t, uint64_t>       m_profile_samples;

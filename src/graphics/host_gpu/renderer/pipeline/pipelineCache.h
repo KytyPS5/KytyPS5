@@ -1,47 +1,51 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
-#include "common/fileLock.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/pipelineUse.h"
-#include "graphics/host_gpu/renderer/pipeline/programList.h"
+#include "common/file.h"
+#include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
-#include <array>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
-#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#include <optional>
+#include <queue>
 #include <span>
 #include <thread>
 #include <type_traits>
-#include <cstdio>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
 
 struct GraphicContext;
-struct RenderColorInfo;
-struct RenderDepthInfo;
+struct ShaderParams;
 class CommandBuffer;
 
-namespace HW {
-class Context;
-class Shader;
-class UserConfig;
-struct ComputeShaderInfo;
-} // namespace HW
+namespace ShaderRecompiler {
+struct CompileOptions;
+struct ShaderSource;
+struct TranslateResult;
+} // namespace ShaderRecompiler
+
+namespace ShaderRecompiler::IR {
+class ImageHeapSource;
+} // namespace ShaderRecompiler::IR
+
+namespace ShaderRecompiler::Spirv {
+struct Profile;
+} // namespace ShaderRecompiler::Spirv
 
 #pragma pack(push, 1)
 
@@ -49,13 +53,13 @@ struct PipelineStaticParameters {
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
+	// 0 without tessellation, 3 for a rectangle list, else the input control points.
+	uint32_t                   patch_control_points     = 0;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
+	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
 	bool                       provoking_vtx_last                                 = false;
 	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
 	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
@@ -66,251 +70,228 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
-
-	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
-
-#pragma pack(pop)
-
-static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
-static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
-static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 116);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
-
-	bool operator==(const PipelineRenderingState&) const = default;
 };
 
 struct PipelineVertexInputState {
 	struct Binding {
-		uint32_t stride                           = 0;
-		bool     instance                         = false;
-		bool     operator==(const Binding&) const = default;
+		uint32_t stride   = 0;
+		uint8_t  instance = 0;
 	};
 	struct Attribute {
-		uint32_t offset                             = 0;
-		uint8_t  binding                            = 0;
-		bool     operator==(const Attribute&) const = default;
+		uint32_t offset  = 0;
+		uint8_t  binding = 0;
 	};
 
 	std::array<Binding, ShaderVertexInputInfo::RES_MAX>   bindings {};
 	std::array<Attribute, ShaderVertexInputInfo::RES_MAX> attributes {};
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
-
-	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
-struct ShaderProgram {
-	uint64_t         id     = 0;
-	vk::ShaderModule module = nullptr;
-	// An emulated mesh program: `module` is its compute shader, and this draws what it wrote.
-	vk::ShaderModule mesh_vertex_module = nullptr;
-	uint32_t         mesh_slot_words    = 0;
+// Everything a graphics pipeline is made of besides the stage modules its ids name. Aligned so
+// that rendering.color_formats can be passed to Vulkan.
+struct alignas(4) GraphicsPipelineKey {
+	// VS, LS or mesh; HS; TES; PS. 0 marks an absent stage.
+	std::array<uint64_t, 4>  stage_ids {};
+	PipelineRenderingState   rendering;
+	PipelineVertexInputState vertex_input;
+	PipelineStaticParameters static_params;
 
-	explicit operator bool() const { return id != 0 && module != nullptr; }
+	bool operator==(const GraphicsPipelineKey& other) const;
+};
+
+#pragma pack(pop)
+
+// Keys are compared and hashed as bytes.
+static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
+
+// A compiled stage with what pipeline creation needs from it besides the key.
+struct ShaderModule {
+	uint64_t                                     id     = 0;
+	vk::ShaderModule                             module = nullptr;
+	ShaderRecompiler::IR::CompiledShaderInfo     info;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	std::vector<uint32_t>                        function_code;
+	// VS or LS: the host format of each vertex input attribute.
+	std::vector<vk::Format>                      vertex_formats;
+	// Rectangle-list PS: the parameters it reads.
+	std::vector<RectListParameter>               rect_parameters;
+};
+
+// A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
+struct DrawRenderState {
+	RenderDepthInfo                      depth_info;
+	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t                             color_count                              = 0;
+	// Color targets the pixel program writes.
+	uint32_t                             mrt_mask                                 = 0;
+	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
+	bool                                 primitive_restart_enable                 = false;
+	bool                                 ps_active                                = false;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	ShaderPixelInputInfo                 ps_input_info;
+	// Input: the user-data slots a GPU-read indirect draw patches.
+	ShaderIndirectOffsets                indirect_offsets;
+	bool                                 indirect_draw = false;
+
+	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
+		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
+	}
+};
+
+// Writes the shader store on its own thread, running jobs in the order they were posted.
+class ShaderStoreWriter {
+public:
+	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`. The
+	// thread runs only if that succeeded.
+	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
+	explicit operator bool() const { return m_thread.joinable(); }
+	// Compresses `record` and appends it on the store thread, in call order.
+	void Append(std::vector<uint8_t>&& record);
+
+private:
+	friend struct PipelineCacheTestAccess;
+
+	void Post(Common::UniqueFunction<void>&& job);
+
+	Common::File                             m_file;
+	std::mutex                               m_mutex;
+	std::condition_variable_any              m_ready;
+	std::queue<Common::UniqueFunction<void>> m_jobs;
+	// Declared last, so it drains the queue and joins before the rest is destroyed.
+	std::jthread m_thread;
 };
 
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	// Without a shader store path nothing is kept across runs.
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
+	              const std::filesystem::path& shader_store = {});
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
-	// For the window title. Safe to read without the renderer's lock.
-	[[nodiscard]] const AheadBuildProgress& BuiltAhead() const { return m_built_ahead; }
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
-		// The stages of the one push constant range of the layout. Every push to the layout names
-		// exactly these stages (VUID-vkCmdPushConstants-offset-01796).
-		vk::ShaderStageFlags push_constant_stages;
-		// An emulated mesh draw first runs this compute pipeline, with its own layout over the same
-		// descriptor set layout, and `pipeline` then draws what it wrote.
-		vk::Pipeline       mesh_compute        = nullptr;
-		vk::PipelineLayout mesh_compute_layout = nullptr;
-		uint32_t           mesh_slot_words     = 0;
+		bool                    uses_image_heap       = false;
+		// The stages the push constant range names: a push must name all of them.
+		vk::ShaderStageFlags    push_constant_stages;
 	};
 
-	struct GraphicsPrograms {
-		std::array<ShaderProgram, 3> vertex;
-		ShaderProgram pixel;
+	// Reads the shaders and registers bound in `command` into the state's shader stages.
+	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// Null skips the dispatch.
+	// push_data_start: PushData::NoStart keeps the shader data out of the push constants (an
+	// indirect dispatch in thread dimensions, whose data the GPU writes).
+	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
+	                                      ShaderComputeInputInfo&      input_info,
+	                                      uint32_t                     push_data_start = 0);
 
-		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
-	};
-
-	// Where the program lookups of one draw put each stage's resources. Without it a stage's
-	// resources live with its program, and the next draw of the program replaces them.
-	struct StageResources {
-		std::array<ShaderRecompiler::IR::ResourceSnapshot, 3> vertex;
-		ShaderRecompiler::IR::ResourceSnapshot                pixel;
-	};
-
-	GraphicsPrograms
-	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
-	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                    const HW::Context& context, const HW::UserConfig& user_config,
-	                    std::span<const ShaderColorTarget, 8> color_targets,
-	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info, StageResources* resources = nullptr);
-	// GPU thread, with the front worker idle: what GetGraphicsPrograms does first, before a
-	// front worker job runs it (frontWorker.h).
-	void PrepareFrontLookups();
-	// `push_data_cursor` NoStart keeps the program's shader data out of push constants, in a
-	// buffer that commands on the GPU can write before the dispatch reads it.
-	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info,
-	                                uint32_t                     push_data_cursor = 0,
-	                                ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr);
-
-	// A pipeline that is not known yet is built on a worker thread. Null when it is still being
-	// built and the draw is left out for now; see PlanPipelineUse for which draws wait instead.
-	// `frame`: the game's frame the draw belongs to, for the budget of waits (FrameWaitBudget).
-	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
-	                              const RenderDepthInfo&                 depth,
-	                              std::span<const ShaderVertexInputInfo> vertex_info,
-	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
-	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs, const DrawEffects& effects,
-	                              uint64_t frame);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
-	                             const ShaderProgram&          compute_program);
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
-	struct ProgramCache;
+	friend struct PipelineCacheTestAccess;
 
-	struct GraphicsPipelineKey {
-		PipelineRenderingState   rendering;
-		std::array<uint64_t, 3>  vertex_shader_ids {};
-		uint64_t                 ps_shader_id = 0;
-		PipelineVertexInputState vertex_input;
-		PipelineStaticParameters static_params;
+	struct Program {
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
+		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		std::vector<ShaderModule>                    modules;
+		bool                                         skip_dispatch = false;
 
-		bool operator==(const GraphicsPipelineKey& other) const {
-			return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
-			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
-			       static_params == other.static_params;
-		}
+		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		template <bool HasCalls>
+		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                         uint32_t                                push_data_cursor);
 	};
 
-	struct PipelineKeyHash {
-		static void Mix(std::size_t& hash, std::size_t value) {
-			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
-			        (hash >> 2u);
-		}
+	struct ProgramKey {
+		ShaderType            stage           = ShaderType::Unknown;
+		uint64_t              hash            = 0;
+		uint32_t              user_data_count = 0;
+		std::vector<uint32_t> static_state;
+
+		bool operator==(const ProgramKey&) const = default;
+	};
+
+	// Variants of one source share a bucket; ProgramKey equality compares the state.
+	struct ProgramKeyHash {
+		std::size_t operator()(const ProgramKey& key) const { return key.hash; }
 	};
 
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
-	GraphicContext&               m_graphics;
-	AheadBuildProgress            m_built_ahead;
-	std::unique_ptr<ProgramCache> m_program_cache;
+	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
+
+	GraphicContext&                        m_graphics;
+	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
+	// Modules compiled per stage.
+	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
+	ProgramKey                             m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
-	// One for each worker thread, when the driver builds the pipelines of a cache one at a time
-	// (DriverFaults::pipeline_cache_serializes_builds).
-	std::vector<vk::PipelineCache> m_builder_caches;
 	std::filesystem::path         m_driver_cache_path;
-	// Save runs on the GPU thread (CheckpointDriverCache) and at exit.
-	std::mutex                    m_driver_cache_save_mutex;
-	// The driver cache is written every few minutes while new pipelines are built
-	// (CheckpointDriverCache, on the GPU thread); a worker that built one sets the flag.
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	std::atomic<bool>                     m_driver_cache_dirty {false};
-	// A pipeline and whether it is built yet: false while a worker thread is still building it,
-	// and the pipeline is read only once it is true.
-	struct PipelineEntry {
-		std::atomic<bool> ready {false};
-		Pipeline          pipeline;
-		// The frame of the last short wait for this pipeline (GraceWaitUs). GPU thread only.
-		uint64_t          grace_wait_frame = UINT64_MAX;
-	};
-	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<PipelineEntry>, GraphicsPipelineKeyHash>
-	                                                             m_graphics_pipelines;
-	std::unordered_map<uint64_t, std::unique_ptr<PipelineEntry>> m_compute_pipelines;
+	bool                          m_driver_cache_dirty = false;
+	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
+	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
+	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
+	// Records everything first created; closed without a shader store.
+	ShaderStoreWriter m_store;
 
-	// What a worker needs to build one pipeline, copied from the draw or dispatch. A compute
-	// job has `compute` set and no vertex stages.
-	struct PipelineJob {
-		PipelineEntry*                       target = nullptr;
-		bool                                 listed = false; // from the game's list, built ahead
-		std::optional<ShaderComputeInputInfo> compute;
-		PipelineRenderingState               rendering;
-		PipelineVertexInputState             vertex_input;
-		std::array<ShaderVertexInputInfo, 3> vertex_info;
-		uint32_t                             vertex_count = 0;
-		std::optional<ShaderPixelInputInfo>  pixel;
-		GraphicsPrograms                     programs;
-		PipelineStaticParameters             static_params;
-	};
-	std::mutex                  m_jobs_mutex;
-	std::condition_variable_any m_job_added;
-	std::condition_variable     m_job_done;
-	std::deque<PipelineJob>     m_jobs;
-	std::vector<std::jthread>   m_builders;
-	bool                        m_always_wait = false;
-	// Counters for the log at exit.
-	uint64_t m_left_out_draws = 0;
-	// Held while this emulator keeps the game's lists (several copies share the folder).
-	Common::FileLock m_list_lock;
-	bool             m_lists_writable = false;
-	// Draws that waited only because a target of theirs was reset in this frame (pipelineUse.h).
-	uint64_t        m_reset_target_waits = 0;
-	FrameWaitBudget m_reset_target_budget;
-	FrameWaitBudget m_grace_wait_budget {GRACE_WAIT_BUDGET_US};
-	uint64_t m_builds         = 0;
-	uint64_t m_build_us       = 0; // under m_jobs_mutex
-	uint64_t m_longest_us     = 0; // under m_jobs_mutex
+	template <typename InputInfo>
+	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
+	                               uint32_t& push_data_cursor);
+	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
+	                            ShaderRecompiler::CompileOptions  options,
+	                            ShaderRecompiler::TranslateResult translated,
+	                            uint32_t                          push_data_cursor);
+	void InitializeDriverCache();
+	void CheckpointDriverCache();
 
-	// The pipeline list: the pipelines a game used, on disk, so the next start builds them
-	// before a draw asks. A record names its programs by their identity on the program list.
-	std::vector<PipelineRecord>  m_listed_pipelines; // read at start, not built yet
-	ListedPipelineScan           m_listed_scan;
-	std::unordered_set<uint64_t> m_pipelines_on_list;
-	std::FILE*                   m_pipeline_list = nullptr;
-
-	void                    InitializeDriverCache();
-	void                    CheckpointDriverCache();
-	void OpenPipelineList(const std::filesystem::path& path, bool writable);
-	void                    QueueListedPipelines();
-	void                    RememberPipeline(const GraphicsPipelineKey& key, const PipelineJob& job);
-	// A compute record: no stages, no pixel program; the program is first, the input info is
-	// the fixed state.
-	void                    RememberComputePipeline(const PipelineJob& job);
-	void                    WriteRecord(const PipelineRecord& record);
-	void                    QueueBuild(GraphicsPipelineKey key, PipelineJob job);
-	void                    QueueComputeBuild(uint64_t program_id, PipelineJob job);
-	void                    Enqueue(PipelineJob job);
-	// A draw or dispatch waits for this build: it goes first.
-	void                    Promote(const PipelineEntry& entry);
-	void                    BuildPipelines(std::stop_token stop, uint32_t builder);
-	[[nodiscard]] Pipeline* WhenReady(PipelineEntry& entry, const DrawEffects& effects,
-	                                   uint64_t frame);
+	// pipelineSerialization.cpp
+	void WarmUp(const std::filesystem::path& path);
+	bool LoadRecord(std::span<const uint8_t>& records, std::vector<GraphicsPipelineKey>& pipelines);
+	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
+	                 const std::vector<uint32_t>& spirv);
+	void StorePipeline(const GraphicsPipelineKey& key);
+	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
+	// Every module by id, with id 0 naming an absent stage.
+	[[nodiscard]] ModuleMap MapModules() const;
+	// False when a stage id of the key is not in `modules`.
+	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                            const ModuleMap& modules);
 };
 
-void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// The shader store of the running title; empty unless --shader-cache is on in a Release build
+// without debug dumps, which change the SPIR-V.
+std::filesystem::path ShaderStorePath();
+// Host capabilities that change the emitted SPIR-V.
+ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
+
+// Stages are indexed like GraphicsPipelineKey::stage_ids.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&          rendering,
-                            const PipelineVertexInputState&        vertex_input,
-                            std::span<const ShaderVertexInputInfo> vertex_info,
-                            const ShaderPixelInputInfo*            ps_input_info,
-                            const PipelineCache::GraphicsPrograms& programs,
-                            const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            const GraphicsPipelineKey&                 key,
+                            const std::array<const ShaderModule*, 4>& stages,
+                            vk::PipelineCache                          driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            const ShaderModule& module, vk::PipelineCache driver_cache);
 
 } // namespace Libs::Graphics
 

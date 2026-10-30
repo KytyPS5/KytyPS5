@@ -48,11 +48,16 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// What the device enabled, not only what it supports, and the known defects of its driver.
 	HostGpu                                   host;
+	bool                                      conditional_rendering_enabled   = false;
+	bool                                      occlusion_queries_enabled       = false;
+	bool                                      occlusion_query_precise_enabled = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
+	uint32_t                           device_clock_period_ps                = 0;
+	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	// What every submitter committed to the queue. Under queue_mutex.

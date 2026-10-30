@@ -28,6 +28,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -55,6 +56,7 @@ struct VulkanExtensions {
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	vk::PhysicalDeviceVulkan11Features features {};
 	features.storageBuffer16BitAccess = VK_TRUE;
+	features.shaderDrawParameters     = VK_TRUE;
 	return features;
 }
 
@@ -69,6 +71,9 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+	features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+	features.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+	features.descriptorBindingPartiallyBound              = VK_TRUE;
 	return features;
 }
 
@@ -564,12 +569,26 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
+	const bool shader_clock_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	if (shader_clock_extension) {
+		shader_clock.pNext = supported_features2.pNext;
+		supported_features2.pNext = &shader_clock;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
 	if (image_atomic_int64_extension) {
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
+	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (conditional_rendering_extension) {
+		conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &conditional_rendering;
 	}
 	physical_device.getFeatures2(&supported_features2);
 
@@ -616,6 +635,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	caps.provoking_vertex_last    = caps.provoking_vertex_last && provoking_extension;
 	caps.attachment_feedback_loop = caps.attachment_feedback_loop && feedback_extensions;
 	caps.maintenance8             = caps.maintenance8 && maintenance8_extension;
+	// The device clock ticks at timestampPeriod nanoseconds.
+	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
+		caps.device_clock_period_ps = static_cast<uint32_t>(
+		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
+	}
+	graphics.device_clock_period_ps = caps.device_clock_period_ps;
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan native FP16: %s\n", graphics.host.capabilities.float16 ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.host.capabilities.attachment_feedback_loop ? "true" : "false");
@@ -635,10 +662,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp                            = caps.depth_clamp ? VK_TRUE : VK_FALSE;
 	device_features.drawIndirectFirstInstance = caps.draw_indirect_first_instance ? VK_TRUE : VK_FALSE;
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	device_features.shaderStorageImageMultisample        =
+	    supported_features2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
+	device_features.shaderResourceMinLod                 = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
+	device_features.drawIndirectFirstInstance            = VK_TRUE;
+	device_features.multiDrawIndirect                    = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
@@ -647,7 +679,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	// Storage image sample counts beyond 1x require the feature.
+	if (!device_features.shaderStorageImageMultisample) {
+		graphics.physical_device_properties.limits.storageImageSampleCounts =
+		    vk::SampleCountFlagBits::e1;
+	}
 	graphics.sample_rate_shading_enabled                 = true;
+	// Occlusion queries reset their queries from the host and count samples exactly where they can.
+	graphics.occlusion_queries_enabled =
+	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;
+	graphics.occlusion_query_precise_enabled =
+	    graphics.occlusion_queries_enabled && supported_features2.features.occlusionQueryPrecise;
+	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
+	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
+	     graphics.occlusion_queries_enabled ? "true" : "false",
+	     graphics.occlusion_query_precise_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64                         = caps.float64 ? VK_TRUE : VK_FALSE;
 
@@ -706,6 +753,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
 		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
 		create_info.pNext                          = &pipeline_executable;
+	}
+	if (graphics.device_clock_period_ps != 0u) {
+		shader_clock.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &shader_clock;
+	}
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &conditional_rendering;
+	}
+	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
+	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
+	// depth- or stencil-writing fragment shader needs an epilog.
+	vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state {};
+	extended_dynamic_state.extendedDynamicState = VK_TRUE;
+	if (HasExtension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
+		extended_dynamic_state.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &extended_dynamic_state;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1153,7 +1217,10 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

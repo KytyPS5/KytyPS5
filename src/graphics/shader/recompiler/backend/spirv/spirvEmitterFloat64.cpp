@@ -150,9 +150,6 @@ constexpr uint32_t Bit(SoftFloat64Op op) {
 }
 
 // The compares that softFloat64.h has no function for are made from these three.
-constexpr uint32_t kDerivedCompare =
-    Bit(SoftFloat64Op::OrdEqual) | Bit(SoftFloat64Op::OrdLessThanEqual) |
-    Bit(SoftFloat64Op::OrdGreaterThanEqual);
 
 // The software operation for a 64-bit float opcode (see softFloat64.h).
 std::optional<SoftFloat64Op> SoftFloat64OpOf(IR::ValueOpcode opcode) {
@@ -179,18 +176,23 @@ std::optional<SoftFloat64Op> SoftFloat64OpOf(IR::ValueOpcode opcode) {
 	}
 }
 
-bool IsDerivedCompare(IR::ValueOpcode opcode) {
+// The base compares a derived 64-bit float compare calls (SoftCompare and the Emit functions
+// below), as SoftFloat64Op bits; 0 for an opcode that is not a derived compare.
+uint32_t DerivedCompareUses(IR::ValueOpcode opcode) {
+	constexpr auto equal         = Bit(SoftFloat64Op::OrdEqual);
+	constexpr auto less_equal    = Bit(SoftFloat64Op::OrdLessThanEqual);
+	constexpr auto greater_equal = Bit(SoftFloat64Op::OrdGreaterThanEqual);
 	switch (opcode) {
-		case IR::ValueOpcode::FPOrdNotEqual64:
 		case IR::ValueOpcode::FPOrdLessThan64:
+		case IR::ValueOpcode::FPUnordGreaterThanEqual64: return equal | less_equal;
 		case IR::ValueOpcode::FPOrdGreaterThan64:
-		case IR::ValueOpcode::FPUnordEqual64:
-		case IR::ValueOpcode::FPUnordNotEqual64:
-		case IR::ValueOpcode::FPUnordLessThan64:
-		case IR::ValueOpcode::FPUnordGreaterThan64:
-		case IR::ValueOpcode::FPUnordLessThanEqual64:
-		case IR::ValueOpcode::FPUnordGreaterThanEqual64: return true;
-		default: return false;
+		case IR::ValueOpcode::FPUnordLessThanEqual64: return equal | greater_equal;
+		case IR::ValueOpcode::FPOrdNotEqual64:
+		case IR::ValueOpcode::FPUnordEqual64: return equal | less_equal | greater_equal;
+		case IR::ValueOpcode::FPUnordNotEqual64: return equal;
+		case IR::ValueOpcode::FPUnordLessThan64: return greater_equal;
+		case IR::ValueOpcode::FPUnordGreaterThan64: return less_equal;
+		default: return 0;
 	}
 }
 
@@ -238,8 +240,8 @@ void DefineSoftFloat64(EmitterState& state) {
 		for (const auto& inst: *block) {
 			if (const auto op = SoftFloat64OpOf(inst.GetOpcode())) {
 				used |= Bit(*op);
-			} else if (IsDerivedCompare(inst.GetOpcode())) {
-				used |= kDerivedCompare;
+			} else {
+				used |= DerivedCompareUses(inst.GetOpcode());
 			}
 		}
 	}

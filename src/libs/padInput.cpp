@@ -231,10 +231,21 @@ void PadInput::Update(uint64_t time) {
 
 	const bool changed = m_written == 0 || !SameInput(state, m_latest);
 	m_latest           = state;
-	if (changed) {
-		m_history[m_written % HISTORY] = state;
-		m_written++;
+	if (!changed) {
+		return;
 	}
+	// Input that changes no button or touch contact updates the newest unread state, so a burst
+	// of stick or motion events between two reads cannot push unread button or touch changes out.
+	if (m_written > m_read) {
+		auto& newest = m_history[(m_written - 1) % HISTORY];
+		if (newest.buttons == state.buttons && newest.touch[0].down == state.touch[0].down &&
+		    newest.touch[1].down == state.touch[1].down) {
+			newest = state;
+			return;
+		}
+	}
+	m_history[m_written % HISTORY] = state;
+	m_written++;
 }
 
 int PadInput::Read(std::span<PadState> out) {

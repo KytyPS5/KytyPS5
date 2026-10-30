@@ -1,349 +1,376 @@
+#include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssr.h"
+#include "graphics/shader/shaderBindings.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
-#include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
-namespace Libs {
-
-namespace LibPsml {
+namespace Libs::LibPsml {
 
 LIB_VERSION("Psml", 1, "Psml", 1, 1);
 
-namespace Psml {
+namespace {
 
-constexpr int PSML_ERROR_NOT_INITIALIZED = static_cast<int>(0x8a810001u);
-constexpr int PSML_ERROR_INVALID_OBJECT  = static_cast<int>(0x8a810005u);
-constexpr int PSML_ERROR_INVALID_POINTER = static_cast<int>(0x8a810009u);
-constexpr int PSML_ERROR_INVALID_VALUE   = static_cast<int>(0x8a81000du);
-constexpr int PSML_ERROR_NULL_OBJECT     = static_cast<int>(0x8a810014u);
+constexpr int      NOT_INITIALIZED           = static_cast<int>(0x8a810001u);
+constexpr int      ALREADY_INITIALIZED       = static_cast<int>(0x8a810002u);
+constexpr int      TOO_MANY_CONTEXTS         = static_cast<int>(0x8a810004u);
+constexpr int      INVALID_CONTEXT           = static_cast<int>(0x8a810005u);
+constexpr int      COMMAND_BUFFER_FULL       = static_cast<int>(0x8a810006u);
+constexpr int      COMMAND_BUFFER_BAD        = static_cast<int>(0x8a810007u);
+constexpr int      INSUFFICIENT_BUFFER       = static_cast<int>(0x8a810008u);
+constexpr int      ARGUMENT_NULL             = static_cast<int>(0x8a810009u);
+constexpr int      TEXTURE_NULL              = static_cast<int>(0x8a81000au);
+constexpr int      INVALID_TEXTURE           = static_cast<int>(0x8a81000bu);
+constexpr int      INVALID_PARAMETER         = static_cast<int>(0x8a81000du);
+constexpr int      UNSUPPORTED_RENDER_SIZE   = static_cast<int>(0x8a81000eu);
+constexpr int      INVALID_OUTPUT_TEXTURE    = static_cast<int>(0x8a81000fu);
+constexpr int      NOT_TRINITY_MODE          = static_cast<int>(0x8a810012u);
+constexpr int      UNSUPPORTED_OUTPUT_SIZE   = static_cast<int>(0x8a810013u);
+constexpr int      INVALID_SHARED_RESOURCES  = static_cast<int>(0x8a810014u);
+constexpr int      TOO_MANY_SHARED_RESOURCES = static_cast<int>(0x8a810015u);
+constexpr uint64_t MEMORY_BLOCK_SIZE         = 0x200000;
+constexpr uint32_t PACKET_DWORDS             = 1 + Graphics::Pssr::RequestDwords;
 
-constexpr uint32_t SHARED_RESOURCES_MAGIC = 0xa9c4;
-constexpr uint32_t CONTEXT_MAGIC          = 0x9231;
-
-constexpr uint64_t MAIN_MEMORY_BLOCK_SIZE = 0x200000;
-constexpr uint64_t MAIN_MEMORY_ALIGNMENT  = 0x200000;
-constexpr uint64_t EXTRA_VA_BYTES         = 0x600000;
-
-struct MainMemoryRequirements {
+struct MemoryRequirements {
 	uint64_t block_size;
 	uint64_t alignment;
 	uint64_t block_count;
 };
 
-struct MainMemoryParameters {
-	uint32_t type;
-	uint32_t reserved;
-};
-
 struct DirectMemoryBlock {
-	uint64_t address;
+	uint64_t offset;
 	uint64_t size;
 };
 
-struct SharedResourcesInitParameters {
-	uint32_t                 type;
-	uint32_t                 reserved;
+struct MemoryParameters {
+	uint32_t                 profile;
+	uint32_t                 flags;
 	const DirectMemoryBlock* blocks;
 	uint64_t                 block_count;
-	uint64_t                 virtual_address_start;
 };
 
-static_assert(sizeof(MainMemoryRequirements) == 24);
-static_assert(sizeof(DirectMemoryBlock) == 16);
+struct SharedParameters {
+	MemoryParameters memory;
+	uint64_t         virtual_address;
+};
 
-static bool                 g_initialized      = false;
-static uint32_t             g_supported_modes  = 0x3;
-static std::atomic<int32_t> g_shared_ref_count = 0;
+struct ContextParameters {
+	MemoryParameters memory;
+	uint16_t         width;
+	uint16_t         height;
+	uint32_t         reserved;
+	const void*      depth_copy;
+	const void*      motion_copy;
+	const char*      name;
+	void*            shared;
+};
+static_assert(offsetof(ContextParameters, width) == 0x18);
+static_assert(offsetof(ContextParameters, shared) == 0x38);
 
-static uint64_t BaseVaBytes(uint32_t type) {
-	// The native implementation indexes this table before adding one 6 MiB range.
-	switch (type) {
-		case 0: return 0x06200000;
-		case 1: return 0x18200000;
-		case 2: return 0x12200000;
-		default: return 0;
+struct SharedResources {
+	uint32_t contexts = 0;
+};
+
+struct Context {
+	uint32_t         width;
+	uint32_t         height;
+	SharedResources* shared;
+};
+
+struct CommandSpace {
+	uint32_t* cmd;
+	uint32_t  dwords;
+};
+
+std::mutex                                                g_mutex;
+bool                                                      g_initialized = false;
+std::unique_ptr<SharedResources>                          g_shared;
+std::unordered_map<const void*, std::unique_ptr<Context>> g_contexts;
+
+uint64_t SharedBlockCount(uint32_t profile) {
+	constexpr uint64_t bytes[] = {0x06200000, 0x18200000, 0x12200000};
+	return profile < 3 ? (bytes[profile] + 0x600000) / MEMORY_BLOCK_SIZE : 0;
+}
+
+int CheckContext(const void* context) {
+	if (!g_initialized) {
+		return NOT_INITIALIZED;
 	}
+	return g_contexts.contains(context) ? OK : INVALID_CONTEXT;
 }
 
-static bool IsSupportedType(uint32_t type) {
-	switch (type) {
-		case 0: return true;
-		case 1: return (g_supported_modes & 0x1u) != 0;
-		case 2: return (g_supported_modes & 0x2u) != 0;
-		default: return false;
+int KYTY_SYSV_ABI Initialize() {
+	std::lock_guard lock(g_mutex);
+	if (!Loader::SystemContentIsTrinityMode()) {
+		return NOT_TRINITY_MODE;
 	}
-}
-
-static uint64_t RequiredBlockCount(uint32_t type) {
-	const auto base = BaseVaBytes(type);
-	if (base == 0) {
-		return 0;
+	if (g_initialized) {
+		return ALREADY_INITIALIZED;
 	}
-	return (base + EXTRA_VA_BYTES) / MAIN_MEMORY_BLOCK_SIZE;
-}
-
-static int CheckInitialized() {
-	return (g_initialized ? OK : PSML_ERROR_NOT_INITIALIZED);
-}
-
-static void MarkSharedResources(void* resources, const SharedResourcesInitParameters& params) {
-	auto* bytes = static_cast<uint8_t*>(resources);
-
-	*reinterpret_cast<uint32_t*>(bytes)                        = SHARED_RESOURCES_MAGIC;
-	*reinterpret_cast<const DirectMemoryBlock**>(bytes + 0x08) = params.blocks;
-	*reinterpret_cast<uint64_t*>(bytes + 0x18)                 = params.block_count;
-	*reinterpret_cast<uint32_t*>(bytes + 0x20)                 = params.type;
-	*reinterpret_cast<uint64_t*>(bytes + 0x28)                 = params.virtual_address_start;
-}
-
-static bool HasKnownObjectMagic(const void* object) {
-	if (object == nullptr) {
-		return false;
-	}
-	const auto magic = *static_cast<const uint32_t*>(object);
-	return magic == SHARED_RESOURCES_MAGIC || magic == CONTEXT_MAGIC;
-}
-
-static int KYTY_SYSV_ABI PsmlInitialize() {
-	PRINT_NAME();
-
-	g_initialized      = true;
-	g_supported_modes  = 0x3;
-	g_shared_ref_count = 0;
-
+	g_initialized = true;
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetMainMemoryRequirements(MainMemoryRequirements*     out,
-                                                       const MainMemoryParameters* params) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const MemoryParameters* params) {
+	std::lock_guard lock(g_mutex);
+	if (!g_initialized) {
+		return NOT_INITIALIZED;
 	}
 	if (out == nullptr || params == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+		return ARGUMENT_NULL;
 	}
-	if (!IsSupportedType(params->type)) {
-		return PSML_ERROR_INVALID_VALUE;
+	const auto blocks = SharedBlockCount(params->profile);
+	if (blocks == 0) {
+		return INVALID_PARAMETER;
 	}
-
-	out->block_size  = MAIN_MEMORY_BLOCK_SIZE;
-	out->alignment   = MAIN_MEMORY_ALIGNMENT;
-	out->block_count = RequiredBlockCount(params->type);
-
+	*out = {MEMORY_BLOCK_SIZE, MEMORY_BLOCK_SIZE, blocks};
 	return OK;
 }
 
-static int KYTY_SYSV_ABI
-PsmlSharedResourcesInitialize(void* resources, const SharedResourcesInitParameters* params) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI CreateSharedResources(void** out, const SharedParameters* params) {
+	std::lock_guard lock(g_mutex);
+	if (!g_initialized) {
+		return NOT_INITIALIZED;
 	}
-	if (resources == nullptr || params == nullptr || params->blocks == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+	if (out == nullptr || params == nullptr || params->memory.blocks == nullptr) {
+		return ARGUMENT_NULL;
 	}
-	if (params->reserved != 0 || !IsSupportedType(params->type) ||
-	    params->block_count < RequiredBlockCount(params->type)) {
-		return PSML_ERROR_INVALID_VALUE;
+	const auto required = SharedBlockCount(params->memory.profile);
+	if (required == 0 || params->memory.flags != 0) {
+		return INVALID_PARAMETER;
 	}
-
-	MarkSharedResources(resources, *params);
-	g_shared_ref_count.fetch_add(1, std::memory_order_relaxed);
-
+	if (params->memory.block_count < required) {
+		return INSUFFICIENT_BUFFER;
+	}
+	if (g_shared) {
+		return TOO_MANY_SHARED_RESOURCES;
+	}
+	g_shared = std::make_unique<SharedResources>();
+	*out     = g_shared.get();
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlSharedResourcesFinalize(void* resources) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI ReleaseSharedResources(void* resources) {
+	std::lock_guard lock(g_mutex);
+	if (!g_initialized) {
+		return NOT_INITIALIZED;
 	}
-	if (resources == nullptr) {
-		return PSML_ERROR_NULL_OBJECT;
+	if (!g_shared || resources != g_shared.get()) {
+		return INVALID_SHARED_RESOURCES;
 	}
-
-	g_shared_ref_count.fetch_sub(1, std::memory_order_relaxed);
-
+	if (g_shared->contexts != 0) {
+		return INVALID_CONTEXT;
+	}
+	g_shared.reset();
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetContextMemoryRequirements(MainMemoryRequirements* out,
-                                                          uint64_t /*params*/) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const void* params) {
+	std::lock_guard lock(g_mutex);
+	if (!g_initialized) {
+		return NOT_INITIALIZED;
 	}
-	if (out == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+	if (out == nullptr || params == nullptr) {
+		return ARGUMENT_NULL;
 	}
-
-	out->block_size  = MAIN_MEMORY_BLOCK_SIZE;
-	out->alignment   = MAIN_MEMORY_ALIGNMENT;
-	out->block_count = 1;
-
+	*out = {MEMORY_BLOCK_SIZE, MEMORY_BLOCK_SIZE, 1};
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlContextInitialize(void* context, const void* params) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int CreateContext(void** out, const MemoryParameters* memory, uint32_t width, uint32_t height,
+                  void* shared, bool use_shared) {
+	std::lock_guard lock(g_mutex);
+	if (!g_initialized) {
+		return NOT_INITIALIZED;
 	}
-	if (context == nullptr || params == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+	if (out == nullptr || memory == nullptr || memory->blocks == nullptr) {
+		return ARGUMENT_NULL;
 	}
-
-	auto* bytes            = static_cast<uint8_t*>(context);
-	auto* params_bytes     = static_cast<const uint8_t*>(params);
-	auto* shared_resources = *reinterpret_cast<void* const*>(params_bytes + 0x08);
-	if (shared_resources == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+	if (memory->profile > 2) {
+		return INVALID_PARAMETER;
 	}
-
-	*reinterpret_cast<uint32_t*>(bytes)        = CONTEXT_MAGIC;
-	*reinterpret_cast<void**>(bytes + 0x360)   = shared_resources;
-	*reinterpret_cast<uint8_t*>(bytes + 0x368) = 0;
-
+	if (memory->block_count == 0) {
+		return INSUFFICIENT_BUFFER;
+	}
+	if (width == 0 || height == 0 || width > 16384 || height > 16384) {
+		return UNSUPPORTED_OUTPUT_SIZE;
+	}
+	if (use_shared && (!g_shared || shared != g_shared.get())) {
+		return INVALID_SHARED_RESOURCES;
+	}
+	if (g_contexts.size() == 4) {
+		return TOO_MANY_CONTEXTS;
+	}
+	auto record =
+	    std::make_unique<Context>(Context {width, height, use_shared ? g_shared.get() : nullptr});
+	auto* handle = record.get();
+	g_contexts.emplace(handle, std::move(record));
+	if (handle->shared != nullptr) {
+		++handle->shared->contexts;
+	}
+	*out = handle;
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlContextFinalize(void* context) {
-	PRINT_NAME();
+int KYTY_SYSV_ABI CreateFixedContext(void** out, const MemoryParameters* params) {
+	const bool large = params != nullptr && params->profile == 1;
+	return CreateContext(out, params, large ? 7680 : 3840, large ? 4320 : 2160, nullptr, false);
+}
 
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI CreatePrivateContext(void** out, const ContextParameters* params) {
+	return CreateContext(out, params == nullptr ? nullptr : &params->memory,
+	                     params == nullptr ? 0 : params->width,
+	                     params == nullptr ? 0 : params->height, nullptr, false);
+}
+
+int KYTY_SYSV_ABI CreateSharedContext(void** out, const ContextParameters* params) {
+	return CreateContext(
+	    out, params == nullptr ? nullptr : &params->memory, params == nullptr ? 0 : params->width,
+	    params == nullptr ? 0 : params->height, params == nullptr ? nullptr : params->shared, true);
+}
+
+int KYTY_SYSV_ABI ReleaseContext(void* context) {
+	std::lock_guard lock(g_mutex);
+	if (const int error = CheckContext(context); error != OK) {
+		return error;
 	}
-	if (!HasKnownObjectMagic(context)) {
-		return PSML_ERROR_INVALID_OBJECT;
+	auto& record = g_contexts.at(context);
+	if (record->shared != nullptr) {
+		--record->shared->contexts;
 	}
-
-	*static_cast<uint32_t*>(context) = 0;
-
+	g_contexts.erase(context);
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetWorkAreaSize(const void* object, uint32_t* out_size) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
+int KYTY_SYSV_ABI GetPacketSize(const void* context, uint32_t* out_size) {
+	std::lock_guard lock(g_mutex);
+	if (const int error = CheckContext(context); error != OK) {
+		return error;
 	}
 	if (out_size == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+		return ARGUMENT_NULL;
 	}
-
-	*out_size = 0x600;
-
+	*out_size = PACKET_DWORDS;
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlDispatch(void* context, uint64_t command, uint64_t params) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space, const void* params) {
+	std::lock_guard lock(g_mutex);
+	if (const int error = CheckContext(context); error != OK) {
+		return error;
 	}
-	if (!HasKnownObjectMagic(context)) {
-		return PSML_ERROR_INVALID_OBJECT;
+	if (space == nullptr || params == nullptr || space->cmd == nullptr) {
+		return ARGUMENT_NULL;
 	}
-	if (command == 0 || params == 0) {
-		return PSML_ERROR_INVALID_POINTER;
+	if (space->dwords < PACKET_DWORDS) {
+		return COMMAND_BUFFER_FULL;
 	}
-
+	if (space->dwords > 0x4001) {
+		return COMMAND_BUFFER_BAD;
+	}
+	const uint32_t* descriptors[2];
+	std::memcpy(descriptors, params, sizeof(descriptors));
+	if (descriptors[0] == nullptr || descriptors[1] == nullptr) {
+		return TEXTURE_NULL;
+	}
+	Graphics::Pssr::Request request {};
+	std::memcpy(request.output, descriptors[0], sizeof(request.output));
+	std::memcpy(request.input, descriptors[1], sizeof(request.input));
+	std::memcpy(&request.width, static_cast<const uint8_t*>(params) + 0xf0, sizeof(uint32_t) * 2);
+	Graphics::ShaderTextureResource input, output;
+	std::memcpy(input.fields, request.input, sizeof(input.fields));
+	std::memcpy(output.fields, request.output, sizeof(output.fields));
+	namespace Gpu    = Graphics::Prospero;
+	const auto is_2d = [](const Graphics::ShaderTextureResource& descriptor) {
+		return !descriptor.IsNull() &&
+		       (descriptor.Type() == Gpu::ImageType::kColor2D ||
+		        descriptor.Type() == Gpu::ImageType::kColor2DArray) &&
+		       descriptor.TileMode() != Gpu::TileMode::kDepth &&
+		       descriptor.BaseLevel() <= descriptor.LastLevel() &&
+		       descriptor.LastLevel() <= descriptor.MaxMip() &&
+		       descriptor.BaseArray5() <= descriptor.Depth();
+	};
+	if (!is_2d(input) || (input.Format() != Gpu::BufferFormat::k11_11_10Float &&
+	                      input.Format() != Gpu::BufferFormat::k10_11_11Float &&
+	                      input.Format() != Gpu::BufferFormat::k16_16_16_16Float)) {
+		return INVALID_TEXTURE;
+	}
+	if (!is_2d(output) || output.Format() != Gpu::BufferFormat::k11_11_10Float ||
+	    output.TileMode() != Gpu::TileMode::kStandard256B || output.BaseLevel() != 0 ||
+	    output.LastLevel() != 0 || output.MaxMip() != 0 || output.BaseArray5() != 0 ||
+	    output.Depth() != 0 || input.Base40() == output.Base40()) {
+		return INVALID_OUTPUT_TEXTURE;
+	}
+	const uint32_t input_width  = std::max(1u, (input.Width5() + 1u) >> input.BaseLevel());
+	const uint32_t input_height = std::max(1u, (input.Height5() + 1u) >> input.BaseLevel());
+	if (request.width == 0 || request.height == 0 || request.width > input_width ||
+	    request.height > input_height) {
+		return UNSUPPORTED_RENDER_SIZE;
+	}
+	const auto& record = *g_contexts.at(context);
+	if (uint32_t(output.Width5()) + 1 != record.width ||
+	    uint32_t(output.Height5()) + 1 != record.height) {
+		return INVALID_OUTPUT_TEXTURE;
+	}
+	namespace Pm4 = Graphics::Pm4;
+	space->cmd[0] = KYTY_PM4(space->dwords, Pm4::IT_NOP, Pm4::R_PSSR);
+	std::memcpy(space->cmd + 1, &request, sizeof(request));
+	std::memset(space->cmd + PACKET_DWORDS, 0, (space->dwords - PACKET_DWORDS) * sizeof(uint32_t));
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetProgress(const void* object, float* out_progress,
-                                         uint32_t /*frame_index*/) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
+int KYTY_SYSV_ABI GetMipmapBias(const void* context, float* bias, uint32_t width, uint32_t height) {
+	std::lock_guard lock(g_mutex);
+	if (const int error = CheckContext(context); error != OK) {
+		return error;
 	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
+	if (bias == nullptr) {
+		return ARGUMENT_NULL;
 	}
-	if (out_progress == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+	if (width == 0 || height == 0) {
+		return UNSUPPORTED_RENDER_SIZE;
 	}
-
-	*out_progress = 0.0f;
-
+	*bias = std::log2(float(width) / float(g_contexts.at(context)->width)) - 1.0f;
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlRequestCapture(const void* object) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-
-	return OK;
+int KYTY_SYSV_ABI ValidateContext(const void* context) {
+	std::lock_guard lock(g_mutex);
+	return CheckContext(context);
 }
 
-static int KYTY_SYSV_ABI PsmlValidateObject(const void* object) {
-	PRINT_NAME();
-
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-
-	return OK;
-}
-
-} // namespace Psml
+} // namespace
 
 LIB_DEFINE(InitPsml_1) {
-	LIB_FUNC("3WVD91e12ZQ", Psml::PsmlInitialize);
-	LIB_FUNC("+2KpvixvL6E", Psml::PsmlGetMainMemoryRequirements);
-	LIB_FUNC("eWoKNeB6V-k", Psml::PsmlSharedResourcesInitialize);
-	LIB_FUNC("jEevBXmagOQ", Psml::PsmlSharedResourcesFinalize);
-	LIB_FUNC("EO9YQXmJEN8", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("IMlj247LdTo", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("sjTyYheKTrU", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("ArakEpzsZo0", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("VGjrQa-WqdU", Psml::PsmlGetContextMemoryRequirements);
-	LIB_FUNC("2ecEbQaf9VU", Psml::PsmlContextInitialize);
-	LIB_FUNC("vUk2pWMx3KQ", Psml::PsmlContextInitialize);
-	LIB_FUNC("gxv3i+MTEzU", Psml::PsmlContextInitialize);
-	LIB_FUNC("JaLBe0P3jSU", Psml::PsmlContextFinalize);
-	LIB_FUNC("AHalTX9wFZY", Psml::PsmlGetWorkAreaSize);
-	LIB_FUNC("RUNLFro+qok", Psml::PsmlDispatch);
-	LIB_FUNC("GHna9-DvnUk", Psml::PsmlGetProgress);
-	LIB_FUNC("GJY0MvuTcs8", Psml::PsmlRequestCapture);
-	LIB_FUNC("LXq+6mIxpCw", Psml::PsmlValidateObject);
-	LIB_FUNC("FSGaTQze0UY", Psml::PsmlValidateObject);
+	LIB_FUNC("3WVD91e12ZQ", Initialize);
+	LIB_FUNC("+2KpvixvL6E", GetSharedRequirements);
+	LIB_FUNC("eWoKNeB6V-k", CreateSharedResources);
+	LIB_FUNC("jEevBXmagOQ", ReleaseSharedResources);
+	LIB_FUNC("EO9YQXmJEN8", GetContextRequirements);
+	LIB_FUNC("IMlj247LdTo", GetContextRequirements);
+	LIB_FUNC("sjTyYheKTrU", GetContextRequirements);
+	LIB_FUNC("ArakEpzsZo0", GetContextRequirements);
+	LIB_FUNC("VGjrQa-WqdU", GetContextRequirements);
+	LIB_FUNC("2ecEbQaf9VU", CreateFixedContext);
+	LIB_FUNC("vUk2pWMx3KQ", CreatePrivateContext);
+	LIB_FUNC("gxv3i+MTEzU", CreateSharedContext);
+	LIB_FUNC("JaLBe0P3jSU", ReleaseContext);
+	LIB_FUNC("AHalTX9wFZY", GetPacketSize);
+	LIB_FUNC("RUNLFro+qok", Dispatch);
+	LIB_FUNC("GHna9-DvnUk", GetMipmapBias);
+	LIB_FUNC("GJY0MvuTcs8", ValidateContext);
+	LIB_FUNC("LXq+6mIxpCw", ValidateContext);
+	LIB_FUNC("FSGaTQze0UY", ValidateContext);
 }
 
-} // namespace LibPsml
-
-} // namespace Libs
+} // namespace Libs::LibPsml

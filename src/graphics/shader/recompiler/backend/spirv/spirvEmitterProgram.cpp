@@ -17,10 +17,8 @@ namespace {
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
-	const auto inactive    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), inactive, active);
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, inactive, kill_label, merge_label);
+	state.builder.AddFunction(spv::OpBranchConditional, active, merge_label, kill_label);
 	EmitLabel(state, kill_label);
 	state.builder.AddFunction(spv::OpKill);
 	EmitLabel(state, merge_label);
@@ -365,10 +363,10 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::WaveReduceU32 ||
-	     op == Op::ReadConstBuffer ||
+	     op == Op::WaveReduceU32 || op == Op::SubgroupUMaxU32 || op == Op::ReadConstBuffer ||
+	     op == Op::ReadRealtimeClock ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
-		// Whole-wave results and SMEM loads (SGPR operands, no EXEC) are identical in both halves.
+		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
@@ -549,6 +547,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U32:
 		case IR::Type::F16: return TypeU32(state);
 		case IR::Type::U64: return TypeU64(state);
+		case IR::Type::Bvh8Result: return TypeBvh8Result(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
 		case IR::Type::F64: return state.soft_float64 ? TypeU64(state) : TypeF64(state);
@@ -638,30 +637,24 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
-	// BallotFindLSB needs the subgroup size built-in, which a stage without built-ins lacks.
-	if (other_half == nullptr && !state.single_lane && !LaneIndexFromScan(state)) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
-		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
-		return result;
+	// An empty ballot (EXEC zero) gives lane 0, which V_READFIRSTLANE reads on hardware. FindILsb
+	// returns -1 for zero, unlike BallotFindLSB, whose result is then undefined.
+	const auto first = [&](uint32_t word) {
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits, ballot, word);
+		return std::pair {bits, EmitGlsl<GLSLstd450FindILsb, IR::Type::U32>(state, bits)};
+	};
+	const auto [low, low_first] = first(0);
+	if (state.program.wave_size == 32u) {
+		return EmitGlsl<GLSLstd450SMax, IR::Type::U32>(state, low_first, ConstantU32(state, 0));
 	}
-	const auto low        = state.builder.AllocateId();
-	const auto high       = state.builder.AllocateId();
-	const auto low_first  = state.builder.AllocateId();
-	const auto high_first = state.builder.AllocateId();
-	const auto low_active = state.builder.AllocateId();
-	const auto result     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), low_first, GlslStd450(state),
-	                          GLSLstd450FindILsb, low);
-	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), high_first, GlslStd450(state),
-	                          GLSLstd450FindILsb, high);
-	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), low_active, low,
-	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, low_active, low_first,
-	                          EmitAddU32(state, high_first, ConstantU32(state, 32)));
-	return result;
+	const auto high_first = first(1).second;
+	const auto high_lane  = EmitGlsl<GLSLstd450SMax, IR::Type::U32>(
+	    state, EmitBinaryU32(state, spv::OpBitwiseOr, high_first, ConstantU32(state, 32)),
+	    ConstantU32(state, 0));
+	return Select(state, TypeU32(state),
+	              Binary(state, spv::OpINotEqual, TypeBool(state), low, ConstantU32(state, 0)),
+	              low_first, high_lane);
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
@@ -829,9 +822,9 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
-	DefineIndirectBufferFormats(ctx);
 	DefineBvhIntersect(state);
 	DefineSoftFloat64(state);
+	DefineTrinityFunctions(state);
 	if (program.info.uses_swizzle) {
 		ctx.scratch_u32_variable = state.builder.AllocateId();
 		if (state.lane_count == 2) {
@@ -920,7 +913,7 @@ void EmitProgram(EmitterState& state) {
 		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
-	EmitMemoryOffsets(state);
+	EmitMemoryBindings(state);
 	EmitDepthBoundsTest(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);

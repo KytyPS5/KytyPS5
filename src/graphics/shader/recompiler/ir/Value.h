@@ -33,14 +33,14 @@ public:
 	static Value F16(uint16_t bits);
 	static Value F32(float value);
 
-	[[nodiscard]] bool IsEmpty() const;
-	[[nodiscard]] bool IsImmediate() const;
+	[[nodiscard]] bool IsEmpty() const { return type == Type::Void; }
+	[[nodiscard]] bool IsImmediate() const { return type != Type::Opaque; }
 	[[nodiscard]] bool IsIdentity() const;
 	[[nodiscard]] bool IsPhi() const;
 	[[nodiscard]] Type GetType() const;
 
 	[[nodiscard]] Inst*     Instruction() const;
-	[[nodiscard]] Inst*     TryInstruction() const;
+	[[nodiscard]] Inst*     TryInstruction() const { return type == Type::Opaque ? inst : nullptr; }
 	[[nodiscard]] Inst*     ResolveInstruction() const;
 	[[nodiscard]] Value     Resolve() const;
 	[[nodiscard]] ScalarReg ScalarRegister() const;
@@ -112,7 +112,7 @@ public:
 	Inst(Inst&&)                 = delete;
 	Inst& operator=(Inst&&)      = delete;
 
-	[[nodiscard]] ValueOpcode             GetOpcode() const;
+	[[nodiscard]] ValueOpcode             GetOpcode() const { return opcode; }
 	[[nodiscard]] Type                    GetType() const;
 	[[nodiscard]] bool                    MayHaveSideEffects() const;
 	[[nodiscard]] bool                    HasUses() const;
@@ -121,17 +121,11 @@ public:
 	[[nodiscard]] size_t                  NumPhiBlocks() const;
 	[[nodiscard]] Value                   Arg(size_t index) const;
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
-	[[nodiscard]] Block*                  Parent() const;
-	[[nodiscard]] const std::vector<Use>& Uses() const;
-	// Runtime indices belong to the resource plan that owns this instruction.
-	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
-		if (evaluation_index == UINT32_MAX) {
-			evaluation_index = count++;
-		}
-		return evaluation_index;
-	}
-	// UINT32_MAX until EvaluationIndex numbers the value.
-	[[nodiscard]] uint32_t AssignedEvaluationIndex() const { return evaluation_index; }
+	[[nodiscard]] Block*                  Parent() const { return parent; }
+	[[nodiscard]] const std::vector<Use>& Uses() const { return uses; }
+	// SRT walker output index, assigned by the resource plan that owns this instruction.
+	[[nodiscard]] uint32_t WalkOutput() const { return walk_output; }
+	void SetWalkOutput(uint32_t index) const { walk_output = index; }
 	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
 	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
 	void SetDefinition(uint32_t half, uint32_t definition) const {
@@ -144,6 +138,8 @@ public:
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void Invalidate();
+	// Drops the arguments without updating their use lists, for teardown that destroys both sides.
+	void DropArgs();
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -163,6 +159,8 @@ public:
 private:
 	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
 
+	template <typename Self>
+	static auto& ArgSlot(Self& self, size_t index);
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
@@ -173,7 +171,7 @@ private:
 	ValueOpcode         opcode;
 	uint8_t             num_args;
 	bool                live = false;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
+	mutable uint32_t    walk_output = UINT32_MAX;
 	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
@@ -187,51 +185,13 @@ private:
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
-// Defined here so that the IR walks, which call these for every value, can inline them.
-
-inline Value::Value(Inst* value): type(Type::Opaque), inst(value) {}
-inline Value::Value(ScalarReg value): type(Type::ScalarReg), scalar_reg(value) {}
-inline Value::Value(VectorReg value): type(Type::VectorReg), vector_reg(value) {}
-inline Value::Value(bool value): type(Type::U1), imm_u1(value) {}
-inline Value::Value(uint8_t value): type(Type::U8), imm_u8(value) {}
-inline Value::Value(uint16_t value): type(Type::U16), imm_u16(value) {}
-inline Value::Value(uint32_t value): type(Type::U32), imm_u32(value) {}
-inline Value::Value(uint64_t value): type(Type::U64), imm_u64(value) {}
-
-inline Value::Value(Type value_type, uint64_t bits): type(value_type), imm_u64(bits) {}
-inline bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-inline bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
+// Called per operand by the IR passes and the resource walker; inline, as the build has no LTO.
 inline bool Value::IsIdentity() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
 }
 
 inline bool Value::IsPhi() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
-inline Type Value::GetType() const {
-	if (IsPhi()) {
-		return inst->Flags<Type>();
-	}
-	if (IsIdentity()) {
-		return inst->Arg(0).GetType();
-	}
-	return type == Type::Opaque ? inst->GetType() : type;
-}
-
-inline Inst* Value::Instruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return inst;
-}
-
-inline Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
 }
 
 inline Inst* Value::ResolveInstruction() const {
@@ -243,99 +203,26 @@ inline Value Value::Resolve() const {
 	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
-inline ScalarReg Value::ScalarRegister() const {
-	EXIT_IF(type != Type::ScalarReg);
-	return scalar_reg;
-}
-
-inline VectorReg Value::VectorRegister() const {
-	EXIT_IF(type != Type::VectorReg);
-	return vector_reg;
-}
-
-inline bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-inline uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-inline uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
-}
-
 inline uint32_t Value::U32() const {
 	EXIT_IF(type != Type::U32);
 	return imm_u32;
-}
-
-inline uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
-inline uint16_t Value::F16Bits() const {
-	EXIT_IF(type != Type::F16);
-	return imm_u16;
-}
-
-inline float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
-}
-
-inline bool Value::operator==(const Value& other) const {
-	if (type != other.type) {
-		return false;
-	}
-	switch (type) {
-		case Type::Void: return true;
-		case Type::Opaque: return inst == other.inst;
-		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
-		case Type::VectorReg: return vector_reg == other.vector_reg;
-		case Type::U1: return imm_u1 == other.imm_u1;
-		case Type::U8: return imm_u8 == other.imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16 == other.imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
-		default: return false;
-	}
-}
-
-inline ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
-
-inline Type Inst::GetType() const {
-	if (opcode == ValueOpcode::Phi) {
-		return static_cast<Type>(flags);
-	}
-	if (opcode == ValueOpcode::Identity && num_args != 0) {
-		return Arg(0).GetType();
-	}
-	return TypeOf(opcode);
 }
 
 inline size_t Inst::NumArgs() const {
 	return num_args == PhiArity ? phi_args.size() : num_args;
 }
 
-inline size_t Inst::NumPhiBlocks() const {
-	return num_args == PhiArity ? phi_args.size() : 0;
+template <typename Self>
+auto& Inst::ArgSlot(Self& self, size_t index) {
+	EXIT_IF(index >= self.NumArgs());
+	if (self.num_args <= InlineArity) {
+		return self.fixed_args[index];
+	}
+	return self.num_args == PhiArity ? self.phi_args[index].second : self.large_args[index];
 }
 
 inline Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+	return ArgSlot(*this, index);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

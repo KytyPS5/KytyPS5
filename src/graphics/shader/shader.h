@@ -16,17 +16,6 @@
 
 namespace Libs::Graphics {
 
-namespace ShaderError {
-
-[[nodiscard]] inline bool Fail(std::string* error, std::string_view message) {
-	if (error != nullptr) {
-		error->assign(message.data(), message.size());
-	}
-	return false;
-}
-
-} // namespace ShaderError
-
 namespace HW {
 struct VertexShaderInfo;
 struct PixelShaderInfo;
@@ -46,16 +35,14 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
-namespace ShaderRecompiler::IR {
-struct CompiledShaderInfo;
-} // namespace ShaderRecompiler::IR
+struct ShaderModule;
 
 struct ShaderStageRuntime {
-	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	const ShaderModule*                           module    = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr && resources != nullptr;
+		return module != nullptr && resources != nullptr;
 	}
 };
 
@@ -141,6 +128,17 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_topology       = 0;
 };
 
+// GS user-data slots an indirect draw packet writes its record's base vertex and first instance
+// to. A packet can leave both slots unused even when its record contains nonzero offsets.
+struct ShaderIndirectOffsets {
+	static constexpr uint8_t None = UINT8_MAX;
+
+	uint8_t vertex   = None;
+	uint8_t instance = None;
+
+	bool operator==(const ShaderIndirectOffsets&) const = default;
+};
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -169,6 +167,11 @@ struct ShaderVertexInputInfo {
 	// at different locations (see ShaderPixelParameterLocation), and the last vertex stage must
 	// write the parameter to both. For each parameter: the second location plus one, or zero.
 	std::array<uint8_t, RES_MAX> param_copy_location {};
+	ShaderIndirectOffsets   indirect_offsets;
+	// GPU-read records add Vulkan bases even when the packet patches no user SGPRs.
+	bool                    indirect_draw       = false;
+	// Attribute-table metadata enables dynamic fetch detection; loads are matched later.
+	bool                    has_dynamic_vertex_fetch = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -213,6 +216,9 @@ struct ShaderPixelInputInfo {
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	std::array<ShaderColorNumberClass, 8>          target_number_class          = {};
 	uint8_t                                        target_packed_unorm_mask      = 0;
+	// Exports to UINT and SINT targets, which take integer outputs of the same signedness.
+	uint8_t                                        target_uint_mask             = 0;
+	uint8_t                                        target_sint_mask             = 0;
 	// CB round mode per converted export: zero adds half an LSB, one truncates.
 	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;

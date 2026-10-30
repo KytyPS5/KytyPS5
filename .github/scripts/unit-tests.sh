@@ -47,7 +47,6 @@ names=(
 	image_readback
 	np_webapi2_entitlements
 	overlay_queue
-	const_ram
 	ime_dialog
 	lru_cache
 	metadata_fill
@@ -94,6 +93,7 @@ ctest_only=(
 # run them: run them locally (ctest -R shader_recompiler_compute and these names).
 # kernel_file_system needs one too: guest memory needs the GPU resources of a Vulkan device.
 local_only=(
+	build_flags
 	buffer_cache_dirty_gc
 	buffer_cache_guest_backed
 	buffer_cache_ranges

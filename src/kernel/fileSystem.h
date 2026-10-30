@@ -56,6 +56,8 @@ void                  Mount(const std::filesystem::path& folder, const std::stri
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+// Returns whether d is an open file, directory or device descriptor.
+bool                  IsOpenDescriptor(int d);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);

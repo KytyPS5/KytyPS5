@@ -50,7 +50,7 @@ void NoteServerPickerQuestion(const ServerPickerQuestion& question);
 // this server, or an empty string.
 std::string PatchPlanJson(const std::string& version, const std::string& process);
 
-// The local user looks signed in to PSN, because the server runs (see KYTY_PSN_SIGNED_IN).
+// The local user looks signed in to PSN, because the server runs (Network::NpManager::IsSignedIn).
 bool SignedInForTitle();
 
 } // namespace Libs::EaEmulation

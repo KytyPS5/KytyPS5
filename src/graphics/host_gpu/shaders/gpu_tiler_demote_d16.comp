@@ -1,10 +1,11 @@
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
 
 layout(constant_id = 0) const uint D32 = 0u;
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
-layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+layout(set = 0, binding = 1, std430) buffer Output { uint16_t data[]; } output_buffer;
 
 layout(push_constant, std430) uniform Conversion {
 	uint src_base;
@@ -32,9 +33,5 @@ void main() {
 	}
 	uint src = params.src_base + y * params.source_pitch + x * 4u;
 	uint dst = params.dst_base + y * params.target_pitch + x * 2u;
-	uint shift = (dst & 2u) * 8u;
-	uint mask = 0xffffu << shift;
-	uint word = dst >> 2u;
-	atomicAnd(output_buffer.data[word], ~mask);
-	atomicOr(output_buffer.data[word], decode(input_buffer.data[src >> 2u]) << shift);
+	output_buffer.data[dst >> 1u] = uint16_t(decode(input_buffer.data[src >> 2u]));
 }

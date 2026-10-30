@@ -145,7 +145,9 @@ void TestReadGivesTheNewestUnreadStates() {
 	input.Connect(1);
 	std::array<PadState, 64> out {};
 	(void)input.Read(out);
+	// Each state differs in a button: a change of the sticks alone updates the newest unread state.
 	for (int i = 0; i < 10; i++) {
+		input.SetButton(1, PAD_BUTTON_CROSS, i % 2 == 0, 10 + i);
 		input.SetAxis(1, Axis::LeftX, 100 + i, 10 + i);
 	}
 	Check(input.Read(std::span(out).first(4)) == 4 && out[0].axes[0] == 106 &&
@@ -153,6 +155,7 @@ void TestReadGivesTheNewestUnreadStates() {
 	      "a short read did not get the newest states, oldest first");
 	Check(input.Read(out) == 0, "states were read twice");
 	for (int i = 0; i < 100; i++) {
+		input.SetButton(1, PAD_BUTTON_CROSS, i % 2 == 0, 100 + i);
 		input.SetAxis(1, Axis::LeftX, i, 100 + i);
 	}
 	Check(input.Read(out) == 64 && out[0].axes[0] == 36 && out[63].axes[0] == 99,

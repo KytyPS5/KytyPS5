@@ -17,9 +17,15 @@
 
 namespace Libs::Graphics {
 
-enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Rotate2_10_10_10 };
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_256_0,
+	Dcc256_64_64,
+	Dcc128_128_128,
+	Unsupported
+};
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 
@@ -99,6 +105,8 @@ struct ImageInfo {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k10_11_11Float:
 				return ColorTransform::Reverse10_11_11;
+			case Prospero::BufferFormat::k2_10_10_10UNorm:
+				return ColorTransform::Rotate2_10_10_10;
 			default: return ColorTransform::None;
 		}
 	}
@@ -287,8 +295,9 @@ inline bool ImageInfo::IsDepth() const noexcept {
 [[nodiscard]] inline VideoOutCompression
 ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t dcc_control,
                             uint64_t dcc_clear_color) noexcept {
-	constexpr uint32_t DCC_256_256_0 = 0x00000048u;
-	constexpr uint32_t DCC_256_64_64 = 0x00000208u;
+	constexpr uint32_t DCC_256_256_0   = 0x00000048u;
+	constexpr uint32_t DCC_256_64_64   = 0x00000208u;
+	constexpr uint32_t DCC_128_128_128 = 0x00100024u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
@@ -300,6 +309,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	switch (dcc_control) {
 		case DCC_256_256_0: return VideoOutCompression::Dcc256_256_0;
 		case DCC_256_64_64: return VideoOutCompression::Dcc256_64_64;
+		case DCC_128_128_128: return VideoOutCompression::Dcc128_128_128;
 		default: return VideoOutCompression::Unsupported;
 	}
 }
@@ -378,6 +388,9 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	const auto unorm16 = [](uint64_t value) {
+		return static_cast<float>(value & 0xffffu) / 65535.0f;
+	};
 	const auto float16 = [](uint32_t value) {
 		const auto sign = (value & 0x8000u) << 16u;
 		const auto exponent = (value >> 10u) & 0x1fu;
@@ -403,19 +416,49 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[1] = float16(packed >> 16u);
 			[[fallthrough]];
 		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
-		case vk::Format::eR16G16Unorm:
-			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[2] = unorm16(clear_words >> 32u);
+			next.float32[3] = unorm16(clear_words >> 48u);
 			[[fallthrough]];
-		case vk::Format::eR16Unorm:
-			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+		case vk::Format::eR16G16Unorm:
+			next.float32[1] = unorm16(packed >> 16u);
+			[[fallthrough]];
+		case vk::Format::eR16Unorm: next.float32[0] = unorm16(packed); break;
+		case vk::Format::eR16G16B16A16Uint:
+			for (uint32_t i = 0; i < 4; i++) {
+				next.uint32[i] = static_cast<uint16_t>(clear_words >> (16u * i));
+			}
 			break;
-		// Each clear register stores one raw 32-bit float channel.
+		case vk::Format::eR16G16B16A16Sint:
+			for (uint32_t i = 0; i < 4; i++) {
+				next.int32[i] = static_cast<int16_t>(clear_words >> (16u * i));
+			}
+			break;
+		// Each clear register stores one raw 32-bit channel.
 		case vk::Format::eR32G32Sfloat:
 			next.float32[1] = std::bit_cast<float>(static_cast<uint32_t>(clear_words >> 32u));
 			[[fallthrough]];
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
-		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
-		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+			next.uint32[1] = static_cast<uint32_t>(clear_words >> 32u);
+			[[fallthrough]];
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint: next.uint32[0] = packed; break;
+		// Narrow targets hold their channels in the low bits of the first word. UFC 6 (PPSA23566)
+		// fast-clears an R8_UINT map through CMASK every frame and then writes only part of it;
+		// without these the clear was dropped and old contents piled up.
+		case vk::Format::eR8Uint: next.uint32[0] = packed & 0xffu; break;
+		case vk::Format::eR8Unorm: next.float32[0] = unorm8(packed); break;
+		case vk::Format::eR8G8Uint:
+			next.uint32[0] = packed & 0xffu;
+			next.uint32[1] = (packed >> 8u) & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			next.float32[0] = unorm8(packed);
+			next.float32[1] = unorm8(packed >> 8u);
+			break;
+		case vk::Format::eR16Uint: next.uint32[0] = packed & 0xffffu; break;
 		case vk::Format::eR8G8B8A8Srgb:
 			next.float32[0] = srgb8(packed);
 			next.float32[1] = srgb8(packed >> 8u);
@@ -462,8 +505,14 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm ||
+	     format == vk::Format::eR16Uint || format == vk::Format::eR8G8Unorm ||
+	     format == vk::Format::eR8G8Uint) &&
 	    (packed & 0xffffu) != (packed >> 16u)) {
+		return false;
+	}
+	if ((format == vk::Format::eR8Unorm || format == vk::Format::eR8Uint) &&
+	    packed != (packed & 0xffu) * 0x01010101u) {
 		return false;
 	}
 	if (format == vk::Format::eR16G16B16A16Sfloat) {

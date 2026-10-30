@@ -23,6 +23,9 @@ namespace Libs {
 namespace LibNpEntitlementAccess {
 void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase* s);
 }
+namespace LibNpEntitlementAccessPft {
+void InitNet_1_NpEntitlementAccessPft(Loader::SymbolDatabase* s);
+}
 namespace LibNpTrophy2 {
 void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
 }
@@ -1685,11 +1688,33 @@ LIB_VERSION("NpAuth", 1, "NpAuth", 1, 1);
 constexpr int NP_AUTH_MAX_REQUEST_NUM         = 16;
 constexpr int NP_AUTH_REQUEST_ID_OFFSET       = 0x10000000;
 constexpr int NP_AUTH_ERROR_INVALID_ARGUMENT  = -2141912319; /* 0x80550301 */
+constexpr int NP_AUTH_ERROR_INVALID_SIZE      = -2141912318; /* 0x80550302 */
 constexpr int NP_AUTH_ERROR_ABORTED           = -2141912316; /* 0x80550304 */
 constexpr int NP_AUTH_ERROR_REQUEST_MAX       = -2141912315; /* 0x80550305 */
 constexpr int NP_AUTH_ERROR_REQUEST_NOT_FOUND = -2141912314; /* 0x80550306 */
 constexpr int NP_AUTH_ERROR_INVALID_ID        = -2141912313; /* 0x80550307 */
+constexpr int NP_AUTH_ERROR_SERVICE_DOWN      = -2141912063; /* 0x80550401 */
 constexpr int NP_ERROR_SIGNED_OUT             = -2141913082; /* 0x80550006 */
+
+struct NpAuthGetAuthorizationCodeParameterV3 {
+	size_t      size;
+	int         user_id;
+	uint8_t     padding[4];
+	const void* client_id;
+	const char* scope;
+};
+
+struct NpAuthGetIdTokenParameterV3 {
+	size_t      size;
+	int         user_id;
+	uint8_t     padding[4];
+	const void* client_id;
+	const void* client_secret;
+	const char* scope;
+};
+
+static_assert(sizeof(NpAuthGetAuthorizationCodeParameterV3) == 32);
+static_assert(sizeof(NpAuthGetIdTokenParameterV3) == 40);
 
 enum class NpAuthRequestState {
 	None = 0,
@@ -1822,7 +1847,7 @@ static int np_auth_wait_or_poll_async(int req_id, int* result) {
 	return 0;
 }
 
-static int np_auth_complete_signed_out(NpAuthRequest* request) {
+static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 	if (request->state == NpAuthRequestState::Complete) {
 		request->result = NP_AUTH_ERROR_INVALID_ARGUMENT;
 		return NP_AUTH_ERROR_INVALID_ARGUMENT;
@@ -1833,15 +1858,17 @@ static int np_auth_complete_signed_out(NpAuthRequest* request) {
 	}
 
 	request->state  = NpAuthRequestState::Complete;
-	request->result = NP_ERROR_SIGNED_OUT;
+	// Emulating sign-in cannot provide a real authorization code or ID token.
+	request->result = Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN
+	                                                        : NP_ERROR_SIGNED_OUT;
 
-	return request->async ? 0 : NP_ERROR_SIGNED_OUT;
+	return request->async ? 0 : request->result;
 }
 
-// KYTY_PSN_SIGNED_IN: the local user has a PSN account, so a request for an authorization code or
-// an id token succeeds with a placeholder. Only a stand-in server accepts it.
+// A title whose servers the emulator answers itself (libs/eaEmulation): a request for an authorization
+// code or an id token succeeds with a placeholder, which only that stand-in server accepts.
 static bool np_auth_ea_signed_in() {
-	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || EaEmulation::SignedInForTitle();
+	static const bool enabled = EaEmulation::SignedInForTitle();
 	return enabled;
 }
 
@@ -1869,8 +1896,9 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* param,
-                                                      void* auth_code, int* issuer_id) {
+static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
+    int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
+    int* issuer_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1878,9 +1906,17 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 	LOGF("\t auth_code = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(auth_code));
 	LOGF("\t issuer_id = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(issuer_id));
 
-	if (auth_code != nullptr) {
-		memset(auth_code, 0, 136);
+	if (req_id <= 0 || param == nullptr || auth_code == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
 	}
+	if (param->size < sizeof(*param)) {
+		return NP_AUTH_ERROR_INVALID_SIZE;
+	}
+	if (param->client_id == nullptr || param->scope == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(auth_code, 0, 136);
 	if (issuer_id != nullptr) {
 		*issuer_id = 0;
 	}
@@ -1891,15 +1927,9 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
 	if (request->state == NpAuthRequestState::Aborted) {
-		// request->result = 0;
-		// return 0;
 		request->result = NP_AUTH_ERROR_ABORTED;
 		return NP_AUTH_ERROR_ABORTED;
 	}
-	// request->state  = NpAuthRequestState::Complete;
-	// request->result = 0;
-
-	// return 0;
 	if (np_auth_ea_signed_in()) {
 		if (auth_code != nullptr) {
 			std::strncpy(static_cast<char*>(auth_code), "kyty0001", 127);
@@ -1909,19 +1939,28 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 		}
 		return np_auth_complete_ok(request);
 	}
-	return np_auth_complete_signed_out(request);
+	return np_auth_complete_unavailable(request, param->user_id);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void* id_token) {
+static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
+                                        void* id_token) {
 	PRINT_NAME();
 
 	LOGF("\t req_id   = %d\n", req_id);
 	LOGF("\t param    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 	LOGF("\t id_token = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(id_token));
 
-	if (id_token != nullptr) {
-		memset(id_token, 0, 4104);
+	if (req_id <= 0 || param == nullptr || id_token == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
 	}
+	if (param->size < sizeof(*param)) {
+		return NP_AUTH_ERROR_INVALID_SIZE;
+	}
+	if (param->client_id == nullptr || param->client_secret == nullptr || param->scope == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(id_token, 0, 4104);
 
 	std::scoped_lock lock(g_np_auth_request_mutex);
 	auto*            request = np_auth_find_request(req_id);
@@ -1929,22 +1968,16 @@ static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void*
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
 	if (request->state == NpAuthRequestState::Aborted) {
-		// request->result = 0;
-		// return 0;
 		request->result = NP_AUTH_ERROR_ABORTED;
 		return NP_AUTH_ERROR_ABORTED;
 	}
-	// request->state  = NpAuthRequestState::Complete;
-	// request->result = 0;
-
-	// return 0;
 	if (np_auth_ea_signed_in()) {
 		if (id_token != nullptr) {
 			std::strncpy(static_cast<char*>(id_token), "kyty.emulated.idtoken", 4103);
 		}
 		return np_auth_complete_ok(request);
 	}
-	return np_auth_complete_signed_out(request);
+	return np_auth_complete_unavailable(request, param->user_id);
 }
 
 LIB_DEFINE(InitNet_1_NpAuth) {
@@ -2074,9 +2107,9 @@ struct NpWebApi2ResponseInformationOption {
 	size_t  response_data_size;
 };
 
-// KYTY_PSN_SIGNED_IN: see the same switch in NpAuth.
+// A title whose servers the emulator answers itself (libs/eaEmulation): see the same switch in NpAuth.
 static bool np_webapi2_ea_signed_in() {
-	static const bool enabled = std::getenv("KYTY_PSN_SIGNED_IN") != nullptr || EaEmulation::SignedInForTitle();
+	static const bool enabled = EaEmulation::SignedInForTitle();
 	return enabled;
 }
 
@@ -2215,7 +2248,7 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 	request->second.response.clear();
 	request->second.read_offset = 0;
 
-	// KYTY_PSN_SIGNED_IN: the answers a signed-in account would get. The bodies follow the public
+	// A title with a stand-in server: the answers a signed-in account would get. The bodies follow the public
 	// shape of these calls; the game's own checks decide whether they are enough.
 	if (np_webapi2_ea_signed_in()) {
 		const auto& path = request->second.path;
@@ -2905,6 +2938,7 @@ LIB_DEFINE(InitNet_1) {
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
+	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);
 	LibNpAuth::InitNet_1_NpAuth(s);
 	LibNpTrophy2::InitNet_1_NpTrophy2(s);
 	LibNpUniversalDataSystem::InitNet_1_NpUniversalDataSystem(s);

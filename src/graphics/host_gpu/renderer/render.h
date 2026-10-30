@@ -29,10 +29,6 @@ class Shader;
 } // namespace HW
 
 struct GraphicContext;
-struct ShaderBufferResource;
-struct ShaderComputeInputInfo;
-struct RenderDepthInfo;
-struct RenderColorInfo;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
@@ -60,6 +56,14 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+struct DrawIndirectArgs {
+	uint64_t              address = 0;
+	uint32_t              count   = 0;
+	uint32_t              stride  = 0;
+	ShaderIndirectOffsets offsets;
+};
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -68,11 +72,9 @@ struct DrawIndexArgs {
 	int32_t          base_vertex                = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	// Nonzero: the host GPU reads the draw's arguments (a VkDrawIndexedIndirectCommand, as the
-	// guest lays them out) at this guest address. index_count is then the size of the index
-	// buffer in indices, and the other counts and offsets are unused.
-	uint64_t         indirect_args_address      = 0;
 	uint32_t         render_target_slice_offset = 0;
+	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
@@ -81,10 +83,8 @@ struct DrawAutoArgs {
 	uint32_t         first_vertex               = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	// Nonzero: the host GPU reads the draw's arguments (a VkDrawIndirectCommand) at this guest
-	// address, and the counts and offsets above are unused.
-	uint64_t         indirect_args_address      = 0;
 	uint32_t         render_target_slice_offset = 0;
+	DrawIndirectArgs indirect;
 };
 
 struct SubmitInfo {
@@ -179,6 +179,10 @@ private:
 	friend class CommandScheduler;
 };
 
+namespace Pssr {
+struct Request;
+}
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context);
@@ -203,6 +207,11 @@ public:
 	[[nodiscard]] bool LastPendingIsDispatch() const;
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
+	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
+	// Frees the PSSR pipeline (the destructor).
+	void DestroyPssr();
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
@@ -223,8 +232,6 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	// Remembered in m_decoded_textures.
 	[[nodiscard]] DecodedTexture DecodeTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                           const ShaderRecompiler::IR::DescriptorValue& value) const;
@@ -271,7 +278,7 @@ private:
 	void FinishDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          std::array<uint32_t, 3> groups, uint32_t mode,
 	                          ShaderComputeInputInfo& input_info,
-	                          const ShaderProgram& compute_program);
+	                          const ShaderModule&  compute_program);
 	// The free slot for the next pending work, with a copy of the buffer's registers.
 	PendingWork& NextPendingWork(CommandBuffer& buffer, uint64_t submit_id);
 	// Queues the lookups of `next` on the front worker, and records the oldest pending work
@@ -286,21 +293,8 @@ private:
 	void RecordPendingDrawIndex(PendingWork& pending, CommandBuffer& buffer);
 	void RecordPendingDrawAuto(PendingWork& pending, CommandBuffer& buffer);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
-	                         DrawRenderState& state, vk::PrimitiveTopology topology,
-	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
-	// Whether the host GPU can read the arguments of an indirect draw in this state: draws that
-	// a special color mode, a depth copy or a quad list turns into other work need the counts
-	// on the CPU.
-	[[nodiscard]] static bool HostReadsIndirectArgs(const CommandBuffer& buffer);
-	// The same once the draw's state is known: the mesh paths need the counts on the CPU, and a
-	// rewritten fetch keeps the arguments' first instance.
-	[[nodiscard]] bool HostReadsIndirectArgs(const DrawRenderState& state) const;
-	// Copies the arguments of an indirect draw for the host GPU to read, without the offsets a
-	// native fetch adds itself; returns the copy.
-	[[nodiscard]] std::pair<vk::Buffer, uint64_t> PrepareIndirectArgs(CommandBuffer&      buffer,
-	                                                                  bool                indexed,
-	                                                                  const DrawEmitInfo& emit);
+	                         DrawRenderState& state, const DrawEmitInfo& emit,
+	                         const DrawIndexBufferSource& index_source);
 	void ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
 	                              const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
@@ -327,7 +321,6 @@ private:
 	// Created on the first pipelined draw or dispatch (see FrontWorkerEnabled).
 	std::unique_ptr<FrontPipeline, FrontPipelineDeleter> m_front_pipeline;
 	// The resources the program lookups of the current draw and dispatch materialized.
-	PipelineCache::StageResources          m_draw_resources;
 	ShaderRecompiler::IR::ResourceSnapshot m_dispatch_resources;
 	// The last color target each slot resolved (colorRenderTarget.cpp).
 	struct ColorTargetMemos;
@@ -351,8 +344,10 @@ private:
 			return std::hash<uint64_t> {}(id.image ^ ((uint64_t {id.mip} << 40) | (uint64_t {id.layer} << 8)));
 		}
 	};
+	// TODO(upstream merge stage 2): slots have no generation since the merge, so a slot given to a
+	// new image inherits the frame of the old one; Image::serial would tell them apart.
 	static uint64_t ImageIdentity(ImageId image) {
-		return (uint64_t {image.index} << 32) | image.generation;
+		return uint64_t {image.index} << 32;
 	}
 	static TargetId TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
 		return {ImageIdentity(image), mip, layer};
@@ -408,6 +403,9 @@ private:
 	// On the heap: inline, its 5 MB made every RenderContext on a stack overflow an 8 MB stack.
 	std::vector<DecodedSlot> m_decoded_slots = std::vector<DecodedSlot>(size_t {1} << DecodedSlotBits);
 	uint64_t                      m_decoded_epoch = 1;
+	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

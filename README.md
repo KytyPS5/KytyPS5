@@ -48,6 +48,16 @@ or graphical glitches, so please include the version you tested when reporting a
 <table align="center">
   <tr>
     <td align="center">
+      <strong>Cyberpunk 2077</strong><br>
+      <img src="docs/screenshots/ps5-07.png" width="300" alt="Cyberpunk 2077 running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>MLB The Show 23</strong><br>
+      <img src="docs/screenshots/ps5-08.png" width="300" alt="MLB The Show 23 running in KytyPS5">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
       <strong>Astro Bot</strong><br>
       <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
     </td>

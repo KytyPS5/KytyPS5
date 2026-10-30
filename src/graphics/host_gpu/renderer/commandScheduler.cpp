@@ -574,13 +574,17 @@ void CommandScheduler::StartGpuProfile() {
 	                                  ProfileBlockQueries / 2);
 }
 
-void CommandScheduler::GpuProfileBegin() {
+void CommandScheduler::GpuProfileBegin(bool count_samples) {
 	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
 	if (block.used + 2 > ProfileBlockQueries) return;
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
 	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
 	                                      block.used);
-	m_command.Handle().beginQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
+	// One occlusion query at a time: the guest's own (--occlusion-queries) has the samples then.
+	m_profile_counts_samples = count_samples;
+	if (count_samples) {
+		m_command.Handle().beginQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
+	}
 	m_command.Handle().beginQuery(m_profile_stats, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
 	block.used++;
 }
@@ -589,7 +593,9 @@ void CommandScheduler::GpuProfileEnd(uint64_t key) {
 	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
 	if ((block.used & 1u) == 0u || block.used + 1 > ProfileBlockQueries) return;
 	m_command.Handle().endQuery(m_profile_stats, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
-	m_command.Handle().endQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
+	if (m_profile_counts_samples) {
+		m_command.Handle().endQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
+	}
 	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
 	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
 	                                      block.used);

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/writeWatchSet.h"
 
+#include <array>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -142,6 +143,10 @@ public:
 	// The end-of-pipe labels the host GPU has not completed: a GPU read recorded after a label
 	// sees its value (ApplyPendingLabels), though guest memory gets it only on completion.
 	void SetPendingLabels(PendingLabels* labels) noexcept { m_labels = labels; }
+	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
+	// until a GPU write or download.
+	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
+	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
 	// Between Begin and End, uploads share one barrier before the first copy and one after the
 	// last. A barrier between two copies makes the Metal backend start a new blit encoder for
@@ -155,10 +160,7 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
-	bool IsBufferInvalid(BufferId id) const {
-		const auto* buffer = m_slot_buffers.try_get(id);
-		return buffer == nullptr || buffer->is_deleted;
-	}
+	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {
@@ -223,6 +225,7 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -293,6 +296,8 @@ private:
 	// Only tests set this: it keeps the copy path covered on a device where the CPU can read
 	// buffer memory.
 	bool                                              m_read_back_through_gpu = false;
+	// One per TileManager::ColorClearSlots key slot.
+	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
 	WriteWatchSet                                      m_write_watches;
 	PendingLabels*                                     m_labels = nullptr;

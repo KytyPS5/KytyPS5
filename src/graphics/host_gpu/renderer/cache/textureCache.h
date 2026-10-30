@@ -46,6 +46,7 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -182,6 +183,12 @@ private:
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
+	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
+	// render area.
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	                               vk::CommandBuffer command);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
@@ -284,7 +291,6 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
-	mutable uint32_t m_image_query_epoch      = 0;
 	// Recent FindImagesInRegion answers. Image ranges do not change while an image is
 	// registered, so an answer holds until an image over its range is registered or
 	// unregistered (RangeUnchangedSince).
@@ -344,10 +350,12 @@ private:
 	static constexpr size_t MaxFoundImages = 1u << 16u;
 	std::unordered_map<FindImageKey, FoundImage, FindImageKeyHash> m_found_images;
 	bool             m_readback_linear_images = false;
+	bool             m_readback_tiled_images  = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class ImageHeap;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);

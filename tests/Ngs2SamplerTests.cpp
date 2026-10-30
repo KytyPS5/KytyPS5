@@ -124,7 +124,7 @@ void TestWaveformQueueCapacity() {
 			for (uint32_t i = 0; i < capacity; ++i) {
 				Check(f.voice.blocks[i].data == reinterpret_cast<const uint8_t*>(pcm) &&
 				          f.voice.blocks[i].info.user_data == i + 1 &&
-				          f.voice.blocks[i].cursor == (i == 0 ? 1u : 0u),
+				          f.voice.blocks[i].data_cursor == (i == 0 ? sizeof(int16_t) : 0u),
 				      "rejected waveform request replaced an outstanding block");
 			}
 			f.Render(3);
@@ -751,6 +751,26 @@ void TestCustomSideChainUserFx() {
 	      "user FX did not receive the side-chain buffer after the source channels");
 }
 
+struct RenderRack {
+	std::unique_ptr<std::byte[]> storage;
+	uintptr_t handle = 0;
+
+	RenderRack(Ngs2Internal& system, uint32_t id, const Ngs2RackOption& option) {
+		Ngs2ContextBufferInfo buffer {};
+		Check(Ngs2RackQueryBufferSize(id, &option, &buffer) == OK, "rack size query failed");
+		storage = std::make_unique<std::byte[]>(buffer.host_buffer_size);
+		buffer.host_buffer = storage.get();
+		Check(Ngs2RackCreate(reinterpret_cast<uintptr_t>(&system), id, &option, &buffer,
+		                     &handle) == OK, "render rack creation failed");
+	}
+
+	~RenderRack() { Check(Ngs2RackDestroy(handle, nullptr) == OK, "render rack cleanup failed"); }
+
+	Ngs2VoiceInternal& Voice() {
+		return *reinterpret_cast<Ngs2VoiceInternal*>(reinterpret_cast<Ngs2RackInternal*>(handle) + 1);
+	}
+};
+
 void TestPcm16RenderOutput() {
 	Ngs2Internal system;
 	system.option                   = Ngs2DefaultSystemOption();
@@ -760,23 +780,11 @@ void TestPcm16RenderOutput() {
 	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
 	sampler_option.common.max_voices = 2;
 	sampler_option.common.max_ports  = 1;
-	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
-	    std::byte sampler_storage[sizeof(Ngs2RackInternal) + 2 * sizeof(Ngs2VoiceInternal)];
-	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
-	    std::byte mastering_storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
-	Ngs2ContextBufferInfo sampler_buffer {sampler_storage, sizeof(sampler_storage)};
-	Ngs2ContextBufferInfo mastering_buffer {mastering_storage, sizeof(mastering_storage)};
-	uintptr_t sampler_handle = 0, mastering_handle = 0;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
 	const auto system_handle = reinterpret_cast<uintptr_t>(&system);
-	Check(Ngs2RackCreate(system_handle, 0x1000, &sampler_option.common, &sampler_buffer,
-	                     &sampler_handle) == OK &&
-	          Ngs2RackCreate(system_handle, 0x3000, &mastering_option.common,
-	                         &mastering_buffer, &mastering_handle) == OK,
-	      "PCM16 render rack creation failed");
-	auto* samplers = reinterpret_cast<Ngs2VoiceInternal*>(
-	    reinterpret_cast<Ngs2RackInternal*>(sampler_handle) + 1);
-	auto& mastering = *reinterpret_cast<Ngs2VoiceInternal*>(
-	    reinterpret_cast<Ngs2RackInternal*>(mastering_handle) + 1);
+	auto* samplers = &sampler.Voice();
+	auto& mastering = master.Voice();
 	mastering.channels = 1;
 	mastering.state    = Ngs2VoicePlayState::Playing;
 	const int16_t source[2][4] = {{16384, -16384, 32767, -32768},
@@ -797,9 +805,104 @@ void TestPcm16RenderOutput() {
 	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
 	          std::ranges::all_of(output_samples, [](int16_t sample) { return sample == 0; }),
 	      "PCM16 output retained samples from the previous render");
-	Check(Ngs2RackDestroy(mastering_handle, nullptr) == OK &&
-	          Ngs2RackDestroy(sampler_handle, nullptr) == OK,
-	      "PCM16 render rack cleanup failed");
+}
+
+void TestCustomMasteringChannelMixer() {
+	Ngs2Internal system;
+	system.option = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 6;
+	Ngs2RackOptionUnion sampler_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	sampler_option.common.max_voices = 1;
+	sampler_option.common.max_ports = 1;
+	Ngs2CustomMasteringRackOption master_option {};
+	auto& custom = master_option.custom_rack_option;
+	custom.rack_option.size = sizeof(master_option);
+	custom.rack_option.max_voices = 1;
+	custom.rack_option.max_voice_channels = 6;
+	custom.num_buffers = 1;
+	custom.num_modules = 1;
+	custom.module[0].module_id = 0x17;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x4003, custom.rack_option);
+	auto& source = sampler.Voice();
+	auto& output = master.Voice();
+	output.channels = 6;
+	output.SetEvent(1);
+	struct {
+		Ngs2VoiceParamHeader header {5484, 0, 0x40001700};
+		float levels[37][37] {};
+	} matrix;
+	constexpr float center = 0.70710677f;
+	matrix.levels[0][0] = matrix.levels[1][1] = 1.0f;
+	matrix.levels[0][2] = matrix.levels[1][2] = center;
+	matrix.levels[0][4] = matrix.levels[1][5] = center;
+	int16_t impulses[6][6] {};
+	for (uint32_t c = 0; c < 6; ++c) impulses[c][c] = 8192;
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		if (pass == 1) {
+			std::memset(matrix.levels, 0, sizeof(matrix.levels));
+			matrix.levels[0][1] = 64.0f;
+			matrix.levels[1][0] = -64.0f;
+		}
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&output), &matrix.header) == OK,
+		      "custom channel mixer control failed");
+		source.SetupSampler({0x12, 6, 48000});
+		source.blocks.push_back({reinterpret_cast<const uint8_t*>(impulses),
+		                         {0, sizeof(impulses), 0, 0, 6}});
+		source.ports[0].dest = &output;
+		source.SetEvent(1);
+		std::array<float, 14> pcm;
+		pcm.fill(99.0f);
+		Ngs2RenderBufferInfo buffer {pcm.data() + 1, 12 * sizeof(float), 0x18, 2};
+		Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &buffer, 1) == OK,
+		      "custom mastering rejected stereo output");
+		const std::array<float, 12> expected = pass == 0
+		    ? std::array<float, 12> {0.25f, 0, 0, 0.25f, center / 4, center / 4,
+		                             0, 0, center / 4, 0, 0, center / 4}
+		    : std::array<float, 12> {0, -8, 8, 0};
+		Check(pcm.front() == 99 && pcm.back() == 99 &&
+		          std::equal(expected.begin(), expected.end(), pcm.begin() + 1),
+		      "custom mixer lost channel routing, in-place input, clamping or output bounds");
+	}
+}
+
+void TestCustomVoiceStateCapacity() {
+	for (auto type: {Ngs2RackType::CustomSampler, Ngs2RackType::CustomMastering}) {
+		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
+		f.rack.type = type;
+		f.rack.option.custom_sampler.custom_rack_option.state_size = 212;
+		f.voice.state_flags = 3;
+		f.voice.decoded_samples = 37;
+		f.voice.decoded_bytes = 128;
+		alignas(Ngs2CustomSamplerVoiceState) std::array<uint8_t, 384> storage;
+		auto* state = reinterpret_cast<Ngs2VoiceState*>(storage.data() + 8);
+		const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
+		for (size_t capacity: {212u, 368u}) {
+			storage.fill(0xa5);
+			Check(Ngs2VoiceGetState(handle, state, capacity) == OK && state->state_flags == 3 &&
+			          state->error_code == 0 &&
+			          std::all_of(storage.begin(), storage.begin() + 8,
+			                      [](uint8_t v) { return v == 0xa5; }) &&
+			          std::all_of(storage.begin() + 220, storage.end(),
+			                      [](uint8_t v) { return v == 0xa5; }),
+			      "oversized custom state buffer was rejected or overwritten past configured state");
+			if (type == Ngs2RackType::CustomSampler) {
+				const auto* sampler = reinterpret_cast<const Ngs2CustomSamplerVoiceState*>(state);
+				Check(sampler->num_decoded_samples == 37 && sampler->decoded_data_size == 128,
+				      "custom sampler state omitted playback progress");
+			}
+			const size_t base_size = type == Ngs2RackType::CustomSampler
+			    ? sizeof(Ngs2CustomSamplerVoiceState) : sizeof(Ngs2CustomMasteringVoiceState);
+			Check(std::all_of(storage.begin() + 8 + base_size, storage.begin() + 220,
+			                  [](uint8_t v) { return v == 0; }),
+			      "configured custom state extension was not initialized");
+		}
+		storage.fill(0xa5);
+		Check(Ngs2VoiceGetState(handle, state, 211) == static_cast<int32_t>(0x804a8011u) &&
+		          std::ranges::all_of(storage, [](uint8_t v) { return v == 0xa5; }),
+		      "undersized custom state buffer was accepted or modified");
+	}
 }
 
 void TestPitchLoopAndSkip() {
@@ -846,11 +949,55 @@ void TestStarvationAndPause() {
 	f.Queue(pcm, 2, 0);
 	f.voice.SetEvent(16);
 	f.Render(2);
-	Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0, "paused voice consumed data");
+	Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
+	      "paused voice consumed data");
 	f.voice.SetEvent(32);
 	f.Render(2);
 	Check(f.voice.samples[0] == 0.5f && f.voice.samples[1] == 0.25f,
 	      "stream failed to resume after starvation/pause");
+}
+
+void TestPcmByteUnitStreaming() {
+	Fixture                 f(48000);
+	const int16_t           pcm[] = {0, 4096, 8192, 12288, 16384, 20480, 24576, 28672};
+	const Ngs2WaveformBlock first {0, 4, 0, 1, 5, 0, 0}, rest {4, 12, 0, 0, 99, 0, 0};
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK && f.QueueBlocks(pcm, &rest, 1, 0x12) == OK &&
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 1),
+	      "byte-unit stream was rejected or its read address ignored the skipped frame");
+	f.Render(8);
+	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0, 0, 0} &&
+	          f.voice.blocks.empty() && f.voice.decoded_samples == 5,
+	      "byte-unit stream did not play exactly its duration across data-only blocks");
+}
+
+void TestPcmSkipAcrossBlocks() {
+	Fixture                 f(48000);
+	const int16_t           pcm[] = {1, 2, 3, 8192, 16384};
+	const Ngs2WaveformBlock first {0, 4, 0, 3, 2, 0, 0}, rest {4, 6, 0, 0, 0, 0, 0};
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK, "skipping stream block was rejected");
+	f.Render(1);
+	Check(!f.voice.has_samples && f.voice.blocks.empty(), "skip-only block produced samples");
+	Check(f.QueueBlocks(pcm, &rest, 1, 2) == OK &&
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 3),
+	      "read address ignored the skip remaining from the previous block");
+	f.Render(2);
+	Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} && f.voice.decoded_samples == 2 &&
+	          f.voice.decoded_bytes == sizeof(pcm),
+	      "skip spanning blocks played skipped frames or miscounted decoded data");
+}
+
+void TestPcmBlocksEndWithTheirData() {
+	// The Last Oricru queues blocks holding fewer frames than they declare, even none.
+	Fixture                 f(48000, 2);
+	const int16_t           pcm[] = {4096, -4096, 8192, -8192, 12288, -12288};
+	const Ngs2WaveformBlock blocks[] = {
+	    {0, 0, 0, 0, 16385, 0, 0}, {0, 8, 0, 0, 4, 0, 0}, {8, 4, 0, 0, 3, 0, 0}};
+	Check(f.QueueBlocks(pcm, blocks, 3, 0) == OK, "partially filled blocks were rejected");
+	f.Render(5);
+	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0, 0, -0.125f, -0.25f,
+	                                             -0.375f, 0, 0} &&
+	          f.voice.blocks.empty() && f.voice.decoded_samples == 3,
+	      "partially filled blocks did not play their data back to back");
 }
 
 void TestMonoRateAndRouting() {
@@ -930,7 +1077,7 @@ void TestSamplerReuseResetsRouting() {
 		const int16_t pcm[] = {8192, 16384, -8192, -16384};
 		f.Queue(pcm, 2, 0);
 		f.Render(1);
-		Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0,
+		Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
 		      "sampler setup started the new waveform without a play event");
 		f.voice.ports[0].dest = &mastering;
 		f.voice.SetEvent(1);
@@ -1216,7 +1363,7 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	active.Queue(pcm + 2, 1, 0);
 	active.Render(6);
 	Check(log.events.size() == 1 && active.voice.decoded_samples == 2 &&
-	          active.voice.blocks.front().cursor == 0 && active.voice.samples[2] == 0,
+	          active.voice.blocks.front().data_cursor == 0 && active.voice.samples[2] == 0,
 	      "loop callback pause consumed another iteration");
 	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0,
 	                                type == Ngs2RackType::Sampler ? 0x10000004u : 0x40010004u};
@@ -1423,7 +1570,7 @@ void TestCallbackStopsConsumption() {
 			      "completion callback failed to interrupt playback");
 			Check(f.voice.samples[0] == 0.0f && f.voice.samples[1] == 0.0f &&
 			          f.voice.decoded_samples == 1 && f.voice.blocks.size() == 1 &&
-			          f.voice.blocks.front().cursor == 0,
+			          f.voice.blocks.front().data_cursor == 0,
 			      "callback pause/stop consumed the next queued block");
 			if (event == 16) {
 				f.voice.SetEvent(32);
@@ -1523,7 +1670,7 @@ void TestCallbackReplacesSource() {
 				f.Render(4);
 				Check(!f.voice.has_samples && f.voice.samples.size() == (setup ? 4u : 8u) &&
 				          std::ranges::all_of(f.voice.samples, [](float value) { return value == 0; }) &&
-				          f.voice.blocks.size() == 1 && f.voice.blocks.front().cursor == 0,
+				          f.voice.blocks.size() == 1 && f.voice.blocks.front().data_cursor == 0,
 				      "callback source replacement used an old frame or channel layout");
 				f.Render(4);
 				const std::vector<float> expected = setup
@@ -1656,6 +1803,8 @@ int main() {
 	TestAtrac9Vibration();
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
+	TestCustomMasteringChannelMixer();
+	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
 	TestCustomSideChainUserFx();
 	TestWaveformBlockGeometry();
@@ -1684,6 +1833,9 @@ int main() {
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestStarvationAndPause();
+	TestPcmByteUnitStreaming();
+	TestPcmSkipAcrossBlocks();
+	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();

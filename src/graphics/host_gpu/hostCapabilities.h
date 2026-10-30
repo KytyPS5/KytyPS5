@@ -52,6 +52,9 @@ struct HostCapabilities {
 	// VK_KHR_maintenance8: images can be copied between depth and color formats, and a sample
 	// can take a texel offset that is not a constant.
 	bool maintenance8 = false;
+	// The tick of the device clock (shaderDeviceClock) in picoseconds, for S_MEMREALTIME; 0 when
+	// the device has no such clock.
+	uint32_t device_clock_period_ps = 0;
 	// An indirect draw can start at an instance other than 0 (drawIndirectFirstInstance). Without
 	// it, the host GPU reads the arguments only of draws whose first instance it zeroes.
 	bool draw_indirect_first_instance = false;

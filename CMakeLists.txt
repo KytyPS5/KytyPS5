@@ -272,6 +272,7 @@ set(gpu_tiler_shader_names
 	promote_d16
 	demote_d16
 	color_transform
+	color_clear
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -332,6 +333,7 @@ add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(dispatch_thread_dimensions dispatch_thread_dimensions.comp)
+add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -344,7 +346,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -557,6 +559,8 @@ add_executable(host_lowering_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(host_lowering_tests PRIVATE ${inc_headers})
 
+add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
@@ -611,6 +615,11 @@ add_executable(program_list_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(program_list_tests fmt::fmt)
 target_include_directories(program_list_tests PRIVATE ${inc_headers})
+
+add_executable(slot_vector_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
+)
+target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
 
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
@@ -677,6 +686,13 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
+add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmResampleTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
+target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
+
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
@@ -687,11 +703,6 @@ add_executable(image_readback_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImageReadbackTests.cpp"
 )
 target_include_directories(image_readback_tests PRIVATE ${inc_headers})
-
-add_executable(const_ram_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/ConstRamTests.cpp"
-)
-target_include_directories(const_ram_tests PRIVATE ${inc_headers})
 
 add_executable(overlay_queue_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/OverlayQueueTests.cpp"
@@ -734,6 +745,19 @@ target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
 add_executable(png_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PngEncTests.cpp")
 target_link_libraries(png_enc_tests common fmt::fmt)
 target_include_directories(png_enc_tests PRIVATE ${inc_headers})
+
+add_executable(jpeg_dec_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegDecTests.cpp")
+target_link_libraries(jpeg_dec_tests common fmt::fmt)
+target_include_directories(jpeg_dec_tests PRIVATE ${inc_headers})
+
+add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.cpp")
+target_link_libraries(jpeg_enc_tests common fmt::fmt)
+target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
+
+add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/OcclusionQueriesTests.cpp")
+target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
 
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
@@ -807,6 +831,19 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
+	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
+target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
+target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
+target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
+
+add_executable(psml_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(psml_tests common kyty_test_gtest)
+target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -867,6 +904,7 @@ if(BUILD_TESTING)
 	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
@@ -884,6 +922,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
@@ -891,16 +930,30 @@ if(BUILD_TESTING)
 	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
 	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
 	add_test(NAME overlay_queue COMMAND $<TARGET_FILE:overlay_queue_tests>)
-	add_test(NAME const_ram COMMAND $<TARGET_FILE:const_ram_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
+	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
+	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
+	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
+	add_test(NAME shader_recompiler_float_min_max
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
+	add_test(NAME shader_recompiler_vop3_conversions
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_quadmask
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
+	add_test(NAME shader_recompiler_integer16_ternary
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
+	add_test(NAME shader_recompiler_mad_u16
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-u16-only)
+	add_test(NAME shader_recompiler_mul_hi24
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -909,6 +962,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME trinity_mode
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
+	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -917,6 +974,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME pm4_flip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME depth_bits
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
+	add_test(NAME msaa_storage
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
@@ -953,6 +1016,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		psml_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -986,6 +1050,7 @@ if(BUILD_TESTING)
 		fence_retirement_tests
 		memory_tracker_tests
 		page_manager_tests
+		build_flags_tests
 		archive_file_tests
 		trophy_system_tests
 		avplayer_file_tests
@@ -1005,6 +1070,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		ajm_resample_tests
 		pad_haptics_tests
 		controller_settings_tests
 		pad_input_tests
@@ -1012,10 +1078,12 @@ if(BUILD_TESTING)
 		gamepad_quit_tests
 		image_readback_tests
 		overlay_queue_tests
-		const_ram_tests
 		host_input_tests
 		save_data_memory_tests
 		png_enc_tests
+		jpeg_dec_tests
+		jpeg_enc_tests
+		occlusion_queries_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
@@ -1058,6 +1126,19 @@ add_custom_target(kyty_touch_cursors
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
+
+set(KYTY_NOTO_SANS_FONTS
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Italic.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-BoldItalic.ttf")
+add_custom_target(kyty_noto_sans_fonts
+	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${KYTY_NOTO_SANS_FONTS}
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_noto_sans_fonts)
+install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

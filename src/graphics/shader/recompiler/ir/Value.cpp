@@ -6,6 +6,16 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+Value::Value(Inst* value): type(Type::Opaque), inst(value) {}
+Value::Value(ScalarReg value): type(Type::ScalarReg), scalar_reg(value) {}
+Value::Value(VectorReg value): type(Type::VectorReg), vector_reg(value) {}
+Value::Value(bool value): type(Type::U1), imm_u1(value) {}
+Value::Value(uint8_t value): type(Type::U8), imm_u8(value) {}
+Value::Value(uint16_t value): type(Type::U16), imm_u16(value) {}
+Value::Value(uint32_t value): type(Type::U32), imm_u32(value) {}
+Value::Value(uint64_t value): type(Type::U64), imm_u64(value) {}
+
+Value::Value(Type value_type, uint64_t bits): type(value_type), imm_u64(bits) {}
 
 Value Value::F16(uint16_t bits) {
 	return Value(Type::F16, bits);
@@ -13,6 +23,81 @@ Value Value::F16(uint16_t bits) {
 
 Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
+}
+
+Type Value::GetType() const {
+	if (IsPhi()) {
+		return inst->Flags<Type>();
+	}
+	if (IsIdentity()) {
+		return inst->Arg(0).GetType();
+	}
+	return type == Type::Opaque ? inst->GetType() : type;
+}
+
+Inst* Value::Instruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return inst;
+}
+
+ScalarReg Value::ScalarRegister() const {
+	EXIT_IF(type != Type::ScalarReg);
+	return scalar_reg;
+}
+
+VectorReg Value::VectorRegister() const {
+	EXIT_IF(type != Type::VectorReg);
+	return vector_reg;
+}
+
+bool Value::U1() const {
+	EXIT_IF(type != Type::U1);
+	return imm_u1;
+}
+
+uint8_t Value::U8() const {
+	EXIT_IF(type != Type::U8);
+	return imm_u8;
+}
+
+uint16_t Value::U16() const {
+	EXIT_IF(type != Type::U16);
+	return imm_u16;
+}
+
+uint64_t Value::U64() const {
+	EXIT_IF(type != Type::U64);
+	return imm_u64;
+}
+
+uint16_t Value::F16Bits() const {
+	EXIT_IF(type != Type::F16);
+	return imm_u16;
+}
+
+float Value::F32Value() const {
+	EXIT_IF(type != Type::F32);
+	return std::bit_cast<float>(imm_u32);
+}
+
+bool Value::operator==(const Value& other) const {
+	if (type != other.type) {
+		return false;
+	}
+	switch (type) {
+		case Type::Void: return true;
+		case Type::Opaque: return inst == other.inst;
+		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+		case Type::VectorReg: return vector_reg == other.vector_reg;
+		case Type::U1: return imm_u1 == other.imm_u1;
+		case Type::U8: return imm_u8 == other.imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16 == other.imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32 == other.imm_u32;
+		case Type::U64: return imm_u64 == other.imm_u64;
+		default: return false;
+	}
 }
 
 Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
@@ -33,6 +118,16 @@ Inst::~Inst() {
 	ClearArgs();
 }
 
+Type Inst::GetType() const {
+	if (opcode == ValueOpcode::Phi) {
+		return static_cast<Type>(flags);
+	}
+	if (opcode == ValueOpcode::Identity && num_args != 0) {
+		return Arg(0).GetType();
+	}
+	return TypeOf(opcode);
+}
+
 bool Inst::MayHaveSideEffects() const {
 	return HasSideEffects(opcode);
 }
@@ -45,17 +140,13 @@ size_t Inst::UseCount() const {
 	return uses.size();
 }
 
+size_t Inst::NumPhiBlocks() const {
+	return num_args == PhiArity ? phi_args.size() : 0;
+}
+
 Block* Inst::PhiBlock(size_t index) const {
 	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_args.size());
 	return phi_args[index].first;
-}
-
-Block* Inst::Parent() const {
-	return parent;
-}
-
-const std::vector<Use>& Inst::Uses() const {
-	return uses;
 }
 
 void Inst::SetParent(Block* block) {
@@ -63,17 +154,11 @@ void Inst::SetParent(Block* block) {
 }
 
 void Inst::SetArg(size_t index, Value value) {
-	const auto old = Arg(index);
-	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
+	auto& arg = ArgSlot(*this, index);
+	if (auto* old_inst = arg.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
-	if (num_args <= InlineArity) {
-		fixed_args[index] = value;
-	} else if (num_args == PhiArity) {
-		phi_args[index].second = value;
-	} else {
-		large_args[index] = value;
-	}
+	arg = value;
 	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
 		AddUse(new_inst, index);
 	}
@@ -89,11 +174,15 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
-	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
-	}
+	// Detach the arguments first (a phi can use itself), then move every use over in order.
 	Invalidate();
+	const auto old_uses = std::exchange(uses, {});
+	for (const auto& use: old_uses) {
+		ArgSlot(*use.user, use.operand) = replacement;
+	}
+	if (auto* target = replacement.TryInstruction(); target != nullptr) {
+		target->uses.insert(target->uses.end(), old_uses.begin(), old_uses.end());
+	}
 	if (preserve) {
 		opcode = ValueOpcode::Identity;
 		num_args = 1;
@@ -107,9 +196,6 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
 	used->uses.push_back({this, operand});
 }
 
@@ -126,6 +212,10 @@ void Inst::ClearArgs() {
 			RemoveUse(value_inst, index);
 		}
 	}
+	DropArgs();
+}
+
+void Inst::DropArgs() {
 	if (num_args == PhiArity) {
 		std::destroy_at(&phi_args);
 		std::construct_at(&fixed_args);

@@ -60,7 +60,9 @@ struct RenderExecutor::ColorTargetMemos {
 };
 
 RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
-RenderExecutor::~RenderExecutor() = default;
+RenderExecutor::~RenderExecutor() {
+	DestroyPssr();
+}
 
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,

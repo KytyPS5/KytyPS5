@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <list>
@@ -212,9 +213,13 @@ struct SamplerResource {
 };
 
 struct SampledResourcePair {
-	uint32_t image        = 0;
-	uint32_t sampler      = 0;
-	uint32_t first_use_pc = 0;
+	uint32_t image            = 0;
+	uint32_t sampler          = 0;
+	uint32_t first_use_pc     = 0;
+	// The entry of the sampler binding that holds the sampler for this texture alone, or
+	// UINT32_MAX. Set on a host where a sampler applies the minimum LOD of the texture it reads,
+	// because the texture view cannot (see DefineDescriptors).
+	uint32_t descriptor_index = UINT32_MAX;
 
 	bool operator==(const SampledResourcePair& other) const = default;
 };
@@ -368,6 +373,14 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 5;
+	// An emulated mesh draw adds the 64-bit address of the record buffer and the workgroup count of
+	// the draw's first dimension.
+	static constexpr uint32_t MeshEmulationAddressDword  = MeshDrawDwordCount;
+	static constexpr uint32_t MeshEmulationGroupsDword   = MeshDrawDwordCount + 2;
+	static constexpr uint32_t MeshEmulatedDrawDwordCount = MeshDrawDwordCount + 3;
+	// Depth bounds test of a pixel shader: depth buffer copy address (two dwords), row width in
+	// pixels, minimum and maximum bound as float bits.
+	static constexpr uint32_t        DepthBoundsDwordCount = 5;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -563,6 +576,12 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// The shader has packed FP16 arithmetic (PackedFPAdd16 and its kind).
+	bool                            packed_float16                = false;
+	// The shader moves an append or consume counter.
+	bool                            append_consume                = false;
+	// The shader reads the barycentrics as values.
+	bool                            barycentric                   = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -665,6 +684,8 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// A mesh program compiled as a compute shader (see capturedVertexLayout.h).
+	bool                          mesh_emulated = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 };
@@ -675,6 +696,10 @@ struct UniformFillPlan {
 	Value                pattern_size;
 	Value                element_count;
 };
+
+class SrtTape;
+class SrtNodes;
+class SrtTrace;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -734,6 +759,8 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// The shader has a DS_ORDERED_COUNT: it adds once per wave, so it needs real waves.
+	bool                          uses_ordered_count  = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
@@ -741,6 +768,7 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	bool                          mesh_emulated        = false;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;

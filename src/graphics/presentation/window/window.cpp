@@ -17,17 +17,23 @@
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/benchScript.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
+#include "libs/padInput.h"
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -52,6 +58,25 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
+static uint32_t ControllerButtonToPadButton(int button) {
+	switch (button) {
+		case SDL_GAMEPAD_BUTTON_SOUTH: return Controller::PAD_BUTTON_CROSS;
+		case SDL_GAMEPAD_BUTTON_EAST: return Controller::PAD_BUTTON_CIRCLE;
+		case SDL_GAMEPAD_BUTTON_WEST: return Controller::PAD_BUTTON_SQUARE;
+		case SDL_GAMEPAD_BUTTON_NORTH: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDL_GAMEPAD_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
+		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return Controller::PAD_BUTTON_L3;
+		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return Controller::PAD_BUTTON_R3;
+		case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return Controller::PAD_BUTTON_L1;
+		case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return Controller::PAD_BUTTON_R1;
+		case SDL_GAMEPAD_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
+		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
+		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
+		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
+		default: return 0;
+	}
+}
 
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
@@ -274,9 +299,21 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
-static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+// Which device SDL opened, for the log: its name, vendor, product, device path, and the driver
+// that opened it ('m' for Apple's GameController framework). One device can show up as two
+// gamepads: that framework reports a Logitech Cordless RumblePad 2 twice.
+static void LogGamepad(SDL_Gamepad* pad, int id) {
+	const auto  guid   = SDL_GetGamepadGUIDForID(static_cast<SDL_JoystickID>(id));
+	const char  driver = guid.data[14] >= ' ' && guid.data[14] < 127 ? static_cast<char>(guid.data[14])
+	                                                                 : '-';
+	const char* name   = SDL_GetGamepadName(pad);
+	const char* path   = SDL_GetGamepadPath(pad);
+	LOGF("Controller: gamepad %d \"%s\": vendor %04x product %04x, driver '%c', path %s\n", id,
+	     name != nullptr ? name : "gamepad", SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+	     driver, path != nullptr ? path : "none");
+}
 
+static void GameEventController([[maybe_unused]] const EventController& f) {
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
@@ -292,42 +329,68 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	}
 #endif
 
-	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
-		}
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
-	}
-
-	if (f.removed) {
-		HostInputDisconnectGamepad(f.id);
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
+	if (f.added || f.removed || f.remapped) {
+		using Controller::GamepadDeviceEvent;
+		const auto event = f.added     ? GamepadDeviceEvent::Added
+		                   : f.removed ? GamepadDeviceEvent::Removed
+		                               : GamepadDeviceEvent::Remapped;
+		auto*      open  = SDL_GetGamepadFromID(f.id);
+		switch (Controller::PlanGamepadDeviceEvent(event, open != nullptr)) {
+			case Controller::GamepadDeviceStep::Open:
+				if (auto* pad = SDL_OpenGamepad(f.id); pad != nullptr) {
+					LogGamepad(pad, f.id);
+				} else {
+					LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
+					     SDL_GetError());
+					return;
+				}
+				Controller::Connect(f.id);
+				break;
+			case Controller::GamepadDeviceStep::Close:
+				HostInputGamepadRemoved(f.id);
+				Controller::Disconnect(f.id);
+				SDL_CloseGamepad(open);
+				break;
+			case Controller::GamepadDeviceStep::Nothing: break;
 		}
 	}
 
 	if (f.down || f.up) {
-		HostInputPadButton(f.id, f.button, f.down);
+		const auto button = ControllerButtonToPadButton(f.button);
+		if (button != 0) {
+			Controller::SetButton(f.id, button, f.down);
+		} else if (f.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+			// The PS button never reaches the game. A press of it seats the pad like any first
+			// press (playerSeats.h); a hold on player 1's pad closes the game.
+			if (HostInputGamepadGuide(f.id, f.down)) {
+				Controller::SeatGamepad(f.id);
+			}
+		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
+			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
+			// blocks games that require it. Use their Back/Select button as a centered click.
+			auto* pad = SDL_GetGamepadFromID(f.id);
+			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
+				if (f.down) {
+					Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
+				}
+				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
+				if (f.up) {
+					Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
+				}
+			}
+		}
 	}
 
 	if (f.axis) {
-		if (f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-		    f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
-			HostInputPadTrigger(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+		const auto axis = ControllerAxisFromSdl(f.axis_id);
+		if (axis != Controller::Axis::AxisMax) {
+			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
-		} else if (const auto axis = ControllerAxisFromSdl(f.axis_id);
-		           axis != Controller::Axis::AxisMax) {
-			const int value = ControllerAxisValueFromSdl(f.axis_id, f.axis_value);
-			if ((f.axis_id == SDL_GAMEPAD_AXIS_LEFTX || f.axis_id == SDL_GAMEPAD_AXIS_LEFTY) &&
-			    HostInputGamepadAxis(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFTX, value)) {
-				return;
-			}
-			Controller::SetAxis(f.id, axis, value);
+		}
+		const bool right_trigger = f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+		if (right_trigger || f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+			// A hold of both triggers closes the game, for pads without a PS button.
+			HostInputGamepadTrigger(f.id, right_trigger, f.axis_value);
 		}
 	}
 }
@@ -454,9 +517,40 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	}
 }
 
+// KYTY_INPUT_LOG=<file>: the player's key and gamepad button presses, one per line with the time
+// and the presented frame, to learn a route through a game from someone playing it.
+static void LogInput(const SDL_Event& event, uint64_t frame) {
+	static std::FILE* const file = [] {
+		const char* path = std::getenv("KYTY_INPUT_LOG");
+		return path != nullptr ? std::fopen(path, "a") : nullptr;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	const char* name = nullptr;
+	bool        down = false;
+	if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+	    event.key.repeat == 0) {
+		name = SDL_GetKeyName(event.key.key);
+		down = event.key.down;
+	} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	           event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+		name = SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
+		down = event.gbutton.down;
+	}
+	if (name == nullptr) {
+		return;
+	}
+	std::fprintf(file, "%llu ms frame %llu %s %s\n",
+	             static_cast<unsigned long long>(SDL_GetTicks()),
+	             static_cast<unsigned long long>(frame), name, down ? "down" : "up");
+	std::fflush(file);
+}
+
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	LogInput(*event, game.presented_frames.load(std::memory_order_relaxed));
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
 		switch (event->key.key) {
@@ -734,9 +828,54 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+// The benchmark script of --bench-script, or nullopt without one. Stops the emulator when the
+// file cannot be read or a step is wrong, so a measured run never goes on without its input.
+static std::optional<BenchScript> LoadBenchScript() {
+	const auto path = Config::GetBenchScript();
+	if (path.empty()) {
+		return std::nullopt;
+	}
+	std::ifstream file(path);
+	if (!file) {
+		EXIT("--bench-script %s: the file cannot be read\n", Common::PathToString(path).c_str());
+	}
+	std::stringstream text;
+	text << file.rdbuf();
+	std::string error;
+	auto        steps = ParseBenchScript(text.str(), error);
+	if (!steps) {
+		EXIT("--bench-script %s: %s\n", Common::PathToString(path).c_str(), error.c_str());
+	}
+	for (const auto& step: *steps) {
+		if (!step.quit && SDL_GetKeyFromName(step.key.c_str()) == SDLK_UNKNOWN) {
+			EXIT("--bench-script %s: unknown key \"%s\"\n", Common::PathToString(path).c_str(),
+			     step.key.c_str());
+		}
+	}
+	std::printf("Bench: %zu step(s) from %s\n", steps->size(), Common::PathToString(path).c_str());
+	return BenchScript(std::move(*steps));
+}
+
 void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
+
+	auto bench = LoadBenchScript();
+	// A step that waits for a frame is checked this often.
+	constexpr int bench_frame_poll_ms = 4;
+	// KYTY_BENCH_LIVE=<file>: key names appended to the file, one per line, are tapped as they
+	// arrive, to steer a run from what its screenshots show.
+	const char*   live_path = std::getenv("KYTY_BENCH_LIVE");
+	// KYTY_BENCH_LIVE_HOLD_MS: how long a tap holds the key (default 150): a game that draws a
+	// frame in half a second sees nothing of a shorter one.
+	const uint64_t live_hold_ms = [] {
+		const char* value = std::getenv("KYTY_BENCH_LIVE_HOLD_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {150};
+	}();
+	std::ifstream live_file;
+	std::string   live_partial;
+	std::vector<std::pair<uint64_t, std::string>> live_releases; // key ups due at a time
+	uint64_t      live_next_ms = 0;
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -760,18 +899,88 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto fps =
+			    static_cast<double>(frames - title_frames) * 1000.0 / static_cast<double>(elapsed);
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				UpdateTitle(frames, fps);
+			}
+			if (bench) {
+				std::printf("Bench: %llu ms, frame %llu, fps %.1f\n",
+				            static_cast<unsigned long long>(now),
+				            static_cast<unsigned long long>(frames), fps);
+				std::fflush(stdout);
 			}
 			title_time   = now;
 			title_frames = frames;
 		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
-			continue;
+		auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		if (bench) {
+			bench->Advance(loop.presented_frames.load(std::memory_order_relaxed), now,
+			               [&](const BenchStep& step) {
+				               std::printf("Bench: %llu ms, step %s %s\n",
+				                           static_cast<unsigned long long>(now),
+				                           step.quit ? "quit" : step.key.c_str(),
+				                           step.quit ? "" : (step.down ? "down" : "up"));
+				               std::fflush(stdout);
+				               if (step.quit) {
+					               LOGF("Event: quit (bench script)\n");
+					               loop.need_exit = true;
+				               } else {
+					               HostInputKey(SDL_GetKeyFromName(step.key.c_str()), step.down);
+				               }
+			               });
+			wait_ms = bench->WaitMs(SDL_GetTicks(), bench_frame_poll_ms, wait_ms);
 		}
-		ProcessEvent(timer.GetTimeS());
+		if (live_path != nullptr) {
+			if (!live_file.is_open()) live_file.open(live_path);
+			const auto live_now = SDL_GetTicks();
+			for (auto it = live_releases.begin(); it != live_releases.end();) {
+				if (it->first <= live_now) {
+					HostInputKey(SDL_GetKeyFromName(it->second.c_str()), false);
+					it = live_releases.erase(it);
+				} else {
+					++it;
+				}
+			}
+			if (live_file.is_open() && live_releases.empty() && live_now >= live_next_ms) {
+				live_file.clear();
+				char c = 0;
+				while (live_file.get(c)) {
+					if (c != '\n') {
+						live_partial += c;
+						continue;
+					}
+					// "KEY:MS" holds this tap MS milliseconds: a fast menu repeats a long hold.
+					auto key  = live_partial;
+					auto hold = live_hold_ms;
+					live_partial.clear();
+					if (const auto colon = key.rfind(':'); colon != std::string::npos && colon + 1 < key.size()) {
+						hold = std::strtoull(key.c_str() + colon + 1, nullptr, 10);
+						key.resize(colon);
+					}
+					if (key.empty() || SDL_GetKeyFromName(key.c_str()) == SDLK_UNKNOWN) continue;
+					std::printf("Bench: %llu ms, live tap %s\n", static_cast<unsigned long long>(live_now), key.c_str());
+					std::fflush(stdout);
+					if (SDL_GetKeyFromName(key.c_str()) == SDLK_F1) {
+						// As on the keyboard: F1 captures the next frame in RenderDoc.
+						RenderDocRequestCapture();
+						continue;
+					}
+					HostInputKey(SDL_GetKeyFromName(key.c_str()), true);
+					live_releases.emplace_back(live_now + hold, key);
+					live_next_ms = live_now + hold + 250; // one tap at a time, as a player would
+					break;
+				}
+			}
+			wait_ms = std::min(wait_ms, 20);
+		}
+		if (HostInputWaitEvent(&loop.event, wait_ms)) {
+			ProcessEvent(timer.GetTimeS());
+		}
+		if (HostInputQuitRequested()) {
+			LOGF("Event: quit (player 1 held the PS button or both triggers)\n");
+			loop.need_exit = true;
+		}
 	}
 }
 
@@ -975,6 +1184,8 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// TODO(upstream merge stage 2): show the progress of pipelines built ahead again once the
+	// builder threads run on the merged pipeline cache.
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

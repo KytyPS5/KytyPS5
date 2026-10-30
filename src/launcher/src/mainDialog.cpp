@@ -261,6 +261,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
 	args << "--present-mode" << EnumToText(info.present_mode);
+	args << "--video-out-resolution" << EnumToText(info.video_out_resolution);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
@@ -277,6 +278,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
+	AddFlag(args, !info.ea_emulation_enabled, "--no-emulate-ea");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
 	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
@@ -287,6 +289,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
+	if (!info.pipeline_cache_folder.isEmpty()) {
+		args << "--pipeline-cache-folder" << info.pipeline_cache_folder;
+	}
 	AddFlag(args, info.command_buffer_dump_enabled, "--command-buffer-dump");
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);

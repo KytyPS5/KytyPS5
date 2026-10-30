@@ -18,6 +18,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <memory>
 
 namespace Libs::Graphics {
 
@@ -40,6 +42,28 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// A slot's color target as last resolved, from the same registers and arguments: draws in a row
+// mostly share their targets. It holds while no image over the target's range changes, when
+// the image came from a plain backing match (TextureCache::FindImage).
+struct RenderExecutor::ColorTargetMemos {
+	struct Memo {
+		HW::RenderTarget rt;
+		uint32_t         mask                       = 0;
+		uint32_t         render_target_slice_offset = 0;
+		bool             exact_format               = false;
+		bool             valid                      = false;
+		ImageId          found_image;
+		uint64_t         image_since = 0;
+		RenderColorInfo  result;
+	};
+	std::array<Memo, RENDER_COLOR_ATTACHMENTS_MAX> slots;
+};
+
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+RenderExecutor::~RenderExecutor() {
+	DestroyPssr();
+}
+
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
@@ -52,6 +76,23 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
+	if (m_color_target_memos == nullptr) {
+		m_color_target_memos = std::make_unique<ColorTargetMemos>();
+	}
+	auto& memo          = m_color_target_memos->slots.at(rt_slot);
+	auto& texture_cache = m_context.GetTextureCache();
+	if (memo.valid && memo.mask == mask &&
+	    memo.render_target_slice_offset == render_target_slice_offset &&
+	    memo.exact_format == exact_format && std::memcmp(&memo.rt, &rt, sizeof(rt)) == 0) {
+		const auto& range = memo.result.desc.info.data;
+		if (texture_cache.RangeUnchangedSince(range.address, range.size, memo.image_since)) {
+			r = memo.result;
+			texture_cache.ReuseImage(memo.found_image, r.desc);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	}
+	memo.valid = false;
 
 	r             = {};
 	r.target_slot = rt_slot;
@@ -262,12 +303,22 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	bool plain                 = false;
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format, &plain);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	if (plain) {
+		memo.rt                         = rt;
+		memo.mask                       = mask;
+		memo.render_target_slice_offset = render_target_slice_offset;
+		memo.exact_format               = exact_format;
+		memo.found_image                = r.image_id;
+		memo.image_since                = texture_cache.m_image_change_count;
+		memo.result                     = r;
+		memo.valid                      = true;
+	}
 }
 
 } // namespace Libs::Graphics

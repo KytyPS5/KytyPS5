@@ -1711,59 +1711,80 @@ Graph Structurize(const Graph& graph) {
 }
 
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {
-	// A vector lane mask (comparison or carry) spans wave_size / 32 SGPRs; a lane read writes one.
-	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
-	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
-	    inst.family == Decoder::Family::VOP3P) {
-		const bool lane_read =
-		    inst.opcode == Opcode::V_READLANE_B32 || inst.opcode == Opcode::V_READFIRSTLANE_B32;
-		const uint32_t size = lane_read ? 1u : wave_size / 32u;
-		uint32_t destination = 0;
+	// Vector comparisons and carry results write a scalar pair in wave64, one register in wave32.
+	// A lane read (V_READLANE_B32, V_READFIRSTLANE_B32) always writes one register.
+	if (inst.opcode != Decoder::Opcode::V_READLANE_B32 && inst.opcode != Decoder::Opcode::V_READFIRSTLANE_B32 &&
+	    (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
+	     inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
+	     inst.family == Decoder::Family::VOP3P)) {
+		const uint32_t width       = wave_size == 64u ? 2u : 1u;
+		uint32_t       destination = 0;
 		for (const auto* operand: {&inst.dst, &inst.dst2})
-			if (ScalarOperandCode(*operand, destination) && code >= destination && code < destination + size)
+			if (ScalarOperandCode(*operand, destination) && code >= destination && code < destination + width)
 				return true;
 	}
 	return InstructionWritesScalarCode(inst, code);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, uint32_t wave_size,
-                              std::vector<uint32_t>& crossed_calls) {
-	EXIT_IF(before >= program.instructions.size());
+std::optional<uint32_t> TryFindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                                                uint32_t before, uint32_t code,
+                                                std::vector<uint32_t>* crossed_calls,
+                                                uint32_t wave_size) {
+	if (before >= program.instructions.size()) return std::nullopt;
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
-	EXIT_IF(found == graph.blocks.end());
-	std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, before}};
-	std::set<std::pair<uint32_t, uint32_t>> visited;
-	std::optional<uint32_t> definition;
+	if (found == graph.blocks.end()) return std::nullopt;
+	// Every path back from the use must reach the same definition, or the entry (UINT32_MAX) on
+	// all of them. A path that comes back to a block already searched adds nothing new. A call
+	// writes only its return address: the callee keeps the caller's other registers. With
+	// crossed_calls, the calls passed on the way are listed, and a call that writes the register
+	// is no definition: the search fails.
+	constexpr uint32_t kNone    = UINT32_MAX - 1u;
+	uint32_t           reaching = kNone;
+	std::vector<bool>  searched(graph.blocks.size(), false);
+	std::vector<std::pair<const BasicBlock*, uint32_t>> pending {{&*found, before}};
 	while (!pending.empty()) {
-		const auto point = pending.back();
+		const auto [block, end] = pending.back();
 		pending.pop_back();
-		if (!visited.insert(point).second) continue;
-		const auto* block = graph.FindBlock(point.first);
-		EXIT_IF(block == nullptr);
-		uint32_t index = UINT32_MAX;
-		for (uint32_t i = point.second; i > block->inst_begin;) {
+		uint32_t definition = kNone;
+		for (uint32_t i = end; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			if (inst.opcode == Opcode::S_SWAPPC_B64) {
-				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code, wave_size));
-				crossed_calls.push_back(i);
+			if (crossed_calls != nullptr && inst.opcode == Decoder::Opcode::S_SWAPPC_B64) {
+				if (MayWriteScalarRegister(inst, code, wave_size)) return std::nullopt;
+				crossed_calls->push_back(i);
 				continue;
 			}
-			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
+			if (MayWriteScalarRegister(inst, code, wave_size)) {
+				definition = i;
+				break;
+			}
 		}
-		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			EXIT_IF(definition && *definition != index);
-			definition = index;
+		if (definition == kNone && block->id == graph.entry_block) definition = UINT32_MAX;
+		if (definition != kNone) {
+			if (reaching != kNone && reaching != definition) return std::nullopt;
+			reaching = definition;
 			continue;
 		}
-		EXIT_IF(block->predecessors.empty());
-		for (const auto predecessor: block->predecessors) {
-			pending.emplace_back(predecessor, graph.blocks[predecessor].inst_end);
+		if (block->predecessors.empty()) return std::nullopt;
+		for (const auto id: block->predecessors) {
+			const auto* predecessor = graph.FindBlock(id);
+			if (predecessor == nullptr) return std::nullopt;
+			const auto index = static_cast<size_t>(predecessor - graph.blocks.data());
+			if (searched[index]) continue;
+			searched[index] = true;
+			pending.emplace_back(predecessor, predecessor->inst_end);
 		}
 	}
-	EXIT_IF(!definition);
+	if (reaching == kNone) return std::nullopt;
+	return reaching;
+}
+
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                              uint32_t before, uint32_t code, std::vector<uint32_t>& crossed_calls,
+                              uint32_t wave_size) {
+	const auto definition = TryFindScalarDefinition(program, graph, before, code, &crossed_calls, wave_size);
+	if (!definition.has_value()) EXIT("scalar shader call source has more than one reaching definition");
 	return *definition;
 }
 

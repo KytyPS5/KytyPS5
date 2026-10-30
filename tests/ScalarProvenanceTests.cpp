@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/MaskedSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -689,6 +690,99 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
+void TestMaskedSelectElimination() {
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto exec = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(19u)});
+  const auto narrower = fixture.Emit(
+      ValueOpcode::LogicalAnd,
+      {exec, fixture.Emit(ValueOpcode::IEqual32, {lane, Value(7u)})});
+  const auto other = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(3u)});
+  const auto data = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto old = fixture.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(3))});
+  const auto store = [&](Value value, Value predicate) {
+    return fixture.Emit(ValueOpcode::WriteSharedU32,
+                        {Value(0u), value, predicate});
+  };
+  const auto masked = [&](Value condition) {
+    const auto sum = fixture.Emit(ValueOpcode::IAdd32, {data, Value(1u)});
+    return std::pair {sum, fixture.Emit(ValueOpcode::SelectU32,
+                                        {condition, sum, old})};
+  };
+
+  // A temporary under EXEC that only feeds the next write under EXEC.
+  const auto x = fixture.Emit(ValueOpcode::BitCastF32U32, {data});
+  const auto y = fixture.Emit(ValueOpcode::BitCastF32U32, {old});
+  const auto product = fixture.Emit(ValueOpcode::FPMul32, {x, x});
+  const auto temporary =
+      fixture.Emit(ValueOpcode::SelectF32, {exec, product, y});
+  const auto sum = fixture.Emit(ValueOpcode::FPAdd32, {temporary, x});
+  const auto last = fixture.Emit(ValueOpcode::SelectF32, {exec, sum, y});
+  const auto chain_store = store(
+      fixture.Emit(ValueOpcode::BitCastU32F32, {last}), Value(true));
+
+  const auto [exec_data, exec_select] = masked(exec);
+  const auto exec_store = store(exec_select, exec);
+  const auto [narrow_data, narrow_select] = masked(exec);
+  const auto narrow_store = store(narrow_select, narrower);
+  const auto [other_data, other_select] = masked(exec);
+  const auto other_store = store(other_select, other);
+  const auto [lane_data, lane_select] = masked(exec);
+  const auto first = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                  {lane_select, Value(true)});
+  store(first, Value(true));
+  const auto [wide_data, wide_select] = masked(narrower);
+  const auto wide_user =
+      fixture.Emit(ValueOpcode::SelectU32, {exec, wide_select, old});
+  store(wide_user, Value(true));
+  const auto [inner_data, inner_select] = masked(exec);
+  const auto inner_user =
+      fixture.Emit(ValueOpcode::SelectU32, {narrower, inner_select, old});
+  store(inner_user, Value(true));
+
+  // The same register written twice under EXEC, and once under an unrelated mask.
+  const auto [first_data, first_write] = masked(exec);
+  const auto second_write =
+      fixture.Emit(ValueOpcode::SelectU32, {exec, data, first_write});
+  store(second_write, Value(true));
+  const auto [unrelated_data, unrelated_write] = masked(other);
+  const auto after_unrelated =
+      fixture.Emit(ValueOpcode::SelectU32, {exec, data, unrelated_write});
+  store(after_unrelated, Value(true));
+
+  Check(EliminateMaskedSelects(fixture.program.blocks) == 5,
+        "masked selects: wrong number removed");
+  const auto stored = [](Value inst, size_t operand) {
+    return inst.ResolveInstruction()->Arg(operand).Resolve();
+  };
+  Check(sum.ResolveInstruction()->Arg(0).Resolve() == product,
+        "a temporary under EXEC kept its select");
+  Check(stored(chain_store, 1).ResolveInstruction()->Arg(0).Resolve() == last,
+        "the write read in every lane lost its select");
+  Check(stored(exec_store, 1) == exec_data &&
+            stored(narrow_store, 1) == narrow_data,
+        "data stored under EXEC kept its select");
+  Check(stored(other_store, 1) == other_select,
+        "data stored under an unrelated predicate lost its select");
+  Check(first.ResolveInstruction()->Arg(0).Resolve() == lane_select,
+        "a lane operation's operand lost its select");
+  Check(stored(wide_user, 1) == wide_select,
+        "a select narrower than its user's condition was removed");
+  Check(stored(inner_user, 1) == inner_data,
+        "a select under a narrower user's condition was kept");
+  Check(stored(second_write, 2) == old,
+        "a second write under EXEC kept the first select as its old value");
+  Check(stored(after_unrelated, 2) == unrelated_write,
+        "a write under EXEC skipped a select under an unrelated mask");
+  (void)lane_data;
+  (void)wide_data;
+  (void)other_data;
+  (void)first_data;
+  (void)unrelated_data;
+}
+
 void TestCompleteWaveReduction() {
   enum class Case {
     Masked, ScalarExec, Wave32, Wave32Rows, Wave32Maximum, RowMask, BankMask,
@@ -954,6 +1048,7 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
+    TestMaskedSelectElimination();
     TestCompleteWaveReduction();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();

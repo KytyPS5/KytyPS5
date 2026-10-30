@@ -29,8 +29,11 @@ struct RectListShaders {
 std::vector<RectListParameter> RectListParameters(
     const ShaderPixelInputInfo& pixel_info, const ShaderRecompiler::IR::CompiledShaderInfo& program);
 // Forwards the parameters the vertex stage exports, one per output location.
+// `clip_count`: the clip distances the vertex shader writes (Spirv::VertexClipDistanceCount). They
+// go through the rectangle's stages like the position, so a clip plane cuts the rectangle as it
+// would the guest's.
 RectListShaders BuildRectListShaders(std::span<const RectListParameter> parameters,
-                                     uint32_t                           param_export_mask);
+                                     uint32_t param_export_mask, uint32_t clip_count);
 
 } // namespace Libs::Graphics
 

@@ -8,6 +8,26 @@
 #include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+ShaderColorNumberClass MrtOutputClass(const EmitterState& state, uint32_t index) {
+	const auto& pixel = *state.input_info.pixel;
+	if (index >= std::size(pixel.target_output_mode)) {
+		return ShaderColorNumberClass::Float;
+	}
+	// The pipeline cache marks the integer targets of each export (target_*int_mask).
+	if ((pixel.target_sint_mask & (1u << index)) != 0u) {
+		return ShaderColorNumberClass::Sint;
+	}
+	if ((pixel.target_uint_mask & (1u << index)) != 0u) {
+		return ShaderColorNumberClass::Uint;
+	}
+	if (pixel.target_number_class[index] != ShaderColorNumberClass::Float) {
+		return pixel.target_number_class[index];
+	}
+	return pixel.target_output_mode[index] == 7u ? ShaderColorNumberClass::Uint
+	                                             : ShaderColorNumberClass::Float;
+}
+
 namespace {
 
 bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
@@ -42,6 +62,15 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto group = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, component);
 		return EmitAddU32(state, local,
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
+	}
+	// A host that cannot interpolate the barycentrics at the centroid or at a sample reads them
+	// at the pixel center. With one sample per pixel that is the centroid and the sample; with
+	// more, a pixel on the edge of a triangle gets the values of its center, which may lie just
+	// outside the triangle, and every sample of a pixel gets the same values.
+	if ((kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+	     kind == IR::StageInputKind::BaryCoordSmoothSample) &&
+	    state.host.faults.no_centroid_barycentric) {
+		kind = IR::StageInputKind::BaryCoordSmooth;
 	}
 	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
 	const bool sample = kind == IR::StageInputKind::BaryCoordSmoothSample;
@@ -118,6 +147,10 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 // Whether EXEC enables a source lane within the caller's 32-lane half.
 uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
 	auto&      state  = ctx.state;
+	if (state.single_lane) {
+		// The one lane stands for every lane, the source among them.
+		return exec;
+	}
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
 	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
 	if (ctx.half != 0) {
@@ -174,10 +207,19 @@ uint32_t LoadVertexParameter(EmitterState& state, const InputBinding& input, uin
                              uint32_t chan) {
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain,
-	                          TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
-	                          input.variable_id, ConstantU32(state, vertex),
-	                          ConstantU32(state, chan & 3u));
+	if (state.host.faults.no_per_vertex_inputs) {
+		// No per-vertex inputs on the host: tessellation shaders hand each vertex's value over in
+		// an input of its own (triangleVertexValueShader.h).
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+		                          pointer, input.vertex_value_variables[vertex],
+		                          ConstantU32(state, chan & 3u));
+	} else {
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+		                          pointer, input.variable_id, ConstantU32(state, vertex),
+		                          ConstantU32(state, chan & 3u));
+	}
 	state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
 	return value;
 }
@@ -199,7 +241,9 @@ uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), word, unpacked, *half);
 		return word;
 	};
-	if (!input.per_vertex) {
+	// Without per-vertex inputs a parameter is an ordinary input; only the raw vertex values
+	// (LoadVertexParameter) come from the tessellation stages.
+	if (!input.per_vertex || state.host.faults.no_per_vertex_inputs) {
 		const auto vector    = state.builder.AllocateId();
 		const auto component = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), vector, input.variable_id);
@@ -291,11 +335,17 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 	return value;
 }
 
+// An integer output (an integer target, or a UINT16 export) takes the export's bits as the colour
+// unit receives them: the 16-bit lanes of a packed export, the dword of a 32-bit one, and for a
+// 16-bit format exported unpacked the 16 bits it is converted to. Which value an FP16 export into an
+// integer target stores is not documented; AMD's own drivers never pair them (Mesa,
+// ac_choose_spi_color_formats). The colour unit is taken to store the lanes it receives.
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      uint32_t vector_type) {
-	auto&      state          = ctx.state;
-	const bool integer_output = vector_type != TypeF32Vector(state, 4);
-	if (exp.compr && !integer_output) {
+                      ShaderColorNumberClass output_class) {
+	auto&      state       = ctx.state;
+	const bool uint_output = output_class != ShaderColorNumberClass::Float;
+	const bool sint_output = output_class == ShaderColorNumberClass::Sint;
+	if (exp.compr && !uint_output) {
 		auto unpack = GLSLstd450UnpackHalf2x16;
 		switch (MrtOutputMode(state, exp)) {
 			case 5: unpack = GLSLstd450UnpackUnorm2x16; break;
@@ -327,16 +377,23 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		                          f32[0], f32[1], f32[2], f32[3]);
 		return vector;
 	}
-	if (exp.compr || exp.en != 0xfu) {
+	// A 16-bit format exported unpacked into an integer output: the hardware converts each float
+	// to 16 bits.
+	const auto mode = MrtOutputMode(state, exp);
+	const auto pack = exp.compr || !uint_output ? GLSLstd450Bad
+	                  : mode == 4u              ? GLSLstd450PackHalf2x16
+	                  : mode == 5u              ? GLSLstd450PackUnorm2x16
+	                  : mode == 6u              ? GLSLstd450PackSnorm2x16
+	                                            : GLSLstd450Bad;
+	if (exp.compr || exp.en != 0xfu || pack != GLSLstd450Bad) {
 		uint32_t raw[4] = {
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
-		    ConstantU32(state, integer_output ? 1u : 0x3f800000u),
+		    ConstantU32(state, uint_output ? 1u : 0x3f800000u),
 		};
 		if (exp.compr) {
-			const auto extract = vector_type == TypeU32Vector(state, 4) ? spv::OpBitFieldUExtract
-			                                                            : spv::OpBitFieldSExtract;
+			const auto extract = sint_output ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract;
 			for (uint32_t pair = 0; pair < 2u; pair++) {
 				if ((exp.en & (3u << (pair * 2u))) == 0u) {
 					continue;
@@ -348,26 +405,51 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 						continue;
 					}
 					raw[component] = state.builder.AllocateId();
-					state.builder.AddFunction(extract, TypeU32(state), raw[component], packed,
-					                          ConstantU32(state, lane * 16u),
-					                          ConstantU32(state, 16));
+					state.builder.AddFunction(
+					    sint_output ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract,
+					    TypeU32(state), raw[component], packed, ConstantU32(state, lane * 16u),
+					    ConstantU32(state, 16));
 				}
 			}
 		} else {
 			for (uint32_t component = 0; component < 4u; component++) {
-				if (((exp.en >> component) & 1u) != 0u) {
-					raw[component] = ExportRawComponent(ctx, data, component);
+				if (((exp.en >> component) & 1u) == 0u) {
+					continue;
 				}
+				raw[component] = ExportRawComponent(ctx, data, component);
+				if (pack == GLSLstd450Bad) {
+					continue;
+				}
+				const auto f32    = state.builder.AllocateId();
+				const auto pair   = state.builder.AllocateId();
+				const auto packed = state.builder.AllocateId();
+				const auto bits   = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw[component]);
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+				                          f32, ConstantF32(state, 0));
+				state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed,
+				                          GlslStd450(state), pack, pair);
+				state.builder.AddFunction(
+				    sint_output ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract,
+				    TypeU32(state), bits, packed, ConstantU32(state, 0), ConstantU32(state, 16));
+				raw[component] = bits;
 			}
 		}
 		data = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), data,
 		                          raw[0], raw[1], raw[2], raw[3]);
 	}
-	if (vector_type == TypeU32Vector(state, 4)) {
+	if (!uint_output) {
+		const auto vector = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitcast, TypeF32Vector(state, 4), vector, data);
+		return vector;
+	}
+	if (!sint_output) {
 		return data;
 	}
-	return Unary(state, spv::OpBitcast, vector_type, data);
+	const auto signed_vector = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeI32Vector(state, 4), signed_vector, data);
+	return signed_vector;
 }
 
 uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
@@ -565,11 +647,18 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const auto vector_type = MrtOutputMode(state, exp) != 0u ? MrtOutputType(state, exp.index)
-		                                                         : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, vector_type);
+		const auto output_class =
+		    state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt
+		        ? MrtOutputClass(state, exp.index)
+		        : ShaderColorNumberClass::Float;
+		const auto vector_type = output_class == ShaderColorNumberClass::Uint
+		                             ? TypeU32Vector(state, 4)
+		                         : output_class == ShaderColorNumberClass::Sint
+		                             ? TypeI32Vector(state, 4)
+		                             : TypeF32Vector(state, 4);
+		auto value = ExportVector(ctx, data, exp, output_class);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && vector_type == TypeF32Vector(state, 4) &&
+		    exp.index == 0 && output_class == ShaderColorNumberClass::Float &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
@@ -680,6 +769,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+			if (const auto copy = CopyVariableForExport(state, exp); copy != 0) {
+				state.builder.AddFunction(spv::OpStore, copy, value);
+			}
 		}
 	});
 }
@@ -805,6 +897,8 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
 	// Zero-kind predicates are already inverted by translation.
 	auto predicate = ctx.Arg(inst, 0);
+	// The one lane decides alone.
+	if (ctx.state.single_lane) return predicate;
 	if (ctx.other_half != nullptr) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
@@ -837,9 +931,47 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
+uint32_t EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (state.single_lane) return ctx.Arg(inst, 0);
+	const auto op = static_cast<IR::ValueOpcode>(inst.Flags<uint64_t>());
+	spv::Op group = spv::OpGroupNonUniformIAdd;
+	uint32_t combine = 0; // A GLSL.std.450 instruction, or 0 for a core one.
+	spv::Op  core    = spv::OpIAdd;
+	switch (op) {
+		case IR::ValueOpcode::UMin32: group = spv::OpGroupNonUniformUMin; combine = GLSLstd450UMin; break;
+		case IR::ValueOpcode::UMax32: group = spv::OpGroupNonUniformUMax; combine = GLSLstd450UMax; break;
+		case IR::ValueOpcode::SMin32: group = spv::OpGroupNonUniformSMin; combine = GLSLstd450SMin; break;
+		case IR::ValueOpcode::SMax32: group = spv::OpGroupNonUniformSMax; combine = GLSLstd450SMax; break;
+		case IR::ValueOpcode::IAdd32: group = spv::OpGroupNonUniformIAdd; core = spv::OpIAdd; break;
+		case IR::ValueOpcode::BitwiseAnd32: group = spv::OpGroupNonUniformBitwiseAnd; core = spv::OpBitwiseAnd; break;
+		case IR::ValueOpcode::BitwiseOr32: group = spv::OpGroupNonUniformBitwiseOr; core = spv::OpBitwiseOr; break;
+		case IR::ValueOpcode::BitwiseXor32: group = spv::OpGroupNonUniformBitwiseXor; core = spv::OpBitwiseXor; break;
+		default: EXIT("wave reduction with an unknown operation");
+	}
+	auto value = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		// This invocation holds two lanes of the wave: combine them first.
+		const auto both = state.builder.AllocateId();
+		if (combine != 0) {
+			state.builder.AddFunction(spv::OpExtInst, TypeU32(state), both, GlslStd450(state), combine,
+			                          ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+		} else {
+			state.builder.AddFunction(core, TypeU32(state), both, ctx.HalfArg(inst, 0, 0),
+			                          ctx.HalfArg(inst, 0, 1));
+		}
+		value = both;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(group, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
+	                          spv::GroupOperationReduce, value);
+	return result;
+}
+
 template <spv::Op Reduce, auto Combine>
 static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
+	if (state.single_lane) return ctx.Arg(inst, 0);
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
 		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
@@ -900,7 +1032,13 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-	const auto shuffled = ctx.Shuffle(inst, 0, target);
+	// A lane the host subgroup does not have, as in a vertex group smaller than the wave, has no
+	// value: a shuffle from it is undefined. The shuffle reads this lane instead, and the result
+	// is zero.
+	const auto present  = EmitBallotLaneActiveBool(state, ctx.Ballot(IR::Value(true)), target);
+	const auto source   = Select(state, TypeU32(state), present, target, subid);
+	const auto shuffled = Select(state, TypeU32(state), present, ctx.Shuffle(inst, 0, source),
+	                             ConstantU32(state, 0));
 	if (flags.fetch_inactive) {
 		return shuffled;
 	}
@@ -930,7 +1068,7 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 
 uint32_t EmitReadRealtimeClock(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
-	const auto period = state.profile.device_clock_period_ps;
+	const auto period = state.host.capabilities.device_clock_period_ps;
 	if (period == 0u) {
 		ctx.Fail(inst, "requires shaderDeviceClock");
 	}

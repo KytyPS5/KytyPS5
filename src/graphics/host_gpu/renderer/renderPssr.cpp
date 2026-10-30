@@ -29,7 +29,7 @@ bool IsInputFormat(Prospero::BufferFormat format) {
 
 } // namespace
 
-RenderExecutor::~RenderExecutor() {
+void RenderExecutor::DestroyPssr() {
 	const auto device = m_context.GetGraphics().device;
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
@@ -84,8 +84,8 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		std::copy_n(words, 8, value.dwords.begin());
 		value.dword_count = 8;
 		auto binding = ResolveTexture(resource, value);
-		binding.desc.view_info.level_count = 1;
-		binding.desc.view_info.min_lod = 0;
+		binding.view_info.level_count = 1;
+		binding.view_info.min_lod = 0;
 		return binding;
 	};
 	auto& cache = m_context.GetTextureCache();
@@ -93,8 +93,8 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	BindImage(input.image_id, false);
 	auto output = resolve(request.output, true);
 	BindImage(output.image_id, true);
-	EXIT_IF(input.desc.info.data.address < output.desc.info.data.End() &&
-	        output.desc.info.data.address < input.desc.info.data.End());
+	EXIT_IF(input.Desc().info.data.address < output.Desc().info.data.End() &&
+	        output.Desc().info.data.address < input.Desc().info.data.End());
 	const auto acquire = [&](TextureBinding& binding, const uint32_t* words, bool storage) {
 		auto& previous = cache.GetImage(binding.image_id);
 		if (!previous.registered || previous.binding.needs_rebind) {
@@ -102,14 +102,14 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			binding = resolve(words, storage);
 			BindImage(binding.image_id, storage);
 		}
-		binding.image_view = cache.FindTexture(binding.image_id, binding.desc);
+		binding.image_view = cache.FindTexture(binding.image_id, binding.Desc());
 	};
 	acquire(input, request.input, false);
 	acquire(output, request.output, true);
 	auto& source = cache.GetImage(input.image_id);
 	auto& destination = cache.GetImage(output.image_id);
-	const auto& source_view = input.desc.view_info;
-	const auto& destination_view = output.desc.view_info;
+	const auto& source_view = input.view_info;
+	const auto& destination_view = output.view_info;
 	EXIT_IF(source.info.IsDepth() || destination.info.IsDepth() ||
 	        source.backing.samples != 1 || destination.backing.samples != 1 ||
 	        (input.image_id == output.image_id &&

@@ -112,15 +112,21 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 	              numeric);
 }
 
+static uint32_t EmitMinMaxF32Exact(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
+	                     EmitBitcastF32ToU32(state, rhs), max_value);
+}
+
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (state.profile.native_float_min_max) {
+	if (state.host.capabilities.guest_float_min_max) {
+		// One V_MIN/V_MAX_F32 of the host (see HostCapabilities::guest_float_min_max). Its FP32
+		// denormals follow the host's mode, flushed, as the guest's MODE (0xc0) has them.
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
 		return result;
 	}
-	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
-	                     EmitBitcastF32ToU32(state, rhs), max_value);
+	return EmitMinMaxF32Exact(state, lhs, rhs, max_value);
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -141,7 +147,9 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
 	const auto y =
 	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
-	const auto median = EmitMinMaxF32Value(state, x, y, true);
+	// MED3 keeps the exact sequence on every host: it returns the bits of a source, denormals
+	// and NaN payloads included.
+	const auto median = EmitMinMaxF32Exact(state, x, y, true);
 	const auto is_nan = [&](uint32_t value) {
 		return Unary(state, spv::OpIsNan, TypeBool(state), value);
 	};
@@ -159,6 +167,26 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	                             ConstantF32(state, 0x00800000u));
 	return Select(state, TypeF32(state), denormal,
 	              Binary(state, spv::OpFMul, TypeF32(state), value, ConstantF32(state, 0)), value);
+}
+
+// x - floor(x), and NaN for an infinity: Metal's fract gives 0 there. The check is on the bits,
+// so that fast math cannot fold it away.
+uint32_t EmitFPFract32(EmitterState& state, uint32_t src) {
+	const auto fract    = state.builder.AllocateId();
+	const auto bits     = state.builder.AllocateId();
+	const auto abs_bits = state.builder.AllocateId();
+	const auto infinite = state.builder.AllocateId();
+	const auto result   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state),
+	                          GLSLstd450Fract, src);
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, src);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
+	                          ConstantU32(state, 0x7fffffffu));
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), infinite, abs_bits,
+	                          ConstantU32(state, 0x7f800000u));
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), result, infinite,
+	                          ConstantF32(state, 0x7fc00000u), fract);
+	return result;
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {

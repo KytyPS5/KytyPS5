@@ -89,7 +89,12 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs);
 namespace Http {
 
 struct HttpEpoll;
-struct HttpNBEvent;
+struct HttpNBEvent {
+	uint32_t events       = 0;
+	uint32_t event_detail = 0;
+	int      id           = 0;
+	void*    user_arg     = nullptr;
+};
 
 using HttpEpollHandle = HttpEpoll*;
 
@@ -119,6 +124,7 @@ int KYTY_SYSV_ABI HttpAddRequestHeader(int id, const char* name, const char* val
 int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg);
 int KYTY_SYSV_ABI HttpUnsetEpoll(int id);
 int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* post_data, size_t size);
+int KYTY_SYSV_ABI HttpReadData(int request_id, void* data, size_t size);
 int KYTY_SYSV_ABI HttpAbortRequest(int request_id);
 int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxevents,
                                   int timeout);

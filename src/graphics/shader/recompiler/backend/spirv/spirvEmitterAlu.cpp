@@ -6,6 +6,10 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, max_value ? SoftFloat64Op::Max : SoftFloat64Op::Min,
+		                       {lhs, rhs});
+	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -113,13 +117,120 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
+namespace {
+
+// Keeps a compiler from merging the operation with a neighbour. On a host where the mark is slow
+// it is left out, and the caller says why the result is exact without it.
+void MarkNoContraction(EmitterState& state, uint32_t result) {
+	if (!state.host.faults.no_contraction_is_slow) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+}
+
+} // namespace
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	// Without the mark: a fused multiply-add is one operation already, and has no part a compiler
+	// could merge with a neighbour.
+	MarkNoContraction(state, result);
 	return result;
 }
 
+namespace {
+
+uint32_t TypeF16x2(EmitterState& state) {
+	if (state.f16x2_type == 0) {
+		const auto half  = state.builder.Type(spv::OpTypeFloat, 16);
+		state.f16x2_type = state.builder.Type(spv::OpTypeVector, half, 2);
+	}
+	return state.f16x2_type;
+}
+
+uint32_t BitcastTo(EmitterState& state, uint32_t type, uint32_t value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, type, result, value);
+	return result;
+}
+
+// Lane `high` of a packed pair as F32, as the guest's lane reads give it (ConvertF32F16).
+uint32_t HalfLaneF32(EmitterState& state, uint32_t packed, bool high) {
+	return EmitF16BitsToF32(state, high ? EmitShiftRightLogical32(state, packed,
+	                                                              ConstantU32(state, 16))
+	                                    : packed);
+}
+
+uint32_t PackLanes(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, low, high);
+	return EmitPackHalf2x16(state, pair);
+}
+
+// A packed FP16 operation: native on two-lane half vectors, or (without native FP16) each lane
+// through F32 and back, as the translator did before these operations existed.
+template <typename Native, typename Lane>
+uint32_t PackedF16(EmitterState& state, std::initializer_list<uint32_t> args, Native native,
+                   Lane lane) {
+	if (state.native_float16) {
+		std::array<uint32_t, 3> halves {};
+		size_t                  index = 0;
+		for (const auto arg: args) halves[index++] = BitcastTo(state, TypeF16x2(state), arg);
+		return BitcastTo(state, TypeU32(state), native(halves));
+	}
+	std::array<uint32_t, 2> lanes {};
+	for (const bool high: {false, true}) {
+		std::array<uint32_t, 3> values {};
+		size_t                  index = 0;
+		for (const auto arg: args) values[index++] = HalfLaneF32(state, arg, high);
+		lanes[high ? 1 : 0] = lane(values);
+	}
+	return PackLanes(state, lanes[0], lanes[1]);
+}
+
+uint32_t NativeF16x2(EmitterState& state, spv::Op op, uint32_t a, uint32_t b) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(op, TypeF16x2(state), result, a, b);
+	MarkNoContraction(state, result);
+	return result;
+}
+
+} // namespace
+
+uint32_t EmitPackedFPAdd16(EmitterState& state, uint32_t a, uint32_t b) {
+	return PackedF16(
+	    state, {a, b}, [&](const auto& h) { return NativeF16x2(state, spv::OpFAdd, h[0], h[1]); },
+	    [&](const auto& v) { return EmitFPAdd32(state, v[0], v[1]); });
+}
+
+uint32_t EmitPackedFPMul16(EmitterState& state, uint32_t a, uint32_t b) {
+	return PackedF16(
+	    state, {a, b}, [&](const auto& h) { return NativeF16x2(state, spv::OpFMul, h[0], h[1]); },
+	    [&](const auto& v) { return EmitFPMul32(state, v[0], v[1]); });
+}
+
+uint32_t EmitPackedFPFma16(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	return PackedF16(
+	    state, {a, b, c},
+	    [&](const auto& h) {
+		    const auto result = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
+		                              GLSLstd450Fma, h[0], h[1], h[2]);
+		    return result;
+	    },
+	    [&](const auto& v) { return EmitFPFma32(state, v[0], v[1], v[2]); });
+}
+
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.host.faults.no_contraction_is_slow) {
+		// The marks below are slow on this host. So the product goes to the sum through the
+		// denormal flush of legacy MAD/MAC, which works on its bits: no multiply then feeds an add
+		// directly, and there is nothing for a compiler to fuse. The operands and the sum are not
+		// flushed, as on the other hosts below. A flush takes six instructions, and with five of
+		// them a multiply-add took 33: a compute shader of Crash Bandicoot 4 grew to 1.65 million
+		// SPIR-V words, and the Metal compiler took from 1.5 to over 10 minutes to build it.
+		const auto product = EmitFPMul32(state, a, b);
+		return EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
 	// a = EmitFlushF32DenormToSignedZero(state, a);
@@ -158,6 +269,10 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return Unary(state, spv::OpBitcast, TypeF32(state),
+		             EmitSoftFloat64(state, SoftFloat64Op::ToF32, {arg0}));
+	}
 	const auto converted = Unary(state, spv::OpFConvert, TypeF32(state), arg0);
 	const auto source    = EmitNative<spv::OpCompositeExtract, IR::Type::U32>(
 	    state, Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0), 1u);
@@ -174,6 +289,10 @@ uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::FromF32,
+		                       {Unary(state, spv::OpBitcast, TypeU32(state), arg0)});
+	}
 	return EmitNative<spv::OpFConvert, IR::Type::F64>(state,
 	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
 }
@@ -273,8 +392,31 @@ uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
-	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
-	return EmitNative<spv::OpFDiv, IR::Type::F64>(state, one, arg0);
+	if (state.soft_float64) {
+		return EmitSoftFloat64(state, SoftFloat64Op::Recip, {arg0});
+	}
+	// V_RCP_F64 takes denormal inputs and gives denormal results, but a driver's division may not
+	// for a divisor outside [2^-1022, 2^1022] (RADV gave 0 for 1/2^1023 and an approximation for
+	// 1/2^-1023). The divisor is scaled into that range by a power of two, and the result back.
+	const auto f64      = TypeF64(state);
+	const auto constant = [&](uint32_t high) {
+		return state.builder.Constant(spv::OpConstant, f64, 0u, high);
+	};
+	const auto words = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0);
+	const auto high  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, words, 1u);
+	const auto exponent = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+	    state, high, ConstantU32(state, 20), ConstantU32(state, 11));
+	const auto large = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), exponent,
+	                          ConstantU32(state, 0x7fdu));
+	const auto tiny  = Binary(state, spv::OpULessThanEqual, TypeBool(state), exponent,
+	                          ConstantU32(state, 2u));
+	const auto scale = Select(state, f64, large, constant(0x3bf00000u), // 2^-64
+	                          Select(state, f64, tiny, constant(0x43f00000u), // 2^64
+	                                 constant(0x3ff00000u)));
+	const auto quotient = EmitNative<spv::OpFDiv, IR::Type::F64>(
+	    state, constant(0x3ff00000u), EmitNative<spv::OpFMul, IR::Type::F64>(state, arg0, scale));
+	return EmitNative<spv::OpFMul, IR::Type::F64>(state, quotient, scale);
 }
 
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {

@@ -89,14 +89,16 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
 	// Mixed interpolation modes share raw vertices at their guest export slot.
-	// Rectangle expansion alone supplies separate flat and smooth outputs.
+	// Rectangle expansion and copied flat aliases supply separate flat and smooth outputs.
+	const bool share_mixed = pixel->parameter_mode != ShaderPixelParameterMode::Rectangle &&
+	                         !pixel->flat_aliases_copied;
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
 			const bool same_mode = ShaderPixelParameterIsFlat(*pixel, input) ==
 			                       ShaderPixelParameterIsFlat(*pixel, alias);
 			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
 			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
-			    (pixel->parameter_mode != ShaderPixelParameterMode::Rectangle || same_mode)) {
+			    (share_mixed || same_mode)) {
 				per_vertex[input] = per_vertex[input] || per_vertex[alias] || !same_mode;
 			}
 		}
@@ -285,6 +287,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
+	info.packed_float16 |= op == ValueOpcode::PackedFPAdd16 || op == ValueOpcode::PackedFPMul16 ||
+	                       op == ValueOpcode::PackedFPFma16;
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||
@@ -431,6 +435,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			const auto kind      = static_cast<StageInputKind>(inst.Arg(0).U32());
 			const auto component = inst.Arg(1).U32();
+			info.barycentric |= kind == StageInputKind::BaryCoordSmooth ||
+			                    kind == StageInputKind::BaryCoordSmoothSample ||
+			                    kind == StageInputKind::BaryCoordSmoothCentroid ||
+			                    kind == StageInputKind::BaryCoordNoPerspective;
 			switch (kind) {
 				case StageInputKind::PackedAncillary:
 					return Fail("packed pixel ancillary input has an unsupported live use");
@@ -523,8 +531,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
+		case ValueOpcode::WaveReduceU32:
 		case ValueOpcode::SubgroupUMinU32:
 		case ValueOpcode::SubgroupUMaxU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::DataAppend:
+		case ValueOpcode::DataConsume: info.append_consume = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -586,7 +597,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
-	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 =
+	    info.append_consume = info.barycentric = info.packed_float16 = false;
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

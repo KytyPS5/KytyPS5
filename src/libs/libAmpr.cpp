@@ -21,6 +21,8 @@
 #include <deque>
 #include <filesystem>
 #include <limits>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1421,26 +1423,48 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
-		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
-		return LibKernel::KERNEL_ERROR_ENOENT;
+	// Games read the same few archives thousands of times: keep them open (the files of a game do
+	// not change while it runs).
+	static thread_local std::list<std::pair<std::filesystem::path, std::unique_ptr<Common::File>>>
+	     open_files;
+	auto cached = std::ranges::find_if(open_files,
+	                                   [&](const auto& entry) { return entry.first == host_path; });
+	if (cached == open_files.end()) {
+		auto opened = std::make_unique<Common::File>();
+		if (!opened->Open(host_path, Common::File::Mode::Read)) {
+			LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
+			return LibKernel::KERNEL_ERROR_ENOENT;
+		}
+		constexpr size_t MAX_OPEN_FILES = 32;
+		if (open_files.size() >= MAX_OPEN_FILES) {
+			open_files.pop_back();
+		}
+		open_files.emplace_front(host_path, std::move(opened));
+	} else if (cached != open_files.begin()) {
+		open_files.splice(open_files.begin(), open_files, cached);
 	}
+	auto&      file      = *open_files.front().second;
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
-		file.Close();
+		if (Trace::Enabled()) {
+			Trace::Note("apr_read_past_end", Common::PathToString(host_path),
+			            fmt::format("offset=0x{:x} size=0x{:x} file_size=0x{:x}", file_offset, size,
+			                        file_size));
+		}
 		return OK;
 	}
 	if (!file.Seek(file_offset)) {
-		file.Close();
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		file.Close();
 		return OK;
 	}
+
+	// The bytes reach guest memory from this host thread. As for a file read (KernelPread), the
+	// GPU caches learn of the write first: what they hold for the range is published or dropped.
+	LibKernel::Memory::InvalidateMemory(destination, readable);
 
 	static thread_local std::vector<uint8_t> buffer;
 	const auto buffer_size = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
@@ -1459,7 +1483,11 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		*bytes_read += read;
 	}
 
-	file.Close();
+	if (Trace::Enabled() && *bytes_read < size) {
+		Trace::Note("apr_short_read", Common::PathToString(host_path),
+		            fmt::format("offset=0x{:x} size=0x{:x} file_size=0x{:x} read=0x{:x} dst=0x{:x}",
+		                        file_offset, size, file_size, *bytes_read, destination));
+	}
 	return OK;
 }
 
@@ -1601,12 +1629,21 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFile(void*    command_buffer, uint6
 	const auto destination_addr = reinterpret_cast<uint64_t>(destination);
 	if (command_buffer == nullptr || !IsValidAprReadRange(destination_addr, size) ||
 	    !IsValidAprFileOffset(file_offset)) {
+		Trace::Note("apr_record_rejected", "ReadFile",
+		            fmt::format("dst=0x{:x} size=0x{:x} offset=0x{:x}", destination_addr, size,
+		                        file_offset));
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto append_ok = AppendReadFileRecord(reinterpret_cast<uint64_t>(command_buffer), 0x17,
 	                                            file_id, destination_addr, size, file_offset,
 	                                            AprReadFileRecordSize(file_offset));
+	if (!append_ok) {
+		Trace::Note("apr_record_failed", "ReadFile",
+		            fmt::format("cb=0x{:x} dst=0x{:x} size=0x{:x}",
+		                        reinterpret_cast<uint64_t>(command_buffer), destination_addr,
+		                        size));
+	}
 	return append_ok ? OK : LibKernel::KERNEL_ERROR_EFAULT;
 }
 

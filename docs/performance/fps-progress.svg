@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="600" viewBox="0 0 1300 600" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <rect width="1300" height="600" fill="#ffffff"/>
+  <text x="650" y="44" text-anchor="middle" font-size="26" font-weight="700" fill="#0f172a">Crash Bandicoot 4: level fps without and with each part</text>
+  <text x="650" y="72" text-anchor="middle" font-size="15" fill="#475569">Apple M4 Max, x86_64 under Rosetta 2, MoltenVK 1.4.2. Each pair: the same build, the same scene, without the part and with it.</text>
+  <g font-size="13" fill="#64748b">
+    <line x1="100" y1="450.0" x2="1250" y2="450.0" stroke="#94a3b8" stroke-width="1"/>
+    <text x="88" y="454.0" text-anchor="end">0</text>
+    <line x1="100" y1="401.4" x2="1250" y2="401.4" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="405.4" text-anchor="end">5</text>
+    <line x1="100" y1="352.9" x2="1250" y2="352.9" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="356.9" text-anchor="end">10</text>
+    <line x1="100" y1="304.3" x2="1250" y2="304.3" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="308.3" text-anchor="end">15</text>
+    <line x1="100" y1="255.7" x2="1250" y2="255.7" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="259.7" text-anchor="end">20</text>
+    <line x1="100" y1="207.1" x2="1250" y2="207.1" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="211.1" text-anchor="end">25</text>
+    <line x1="100" y1="158.6" x2="1250" y2="158.6" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="162.6" text-anchor="end">30</text>
+    <line x1="100" y1="110.0" x2="1250" y2="110.0" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="88" y="114.0" text-anchor="end">35</text>
+    <text x="40" y="280" text-anchor="middle" transform="rotate(-90 40 280)" font-size="14" fill="#475569">fps</text>
+  </g>
+  <!-- Pipelines on workers* -->
+  <rect x="104.9" y="370.3" width="40" height="79.7" rx="3" fill="#94a3b8"/>
+  <text x="124.9" y="362.3" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">8.2</text>
+  <rect x="150.9" y="323.7" width="40" height="126.3" rx="3" fill="#2563eb"/>
+  <text x="170.9" y="315.7" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">13</text>
+  <text x="147.9" y="472" text-anchor="middle" font-size="13" fill="#334155">Pipelines on</text>
+  <text x="147.9" y="488" text-anchor="middle" font-size="13" fill="#334155">workers*</text>
+  <!-- NoContraction left out* -->
+  <rect x="200.8" y="401.4" width="40" height="48.6" rx="3" fill="#94a3b8"/>
+  <rect x="200.8" y="382.0" width="40" height="19.4" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="220.8" y="374.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">5–7</text>
+  <rect x="246.8" y="343.1" width="40" height="106.9" rx="3" fill="#2563eb"/>
+  <rect x="246.8" y="333.4" width="40" height="9.7" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="266.8" y="325.4" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">11–12</text>
+  <text x="243.8" y="472" text-anchor="middle" font-size="13" fill="#334155">NoContraction</text>
+  <text x="243.8" y="488" text-anchor="middle" font-size="13" fill="#334155">left out*</text>
+  <!-- 1080p rendering -->
+  <rect x="296.6" y="352.9" width="40" height="97.1" rx="3" fill="#94a3b8"/>
+  <rect x="296.6" y="314.0" width="40" height="38.9" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="316.6" y="306.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">10–14</text>
+  <rect x="342.6" y="294.6" width="40" height="155.4" rx="3" fill="#2563eb"/>
+  <rect x="342.6" y="284.9" width="40" height="9.7" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="362.6" y="276.9" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">16–17</text>
+  <text x="339.6" y="472" text-anchor="middle" font-size="13" fill="#334155">1080p</text>
+  <text x="339.6" y="488" text-anchor="middle" font-size="13" fill="#334155">rendering</text>
+  <!-- Idle images, 2 MiB buffers -->
+  <rect x="392.4" y="382.0" width="40" height="68.0" rx="3" fill="#94a3b8"/>
+  <text x="412.4" y="374.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">7</text>
+  <rect x="438.4" y="255.7" width="40" height="194.3" rx="3" fill="#2563eb"/>
+  <rect x="438.4" y="207.1" width="40" height="48.6" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="458.4" y="199.1" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">20–25</text>
+  <text x="435.4" y="472" text-anchor="middle" font-size="13" fill="#334155">Idle images,</text>
+  <text x="435.4" y="488" text-anchor="middle" font-size="13" fill="#334155">2 MiB buffers</text>
+  <!-- Passes not split* -->
+  <rect x="488.2" y="391.7" width="40" height="58.3" rx="3" fill="#94a3b8"/>
+  <rect x="488.2" y="382.0" width="40" height="9.7" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="508.2" y="374.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">6–7</text>
+  <rect x="534.2" y="382.0" width="40" height="68.0" rx="3" fill="#2563eb"/>
+  <rect x="534.2" y="362.6" width="40" height="19.4" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="554.2" y="354.6" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">7–9</text>
+  <text x="531.2" y="472" text-anchor="middle" font-size="13" fill="#334155">Passes not</text>
+  <text x="531.2" y="488" text-anchor="middle" font-size="13" fill="#334155">split*</text>
+  <!-- No barrier, read-only uses* -->
+  <rect x="584.1" y="382.0" width="40" height="68.0" rx="3" fill="#94a3b8"/>
+  <rect x="584.1" y="362.6" width="40" height="19.4" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="604.1" y="354.6" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">7–9</text>
+  <rect x="630.1" y="362.6" width="40" height="87.4" rx="3" fill="#2563eb"/>
+  <rect x="630.1" y="352.9" width="40" height="9.7" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="650.1" y="344.9" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">9–10</text>
+  <text x="627.1" y="472" text-anchor="middle" font-size="13" fill="#334155">No barrier,</text>
+  <text x="627.1" y="488" text-anchor="middle" font-size="13" fill="#334155">read-only uses*</text>
+  <!-- 128-draw batches -->
+  <rect x="679.9" y="314.0" width="40" height="136.0" rx="3" fill="#94a3b8"/>
+  <text x="699.9" y="306.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">14</text>
+  <rect x="725.9" y="294.6" width="40" height="155.4" rx="3" fill="#2563eb"/>
+  <rect x="725.9" y="284.9" width="40" height="9.7" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="745.9" y="276.9" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">16–17</text>
+  <text x="722.9" y="472" text-anchor="middle" font-size="13" fill="#334155">128-draw</text>
+  <text x="722.9" y="488" text-anchor="middle" font-size="13" fill="#334155">batches</text>
+  <!-- Hot ranges once per submission -->
+  <rect x="775.8" y="272.2" width="40" height="177.8" rx="3" fill="#94a3b8"/>
+  <text x="795.8" y="264.2" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">18.3</text>
+  <rect x="821.8" y="241.1" width="40" height="208.9" rx="3" fill="#2563eb"/>
+  <text x="841.8" y="233.1" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">21.5</text>
+  <text x="818.8" y="472" text-anchor="middle" font-size="13" fill="#334155">Hot ranges once</text>
+  <text x="818.8" y="488" text-anchor="middle" font-size="13" fill="#334155">per submission</text>
+  <!-- Hot pages 32 frames -->
+  <rect x="871.6" y="241.1" width="40" height="208.9" rx="3" fill="#94a3b8"/>
+  <text x="891.6" y="233.1" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">21.5</text>
+  <rect x="917.6" y="191.6" width="40" height="258.4" rx="3" fill="#2563eb"/>
+  <text x="937.6" y="183.6" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">26.6</text>
+  <text x="914.6" y="472" text-anchor="middle" font-size="13" fill="#334155">Hot pages</text>
+  <text x="914.6" y="488" text-anchor="middle" font-size="13" fill="#334155">32 frames</text>
+  <!-- Copy workers -->
+  <rect x="967.4" y="197.4" width="40" height="252.6" rx="3" fill="#94a3b8"/>
+  <rect x="967.4" y="187.7" width="40" height="9.7" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="987.4" y="179.7" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">26–27</text>
+  <rect x="1013.4" y="153.7" width="40" height="296.3" rx="3" fill="#2563eb"/>
+  <text x="1033.4" y="145.7" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">30.5</text>
+  <text x="1010.4" y="472" text-anchor="middle" font-size="13" fill="#334155">Copy</text>
+  <text x="1010.4" y="488" text-anchor="middle" font-size="13" fill="#334155">workers</text>
+  <!-- Read-backs from buffer memory* -->
+  <rect x="1063.2" y="372.3" width="40" height="77.7" rx="3" fill="#94a3b8"/>
+  <rect x="1063.2" y="352.9" width="40" height="19.4" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="1083.2" y="344.9" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">8–10</text>
+  <rect x="1109.2" y="343.1" width="40" height="106.9" rx="3" fill="#2563eb"/>
+  <rect x="1109.2" y="314.0" width="40" height="29.1" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="1129.2" y="306.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">11–14</text>
+  <text x="1106.2" y="472" text-anchor="middle" font-size="13" fill="#334155">Read-backs from</text>
+  <text x="1106.2" y="488" text-anchor="middle" font-size="13" fill="#334155">buffer memory*</text>
+  <!-- Fast clears, small uploads* -->
+  <rect x="1159.1" y="401.4" width="40" height="48.6" rx="3" fill="#94a3b8"/>
+  <rect x="1159.1" y="391.7" width="40" height="9.7" rx="3" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="1179.1" y="383.7" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">5–6</text>
+  <rect x="1205.1" y="391.7" width="40" height="58.3" rx="3" fill="#2563eb"/>
+  <rect x="1205.1" y="382.0" width="40" height="9.7" rx="3" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="1225.1" y="374.0" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">6–7</text>
+  <text x="1202.1" y="472" text-anchor="middle" font-size="13" fill="#334155">Fast clears,</text>
+  <text x="1202.1" y="488" text-anchor="middle" font-size="13" fill="#334155">small uploads*</text>
+  <rect x="100" y="512" width="16" height="12" rx="2" fill="#94a3b8"/><text x="124" y="523" font-size="13" fill="#475569">without the part</text>
+  <rect x="270" y="512" width="16" height="12" rx="2" fill="#2563eb"/><text x="294" y="523" font-size="13" fill="#475569">with the part</text>
+  <rect x="420" y="512" width="16" height="12" rx="2" fill="#bfdbfe" stroke="#2563eb"/><text x="444" y="523" font-size="13" fill="#475569">the measured range</text>
+  <text x="100" y="556" font-size="12" fill="#64748b">The pairs come from different scenes, routes and render sizes, so compare a bar only with its pair. * The game renders at 4K in these pairs.</text>
+  <text x="100" y="576" font-size="12" fill="#64748b">With every part, the level runs at about 28 fps (28.7 fps on the one-minute route), and at 27–34 fps through nine minutes of play. "Idle images, 2 MiB buffers": after six minutes.</text>
+</svg>

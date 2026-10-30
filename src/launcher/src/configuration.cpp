@@ -26,6 +26,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(user_id);
 	KYTY_CFG_SET(audio_input_device);
 	KYTY_CFG_SET(present_mode);
+	KYTY_CFG_SET(video_out_resolution);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hdr_enabled);
@@ -43,6 +44,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(network_connected);
 	KYTY_CFG_SET(psn_emulation_enabled);
+	KYTY_CFG_SET(ea_emulation_enabled);
 	KYTY_CFG_SET(vblank_frequency);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
@@ -50,6 +52,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(shader_optimization_type);
 	KYTY_CFG_SET(shader_log_direction);
 	KYTY_CFG_SET(shader_log_folder);
+	KYTY_CFG_SET(pipeline_cache_folder);
 	KYTY_CFG_SET(command_buffer_dump_enabled);
 	KYTY_CFG_SET(command_buffer_dump_folder);
 	KYTY_CFG_SET(printf_direction);
@@ -83,6 +86,10 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	if (EnumToText(present_mode).isEmpty()) {
 		present_mode = PresentMode::Mailbox;
 	}
+	KYTY_CFG_GET(video_out_resolution);
+	if (EnumToText(video_out_resolution).isEmpty()) {
+		video_out_resolution = VideoOutResolution::Title;
+	}
 	KYTY_CFG_GET(fullscreen_enabled);
 	KYTY_CFG_GET(hdr_enabled);
 	KYTY_CFG_GET(hide_cursor_enabled);
@@ -99,6 +106,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(network_connected);
 	KYTY_CFG_GET(psn_emulation_enabled);
+	ea_emulation_enabled = s.value("ea_emulation_enabled", ea_emulation_enabled).toBool();
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -109,6 +117,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(shader_optimization_type);
 	KYTY_CFG_GET(shader_log_direction);
 	KYTY_CFG_GET(shader_log_folder);
+	KYTY_CFG_GET(pipeline_cache_folder);
 	KYTY_CFG_GET(command_buffer_dump_enabled);
 	KYTY_CFG_GET(command_buffer_dump_folder);
 	KYTY_CFG_GET(printf_direction);

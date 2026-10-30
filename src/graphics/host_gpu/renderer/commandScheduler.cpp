@@ -1,9 +1,14 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 
 #include "common/assert.h"
+#include "common/perfCounters.h"
+#include "common/profiler.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/submitPlan.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -94,13 +99,26 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+bool CommandScheduler::InCompletionOffGpuThread() noexcept {
+	return InDeferredOperation() && !GuestGpu::IsGpuThread();
+}
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	Common::LockGuard lock(graphics.queue_mutex);
+	m_queue_timeline = graphics.queue_commits.AddTimeline(
+	    [this](uint64_t tick) { return m_master.IsRetired(tick); });
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_gpu_timer_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_gpu_timer_pool);
+	}
+	Common::LockGuard lock(m_graphics.queue_mutex);
+	m_graphics.queue_commits.RemoveTimeline(m_queue_timeline);
 }
 
 void CommandScheduler::Shutdown() {
@@ -126,14 +144,18 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
-	PopPendingOperations();
+	m_master.WaitRetired(CurrentTick() - 1);
+	RunRetiredOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
+	m_graphics.WithQueueIdle([this] {
+		std::lock_guard lock(m_operation_mutex);
+		m_retired_while_draining.clear();
+	});
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -176,6 +198,40 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+bool CommandScheduler::SubmitIfDue(SubmitPoint point) {
+	if (m_command.IsInvalid()) {
+		return false;
+	}
+	const bool used = m_command.Used();
+	if (used && m_open_since == std::chrono::steady_clock::time_point {}) {
+		m_open_since = std::chrono::steady_clock::now();
+	}
+	const uint32_t open_operations = m_open_operations.load(std::memory_order_relaxed);
+	SubmitState state {.open_work       = m_open_work,
+	                   .open_callbacks  = point == SubmitPoint::Packet ? 0u : m_open_callbacks,
+	                   .open_operations = open_operations,
+	                   .open_used       = used,
+	                   .about_to_wait  = point == SubmitPoint::Wait};
+	// The clock is read only when the age can decide: it is the costly part of this check.
+	if (point == SubmitPoint::GuestSubmission && used && state.open_callbacks == 0 &&
+	    m_open_work < SUBMIT_WORK_LIMIT) {
+		state.open_age_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+		                                                          m_open_since)
+		        .count());
+	}
+	switch (PlanSubmit(state)) {
+		case SubmitReason::None: return false;
+		case SubmitReason::Callbacks: KYTY_PROFILER_MESSAGE("submit: callbacks"); break;
+		case SubmitReason::Idle: KYTY_PROFILER_MESSAGE("submit: idle"); break;
+		case SubmitReason::Operations: KYTY_PROFILER_MESSAGE("submit: operations"); break;
+		case SubmitReason::Work: KYTY_PROFILER_MESSAGE("submit: work"); break;
+		case SubmitReason::Age: KYTY_PROFILER_MESSAGE("submit: age"); break;
+	}
+	Flush();
+	return true;
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
@@ -183,16 +239,28 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	// Until every submission has retired, not only until the GPU has reached it: the deferred
+	// operations below run only then, and a caller of Finish relies on them having run.
+	m_master.WaitRetired(CurrentTick() - 1);
 	BeginNext();
-	PopPendingOperations();
+	bool pending = false;
+	{
+		std::lock_guard lock(m_operation_mutex);
+		pending = !m_pending_operations.empty();
+	}
+	if (!pending) {
+		return;
+	}
+	RunRetiredOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -208,20 +276,81 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
+void CommandScheduler::RunRetiredOperations() {
+	WaitPriorityOperations(CurrentTick() - 1);
+	// Also for the other scheduler and the presents, and with nothing committed until every
+	// deferred operation has run.
+	m_graphics.WithQueueIdle([this] { PopPendingOperations(); });
+}
+
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {
-		PendingOperation operation;
+		uint64_t front_tick = 0;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			front_tick = m_pending_operations.front().tick;
+			// Cheap early out, without holding off submissions: checked again below. An operation
+			// of the open submission is never forced, also past the limit: the open command buffer
+			// can still use what it destroys, and waiting for that submission here can block the
+			// thread that has to submit it. Many of them make the GPU thread submit at the next
+			// packet instead (see submitPlan.h).
+			if (front_tick >= m_master.CurrentTick() ||
+			    (m_pending_operations.size() <= MaxPendingOperations &&
+			     !m_master.IsRetired(std::max(front_tick, m_master.CurrentTick() - 1)))) {
+				return;
+			}
+		}
+		WaitPriorityOperations(front_tick);
+
+		// Deferred operations destroy resources. An operation runs only when every command buffer
+		// committed to the queue so far has completed, also those of the other scheduler and of
+		// the presents (see queueCommits.h), and no submission can be made between that check and
+		// the end of the operation: any thread may get here, while the GPU thread submits.
+		Common::LockGuard submissions_held(m_graphics.queue_mutex);
+		PendingOperation  operation;
+		{
+			std::unique_lock lock(m_operation_mutex);
+			if (m_pending_operations.empty()) {
+				return;
+			}
+			if (m_pending_operations.front().tick != front_tick) {
+				continue;
+			}
+			const auto last_submitted = m_master.CurrentTick() - 1;
+			if (front_tick > last_submitted) {
+				return; // of the open submission: see above
+			}
+			if (!m_master.IsRetired(last_submitted) || !m_graphics.queue_commits.AllDone()) {
+				if (m_pending_operations.size() <= MaxPendingOperations) {
+					return;
+				}
+				// The GPU never caught up: wait instead of holding resources without limit.
+				lock.unlock();
+				m_master.WaitRetired(last_submitted);
+				lock.lock();
+				if (m_pending_operations.empty() ||
+				    m_pending_operations.front().tick != front_tick) {
+					continue;
+				}
+				// Another submitter's command buffer or a present may still run. Submissions are
+				// held off here, so the queue is drained.
+				if (!m_graphics.queue_commits.AllDone()) {
+					lock.unlock();
+					m_graphics.WithQueueIdle([] {});
+					lock.lock();
+					if (m_pending_operations.empty() ||
+					    m_pending_operations.front().tick != front_tick) {
+						continue;
+					}
+				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -236,11 +365,26 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
+	QueueOperationInAnyState(std::move(operation), priority);
+}
+
+void CommandScheduler::DeferDestruction(Common::UniqueFunction<void>&& operation) {
+	QueueOperationInAnyState(std::move(operation), false);
+}
+
+void CommandScheduler::QueueOperationInAnyState(Common::UniqueFunction<void>&& operation,
+                                                bool                           priority) {
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (priority) {
+			// Runs when the open submission completes: the submission must go out for that.
+			m_open_callbacks++;
+		} else {
+			m_open_operations++;
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -276,9 +420,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		m_master.WaitRetired(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
+			RetireCallbackState(std::move(operation.callback));
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -289,11 +434,35 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	}
 }
 
+void CommandScheduler::RetireCallbackState(Common::UniqueFunction<void>&& callback) {
+	// A callback may own resources, such as a download buffer. They are destroyed with the
+	// callback, so hand it to the deferred queue, which destroys resources only when no submission
+	// holds them.
+	std::lock_guard lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		m_pending_operations.push(
+		    {[state = std::move(callback)]() mutable { state = {}; }, CurrentTick()});
+		m_open_operations++;
+		return;
+	}
+	// During shutdown the other scheduler and the presents may still run command buffers that
+	// hold these resources: Shutdown destroys them once the queue is idle.
+	m_retired_while_draining.push_back(std::move(callback));
+}
+
 void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
+}
+
+bool CommandScheduler::PriorityOperationsDone(uint64_t tick) {
+	std::unique_lock lock(m_operation_mutex);
+	const bool       active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
+	const bool       queued_before_or_at =
+	    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+	return !active_before_or_at && !queued_before_or_at;
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
@@ -331,19 +500,231 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
+void CommandScheduler::EndComputeChain() {
+	if (!m_command.IsInvalid()) {
+		m_command.EndComputeChain();
+	}
+}
+
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	StartGpuTimer();
+	StartGpuProfile();
 	return m_command;
 }
 
+namespace {
+std::mutex                                  g_profile_names_mutex;
+std::unordered_map<uint64_t, uint64_t>      g_profile_names;
+} // namespace
+
+bool CommandScheduler::GpuProfileEnabled() {
+	static const bool enabled = std::getenv("KYTY_GPU_PROFILE") != nullptr;
+	return enabled;
+}
+
+void CommandScheduler::NoteProgramHash(uint64_t program_id, uint64_t guest_hash) {
+	if (!GpuProfileEnabled()) return;
+	std::lock_guard lock(g_profile_names_mutex);
+	g_profile_names[program_id] = guest_hash;
+}
+
+void CommandScheduler::StartGpuProfile() {
+	if (!GpuProfileEnabled()) return;
+	if (m_profile_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = ProfileBlocks * ProfileBlockQueries;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_profile_pool),
+		                     "create the GPU profile query pool");
+		vk::QueryPoolCreateInfo occ {};
+		occ.queryType  = vk::QueryType::eOcclusion;
+		occ.queryCount = ProfileBlocks * ProfileBlockQueries / 2;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&occ, nullptr, &m_profile_occ),
+		                     "create the GPU profile occlusion pool");
+		vk::QueryPoolCreateInfo stats {};
+		stats.queryType          = vk::QueryType::ePipelineStatistics;
+		stats.queryCount         = ProfileBlocks * ProfileBlockQueries / 2;
+		stats.pipelineStatistics = vk::QueryPipelineStatisticFlagBits::eInputAssemblyPrimitives |
+		                           vk::QueryPipelineStatisticFlagBits::eClippingPrimitives |
+		                           vk::QueryPipelineStatisticFlagBits::eFragmentShaderInvocations;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&stats, nullptr, &m_profile_stats),
+		                     "create the GPU profile statistics pool");
+	}
+	// A block still in flight is skipped this time: the profile loses those spans.
+	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if (block.tick != 0 && !m_master.IsFree(block.tick)) {
+		block.used = ProfileBlockQueries; // full: nothing is recorded into it
+		return;
+	}
+	block.tick = 0;
+	block.used = 0;
+	block.keys.clear();
+	m_command.Handle().resetQueryPool(m_profile_pool,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries,
+	                                  ProfileBlockQueries);
+	m_command.Handle().resetQueryPool(m_profile_occ,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2,
+	                                  ProfileBlockQueries / 2);
+	m_command.Handle().resetQueryPool(m_profile_stats,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2,
+	                                  ProfileBlockQueries / 2);
+}
+
+void CommandScheduler::GpuProfileBegin(bool count_samples) {
+	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if (block.used + 2 > ProfileBlockQueries) return;
+	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
+	                                      block.used);
+	// One occlusion query at a time: the guest's own (--occlusion-queries) has the samples then.
+	m_profile_counts_samples = count_samples;
+	if (count_samples) {
+		m_command.Handle().beginQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
+	}
+	m_command.Handle().beginQuery(m_profile_stats, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2, {});
+	block.used++;
+}
+
+void CommandScheduler::GpuProfileEnd(uint64_t key) {
+	auto& block = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if ((block.used & 1u) == 0u || block.used + 1 > ProfileBlockQueries) return;
+	m_command.Handle().endQuery(m_profile_stats, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
+	if (m_profile_counts_samples) {
+		m_command.Handle().endQuery(m_profile_occ, (m_profile_block % ProfileBlocks) * ProfileBlockQueries / 2 + block.used / 2);
+	}
+	m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_profile_pool,
+	                                  (m_profile_block % ProfileBlocks) * ProfileBlockQueries +
+	                                      block.used);
+	block.used++;
+	block.keys.push_back(key);
+}
+
+void CommandScheduler::CollectGpuProfile(uint64_t tick) {
+	if (!GpuProfileEnabled() || m_profile_pool == nullptr) return;
+	auto& current = m_profile_blocks[m_profile_block % ProfileBlocks];
+	if (current.used != ProfileBlockQueries || !current.keys.empty()) {
+		current.tick = tick;
+		m_profile_pending.push_back(m_profile_block % ProfileBlocks);
+	}
+	m_profile_block++;
+	const auto period = static_cast<double>(m_graphics.physical_device_properties.limits.timestampPeriod);
+	while (!m_profile_pending.empty() && m_master.IsFree(m_profile_blocks[m_profile_pending.front()].tick)) {
+		const auto index = m_profile_pending.front();
+		m_profile_pending.pop_front();
+		auto& block = m_profile_blocks[index];
+		const auto count = static_cast<uint32_t>(block.keys.size()) * 2u;
+		if (count != 0) {
+			std::vector<uint64_t> stamps(count);
+			if (m_graphics.device.getQueryPoolResults(m_profile_pool, index * ProfileBlockQueries, count,
+			                                          count * sizeof(uint64_t), stamps.data(),
+			                                          sizeof(uint64_t), vk::QueryResultFlagBits::e64) ==
+			    vk::Result::eSuccess) {
+				std::vector<uint64_t> samples(block.keys.size());
+				(void)m_graphics.device.getQueryPoolResults(m_profile_occ, index * ProfileBlockQueries / 2, static_cast<uint32_t>(samples.size()),
+				                                      samples.size() * sizeof(uint64_t), samples.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+				std::vector<std::array<uint64_t, 3>> st(block.keys.size());
+				(void)m_graphics.device.getQueryPoolResults(m_profile_stats, index * ProfileBlockQueries / 2, static_cast<uint32_t>(st.size()),
+				                                      st.size() * sizeof(st[0]), st.data(), sizeof(st[0]), vk::QueryResultFlagBits::e64);
+				for (size_t i = 0; i < block.keys.size(); i++) {
+					for (int k = 0; k < 3; k++) m_profile_stat_totals[block.keys[i]][k] += st[i][k];
+					m_profile_samples[block.keys[i]] += samples[i];
+					if (stamps[2 * i + 1] < stamps[2 * i]) continue;
+					auto& total = m_profile_totals[block.keys[i]];
+					total.first += static_cast<double>(stamps[2 * i + 1] - stamps[2 * i]) * period;
+					total.second++;
+				}
+			}
+		}
+		block.tick = 0;
+		if (++m_profile_buffers % 3000 == 0) {
+			std::vector<std::pair<double, uint64_t>> top;
+			double sum = 0;
+			for (const auto& [key, total]: m_profile_totals) { top.emplace_back(total.first, key); sum += total.first; }
+			std::sort(top.rbegin(), top.rend());
+			std::lock_guard lock(g_profile_names_mutex);
+			const auto name = [](uint64_t id) { const auto it = g_profile_names.find(id); return it == g_profile_names.end() ? id : it->second; };
+			std::printf("GPUPROF total %.1f ms over %zu keys\n", sum / 1e6, top.size());
+			for (size_t i = 0; i < std::min<size_t>(top.size(), 25); i++) {
+				const auto key = top[i].second;
+				const auto& total = m_profile_totals[key];
+				std::printf("GPUPROF %5.1f%% %8.1f ms %7llu calls %6.1f us/call  passing samples/call %.0f prims/call %.0f clipped/call %.0f fsinv/call %.0f a %016llx b %016llx\n", 100.0 * total.first / sum,
+				            total.first / 1e6, (unsigned long long)total.second, total.first / 1e3 / static_cast<double>(total.second), static_cast<double>(m_profile_samples[key]) / static_cast<double>(total.second), static_cast<double>(m_profile_stat_totals[key][0]) / static_cast<double>(total.second), static_cast<double>(m_profile_stat_totals[key][1]) / static_cast<double>(total.second), static_cast<double>(m_profile_stat_totals[key][2]) / static_cast<double>(total.second),
+				            (unsigned long long)name(key >> 32u), (unsigned long long)name(key & 0xffffffffu));
+			}
+			m_profile_totals.clear();
+			m_profile_samples.clear();
+			m_profile_stat_totals.clear();
+		}
+	}
+}
+
+void CommandScheduler::StartGpuTimer() {
+	static const bool enabled = std::getenv("KYTY_GPU_TIME") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	if (m_gpu_timer_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = 2 * GpuTimerSlots;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_gpu_timer_pool),
+		                     "create the GPU timer query pool");
+	}
+	const auto slot = m_gpu_timer_slot % GpuTimerSlots;
+	const auto cmd  = m_command.Handle();
+	cmd.resetQueryPool(m_gpu_timer_pool, 2 * slot, 2);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_gpu_timer_pool, 2 * slot);
+}
+
+void CommandScheduler::StopGpuTimer(uint64_t tick) {
+	if (m_gpu_timer_pool == nullptr) {
+		return;
+	}
+	m_gpu_timer_pending.emplace_back(tick, m_gpu_timer_slot % GpuTimerSlots);
+	m_gpu_timer_slot++;
+	const auto period = static_cast<double>(m_graphics.physical_device_properties.limits.timestampPeriod);
+	while (!m_gpu_timer_pending.empty() && m_master.IsFree(m_gpu_timer_pending.front().first)) {
+		std::array<uint64_t, 2> stamps {};
+		const auto slot = m_gpu_timer_pending.front().second;
+		if (m_graphics.device.getQueryPoolResults(m_gpu_timer_pool, 2 * slot, 2, sizeof(stamps),
+		                                          stamps.data(), sizeof(uint64_t),
+		                                          vk::QueryResultFlagBits::e64) ==
+		        vk::Result::eSuccess &&
+		    stamps[1] > stamps[0]) {
+			PerfCounters::Add(PerfCounters::Counter::GpuMicroseconds,
+			                  static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) *
+			                                        period / 1000.0));
+		}
+		m_gpu_timer_pending.pop_front();
+	}
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_cpu_reads_writes) {
+		m_cpu_reads_writes = false;
+		m_command.EndRendering();
+		vk::MemoryBarrier visible_to_cpu {};
+		visible_to_cpu.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		visible_to_cpu.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                   vk::PipelineStageFlagBits::eHost, {}, 1,
+		                                   &visible_to_cpu, 0, nullptr, 0, nullptr);
+	}
+	if (m_gpu_timer_pool != nullptr) {
+		m_command.EndRendering();
+		m_command.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+		                                  m_gpu_timer_pool,
+		                                  2 * (m_gpu_timer_slot % GpuTimerSlots) + 1);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -372,19 +753,36 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = graphics.queue.submit(1, &submit_info, m_master.AcquireFence(tick));
+		m_master.FenceSubmitted(tick);
+		PerfCounters::Add(PerfCounters::Counter::Submissions);
+		if (result == vk::Result::eSuccess) {
+			graphics.queue_commits.NoteSubmit(m_queue_timeline, tick);
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		GpuBreadcrumbs::Report();
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	StopGpuTimer(tick);
+	CollectGpuProfile(tick);
 
 	m_command.m_buffer = nullptr;
+	{
+		// An operation queued between the tick's change and here is not counted: the limit is
+		// a soft one.
+		std::lock_guard lock(m_operation_mutex);
+		m_open_operations = 0;
+	}
+	m_open_work      = 0;
+	m_open_callbacks = 0;
+	m_open_since     = {};
 	return tick;
 }
 

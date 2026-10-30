@@ -5,9 +5,12 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "loader/timer.h" // IWYU pragma: keep
 
+#include <cstdlib>
 #include <fmt/format.h>
+#include <string_view>
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
@@ -50,8 +53,10 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED) {                                                                      \
-		Libs::PrintName(g_library, g_module, __func__);                                              \
+	static ::Trace::Site kyty_trace_lib_site {g_library, __func__};                                \
+	const ::Trace::Scope kyty_trace_lib_scope {kyty_trace_lib_site};                               \
+	if (PRINT_NAME_ENABLED || (Libs::g_print_name_filter_set && Libs::PrintNameMatches(g_library))) { \
+		Libs::PrintName(g_library, g_module, __func__);                                            \
 	}
 
 namespace Loader {
@@ -59,6 +64,27 @@ class SymbolDatabase;
 } // namespace Loader
 
 namespace Libs {
+
+// KYTY_PRINT_NAME=Http,NpManager,...: log every call of the named libraries.
+inline const char* const g_print_name_filter     = std::getenv("KYTY_PRINT_NAME");
+inline const bool        g_print_name_filter_set = g_print_name_filter != nullptr;
+
+inline bool PrintNameMatches(const char* library) {
+	const std::string_view filter(g_print_name_filter);
+	const std::string_view name(library);
+	size_t                 begin = 0;
+	while (begin <= filter.size()) {
+		auto end = filter.find(',', begin);
+		if (end == std::string_view::npos) {
+			end = filter.size();
+		}
+		if (filter.substr(begin, end - begin) == name) {
+			return true;
+		}
+		begin = end + 1;
+	}
+	return false;
+}
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {

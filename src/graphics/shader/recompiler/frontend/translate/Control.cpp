@@ -205,9 +205,16 @@ void Translator::S_INST_PREFETCH() {
 }
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
-	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
-	const auto address = IR::U64(
-	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	// A call that a table call links returns to an address of its own (return_pc). Such calls
+	// sit on paths that the structured program joins with others, where the address stays alive
+	// past its last use: it is written as the shader-relative value that the GPU sees anyway
+	// (EmitGetShaderBase), so no host shader base reaches GPU data.
+	const auto address =
+	    inst.return_pc != UINT32_MAX
+	        ? IR::U64(IR::Value(uint64_t {inst.return_pc}))
+	        : IR::U64(ir.Emit(IR::ValueOpcode::IAdd64,
+	                          {IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase)),
+	                           IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}

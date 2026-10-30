@@ -79,10 +79,16 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	vk::PhysicalDeviceProperties2        properties {};
 	properties.pNext = &limits;
 	graphics.physical_device.getProperties2(&properties);
-	EXIT_NOT_IMPLEMENTED(std::min({limits.maxDescriptorSetUpdateAfterBindSampledImages,
-	                               limits.maxPerStageDescriptorUpdateAfterBindSampledImages,
-	                               limits.maxPerStageUpdateAfterBindResources}) <
-	                     IR::ImageHeapCapacity);
+	// A device with fewer update-after-bind images (MoltenVK may be one) keeps no table resident:
+	// Acquire refuses, and the draws materialize their heap entries as before.
+	if (std::min({limits.maxDescriptorSetUpdateAfterBindSampledImages,
+	              limits.maxPerStageDescriptorUpdateAfterBindSampledImages,
+	              limits.maxPerStageUpdateAfterBindResources}) < IR::ImageHeapCapacity) {
+		Log::WriteToConsoleAndLog(fmt::format("GPU: image heaps are not kept resident: the device "
+		                                      "binds fewer than {} images after binding.\n",
+		                                      IR::ImageHeapCapacity));
+		return;
+	}
 
 	const vk::DescriptorBindingFlags binding_flags =
 	    vk::DescriptorBindingFlagBits::ePartiallyBound |
@@ -123,6 +129,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 }
 
 ImageHeap::~ImageHeap() {
+	if (m_set == nullptr) return;
 	for (const auto& memory: m_memories) Unwatch(*memory);
 	auto& graphics             = m_context.GetGraphics();
 	graphics.image_heap_layout = nullptr;
@@ -132,6 +139,7 @@ ImageHeap::~ImageHeap() {
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
+	if (m_set == nullptr) return false;
 	const auto size = request.size & ~uint64_t {3};
 	if (request.count == 0u || request.step == 0u ||
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
@@ -315,9 +323,9 @@ void ImageHeap::Bury() {
 		for (const auto& view: memory->views) {
 			bool buried = false;
 			for (const auto& [value, index]: view->elements) {
-				const auto& binding = m_elements[index].binding;
-				if (binding.image_id && std::ranges::any_of(m_unmapped, [&](GuestRange range) {
-					    return ImageRangeOverlaps(binding.desc.info.data, range);
+				const auto& element = m_elements[index];
+				if (element.binding.image_id && std::ranges::any_of(m_unmapped, [&](GuestRange range) {
+					    return ImageRangeOverlaps(element.desc.info.data, range);
 				    })) {
 					m_elements[index].stale = buried = true;
 				}
@@ -461,7 +469,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				    image->binding.needs_rebind) {
 					mark(index);
 				} else {
-					(void)textures.FindTexture(binding.image_id, binding.desc);
+					(void)textures.FindTexture(binding.image_id, m_elements[index].desc);
 				}
 			}
 		}
@@ -486,7 +494,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				    IR::ImageHeapResource(view->profile, element.kind), element.value);
 				if (binding.image_id) mark(index);
 				// An unmapped texture stays null.
-				return binding.image_id || binding.desc.info.data.Empty();
+				return binding.image_id || binding.texture == nullptr || binding.texture->desc.info.data.Empty();
 			});
 		}
 		if (stale) {
@@ -512,14 +520,17 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
 				m_elements[index].serial = image.serial;
 				binding.layout     = image.ReadLayout();
-				binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
-				if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+				binding.image_view = textures.FindTexture(binding.image_id, binding.Desc());
+				if (binding.texture->desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 					view->dcc.push_back(index);
 				}
 				view->away.push_back(index);
-			} else if (!binding.desc.info.data.Empty()) {
+			} else if (binding.texture != nullptr && !binding.texture->desc.info.data.Empty()) {
 				view->held.push_back(index);
 			}
+			m_elements[index].desc    = binding.texture != nullptr ? binding.Desc()
+			                                                       : TextureCache::ImageDesc {};
+			binding.texture           = nullptr;
 			m_elements[index].binding = std::move(binding);
 			m_writes.push_back(index);
 		}
@@ -577,7 +588,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			    image->binding.force_general) {
 				return false;
 			}
-			const auto& view_info = element.binding.desc.view_info;
+			const auto& view_info = element.binding.view_info;
 			image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead,
 			               ImageSubresourceRange {view_info.base_level, view_info.level_count,
 			                                      view_info.base_layer, view_info.layer_count},

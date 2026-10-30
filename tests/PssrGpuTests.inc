@@ -92,7 +92,7 @@
         const auto binding = resolve(output);
         return ReadCachedTexel(name, context, binding.image_id, {},
             {output.Width5() + 1u, output.Height5() + 1u, 1},
-            binding.desc.view_info.base_layer, binding.desc.view_info.base_level);
+            binding.view_info.base_layer, binding.view_info.base_level);
       };
 
       auto input = descriptor(base, 2, 1, packed, linear);
@@ -159,7 +159,7 @@
           4, 2, packed, tiled);
       const auto resolved_output = resolve(output);
       Require(name, "parent array resolution", resolved_output.image_id == parent_id &&
-          resolved_output.desc.view_info.base_layer == 1,
+          resolved_output.view_info.base_layer == 1,
           "standalone output did not resolve into the existing array's second layer");
       Require(name, "resolved output layer", run(input, output, 4, 2) ==
           std::vector<u32>(8, red), "upscaling wrote layer zero instead of the resolved layer");
@@ -187,7 +187,7 @@
       const auto float_binding = resolve(input);
       Require(name, "reinterpreted sampled view", float_binding.image_id == raw_id &&
           cache.GetImage(raw_id).backing.format == vk::Format::eR32Uint &&
-          float_binding.desc.view_info.format == vk::Format::eB10G11R11UfloatPack32,
+          float_binding.view_info.format == vk::Format::eB10G11R11UfloatPack32,
           "float sampled descriptor did not reuse the integer native allocation");
       Require(name, "sampled view format", run(input, output, 2, 1) ==
           std::vector<u32>{red, green}, "upscaling used the allocation format instead of its view");
@@ -212,7 +212,7 @@
       output = descriptor(base + 0xf0000, 64, 32, packed, tiled);
       const auto resolved_mip = resolve(input);
       Require(name, "parent mip resolution", resolved_mip.image_id == mip_parent_id &&
-          resolved_mip.desc.view_info.base_level == 1,
+          resolved_mip.view_info.base_level == 1,
           "standalone source did not resolve into the existing image's second mip");
       Require(name, "resolved source mip", run(input, output, 64, 32) ==
           std::vector<u32>(64 * 32, green),

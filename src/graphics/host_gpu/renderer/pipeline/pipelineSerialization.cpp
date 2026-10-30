@@ -60,6 +60,52 @@ uint64_t BuildStamp() {
 	return error ? 0 : static_cast<uint64_t>(time);
 }
 
+// The host as the store sees it: every field by value, never the object's bytes, which have
+// padding. A new field of HostCapabilities or DriverFaults must be added here, or modules built
+// for another host would be taken from the store.
+uint64_t HostSignature(const HostGpu& host) {
+	const auto&    c       = host.capabilities;
+	const auto&    f       = host.faults;
+	const uint32_t words[] = {
+	    c.image_view_min_lod,
+	    c.cull_distance,
+	    c.buffer_int64_atomics,
+	    c.shared_int64_atomics,
+	    c.image_int64_atomics,
+	    c.float64,
+	    c.float16,
+	    c.fragment_barycentric,
+	    c.depth_bounds,
+	    c.depth_clamp,
+	    c.depth_clip_enable,
+	    c.color_write_enable,
+	    c.mesh_shader,
+	    c.compute_derivatives,
+	    c.push_descriptors,
+	    c.packed_scaled_vertex_input,
+	    c.provoking_vertex_last,
+	    c.attachment_feedback_loop,
+	    c.compute_subgroup_size_control,
+	    c.block_texel_view,
+	    c.maintenance8,
+	    c.device_clock_period_ps,
+	    c.draw_indirect_first_instance,
+	    c.guest_float_min_max,
+	    c.subgroup_supported_stages,
+	    c.subgroup_supported_operations,
+	    c.max_stage_samplers,
+	    f.pushed_buffers_have_no_size,
+	    f.no_per_vertex_inputs,
+	    f.no_centroid_barycentric,
+	    f.volatile_loads_are_reused,
+	    f.no_contraction_is_slow,
+	    f.pipeline_cache_load_is_slow,
+	    f.pipeline_cache_serializes_builds,
+	    f.vertex_subgroups_unreported,
+	};
+	return XXH3_64bits(words, sizeof(words));
+}
+
 // What every record depends on besides its own fields; empty when the build is unknown.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	const auto stamp = BuildStamp();
@@ -67,7 +113,7 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 		return {};
 	}
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	IoAll(header, stamp, HostSignature(graphics.host),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }

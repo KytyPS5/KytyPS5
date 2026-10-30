@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <bit>
 #include <functional>
@@ -35,6 +36,78 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, mask_value,
 	                          ConstantU32(state, 0));
 	EmitKillIfBoolFalse(state, active);
+}
+
+// Depth bounds test for hosts that have none. The renderer copies the depth buffer to a buffer
+// before the draw; its address, row width and the bounds are in push data. A pixel whose stored
+// depth is outside [min, max] is discarded before the guest shader runs.
+void EmitDepthBoundsTest(EmitterState& state) {
+	if (!UsesDepthBounds(state)) {
+		return;
+	}
+	const auto& pixel = *state.input_info.pixel;
+	const auto  push  = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, pixel.ps_depth_bounds_dword + dword));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto coordinate = [&](uint32_t component) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
+		    InputVariableForKind(state, IR::StageInputKind::FragCoord),
+		    ConstantU32(state, component));
+		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+		return Unary(state, spv::OpConvertFToU, TypeU32(state), value);
+	};
+	const auto texel =
+	    Binary(state, spv::OpIAdd, TypeU32(state),
+	           Binary(state, spv::OpIMul, TypeU32(state), coordinate(1), push(2)), coordinate(0));
+	const bool half_depth = pixel.ps_depth_bounds_format == 2u;
+	// Texels are 4 bytes, or 2 bytes for 16-bit depth, which the copy packs two to a dword.
+	const auto word    = half_depth ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), texel,
+	                                         ConstantU32(state, 1))
+	                                : texel;
+	const auto address = Binary(state, spv::OpIAdd, TypeU64(state),
+	                            PackU64(state, push(0), push(1)),
+	                            Binary(state, spv::OpIMul, TypeU64(state),
+	                                   Unary(state, spv::OpUConvert, TypeU64(state), word),
+	                                   ConstantU64(state, sizeof(uint32_t))));
+	const auto pointer = state.builder.AllocateId();
+	const auto bits    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          address);
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), bits, pointer,
+	                          spv::MemoryAccessAlignedMask, alignment);
+	uint32_t depth = 0;
+	if (half_depth) {
+		const auto shift =
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		           Binary(state, spv::OpBitwiseAnd, TypeU32(state), texel, ConstantU32(state, 1)),
+		           ConstantU32(state, 4));
+		const auto raw =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, shift),
+		           ConstantU32(state, 0xffffu));
+		depth = Binary(state, spv::OpFMul, TypeF32(state),
+		               Unary(state, spv::OpConvertUToF, TypeF32(state), raw),
+		               ConstantF32Value(state, 1.0f / 65535.0f));
+	} else {
+		depth = Unary(state, spv::OpBitcast, TypeF32(state), bits);
+	}
+	const auto minimum = Unary(state, spv::OpBitcast, TypeF32(state), push(3));
+	const auto maximum = Unary(state, spv::OpBitcast, TypeF32(state), push(4));
+	const auto inside =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	           Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), depth, minimum),
+	           Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), depth, maximum));
+	EmitKillIfBoolFalse(state, inside);
 }
 
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
@@ -94,9 +167,55 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+
+// A guest loop that never ends hangs the host GPU, and the driver then loses the device: the
+// whole emulator stops. Correct shaders end their loops; one fed corrupt data may not. Every
+// invocation may run LoopBudget iterations of its loops in all, and then each loop leaves at
+// its next exit. Exits keep their edges, only their conditions change, so the structure holds.
+// The budget is small on purpose: a loop that spends it on a full-screen draw keeps the GPU busy
+// for seconds, and on a GPU that also draws the desktop the whole screen freezes (FC 27). Games
+// tested (FC 25, TEKKEN 8) render the same with it.
+constexpr uint32_t DefaultLoopBudget = 1u << 16u;
+
+// KYTY_LOOP_BUDGET replaces it, to test whether a hang is a loop fed bad data (it changes the
+// shader: use a pipeline cache folder of its own).
+uint32_t LoopBudget() {
+	static const uint32_t budget = [] {
+		const char* text = std::getenv("KYTY_LOOP_BUDGET");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
+		                       : DefaultLoopBudget;
+	}();
+	return budget;
+}
+
+// In a loop header: one iteration of the budget is spent, until none is left.
+void SpendLoopBudget(EmitterState& state) {
+	const auto left  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), left, state.loop_budget_variable);
+	const auto some  = Binary(state, spv::OpINotEqual, TypeBool(state), left, ConstantU32(state, 0));
+	const auto spent = Select(state, TypeU32(state), some, ConstantU32(state, 1), ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable,
+	                          Binary(state, spv::OpISub, TypeU32(state), left, spent));
+}
+
+uint32_t LoopBudgetSpent(EmitterState& state) {
+	const auto left = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), left, state.loop_budget_variable);
+	return Binary(state, spv::OpIEqual, TypeBool(state), left, ConstantU32(state, 0));
+}
+
+bool IsLoopMerge(const IR::Program& program, const IR::Block* block) {
+	return std::ranges::any_of(program.blocks, [block](const IR::Block* header) {
+		return header->terminator.loop_header && header->terminator.merge_block == block;
+	});
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
+		if (term.loop_header && ctx.state.loop_budget_variable != 0) {
+			SpendLoopBudget(ctx.state);
+		}
 		if (term.loop_header) {
 			const auto* merge = term.merge_block;
 			const auto* cont  = term.continue_block;
@@ -129,7 +248,16 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto       condition   = ctx.Def(block->condition);
+			const bool true_exits  = IsLoopMerge(ctx.state.program, true_block);
+			const bool false_exits = IsLoopMerge(ctx.state.program, false_block);
+			if (ctx.state.loop_budget_variable != 0 && true_exits != false_exits) {
+				const auto spent = LoopBudgetSpent(ctx.state);
+				condition = true_exits
+				                ? Binary(ctx.state, spv::OpLogicalOr, TypeBool(ctx.state), condition, spent)
+				                : Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), condition,
+				                         Unary(ctx.state, spv::OpLogicalNot, TypeBool(ctx.state), spent));
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -235,7 +363,8 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
-	     op == Op::SubgroupUMaxU32 || op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
+	     op == Op::WaveReduceU32 || op == Op::SubgroupUMaxU32 || op == Op::ReadConstBuffer ||
+	     op == Op::ReadRealtimeClock ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
@@ -364,9 +493,13 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	if (state.loop_budget_variable != 0) {
+		done = Binary(state, spv::OpLogicalOr, TypeBool(state), done, LoopBudgetSpent(state));
+		SpendLoopBudget(state);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -417,7 +550,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::Bvh8Result: return TypeBvh8Result(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
-		case IR::Type::F64: return TypeF64(state);
+		case IR::Type::F64: return state.soft_float64 ? TypeU64(state) : TypeF64(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
@@ -471,6 +604,16 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (state.single_lane) {
+		// The one lane stands for every lane: the predicate in every bit.
+		const auto word   = state.builder.AllocateId();
+		const auto ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), word, Def(predicate),
+		                          ConstantU32(state, 0xffffffffu), ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), ballot, word,
+		                          word, word, word);
+		return ballot;
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
@@ -518,6 +661,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
+	if (state.single_lane) {
+		return Arg(inst, index);
+	}
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
 		                          lane);
@@ -677,6 +823,7 @@ void EmitProgram(EmitterState& state) {
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineBvhIntersect(state);
+	DefineSoftFloat64(state);
 	DefineTrinityFunctions(state);
 	if (program.info.uses_swizzle) {
 		ctx.scratch_u32_variable = state.builder.AllocateId();
@@ -707,6 +854,13 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.program.dispatcher_fallback ||
+	    std::ranges::any_of(program.blocks, [](const IR::Block* block) { return block->terminator.loop_header; })) {
+		state.loop_budget_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_budget_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -736,6 +890,18 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, LoopBudget()));
+	}
+	if (state.subgroup_local_invocation_id_variable != 0 && LaneIndexFromScan(state)) {
+		// The lane index is the number of active invocations below this one, here where all
+		// of them are active.
+		const auto lane = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformIAdd, TypeU32(state), lane,
+		                          ConstantU32(state, spv::ScopeSubgroup),
+		                          spv::GroupOperationExclusiveScan, ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, state.subgroup_local_invocation_id_variable, lane);
+	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
@@ -748,6 +914,7 @@ void EmitProgram(EmitterState& state) {
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryBindings(state);
+	EmitDepthBoundsTest(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

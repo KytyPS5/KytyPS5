@@ -35,7 +35,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
-		if (info.IsBlock() && graphics.supports_block_texel_view) {
+		if (info.IsBlock() && graphics.host.capabilities.block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
 		}
 	}
@@ -57,7 +57,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
-		if (graphics.supports_block_texel_view) {
+		if (graphics.host.capabilities.block_texel_view) {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
 			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
 			                                      vk::ImageTiling::eOptimal, storage,
@@ -82,7 +82,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	}
 	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
+		if (graphics.host.capabilities.attachment_feedback_loop && (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
 		}
 		return usage;
@@ -92,7 +92,12 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	}
 	if (graphics.GetPhysicalDeviceProperties().limits.storageImageSampleCounts &
 	    static_cast<vk::SampleCountFlagBits>(info.samples)) {
-		usage |= vk::ImageUsageFlagBits::eStorage;
+		const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
+		if (graphics.GetImageFormatProperties(
+		        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, storage,
+		        ImageCreateFlags(graphics, info, storage), nullptr) == vk::Result::eSuccess) {
+			usage = storage;
+		}
 	}
 	return usage;
 }
@@ -120,6 +125,39 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 		default: return vk::ImageAspectFlagBits::eColor;
 	}
 }
+
+namespace {
+
+constexpr auto DataWriteAccess = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+
+// Layouts in which every aspect a sampler may read is read-only.
+[[nodiscard]] bool SampledAspectsAreReadOnly(vk::ImageLayout layout) {
+	return layout == vk::ImageLayout::eShaderReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+	       layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+	       layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+}
+
+// A new use of an image in the layout it already has, where neither the earlier uses nor the new
+// one write the aspects a sampler reads: an attachment use and a sampler read then do not depend
+// on each other. No barrier is needed and the accesses add up. Without this, a read-only depth
+// buffer that is tested and sampled by alternate draws gets a barrier, and so a new render pass,
+// on every draw.
+template <typename State>
+[[nodiscard]] bool JoinWithoutBarrier(State& state, vk::ImageLayout layout, vk::AccessFlags2 access,
+                                      vk::PipelineStageFlags2 stage) {
+	if (state.layout != layout || !SampledAspectsAreReadOnly(layout) ||
+	    static_cast<bool>((state.access_mask | access) & DataWriteAccess)) {
+		return false;
+	}
+	state.access_mask |= access;
+	state.pl_stage |= stage;
+	return true;
+}
+
+} // namespace
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
@@ -158,6 +196,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
+				if (JoinWithoutBarrier(subresource_state, destination_layout, destination_access,
+				                       destination_stage)) {
+					continue;
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -191,6 +233,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		if (JoinWithoutBarrier(state, destination_layout, destination_access, destination_stage)) {
 			return {};
 		}
 
@@ -250,6 +295,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
+	NoteContentWrite();
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
@@ -348,6 +394,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 }
 
 void Image::CopyImage(Image& source) {
+	NoteContentWrite();
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -407,6 +454,7 @@ void Image::CopyImage(Image& source) {
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
+	NoteContentWrite();
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
 	        destination_range.level_count != 1 ||
@@ -472,6 +520,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
+	NoteContentWrite();
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -575,6 +624,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	NoteContentWrite();
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
@@ -724,10 +774,20 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+	const auto supported = [&] {
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         create.usage, create.flags,
+		                                         &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	// A host can refuse 2D views of the slices of a block-compressed volume, and then views of
+	// its blocks as texels: the image goes without them, and so do views that need them.
+	for (const auto optional: {vk::ImageCreateFlagBits::e2DArrayCompatible,
+	                           vk::ImageCreateFlagBits::eBlockTexelViewCompatible}) {
+		if (supported() || !(create.flags & optional)) continue;
+		create.flags &= ~vk::ImageCreateFlags {optional};
+	}
+	if (!supported()) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),

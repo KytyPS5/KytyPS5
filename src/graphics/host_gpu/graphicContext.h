@@ -2,8 +2,11 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/hostCapabilities.h"
+#include "graphics/host_gpu/queueCommits.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <map>
@@ -28,18 +31,26 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
-	bool                               compute_subgroup_size_control_enabled = false;
+	// VK_EXT_external_memory_dma_buf and VK_KHR_external_memory_fd: guest memory can be imported
+	// (guestMemoryImport.h).
+	bool                               dma_buf_import_enabled                = false;
+	// VK_AMD_buffer_marker, for the breadcrumbs of KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h).
+	bool                               buffer_marker_enabled                 = false;
+	// The device was made with a low global queue priority (see VulkanCreateDevice).
+	bool                               low_queue_priority                    = false;
+	// VK_KHR_pipeline_executable_properties, for KYTY_PIPELINE_IR: the driver's statistics and
+	// internal representations of the compute pipelines of one guest shader.
+	bool                               pipeline_executable_info_enabled      = false;
+	// VK_EXT_robustness2's nullDescriptor: a null guest texture is bound as a null descriptor.
+	// Off where the device lacks it (MoltenVK), and the renderer binds a placeholder instead.
+	bool                               null_descriptor_enabled               = false;
 	bool                               sample_rate_shading_enabled           = false;
-	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
-	bool                               attachment_feedback_loop_enabled      = false;
-	bool                               provoking_vertex_last_enabled         = false;
-	bool                               maintenance8_enabled                  = false;
-	bool                               conditional_rendering_enabled         = false;
-	bool                               occlusion_queries_enabled             = false;
-	bool                               occlusion_query_precise_enabled       = false;
-	bool                               supports_block_texel_view              = false;
-	bool                                      mesh_shader_enabled                   = false;
+	// What the device enabled, not only what it supports, and the known defects of its driver.
+	HostGpu                                   host;
+	bool                                      conditional_rendering_enabled   = false;
+	bool                                      occlusion_queries_enabled       = false;
+	bool                                      occlusion_query_precise_enabled = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -49,6 +60,21 @@ struct GraphicContext {
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
+	// What every submitter committed to the queue. Under queue_mutex.
+	QueueCommits queue_commits;
+
+	// Waits until every command buffer committed to the queue has completed, then runs `then`
+	// before anything new can be committed: for destroying resources the queue may hold (see
+	// queueCommits.h). Waits only when some command buffer may still run.
+	template <typename Then>
+	void WithQueueIdle(Then&& then) {
+		Common::LockGuard lock(queue_mutex);
+		if (!queue_commits.AllDone()) {
+			RequireVulkanSuccess(queue.waitIdle(), "vkQueueWaitIdle");
+			queue_commits.NoteIdle();
+		}
+		then();
+	}
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
 
@@ -91,7 +117,7 @@ struct GraphicContext {
 	}
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
-		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+		return subgroup_size == 64u || host.capabilities.compute_subgroup_size_control;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
@@ -103,6 +129,10 @@ struct GraphicContext {
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+	// The GPU uses the system memory, not memory of its own (see cacheCollection.h).
+	[[nodiscard]] bool UsesSystemMemory() const noexcept {
+		return physical_device_properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+	}
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 

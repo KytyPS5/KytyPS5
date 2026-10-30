@@ -30,6 +30,7 @@ target_include_directories(common
 	PRIVATE
 		${CMAKE_CURRENT_BINARY_DIR}
 		${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
+		${KYTY_THIRD_PARTY_DIR}/stb
 )
 
 target_link_libraries(common

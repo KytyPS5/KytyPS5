@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audio_internal.h"
@@ -15,8 +16,12 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace Libs::Audio {
@@ -370,6 +375,34 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
+// KYTY_AUDIO_DUMP=<prefix>: the samples each output port sends to the host, as raw PCM in
+// <prefix>.<n>_<channels>ch_<rate>_<f32|s16>.pcm, to find clipping, gaps and jumps in the output.
+static void DumpAudio(const void* port, uint32_t channels, uint32_t freq, bool is_float,
+                      const void* data, size_t bytes) {
+	static const char* const prefix = std::getenv("KYTY_AUDIO_DUMP");
+	if (prefix == nullptr) {
+		return;
+	}
+	static std::mutex                             mutex;
+	static std::vector<std::pair<const void*, std::FILE*>> files;
+	std::scoped_lock                              lock(mutex);
+	std::FILE*                                    file = nullptr;
+	for (const auto& [owner, open]: files) {
+		if (owner == port) file = open;
+	}
+	if (file == nullptr) {
+		const auto name = std::string(prefix) + "." + std::to_string(files.size()) + "_" +
+		                  std::to_string(channels) + "ch_" + std::to_string(freq) + "_" +
+		                  (is_float ? "f32" : "s16") + ".pcm";
+		file = std::fopen(name.c_str(), "wb");
+		if (file == nullptr) {
+			return;
+		}
+		files.emplace_back(port, file);
+	}
+	std::fwrite(data, 1, bytes, file);
+}
+
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
                           const float* gains) {
 	EXIT_IF(port == nullptr);
@@ -396,6 +429,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
 		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
+				PerfCounters::Add(PerfCounters::Counter::AudioDrops);
 				SDL_ClearAudioStream(port->stream);
 				port->queue_primed = false;
 				break;
@@ -406,11 +440,14 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		if (queued < static_cast<int>(prepared_size)) {
 			if (port->queue_primed) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+				PerfCounters::Add(PerfCounters::Counter::AudioUnderruns);
 			}
 			port->queue_primed = false;
 		}
 	}
 
+	DumpAudio(port, output_channels, port->freq, FormatIsFloat(port->format), prepared_data,
+	          prepared_size);
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		port->queue_primed = false;

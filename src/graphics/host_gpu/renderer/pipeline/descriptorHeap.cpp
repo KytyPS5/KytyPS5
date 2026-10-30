@@ -9,6 +9,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint32_t   DescriptorHeapCount = 1024;
+// A pool holds at most this many times the sizes below: no layout of a device needs more.
+constexpr uint32_t   MaxDescriptorPoolScale = 64;
 constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
@@ -25,9 +27,9 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 
 DescriptorHeap::~DescriptorHeap() {
 	m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
-	for (const auto& [pool, tick]: m_pending_pools) {
-		m_master_semaphore.Wait(tick);
-		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+	for (const auto& pending: m_pending_pools) {
+		m_master_semaphore.Wait(pending.tick);
+		m_graphics.device.destroyDescriptorPool(pending.pool, nullptr);
 	}
 }
 
@@ -43,9 +45,16 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
-	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
-	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
-		m_current_pool = pool;
+	m_pending_pools.push_back({m_current_pool, m_master_semaphore.CurrentTick(), m_pool_scale});
+	// Pools of an older, smaller size are no use once their work is done.
+	while (!m_pending_pools.empty() && m_pending_pools.front().scale < m_pool_scale &&
+	       m_master_semaphore.IsFree(m_pending_pools.front().tick)) {
+		m_graphics.device.destroyDescriptorPool(m_pending_pools.front().pool, nullptr);
+		m_pending_pools.pop_front();
+	}
+	if (const auto front = m_pending_pools.empty() ? PendingPool {nullptr, 0, 0} : m_pending_pools.front();
+	    front.scale == m_pool_scale && m_master_semaphore.IsFree(front.tick)) {
+		m_current_pool = front.pool;
 		m_pending_pools.pop_front();
 		EXIT_IF(m_graphics.device.resetDescriptorPool(m_current_pool, {}) != vk::Result::eSuccess);
 	} else {
@@ -53,9 +62,22 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	}
 
 	m_sets.clear();
-	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
-	return fresh_batch.sets[--fresh_batch.size];
+	auto* fresh_batch = &m_sets[layout];
+	while (!Allocate(layout, *fresh_batch)) {
+		// Not even one set fits an empty pool: the layout has more descriptors of a kind than the
+		// pool has. Pools of the next size take it, and so the sets that follow.
+		EXIT_IF(m_pool_scale >= MaxDescriptorPoolScale);
+		GrowDescriptorPool();
+		m_sets.clear();
+		fresh_batch = &m_sets[layout];
+	}
+	return fresh_batch->sets[--fresh_batch->size];
+}
+
+void DescriptorHeap::GrowDescriptorPool() {
+	m_pending_pools.push_back({m_current_pool, m_master_semaphore.CurrentTick(), m_pool_scale});
+	m_pool_scale *= 2;
+	CreateDescriptorPool();
 }
 
 bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
@@ -83,10 +105,14 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 }
 
 void DescriptorHeap::CreateDescriptorPool() {
+	auto sizes = DescriptorPoolSizes;
+	for (auto& size: sizes) {
+		size.descriptorCount *= m_pool_scale;
+	}
 	vk::DescriptorPoolCreateInfo create {};
 	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 }

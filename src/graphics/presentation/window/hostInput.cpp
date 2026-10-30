@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/presentation/window/gamepadQuit.h"
 #include "libs/controller.h"
 
 #include <algorithm>
@@ -145,6 +146,7 @@ struct MouseJoystickState {
 MouseJoystickState g_mouse;
 SDL_Window*        g_mouse_window   = nullptr;
 uint64_t           g_cursor_hide_at = 0;
+GamepadQuitHold    g_quit_hold;
 
 struct MouseTouchPadState {
 	bool     enabled        = false;
@@ -1035,6 +1037,12 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
 	}
+	// A running close hold wakes the loop when it is due, also without another event.
+	if (const auto quit_left =
+	        g_quit_hold.Remaining(SDL_GetTicks(), Controller::GetGamepadOfPlayer(0))) {
+		const int quit_timeout = static_cast<int>(*quit_left);
+		timeout = timeout < 0 ? quit_timeout : std::min(timeout, quit_timeout);
+	}
 	if (const int touch_timeout = PollGamepadTouchPad(SDL_GetTicks()); touch_timeout >= 0) {
 		timeout = timeout < 0 ? touch_timeout : std::min(timeout, touch_timeout);
 	}
@@ -1059,6 +1067,23 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		CenterMouseStick();
 	}
 	return has_event;
+}
+
+bool HostInputGamepadGuide(int gamepad, bool down) {
+	return g_quit_hold.Press(gamepad, down, SDL_GetTicks());
+}
+
+void HostInputGamepadTrigger(int gamepad, bool right, int value) {
+	g_quit_hold.Trigger(gamepad, right, TriggerPressed(value), SDL_GetTicks());
+}
+
+void HostInputGamepadRemoved(int gamepad) {
+	g_quit_hold.Forget(gamepad);
+}
+
+bool HostInputQuitRequested() {
+	return g_quit_hold.Remaining(SDL_GetTicks(), Controller::GetGamepadOfPlayer(0)) ==
+	       uint64_t {0};
 }
 
 } // namespace Libs::Graphics

@@ -23,6 +23,7 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "graphics/presentation/videoOutResolution.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -196,9 +197,14 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	// Performance counter: the earliest the next flip may show (the flip rate's cap).
+	std::atomic<uint64_t>               next_flip_due {0};
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
+	// GPU flips submitted that the command processor has not reached: the driver counts a flip
+	// as pending and queued when its command buffer is submitted (NoteGpuFlipSubmitted).
+	int32_t                             gpu_flips_submitted = 0;
 	VideoOutVblankStatus                pre_vblank_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
@@ -216,12 +222,14 @@ public:
 	bool Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
 	             uint64_t& request_id);
 	void Cancel(VideoOutConfig& cfg);
+	void NoteGpuFlipSubmitted(VideoOutConfig& cfg);
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
-	void WaitForSubmitSlot(VideoOutConfig& cfg);
+	bool WaitForSubmitSlot(VideoOutConfig& cfg, uint32_t micros);
+	bool WaitForDueFlip(uint64_t until);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	void Wait(VideoOutConfig& cfg, int index);
+	bool Wait(VideoOutConfig& cfg, int index, uint32_t micros);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -502,9 +510,26 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	const int interval = cfg.flip_rate + 1;
+	return Common::Timer::QueryPerformanceCounter() >=
+	       cfg.next_flip_due.load(std::memory_order_relaxed);
+}
 
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+static uint64_t VblankPeriod() {
+	return std::max(Common::Timer::QueryPerformanceFrequency() /
+	                    std::max(Config::GetVblankFrequency(), 1u),
+	                uint64_t {1});
+}
+
+// A flip shows at most once per flip_rate + 1 vblank periods, on average exactly that often, but
+// a late frame shows at once instead of at the next vblank: the host presents on its own clock,
+// and waiting for a vblank would hold every frame of a game below its rate for half a period.
+static void NoteFlipShownLocked(VideoOutConfig& cfg, uint64_t now) {
+	const auto period   = VblankPeriod();
+	const auto interval = static_cast<uint64_t>(cfg.flip_rate + 1) * period;
+	const auto previous = cfg.next_flip_due.load(std::memory_order_relaxed);
+	// The slack lets a frame of a game at its rate show in the vblank it was made for.
+	cfg.next_flip_due.store(std::max(previous + interval, now + interval - period / 4),
+	                        std::memory_order_relaxed);
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -727,6 +752,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate   = 0;
+		config.next_flip_due.store(0, std::memory_order_relaxed);
 		master             = config.master;
 		config.master      = nullptr;
 
@@ -863,10 +889,11 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
-			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			// Until the next vblank, a frame that is ready and due shows at once.
+			const auto vblank = sleep_begin + static_cast<uint64_t>(total_wait);
+			while (!token.stop_requested() && m_flip_queue.WaitForDueFlip(vblank) &&
+			       m_flip_queue.Flip(0)) {
+			}
 		}
 		if (token.stop_requested()) {
 			break;
@@ -955,7 +982,9 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 		}
 		m_done_cond_var.SignalAll();
 	}
-	if (cfg.flip_status.flipPendingNum >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
+	// A GPU flip counted when it was submitted takes that place in the queue.
+	const bool counted = source == FlipRequestSource::GpuEop && cfg.gpu_flips_submitted > 0;
+	if (cfg.flip_status.flipPendingNum - (counted ? 1 : 0) >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRejected);
 		return false;
 	}
@@ -986,13 +1015,24 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	request_id = r.id;
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 
-	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
-	if (source == FlipRequestSource::GpuEop) {
-		cfg.flip_status.gcQueueNum++;
+	if (counted) {
+		cfg.gpu_flips_submitted--;
+	} else {
+		cfg.flip_status.flipPendingNum++;
+		if (source == FlipRequestSource::GpuEop) {
+			cfg.flip_status.gcQueueNum++;
+		}
 	}
 
 	return true;
+}
+
+void FlipQueue::NoteGpuFlipSubmitted(VideoOutConfig& cfg) {
+	Common::LockGuard lock(m_mutex);
+	cfg.gpu_flips_submitted++;
+	cfg.flip_status.flipPendingNum++;
+	cfg.flip_status.gcQueueNum++;
 }
 
 FlipQueue::~FlipQueue() {
@@ -1043,6 +1083,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	Common::LockGuard lock(cfg.mutex);
 	cfg.flip_status.flipPendingNum = 0;
 	cfg.flip_status.gcQueueNum     = 0;
+	cfg.gpu_flips_submitted        = 0;
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
@@ -1192,20 +1233,28 @@ void FlipQueue::Complete(uint64_t request_id) {
 	}
 }
 
-void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
+bool FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg, uint32_t micros) {
 	Common::LockGuard lock(m_mutex);
 	auto belongs_to_port = [&cfg](const auto& request) { return request.cfg == &cfg; };
-	while (std::count_if(m_requests.begin(), m_requests.end(), belongs_to_port) +
-	           std::count_if(m_cpu_requests.begin(), m_cpu_requests.end(), belongs_to_port) >=
-	       VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
+	auto full            = [&] {
+        return std::count_if(m_requests.begin(), m_requests.end(), belongs_to_port) +
+                   std::count_if(m_cpu_requests.begin(), m_cpu_requests.end(), belongs_to_port) >=
+               VIDEO_OUT_FLIP_QUEUE_CAPACITY;
+	};
+	while (full()) {
 		if (m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
+		if (micros != 0) {
+			m_submit_slot_cond_var.WaitFor(&m_mutex, micros);
+			return !full();
+		}
 		m_submit_slot_cond_var.Wait(&m_mutex);
 	}
+	return true;
 }
 
-void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+bool FlipQueue::Wait(VideoOutConfig& cfg, int index, uint32_t micros) {
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {
@@ -1214,7 +1263,48 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
+		if (micros != 0) {
+			m_done_cond_var.WaitFor(&m_mutex, micros);
+			return !has_request();
+		}
 		m_done_cond_var.Wait(&m_mutex);
+	}
+	return true;
+}
+
+// Waits until the performance counter reaches `until` or a flip may show: its whole group is
+// recorded and the flip rate allows it. True for a flip.
+bool FlipQueue::WaitForDueFlip(uint64_t until) {
+	const auto        frequency = Common::Timer::QueryPerformanceFrequency();
+	Common::LockGuard lock(m_mutex);
+	for (;;) {
+		const auto now  = Common::Timer::QueryPerformanceCounter();
+		uint64_t   wake = until;
+		const auto owner =
+		    std::find_if(m_requests.begin(), m_requests.end(),
+		                 [](const auto& r) { return r.group == r.id; });
+		if (!m_processing && owner != m_requests.end()) {
+			const uint64_t group = owner->id;
+			const bool     ready =
+			    std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+			                 [group](const auto& r) { return r.group == group; }) &&
+			    std::all_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
+				    return r.group != group || r.state == RequestState::Ready;
+			    });
+			if (ready) {
+				const auto due = owner->cfg->next_flip_due.load(std::memory_order_relaxed);
+				if (now >= due) {
+					return true;
+				}
+				wake = std::min(wake, due);
+			}
+		}
+		if (now >= until) {
+			return false;
+		}
+		const auto micros = ((wake - now) * 1000000u + frequency - 1) / frequency;
+		m_submit_cond_var.WaitFor(&m_mutex, static_cast<uint32_t>(std::clamp<uint64_t>(
+		                                        micros, 1, std::numeric_limits<uint32_t>::max())));
 	}
 }
 
@@ -1299,6 +1389,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 			continue;
 		}
 		auto& r = *it;
+		NoteFlipShownLocked(*r.cfg, Common::Timer::QueryPerformanceCounter());
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1688,18 +1779,27 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 
-void VideoOutDriver::WaitForSubmitSlot(int handle) {
+void VideoOutDriver::NoteGpuFlipSubmitted(int handle) {
 	auto* cfg = m_impl->Get(handle);
-	EXIT_IF(cfg == nullptr);
-	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
+	if (cfg == nullptr) {
+		return;
+	}
+	Common::LockGuard lock(cfg->mutex);
+	m_impl->GetFlipQueue().NoteGpuFlipSubmitted(*cfg);
 }
 
-void VideoOutDriver::WaitFlipDone(int handle, int index) {
+bool VideoOutDriver::WaitForSubmitSlot(int handle, uint32_t micros) {
+	auto* cfg = m_impl->Get(handle);
+	EXIT_IF(cfg == nullptr);
+	return m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg, micros);
+}
+
+bool VideoOutDriver::WaitFlipDone(int handle, int index, uint32_t micros) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	m_impl->GetFlipQueue().Wait(*ctx, index);
+	return m_impl->GetFlipQueue().Wait(*ctx, index, micros);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
@@ -1864,9 +1964,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    Graphics::ReportedVideoOutResolution({.setting    = Config::GetVideoOutResolution(),
+	                                          .attribute3 = attribute3,
+	                                          .width      = ctx->width,
+	                                          .height     = ctx->height});
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

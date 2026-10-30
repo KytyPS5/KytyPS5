@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 
 namespace {
@@ -59,12 +60,12 @@ struct GuardedMemory {
 	uint8_t* data;
 	size_t size;
 	explicit GuardedMemory(size_t bytes): size(bytes) {
-		allocation = static_cast<uint8_t*>(std::aligned_alloc(256, (bytes + 767u) & ~size_t{255}));
+		allocation = static_cast<uint8_t*>(::operator new((bytes + 767u) & ~size_t{255}, std::align_val_t{256}));
 		CHECK(allocation != nullptr);
 		data = allocation + 256;
 		std::memset(allocation, 0xa7, bytes + 512);
 	}
-	~GuardedMemory() { Check(); std::free(allocation); }
+	~GuardedMemory() { Check(); ::operator delete(allocation, std::align_val_t{256}); }
 	void Check() const {
 		for (size_t i = 0; i < 256; ++i)
 			CHECK(allocation[i] == 0xa7 && data[size + i] == 0xa7);

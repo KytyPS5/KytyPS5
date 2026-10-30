@@ -185,13 +185,18 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// The stages the push constant range names: a push must name all of them.
+		vk::ShaderStageFlags    push_constant_stages;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
 	// Null skips the dispatch.
+	// push_data_start: PushData::NoStart keeps the shader data out of the push constants (an
+	// indirect dispatch in thread dimensions, whose data the GPU writes).
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                      ShaderComputeInputInfo&      input_info);
+	                                      ShaderComputeInputInfo&      input_info,
+	                                      uint32_t                     push_data_start = 0);
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);

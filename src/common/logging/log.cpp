@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/signalDefer.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -109,6 +110,8 @@ static void WriteImpl(std::string_view text, fmt::text_style style = {}) {
 	if (text.empty()) {
 		return;
 	}
+	// The sinks hold a lock while they write: a guest signal handler that logs must not run then.
+	Common::SignalDeferScope defer;
 
 	if (!g_initialized) {
 		WriteStdout(text, style);

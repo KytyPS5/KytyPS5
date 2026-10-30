@@ -19,6 +19,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <span>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -1295,6 +1298,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		cp.NoteGuestWrite(dst, buffer_size);
 	}
 
 	return 4;
@@ -1379,7 +1383,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.ReadLabel(reinterpret_cast<const uint32_t*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1540,6 +1544,9 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		auto*    index_addr =
 		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 		uint32_t max_instance_count = buffer[3];
+		// TODO: words 4 and 5 are the address of one object id per instance
+		// (AgcDcbDrawIndexMultiInstanced). Every instance gets VGT_OBJECT_ID's id instead, which a
+		// pixel shader that reads the object id sees as wrong for all instances but those it matches.
 		uint32_t instance_count     = buffer[6];
 		uint32_t flags              = buffer[7];
 
@@ -1602,12 +1609,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
-	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 4
-	// bit 31 enables the subdraw index, written to the register in its low half.
+	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 4 also
+	// holds the draw index destination, enabled by bit 31.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
-	    (buffer[3] >> 31u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
+	    (buffer[3] & (1u << 31u)) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
@@ -1701,8 +1708,13 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
 
+	// A Gen5 flip (AgcDcbSetFlip) raises the end-of-pipe interrupt when the game raised none of its
+	// own since the last flip: Minecraft waits for it on its graphics event queue while a flip is
+	// pending, and Contra, which has its own, would count a second one per frame and reuse buffers
+	// the GPU still reads.
 	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
-	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)),
+	        !cp.HadInterruptSinceFlip());
 	return 5;
 }
 
@@ -1772,6 +1784,19 @@ KYTY_CP_OP_PARSER(CpOpSetBase) {
 	return 3;
 }
 
+// Register pairs (offset, value) that a packet reads from guest memory. Read through the backing:
+// a read of the guest mapping waits for the GPU whenever the 16 KiB page holds any GPU-written
+// byte; the backing read waits only when these bytes are GPU-written (TryReadBufferBacking).
+std::span<const uint32_t> ReadIndirectRegisterPairs(const uint32_t* guest, uint32_t pairs) {
+	static thread_local std::vector<uint32_t> copy;
+	copy.resize(static_cast<size_t>(pairs) * 2u);
+	if (!LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(guest), copy.data(),
+	                                             copy.size() * sizeof(uint32_t))) {
+		std::memcpy(copy.data(), guest, copy.size() * sizeof(uint32_t));
+	}
+	return copy;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1828,12 +1853,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
+	const auto pairs = ReadIndirectRegisterPairs(indirect_buffer, indirect_num_dw);
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
-		auto raw_cmd_offset = indirect_buffer[0];
+		auto raw_cmd_offset = pairs[static_cast<size_t>(i) * 2u];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = pairs[static_cast<size_t>(i) * 2u + 1u];
 
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
 			continue;
@@ -1898,12 +1924,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto pairs = ReadIndirectRegisterPairs(indirect_buffer, indirect_num_dw);
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = pairs[static_cast<size_t>(i) * 2u];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = pairs[static_cast<size_t>(i) * 2u + 1u];
 
 		// Not sure if this is correct
 		// if (raw_cmd_offset != cmd_offset) {
@@ -1961,10 +1988,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	const auto pairs = ReadIndirectRegisterPairs(indirect_buffer, indirect_num_dw);
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = pairs[static_cast<size_t>(i) * 2u];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = pairs[static_cast<size_t>(i) * 2u + 1u];
 
 		// Not sure if this is correct
 		// if (raw_cmd_offset != cmd_offset) {

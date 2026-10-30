@@ -1,0 +1,43 @@
+#version 450
+
+// The arguments of an indirect dispatch in thread dimensions are thread counts, which an earlier
+// command of the same submission can have written. Turns them into the group counts of the host
+// dispatch and the extent the dispatched shader masks its last groups with.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer args_buf {
+    uint args[];
+};
+layout(std430, binding = 1) writeonly buffer groups_buf {
+    uint groups[];
+};
+layout(std430, binding = 2) writeonly buffer extent_buf {
+    uint extent[];
+};
+
+layout(push_constant) uniform Push {
+    uvec4 group_size;
+    uint  args_dword;
+    uint  extent_dword;
+    // Not zero: arguments asking for more groups than this in all dispatch none (an argument
+    // buffer that was not written yet holds other data, and a dispatch of billions of groups
+    // hangs the GPU and the desktop with it).
+    float max_groups;
+} push;
+
+void main() {
+    float total = 1.0;
+    for (uint axis = 0u; axis < 3u; axis++) {
+        const uint threads = args[push.args_dword + axis];
+        const uint size    = max(push.group_size[axis], 1u);
+        total *= float(threads / size + uint(threads % size != 0u));
+    }
+    const bool refuse = push.max_groups > 0.0 && total > push.max_groups;
+    for (uint axis = 0u; axis < 3u; axis++) {
+        const uint threads = args[push.args_dword + axis];
+        const uint size    = max(push.group_size[axis], 1u);
+        groups[axis]                     = refuse ? 0u : threads / size + uint(threads % size != 0u);
+        extent[push.extent_dword + axis] = threads;
+    }
+}

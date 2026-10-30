@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -99,7 +100,33 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
+void DeclareFloat16(EmitterState& state) {
+	if (state.float16_declared) return;
+	state.float16_declared = true;
+	state.builder.RequireCapability(spv::CapabilityFloat16);
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
+}
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair) {
+	if (!state.host.capabilities.float16) {
+		return EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32>(state, pair);
+	}
+	DeclareFloat16(state);
+	if (state.f16x2_type == 0) {
+		const auto half  = state.builder.Type(spv::OpTypeFloat, 16);
+		state.f16x2_type = state.builder.Type(spv::OpTypeVector, half, 2);
+	}
+	const auto halves = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFConvert, state.f16x2_type, halves, pair);
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), packed, halves);
+	return packed;
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.single_lane) {
+		return ConstantU32(state, 0);
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -107,6 +134,19 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+bool LaneIndexFromScan(const EmitterState& state) {
+	return Spirv::LaneIndexFromScan(state.program.stage, state.host);
+}
+
+bool MeshEmulated(const EmitterState& state) {
+	return state.program.stage == ShaderType::Mesh && state.input_info.vertex->mesh.emulated;
+}
+
+bool UsesDepthBounds(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel &&
+	       state.input_info.pixel->ps_depth_bounds_format != 0;
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -159,8 +199,26 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(input);
 	const auto kind  = VertexParameterScalarKind(state, input.location);
+	if (IsPacked1010102(kind)) {
+		// Fields at bits 0, 10, 20 and 30, 10 bits wide but the last, 2. As floats; the signed
+		// form sign-extends each field.
+		EXIT_IF(component > 3u);
+		const bool sign  = kind == VertexInputScalarKind::Sscaled1010102;
+		const auto word  = state.builder.AllocateId();
+		const auto field = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		const auto bits  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, input.variable_id);
+		state.builder.AddFunction(sign ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract,
+		                          TypeU32(state), field, word, ConstantU32(state, component * 10u),
+		                          ConstantU32(state, component == 3u ? 2u : 10u));
+		state.builder.AddFunction(sign ? spv::OpConvertSToF : spv::OpConvertUToF, TypeF32(state),
+		                          value, field);
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		return bits;
+	}
+	const auto count = VertexParameterComponentCount(input);
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {
@@ -183,6 +241,9 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
+	if (state.single_lane) {
+		return ConstantBool(state, true);
+	}
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));

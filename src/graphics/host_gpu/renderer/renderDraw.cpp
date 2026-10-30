@@ -22,6 +22,11 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "common/perfCounters.h"
+#include "common/trace.h"
+#include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -524,7 +529,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {
 				if (binding.image_id != depth.image_id ||
-				    binding.desc.type != TextureCache::BindingType::Texture) continue;
+				    binding.type != TextureCache::BindingType::Texture) continue;
 				const auto native =
 				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 				EXIT_IF(native == image.views.end());
@@ -533,7 +538,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		if (feedback_aspects && !m_context.GetGraphics().host.capabilities.attachment_feedback_loop) {
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				std::printf("depth attachment feedback loop is not supported by the host\n");
@@ -541,7 +546,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
-			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
+			layout = m_context.GetGraphics().host.capabilities.attachment_feedback_loop
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
@@ -1016,7 +1021,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	const auto& hw = buffer.GetRegisters();
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
-	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
+	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().host.capabilities.maintenance8 ||
 	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
 	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
 	                     emit.vertex_offset != 0 || emit.first_instance != 0 ||
@@ -1061,6 +1066,50 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		                  1, &region);
 	}
 	return true;
+}
+
+// Limits the pass of a draw to what the draw can touch: the scissors of the viewports it uses, as
+// UpdateGraphicsDynamicState sets them. Not when an attachment is cleared: a clear covers the whole
+// attachment.
+static void LimitRenderArea(RenderState& rendering, const CommandBuffer& buffer,
+                            const ShaderVertexInputInfo& vs_input_info) {
+	const auto& depth = rendering.depth_stencil_attachment;
+	if (depth.depth_clear || depth.stencil_clear ||
+	    std::any_of(rendering.color_attachments.begin(), rendering.color_attachments.end(),
+	                [](const RenderAttachment& color) { return color.is_clear; })) {
+		return;
+	}
+	const auto& ctx = buffer.GetRegisters();
+	const auto& vp  = ctx.GetScreenViewport();
+	const auto& outputs = vs_input_info.stage.module->info.info.outputs;
+	const bool  indexed_viewports =
+	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+	    });
+	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	const uint32_t     viewport_count = indexed_viewports ? viewport_slots : 1;
+	int32_t left = INT32_MAX, top = INT32_MAX, right = INT32_MIN, bottom = INT32_MIN;
+	for (uint32_t i = 0; i < viewport_count; i++) {
+		if (!ctx.GetClipControl().clip_disable && vp.viewports[i].xscale == 0.0f) continue;
+		const auto scissor = calc_final_scissor(
+		    vp, ctx.GetScanModeControl(), vk::Extent2D {rendering.width, rendering.height}, i);
+		left   = std::min<int32_t>(left, scissor.left);
+		top    = std::min<int32_t>(top, scissor.top);
+		right  = std::max<int32_t>(right, scissor.right);
+		bottom = std::max<int32_t>(bottom, scissor.bottom);
+	}
+	left   = std::max(left, 0);
+	top    = std::max(top, 0);
+	right  = std::min<int32_t>(right, static_cast<int32_t>(rendering.width));
+	bottom = std::min<int32_t>(bottom, static_cast<int32_t>(rendering.height));
+	if (right <= left || bottom <= top) return;
+	// Most of the target: a smaller area gains nothing, and a draw outside it would restart the pass.
+	if (uint64_t {static_cast<uint32_t>(right - left)} * static_cast<uint32_t>(bottom - top) * 2u >=
+	    uint64_t {rendering.width} * rendering.height) return;
+	rendering.area_x      = left;
+	rendering.area_y      = top;
+	rendering.area_width  = static_cast<uint32_t>(right - left);
+	rendering.area_height = static_cast<uint32_t>(bottom - top);
 }
 
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
@@ -1145,9 +1194,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
+	auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	LimitRenderArea(rendering, buffer, state.VertexStages().back());
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1222,6 +1272,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	const bool    profile           = CommandScheduler::GpuProfileEnabled();
+	if (profile) m_context.GetCommandScheduler().GpuProfileBegin(occlusion_query < 0);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
@@ -1232,6 +1284,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
+	}
+	if (profile) {
+		const uint64_t vertex_id = state.vertex_info[0].stage.module->id;
+		const uint64_t pixel_id  = state.ps_active ? state.ps_input_info.stage.module->id : 0u;
+		m_context.GetCommandScheduler().GpuProfileEnd((vertex_id << 32u) | (pixel_id & 0xffffffffu));
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
@@ -1504,6 +1561,12 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	}
 
 	auto& cache = m_context.GetTextureCache();
+	// The resolve writes one level and layer: the others keep the guest's bytes, which a target
+	// gets only when it is first used.
+	{
+		std::scoped_lock lock {cache.m_lock};
+		cache.InitializeImage(dst.image_id);
+	}
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
@@ -1511,6 +1574,115 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	                    {src.desc.view_info.base_level, 1, src.desc.view_info.base_layer, 1},
 	                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
 	return true;
+}
+
+
+// The front worker's pipeline of pending work does not exist until stage 2 of the upstream merge;
+// the deleter keeps RenderExecutor's member complete.
+void FrontPipelineDeleter::operator()(FrontPipeline* pipeline) const {
+	EXIT_IF(pipeline != nullptr);
+}
+
+// Pending work of the front worker (stage 2 of the upstream merge brings the front worker back):
+// until then every draw and dispatch is recorded at once, so nothing is ever pending.
+void RenderExecutor::FlushPendingWork() {}
+
+bool RenderExecutor::HasPendingWork() const {
+	return false;
+}
+
+void RenderExecutor::QueueDeferred(std::function<void()> action) {
+	action();
+}
+
+bool RenderExecutor::LastPendingIsDispatch() const {
+	return false;
+}
+
+bool RenderExecutor::FrontWorkerEnabled() {
+	return false;
+}
+
+void RenderExecutor::NoteFlip() {
+	if (m_decoded_textures.size() >= MaxDecodedTextures) {
+		// Prepared bindings point into the table; each draw prepares its own again.
+		for (auto& stage: m_graphics_bindings.vertex) stage.images.clear();
+		if (m_graphics_bindings.pixel) m_graphics_bindings.pixel->images.clear();
+		m_compute_bindings.images.clear();
+		m_decoded_textures.clear();
+		m_decoded_epoch++;
+	}
+	m_frame++;
+	RegionManager::NoteFrame();
+	PerfCounters::EndFrame();
+	Trace::EndFrame();
+	KYTY_PROFILER_FRAME();
+}
+
+RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderColorInfo& color) {
+	return TargetKey(color.image_id, color.guest_mip_level, color.guest_array_layer);
+}
+
+RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderDepthInfo& depth) {
+	return TargetKey(depth.image_id, depth.desc.view_info.base_level,
+	                 depth.desc.view_info.base_layer);
+}
+
+Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
+	EXIT_IF(bytes == 0);
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& master    = scheduler.GetMasterSemaphore();
+	master.Refresh();
+	ScratchBuffer* chosen = nullptr;
+	for (auto& scratch: m_scratch) {
+		if (scratch.buffer->Size() < bytes || !master.IsFree(scratch.tick)) {
+			continue;
+		}
+		if (chosen == nullptr || scratch.buffer->Size() < chosen->buffer->Size()) {
+			chosen = &scratch;
+		}
+	}
+	size_t chosen_index = 0;
+	if (chosen == nullptr) {
+		// Sizes are rounded up, so a few buffers serve many draws.
+		const auto size = std::max<uint64_t>(std::bit_ceil(bytes), 64u * 1024u);
+		m_scratch.push_back({std::make_unique<Buffer>(
+		                         m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
+		                         vk::BufferUsageFlagBits::eStorageBuffer |
+		                             vk::BufferUsageFlagBits::eTransferSrc |
+		                             vk::BufferUsageFlagBits::eTransferDst |
+		                             vk::BufferUsageFlagBits::eIndirectBuffer |
+		                             vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		                         size),
+		                     0});
+		m_scratch_bytes += size;
+		chosen_index = m_scratch.size() - 1;
+	} else {
+		chosen_index = static_cast<size_t>(chosen - m_scratch.data());
+	}
+	// Busy until the open submission has run.
+	m_scratch[chosen_index].tick = scheduler.CurrentTick();
+	// Past the budget, the buffers no draw has used for a while go; the busy and the recently
+	// used ones stay: a frame that needs more than the budget at once (75 depth snapshots of
+	// 8 MiB) would otherwise create and destroy them again every frame, and a wait for a busy
+	// one would stall every draw of that frame.
+	constexpr uint64_t ScratchBudget    = 256u * 1024u * 1024u;
+	constexpr uint64_t ScratchIdleTicks = 64;
+	const auto         current          = scheduler.CurrentTick();
+	for (size_t i = 0; i < m_scratch.size() && m_scratch_bytes > ScratchBudget;) {
+		if (i != chosen_index && m_scratch[i].tick + ScratchIdleTicks < current &&
+		    master.IsFree(m_scratch[i].tick)) {
+			m_scratch_bytes -= m_scratch[i].buffer->Size();
+			scheduler.DeferOperation([old = std::move(m_scratch[i].buffer)]() mutable { old.reset(); });
+			m_scratch.erase(m_scratch.begin() + static_cast<std::ptrdiff_t>(i));
+			if (i < chosen_index) {
+				chosen_index--;
+			}
+		} else {
+			i++;
+		}
+	}
+	return *m_scratch[chosen_index].buffer;
 }
 
 } // namespace Libs::Graphics

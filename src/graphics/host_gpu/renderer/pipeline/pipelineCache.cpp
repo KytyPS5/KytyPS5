@@ -203,12 +203,20 @@ vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
 	}
 }
 
-vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_components) {
+vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_components,
+                       const HostCapabilities& host) {
 	switch (resource.RawFormat()) {
 		// Temporary: invalid PS5 buffer format 113 (VertexAttribFormat::k16_16SInt).
 		case 113: return NarrowInputFormat(vk::Format::eR32G32B32A32Sfloat, used_components);
 		case 121: return vk::Format::eR16G16Sfloat;
 		default: break;
+	}
+	const auto guest_format = resource.Format();
+	if ((guest_format == Prospero::BufferFormat::k10_10_10_2UScaled &&
+	     !host.packed_scaled_vertex_input) ||
+	    guest_format == Prospero::BufferFormat::k10_10_10_2SScaled) {
+		// The packed word: the vertex shader unpacks it (see VertexInputScalarKind).
+		return vk::Format::eR32Uint;
 	}
 	const auto format = VulkanFormat(resource.Format());
 	if (format == vk::Format::eUndefined ||
@@ -220,14 +228,16 @@ vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_compo
 
 // The host format of each vertex input attribute, narrowed to the components the stage reads.
 std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
-                                           const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+                                           const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                           const HostCapabilities&                         host) {
 	std::vector<vk::Format> formats(input_info.resources_num);
 	for (int index = 0; index < input_info.resources_num; index++) {
 		const auto registers_num = input_info.resources_dst[index].registers_num;
 		EXIT_IF(registers_num < 1 || registers_num > 4);
 		const auto fetched = program.info.vertex_fetch_components[index];
 		formats[index] = InputFormat(input_info.resources[index],
-		                             fetched > 0 ? fetched : static_cast<uint32_t>(registers_num));
+		                             fetched > 0 ? fetched : static_cast<uint32_t>(registers_num),
+		                             host);
 	}
 	return formats;
 }
@@ -237,9 +247,9 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
-	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
-	        .device_clock_period_ps = graphics.device_clock_period_ps};
+	return {.maintenance8           = graphics.host.capabilities.maintenance8,
+	        .native_float_min_max   = graphics.host.capabilities.guest_float_min_max,
+	        .device_clock_period_ps = graphics.host.capabilities.device_clock_period_ps};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -251,7 +261,7 @@ std::filesystem::path ShaderStorePath() {
 	if (title_id.empty()) {
 		return {};
 	}
-	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	return Config::GetPipelineCacheFolder() / (title_id + ".shaders");
 }
 
 bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
@@ -302,8 +312,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
-	const auto profile = SpirvProfile(m_graphics);
-	options.profile    = &profile;
+	options.host = m_graphics.host;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 	                                               program.specialization, push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
@@ -318,7 +327,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
-	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
+	ValidateShaderSpirv(stage, key.hash, result.spirv, m_graphics.host.capabilities.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
 	    .module         = CompileSPV(result.spirv, m_graphics.device),
@@ -339,7 +348,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	// The inputs of these come from the stage's static key.
 	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
-		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
+		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info,
+		                                           m_graphics.host.capabilities);
 	} else if (key.stage == ShaderType::Pixel &&
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
@@ -498,7 +508,7 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path     = Config::GetPipelineCacheFolder() / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -702,7 +712,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		EXIT_NOT_IMPLEMENTED(!m_graphics.host.capabilities.mesh_shader);
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
@@ -726,15 +736,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
+		std::array<ShaderColorTarget, RENDER_COLOR_ATTACHMENTS_MAX>
 		    target_export_mapping {};
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			const auto& rt = context.GetRenderTarget(slot);
 			if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-				target_export_mapping[slot] =
+				target_export_mapping[slot].export_mapping =
 				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 				                                 rt.info.channel_order)
 				        .export_mapping;
+				target_export_mapping[slot].number_class =
+				    rt.info.channel_type == Prospero::ChannelType::kUInt   ? ShaderColorNumberClass::Uint
+				    : rt.info.channel_type == Prospero::ChannelType::kSInt ? ShaderColorNumberClass::Sint
+				                                                           : ShaderColorNumberClass::Float;
 			}
 		}
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
@@ -851,12 +865,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 }
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
-                                                     ShaderComputeInputInfo&      input_info) {
+                                                     ShaderComputeInputInfo&      input_info,
+                                                     uint32_t push_data_start) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	uint32_t          push_data_cursor = 0;
+	uint32_t          push_data_cursor = push_data_start;
 	return GetProgram(params, input_info, push_data_cursor);
 }
 

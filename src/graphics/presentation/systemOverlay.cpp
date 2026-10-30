@@ -9,6 +9,7 @@
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
+#include "graphics/presentation/overlayQueue.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
@@ -1128,6 +1129,9 @@ struct SystemOverlay::Impl {
 			info.CustomShaderFragCreateInfo.pCode    = GPU_IMGUI_HDR_SPV;
 		}
 		EXIT_IF(!ImGui_ImplVulkan_Init(&info));
+		set_vertices.assign(image_count, 0);
+		set_indices.assign(image_count, 0);
+		set_index = 0;
 		vulkan_initialized = true;
 	}
 
@@ -1865,10 +1869,33 @@ struct SystemOverlay::Impl {
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &color;
 		command.beginRendering(rendering);
-		{
+		auto*      draw_data = ImGui::GetDrawData();
+		const auto render    = [&] {
+            ImGui_ImplVulkan_RenderDrawData(draw_data, static_cast<VkCommandBuffer>(command));
+		};
+		// See overlayQueue.h. The backend takes its buffer sets in turn, one for each call, and
+		// grows only the set it takes: the same is tracked here.
+		set_index      = (set_index + 1u) % static_cast<uint32_t>(set_vertices.size());
+		auto& vertices = set_vertices[set_index];
+		auto& indices  = set_indices[set_index];
+		// The backend destroys a retired texture during the draw (ImGui_ImplVulkan_UpdateTexture).
+		const bool destroys_texture =
+		    draw_data->Textures != nullptr &&
+		    std::ranges::any_of(*draw_data->Textures, [](const ImTextureData* texture) {
+			    return texture->Status == ImTextureStatus_WantDestroy;
+		    });
+		const OverlayDraw draw {.vertices         = draw_data->TotalVtxCount,
+		                        .indices          = draw_data->TotalIdxCount,
+		                        .destroys_texture = destroys_texture};
+		if (OverlayDrawNeedsIdleQueue(draw, {.vertices = vertices, .indices = indices})) {
+			if (draw.vertices > 0) {
+				vertices = std::max(vertices, draw.vertices);
+				indices  = std::max(indices, draw.indices);
+			}
+			graphics.WithQueueIdle(render);
+		} else {
 			Common::LockGuard queue_lock(graphics.queue_mutex);
-			ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
-			                                static_cast<VkCommandBuffer>(command));
+			render();
 		}
 		command.endRendering();
 	}
@@ -1886,6 +1913,11 @@ struct SystemOverlay::Impl {
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
 	bool                                  vulkan_initialized = false;
+	// The vertices and indices each of the backend's buffer sets holds, and the set it took
+	// last (see Record).
+	std::vector<int>                      set_vertices;
+	std::vector<int>                      set_indices;
+	uint32_t                              set_index          = 0;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;
 	bool                                  focus_pending      = true;

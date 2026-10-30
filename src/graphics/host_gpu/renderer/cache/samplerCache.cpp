@@ -14,10 +14,12 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border,
+                                     uint32_t view_min_lod) {
 	Common::LockGuard lock(m_mutex);
 
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+	const SamplerKey key {r.fields[0], r.fields[1],    r.fields[2],
+	                      r.fields[3], integer_border, view_min_lod};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}
@@ -67,6 +69,26 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	if (static_cast<Prospero::SamplerMipFilter>(mip_filter) != Prospero::SamplerMipFilter::kNone) {
 		min_lod = static_cast<float>(r.MinLod()) / 256.0f;
 		max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
+	}
+
+	if (view_min_lod != 0) {
+		// The level that is read becomes max(clamp(lod, min, max), view minimum).
+		const auto view_min = static_cast<float>(view_min_lod) / 256.0f;
+		min_lod             = std::max(min_lod, view_min);
+		max_lod             = std::max(max_lod, view_min);
+		// The host cannot give a sampler with unnormalized coordinates an LOD range.
+		EXIT_NOT_IMPLEMENTED(r.ForceUnormCoords());
+		if (mag_filter != min_filter) {
+			// A view minimum leaves the choice between the two filters to the LOD before it. The
+			// raised range makes the host take the minification filter where the texture is
+			// magnified.
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: a texture with a minimum LOD is read through a sampler with "
+				            "different magnification and minification filters; the host uses the "
+				            "minification filter for it until its mips are all there.\n");
+			}
+		}
 	}
 
 	vk::SamplerCreateInfo sampler_info {};

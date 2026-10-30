@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -556,17 +557,27 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	// An image heap holds thousands of distinct descriptors: a search through the children so far
+	// would cost more than everything else in a frame.
+	struct DescriptorHash {
+		size_t operator()(const DescriptorValue& value) const noexcept {
+			uint64_t hash = value.dword_count;
+			for (const auto word: value.dwords) hash = (hash ^ word) * 0x100000001b3ull;
+			return static_cast<size_t>(hash ^ (hash >> 32u));
+		}
+	};
+	std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> child_ordinals;
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		const auto ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
+		const auto [found, inserted] = child_ordinals.try_emplace(
+		    candidate, static_cast<uint32_t>(descriptors.size() - children_begin + 1u));
+		if (inserted) {
 			descriptors.push_back(candidate);
 			auto child = root_resource;
 			child.indirect_root = resource_index;
 			specializations.push_back(child);
 		}
-		return ordinal;
+		return found->second;
 	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -1560,8 +1571,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
 	plan.capture_specialization_reads |=
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
-	if (capture_indirect_reads || !plan.source_reads.empty())
-		plan.resource_tracking_complete &= !program.has_address_writes;
+	// Address writes are not tracked, so values captured from memory the shader may write are not
+	// known to stay. Linked calls read guest code and function tables, which shaders do not write.
+	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
 	DerivePlanState(plan);
 	return plan;
 }
@@ -2140,6 +2152,28 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 	Reader reader {bytes};
 	IoPlan(reader, plan);
 	return reader.ok && reader.bytes.empty() && DerivePlanState(plan);
+}
+
+bool ResourceSpecializationFits(const ShaderInfo&             info,
+                                const ResourceSpecialization& specialization) {
+	// Each entry past the shader's own resources is a copy of one of them; every indirect root
+	// is an entry.
+	const auto fits = [](const auto& sources, size_t original_count, uint32_t no_root) {
+		if (original_count > sources.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < sources.size(); index++) {
+			const auto root = sources[index].indirect_root;
+			if ((index >= original_count && root >= original_count) ||
+			    (root != no_root && root >= sources.size())) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return fits(specialization.buffers, info.buffers.size(), BufferResource::NoIndirectBuffer) &&
+	       fits(specialization.images, info.images.size(), ImageResource::NoIndirectImage) &&
+	       fits(specialization.samplers, info.samplers.size(), SamplerResource::NoIndirectSampler);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

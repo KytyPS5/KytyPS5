@@ -86,6 +86,16 @@ or graphical glitches, so please include the version you tested when reporting a
       <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
     </td>
   </tr>
+  <tr>
+    <td align="center">
+      <strong>Crash Bandicoot 4: It's About Time</strong><br>
+      <img src="docs/screenshots/ps5-07.jpg" width="300" alt="Crash Bandicoot 4: It's About Time running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>Contra: Operation Galuga</strong><br>
+      <img src="docs/screenshots/ps5-08.jpg" width="300" alt="Contra: Operation Galuga running in KytyPS5">
+    </td>
+  </tr>
 </table>
 
 <p align="center"><em>And many more...</em></p>
@@ -235,6 +245,64 @@ time.
 
 The CMake source root is the repository root.
 
+#### GPU access to guest memory
+
+On Linux the GPU reads and writes guest memory in place through `/dev/udmabuf`, so buffers need no
+copies. The kernel caps each udmabuf at `size_limit_mb` (64 MiB by default), and buffers larger
+than half of that are still copied every frame. KytyPS5 reads the current limit at startup, so
+raising it is enough:
+
+```bash
+# Now:
+echo 1024 | sudo tee /sys/module/udmabuf/parameters/size_limit_mb
+# At every boot (udmabuf is often built into the kernel, where modprobe.d options do not apply):
+echo "w /sys/module/udmabuf/parameters/size_limit_mb - - - - 1024" | sudo tee /etc/tmpfiles.d/udmabuf.conf
+```
+
+Check it with `cat /sys/module/udmabuf/parameters/size_limit_mb`, and restart the emulator.
+
+#### Debugging and profiling tools (optional)
+
+These are not needed to build, but help when working on the renderer and the shader recompiler
+(Fedora package names; most distributions use the same or similar names):
+
+```bash
+sudo dnf install gdb perf valgrind strace radeontop \
+  vulkan-validation-layers spirv-tools umr
+```
+
+- `gdb` and `perf` attach to a running emulator. The Release build is stripped; the linker map
+  `_Build/linux/kyty_emulator_clang_lld.map` resolves its addresses. `perf record -e cycles:u -g
+  --user-callchains` samples user-space call stacks without changing `perf_event_paranoid`.
+- `vulkan-validation-layers` checks the renderer's Vulkan usage (the `--vulkan-validation` option).
+- `spirv-tools` disassembles and validates the SPIR-V the recompiler emits.
+- `radeontop` shows whether the GPU is busy; `umr` inspects AMD GPU state, such as the waves of a
+  hung shader (it needs root or access to the amdgpu debugfs files).
+
+#### Crash dumps
+
+On distributions with systemd-coredump, every crash of the emulator or a test leaves a dump in
+`/var/lib/systemd/coredump`, and crashing test runs can fill it quickly. `coredumpctl` lists them
+but has no option to delete them:
+
+```bash
+coredumpctl list                              # deleted dumps stay listed as "missing"; harmless
+sudo rm -f /var/lib/systemd/coredump/*        # delete all stored dumps now
+sudo systemd-tmpfiles --clean                 # delete only dumps older than the tmpfiles.d age (two weeks on Fedora)
+```
+
+To cap the space future dumps use, add a drop-in file. The `coredump.conf.d` folder does not exist
+until you create it, and unlike edits to `/etc/systemd/coredump.conf`, the drop-in survives package
+updates:
+
+```bash
+sudo mkdir -p /etc/systemd/coredump.conf.d
+printf '[Coredump]\nMaxUse=500M\n' | sudo tee /etc/systemd/coredump.conf.d/size.conf
+```
+
+Use `Storage=none` instead of `MaxUse=500M` to keep no dumps at all. The setting applies from the
+next crash; nothing needs to be restarted.
+
 ### Building on NixOS
 
 A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
@@ -278,7 +346,7 @@ sudo dnf install -y \
   mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
   libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
   alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
-  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+  wayland-devel wayland-protocols-devel qt6-qtbase-devel renderdoc
 ```
 
 From the repository root, follow the launcher configure, build and install steps in
@@ -427,6 +495,14 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
+
+A worker thread looks up the shader programs of the next draw while the GPU thread records the
+current one. To keep the lookups on the GPU thread, for example when narrowing down a rendering
+problem, set `KYTY_FRONT_WORKER=0`:
+
+```bash
+KYTY_FRONT_WORKER=0 ./kyty_emulator --game "/games/ExampleGame"
+```
 
 ### AI Use
 

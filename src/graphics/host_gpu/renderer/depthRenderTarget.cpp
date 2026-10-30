@@ -25,6 +25,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -160,10 +161,28 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			           z.depth_view.slice_max);
 	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
+	// A mip level selected on a surface of one level: Super Bomberman R 2 (PPSA07190) draws to
+	// mip 1 with MAX_MIP 0. The extent and the address are those of the target, so it is taken as
+	// an image of its own.
+	if (z.z_info.max_mip_level == 0 && z.depth_view.current_mip_level != 0) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "Warning: a depth target selects mip level " +
+			    std::to_string(z.depth_view.current_mip_level) +
+			    " of a one-level surface; its address and extent are used as they are.\n");
+		}
+	}
 	if (z.z_info.max_mip_level != 0 ||
-	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
+	    (z.depth_view.current_mip_level != 0 && z.z_info.max_mip_level != 0) ||
+	    unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state: max_mip=%u current_mip=%u shading_rate=%u "
+		           "htile=%d address=0x%llx",
+		           static_cast<unsigned>(z.z_info.max_mip_level),
+		           static_cast<unsigned>(z.depth_view.current_mip_level),
+		           static_cast<unsigned>(z.shading_rate_encoding), has_htile ? 1 : 0,
+		           static_cast<unsigned long long>(depth_address));
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
@@ -300,7 +319,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state: copy_stencil_to_color=%d zfunc=%u "
+		           "depth_write_disable=%d z_write=0x%llx z_read=0x%llx has_stencil=%d "
+		           "stencil_write_disable=%d s_write=0x%llx s_read=0x%llx",
+		           rc.copy_stencil_to_color ? 1 : 0, static_cast<unsigned>(dc.zfunc),
+		           z.depth_view.depth_write_disable ? 1 : 0,
+		           static_cast<unsigned long long>(z.z_write_base_addr),
+		           static_cast<unsigned long long>(z.z_read_base_addr), has_stencil ? 1 : 0,
+		           z.depth_view.stencil_write_disable ? 1 : 0,
+		           static_cast<unsigned long long>(z.stencil_write_base_addr),
+		           static_cast<unsigned long long>(z.stencil_read_base_addr));
 	}
 	if (rc.copy_depth_to_color &&
 	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
@@ -394,6 +422,42 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	               range, command);
 	destination.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	                    range, command);
+	const auto aspects = ImageViewOps::DepthAspectMask(source.backing.format);
+	if (depth_copy != stencil_copy && (aspects & vk::ImageAspectFlagBits::eDepth) &&
+	    (aspects & vk::ImageAspectFlagBits::eStencil) && source.backing.samples == 1) {
+		// One aspect of an image that has both. MoltenVK copies both planes for an image copy of
+		// one aspect, so the copy goes through a buffer: buffer copies take one aspect alone.
+		// TODO: a multisampled image cannot be copied through a buffer; on MoltenVK its copy of
+		// one aspect still copies both.
+		const auto aspect      = depth_copy ? vk::ImageAspectFlagBits::eDepth
+		                                    : vk::ImageAspectFlagBits::eStencil;
+		const auto texel_bytes =
+		    depth_copy ? uint64_t {DepthAspectTransferBytes(source.backing.format)} : uint64_t {1};
+		const auto& extent = write_desc.info.extent;
+		const auto  bytes  = Common::AlignUp(static_cast<uint64_t>(extent.width) *
+		                                         extent.height * extent.depth *
+		                                         range.layer_count * texel_bytes,
+		                                     uint64_t {4});
+		auto& staging = AcquireScratch(bytes);
+		const vk::BufferImageCopy copy {
+		    0, 0, 0, {aspect, range.base_level, range.base_layer, range.layer_count}, {}, extent};
+		command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          staging.Handle(), 1, &copy);
+		vk::BufferMemoryBarrier staged {};
+		staged.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		staged.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+		staged.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		staged.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		staged.buffer              = staging.Handle();
+		staged.offset              = 0;
+		staged.size                = bytes;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &staged, 0,
+		                        nullptr);
+		command.copyBufferToImage(staging.Handle(), destination.backing.image,
+		                          vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+		return true;
+	}
 	std::array<vk::ImageCopy, 2> regions {};
 	uint32_t                   count = 0;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {

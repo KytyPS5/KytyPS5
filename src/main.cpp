@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -64,6 +65,10 @@ static void PrintUsage() {
 	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	::printf("  --video-out-resolution <value>       Title, FullHd, or Uhd: the output resolution the\n"
+	         "                                       console reports to games, which render at it.\n"
+	         "                                       Default: Title (4K unless the title may detect\n"
+	         "                                       a smaller output).\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
@@ -78,25 +83,49 @@ static void PrintUsage() {
 	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --gpu-frames-in-flight <1-3>         Guest frames recorded ahead of the host GPU. "
+	         "Default: 2.\n");
+	::printf("  --gpu-guest-memory-import <0|1>      The GPU uses guest memory in place where the "
+	         "host can import it. Default: 1.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
 	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");
+	::printf("  --no-emulate-ea                      Do not answer a game of EA with the built-in EA server.\n");
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
+	::printf("  --pipeline-wait                      Wait for every graphics pipeline to be built;\n"
+	         "                                       by default a draw is left out while it builds.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
+	::printf("  --pipeline-cache-folder <path>       Pipeline and program lists of each game.\n"
+	         "                                       Default: the user's cache folder.\n");
+	::printf(
+	    "  --bench-script <path>                Replay key presses at given frames and log the\n"
+	    "                                       frame rate each second, for measured runs.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
+	::printf("  --gpu-debug-labels                   Name GPU objects and label GPU work for "
+	         "captures.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
+	::printf("  --perf-counters                      Print what a frame costs (faults, draws, "
+	         "passes) every 30 frames.\n");
+	::printf(
+	    "  --trace-dir <path>                   Write frame times, hotspots, errors, hangs and\n"
+	    "                                       screenshots of a measured run to a folder.\n");
+	::printf("  --trace-screenshot-seconds <num>     Seconds between trace screenshots; 0: none.\n"
+	         "                                       Default: 10.\n");
+	::printf(
+	    "  --trace-hang-seconds <num>           Seconds without a frame before a trace reports\n"
+	    "                                       a hang. Default: 30.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
@@ -211,15 +240,19 @@ static constexpr Flag FLAGS[] = {
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
+    {"--no-emulate-ea", &ConfigOptions::ea_emulation_enabled, false},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
+    {"--pipeline-wait", &ConfigOptions::pipeline_wait_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
+    {"--gpu-debug-labels", &ConfigOptions::gpu_debug_labels_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
+    {"--perf-counters", &ConfigOptions::perf_counters_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
@@ -385,6 +418,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid gpu index: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-guest-memory-import") {
+			if (value != "0" && value != "1") {
+				::printf("invalid guest memory import: %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_guest_memory_import = value == "1";
+		} else if (arg == "--gpu-frames-in-flight") {
+			if (!ParseUint32(value, options.config.gpu_frames_in_flight) ||
+			    options.config.gpu_frames_in_flight < 1 ||
+			    options.config.gpu_frames_in_flight > Config::MAX_GPU_FRAMES_IN_FLIGHT) {
+				::printf("invalid GPU frames in flight: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
@@ -400,6 +446,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--video-out-resolution") {
+			if (!ParseEnum(value, options.config.video_out_resolution)) {
+				::printf("invalid video out resolution: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--shader-optimization-type") {
 			if (!ParseEnum(value, options.config.shader_optimization_type)) {
 				::printf("invalid shader optimization type: %s\n", value.c_str());
@@ -408,6 +459,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--shader-log-direction") {
 			if (!ParseEnum(value, options.config.shader_log_direction)) {
 				::printf("invalid shader log direction: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--pipeline-cache-folder") {
+			options.config.pipeline_cache_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--bench-script") {
+			options.config.bench_script = Common::PathFromUtf8(value);
+		} else if (arg == "--trace-dir") {
+			options.config.trace_dir = Common::PathFromUtf8(value);
+		} else if (arg == "--trace-screenshot-seconds") {
+			if (!ParseUint32(value, options.config.trace_screenshot_seconds)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trace-hang-seconds") {
+			if (!ParseUint32(value, options.config.trace_hang_seconds)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-log-folder") {
@@ -442,6 +509,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+	Libs::Graphics::PrepareVulkanDriverEnvironment();
 	VirtualMemory::Init();
 	InitializeThreads();
 

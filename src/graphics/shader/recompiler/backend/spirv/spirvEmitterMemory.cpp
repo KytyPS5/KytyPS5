@@ -167,9 +167,6 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
-// Coherent (GLC) loads may read what other invocations store concurrently, such as a value another
-// workgroup publishes while this one polls it. A non-atomic load of such a value is a data race,
-// and a compiler may move it out of the polling loop.
 void EmitCoherentLoad(EmitterState& state, uint32_t value, uint32_t pointer) {
 	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
 	                          ConstantU32(state, spv::ScopeDevice),

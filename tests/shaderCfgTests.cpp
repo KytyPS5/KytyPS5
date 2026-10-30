@@ -2231,6 +2231,103 @@ void TestCallTableExpansionLongBranches() {
     Check(returns == expander.Bodies().size(), "a body does not return to the caller");
   }
 }
+
+void TestInlinedCallTargetsBecomeFunctions() {
+  // A call through a 3-row table whose targets loop, branch, update v1 and store it, as the
+  // caller does. Each inlined target becomes a DontInline SPIR-V function (Wolverine's
+  // CS 0xe6d76d24f59f8015 inlines 20 hit groups, too much for one function in the NVIDIA
+  // compiler), and the program still validates.
+  using namespace ShaderRecompiler;
+  constexpr uint32_t Targets = 3;
+  // The resource walker reads the call table directly: keep it, and the targets, in host memory.
+  static std::array<uint32_t, Targets * 2u> table{};
+  static std::array<uint32_t, Targets * 1024u> functions{};
+  const auto TableAddress = reinterpret_cast<uint64_t>(table.data());
+  const auto FunctionBase = reinterpret_cast<uint64_t>(functions.data());
+  const uint32_t shader[] = {
+      EncodeSop2(0x1e, 8, 8, 131),               // s_lshl_b32 s8, s8, 3
+      0xf4240000u | (22u << 6u) | (16u >> 1u),   // s_buffer_load_dwordx2 s[22:23], s[16:19], s8
+      8u << 25u,
+      0xbf8cc07fu,                               // s_waitcnt lgkmcnt(0)
+      EncodeVop1(0x01, 1, 256),                  // v_mov_b32 v1, v0
+      EncodeSop1(0x21, 20, 22),                  // s_swappc_b64 s[20:21], s[22:23]
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0), // buffer_store_dword v1
+      EncodeSopp(0x01),                          // s_endpgm
+  };
+  const auto function = [](uint32_t k) {
+    return std::array<uint32_t, 10>{
+        EncodeVop2(0x25, 1, 129 + k, 1), // L: v_add_nc_u32 v1, k + 1, v1
+        EncodeSop2(0x01, 10, 10, 129),   // s_sub_u32 s10, s10, 1
+        EncodeSopc(0x07, 10, 128),       // s_cmp_lg_u32 s10, 0
+        EncodeSopp(0x05, 0xfffcu),       // s_cbranch_scc1 L
+        EncodeSopc(0x06, 9, 128),        // s_cmp_eq_u32 s9, 0
+        EncodeSopp(0x05, 1),             // s_cbranch_scc1 +1
+        EncodeVop2(0x1d, 1, 257, 0),     // v_xor_b32 v1, v1, v0
+        EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(1, 0, 0), // buffer_store_dword v1, off offset:4
+        EncodeSop1(0x20, 0, 20),         // s_setpc_b64 s[20:21]
+    };
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 32;
+  std::array<uint32_t, 64> user_data{};
+  std::copy(options.user_data.begin(), options.user_data.end(), user_data.begin());
+  user_data[16] = static_cast<uint32_t>(TableAddress);
+  user_data[17] = static_cast<uint32_t>(TableAddress >> 32u);
+  user_data[18] = Targets * 8u;
+  user_data[19] = 0;
+  options.user_data = user_data;
+  functions.fill(0xbf800000u); // s_nop
+  for (uint32_t k = 0; k < Targets; ++k) {
+    const auto code = function(k);
+    std::copy(code.begin(), code.end(), functions.begin() + k * 1024u);
+    const uint64_t target = FunctionBase + k * 4096u;
+    table[k * 2u] = static_cast<uint32_t>(target);
+    table[k * 2u + 1u] = static_cast<uint32_t>(target >> 32u);
+  }
+  const auto read = [&](uint64_t address, std::span<uint32_t> words) {
+    const bool in_table = address >= TableAddress && address + words.size_bytes() <= TableAddress + sizeof(table);
+    const bool in_code = address >= FunctionBase && address + words.size_bytes() <= FunctionBase + sizeof(functions);
+    return (in_table || in_code) && ReadHostTestMemory(nullptr, address, words);
+  };
+  Decoder::ShaderFunctionExpander expander;
+  std::vector<uint32_t> expanded;
+  std::string reason;
+  Check(expander.Expand(shader, 0x300000000ull, user_data, read, expanded, reason, 32u),
+        ("the call table did not expand: " + reason).c_str());
+  std::vector<uint32_t> linked(std::begin(shader), std::end(shader));
+  linked.insert(linked.end(), expanded.begin(), expanded.end());
+  const auto expanded_code = std::span<const uint32_t>(linked).subspan(std::size(shader));
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(expanded_code, decoded, expander.LongBranches());
+  decoded.call_bodies = expander.Bodies();
+  auto translated = TranslateProgram(decoded, options);
+  Check(translated.program.inlined_call_entries.size() == Targets,
+        "the translated program lost its inlined call targets");
+  auto plan = IR::ExtractResourcePlan(translated.program);
+  IR::ResourceSnapshot resources;
+  IR::ResourceSpecialization specialization;
+  const IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(shader),
+      .read_specialization_memory = ReadHostTestMemory,
+  };
+  Check(IR::MaterializeResources(plan, runtime, resources, specialization),
+        "the expanded program's resources did not materialize");
+  const auto compiled = CompileProgram(std::move(translated), options, specialization, 0);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  uint32_t dont_inline = 0, calls = 0, switches = 0;
+  for (size_t at = 5; at < compiled.spirv.size();) {
+    const auto words = compiled.spirv[at] >> 16u;
+    const auto opcode = compiled.spirv[at] & 0xffffu;
+    if (opcode == 54u && (compiled.spirv[at + 3] & 2u) != 0u) ++dont_inline; // OpFunction DontInline
+    if (opcode == 57u) ++calls;                                          // OpFunctionCall
+    if (opcode == 251u) ++switches;                                      // OpSwitch
+    at += words == 0u ? 1u : words;
+  }
+  Check(dont_inline == Targets, "the inlined call targets did not become DontInline functions");
+  Check(calls >= Targets, "main does not call the outlined call targets");
+  Check(switches == 1u, "the levels of the call table did not become one switch");
+}
 void TestReadLaneOfSkippedLaneSpill() {
   // v1 only holds a spilled SGPR. On the path that skips the spill its lane 3 is undefined, so
   // the lane read after the join is the spilled s2 (Wolverine's CS 0xe6d76d24f59f8015 reads a V#
@@ -13961,6 +14058,7 @@ int main() {
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
   TestReadLaneOfSkippedLaneSpill();
   TestCallTableExpansionLongBranches();
+  TestInlinedCallTargetsBecomeFunctions();
 
   return 0;
 }

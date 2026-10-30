@@ -13602,6 +13602,122 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckCallTableExpansion() {
+    // A call through a 3-row table in GPU memory: the expansion inlines the targets and the
+    // emitter gives each its own SPIR-V function (Wolverine's ray-tracing compute
+    // 0xe6d76d24f59f8015 calls 20 hit groups this way). Each target loops, branches and
+    // updates v1, which the caller stores per lane.
+    constexpr const char* name = "CallTableExpansion";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto functions = base + 0x1000;
+    constexpr auto output = base + 0x8000;
+    constexpr u32 Targets = 3;
+    // The row passes through V_READFIRSTLANE, which the call queries do not evaluate: the
+    // targets are expanded, as Wolverine's are.
+    std::vector<u32> code{
+        EncodeVop1(0x01, 2, 8),                         // v_mov_b32 v2, s8
+        EncodeVop1(0x02, 8, 258),                       // v_readfirstlane_b32 s8, v2
+        EncodeSop2(0x1e, 8, 8, InlineU32(3)),           // s_lshl_b32 s8, s8, 3
+        EncodeSmem0(0x09, 20, 8), EncodeSmem1(0, 8),    // s_buffer_load_dwordx2 s[20:21], s[16:19], s8
+        EncodeSopp(0x0c, 0),                            // s_waitcnt 0
+        EncodeVop1(0x01, 1, InlineU32(5)),              // v_mov_b32 v1, 5
+        EncodeSop1(0x21, 20, 20),                       // s_swappc_b64 s[20:21], s[20:21]
+        EncodeMubuf0(0x1c, 0, true, false), EncodeMubuf1(1, 0, 0)}; // buffer_store_dword v1, v0 idxen
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "call table fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "call table fixture mapping failed");
+    std::memset(mapped, 0, size);
+    for (u32 k = 0; k < Targets; ++k) {
+      const std::array<u32, 8> target{
+          EncodeVop2(0x25, 1, InlineU32(k + 1), 1),     // L: v_add_nc_u32 v1, k + 1, v1
+          EncodeSop2(0x01, 10, 10, InlineU32(1)),       // s_sub_u32 s10, s10, 1
+          EncodeSopc(0x07, 10, InlineU32(0)),           // s_cmp_lg_u32 s10, 0
+          EncodeSopp(0x05, 0xfffcu),                    // s_cbranch_scc1 L
+          EncodeSopc(0x06, 9, InlineU32(0)),            // s_cmp_eq_u32 s9, 0
+          EncodeSopp(0x05, 1),                          // s_cbranch_scc1 +1
+          EncodeVop2(0x1d, 1, 256, 1),                  // v_xor_b32 v1, v0, v1
+          EncodeSop1(0x20, 0, 20)};                     // s_setpc_b64 s[20:21]
+      const uint64_t address = functions + k * 0x1000u;
+      LibKernel::Memory::WriteBacking(address, target.data(), sizeof(target));
+      const std::array<u32, 2> row{static_cast<u32>(address), static_cast<u32>(address >> 32u)};
+      LibKernel::Memory::WriteBacking(table + k * 8u, row.data(), sizeof(row));
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& cache = context.GetBufferCache();
+      auto& shaders = processor.GetShCtx();
+      for (const u32 wave_size : {32u, 64u}) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = wave_size, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = static_cast<uint8_t>(wave_size), .user_sgpr = 20});
+        for (const u32 row : {2u, 0u, 1u}) {
+          for (const u32 xor_lane : {0u, 1u}) {
+            ShaderBufferResource out{};
+            out.UpdateAddress48(output);
+            out.fields[1] |= 4u << 16u;
+            out.fields[2] = wave_size;
+            out.fields[3] = DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+            std::array<u32, 20> user_data{};
+            std::copy_n(out.fields, 4, user_data.begin());
+            user_data[8] = row;
+            user_data[9] = xor_lane;
+            user_data[10] = 3;
+            const ShaderBufferResource table_desc{{static_cast<u32>(table),
+                static_cast<u32>(table >> 32u), Targets * 8u, 0x5204u}};
+            std::copy_n(table_desc.fields, 4, user_data.begin() + 16);
+            for (u32 i = 0; i < user_data.size(); ++i)
+              shaders.SetCsUserSgpr(i, user_data[i]);
+            Require(name, "reset output", context.InvalidateMemory(output, wave_size * 4),
+                    "call table output escaped mapped memory");
+            std::array<u32, 64> actual{};
+            LibKernel::Memory::WriteBacking(output, actual.data(), wave_size * 4);
+            ShaderComputeInputInfo input{};
+            const auto program = context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+            Require(name, "program", program != nullptr, "the call table program did not compile");
+            processor.DispatchDirect(1, 1, 1, 0x41u |
+                (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+            cache.ReadMemory(output, wave_size * 4);
+            Require(name, "read output", LibKernel::Memory::TryReadBacking(
+                output, actual.data(), wave_size * 4), "call table output was not readable");
+            for (u32 lane = 0; lane < wave_size; ++lane) {
+              const u32 expected = (5u + 3u * (row + 1u)) ^ (xor_lane != 0u ? lane : 0u);
+              Require(name, "outlined call target result", actual[lane] == expected,
+                      "wave" + std::to_string(wave_size) + " row" + std::to_string(row) +
+                          " xor" + std::to_string(xor_lane) + " lane" + std::to_string(lane) +
+                          " actual=" + std::to_string(actual[lane]) + " expected=" + std::to_string(expected));
+            }
+          }
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "call table fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckZeroStrideBufferBinding() {
     constexpr const char *name = "ZeroStrideBufferBinding";
     constexpr uintptr_t base = 0x0000000204c00000ull;
@@ -58523,6 +58639,11 @@ int main(int argc, char **argv) {
     vulkan.CheckScalarLeafCall();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--call-table-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckCallTableExpansion();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
     return 0;
@@ -59192,6 +59313,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  vulkan.CheckCallTableExpansion();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

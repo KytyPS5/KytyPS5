@@ -133,6 +133,9 @@ struct EmitterState {
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// Per-invocation memory (scratch and function-local LDS) lives in Function variables of
+	// main unless the program has outlined functions, which need it as Private.
+	spv::StorageClass                                scratch_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
@@ -209,6 +212,16 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 }
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
+
+// Function control of the shared memory helpers (BDA pointer, runtime-V# buffer loads, format
+// conversion). Programs of inlined call targets call them from hundreds of sites, and the NVIDIA
+// compiler inlining each copy ran out of time and memory: Wolverine's 0xe6d76d24f59f8015 did
+// not compile in 10 minutes and 25 GB with them inlined, and takes 166 s and 5.5 GB with one
+// copy of each. Other programs keep inlining them.
+inline spv::FunctionControlMask SharedHelperControl(const EmitterState& state) {
+	return state.program.inlined_call_entries.empty() ? spv::FunctionControlMaskNone
+	                                                  : spv::FunctionControlDontInlineMask;
+}
 
 // Shared instruction construction; typed aliases add no forwarding functions.
 template <spv::Op opcode, IR::Type type, typename... Args>

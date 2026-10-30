@@ -376,7 +376,7 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch
-		                               ? spv::StorageClassFunction : state.lds_storage_class;
+		                               ? state.scratch_storage_class : state.lds_storage_class;
 		if (storage_class == spv::StorageClassStorageBuffer) {
 			return EmitStorageBufferElementPointer(
 			    state, access, EmitAddU32(state, state.lds_base_dwords, index),

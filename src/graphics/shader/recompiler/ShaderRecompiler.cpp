@@ -586,6 +586,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
 	     options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	for (const auto& body: decoded.call_bodies)
+		ir.inlined_call_entries.push_back(body.begin);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,

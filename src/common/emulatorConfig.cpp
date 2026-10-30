@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string_view>
 
 namespace Config {
@@ -327,6 +328,11 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	if (high_priority) {
 		Common::Thread::RaiseCurrentPriority();
 	}
+	// Guest threads that spin while they wait for work (Demon's Souls keeps ~12 job workers at
+	// ~95% of a core each) otherwise run on the SMT siblings of the pinned stages and slow them
+	// down: give the stages whole physical cores.
+	static std::once_flag reserved;
+	std::call_once(reserved, [] { Common::Thread::ReserveCores(cpus); });
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
 }
 

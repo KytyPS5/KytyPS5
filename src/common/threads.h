@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 
+#include <span>
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <condition_variable>
 #include <mutex>
@@ -26,6 +28,12 @@ int GetThreadIdUnique();
 // processor (when `logical_cpu` is not negative). No-ops where unsupported.
 void RaiseCurrentPriority();
 void PinCurrent(int logical_cpu);
+
+// Keeps the threads of the process that pick no processors themselves off the physical cores
+// of `logical_cpus` (and their SMT siblings), for threads pinned there, when at least six
+// other physical cores remain: those running now and those that start later get a hard
+// affinity to the other processors.
+void ReserveCores(std::span<const int> logical_cpus);
 
 } // namespace Thread
 

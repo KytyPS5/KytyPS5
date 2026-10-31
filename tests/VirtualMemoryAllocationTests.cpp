@@ -329,9 +329,109 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+// Frame-pointer functions can address red-zone slots through RBP (Tetris Effect Connected
+// spills a pointer to [rbp-0x38] below RSP and reloads it after a faulting store).
+void TestWindowsGuestFramePointerRedZoneStaticPatcher() {
+	const char* test = "WindowsGuestFramePointerRedZoneStaticPatcher";
+	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
+	constexpr uint64_t CODE_SIZE = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000902000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "frame_red_zone_patcher_test");
+	Check(test, mapping != 0, "failed to allocate patch test code");
+
+	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*, const uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
+	const uint64_t readable = 0;
+	const auto run_fault = [&] {
+		DWORD old_protection = 0;
+		Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return function(static_cast<const uint64_t*>(g_red_zone_fault_page), &readable) == 1;
+	};
+	enum class Epilogue { Pop, LeaRsp, MovRsp, Leave };
+	bool reproduced = true;
+	bool covered = true;
+	bool preserved = true;
+	for (const auto epilogue: {Epilogue::Pop, Epilogue::LeaRsp, Epilogue::MovRsp, Epilogue::Leave}) {
+		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.push(code.rbx); // RSP = RBP - 8, so [rbp-0x20] is [rsp-0x18].
+		// Non-stack access before the slot is live; resolved epilogues keep it unprotected.
+		code.mov(code.rdx, code.ptr[code.rsi]);
+		code.mov(code.rax, SENTINEL);
+		code.mov(code.qword[code.rbp - 0x20], code.rax);
+		code.mov(code.rax, code.ptr[code.rdi]); // Faultable three-byte instruction.
+		code.mov(code.rax, code.qword[code.rbp - 0x20]);
+		code.mov(code.rcx, SENTINEL);
+		code.cmp(code.rax, code.rcx);
+		code.sete(code.al);
+		code.movzx(code.eax, code.al);
+		switch (epilogue) {
+			case Epilogue::Pop:
+				code.pop(code.rbx);
+				code.pop(code.rbp);
+				break;
+			case Epilogue::LeaRsp:
+				code.lea(code.rsp, code.ptr[code.rbp - 8]);
+				code.pop(code.rbx);
+				code.pop(code.rbp);
+				break;
+			case Epilogue::MovRsp:
+				code.mov(code.rsp, code.rbp);
+				code.pop(code.rbp);
+				break;
+			case Epilogue::Leave: code.leave(); break;
+		}
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate frame red-zone patch fixture");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated test code");
+		reproduced &= !run_fault();
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+		    TRAMPOLINE_SIZE);
+		const auto result = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, true, false);
+		const bool intact = run_fault();
+		covered &= result.red_zone_function_count == 1 && result.memory_instruction_count == 1 &&
+		           result.patched_memory_instruction_count == 1 &&
+		           result.unrelocatable_memory_instruction_count == 0;
+		preserved &= intact;
+		std::printf("[host]    frame red-zone epilogue=%d memory=%llu patched=%llu preserved=%d\n",
+		            static_cast<int>(epilogue),
+		            static_cast<unsigned long long>(result.memory_instruction_count),
+		            static_cast<unsigned long long>(result.patched_memory_instruction_count), intact);
+	}
+
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
+	g_red_zone_fault_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, reproduced, "test harness did not reproduce frame red-zone corruption");
+	Check(test, covered, "static patcher did not cover the faultable instruction");
+	Check(test, preserved, "patched fault still corrupted the frame-pointer red zone");
+	Check(test, freed, "failed to free patch test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
+}
+
+void TestWindowsGuestFramePointerRedZoneStaticPatcher() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestFramePointerRedZoneStaticPatcher");
 }
 #endif
 
@@ -5805,6 +5905,7 @@ int main(int argc, char** argv) {
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
+		RunTest(TestWindowsGuestFramePointerRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
@@ -5820,6 +5921,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
+	RunTest(TestWindowsGuestFramePointerRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);

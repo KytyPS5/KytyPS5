@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -48,6 +49,14 @@ void RenderContext::ShutdownGpu() {
 GuestGpu& RenderContext::GetGpu() const {
 	EXIT_IF(m_gpu == nullptr);
 	return *m_gpu;
+}
+
+void RenderContext::RunGpuCommandSync(Common::UniqueFunction<void>&& command) {
+	if (m_gpu == nullptr) {
+		command();
+	} else {
+		m_gpu->SendCommandSync(std::move(command));
+	}
 }
 
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
@@ -121,11 +130,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
-	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+	if (m_gpu != nullptr && m_gpu->IsStopping()) {
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	RunGpuCommandSync(unmap);
 }
 
 void RenderContext::PrepareBda() {

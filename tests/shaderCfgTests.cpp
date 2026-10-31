@@ -3937,6 +3937,31 @@ void TestStorageSwizzleOfAbsentChannelsKeepsProgram() {
   Check(four_channels.spirv == two_channels.spirv,
         "a swizzle of channels the storage format lacks changed the program");
 }
+void TestUnboundScalarBufferKeepsProgram() {
+  // A constant buffer the shader reads only by scalar loads: an unbound (all-zero) V# reads
+  // zero from the null buffer, so it gives the program of a bound one with a stride.
+  const uint32_t shader[] = {
+      EncodeSmem0(0x08, 12, 4),
+      0u, // s_buffer_load_dword s12, s[8:11], 0
+      EncodeVop1(0x01, 0, 12),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> bound{};
+  bound[8] = 0x2000u;
+  bound[9] = 16u << 16u;
+  bound[10] = 4u;
+  const std::array<uint32_t, 12> unbound{};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data = bound;
+  const auto with_buffer = RecompileForTest(shader, options);
+  options.user_data = unbound;
+  const auto without_buffer = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(without_buffer.spirv);
+  Check(with_buffer.spirv == without_buffer.spirv,
+        "an unbound scalar-only buffer changed the program");
+}
 void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   constexpr uint32_t OpImageSampleImplicitLod = 87;
   constexpr uint32_t OpImageSampleExplicitLod = 88;
@@ -14219,6 +14244,7 @@ int main() {
   TestInlinedCallTargetsBecomeFunctions();
   TestNullImageKeepsShaderDimension();
   TestStorageSwizzleOfAbsentChannelsKeepsProgram();
+  TestUnboundScalarBufferKeepsProgram();
 
   return 0;
 }

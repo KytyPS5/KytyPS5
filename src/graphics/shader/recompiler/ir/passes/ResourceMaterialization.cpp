@@ -1890,6 +1890,52 @@ static bool DerivePlanState(ResourcePlan& plan) {
 	return true;
 }
 
+// Which parts of a buffer's specialization can change the program (see the use in
+// BuildResourceSpecialization).
+static void FindBufferSpecializationUses(const Program& program, ResourcePlan& plan) {
+	const auto& buffers = program.info.buffers;
+	plan.buffer_vector_access.assign(buffers.size(), 0u);
+	plan.buffer_feeds_descriptors.assign(buffers.size(), 0u);
+	for (uint32_t index = 0; index < buffers.size(); ++index) {
+		if (buffers[index].indirect_root != BufferResource::NoIndirectBuffer ||
+		    !buffers[index].indirect_resources.empty()) {
+			plan.buffer_vector_access[index] = plan.buffer_feeds_descriptors[index] = 1u;
+		}
+	}
+	for (const auto& memory: program.memory_info) {
+		if (!memory.planning_only && memory.resource < buffers.size() &&
+		    (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::IndirectBuffer)) {
+			plan.buffer_vector_access[memory.resource] = 1u;
+		}
+	}
+	std::unordered_set<const Inst*> visited;
+	std::vector<const Inst*>        pending;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			if (opcode == ValueOpcode::GetBufferResource || opcode == ValueOpcode::GetImageResource ||
+			    opcode == ValueOpcode::GetSamplerResource) {
+				pending.push_back(&inst);
+			}
+		}
+	}
+	while (!pending.empty()) {
+		const auto* inst = pending.back();
+		pending.pop_back();
+		if (!visited.insert(inst).second) continue;
+		if (inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+			const auto& memory = program.memory_info.at(inst->Flags<MemoryFlags>().index);
+			if (memory.kind == ResourceKind::ScalarBuffer && !memory.planning_only &&
+			    memory.resource < buffers.size()) {
+				plan.buffer_feeds_descriptors[memory.resource] = 1u;
+			}
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+			if (const auto* source = inst->Arg(arg).Resolve().TryInstruction()) pending.push_back(source);
+		}
+	}
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1901,6 +1947,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
+	FindBufferSpecializationUses(program, plan);
 
 	std::unordered_map<const Inst*, Inst*> cloned;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
@@ -2195,6 +2242,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		// Only vector accesses use the stride and bounds mode, and an empty buffer binds the
+		// zeroed null buffer, so its scalar reads give the zero that scalar_empty folds in; the
+		// fold matters only where those reads build descriptors. Leaving out what the program
+		// does not use keeps one program when a buffer the shader only reads by scalar loads is
+		// unbound in some dispatches (Wolverine's ray tracing shader).
+		if (i < program.buffer_vector_access.size() && !program.buffer_vector_access[i]) {
+			buffer.packed_stride   = 0u;
+			buffer.zero_stride_oob = false;
+		}
+		if (i < program.buffer_feeds_descriptors.size() && !program.buffer_feeds_descriptors[i]) {
+			buffer.scalar_empty = false;
+		}
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -2661,13 +2720,15 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 template <class S, class P> void IoPlan(S& io, P& plan) {
 	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
-	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
+	       srt_plan_complete, resource_tracking_complete, info, buffer_vector_access,
+	       buffer_feeds_descriptors, uniform_fill,
 	       // Derived on load.
 	       descriptor_refresh, descriptor_word_flat, srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,
-	      srt_plan_complete, resource_tracking_complete, info, uniform_fill);
+	      srt_plan_complete, resource_tracking_complete, info, buffer_vector_access,
+	      buffer_feeds_descriptors, uniform_fill);
 }
 
 } // namespace

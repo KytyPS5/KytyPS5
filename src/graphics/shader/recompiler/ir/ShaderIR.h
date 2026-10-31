@@ -854,6 +854,11 @@ struct ResourcePlan {
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
+	// Per buffer, from the whole program: whether it has vector (non-scalar) accesses, which use
+	// its stride and bounds mode, and whether its scalar reads feed descriptors. Empty means
+	// unknown (both true). See BuildResourceSpecialization.
+	std::vector<uint8_t>                buffer_vector_access;
+	std::vector<uint8_t>                buffer_feeds_descriptors;
 	UniformFillPlan                     uniform_fill;
 	// By descriptor source: whether it is the descriptor of direct buffers or images only, whose
 	// words have bits the execution thread may refresh (see DescriptorRefreshMask()).

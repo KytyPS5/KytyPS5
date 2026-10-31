@@ -129,6 +129,7 @@ void GuestGpu::Submit(std::span<const uint32_t> commands) {
 	submission.queue_id = 0;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	WaitForIdle();
 }
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {

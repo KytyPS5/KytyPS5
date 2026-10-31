@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -372,15 +373,15 @@ struct PthreadMutexPrivate {
 		Waiter*                 previous = nullptr;
 		Waiter*                 next     = nullptr;
 	};
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	Pthread                 owner     = nullptr;
-	uint32_t                count     = 0;
-	int                     type      = 1;
-	int                     pprotocol = PTHREAD_PRIO_NONE;
-	Waiter*                 first_waiter = nullptr;
-	Waiter*                 last_waiter  = nullptr;
+	uint8_t     reserved[256];
+	std::string name;
+	std::mutex  m;
+	Pthread     owner        = nullptr;
+	uint32_t    count        = 0;
+	int         type         = 1;
+	int         pprotocol    = PTHREAD_PRIO_NONE;
+	Waiter*     first_waiter = nullptr;
+	Waiter*     last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -415,23 +416,23 @@ struct PthreadGuestData {
 static_assert(sizeof(PthreadGuestData) == 4096);
 
 struct PthreadPrivate {
-	PthreadGuestData      guest;
-	std::string           name;
-	pthread_t             p;
-	PthreadAttr           attr;
-	pthread_entry_func_t  entry;
-	void*                 arg;
-	int                   unique_id;
-	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free;
-	uint64_t              host_thread_id;
-	uintptr_t             guest_host_rbx;
-	uintptr_t             guest_host_rsp;
-	uintptr_t             guest_host_rbp;
-	uint64_t              cond_sequence = 0;
+	PthreadGuestData        guest;
+	std::string             name;
+	pthread_t               p;
+	PthreadAttr             attr;
+	pthread_entry_func_t    entry;
+	void*                   arg;
+	int                     unique_id;
+	std::atomic_bool        detached;
+	std::atomic_bool        almost_done;
+	std::atomic_bool        free;
+	uint64_t                host_thread_id;
+	uintptr_t               guest_host_rbx;
+	uintptr_t               guest_host_rsp;
+	uintptr_t               guest_host_rbp;
+	uint64_t                cond_sequence = 0;
 	std::condition_variable cond_cv;
-	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic<uint64_t>   pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -482,11 +483,11 @@ struct PthreadCondattrPrivate {
 };
 
 struct PthreadCondPrivate {
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
-	std::vector<Pthread>    waiters;
+	uint8_t              reserved[256];
+	std::string          name;
+	std::mutex           m;
+	KernelClockid        clock_id = KERNEL_CLOCK_REALTIME;
+	std::vector<Pthread> waiters;
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -1017,11 +1018,187 @@ static void FreeDetachedThreads(void* /*arg*/) {
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct RegisteredUnwindTable {
+	uint64_t        base_address = 0;
+	uint64_t        size         = 0;
+	void*           table_memory = nullptr;
+	UnwindFrameType frame_type   = UnwindFrameType::RbpFrame;
+};
+
+static std::mutex                                g_unwind_tables_mutex;
+static std::map<uint64_t, RegisteredUnwindTable> g_registered_unwind_tables;
+
+static void* AllocateTableNear(uint64_t base_address, uint64_t code_size, size_t alloc_size) {
+	constexpr uint64_t GRANULARITY = 64 * 1024;
+	constexpr uint64_t MAX_WINDOW  = 1024ULL * 1024 * 1024; // 1 GB search range
+
+	// Probe after code range first
+	uint64_t aligned_code_size = ((code_size + GRANULARITY - 1) / GRANULARITY) * GRANULARITY;
+	for (uint64_t offset = aligned_code_size; offset < aligned_code_size + MAX_WINDOW;
+	     offset += GRANULARITY) {
+		uint64_t target = base_address + offset;
+		void*    ptr    = VirtualAlloc(reinterpret_cast<void*>(target), alloc_size,
+		                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		if (ptr != nullptr) {
+			return ptr;
+		}
+	}
+
+	// Probe before code range
+	for (uint64_t offset = GRANULARITY; offset < MAX_WINDOW; offset += GRANULARITY) {
+		if (base_address < offset) {
+			break;
+		}
+		uint64_t target = base_address - offset;
+		void*    ptr    = VirtualAlloc(reinterpret_cast<void*>(target), alloc_size,
+		                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		if (ptr != nullptr) {
+			return ptr;
+		}
+	}
+
+	// Fallback to any address
+	return VirtualAlloc(nullptr, alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+#endif
+
+bool PthreadRegisterFunctionTable(uint64_t base_address, uint64_t size,
+                                  UnwindFrameType frame_type) {
+	if (base_address == 0 || size == 0 || size > 0xFFFFFFFFULL) {
+		return false;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::lock_guard<std::mutex> lock(g_unwind_tables_mutex);
+	if (g_registered_unwind_tables.find(base_address) != g_registered_unwind_tables.end()) {
+		return true;
+	}
+
+	constexpr size_t ALLOC_SIZE = 4096;
+	void*            table_mem  = AllocateTableNear(base_address, size, ALLOC_SIZE);
+	if (table_mem == nullptr) {
+		return false;
+	}
+
+	std::memset(table_mem, 0, ALLOC_SIZE);
+
+	auto*    rf               = reinterpret_cast<RUNTIME_FUNCTION*>(table_mem);
+	uint64_t table_addr       = reinterpret_cast<uint64_t>(table_mem);
+	uint64_t unwind_info_addr = table_addr + 16;
+	uint64_t reg_base_addr    = 0;
+
+	if (table_addr >= base_address) {
+		uint64_t diff = table_addr - base_address;
+		if (diff + 16 > 0xFFFFFFFFULL) {
+			VirtualFree(table_mem, 0, MEM_RELEASE);
+			return false;
+		}
+		reg_base_addr    = base_address;
+		rf->BeginAddress = 0;
+		rf->EndAddress   = static_cast<DWORD>(size);
+		rf->UnwindData   = static_cast<DWORD>(unwind_info_addr - base_address);
+	} else {
+		uint64_t diff = base_address - table_addr;
+		if (diff + size > 0xFFFFFFFFULL) {
+			VirtualFree(table_mem, 0, MEM_RELEASE);
+			return false;
+		}
+		reg_base_addr    = table_addr;
+		rf->BeginAddress = static_cast<DWORD>(diff);
+		rf->EndAddress   = static_cast<DWORD>(diff + size);
+		rf->UnwindData   = static_cast<DWORD>(unwind_info_addr - table_addr);
+	}
+
+	auto* unwind_info = reinterpret_cast<uint8_t*>(table_mem) + 16;
+	if (frame_type == UnwindFrameType::RbpFrame) {
+		// Version 1, Flags 0
+		unwind_info[0] = 0x01;
+		// SizeOfProlog = 4
+		unwind_info[1] = 0x04;
+		// CountOfCodes = 2
+		unwind_info[2] = 0x02;
+		// FrameRegister = 5 (RBP), FrameOffset = 0
+		unwind_info[3] = 0x05;
+		// UNWIND_CODE 0: CodeOffset = 4, UWOP_SET_FPREG (3), OpInfo = 0
+		unwind_info[4] = 0x04;
+		unwind_info[5] = 0x03;
+		// UNWIND_CODE 1: CodeOffset = 1, UWOP_PUSH_NONVOL (0), OpInfo = 5 (RBP)
+		unwind_info[6] = 0x01;
+		unwind_info[7] = 0x50;
+	} else {
+		// Leaf or SP Frame:
+		// Version 1, Flags 0, SizeOfProlog = 0, CountOfCodes = 0, FrameRegister = 0
+		unwind_info[0] = 0x01;
+		unwind_info[1] = 0x00;
+		unwind_info[2] = 0x00;
+		unwind_info[3] = 0x00;
+	}
+
+	BOOLEAN ok = RtlAddFunctionTable(rf, 1, reg_base_addr);
+	if (!ok) {
+		VirtualFree(table_mem, 0, MEM_RELEASE);
+		return false;
+	}
+
+	RegisteredUnwindTable entry {};
+	entry.base_address = base_address;
+	entry.size         = size;
+	entry.table_memory = table_mem;
+	entry.frame_type   = frame_type;
+
+	g_registered_unwind_tables[base_address] = entry;
+	return true;
+#else
+	return true;
+#endif
+}
+
+bool PthreadUnregisterFunctionTable(uint64_t base_address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::lock_guard<std::mutex> lock(g_unwind_tables_mutex);
+	auto                        it = g_registered_unwind_tables.find(base_address);
+	if (it == g_registered_unwind_tables.end()) {
+		return false;
+	}
+
+	auto* rf = reinterpret_cast<PRUNTIME_FUNCTION>(it->second.table_memory);
+	RtlDeleteFunctionTable(rf);
+	VirtualFree(it->second.table_memory, 0, MEM_RELEASE);
+	g_registered_unwind_tables.erase(it);
+	return true;
+#else
+	return true;
+#endif
+}
+
+bool PthreadIsFunctionTableRegistered(uint64_t base_address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::lock_guard<std::mutex> lock(g_unwind_tables_mutex);
+	return g_registered_unwind_tables.find(base_address) != g_registered_unwind_tables.end();
+#else
+	return false;
+#endif
+}
+
+size_t PthreadGetRegisteredFunctionTableCount() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::lock_guard<std::mutex> lock(g_unwind_tables_mutex);
+	return g_registered_unwind_tables.size();
+#else
+	return 0;
+#endif
+}
+
 void PthreadDeleteStaticObjects(Loader::Program* program) {
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	pthread_static_objects->DeleteObjects(program);
+
+	if (program != nullptr && program->base_vaddr != 0) {
+		PthreadUnregisterFunctionTable(program->base_vaddr);
+	}
 }
 
 void PthreadInitSelfForMainThread() {
@@ -1272,8 +1449,8 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
-static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
-                                     PthreadMutexPrivate::Waiter* waiter) {
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate*         mutex,
+                                    PthreadMutexPrivate::Waiter* waiter) {
 	if (waiter->previous != nullptr) {
 		waiter->previous->next = waiter->next;
 	} else {
@@ -1325,12 +1502,11 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	} else {
 		mutex->first_waiter = &waiter;
 	}
-	mutex->last_waiter = &waiter;
-	const auto deadline = timeout_us != nullptr
-	                          ? std::chrono::steady_clock::now() +
-	                                std::chrono::microseconds(*timeout_us)
-	                          : std::chrono::steady_clock::time_point::max();
-	int result = OK;
+	mutex->last_waiter  = &waiter;
+	const auto deadline = timeout_us != nullptr ? std::chrono::steady_clock::now() +
+	                                                  std::chrono::microseconds(*timeout_us)
+	                                            : std::chrono::steady_clock::time_point::max();
+	int        result   = OK;
 	while (mutex->owner != self) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
@@ -1338,8 +1514,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			result = ETIMEDOUT;
 			break;
 		}
-		waiter.cv.wait_until(lock, std::min(deadline, now +
-		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		waiter.cv.wait_until(
+		    lock, std::min(deadline, now + std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		if (mutex->owner != self) {
 			lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();

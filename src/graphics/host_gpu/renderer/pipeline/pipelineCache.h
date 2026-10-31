@@ -397,9 +397,10 @@ private:
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// Null with `failed` set when the resources cannot be resolved now (see GetProgram()).
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         uint32_t push_data_cursor, bool& failed);
 	};
 
 	struct ProgramKey {

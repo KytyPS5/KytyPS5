@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -651,9 +652,12 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 uint32_t push_data_cursor) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+                                                 uint32_t push_data_cursor, bool& failed) {
+	failed = !ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                     specialization);
+	if (failed) {
+		return nullptr;
+	}
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -833,6 +837,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
 	};
+	// The resources of a draw or dispatch can fail to resolve, as the guest rewrites a
+	// descriptor table it reads (Demon's Souls: an image table read half rewritten has candidates
+	// of incompatible types): it is skipped, as the resolution ahead of execution is. [HACK] until
+	// the cause is fixed: the draw is not rendered.
+	bool       failed       = false;
+	const auto skip_failure = [&] {
+		Common::HackNotice::Report("draw or dispatch with unresolvable resources skipped",
+		                           "PipelineCache::GetProgram", params.hash, 0);
+		return nullptr;
+	};
 	bool source_changed = false;
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
@@ -843,10 +857,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (cached.call_source->refresh_failed) {
 				ExitCallExpansionFailure(params.hash, *cached.call_source);
 			}
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, failed);
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor);
+			module = cached.FindModule<false>(runtime, push_data_cursor, failed);
 		}
+		if (failed) return skip_failure();
 		if (module != nullptr) return bind(*module);
 	}
 	// A worker may be compiling this program: use it once it is there.
@@ -897,13 +912,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
-		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		if (!ShaderRecompiler::IR::MaterializeResources(program.resource_plan, runtime,
+		                                                program.resources, program.specialization)) {
+			return skip_failure();
+		}
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor, failed)) {
 			return bind(*module);
 		}
+		if (failed) return skip_failure();
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor));
@@ -1420,8 +1438,13 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		return true;
 	}
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
-		for (const auto& output: pixel_module.info.info.outputs) {
+		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		if (pixel_module == nullptr) {
+			// Skipped: the draw has no vertex program either.
+			vertex_info[0].stage = {};
+			return true;
+		}
+		for (const auto& output: pixel_module->info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
 				state.mrt_mask |= 1u << output.location;

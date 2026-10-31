@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuStall.h"
 
 #include <algorithm>
 #include <memory>
@@ -18,6 +19,8 @@ void Initialize() {
 
 void Shutdown() {
 	Common::DebugCounters::SetEnabled(false);
+	// A backstop that lets any audio thread still held go, so none waits through process exit.
+	Common::GpuStall::Configure(false);
 	g_config.reset();
 }
 
@@ -30,6 +33,8 @@ void Load(const ConfigOptions& cfg) {
 
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	// Pushed here rather than read by the audio code, so audio tests need no config.
+	Common::GpuStall::Configure(cfg.audio_compile_hold_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -215,6 +220,10 @@ bool TessellationEnabled() {
 
 bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
+}
+
+bool AudioCompileHoldEnabled() {
+	return g_config->audio_compile_hold_enabled;
 }
 
 bool TrophyEnabled() {

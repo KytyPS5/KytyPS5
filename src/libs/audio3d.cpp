@@ -1,6 +1,7 @@
 #include "libs/audio3d.h"
 
 #include "common/assert.h"
+#include "common/gpuStall.h"
 #include "common/threads.h"
 #include "kernel/semaphore.h"
 #include "libs/errno.h"
@@ -269,6 +270,9 @@ int KYTY_SYSV_ABI Audio3dPortAdvance(uint32_t port_id) {
 }
 
 int KYTY_SYSV_ABI Audio3dPortPush(uint32_t port_id, uint32_t blocking) {
+	// Waits out a long pipeline compile before anything else, like the other audio submit entry
+	// points, so a game pacing its scenes by this audio does not run ahead of its frozen frames.
+	Common::GpuStall::WaitWhileStalled();
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);

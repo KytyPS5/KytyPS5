@@ -6,6 +6,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -396,6 +397,13 @@ constexpr int SAVE_STATUS_FINISHED    = 3;
 constexpr int SAVE_RESULT_OK          = 0;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
 
+constexpr int SAVE_DATA_DIALOG_ERROR_NOT_INITIALIZED     = static_cast<int>(0x81360001u);
+constexpr int SAVE_DATA_DIALOG_ERROR_ALREADY_INITIALIZED = static_cast<int>(0x81360002u);
+constexpr int SAVE_DATA_DIALOG_ERROR_PARAM_INVALID       = static_cast<int>(0x81360003u);
+constexpr int SAVE_DATA_DIALOG_ERROR_INVALID_STATE       = static_cast<int>(0x81360005u);
+
+constexpr size_t MAX_PROGRESS_BAR_TARGETS = 4;
+
 struct SaveDataDialogParam {
 	uint8_t  base_param[48];
 	int32_t  size;
@@ -413,18 +421,28 @@ struct SaveDataDialogParam {
 	void*    wizard_param;
 	uint8_t  reserved[16];
 };
+static_assert(sizeof(SaveDataDialogParam) == 152);
 
 struct SaveDataDirName {
 	char data[32];
 };
+static_assert(sizeof(SaveDataDirName) == 32);
 
 struct SaveDataDialogItems {
 	int32_t                user_id;
-	int32_t                pad0;
+	uint32_t               pad0;
 	const void*            title_id;
 	const SaveDataDirName* dir_names;
 	uint32_t               dir_names_num;
+	uint32_t               pad1;
+	const void*            new_item;
+	int32_t                focus_pos;
+	uint32_t               pad2;
+	const SaveDataDirName* focus_dir_name;
+	int32_t                item_style;
+	uint8_t                reserved[36];
 };
+static_assert(sizeof(SaveDataDialogItems) == 96);
 
 struct SaveDataDialogResult {
 	int32_t  mode;
@@ -436,33 +454,46 @@ struct SaveDataDialogResult {
 	void*    user_data;
 	uint8_t  reserved[32];
 };
+static_assert(sizeof(SaveDataDialogResult) == 72);
 
-static std::atomic<int> g_save_status         = SAVE_STATUS_NONE;
-static bool             g_save_running_polled = false;
-static int              g_save_mode           = 0;
-static void*            g_save_user_data      = nullptr;
-static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+static std::mutex g_save_dialog_mutex;
+static int        g_save_status         = SAVE_STATUS_NONE;
+static bool       g_save_running_polled = false;
+static int        g_save_mode           = 0;
+static void*      g_save_user_data      = nullptr;
+static char       g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+static uint32_t   g_save_progress_bar[MAX_PROGRESS_BAR_TARGETS] {};
 
 int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
+
+	if (g_save_status != SAVE_STATUS_NONE) {
+		return SAVE_DATA_DIALOG_ERROR_ALREADY_INITIALIZED;
+	}
 
 	g_save_status         = SAVE_STATUS_INITIALIZED;
 	g_save_running_polled = false;
 	g_save_mode           = 0;
 	g_save_user_data      = nullptr;
 	g_save_dir_name[0]    = '\0';
+	for (auto& bar: g_save_progress_bar) {
+		bar = 0;
+	}
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
 	return g_save_status;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
 	// Some games require a RUNNING update before FINISHED.
 	if (g_save_status == SAVE_STATUS_RUNNING) {
@@ -477,17 +508,29 @@ int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 
 int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
-	if (result != nullptr) {
-		auto* r      = static_cast<SaveDataDialogResult*>(result);
-		r->mode      = g_save_mode;
-		r->result    = SAVE_RESULT_OK;
-		r->button_id = SAVE_BUTTON_ID_OK;
-		r->user_data = g_save_user_data;
-		if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
-			std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
-			              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
-		}
+	if (g_save_status == SAVE_STATUS_NONE) {
+		return SAVE_DATA_DIALOG_ERROR_NOT_INITIALIZED;
+	}
+	if (g_save_status != SAVE_STATUS_FINISHED) {
+		return SAVE_DATA_DIALOG_ERROR_INVALID_STATE;
+	}
+	if (result == nullptr) {
+		return SAVE_DATA_DIALOG_ERROR_PARAM_INVALID;
+	}
+
+	auto* r      = static_cast<SaveDataDialogResult*>(result);
+	r->mode      = g_save_mode;
+	r->result    = SAVE_RESULT_OK;
+	r->button_id = SAVE_BUTTON_ID_OK;
+	r->pad0      = 0;
+	r->param     = nullptr;
+	r->user_data = g_save_user_data;
+	std::memset(r->reserved, 0, sizeof(r->reserved));
+	if (r->dir_name != nullptr) {
+		auto* dir = static_cast<SaveDataDirName*>(r->dir_name);
+		std::snprintf(dir->data, sizeof(dir->data), "%s", g_save_dir_name);
 	}
 
 	return OK;
@@ -495,33 +538,61 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 
 int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
+
+	if (g_save_status == SAVE_STATUS_NONE) {
+		return SAVE_DATA_DIALOG_ERROR_NOT_INITIALIZED;
+	}
+	if (g_save_status != SAVE_STATUS_INITIALIZED && g_save_status != SAVE_STATUS_FINISHED) {
+		return SAVE_DATA_DIALOG_ERROR_INVALID_STATE;
+	}
+	if (param == nullptr) {
+		return SAVE_DATA_DIALOG_ERROR_PARAM_INVALID;
+	}
 
 	const auto* p = static_cast<const SaveDataDialogParam*>(param);
-	if (p != nullptr) {
-		g_save_mode        = p->mode;
-		g_save_user_data   = p->user_data;
-		g_save_dir_name[0] = '\0';
-		LOGF("\t size           = %d\n"
-		     "\t mode           = %d\n"
-		     "\t disp_type      = %d\n"
-		     "\t items          = 0x%016" PRIx64 "\n"
-		     "\t user_msg_param = 0x%016" PRIx64 "\n"
-		     "\t sys_msg_param  = 0x%016" PRIx64 "\n"
-		     "\t prog_bar_param = 0x%016" PRIx64 "\n"
-		     "\t user_data      = 0x%016" PRIx64 "\n",
-		     p->size, p->mode, p->disp_type, reinterpret_cast<uint64_t>(p->items),
-		     reinterpret_cast<uint64_t>(p->user_msg_param),
-		     reinterpret_cast<uint64_t>(p->sys_msg_param),
-		     reinterpret_cast<uint64_t>(p->prog_bar_param),
-		     reinterpret_cast<uint64_t>(p->user_data));
+	if (p->size < static_cast<int32_t>(sizeof(SaveDataDialogParam))) {
+		return SAVE_DATA_DIALOG_ERROR_PARAM_INVALID;
+	}
 
-		const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
-		if (items != nullptr && items->dir_names != nullptr) {
-			for (uint32_t i = 0; i < items->dir_names_num; i++) {
-				const auto* name = items->dir_names[i].data;
-				if (name[0] != '\0') {
-					std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s", name);
-					break;
+	g_save_mode        = p->mode;
+	g_save_user_data   = p->user_data;
+	g_save_dir_name[0] = '\0';
+	for (auto& bar: g_save_progress_bar) {
+		bar = 0;
+	}
+
+	LOGF("\t size           = %d\n"
+	     "\t mode           = %d\n"
+	     "\t disp_type      = %d\n"
+	     "\t items          = 0x%016" PRIx64 "\n"
+	     "\t user_msg_param = 0x%016" PRIx64 "\n"
+	     "\t sys_msg_param  = 0x%016" PRIx64 "\n"
+	     "\t prog_bar_param = 0x%016" PRIx64 "\n"
+	     "\t user_data      = 0x%016" PRIx64 "\n",
+	     p->size, p->mode, p->disp_type, reinterpret_cast<uint64_t>(p->items),
+	     reinterpret_cast<uint64_t>(p->user_msg_param),
+	     reinterpret_cast<uint64_t>(p->sys_msg_param),
+	     reinterpret_cast<uint64_t>(p->prog_bar_param), reinterpret_cast<uint64_t>(p->user_data));
+
+	const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
+	if (items != nullptr) {
+		if (items->focus_dir_name != nullptr && items->focus_dir_name->data[0] != '\0') {
+			std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s",
+			              items->focus_dir_name->data);
+		} else if (items->dir_names != nullptr && items->dir_names_num > 0) {
+			if (items->focus_pos >= 0 &&
+			    static_cast<uint32_t>(items->focus_pos) < items->dir_names_num &&
+			    items->dir_names[items->focus_pos].data[0] != '\0') {
+				std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s",
+				              items->dir_names[items->focus_pos].data);
+			} else {
+				for (uint32_t i = 0; i < items->dir_names_num; i++) {
+					const auto* name = items->dir_names[i].data;
+					if (name[0] != '\0') {
+						std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s", name);
+						break;
+					}
 				}
 			}
 		}
@@ -535,8 +606,13 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 
 int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
 	LOGF("\t close_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(close_param));
+
+	if (g_save_status == SAVE_STATUS_NONE) {
+		return SAVE_DATA_DIALOG_ERROR_NOT_INITIALIZED;
+	}
 
 	g_save_status         = SAVE_STATUS_FINISHED;
 	g_save_running_polled = false;
@@ -546,40 +622,77 @@ int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 
 int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
-	return 1;
+	return (g_save_status == SAVE_STATUS_RUNNING || g_save_status == SAVE_STATUS_FINISHED) ? 1 : 0;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogTerminate() {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
 	g_save_status         = SAVE_STATUS_NONE;
 	g_save_running_polled = false;
 	g_save_mode           = 0;
 	g_save_user_data      = nullptr;
 	g_save_dir_name[0]    = '\0';
+	for (auto& bar: g_save_progress_bar) {
+		bar = 0;
+	}
 
 	return 0;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta) {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
 	LOGF("\t target = %d\n"
 	     "\t delta  = %u\n",
 	     target, delta);
+
+	if (g_save_status == SAVE_STATUS_NONE) {
+		return SAVE_DATA_DIALOG_ERROR_NOT_INITIALIZED;
+	}
+	if (target < 0 || static_cast<size_t>(target) >= MAX_PROGRESS_BAR_TARGETS) {
+		return SAVE_DATA_DIALOG_ERROR_PARAM_INVALID;
+	}
+
+	const uint64_t current      = g_save_progress_bar[target];
+	const uint64_t next         = current + delta;
+	g_save_progress_bar[target] = static_cast<uint32_t>(std::min<uint64_t>(next, 100u));
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogProgressBarSetValue(int target, uint32_t rate) {
 	PRINT_NAME();
+	std::scoped_lock lock(g_save_dialog_mutex);
 
 	LOGF("\t target = %d\n"
 	     "\t rate   = %u\n",
 	     target, rate);
 
+	if (g_save_status == SAVE_STATUS_NONE) {
+		return SAVE_DATA_DIALOG_ERROR_NOT_INITIALIZED;
+	}
+	if (target < 0 || static_cast<size_t>(target) >= MAX_PROGRESS_BAR_TARGETS) {
+		return SAVE_DATA_DIALOG_ERROR_PARAM_INVALID;
+	}
+
+	g_save_progress_bar[target] = std::min(rate, 100u);
+
 	return OK;
+}
+
+uint32_t KYTY_SYSV_ABI SaveDataDialogGetProgressBarValue(int target) {
+	std::scoped_lock lock(g_save_dialog_mutex);
+
+	if (target < 0 || static_cast<size_t>(target) >= MAX_PROGRESS_BAR_TARGETS) {
+		return 0;
+	}
+
+	return g_save_progress_bar[target];
 }
 
 } // namespace SaveDataDialog

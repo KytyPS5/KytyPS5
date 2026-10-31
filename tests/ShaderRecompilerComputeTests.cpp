@@ -8,6 +8,8 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -2210,6 +2212,160 @@ public:
       create.usage = vk::ImageUsageFlagBits::eTransferSrc |
                      vk::ImageUsageFlagBits::eTransferDst;
     }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // The video-out layer shader converts PQ and linear-nit main-bus frames for an SDR swapchain.
+  void CheckVideoOutHdr10ToSdr() {
+    constexpr const char *name = "VideoOutHdr10ToSdr";
+    const auto vertex = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_device);
+    const auto fragment = CompileSPV(GPU_VIDEO_OUT_OVERLAY_SPV, m_device);
+    const auto sampler = CreateSampler(name);
+    const vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eCombinedImageSampler,
+                                                 1, vk::ShaderStageFlagBits::eFragment};
+    vk::DescriptorSetLayoutCreateInfo descriptors{};
+    descriptors.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    descriptors.bindingCount = 1;
+    descriptors.pBindings = &binding;
+    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    RequireVk(name, "descriptors",
+              m_device.createDescriptorSetLayout(&descriptors, nullptr, &descriptor_layout),
+              "vkCreateDescriptorSetLayout");
+    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eFragment, 0, sizeof(u32)};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &descriptor_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    vk::PipelineLayout layout = nullptr;
+    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_info, nullptr, &layout),
+              "vkCreatePipelineLayout");
+    std::array<vk::PipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].stage = vk::ShaderStageFlagBits::eVertex;
+    stages[0].module = vertex;
+    stages[0].pName = "main";
+    stages[1].stage = vk::ShaderStageFlagBits::eFragment;
+    stages[1].module = fragment;
+    stages[1].pName = "main";
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vk::PipelineInputAssemblyStateCreateInfo assembly{};
+    assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    const vk::Viewport viewport{0.0f, 0.0f, 4.0f, 1.0f, 0.0f, 1.0f};
+    const vk::Rect2D scissor{{0, 0}, {4, 1}};
+    vk::PipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    vk::PipelineRasterizationStateCreateInfo rasterization{};
+    rasterization.lineWidth = 1.0f;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    vk::PipelineColorBlendAttachmentState attachment{};
+    attachment.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo blend{};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &attachment;
+    const auto target_format = vk::Format::eR8G8B8A8Unorm;
+    vk::PipelineRenderingCreateInfo rendering_format{};
+    rendering_format.colorAttachmentCount = 1;
+    rendering_format.pColorAttachmentFormats = &target_format;
+    vk::GraphicsPipelineCreateInfo create{};
+    create.pNext = &rendering_format;
+    create.stageCount = static_cast<u32>(stages.size());
+    create.pStages = stages.data();
+    create.pVertexInputState = &vertex_input;
+    create.pInputAssemblyState = &assembly;
+    create.pViewportState = &viewport_state;
+    create.pRasterizationState = &rasterization;
+    create.pMultisampleState = &multisample;
+    create.pColorBlendState = &blend;
+    create.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              m_device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines");
+
+    auto target = CreateImage2D(name, 4, 1, target_format,
+                                vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+                                vk::ImageLayout::eTransferSrcOptimal);
+    const auto render = [&](Image &source, u32 flags) {
+      vk::CommandBuffer cmd = BeginCommands(name, "draw");
+      AddImageBarrier(cmd, target.image, target.layout,
+                      vk::ImageLayout::eColorAttachmentOptimal,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                      vk::AccessFlagBits::eTransferRead,
+                      vk::AccessFlagBits::eColorAttachmentWrite);
+      target.layout = vk::ImageLayout::eColorAttachmentOptimal;
+      vk::RenderingAttachmentInfo color{};
+      color.imageView = target.view;
+      color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+      color.loadOp = vk::AttachmentLoadOp::eClear;
+      color.storeOp = vk::AttachmentStoreOp::eStore;
+      vk::RenderingInfo rendering{};
+      rendering.renderArea.extent = scissor.extent;
+      rendering.layerCount = 1;
+      rendering.colorAttachmentCount = 1;
+      rendering.pColorAttachments = &color;
+      const vk::DescriptorImageInfo image{sampler, source.view,
+                                          vk::ImageLayout::eShaderReadOnlyOptimal};
+      vk::WriteDescriptorSet write{};
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+      write.pImageInfo = &image;
+      cmd.beginRendering(rendering);
+      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0, 1, &write);
+      cmd.pushConstants(layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(flags), &flags);
+      cmd.draw(3, 1, 0, 0);
+      cmd.endRendering();
+      EndSubmitAndFree(name, "draw", cmd);
+      return ReadImage(name, &target);
+    };
+    const auto near = [](const std::vector<u32> &actual, const std::vector<u32> &expected) {
+      for (size_t i = 0; i < expected.size(); i++) {
+        for (u32 shift = 0; shift < 32; shift += 8) {
+          if (std::abs(static_cast<int>((actual[i] >> shift) & 0xffu) -
+                       static_cast<int>((expected[i] >> shift) & 0xffu)) > 1) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    // Black, 100-nit and 250-nit gray, then a color; every source alpha is zero. Flags: PQ
+    // source (4), linear source (8), opaque main bus (16).
+    const auto pq = [](u32 r, u32 g, u32 b) { return r | (g << 10u) | (b << 20u); };
+    auto pq_source = CreateImage2D(
+        name, 4, 1, vk::Format::eA2B10G10R10UnormPack32, vk::ImageUsageFlagBits::eSampled,
+        {pq(0, 0, 0), pq(520, 520, 520), pq(616, 616, 616), pq(560, 500, 440)}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "PQ source",
+            near(render(pq_source, 4u | 16u),
+                 {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}),
+            "PQ pixels were not converted to opaque sRGB");
+    // Half-float nits: 0, 100, 250 and (150, 90, 40).
+    auto nit_source = CreateImage2D(
+        name, 4, 1, vk::Format::eR16G16B16A16Sfloat, vk::ImageUsageFlagBits::eSampled,
+        {0, 0, 0x56405640u, 0x5640u, 0x5bd05bd0u, 0x5bd0u, 0x55a058b0u, 0x5100u}, 2,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "linear source",
+            near(render(nit_source, 4u | 8u | 16u),
+                 {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
+            "linear-nit pixels were not converted to opaque sRGB");
+
+    DestroyImage(&nit_source);
+    DestroyImage(&pq_source);
+    DestroyImage(&target);
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(layout, nullptr);
+    m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+    m_device.destroySampler(sampler, nullptr);
+    m_device.destroyShaderModule(fragment, nullptr);
+    m_device.destroyShaderModule(vertex, nullptr);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -53848,6 +54004,11 @@ int main(int argc, char **argv) {
     CheckPm4Flip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--video-out-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckVideoOutHdr10ToSdr();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
@@ -54383,6 +54544,7 @@ int main(int argc, char **argv) {
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
+  vulkan.CheckVideoOutHdr10ToSdr();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();

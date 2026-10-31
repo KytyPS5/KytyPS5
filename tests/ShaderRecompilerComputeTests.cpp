@@ -209,6 +209,14 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static bool IsReleaseProtected(const BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.m_release_protected.Intersects(address, size);
+  }
+
+  static size_t RecentReleaseCount(const BufferCache &cache) {
+    return cache.m_recent_releases.size();
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -4420,6 +4428,380 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A shader-read lookup counts as a use, so garbage collection keeps that buffer, while a plain
+  // FindBuffer lookup still does not.
+  void CheckBufferCacheShaderReadLookup() {
+    constexpr const char *name = "BufferCacheShaderReadLookup";
+    constexpr uintptr_t base = 0x0000000241000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint64_t lookup_offset = 0;
+    constexpr uint64_t shader_read_offset = 0x100000;
+    constexpr uint64_t range_size = 2 * BufferCache::CACHING_PAGESIZE;
+    // Past the 160-tick age of normal garbage collection, re-reading every 40 ticks.
+    constexpr uint32_t aging_ticks = 160;
+    constexpr uint32_t reread_interval = 40;
+    constexpr auto no_pressure = std::numeric_limits<uint64_t>::max();
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      const auto looked_up = cache.FindBuffer(base + lookup_offset, range_size);
+      const auto shader_read =
+          cache.FindBufferForShaderRead(base + shader_read_offset, range_size);
+      bool same_owner = true;
+      for (uint32_t tick = 0; tick <= aging_ticks; tick++) {
+        if (tick % reread_interval == 0) {
+          same_owner = same_owner &&
+                       cache.FindBufferForShaderRead(base + shader_read_offset,
+                                                     range_size) == shader_read;
+        }
+        cache.RunGarbageCollector();
+      }
+      Require(name, "shader-read owner identity", same_owner,
+              "a shader-read lookup replaced its valid Buffer owner");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, no_pressure);
+      cache.RunGarbageCollector();
+      Require(name, "shader-read residency",
+              !cache.IsRegionRegistered(base + lookup_offset, range_size) &&
+                  !BufferCacheTestAccess::PageOwner(cache, base + lookup_offset) &&
+                  cache.IsRegionRegistered(base + shader_read_offset, range_size) &&
+                  BufferCacheTestAccess::PageOwner(cache, base + shader_read_offset) ==
+                      shader_read &&
+                  looked_up != shader_read,
+              "a plain lookup kept its buffer, or a shader-read lookup did not");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Without memory pressure, a clean buffer no binding has used for STALE_RELEASE_AGE_TICKS is
+  // released, while recently used and GPU-written buffers are kept, and each pass is capped.
+  void CheckBufferCacheStaleRelease() {
+    constexpr const char *name = "BufferCacheStaleRelease";
+    constexpr uintptr_t base = 0x0000000241800000ull;
+    constexpr uint64_t allocation_size = 0x800000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    // Larger than one page, so a clean read goes through the cache, not the stream buffer.
+    constexpr uint64_t range_size = 2 * page;
+    // A gap between buffers keeps them from merging.
+    constexpr uint64_t buffer_stride = 3 * page;
+    constexpr uint64_t stale_offset = 0;
+    constexpr uint64_t kept_offset = buffer_stride;
+    constexpr uint64_t dirty_offset = 2 * buffer_stride;
+    constexpr uint64_t cap_offset = 4 * buffer_stride;
+    constexpr uint64_t reuse_interval = 100;
+    constexpr uint32_t rebound_value = 0x5a5aa5a5u;
+    constexpr auto no_pressure = std::numeric_limits<uint64_t>::max();
+    constexpr auto age = BufferCache::STALE_RELEASE_AGE_TICKS;
+    constexpr auto interval = BufferCache::STALE_RELEASE_INTERVAL_TICKS;
+    constexpr auto cap = BufferCache::STALE_RELEASE_MAX_PER_PASS;
+    static_assert(cap_offset + (cap + 1) * buffer_stride <= allocation_size);
+    namespace Dc = Common::DebugCounters;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      const bool counters_were_enabled = Dc::Enabled();
+      Dc::SetEnabled(true);
+      const auto obtain = [&](uint64_t offset, bool is_written) {
+        const auto [buffer, buffer_offset] =
+            cache.ObtainBuffer(base + offset, range_size, is_written, false);
+        Require(name, "allocation", buffer != nullptr && buffer_offset == 0,
+                "a test buffer was not cached on its own");
+        return buffer;
+      };
+      const auto registered = [&](uint64_t offset) {
+        return cache.IsRegionRegistered(base + offset, range_size) &&
+               BufferCacheTestAccess::PageOwner(cache, base + offset);
+      };
+      // The first release pass for a buffer last used at `tick`.
+      const auto release_tick = [&](uint64_t tick) {
+        return (tick + age + interval - 1) / interval * interval;
+      };
+      // Runs garbage collection through `last_tick`, using the kept buffer every reuse_interval.
+      const auto run_through = [&](uint64_t last_tick, bool use_kept) {
+        while (BufferCacheTestAccess::GcTick(cache) <= last_tick) {
+          if (use_kept && BufferCacheTestAccess::GcTick(cache) % reuse_interval == 0) {
+            (void)obtain(kept_offset, false);
+          }
+          cache.RunGarbageCollector();
+        }
+      };
+
+      // (a), (b), (c) and (e): one stale, one kept in use, one GPU-written.
+      const auto created = BufferCacheTestAccess::GcTick(cache);
+      const auto releases_before = Dc::Get(Dc::Counter::BufferReleases);
+      const auto evictions_before = Dc::Get(Dc::Counter::BufferEvictions);
+      (void)obtain(stale_offset, false);
+      const auto *kept = obtain(kept_offset, false);
+      (void)obtain(dirty_offset, true);
+      const auto first_release = release_tick(created);
+      run_through(first_release - 1, true);
+      Require(name, "kept before age", registered(stale_offset),
+              "a buffer was released before it went unused for the full age");
+      const auto submissions_before = scheduler.CurrentTick();
+      run_through(first_release, true);
+      Require(name, "stale released",
+              !registered(stale_offset) && registered(dirty_offset) &&
+                  scheduler.CurrentTick() == submissions_before,
+              "a stale clean buffer was kept, a GPU-written one was released, or the "
+              "release submitted work");
+      run_through(first_release + 2 * interval, true);
+      Require(name, "in use kept",
+              registered(kept_offset) && obtain(kept_offset, false) == kept &&
+                  registered(dirty_offset),
+              "a buffer in use or a GPU-written buffer was released");
+      Require(name, "release counters",
+              Dc::Get(Dc::Counter::BufferReleases) - releases_before == 1 &&
+                  Dc::Get(Dc::Counter::BufferEvictions) == evictions_before,
+              "releases were miscounted or counted as evictions");
+
+      // (f): the released pages are untracked, so a rebind uploads the current guest data.
+      Require(name, "released pages untracked",
+              cache.IsRegionCpuModified(base + stale_offset, range_size),
+              "a released buffer's pages were not left CPU-modified for the next upload");
+      std::memcpy(reinterpret_cast<void *>(base + stale_offset), &rebound_value,
+                  sizeof(rebound_value));
+      const auto *rebound = obtain(stale_offset, false);
+      auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                       vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::BufferCopy copy{0, 0, sizeof(uint32_t)};
+      scheduler.Current().Handle().copyBuffer(rebound->Handle(), readback.buffer, 1, &copy);
+      vk::BufferMemoryBarrier to_host{};
+      to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_host.buffer = readback.buffer;
+      to_host.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+          nullptr, 1, &to_host, 0, nullptr);
+      scheduler.Finish();
+      Require(name, "rebind contents", ReadBuffer(name, readback, 1)[0] == rebound_value,
+              "a rebound buffer did not upload the guest data written after its release");
+      DestroyBuffer(&readback);
+
+      // (d): let the kept and rebound buffers age out, then check the per-pass cap.
+      run_through(release_tick(BufferCacheTestAccess::GcTick(cache)), false);
+      const auto cap_created = BufferCacheTestAccess::GcTick(cache);
+      for (uint64_t i = 0; i <= cap; i++) {
+        (void)obtain(cap_offset + i * buffer_stride, false);
+      }
+      const auto cap_release = release_tick(cap_created);
+      run_through(cap_release - 1, false);
+      const auto cap_releases_before = Dc::Get(Dc::Counter::BufferReleases);
+      run_through(cap_release, false);
+      const auto first_pass = Dc::Get(Dc::Counter::BufferReleases) - cap_releases_before;
+      run_through(cap_release + interval, false);
+      const auto second_pass =
+          Dc::Get(Dc::Counter::BufferReleases) - cap_releases_before - first_pass;
+      Require(name, "per-pass cap", first_pass == cap && second_pass == 1,
+              "a release pass ignored its cap, or left the remainder for later passes");
+
+      Dc::SetEnabled(counters_were_enabled);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A shader reading a range again after a stale release protects that range from further stale
+  // releases, through buffer merges, until the range is unmapped.
+  void CheckBufferCacheReleaseRefault() {
+    constexpr const char *name = "BufferCacheReleaseRefault";
+    constexpr uintptr_t base = 0x0000000242000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t range_size = 2 * page;
+    constexpr uint64_t refault_offset = 0;
+    constexpr uint64_t fresh_offset = 0x100000;
+    // Covers the refaulted page and its neighbours, so the cache merges them into one buffer.
+    constexpr uint64_t merged_size = 3 * page;
+    constexpr auto no_pressure = std::numeric_limits<uint64_t>::max();
+    constexpr auto age = BufferCache::STALE_RELEASE_AGE_TICKS;
+    constexpr auto interval = BufferCache::STALE_RELEASE_INTERVAL_TICKS;
+    namespace Dc = Common::DebugCounters;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, no_pressure,
+                                                            no_pressure);
+      const bool counters_were_enabled = Dc::Enabled();
+      Dc::SetEnabled(true);
+      const auto registered = [&](uint64_t offset, uint64_t size) {
+        return cache.IsRegionRegistered(base + offset, size) &&
+               BufferCacheTestAccess::PageOwner(cache, base + offset);
+      };
+      // Runs garbage collection through the first release pass for a buffer used now.
+      const auto age_out = [&]() {
+        const auto now = BufferCacheTestAccess::GcTick(cache);
+        const auto last = (now + age + interval - 1) / interval * interval;
+        while (BufferCacheTestAccess::GcTick(cache) <= last) {
+          cache.RunGarbageCollector();
+        }
+      };
+
+      // (g): a refault inside a released range protects it.
+      const auto [created, created_offset] =
+          cache.ObtainBuffer(base + refault_offset, range_size, false, false);
+      Require(name, "allocation", created != nullptr && created_offset == 0,
+              "the test buffer was not cached on its own");
+      age_out();
+      Require(name, "released",
+              !registered(refault_offset, range_size) &&
+                  BufferCacheTestAccess::RecentReleaseCount(cache) == 1,
+              "the stale buffer was not released or not remembered");
+      const auto refaults_before = Dc::Get(Dc::Counter::BufferReleaseRefaults);
+      cache.RecreateFaultedRange(base + refault_offset, page);
+      Require(name, "refault",
+              Dc::Get(Dc::Counter::BufferReleaseRefaults) - refaults_before == 1 &&
+                  BufferCacheTestAccess::IsReleaseProtected(cache, base + refault_offset,
+                                                            range_size) &&
+                  BufferCacheTestAccess::RecentReleaseCount(cache) == 0 &&
+                  registered(refault_offset, page),
+              "a refault was not counted, did not protect its range, or left no buffer");
+      age_out();
+      Require(name, "protected", registered(refault_offset, page),
+              "stale release dropped a protected range");
+
+      // (h): a fault on a range that was never released is not a refault.
+      cache.RecreateFaultedRange(base + fresh_offset, page);
+      Require(name, "fresh fault",
+              Dc::Get(Dc::Counter::BufferReleaseRefaults) - refaults_before == 1 &&
+                  !BufferCacheTestAccess::IsReleaseProtected(cache, base + fresh_offset, page) &&
+                  registered(fresh_offset, page),
+              "a fault on a never-released range was counted or protected");
+
+      // (i): a buffer merged over a protected range is kept.
+      const auto merged = cache.FindBuffer(base + refault_offset, merged_size);
+      const auto owns_merged_range = [&]() {
+        return BufferCacheTestAccess::PageOwner(cache, base + refault_offset) == merged &&
+               BufferCacheTestAccess::PageOwner(cache, base + refault_offset + 2 * page) ==
+                   merged;
+      };
+      Require(name, "merge", owns_merged_range(),
+              "the wider lookup did not merge the protected page into one buffer");
+      age_out();
+      Require(name, "merged protected", owns_merged_range(),
+              "stale release dropped a merged buffer covering a protected range");
+
+      // (j): an unmap forgets the protection, so the remapped range is released again.
+      context.UnmapMemory(base + refault_offset, merged_size);
+      context.MapMemory(base + refault_offset, merged_size);
+      Require(name, "unmap forgets",
+              !BufferCacheTestAccess::IsReleaseProtected(cache, base + refault_offset,
+                                                         merged_size),
+              "an unmap kept the protection of its range");
+      age_out();
+      Require(name, "released after remap", !registered(refault_offset, page),
+              "a remapped range stayed protected from stale release");
+
+      Dc::SetEnabled(counters_were_enabled);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -54571,6 +54953,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheShaderReadLookup();
+    vulkan.CheckBufferCacheStaleRelease();
+    vulkan.CheckBufferCacheReleaseRefault();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -54840,6 +55225,9 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheShaderReadLookup();
+    vulkan.CheckBufferCacheStaleRelease();
+    vulkan.CheckBufferCacheReleaseRefault();
   } else {
     skipped_device_checks = true;
   }

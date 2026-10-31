@@ -322,6 +322,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.function_lds |= kind == ResourceKind::FlatLocal &&
 				                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
 			} else if (address_access == AddressAccess::Write) {
+				// The buffer cache relies on this rejection. Stale release and the memory-pressure
+				// collector drop buffers the GPU did not write without downloading them, and only
+				// writes through bound buffers are tracked. Track these writes before lifting it.
 				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
 			} else {
 				info.coherent_buffers |= memory.coherent;

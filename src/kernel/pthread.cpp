@@ -410,8 +410,9 @@ struct PthreadPrivate {
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t guest_host_gs8;
-	uintptr_t guest_host_gs10;
+	uintptr_t        guest_host_gs8;
+	uintptr_t        guest_host_gs10;
+	std::atomic_bool cancel_requested {false};
 #endif
 };
 
@@ -3397,7 +3398,14 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// winpthread acts on a cancel by unwinding the thread's stack, which fails with
+	// STATUS_BAD_STACK on the guest stack. PthreadTestcancel exits through PthreadExit instead.
+	thread->cancel_requested.store(true, std::memory_order_release);
+	int result = 0;
+#else
 	int result = pthread_cancel(thread->p);
+#endif
 
 	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
 
@@ -3552,7 +3560,22 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 void KYTY_SYSV_ABI PthreadTestcancel() {
 	PRINT_NAME();
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_pthread_self == nullptr ||
+	    !g_pthread_self->cancel_requested.load(std::memory_order_acquire)) {
+		return;
+	}
+	// Read the cancel state without changing it.
+	int state = PTHREAD_CANCEL_ENABLE;
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state);
+	pthread_setcancelstate(state, nullptr);
+	if (state == PTHREAD_CANCEL_ENABLE) {
+		// Report the same value as the glibc PTHREAD_CANCELED the Linux build returns.
+		PthreadExit(reinterpret_cast<void*>(-1));
+	}
+#else
 	pthread_testcancel();
+#endif
 }
 
 void KYTY_SYSV_ABI PthreadExit(void* value) {

@@ -368,20 +368,20 @@ struct PthreadMutexattrPrivate {
 };
 
 struct PthreadAttrPrivate {
-	uint8_t        reserved[64];
-	KernelCpumask  affinity;
-	size_t         guard_size;
-	void*          stack_addr;
-	size_t         stack_size;
-	bool           stack_user;
-	uint64_t       stack_map_addr;
-	size_t         stack_map_size;
-	int            policy;
-	int            guest_priority;
-	int            inherit_sched;
-	int            solosched;
-	bool           detached;
-	pthread_attr_t p;
+	uint8_t          reserved[64];
+	KernelCpumask    affinity;
+	size_t           guard_size;
+	void*            stack_addr;
+	size_t           stack_size;
+	bool             stack_user;
+	uint64_t         stack_map_addr;
+	size_t           stack_map_size;
+	int              policy;
+	std::atomic<int> guest_priority;
+	int              inherit_sched;
+	int              solosched;
+	bool             detached;
+	pthread_attr_t   p;
 };
 
 struct PthreadGuestData {

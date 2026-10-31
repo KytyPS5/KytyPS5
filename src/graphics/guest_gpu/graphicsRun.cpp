@@ -207,7 +207,6 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
-	m_renderer.GetTextureCache().ProcessStorageDownloads();
 	GetScheduler().Flush();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();

@@ -2324,7 +2324,7 @@ public:
       EndSubmitAndFree(name, "draw", cmd);
       return ReadImage(name, &target);
     };
-    const auto near = [](const std::vector<u32> &actual, const std::vector<u32> &expected) {
+    const auto pixelsMatch = [](const std::vector<u32> &actual, const std::vector<u32> &expected) {
       for (size_t i = 0; i < expected.size(); i++) {
         for (u32 shift = 0; shift < 32; shift += 8) {
           if (std::abs(static_cast<int>((actual[i] >> shift) & 0xffu) -
@@ -2344,8 +2344,8 @@ public:
         {pq(0, 0, 0), pq(520, 520, 520), pq(616, 616, 616), pq(560, 500, 440)}, 1,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "PQ source",
-            near(render(pq_source, 4u | 16u),
-                 {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}),
+            pixelsMatch(render(pq_source, 4u | 16u),
+                        {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}),
             "PQ pixels were not converted to opaque sRGB");
     // Half-float nits: 0, 100, 250 and (150, 90, 40).
     auto nit_source = CreateImage2D(
@@ -2353,8 +2353,8 @@ public:
         {0, 0, 0x56405640u, 0x5640u, 0x5bd05bd0u, 0x5bd0u, 0x55a058b0u, 0x5100u}, 2,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "linear source",
-            near(render(nit_source, 4u | 8u | 16u),
-                 {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
+            pixelsMatch(render(nit_source, 4u | 8u | 16u),
+                        {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
             "linear-nit pixels were not converted to opaque sRGB");
 
     DestroyImage(&nit_source);

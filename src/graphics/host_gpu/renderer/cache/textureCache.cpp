@@ -743,13 +743,9 @@ bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
 }
 
 bool Publish(TextureCache& cache, Image& image) {
-	if (!cache.CanDownload(image)) {
+	if (!cache.CopyImageToBufferCache(image)) {
 		return false;
 	}
-	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
-	auto [buffer, offset] =
-	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
-	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
 	return true;
@@ -2080,24 +2076,42 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-void TextureCache::ProcessStorageDownloads() {
-	std::scoped_lock lock {m_lock};
-	DownloadImages(m_storage_downloads);
+void TextureCache::PublishStorageImages() {
+	std::vector<GuestRange> eager_readbacks;
+	{
+		std::scoped_lock lock {m_lock};
+		for (const auto id: m_storage_downloads) {
+			auto& image = m_slot_images[id];
+			if (image.SafeToDownload() && CopyImageToBufferCache(image) && m_readback_linear_images) {
+				eager_readbacks.push_back(image.info.data);
+			}
+		}
+		m_storage_downloads.clear();
+	}
+	for (const auto range: eager_readbacks) {
+		m_buffer_cache.ReadMemory(range.address, range.size);
+	}
+}
+
+bool TextureCache::CopyImageToBufferCache(Image& image) {
+	if (!CanDownload(image)) {
+		return false;
+	}
+	const auto range = image.info.data;
+	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, true);
+	DownloadImage(image, *buffer, offset, range.size, image.info.resources.levels);
+	return true;
 }
 
 void TextureCache::ProcessDownloadImages() {
+	PublishStorageImages();
 	std::scoped_lock lock {m_lock};
-	DownloadImages(m_storage_downloads);
-	DownloadImages(m_download_images);
-}
-
-void TextureCache::DownloadImages(std::unordered_set<ImageId>& images) {
-	for (const auto id: images) {
+	for (const auto id: m_download_images) {
 		if (m_slot_images[id].IsGpuModified()) {
 			(void)DownloadImageMemory(id);
 		}
 	}
-	images.clear();
+	m_download_images.clear();
 }
 
 } // namespace Libs::Graphics

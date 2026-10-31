@@ -9798,7 +9798,7 @@ public:
           submit_readback_desc.info.data.address, &submit_readback_stale,
           sizeof(submit_readback_stale));
       const auto submit_readback_tick = scheduler.CurrentTick();
-      texture_cache.ProcessStorageDownloads();
+      texture_cache.PublishStorageImages();
       uint32_t submit_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
           submit_readback_desc.info.data.address, &submit_before_completion,
@@ -9809,6 +9809,9 @@ public:
               "submit-time linear readback published synchronously");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
+      Require(name, "storage result accessible through a guest read fault",
+              resources.HandleFault(PageFaultAccess::Read, submit_readback_desc.info.data.address),
+              "guest read fault did not resolve the updated storage image");
       uint32_t submit_after_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
           submit_readback_desc.info.data.address, &submit_after_completion,
@@ -9820,6 +9823,18 @@ public:
                   texture_cache.GetImage(submit_readback_image).IsGpuModified(),
               "submit-time readback did not publish or retained no reusable "
               "GPU-current image");
+
+      (void)texture_cache.FindTexture(submit_readback_image, submit_readback_desc);
+      texture_cache.PublishStorageImages();
+      Require(name, "guest write to pending storage result",
+              resources.HandleFault(PageFaultAccess::Write, submit_readback_desc.info.data.address),
+              "guest write fault did not resolve the pending image copy");
+      std::memcpy(memory + submit_readback_offset, &submit_readback_stale, sizeof(uint32_t));
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "newer guest write survives completion",
+              std::memcmp(memory + submit_readback_offset, &submit_readback_stale, sizeof(uint32_t)) == 0,
+              "a late storage readback overwrote the guest write");
 
       constexpr uint64_t linear_depth_offset = 0x33a000;
       constexpr uint64_t linear_stencil_offset = 0x33b000;
@@ -16164,6 +16179,8 @@ public:
                                                            ordered_sampled_id),
           "production graphics binding did not retain vertex resources "
           "before pixel resources");
+      Libs::LibKernel::Memory::WriteBacking(
+          storage_address, &storage_stale_value, sizeof(storage_stale_value));
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto graphics_bindings =
@@ -16199,6 +16216,9 @@ public:
                    vk::AccessFlagBits2::eShaderWrite),
               "a later sampled alias dropped an earlier storage write access");
       RenderExecutorTestAccess::ResetBindings(executor);
+      Require(name, "draw publishes storage writes before the next packet",
+              !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
+              "a completed draw left storage writes pending");
 
       ShaderRecompiler::IR::Program vertex_sampled_program{};
       vertex_sampled_program.stage = ShaderType::Vertex;
@@ -16422,13 +16442,6 @@ public:
                       depth_views_rendering.depth_stencil_attachment.image_layout,
               "two depth views chose different descriptor layouts or feedback aspects");
 
-      Libs::LibKernel::Memory::WriteBacking(
-          storage_address, &storage_stale_value, sizeof(storage_stale_value));
-      texture_cache.ProcessDownloadImages();
-      Require(
-          name, "storage acquisition download consumption",
-          !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
-          "submit-time processing retained an acquired storage request");
       RenderExecutorTestAccess::ResetBindings(executor);
       scheduler.Finish();
       scheduler.DrainPriorityOperations();

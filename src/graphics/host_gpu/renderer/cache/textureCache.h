@@ -78,7 +78,7 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void ProcessStorageDownloads();
+	void PublishStorageImages();
 	void RunGarbageCollector();
 
 private:
@@ -127,7 +127,7 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
-	void                      DownloadImages(std::unordered_set<ImageId>& images);
+	[[nodiscard]] bool        CopyImageToBufferCache(Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);

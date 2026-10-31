@@ -677,6 +677,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	m_context.GetTextureCache().PublishStorageImages();
 	for (const auto id: m_bound_images) {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}

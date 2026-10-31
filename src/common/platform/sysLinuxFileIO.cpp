@@ -210,6 +210,22 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 	return OpenHostFile(file_name, "r+", cache_type);
 }
 
+sys_file_t* SysFileOpenDir(const std::filesystem::path& dir_name) {
+	auto* ret = new sys_file_t;
+	int fd = open(get_internal_name(dir_name).c_str(), O_RDONLY | O_DIRECTORY);
+	if (fd < 0) {
+		ret->f = nullptr;
+		ret->type = SYS_FILE_ERROR;
+	} else {
+		ret->f = fdopen(fd, "r");
+		ret->type = (ret->f == nullptr) ? SYS_FILE_ERROR : SYS_FILE_FILE;
+		if (ret->f != nullptr) {
+			setvbuf(ret->f, nullptr, _IONBF, 0);
+		}
+	}
+	return ret;
+}
+
 void SysFileClose(sys_file_t* f) {
 	[[maybe_unused]] int result = 0;
 

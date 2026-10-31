@@ -238,6 +238,30 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 	return ret;
 }
 
+sys_file_t* SysFileOpenDir(const std::filesystem::path& dir_name) {
+	auto* ret = new sys_file_t;
+
+	auto   wide   = dir_name.wstring();
+	HANDLE h_file = nullptr;
+	h_file = CreateFileW(wide.c_str(),
+	                     GENERIC_READ,
+	                     FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                     nullptr,
+	                     OPEN_EXISTING,
+	                     FILE_FLAG_BACKUP_SEMANTICS,
+	                     nullptr);
+
+	if (h_file == INVALID_HANDLE_VALUE) {
+		ret->type = SYS_FILE_ERROR;
+	} else {
+		ret->type = SYS_FILE_FILE;
+	}
+
+	ret->handle = h_file;
+
+	return ret;
+}
+
 void SysFileClose(sys_file_t* f) {
 	if (f->type == SYS_FILE_FILE) {
 		CloseHandle(f->handle);

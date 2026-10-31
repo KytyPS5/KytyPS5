@@ -37,6 +37,7 @@ sys_file_t* SysFileOpen(uint8_t* buf, uint32_t buf_size);
 sys_file_t* SysFileCreate();
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type = SYS_FILE_CACHE_AUTO);
+sys_file_t* SysFileOpenDir(const std::filesystem::path& dir_name);
 void        SysFileClose(sys_file_t* f);
 uint64_t    SysFileSize(sys_file_t& f);                    // NOLINT(google-runtime-references)
 bool        SysFileSeek(sys_file_t& f, uint64_t offset);   // NOLINT(google-runtime-references)

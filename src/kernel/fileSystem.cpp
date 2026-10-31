@@ -6,15 +6,29 @@
 #include "common/dateTime.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
-#include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifdef CreateDirectory
+#undef CreateDirectory
+#endif
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
+#ifdef CopyFile
+#undef CopyFile
+#endif
+#endif
+
+#include "common/file.h"
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +79,7 @@ private:
 
 struct File {
 	Common::File          f;
+	sys_file_t*           dir_handle;
 	std::string           name;
 	std::filesystem::path real_name;
 	std::atomic_bool      opened;
@@ -181,6 +196,7 @@ int FileDescriptors::CreateDescriptor() {
 	Common::LockGuard lock(m_mutex);
 
 	auto* file        = new File {};
+	file->dir_handle  = nullptr;
 	file->opened      = false;
 	file->directory   = false;
 	file->readable    = false;
@@ -541,6 +557,16 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
 		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
 
+		// Open directory handle for fchmod support
+		file->dir_handle = SysFileOpenDir(file->real_name);
+		if (SysFileIsError(*file->dir_handle)) {
+			LOGF("\tFailed to open directory handle: %s\n", Common::PathToString(file->real_name).c_str());
+			SysFileClose(file->dir_handle);
+			file->dir_handle = nullptr;
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EIO;
+		}
+
 		const auto entries = Common::File::GetDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
@@ -614,6 +640,11 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	if (!file->directory && file->special == SpecialFile::None) {
 		file->f.Close();
+	}
+
+	if (file->directory && file->dir_handle != nullptr) {
+		SysFileClose(file->dir_handle);
+		file->dir_handle = nullptr;
 	}
 
 	file->opened = false;
@@ -1753,49 +1784,13 @@ int KYTY_SYSV_ABI KernelFchmod(int fd, uint32_t mode) {
 		return OK;
 	}
 
-	Common::LockGuard fs_lock(g_fs_operation_mutex);
-
-	std::filesystem::path canonical_target;
-	if (!ConstrainTargetToMount(file->name, file->real_name, &canonical_target)) {
-		LOGF("\t KernelFchmod directory target escapes mount point: %s -> %s\n", file->name.c_str(),
-		     Common::PathToString(file->real_name).c_str());
-		return KERNEL_ERROR_ENOENT;
+	// fchmod on directories - use the directory handle
+	if (file->dir_handle == nullptr) {
+		return KERNEL_ERROR_EBADF;
 	}
 
-	std::error_code ec;
-	bool            exists = std::filesystem::exists(canonical_target, ec);
-	if (ec) {
-		LOGF("\t KernelFchmod exists check failed: %s (ec = %d)\n", ec.message().c_str(),
-		     ec.value());
-		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
-			return KERNEL_ERROR_EPERM;
-		}
-		if (ec == std::errc::no_such_file_or_directory) {
-			return KERNEL_ERROR_ENOENT;
-		}
-		if (ec == std::errc::read_only_file_system) {
-			return KERNEL_ERROR_EROFS;
-		}
-		return KERNEL_ERROR_EIO;
-	}
-	if (!exists) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	std::filesystem::permissions(canonical_target,
-	                             static_cast<std::filesystem::perms>(mode & 07777), ec);
-	if (ec) {
-		LOGF("\t KernelFchmod permissions failed: %s (ec = %d)\n", ec.message().c_str(),
-		     ec.value());
-		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
-			return KERNEL_ERROR_EPERM;
-		}
-		if (ec == std::errc::no_such_file_or_directory) {
-			return KERNEL_ERROR_ENOENT;
-		}
-		if (ec == std::errc::read_only_file_system) {
-			return KERNEL_ERROR_EROFS;
-		}
+	bool result = SysFileChmod(*file->dir_handle, mode, file->real_name);
+	if (!result) {
 		return KERNEL_ERROR_EIO;
 	}
 

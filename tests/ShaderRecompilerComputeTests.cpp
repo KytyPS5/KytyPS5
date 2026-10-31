@@ -8083,6 +8083,39 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
+      auto storage_alias_desc = buffer_alias_desc;
+      storage_alias_desc.type = BindingType::Storage;
+      storage_alias_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      (void)texture_cache.FindTexture(buffer_alias_image, storage_alias_desc);
+      vk::ClearValue storage_clear{};
+      storage_clear.color.uint32[0] = buffer_alias_image_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), buffer_alias_image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, storage_clear);
+      const auto alias_range = storage_alias_desc.info.data;
+      texture_cache.InvalidateMemory(alias_range.End(), 1);
+      Require(name, "storage alias pending page check",
+              texture_cache.GetImage(buffer_alias_image).IsMaybeCpuDirty() &&
+                  !texture_cache.GetImage(buffer_alias_image).IsTracked(),
+              "a write beside the image did not take it off the page watch");
+      texture_cache.PublishStorageImages();
+      Require(name, "storage alias restored after a neighboring write",
+              !texture_cache.GetImage(buffer_alias_image).IsCpuDirty() &&
+                  texture_cache.GetImage(buffer_alias_image).IsTracked(),
+              "publishing did not resolve and re-track the unchanged image");
+      resources.GetBufferCache().FillBuffer(alias_range.address + 2 * sizeof(u32),
+                                             sizeof(u32), buffer_alias_write_value, false);
+      (void)texture_cache.FindTexture(buffer_alias_image, storage_alias_desc);
+      texture_cache.PublishStorageImages();
+      resources.GetBufferCache().ReadMemory(alias_range.address, alias_range.size);
+      std::array<u32, 4> published_alias{};
+      Require(name, "storage alias preserves a partial buffer write",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  alias_range.address, published_alias.data(), sizeof(published_alias)) &&
+                  published_alias == std::array{buffer_alias_image_value, buffer_alias_image_value,
+                                                buffer_alias_write_value, buffer_alias_image_value},
+              "republishing lost the interior buffer write or an untouched image texel");
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,

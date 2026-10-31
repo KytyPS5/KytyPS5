@@ -103,7 +103,12 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified      = true;
+		m_has_buffer_mirror = false;
+	}
+	[[nodiscard]] bool HasBufferMirror() const noexcept { return m_has_buffer_mirror; }
+	void               MarkBufferMirrored() noexcept { m_has_buffer_mirror = true; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
@@ -176,8 +181,9 @@ private:
 	uint64_t          m_maybe_cpu_hash  = 0;
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;
-	bool              m_gpu_modified    = false;
-	bool              m_buffer_modified = false;
+	bool              m_gpu_modified      = false;
+	bool              m_has_buffer_mirror = false;
+	bool              m_buffer_modified   = false;
 };
 
 namespace ImageOps {

@@ -3886,6 +3886,35 @@ void TestImageAddressOperands() {
   }
 }
 
+void TestNullImageKeepsShaderDimension() {
+  // A texture the game binds once it has streamed in: the null descriptor before it and the
+  // real 3D descriptor after it give the same program (Wolverine's ray tracing shader compiled
+  // a second three-minute pipeline for its null 3D lookup tables).
+  constexpr uint32_t MimgDim3D = 2;
+  const uint32_t shader[] = {
+      EncodeMimg0(0x20, 0xf, false, MimgDim3D),
+      EncodeMimg1(0, 0, 2, 4), // image_sample 3D
+      EncodeExp0(0x00, 0xf, true, false, true),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  auto ps_info = RegressionPixelInputInfo();
+  // A 64x64x64 R16G16B16A16 float 3D texture.
+  std::array<uint32_t, 64> bound{0x118c1f00u, 0xc2400000u, 0x000fc01fu, 0xa05003acu,
+                                 0x0000003fu, 0x00700000u, 0u, 0u};
+  auto unbound = bound;
+  std::fill(unbound.begin(), unbound.begin() + 8, 0u);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.user_data = bound;
+  const auto with_image = RecompileForTest(shader, options);
+  options.user_data = unbound;
+  const auto without_image = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(without_image.spirv);
+  Check(with_image.spirv == without_image.spirv,
+        "a null image changed the program of a shader that samples a 3D image");
+}
+
 void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   constexpr uint32_t OpImageSampleImplicitLod = 87;
   constexpr uint32_t OpImageSampleExplicitLod = 88;
@@ -14166,6 +14195,7 @@ int main() {
   TestCallTableExpansionLongBranches();
   TestCallTableSharedBodies();
   TestInlinedCallTargetsBecomeFunctions();
+  TestNullImageKeepsShaderDimension();
 
   return 0;
 }

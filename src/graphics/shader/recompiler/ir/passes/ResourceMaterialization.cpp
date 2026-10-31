@@ -1399,6 +1399,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
+			// A shader without a declared dimension gets a plain 2D view, as before.
+			if (image.dimension == Decoder::ImageDimension::Unknown) {
+				image.dimension = Decoder::ImageDimension::Dim2D;
+				image.cube      = false;
+			}
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);

@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdint>
 #include <fmt/format.h>
+#include <iterator>
 #include <nlohmann/json.hpp>
 #include <span>
+#include <utility>
 
 namespace Common::Trophies {
 namespace {
@@ -40,23 +43,137 @@ int ReadId(const Json& value) {
 	return error == std::errc {} && end == text.data() + text.size() && id >= 0 ? id : -1;
 }
 
-std::optional<uint64_t> ReadUnsigned(const Json& value) {
+template <typename T, typename From>
+std::optional<T> NarrowInteger(From number) {
+	return std::in_range<T>(number) ? std::optional<T>(static_cast<T>(number)) : std::nullopt;
+}
+
+// Accepts JSON integers and decimal strings that fit T exactly.
+template <typename T>
+std::optional<T> ReadInteger(const Json& value) {
 	if (value.is_number_unsigned()) {
-		return value.get<uint64_t>();
+		return NarrowInteger<T>(value.get<uint64_t>());
 	}
 	if (value.is_number_integer()) {
-		const auto number = value.get<int64_t>();
-		return number >= 0 ? std::optional<uint64_t>(static_cast<uint64_t>(number)) : std::nullopt;
+		return NarrowInteger<T>(value.get<int64_t>());
 	}
 	if (!value.is_string()) {
 		return std::nullopt;
 	}
 	const auto& text        = value.get_ref<const std::string&>();
-	uint64_t    number      = 0;
+	T           number      = 0;
 	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
-	return error == std::errc {} && end == text.data() + text.size()
-	           ? std::optional<uint64_t>(number)
-	           : std::nullopt;
+	return error == std::errc {} && end == text.data() + text.size() ? std::optional<T>(number)
+	                                                                 : std::nullopt;
+}
+
+std::optional<uint64_t> ReadUnsigned(const Json& value) {
+	return ReadInteger<uint64_t>(value);
+}
+
+bool IsString(const Json& value, std::string_view text) {
+	return value.is_string() && value.get_ref<const std::string&>() == text;
+}
+
+// Indexed like the UdsInteger alternatives.
+struct StatType {
+	std::string_view name;
+	bool             is_signed;
+	int64_t          lowest;
+	uint64_t         highest;
+};
+constexpr StatType StatTypes[] = {
+    {"int32", true, INT32_MIN, INT32_MAX},
+    {"uint32", false, 0, UINT32_MAX},
+    {"int64", true, INT64_MIN, INT64_MAX},
+    {"uint64", false, 0, UINT64_MAX},
+};
+static_assert(std::size(StatTypes) == std::variant_size_v<UdsInteger>);
+
+// Bounded stats need clamping rules we have not verified, so only full-range stats are used.
+bool HasFullRange(const Json& definition, const StatType& type) {
+	const auto matches = [&](const char* key, auto limit) {
+		return !definition.contains(key) ||
+		       ReadInteger<decltype(limit)>(definition[key]) == std::optional(limit);
+	};
+	return type.is_signed ? matches("minValue", type.lowest) &&
+	                            matches("maxValue", static_cast<int64_t>(type.highest))
+	                      : matches("minValue", uint64_t {0}) && matches("maxValue", type.highest);
+}
+
+std::optional<Aggregation> ReadAggregation(const Json& value) {
+	static constexpr std::pair<std::string_view, Aggregation> Names[] = {
+	    {"latest", Aggregation::Latest}, {"max", Aggregation::Max},     {"min", Aggregation::Min},
+	    {"sum", Aggregation::Sum},       {"count", Aggregation::Count},
+	};
+	for (const auto& [name, aggregation]: Names) {
+		if (IsString(value, name)) {
+			return aggregation;
+		}
+	}
+	return std::nullopt;
+}
+
+// T is int64_t for signed stats and uint64_t for unsigned ones; sums saturate at the type range.
+template <typename T>
+T Aggregate(const std::optional<T>& current, T input, Aggregation aggregation,
+            const StatType& type) {
+	const auto lowest  = static_cast<T>(type.lowest);
+	const auto highest = static_cast<T>(type.highest);
+	switch (aggregation) {
+		case Aggregation::Latest: return input;
+		case Aggregation::Max: return current ? std::max(*current, input) : input;
+		case Aggregation::Min: return current ? std::min(*current, input) : input;
+		case Aggregation::Sum:
+		case Aggregation::Count: {
+			const auto base = std::clamp(current.value_or(0), lowest, highest);
+			if (input > 0) {
+				return base > highest - input ? highest : base + input;
+			}
+			return base < lowest - input ? lowest : base + input;
+		}
+	}
+	return input;
+}
+
+UdsValue ApplyRule(const UdsRule& rule, const std::optional<UdsValue>& current,
+                   const UdsInteger& input) {
+	const auto& type   = StatTypes[rule.type];
+	const auto  update = [&]<typename T>(T value) -> UdsValue {
+		std::optional<T> previous;
+		if (current) {
+			previous = std::visit([](auto number) { return NarrowInteger<T>(number); }, *current);
+		}
+		return Aggregate(previous, value, rule.aggregation, type);
+	};
+	if (rule.aggregation == Aggregation::Count) {
+		return type.is_signed ? update(int64_t {1}) : update(uint64_t {1});
+	}
+	return std::visit(
+	    [&](auto number) {
+		    return type.is_signed ? update(static_cast<int64_t>(number))
+		                          : update(static_cast<uint64_t>(number));
+	    },
+	    input);
+}
+
+bool Satisfies(const Trophy& trophy, const UdsValue& stat) {
+	return std::visit(
+	    [&](auto value) {
+		    switch (trophy.comparison) {
+			    case Comparison::GreaterEqual: return std::cmp_greater_equal(value, *trophy.target);
+			    case Comparison::Greater: return std::cmp_greater(value, *trophy.target);
+			    case Comparison::LessEqual: return std::cmp_less_equal(value, *trophy.target);
+			    case Comparison::Less: return std::cmp_less(value, *trophy.target);
+			    case Comparison::None: break;
+		    }
+		    return false;
+	    },
+	    stat);
+}
+
+bool IsStatTrophy(const Trophy& trophy) {
+	return trophy.grade != 1 && trophy.uds_stat_id && trophy.target;
 }
 
 Json ReadJson(const Files& files, std::string_view name) {
@@ -106,7 +223,7 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		return {};
 	}
 	const auto locale = Localization::LocaleName(console_language);
-	auto meta = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
+	auto       meta   = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
 	if (meta.is_null()) {
 		meta = ReadJson(files, fmt::format("tropmeta_{}.json",
 		                                   conf["defaultLanguage"].get_ref<const std::string&>()));
@@ -274,6 +391,19 @@ UnlockData LoadUnlockData(const std::filesystem::path& path) {
 			}
 		}
 	}
+	if (json.contains("statValues") && json["statValues"].is_object()) {
+		for (auto it = json["statValues"].begin(); it != json["statValues"].end(); ++it) {
+			const auto id = ReadUnsigned(Json(it.key()));
+			if (!id) {
+				continue;
+			}
+			if (it.value().is_number_unsigned()) {
+				unlocks.stats.emplace(*id, it.value().get<uint64_t>());
+			} else if (it.value().is_number_integer()) {
+				unlocks.stats.emplace(*id, it.value().get<int64_t>());
+			}
+		}
+	}
 	return unlocks;
 }
 
@@ -287,9 +417,14 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 			timestamps[std::to_string(id)] = tick;
 		}
 	}
-	const auto text =
-	    Json {{"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", timestamps}}.dump();
-	auto temporary = path;
+	Json stats = Json::object();
+	for (const auto& [id, value]: unlocks.stats) {
+		std::visit([&](auto number) { stats[std::to_string(id)] = number; }, value);
+	}
+	const Json json {
+	    {"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", timestamps}, {"statValues", stats}};
+	const auto text      = json.dump();
+	auto       temporary = path;
 	temporary += ".tmp";
 	File file;
 	if (text.size() > MaxUnlocksSize || !file.Create(temporary)) {
@@ -329,26 +464,25 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 	    !extraction["statsExtractionRuleArray"].is_array()) {
 		return {};
 	}
-	// Only direct unsigned latest-value stats are evaluated here. Aggregated stats
-	// and filtered/nested extraction require UDS state and event types we do not implement.
-	std::map<uint64_t, bool> stats;
+	// Only direct integer stats are evaluated here. Filtered/nested extraction and
+	// non-integer stats require UDS event types we do not implement.
+	std::map<uint64_t, std::pair<size_t, Aggregation>> stats;
 	for (const auto& definition: definitions["statDefinitionArray"]) {
 		if (!definition.is_object() || !definition.contains("statId") ||
-		    !definition.contains("aggregation") || definition["aggregation"] != "latest" ||
-		    !definition.contains("dataType")) {
+		    !definition.contains("aggregation") || !definition.contains("dataType")) {
 			continue;
 		}
-		const auto  id   = ReadUnsigned(definition["statId"]);
-		const auto& type = definition["dataType"];
-		if (!id || (type != "uint64" && type != "uint32")) {
+		const auto id          = ReadUnsigned(definition["statId"]);
+		const auto aggregation = ReadAggregation(definition["aggregation"]);
+		const auto type =
+		    std::find_if(std::begin(StatTypes), std::end(StatTypes),
+		                 [&](const auto& t) { return IsString(definition["dataType"], t.name); });
+		if (!id || !aggregation || type == std::end(StatTypes) ||
+		    !HasFullRange(definition, *type)) {
 			continue;
 		}
-		const uint64_t maximum = type == "uint32" ? UINT32_MAX : UINT64_MAX;
-		if ((definition.contains("minValue") && ReadUnsigned(definition["minValue"]) != 0) ||
-		    (definition.contains("maxValue") && ReadUnsigned(definition["maxValue"]) != maximum)) {
-			continue;
-		}
-		stats.emplace(*id, type == "uint32");
+		stats.emplace(*id,
+		              std::pair(static_cast<size_t>(type - std::begin(StatTypes)), *aggregation));
 	}
 	UdsRules events;
 	for (const auto& rule: extraction["statsExtractionRuleArray"]) {
@@ -359,21 +493,33 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 		const auto& action    = rule["action"];
 		if (!condition.is_object() || condition.size() != 1 || !condition.contains("eventName") ||
 		    !condition["eventName"].is_string() || !action.is_object() ||
-		    !action.contains("input") || !action["input"].is_string() ||
 		    !action.contains("output") || !action["output"].is_object() ||
 		    !action["output"].contains("statId")) {
 			continue;
 		}
-		const auto  id    = ReadUnsigned(action["output"]["statId"]);
-		const auto& input = action["input"].get_ref<const std::string&>();
-		if (!id || !stats.contains(*id) || !input.starts_with("$.") || input.size() == 2 ||
-		    input.find_first_not_of(
-		        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 2) !=
-		        std::string::npos) {
+		const auto id   = ReadUnsigned(action["output"]["statId"]);
+		const auto stat = id ? stats.find(*id) : stats.end();
+		if (stat == stats.end()) {
 			continue;
 		}
+		const auto [type, aggregation] = stat->second;
+		std::string input;
+		// Count stats only tally matching events, so they need no input property.
+		if (aggregation != Aggregation::Count) {
+			if (!action.contains("input") || !action["input"].is_string()) {
+				continue;
+			}
+			input = action["input"].get<std::string>();
+			if (!input.starts_with("$.") || input.size() == 2 ||
+			    input.find_first_not_of(
+			        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 2) !=
+			        std::string::npos) {
+				continue;
+			}
+			input.erase(0, 2);
+		}
 		events[condition["eventName"].get<std::string>()].push_back(
-		    {*id, input.substr(2), stats.at(*id)});
+		    {*id, std::move(input), type, aggregation});
 	}
 	return events;
 }
@@ -382,44 +528,67 @@ std::filesystem::path UdsPackagePath(uint32_t service_label) {
 	return std::filesystem::path("sce_sys/uds") / fmt::format("uds{:02}.ucp", service_label);
 }
 
-std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
-                                 const std::map<std::string, UdsInteger>& properties) {
+std::vector<int> ApplyUdsEvent(const Package& package, std::string_view event_name,
+                               const std::map<std::string, UdsInteger>& properties,
+                               UnlockData& unlocks, bool& changed) {
+	changed          = false;
 	const auto rules = package.event_rules.find(std::string(event_name));
 	if (rules == package.event_rules.end()) {
 		return {};
 	}
-	std::vector<int> ids;
-	for (const auto& [id, trophy]: package.trophies) {
-		if (trophy.grade == 1 || !trophy.uds_stat_id || !trophy.target) {
+	const auto pending = [&](uint64_t stat_id) {
+		return std::any_of(package.trophies.begin(), package.trophies.end(),
+		                   [&](const auto& entry) {
+			                   const auto& [id, trophy] = entry;
+			                   return IsStatTrophy(trophy) && *trophy.uds_stat_id == stat_id &&
+			                          !unlocks.unlocked.contains(id);
+		                   });
+	};
+	std::set<uint64_t> fed;
+	for (const auto& rule: rules->second) {
+		const auto value = properties.find(rule.input);
+		if (!pending(rule.stat_id) ||
+		    (rule.aggregation != Aggregation::Count &&
+		     (value == properties.end() || value->second.index() != rule.type))) {
 			continue;
 		}
-		for (const auto& rule: rules->second) {
-			const auto value = properties.find(rule.input);
-			if (rule.stat_id != *trophy.uds_stat_id || value == properties.end()) {
-				continue;
-			}
-			std::optional<uint64_t> number;
-			if (rule.is_uint32) {
-				if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
-			} else if (const auto* input = std::get_if<uint64_t>(&value->second)) {
-				number = *input;
-			}
-			if (!number) continue;
-			bool matched = false;
-			switch (trophy.comparison) {
-				case Comparison::GreaterEqual: matched = *number >= *trophy.target; break;
-				case Comparison::Greater: matched = *number > *trophy.target; break;
-				case Comparison::LessEqual: matched = *number <= *trophy.target; break;
-				case Comparison::Less: matched = *number < *trophy.target; break;
-				case Comparison::None: break;
-			}
-			if (matched) {
-				ids.push_back(id);
-				break;
-			}
+		const auto current = unlocks.stats.find(rule.stat_id);
+		const auto updated = ApplyRule(
+		    rule, current == unlocks.stats.end() ? std::nullopt : std::optional(current->second),
+		    value == properties.end() ? UdsInteger {} : value->second);
+		if (current == unlocks.stats.end() || current->second != updated) {
+			unlocks.stats.insert_or_assign(rule.stat_id, updated);
+			changed = true;
+		}
+		fed.insert(rule.stat_id);
+	}
+	std::vector<int> ids;
+	for (const auto& [id, trophy]: package.trophies) {
+		if (IsStatTrophy(trophy) && fed.contains(*trophy.uds_stat_id) &&
+		    !unlocks.unlocked.contains(id) &&
+		    Satisfies(trophy, unlocks.stats.at(*trophy.uds_stat_id))) {
+			ids.push_back(id);
 		}
 	}
 	return ids;
+}
+
+std::optional<uint64_t> StatProgress(const Trophy& trophy, const UdsStats& stats) {
+	if (!IsStatTrophy(trophy) || (trophy.comparison != Comparison::GreaterEqual &&
+	                              trophy.comparison != Comparison::Greater)) {
+		return std::nullopt;
+	}
+	const auto stat = stats.find(*trophy.uds_stat_id);
+	if (stat == stats.end()) {
+		return std::nullopt;
+	}
+	return std::visit(
+	    [&](auto value) {
+		    return std::cmp_less_equal(value, 0)
+		               ? uint64_t {0}
+		               : std::min(static_cast<uint64_t>(value), *trophy.target);
+	    },
+	    stat->second);
 }
 
 uint32_t Progress::Percentage() const {

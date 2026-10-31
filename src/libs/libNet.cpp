@@ -13,7 +13,6 @@
 #include <limits>
 #include <map>
 #include <mutex>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -191,7 +190,7 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 }
 
 int KYTY_SYSV_ABI NetSendto(int s, const void* buf, size_t len, int flags, const void* addr,
-                            uint32_t addrlen) {
+                         uint32_t addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
 	return FinishSocketCall(
 	    static_cast<int>(Net::Sendto(s, buf, size, flags | 0x20000, addr, addrlen)));
@@ -207,7 +206,7 @@ int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
 }
 
 int KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, size_t len, int flags, void* addr,
-                              uint32_t* addrlen) {
+                               uint32_t* addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
 	return FinishSocketCall(static_cast<int>(Net::Recvfrom(s, buf, size, flags, addr, addrlen)));
 }
@@ -657,10 +656,8 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		}
 	}
 
-	const bool with_username =
-	    (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
-	const bool with_password =
-	    (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
+	const bool with_username = (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
+	const bool with_password = (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
 	if (with_username) {
 		uri.append(src_element->username);
 	}
@@ -1858,10 +1855,10 @@ static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 		return NP_AUTH_ERROR_ABORTED;
 	}
 
-	request->state = NpAuthRequestState::Complete;
+	request->state  = NpAuthRequestState::Complete;
 	// Emulating sign-in cannot provide a real authorization code or ID token.
-	request->result =
-	    Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN : NP_ERROR_SIGNED_OUT;
+	request->result = Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN
+	                                                        : NP_ERROR_SIGNED_OUT;
 
 	return request->async ? 0 : request->result;
 }
@@ -1884,9 +1881,9 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI
-NpAuthGetAuthorizationCodeV3(int req_id, const NpAuthGetAuthorizationCodeParameterV3* param,
-                             void* auth_code, int* issuer_id) {
+static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
+    int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
+    int* issuer_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1918,7 +1915,7 @@ NpAuthGetAuthorizationCodeV3(int req_id, const NpAuthGetAuthorizationCodeParamet
 }
 
 static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
-                                            void* id_token) {
+                                        void* id_token) {
 	PRINT_NAME();
 
 	LOGF("\t req_id   = %d\n", req_id);
@@ -2049,14 +2046,11 @@ namespace LibNpWebApi2 {
 
 LIB_VERSION("NpWebApi2", 1, "NpWebApi2", 1, 1);
 
-constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT              = -2141899774; /* 0x80553402 */
-constexpr int NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID        = -2141899773; /* 0x80553403 */
-constexpr int NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND         = -2141899772; /* 0x80553404 */
-constexpr int NP_WEBAPI2_ERROR_USER_CONTEXT_NOT_FOUND        = -2141899771; /* 0x80553405 */
-constexpr int NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND             = -2141899770; /* 0x80553406 */
-constexpr int NP_WEBAPI2_ERROR_NOT_SIGNED_IN                 = -2141899769; /* 0x80553407 */
-constexpr int NP_WEBAPI2_ERROR_PUSH_EVENT_FILTER_NOT_FOUND   = -2141899765; /* 0x8055340b */
-constexpr int NP_WEBAPI2_ERROR_PUSH_EVENT_CALLBACK_NOT_FOUND = -2141899764; /* 0x8055340c */
+constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT       = -2141899774; /* 0x80553402 */
+constexpr int NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID = -2141899773; /* 0x80553403 */
+constexpr int NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND  = -2141899772; /* 0x80553404 */
+constexpr int NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND      = -2141899770; /* 0x80553406 */
+constexpr int NP_WEBAPI2_ERROR_NOT_SIGNED_IN          = -2141899769; /* 0x80553407 */
 
 struct NpWebApi2MemoryPoolStats {
 	size_t  pool_size;
@@ -2065,12 +2059,8 @@ struct NpWebApi2MemoryPoolStats {
 	int32_t reserved;
 };
 
-static std::mutex                   g_np_webapi2_context_mutex;
-static std::map<int, size_t>        g_np_webapi2_contexts;
-static std::map<int, std::set<int>> g_np_webapi2_filters;   // lib_ctx_id -> {filter_id}
-static std::map<int, std::set<int>> g_np_webapi2_callbacks; // user_ctx_id -> {callback_id}
-static int                          g_np_webapi2_next_filter_id   = 1;
-static int                          g_np_webapi2_next_callback_id = 1;
+static std::mutex            g_np_webapi2_context_mutex;
+static std::map<int, size_t> g_np_webapi2_contexts;
 
 struct NpWebApi2ResponseInformationOption {
 	int32_t http_status;
@@ -2109,8 +2099,8 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 	return id;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int                       lib_ctx_id,
-                                                     NpWebApi2MemoryPoolStats* stats) {
+static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
+                                                   NpWebApi2MemoryPoolStats* stats) {
 	if (stats == nullptr) {
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 	}
@@ -2118,7 +2108,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int                       l
 		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
 	}
 	std::lock_guard lock(g_np_webapi2_context_mutex);
-	const auto      context = g_np_webapi2_contexts.find(lib_ctx_id);
+	const auto context = g_np_webapi2_contexts.find(lib_ctx_id);
 	if (context == g_np_webapi2_contexts.end()) {
 		return NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 	}
@@ -2192,7 +2182,7 @@ static int KYTY_SYSV_ABI NpWebApi2AbortRequest(int64_t request_id) {
 
 	return (NpWebApi2Requests().find(request_id) == NpWebApi2Requests().end()
 	            ? NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND
-				: 0);
+	            : 0);
 }
 
 static int KYTY_SYSV_ABI
@@ -2386,17 +2376,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filt
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
 	LOGF("\t filter_id  = %d\n", filter_id);
 
-	// Implementazione offline: la gestione dei filtri usa un contatore senza
-	// stato persistente, quindi la cancellazione e' sempre considerata riuscita
-	// se gli argomenti non sono palesemente invalidi.
-	if (lib_ctx_id <= 0) {
-		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
-	}
-	std::lock_guard lock(g_np_webapi2_context_mutex);
-	if (g_np_webapi2_contexts.find(lib_ctx_id) == g_np_webapi2_contexts.end()) {
-		return NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
-	}
-	return OK;
+	return 0;
 }
 
 static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
@@ -2406,11 +2386,9 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_i
 	LOGF("\t user_context_id = %d\n", user_context_id);
 	LOGF("\t callback_id     = %d\n", callback_id);
 
-	// Implementazione offline: i callback sono stub senza stato persistente;
-	// la de-registrazione e' sempre considerata riuscita per qualsiasi ID
-	// assegnato da NpWebApi2PushEventRegisterCallback.
-	return OK;
+	return 0;
 }
+
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
 	// Timeout processing is an internal maintenance tick in Prospero. Requests
 	// complete synchronously in this implementation, so there is no pending
@@ -2426,8 +2404,7 @@ static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
 	}
 	std::lock_guard lock(g_np_webapi2_context_mutex);
-	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK
-	                                                    : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
+	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 }
 
 LIB_DEFINE(InitNet_1_NpWebApi2) {
@@ -2807,8 +2784,7 @@ static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingSta
 	return OK;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int       type,
-                                                                         uint32_t* count) {
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
 	PRINT_NAME();
 
 	if (type < 1 || type > 3 || count == nullptr) {

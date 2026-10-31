@@ -276,13 +276,13 @@ static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceInitializePlayerDialogParam() {
+static void KYTY_SYSV_ABI SystemServiceInitializePlayerDialogParam() {
 	PRINT_NAME();
-	return OK;
 }
 
 static int KYTY_SYSV_ABI SystemServiceLaunchPlayerDialog() {
 	PRINT_NAME();
+
 	return OK;
 }
 

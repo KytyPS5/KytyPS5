@@ -1844,10 +1844,15 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size, bool defer_pending_storage) {
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	if (defer_pending_storage && std::ranges::any_of(m_storage_downloads, [&](ImageId id) {
+		    return m_slot_images[id].Overlaps(page_begin, page_end - page_begin);
+	    })) {
+		return false;
+	}
 	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
@@ -1865,6 +1870,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 			MarkAsMaybeDirty(id, owner);
 		}
 	}
+	return true;
 }
 
 bool TextureCache::IsMeta(uint64_t address) {

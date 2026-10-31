@@ -92,6 +92,11 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// Lock-free: grows with every change of the dirty bits, made under the lock. Equal values
+	// mean no change in between (see MemoryTracker::ForEachUploadRange).
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -111,6 +116,7 @@ public:
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
+		Bump();
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
@@ -133,6 +139,7 @@ public:
 		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			Bump();
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
@@ -148,6 +155,8 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	void Bump() noexcept { m_generation.fetch_add(1, std::memory_order_release); }
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -194,6 +203,8 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// Starts at 1: a sum of existing regions' generations is never 0.
+	std::atomic<uint64_t> m_generation {1};
 };
 
 } // namespace Libs::Graphics

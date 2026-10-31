@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -83,29 +84,86 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		// Draws bind the same ranges again and again, unchanged. A call leaves its range
+		// CPU-clean, and GPU-dirty when written; the same call again, with no change to the
+		// range's regions since (their generations sum to the same value), would find nothing to
+		// upload and change nothing, so it only runs the upload callback.
+		auto& memo = UploadMemoSlot(vaddr, size, is_written);
+		if (memo.tracker == m_id && memo.vaddr == vaddr && memo.size == size &&
+		    memo.written == is_written && memo.generations == RegionGenerations(vaddr, size)) {
+			upload_func();
+			s_upload_owner = previous_upload_owner;
+			return;
+		}
+		// The regions' generations as this call leaves them, read under their locks.
+		uint64_t generations = 0;
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {
+				generations += manager->Generation();
 				manager->lock.unlock();
 			}
 		});
 		upload_func();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
-			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				               manager->template ChangeState<DirtySource::Gpu, true>(
 				                   manager->GetCpuAddr() + offset, bytes);
+				               generations += manager->Generation();
 				               manager->lock.unlock();
 			               });
 		}
 		s_upload_owner = previous_upload_owner;
+		memo           = {.tracker     = m_id,
+		                  .vaddr       = vaddr,
+		                  .size        = size,
+		                  .generations = generations,
+		                  .written     = is_written};
 	}
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+
+	// ForEachUploadRange's last call per range, per thread.
+	struct UploadMemo {
+		uint64_t tracker     = 0;
+		uint64_t vaddr       = 0;
+		uint64_t size        = 0;
+		uint64_t generations = 0;
+		bool     written     = false;
+	};
+	static constexpr size_t UPLOAD_MEMO_SLOTS = 4096;
+	inline static thread_local std::unique_ptr<std::array<UploadMemo, UPLOAD_MEMO_SLOTS>>
+	                                    s_upload_memo;
+	inline static std::atomic<uint64_t> s_next_id {1};
+
+	[[nodiscard]] static UploadMemo& UploadMemoSlot(uint64_t vaddr, uint64_t size, bool written) {
+		if (s_upload_memo == nullptr) {
+			s_upload_memo = std::make_unique<std::array<UploadMemo, UPLOAD_MEMO_SLOTS>>();
+		}
+		auto hash = (vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull) ^ (written ? 1u : 0u);
+		hash ^= hash >> 29u;
+		return (*s_upload_memo)[hash % UPLOAD_MEMO_SLOTS];
+	}
+
+	// Lock-free sum of the generations of the regions the range touches; 0 when one of them
+	// does not exist yet.
+	[[nodiscard]] uint64_t RegionGenerations(uint64_t vaddr, uint64_t size) const noexcept {
+		uint64_t sum = 0;
+		for (auto index = vaddr / TRACKER_REGION_SIZE;
+		     index <= (vaddr + size - 1) / TRACKER_REGION_SIZE; index++) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				return 0;
+			}
+			sum += manager->Generation();
+		}
+		return sum;
+	}
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
@@ -150,6 +208,8 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	// Tells upload memos of a destroyed tracker from this one's.
+	const uint64_t m_id = s_next_id.fetch_add(1, std::memory_order_relaxed);
 };
 
 } // namespace Libs::Graphics

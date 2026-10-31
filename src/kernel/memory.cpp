@@ -891,6 +891,13 @@ bool MayBeGpuWritten(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size);
 }
 
+bool HasGpuWrittenBytes(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
 bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return false;

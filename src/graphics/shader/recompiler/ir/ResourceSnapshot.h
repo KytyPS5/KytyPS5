@@ -44,6 +44,13 @@ struct ImageTableSnapshot {
 	uint64_t                     slots_id = 0;
 };
 
+// A flattened SRT dword run whose guest bytes the GPU writes (see ResourceSnapshot).
+struct GpuFlatLoad {
+	uint64_t address = 0;
+	uint32_t slot    = 0;
+	uint32_t count   = 0;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -53,6 +60,9 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	// Flattened SRT dwords that the GPU writes before the shader runs and that the execution thread
+	// did not read back: the bindings copy them into the uploaded dwords on the GPU.
+	mutable std::vector<GpuFlatLoad> gpu_flat_loads;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

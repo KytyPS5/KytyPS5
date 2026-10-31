@@ -803,6 +803,20 @@ struct UniformFillPlan {
 	Value                element_count;
 };
 
+// What a descriptor source is for the refresh of its words on the execution thread.
+enum class DescriptorRefresh : uint8_t { None, Buffer, Image };
+
+// The bits of a descriptor word that nothing a resolution derives from the descriptor depends on:
+// the base address of a V# (the host binds the buffer at that address when the operation executes)
+// and the LOD warning, perf_mod and mip statistics fields of a T# (the host ignores them).
+constexpr uint32_t DescriptorRefreshMask(DescriptorRefresh kind, uint32_t word) {
+	switch (kind) {
+		case DescriptorRefresh::Buffer: return word == 0 ? 0xffffffffu : (word == 1 ? 0x0000ffffu : 0u);
+		case DescriptorRefresh::Image: return word == 5 ? 0x027fff00u : (word == 6 ? 0x000000ffu : 0u);
+		default: return 0u;
+	}
+}
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -836,6 +850,12 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// By descriptor source: whether it is the descriptor of direct buffers or images only, whose
+	// words have bits the execution thread may refresh (see DescriptorRefreshMask()).
+	std::vector<DescriptorRefresh>      descriptor_refresh;
+	// By descriptor word (source * 8 + word): the flattened SRT dword the load of a refreshable
+	// word also fills, else UINT32_MAX.
+	std::vector<uint32_t>               descriptor_word_flat;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.

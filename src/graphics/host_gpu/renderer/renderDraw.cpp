@@ -725,7 +725,7 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	shaders_resolved = resolved != nullptr && resolved->compute_module == nullptr &&
 	                   resolved->storage.state.indirect_offsets == indirect_offsets &&
 	                   resolved->storage.state.indirect_draw == indirect_draw &&
-	                   resolved->programs.reads.StillValid();
+	                   resolved->programs.Revalidate();
 	if (shaders_resolved) {
 		return resolved->storage.state;
 	}
@@ -1359,7 +1359,7 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
                                           const ShaderModule*&    module) {
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 	if (resolved == nullptr || resolved->compute_module == nullptr ||
-	    !resolved->programs.reads.StillValid()) {
+	    !resolved->programs.Revalidate(true)) {
 		return false;
 	}
 	input_info = resolved->compute;

@@ -1114,6 +1114,41 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// The flattened SRT dwords that the GPU writes before the shader runs (see
+// GuestReadLog::RefreshFlatLoads()): copied on the GPU, in stream order, from the cached buffers
+// into the uploaded dwords, instead of reading them back on the execution thread.
+static void CopyGpuFlatLoads(RenderContext& context, const vk::DescriptorBufferInfo& target,
+                             std::span<const ShaderRecompiler::IR::GpuFlatLoad> loads) {
+	auto& cache = context.GetBufferCache();
+	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
+	copies.reserve(loads.size());
+	for (const auto& load: loads) {
+		const auto bytes            = uint64_t {load.count} * sizeof(uint32_t);
+		const auto [buffer, offset] = cache.ObtainBuffer(load.address, bytes, false);
+		copies.push_back({buffer->Handle(),
+		                  vk::BufferCopy {offset, target.offset + uint64_t {load.slot} * sizeof(uint32_t),
+		                                  bytes}});
+	}
+	auto& command = context.GetCommandScheduler().Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	for (const auto& [source, copy]: copies) {
+		native.copyBuffer(source, target.buffer, 1, &copy);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eUniformRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+}
+
 // Whether binding `texture` (a table element nothing else in the operation binds) leaves its
 // image as it is: CommitBindings() would record no barrier for it.
 // Whether a table element's view, just acquired in `state`, can be kept while the image keeps that
@@ -2097,6 +2132,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (!snapshot.gpu_flat_loads.empty()) {
+			CopyGpuFlatLoads(m_context, prepared.flattened_srt, snapshot.gpu_flat_loads);
+			snapshot.gpu_flat_loads.clear();
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);

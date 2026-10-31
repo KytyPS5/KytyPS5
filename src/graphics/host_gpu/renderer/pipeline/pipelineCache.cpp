@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -139,8 +140,8 @@ bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
-void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value) {
-	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value);
+void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t flat_slot) {
+	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
 }
 
 class ProgramLockGuard {
@@ -345,7 +346,41 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 	return true;
 }
 
-void GuestReadLog::RecordLoad(uint64_t address, uint32_t value) {
+void GuestReadLog::RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot) {
+	if (ShaderRecompiler::IR::IsDescriptorSlot(flat_slot)) {
+		const auto source = ShaderRecompiler::IR::DescriptorSlotSource(flat_slot);
+		const auto word   = ShaderRecompiler::IR::DescriptorSlotWord(flat_slot);
+		const auto kind   = m_plan != nullptr && source < m_plan->descriptor_refresh.size()
+		                        ? m_plan->descriptor_refresh[source]
+		                        : ShaderRecompiler::IR::DescriptorRefresh::None;
+		const auto offset = static_cast<uint32_t>(m_bytes.size());
+		Append(address, &value, sizeof(value), false);
+		const auto mask = ShaderRecompiler::IR::DescriptorRefreshMask(kind, word);
+		if (mask != 0) {
+			auto&      entry = m_entries.back();
+			const auto index = static_cast<uint32_t>(m_words.size());
+			m_words.push_back(
+			    {.offset = offset, .stage = m_stage, .source = source, .word = word, .mask = mask});
+			if (entry.words_begin == entry.words_end) {
+				entry.words_begin = index;
+			}
+			entry.words_end = index + 1;
+		}
+		return;
+	}
+	if (flat_slot != ShaderRecompiler::IR::NoFlatSlot) {
+		if (!m_flat_loads.empty()) {
+			auto& last = m_flat_loads.back();
+			const auto next = last.address + uint64_t {last.count} * sizeof(uint32_t);
+			if (last.stage == m_stage && next == address && last.slot + last.count == flat_slot &&
+			    (address & 0xfffu) != 0) {
+				last.count++;
+				return;
+			}
+		}
+		m_flat_loads.push_back({address, m_stage, flat_slot, 1});
+		return;
+	}
 	Append(address, &value, sizeof(value), false);
 }
 
@@ -508,6 +543,7 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 }
 
 bool GuestReadLog::StillValid() const {
+	m_refresh.clear();
 	if (m_failed) {
 		return false;
 	}
@@ -558,7 +594,10 @@ bool GuestReadLog::StillValid() const {
 				                       : Libs::LibKernel::Memory::TryReadAroundGpuWrites(
 				                             entry.address + done, buffer.data(), bytes);
 				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
-					return false;
+					if (!refreshable(entry)) {
+						return false;
+					}
+					break;
 				}
 			}
 			if (around) {
@@ -567,7 +606,8 @@ bool GuestReadLog::StillValid() const {
 			// A plain load, as the execution thread's own walk reads: GPU-owned pages fault and
 			// read the GPU's bytes back.
 			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
-			                    entry.size)) {
+			                    entry.size) &&
+			    !refreshable(entry)) {
 				return false;
 			}
 			continue;
@@ -1426,6 +1466,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const auto stage_index    = ahead.stages++;
 	auto&      resources      = ahead.resources[stage_index];
 	auto&      specialization = ahead.specializations[stage_index];
+	ahead.plans[stage_index] = &entry->second.resource_plan;
+	ahead.reads.SetStage(stage_index, &entry->second.resource_plan);
 	// The walker's loads of GPU-owned pages read the backing store instead of downloading
 	// GPU-written bytes, and the loads that still fault fail the walk; every load is logged with
 	// the value it read, for the execution thread to check.

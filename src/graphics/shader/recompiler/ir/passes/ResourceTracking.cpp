@@ -3671,16 +3671,21 @@ private:
 		indirect.table_immediate = low_memory->offset & ~3u;
 		indirect.table_source = InternSource(table_source);
 		indirect.table_scalar = true;
-		uint64_t function = 0;
+		uint64_t              function = 0;
+		std::vector<uint64_t> functions;
 		for (const auto& body: m_decoded.call_bodies) {
-			if (body.begin <= element_pc && element_pc < body.end) function = body.address;
+			if (body.begin <= element_pc && element_pc < body.end) {
+				function  = body.address;
+				functions = body.aliases;
+			}
 		}
 		indirect.pointer_table = DescriptorSource::IndirectDescriptor::PointerTable {
 		    .offset = record_offset,
 		    .buffer = true,
 		    .element_stride = element_stride,
 		    .element_offset = (element_offset & ~3u) + (element_immediate & ~3u),
-		    .function = function};
+		    .function = function,
+		    .functions = std::move(functions)};
 		DescriptorSource source;
 		source.dword_count = handle.NumArgs();
 		source.dwords.fill(Value(0u));

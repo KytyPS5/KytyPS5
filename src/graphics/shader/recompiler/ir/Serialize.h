@@ -164,7 +164,7 @@ KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, 
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
                l, m, n, o)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d, e, f, g, h)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d, e, f, g, h, i)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p,
                q, r, s, t)
 KYTY_IO_FIELDS(DescriptorSource, a, b, c)

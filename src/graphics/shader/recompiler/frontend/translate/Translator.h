@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/assert.h"
+#include <optional>
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
@@ -39,6 +40,8 @@ public:
 	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
+	// The runtime word an expanded instruction's literal stands for (Decoder::RuntimeLiteral).
+	std::optional<uint32_t> runtime_word;
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,

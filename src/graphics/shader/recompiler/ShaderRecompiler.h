@@ -79,6 +79,9 @@ struct ShaderSource {
 	bool refresh_failed = false;
 	std::string refresh_failure;
 	std::optional<Linked> linked;
+	// The addresses the expanded program reads at run time (Decoder::RuntimeLiteral), current
+	// after each refresh: they change without changing the program.
+	std::vector<uint32_t> call_words;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 

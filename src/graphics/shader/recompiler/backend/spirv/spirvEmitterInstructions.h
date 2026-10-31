@@ -259,6 +259,7 @@ uint32_t              EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst&
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
+uint32_t              EmitReadCallWord(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadRealtimeClock(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;

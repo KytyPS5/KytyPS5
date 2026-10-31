@@ -85,6 +85,9 @@ struct SrtRuntime {
 	// above the null page with the value it read. A load whose value only fills a flattened SRT
 	// dword reports that dword: nothing else the walk resolved depends on its bytes.
 	SrtLoadRecorder           record_load           = nullptr;
+	// The runtime words of an expanded program (ShaderSource::call_words): they follow the
+	// walked SRT words in the flattened SRT, where ReadCallWord reads them.
+	std::span<const uint32_t> call_words;
 };
 
 class SrtReadCapture {

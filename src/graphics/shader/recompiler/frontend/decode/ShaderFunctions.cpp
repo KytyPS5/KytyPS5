@@ -21,6 +21,11 @@ constexpr uint32_t MaxFunctionWords  = 4096;
 constexpr uint32_t MaxExpandedWords  = 524288;
 constexpr uint64_t MaxCallTableBytes = 16u * 1024u * 1024u;
 constexpr size_t   MaxCallTargets    = 256;
+// A call table can name many more functions, as long as their code is that of at most
+// MaxCallTargets bodies (Gran Turismo 7's any-hit table: 10614 rows, 1695 addresses).
+constexpr size_t   MaxCallTableTargets = 4096;
+// CallSite::consumed names VGPR n as VgprHeld + n.
+constexpr uint32_t VgprHeld          = 0x10000;
 
 bool IsCall(uint32_t word) {
 	return (word & 0xff80ff00u) == 0xbe802100u && ((word >> 16u) & 127u) != 125u;
@@ -268,13 +273,9 @@ std::optional<uint32_t> ScalarIndex(const Operand& operand) {
 	}
 }
 
-void EmitMove(std::vector<uint32_t>& code, uint32_t reg, uint32_t value) {
-	code.push_back(0xbe8003ffu | (reg << 16u)); // S_MOV_B32 s[reg], literal
-	code.push_back(value);
-}
-
+template <typename Move>
 bool EmitOriginalPc(std::vector<uint32_t>& code, const Instruction& inst, uint64_t base,
-                    std::string& reason) {
+                    std::string& reason, const Move& move) {
 	if (inst.dst.kind == OperandKind::Null) {
 		code.push_back(0xbf800000u); // S_NOP retains an instruction boundary.
 		return true;
@@ -289,9 +290,26 @@ bool EmitOriginalPc(std::vector<uint32_t>& code, const Instruction& inst, uint64
 	// Expansion changes instruction positions, but GETPC must still address the
 	// original shader's constants/code. MOV does not change SCC, matching GETPC.
 	const auto pc = base + inst.pc + 4u;
-	EmitMove(code, reg, static_cast<uint32_t>(pc));
-	EmitMove(code, reg + 1u, static_cast<uint32_t>(pc >> 32u));
+	move(reg, static_cast<uint32_t>(pc));
+	move(reg + 1u, static_cast<uint32_t>(pc >> 32u));
 	return true;
+}
+
+// The runtime words of an expansion (see ShaderFunctionExpander::RuntimeLiterals()).
+struct ExpansionWords {
+	std::vector<RuntimeLiteral> literals;
+	std::vector<uint32_t>       words;
+};
+
+// Code identity of a call target: its instructions (branch offsets are relative).
+uint64_t FunctionContentKey(const Function& function) {
+	uint64_t key = 0xcbf29ce484222325ull;
+	for (const auto& inst: function.instructions) {
+		for (uint32_t i = 0; i < inst.word_count; ++i) {
+			key = (key ^ inst.raw[i]) * 0x100000001b3ull;
+		}
+	}
+	return key;
 }
 
 using Branches = std::vector<std::pair<uint32_t, uint32_t>>;
@@ -509,10 +527,12 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 				    table[offset / 4u] | (uint64_t {table[offset / 4u + 1u]} << 32u);
 				if (address == 0) continue; // A runtime null target takes the explicit trap path.
 				addresses.insert(address);
-				if (addresses.size() > MaxCallTargets) {
-					reason = "shader call table exceeds the bounded target count";
-					return false;
-				}
+			}
+			if (addresses.size() > MaxCallTableTargets) {
+				reason = "shader call table exceeds the bounded target count (" + std::to_string(addresses.size()) +
+				         " targets in " + std::to_string((size - first_slot + step - 1) / step) + " slots of " +
+				         std::to_string(step) + " bytes)";
+				return false;
 			}
 		}
 		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()}});
@@ -570,12 +590,19 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
                     const std::vector<CallSite>& sites, const std::set<uint32_t>& dependencies,
                     const ShaderCodeReader& read, uint32_t wave_size,
                     std::vector<uint32_t>& expanded, std::vector<LongBranch>& long_branches,
-                    std::string& reason, std::vector<InlinedCallBody>* bodies = nullptr) {
+                    std::string& reason, std::vector<InlinedCallBody>* bodies = nullptr,
+                    ExpansionWords* runtime = nullptr) {
 	if (bodies != nullptr) bodies->clear();
+	if (runtime != nullptr) *runtime = {};
 	long_branches.clear();
 	const auto&              program = analysis.program;
 	std::map<uint32_t, Call> calls;
 	for (const auto& site: sites) {
+		// Without runtime words every target gets a body of its own.
+		if (site.addresses.size() > MaxCallTargets && runtime == nullptr) {
+			reason = "shader call table exceeds the bounded target count";
+			return false;
+		}
 		Call call {site.source_reg, site.return_reg, site.dynamic, {}};
 		for (const auto address: site.addresses) {
 			CallTarget target {address, {}};
@@ -623,6 +650,24 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		}
 	}
 	std::vector<uint32_t>                      result;
+	// Address literals: with runtime words, the code holds a word index and the address goes to
+	// the words (the shader reads it at run time).
+	const auto address_literal = [&](uint32_t at, uint32_t value) {
+		if (runtime == nullptr) return value;
+		runtime->literals.push_back({at * 4u, static_cast<uint32_t>(runtime->words.size())});
+		runtime->words.push_back(value);
+		return runtime->literals.back().word;
+	};
+	const auto move_address = [&](uint32_t reg, uint32_t value) {
+		const auto at = static_cast<uint32_t>(result.size());
+		result.push_back(0xbe8003ffu | (reg << 16u)); // S_MOV_B32 s[reg], literal
+		result.push_back(address_literal(at, value));
+	};
+	const auto compare_address = [&](uint32_t reg, uint32_t value) {
+		const auto at = static_cast<uint32_t>(result.size());
+		result.push_back(0xbf06ff00u | reg); // S_CMP_EQ_U32 s[reg], literal
+		result.push_back(address_literal(at, value));
+	};
 	std::map<uint32_t, uint32_t>               main_pc;
 	std::vector<std::pair<uint32_t, uint32_t>> main_branches;
 	Branches                                   relocations;
@@ -633,7 +678,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			if (inst.opcode == Opcode::S_ENDPGM) {
 				result.push_back(0xbf810000u);
 			} else if (inst.opcode == Opcode::S_GETPC_B64) {
-				if (!EmitOriginalPc(result, inst, base, reason)) return false;
+				if (!EmitOriginalPc(result, inst, base, reason, move_address)) return false;
 			} else {
 				if (IsDirectBranch(inst.opcode))
 					main_branches.emplace_back(result.size(), inst.branch_target);
@@ -643,10 +688,11 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			const auto&           call      = found->second;
 			const uint64_t        return_pc = base + inst.pc + inst.word_count * 4u;
 			std::vector<uint32_t> returns;
-			auto                  emit_target = [&](const CallTarget& target) -> bool {
+			auto                  emit_target = [&](const CallTarget& target,
+			                                    std::span<const CallTarget* const> aliases = {}) -> bool {
 				const auto body_begin = static_cast<uint32_t>(result.size());
-				EmitMove(result, call.return_reg, static_cast<uint32_t>(return_pc));
-				EmitMove(result, call.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
+				move_address(call.return_reg, static_cast<uint32_t>(return_pc));
+				move_address(call.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
 				std::map<uint32_t, uint32_t>               local_pc;
 				std::vector<std::pair<uint32_t, uint32_t>> branches;
 				for (const auto& body: target.function.instructions) {
@@ -656,7 +702,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 						returns.push_back(at);
 						result.push_back(0xbf820000u); // S_BRANCH to the caller's continuation.
 					} else if (body.opcode == Opcode::S_GETPC_B64) {
-						if (!EmitOriginalPc(result, body, target.address, reason)) return false;
+						if (!EmitOriginalPc(result, body, target.address, reason, move_address)) return false;
 					} else {
 						if (IsDirectBranch(body.opcode))
 							branches.emplace_back(at, body.branch_target);
@@ -666,9 +712,11 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				for (const auto& [at, target]: branches) {
 					relocations.emplace_back(at, local_pc.at(target));
 				}
-				if (bodies != nullptr)
+				if (bodies != nullptr) {
 					bodies->push_back({body_begin * 4u, static_cast<uint32_t>(result.size()) * 4u,
 					                   target.address});
+					for (const auto* alias: aliases) bodies->back().aliases.push_back(alias->address);
+				}
 				return true;
 			};
 			if (call.dynamic) {
@@ -687,7 +735,74 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				});
 				const auto select_scc = static_cast<uint32_t>(result.size());
 				if (keep_scc) result.push_back(0xbf850000u);
-				for (uint32_t scc = 0; scc < (keep_scc ? 2u : 1u); ++scc) {
+				// With runtime words the targets follow their code, not their addresses (the
+				// game loads its functions in a different order on each start), and each
+				// compares both address words, which the shader reads at run time.
+				// Targets with the same code share one body: each one's compares branch to it (a
+				// function that reads its own address, S_GETPC_B64, keeps a body of its own).
+				std::vector<std::vector<const CallTarget*>> groups;
+				if (runtime != nullptr) {
+					std::vector<const CallTarget*> ordered;
+					for (const auto& target: call.targets) ordered.push_back(&target);
+					std::ranges::stable_sort(ordered, {}, [](const CallTarget* target) {
+						return FunctionContentKey(target->function);
+					});
+					const auto same_code = [](const Function& a, const Function& b) {
+						return std::ranges::equal(a.instructions, b.instructions, [](const auto& x, const auto& y) {
+							return x.word_count == y.word_count && std::equal(x.raw, x.raw + x.word_count, y.raw);
+						});
+					};
+					const auto reads_pc = [](const Function& function) {
+						return std::ranges::any_of(function.instructions, [](const Instruction& inst) {
+							return inst.opcode == Opcode::S_GETPC_B64;
+						});
+					};
+					for (const auto* target: ordered) {
+						if (!groups.empty() && !reads_pc(target->function) &&
+						    FunctionContentKey(groups.back().front()->function) == FunctionContentKey(target->function) &&
+						    same_code(groups.back().front()->function, target->function)) {
+							groups.back().push_back(target);
+						} else {
+							groups.push_back({target});
+						}
+					}
+					if (groups.size() > MaxCallTargets) {
+						reason = "shader call table exceeds the bounded body count (" + std::to_string(groups.size()) +
+						         " bodies for " + std::to_string(call.targets.size()) + " targets)";
+						return false;
+					}
+				}
+				for (uint32_t scc = 0; runtime != nullptr && scc < (keep_scc ? 2u : 1u); ++scc) {
+					if (scc != 0) relocations.emplace_back(select_scc, result.size());
+					for (const auto& group: groups) {
+						// Each target but the last branches to the body; the last one falls into it.
+						std::vector<uint32_t> hits;
+						for (size_t member = 0; member < group.size(); ++member) {
+							const auto* target = group[member];
+							compare_address(call.source_reg + 1u, static_cast<uint32_t>(target->address >> 32u));
+							const auto high_miss = static_cast<uint32_t>(result.size());
+							result.push_back(0xbf840000u);
+							compare_address(call.source_reg, static_cast<uint32_t>(target->address));
+							const auto low_miss = static_cast<uint32_t>(result.size());
+							result.push_back(0xbf840000u);
+							if (keep_scc) result.push_back(scc != 0 ? 0xbf068080u : 0xbf068180u);
+							if (member + 1u < group.size()) {
+								hits.push_back(static_cast<uint32_t>(result.size()));
+								result.push_back(0xbf820000u); // S_BRANCH to the body.
+								relocations.emplace_back(high_miss, result.size());
+								relocations.emplace_back(low_miss, result.size());
+								continue;
+							}
+							for (const auto at: hits) relocations.emplace_back(at, result.size());
+							if (!emit_target(*group.front(), std::span(group).subspan(1))) return false;
+							relocations.emplace_back(high_miss, result.size());
+							relocations.emplace_back(low_miss, result.size());
+						}
+					}
+					result.push_back(0xbf920000u | ShaderCallMissTrapCode);
+					result.push_back(0xbf810000u);
+				}
+				for (uint32_t scc = 0; runtime == nullptr && scc < (keep_scc ? 2u : 1u); ++scc) {
 					if (scc != 0) relocations.emplace_back(select_scc, result.size());
 					std::map<uint32_t, std::vector<const CallTarget*>> groups;
 					for (const auto& target: call.targets)
@@ -815,6 +930,7 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<uint32_t> code;
 		std::vector<LongBranch> long_branches;
 		std::vector<InlinedCallBody> bodies;
+		ExpansionWords              runtime;
 	};
 	struct Shader {
 		uint64_t               code_hash = 0;
@@ -831,6 +947,7 @@ struct ShaderFunctionExpander::Impl {
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<InlinedCallBody>         bodies;  // of the last expansion
 	std::vector<LongBranch>              long_branches; // of the last expansion
+	ExpansionWords                       runtime;       // of the last expansion
 	std::vector<uint32_t>                scratch;
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
@@ -854,6 +971,14 @@ const std::vector<InlinedCallBody>& ShaderFunctionExpander::Bodies() const {
 
 const std::vector<LongBranch>& ShaderFunctionExpander::LongBranches() const {
 	return m_impl->long_branches;
+}
+
+const std::vector<RuntimeLiteral>& ShaderFunctionExpander::RuntimeLiterals() const {
+	return m_impl->runtime.literals;
+}
+
+const std::vector<uint32_t>& ShaderFunctionExpander::RuntimeWords() const {
+	return m_impl->runtime.words;
 }
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
@@ -922,6 +1047,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 			reason   = expansion.reason;
 			m_impl->bodies        = expansion.bodies;
 			m_impl->long_branches = expansion.long_branches;
+			m_impl->runtime       = expansion.runtime;
 			return expansion.ok;
 		}
 	}
@@ -938,9 +1064,10 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	};
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
 	                              wave_size, expansion.code, expansion.long_branches,
-	                              expansion.reason, &expansion.bodies);
+	                              expansion.reason, &expansion.bodies, &expansion.runtime);
 	m_impl->bodies        = expansion.bodies;
 	m_impl->long_branches = expansion.long_branches;
+	m_impl->runtime       = expansion.runtime;
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;

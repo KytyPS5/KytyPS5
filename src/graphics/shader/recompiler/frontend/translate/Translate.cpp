@@ -136,6 +136,10 @@ std::array<IR::U32, 2> Translator::VectorMask(IR::U1 value) {
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::LiteralConstant:
+			if (runtime_word) {
+				return IR::U32(ir.Emit(IR::ValueOpcode::ReadCallWord, {IR::Value(*runtime_word)}));
+			}
+			return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
@@ -1480,8 +1484,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  options.input_info.vertex->resources[resource]);
 				continue;
 			}
+			const auto literal = std::ranges::lower_bound(decoded.runtime_literals, instruction.pc, {},
+			                                              &Decoder::RuntimeLiteral::pc);
+			translator.runtime_word.reset();
+			if (literal != decoded.runtime_literals.end() && literal->pc == instruction.pc) {
+				translator.runtime_word = literal->word;
+			}
 			translator.TranslateInstruction(instruction);
 		}
+		translator.runtime_word.reset();
 		translator.AddBranchCondition(cfg, cfg_block, *block);
 	}
 	return result;

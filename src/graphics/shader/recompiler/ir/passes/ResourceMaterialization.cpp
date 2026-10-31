@@ -705,12 +705,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			if (!function_slot) return failed("record function", fmt::format("function={:#x}", pointer.function));
 		}
+		// The function and the targets that share its inlined code.
+		std::unordered_set<uint64_t> functions {pointer.function & AddressMask};
+		for (const auto alias: pointer.functions) functions.insert(alias & AddressMask);
 		std::vector<uint64_t> records;
 		for (uint64_t row = 0; row < rows; ++row) {
 			if (function_slot &&
 			    ((indirect.table_offset & ~3u) + row * indirect.table_stride + *function_slot + 8u > table_size ||
-			     (row_word(row, (indirect.table_offset & ~3u) + *function_slot) & AddressMask) !=
-			         (pointer.function & AddressMask))) continue;
+			     !functions.contains(row_word(row, (indirect.table_offset & ~3u) + *function_slot) & AddressMask))) continue;
 			const auto word = (first + row * indirect.table_stride) / 4u;
 			const auto record = ((uint64_t {words[word + 1u]} << 32u) | words[word]) & AddressMask;
 			if (record != 0u) records.push_back(record);
@@ -2066,6 +2068,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
+	snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), runtime.call_words.begin(),
+	                              runtime.call_words.end());
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	std::array<uint32_t, 3> workgroup_counts {};

@@ -35,6 +35,8 @@
 #include "SrtWalkerTestMemory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -2198,8 +2200,11 @@ void TestCallTableExpansionLongBranches() {
         } else if (at >= FunctionBase && at < FunctionBase + Targets * 0x10000u) {
           const uint64_t word = ((at - FunctionBase) % 0x10000u) / 4u;
           const bool first_function = at < FunctionBase + 0x10000u;
+          // Each function differs (s_nop <row> second): targets with the same code share a body.
+          const auto function_row = static_cast<uint32_t>((at - FunctionBase) / 0x10000u);
           words[i] = word == FunctionWords - 1u ? 0xbe802006u // s_setpc_b64 s[6:7]
                      : word == 0u && reads_scc && first_function ? 0xbf850000u // s_cbranch_scc1 +0
+                     : word == 1u                                ? 0xbf800000u | function_row
                                                                   : 0xbf800000u; // s_nop 0
         } else {
           return false;
@@ -2231,6 +2236,57 @@ void TestCallTableExpansionLongBranches() {
     }
     Check(returns == expander.Bodies().size(), "a body does not return to the caller");
   }
+}
+
+void TestCallTableSharedBodies() {
+  // A call through a 600-row table whose rows name 300 copies of one function and 300 of another
+  // (Gran Turismo 7's any-hit table names 1695 addresses in 10614 rows): the targets with the same
+  // code share a body, so the expansion holds two, and each body knows its other addresses.
+  using namespace ShaderRecompiler::Decoder;
+  constexpr uint64_t TableAddress = 0x100000000ull;
+  constexpr uint64_t FunctionBase = 0x200000000ull;
+  constexpr uint32_t Rows = 600;
+  const uint32_t shader[] = {
+      0x8f088308u,              // s_lshl_b32 s8, s8, 3
+      0xf4240100u, 0x10000000u, // s_buffer_load_dwordx2 s[4:5], s[0:3], s8
+      0xbf8cc07fu,              // s_waitcnt lgkmcnt(0)
+      0xbe862104u,              // s_swappc_b64 s[6:7], s[4:5]
+      0xbf810000u,              // s_endpgm
+  };
+  const std::array<uint32_t, 4> user_data{static_cast<uint32_t>(TableAddress),
+                                          static_cast<uint32_t>(TableAddress >> 32u), Rows * 8u, 0u};
+  const auto read = [&](uint64_t address, std::span<uint32_t> words) {
+    for (size_t i = 0; i < words.size(); ++i) {
+      const uint64_t at = address + i * 4u;
+      if (at >= TableAddress && at < TableAddress + Rows * 8u) {
+        const uint64_t target = FunctionBase + (at - TableAddress) / 8u * 0x100u;
+        words[i] = ((at - TableAddress) & 4u) != 0u ? static_cast<uint32_t>(target >> 32u)
+                                                    : static_cast<uint32_t>(target);
+      } else if (at >= FunctionBase && at < FunctionBase + Rows * 0x100u) {
+        const uint64_t word = ((at - FunctionBase) % 0x100u) / 4u;
+        const bool odd = ((at - FunctionBase) / 0x100u) % 2u != 0u;
+        words[i] = word == 0u ? (odd ? 0x7e0e0281u : 0x7e0e0280u) // v_mov_b32 v7, 1 or 0
+                   : word == 1u ? 0xbe802006u                      // s_setpc_b64 s[6:7]
+                                : 0xbf800000u;                      // s_nop 0
+      } else {
+        return false;
+      }
+    }
+    return true;
+  };
+  ShaderFunctionExpander expander;
+  std::vector<uint32_t> expanded;
+  std::string reason;
+  Check(expander.Expand(shader, 0x300000000ull, user_data, read, expanded, reason, 64u),
+        ("a call table of copies of two functions did not expand: " + reason).c_str());
+  const auto& bodies = expander.Bodies();
+  Check(bodies.size() == 2u && bodies[0].aliases.size() == Rows / 2u - 1u &&
+            bodies[1].aliases.size() == Rows / 2u - 1u,
+        "the copies of a function did not share its body");
+  Program decoded;
+  DecodeProgram(expanded, decoded, expander.LongBranches());
+  Check(std::ranges::count(decoded.instructions, Opcode::S_SWAPPC_B64, &Instruction::opcode) == 0,
+        "the shared bodies left a call in the expanded program");
 }
 
 void TestInlinedCallTargetsBecomeFunctions() {
@@ -2295,12 +2351,42 @@ void TestInlinedCallTargetsBecomeFunctions() {
   std::string reason;
   Check(expander.Expand(shader, 0x300000000ull, user_data, read, expanded, reason, 32u),
         ("the call table did not expand: " + reason).c_str());
+  {
+    // The game loads its functions elsewhere on another start: the expansion follows their code,
+    // and only the runtime words (their addresses) change.
+    const auto words = expander.RuntimeWords();
+    const auto saved_table = table;
+    const auto saved_functions = functions;
+    functions.fill(0xbf800000u);
+    for (uint32_t k = 0; k < Targets; ++k) {
+      const auto code = function(k);
+      const uint32_t slot = Targets - 1u - k;
+      std::copy(code.begin(), code.end(), functions.begin() + slot * 1024u);
+      const uint64_t target = FunctionBase + slot * 4096u;
+      table[k * 2u] = static_cast<uint32_t>(target);
+      table[k * 2u + 1u] = static_cast<uint32_t>(target >> 32u);
+    }
+    Decoder::ShaderFunctionExpander moved;
+    std::vector<uint32_t> again;
+    std::string again_reason;
+    Check(moved.Expand(shader, 0x300000000ull, user_data, read, again, again_reason, 32u),
+          ("the moved call table did not expand: " + again_reason).c_str());
+    Check(again == expanded && moved.RuntimeLiterals() == expander.RuntimeLiterals(),
+          "moving the call targets changed the expanded program");
+    Check(moved.RuntimeWords() != words, "moving the call targets kept their runtime words");
+    table = saved_table;
+    functions = saved_functions;
+  }
   std::vector<uint32_t> linked(std::begin(shader), std::end(shader));
   linked.insert(linked.end(), expanded.begin(), expanded.end());
   const auto expanded_code = std::span<const uint32_t>(linked).subspan(std::size(shader));
   Decoder::Program decoded;
   Decoder::DecodeProgram(expanded_code, decoded, expander.LongBranches());
   decoded.call_bodies = expander.Bodies();
+  decoded.runtime_literals = expander.RuntimeLiterals();
+  Check(!decoded.runtime_literals.empty() &&
+            decoded.runtime_literals.size() == expander.RuntimeWords().size(),
+        "the expansion kept guest addresses as literals");
   auto translated = TranslateProgram(decoded, options);
   Check(translated.program.inlined_call_entries.size() == Targets,
         "the translated program lost its inlined call targets");
@@ -2311,6 +2397,7 @@ void TestInlinedCallTargetsBecomeFunctions() {
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(shader),
       .read_specialization_memory = ReadHostTestMemory,
+      .call_words = expander.RuntimeWords(),
   };
   Check(IR::MaterializeResources(plan, runtime, resources, specialization),
         "the expanded program's resources did not materialize");
@@ -14077,6 +14164,7 @@ int main() {
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
   TestReadLaneOfSkippedLaneSpill();
   TestCallTableExpansionLongBranches();
+  TestCallTableSharedBodies();
   TestInlinedCallTargetsBecomeFunctions();
 
   return 0;

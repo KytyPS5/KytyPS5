@@ -945,6 +945,20 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
 
+uint32_t EmitReadCallWord(ValueEmitContext& ctx, const IR::Inst& inst) {
+	// The expansion's runtime words follow the walked SRT words (see SrtRuntime::call_words).
+	auto& state = ctx.state;
+	if (state.flattened_srt_variable == 0) ctx.Fail(inst, "requires the flattened SRT descriptor");
+	const auto index   = static_cast<uint32_t>(state.program.srt_reads.size()) + inst.Arg(0).U32();
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.flattened_srt_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, index));
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 uint32_t EmitReadRealtimeClock(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto period = state.profile.device_clock_period_ps;

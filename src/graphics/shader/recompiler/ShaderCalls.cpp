@@ -176,6 +176,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 			if (source.refresh_failure.empty()) source.refresh_failure = "shader call expansion is empty";
 			return source.decoded;
 		}
+		source.call_words = source.expander->RuntimeWords();
 		if (source.linked &&
 		    std::ranges::equal(std::span(source.linked->code).subspan(source.code.size()), expanded) &&
 		    source.linked->decoded.long_branches == source.expander->LongBranches()) {
@@ -188,6 +189,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		Decoder::DecodeProgram(expanded_code, linked.decoded, source.expander->LongBranches());
 		linked.decoded.code = expanded_code;
 		linked.decoded.call_bodies = source.expander->Bodies();
+		linked.decoded.runtime_literals = source.expander->RuntimeLiterals();
 		source.linked = std::move(linked);
 		++source.revision;
 		return source.linked->decoded;

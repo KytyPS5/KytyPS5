@@ -731,6 +731,9 @@ struct DescriptorSource {
 			// The inlined call target whose code reads the descriptor: only the rows that name it
 			// hold records of its layout (0 when the read is outside inlined code).
 			uint64_t function       = 0;
+			// The other call targets that run the same inlined code (InlinedCallBody::aliases):
+			// the rows that name them hold records of the same layout.
+			std::vector<uint64_t> functions;
 
 			bool operator==(const PointerTable& other) const = default;
 		};

@@ -51,6 +51,11 @@ public:
 	[[nodiscard]] const std::vector<InlinedCallBody>& Bodies() const;
 	// The long branches of the last successful Expand(): its code decodes correctly only with them.
 	[[nodiscard]] const std::vector<LongBranch>& LongBranches() const;
+	// The address literals of the last successful Expand() (ascending pc) and the words they
+	// stand for: call targets, return and GETPC addresses. The expanded code holds word indices
+	// and orders call targets by their code, so it does not change when the game moves its code.
+	[[nodiscard]] const std::vector<RuntimeLiteral>& RuntimeLiterals() const;
+	[[nodiscard]] const std::vector<uint32_t>&       RuntimeWords() const;
 	// Whether the code Expand last analyzed at this address contains calls (true when unknown).
 	[[nodiscard]] bool HasCalls(std::span<const uint32_t> code) const;
 	// The user-data registers the last complete call resolution of this code (same content hash

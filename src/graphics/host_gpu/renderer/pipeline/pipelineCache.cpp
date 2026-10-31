@@ -857,6 +857,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (cached.call_source->refresh_failed) {
 				ExitCallExpansionFailure(params.hash, *cached.call_source);
 			}
+			runtime.call_words = cached.call_source->call_words;
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, failed);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, failed);
@@ -894,6 +895,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (entry == m_program_cache.end()) {
 				ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				if (current->refresh_failed) ExitCallExpansionFailure(params.hash, *current);
+				runtime.call_words = current->call_words;
 			}
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 			translated.program.source_reads = current->reads;

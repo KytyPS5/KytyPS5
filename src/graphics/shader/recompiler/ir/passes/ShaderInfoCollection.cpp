@@ -531,7 +531,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::GetDispatchThreadExtent:
 			info.uses_dispatch_threads |= inst.HasUses();
 			break;
-		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
+		case ValueOpcode::ReadConst:
+		case ValueOpcode::ReadCallWord: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;

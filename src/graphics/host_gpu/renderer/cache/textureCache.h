@@ -67,7 +67,7 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
-	void               InvalidateMemory(uint64_t address, uint64_t size);
+	bool               InvalidateMemory(uint64_t address, uint64_t size, bool defer_pending_storage = false);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 

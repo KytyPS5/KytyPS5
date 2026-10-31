@@ -8116,6 +8116,30 @@ public:
                                                 buffer_alias_write_value, buffer_alias_image_value},
               "republishing lost the interior buffer write or an untouched image texel");
 
+      (void)texture_cache.FindTexture(buffer_alias_image, storage_alias_desc);
+      constexpr u32 pending_image_value = 0x10293847u;
+      storage_clear.color.uint32[0] = pending_image_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), buffer_alias_image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, storage_clear);
+      const auto guest_store = alias_range.address + sizeof(u32);
+      Require(name, "guest write before storage publication",
+              !resources.GetBufferCache().IsRegionGpuModified(guest_store, sizeof(u32)) &&
+                  TextureCacheTestAccess::PendingDownload(texture_cache, buffer_alias_image) &&
+                  resources.HandleFault(PageFaultAccess::Write, guest_store),
+              "expected a write fault with an unpublished storage result");
+      std::memcpy(memory + buffer_alias_offset + sizeof(u32), &buffer_alias_write_value,
+                  sizeof(buffer_alias_write_value));
+      texture_cache.PublishStorageImages();
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "pre-publication guest write preserves neighboring texels",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  alias_range.address, published_alias.data(), sizeof(published_alias)) &&
+                  published_alias == std::array{pending_image_value, buffer_alias_write_value,
+                                                pending_image_value, pending_image_value},
+              "handling the guest write lost the rest of the pending image");
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,

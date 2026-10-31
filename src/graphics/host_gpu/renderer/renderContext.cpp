@@ -68,16 +68,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	if (access == PageFaultAccess::Write) {
+		return InvalidateMemory(fault_vaddr, fault_size);
+	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
-	}
+	m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	return true;
 }
 
@@ -86,7 +83,16 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
-	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (!m_texture_cache.InvalidateMemory(vaddr, size, !GuestGpu::IsGpuThread())) {
+		if (CommandScheduler::InDeferredOperation()) {
+			EXIT("unsupported storage image write fault from an asynchronous GPU completion\n");
+		}
+		RunGpuCommandSync([this, vaddr, size] {
+			m_texture_cache.PublishStorageImages();
+			m_buffer_cache.InvalidateMemory(vaddr, size);
+			m_texture_cache.InvalidateMemory(vaddr, size);
+		});
+	}
 	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
 }

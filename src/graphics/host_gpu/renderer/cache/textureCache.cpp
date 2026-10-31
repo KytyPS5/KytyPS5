@@ -1727,12 +1727,18 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 	return rendering.renderArea;
 }
 
-void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size, bool defer_pending_storage) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	if (defer_pending_storage && std::ranges::any_of(m_storage_downloads, [&](ImageId id) {
+		    return m_slot_images[id].Overlaps(address, size, true);
+	    })) {
+		return false;
+	}
 	InvalidateCpuAliases(address, size);
+	return true;
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {

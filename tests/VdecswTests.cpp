@@ -1,5 +1,9 @@
 #include "libs/libVdecsw.cpp"
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -59,12 +63,23 @@ struct GuardedMemory {
 	uint8_t* data;
 	size_t size;
 	explicit GuardedMemory(size_t bytes): size(bytes) {
+#if defined(_WIN32)
+		allocation = static_cast<uint8_t*>(_aligned_malloc((bytes + 767u) & ~size_t{255}, 256));
+#else
 		allocation = static_cast<uint8_t*>(std::aligned_alloc(256, (bytes + 767u) & ~size_t{255}));
+#endif
 		CHECK(allocation != nullptr);
 		data = allocation + 256;
 		std::memset(allocation, 0xa7, bytes + 512);
 	}
-	~GuardedMemory() { Check(); std::free(allocation); }
+	~GuardedMemory() {
+		Check();
+#if defined(_WIN32)
+		_aligned_free(allocation);
+#else
+		std::free(allocation);
+#endif
+	}
 	void Check() const {
 		for (size_t i = 0; i < 256; ++i)
 			CHECK(allocation[i] == 0xa7 && data[size + i] == 0xa7);
@@ -186,6 +201,12 @@ void CheckPicture(const OutputInfo& output, uint32_t frame, GuardedMemory& pixel
 	CHECK(output.frame_buffer == pixels.data && output.frame_buffer_size == pixels.size);
 	for (uint32_t y = 0; y < 16; ++y)
 		for (uint32_t x = 0; x < 16; ++x) CHECK(pixels.data[y * 256 + x] == 40 + frame * 20);
+	const uint8_t* chroma = pixels.data + output.pitch * output.height;
+	for (uint32_t y = 0; y < (output.height + 1) / 2; ++y) {
+		for (uint32_t x = output.width; x < output.pitch; ++x) {
+			CHECK(chroma[y * output.pitch + x] == 128);
+		}
+	}
 	Decoder::AvcPictureInfo picture{sizeof(picture)};
 	CHECK(GetAvcPictureInfo(&output, &picture, nullptr) == 0);
 	CHECK(picture.is_valid && picture.pts_data == frame * 1000u);
@@ -361,6 +382,31 @@ void TestDisabledInputSync() {
 	InputResult completion{sizeof(completion)};
 	CHECK(TrySyncDecodeInput(session.decoder, &completion) == Fail(Error::ApiFail));
 }
+
+void TestChromaStrideAndAlignment() {
+	Session session;
+	InputData input{sizeof(input), const_cast<uint8_t*>(Intra), sizeof(Intra), 0, 0, 0x12340000};
+	CHECK(SetDecodeInput(session.decoder, &input) == 0);
+	InputResult completion{sizeof(completion)};
+	CHECK(TrySyncDecodeInput(session.decoder, &completion) == 0);
+	GuardedMemory pixels(session.memory.max_frame_buffer_size);
+	FrameBuffer buffer{sizeof(buffer), pixels.data, pixels.size};
+	CHECK(SetDecodeOutput(session.decoder, &buffer) == 0);
+	OutputInfo output{sizeof(output)};
+	CHECK(TrySyncDecodeOutput(session.decoder, &output) == 0);
+	CHECK(output.valid);
+	CHECK(output.pitch >= output.width);
+	CHECK((output.pitch % 64) == 0 && (output.pitch % 128) == 0 && (output.pitch % 256) == 0);
+	const size_t luma_size = static_cast<size_t>(output.pitch) * output.height;
+	CHECK((luma_size % 128) == 0);
+	const uint8_t* chroma = pixels.data + luma_size;
+	const uint32_t chroma_rows = (output.height + 1) / 2;
+	for (uint32_t y = 0; y < chroma_rows; ++y) {
+		for (uint32_t x = output.width; x < output.pitch; ++x) {
+			CHECK(chroma[y * output.pitch + x] == 128);
+		}
+	}
+}
 }
 
 int main() {
@@ -372,5 +418,6 @@ int main() {
 	TestBoundedQueueFinalization();
 	TestCombinedDecode();
 	TestDisabledInputSync();
+	TestChromaStrideAndAlignment();
 	std::puts("Vdecsw tests passed");
 }

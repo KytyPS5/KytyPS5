@@ -15056,6 +15056,192 @@ public:
     std::fill_n(reinterpret_cast<uint32_t *>(mipped_storage_address),
                 0x10000 / 4, tail_backing_value);
 
+    for (const bool array : {true, false}) {
+      for (const bool is_1d : {true, false}) {
+        for (const bool sample : {false, true}) {
+          for (const bool reverse : {false, true}) {
+            const auto type = is_1d
+                                  ? (array ? Prospero::ImageType::kColor1DArray
+                                           : Prospero::ImageType::kColor1D)
+                                  : (array ? Prospero::ImageType::kColor2DArray
+                                           : Prospero::ImageType::kColor2D);
+            ShaderTextureResource descriptor{
+                {static_cast<u32>(base >> 8u),
+                 (u32(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u),
+                 is_1d ? 0u : 3u << 14u,
+                 DstSel(4, 0, 0, 1) | (u32(type) << 28u), array ? 1u : 0u,
+                 0x00700000u, 0, 0}};
+            ShaderSamplerResource sampler_descriptor{};
+            TestCase test;
+            test.name = is_1d ? "TextureBaseArray1D" : "TextureBaseArray2D";
+            test.image_descriptor_swizzle = descriptor.DstSelXYZW();
+            test.has_user_data = true;
+            std::copy_n(descriptor.fields, 8, test.user_data.begin());
+            std::copy_n(sampler_descriptor.fields, 4,
+                        test.user_data.begin() + 8);
+            test.user_data[50] = sizeof(u32);
+            test.user_data[51] = 3u << 28u;
+            test.opcodes = {
+                ShaderOpcode::V_MOV_B32,
+                sample ? ShaderOpcode::IMAGE_SAMPLE : ShaderOpcode::IMAGE_LOAD,
+                ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+            AppendVMovLiteral(&test.code, 20,
+                              sample ? std::bit_cast<u32>(0.5f) : 0u);
+            AppendVMovLiteral(&test.code, 21,
+                              sample ? std::bit_cast<u32>(0.5f) : 0u);
+            const auto image_instruction = test.code.size();
+            test.code.push_back(
+                EncodeMimg0(sample ? 0x27 : 0x00, 1, 0, false, is_1d ? 0 : 1));
+            test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+            AppendStoreVgpr(&test.code, 0, 0);
+            AppendEnd(&test.code);
+            const auto compiled = CompileCase(test, SubgroupSize());
+            const auto &resource = compiled.program.info.images.at(0);
+            Require(
+                test.name, "ordinary shader dimension",
+                resource.dimension ==
+                    (is_1d ? ShaderRecompiler::Decoder::ImageDimension::Dim1D
+                           : ShaderRecompiler::Decoder::ImageDimension::Dim2D),
+                "the shader did not request a single-layer view");
+            RenderContext context(m_runtime_context);
+            auto &scheduler = context.GetCommandScheduler();
+            HW::Context registers{};
+            HW::UserConfig user_config{};
+            HW::Shader shaders{};
+            scheduler.Begin(registers, user_config, shaders);
+            context.MapMemory(base, allocation_size);
+            auto &cache = context.GetTextureCache();
+            auto &executor = context.GetRenderExecutor();
+            TextureBinding first{};
+            vk::ImageView first_view{};
+            for (const auto base_layer :
+                 reverse ? std::array{array ? 1u : 3u, 0u}
+                         : std::array{0u, array ? 1u : 3u}) {
+              auto value = compiled.resources.images.at(0);
+              value.dwords[4] =
+                  (value.dwords[4] & ~(0x1fffu << 16u)) | (base_layer << 16u);
+              const auto original = value.dwords;
+              const auto binding = RenderExecutorTestAccess::ResolveTexture(
+                  executor, resource, value);
+              const auto view =
+                  cache.FindTexture(binding.image_id, binding.desc);
+              const auto &info = binding.desc.info;
+              Require(
+                  test.name, "guest descriptor and native view",
+                  value.dwords == original &&
+                      ShaderTextureResource{{value.dwords[0], value.dwords[1],
+                                             value.dwords[2], value.dwords[3],
+                                             value.dwords[4], value.dwords[5],
+                                             value.dwords[6], value.dwords[7]}}
+                              .BaseArray5() == base_layer &&
+                      view != nullptr &&
+                      binding.desc.view_info.base_layer ==
+                          (array ? base_layer : 0u) &&
+                      binding.desc.view_info.layer_count == 1u,
+                  "BASE_ARRAY changed the descriptor or selected the wrong "
+                  "native layer");
+              if (first_view != nullptr) {
+                Require(test.name, "physical backing reuse",
+                        binding.image_id == first.image_id &&
+                            info.data == first.desc.info.data &&
+                            info.pitch == first.desc.info.pitch &&
+                            info.extent == first.desc.info.extent &&
+                            info.mip_layout == first.desc.info.mip_layout &&
+                            info.tile_mode == first.desc.info.tile_mode &&
+                            info.DataAlignment() ==
+                                first.desc.info.DataAlignment() &&
+                            info.resources.layers ==
+                                first.desc.info.resources.layers &&
+                            info.resources.levels ==
+                                first.desc.info.resources.levels &&
+                            (array ? view != first_view : view == first_view),
+                        "BASE_ARRAY changed the physical footprint or cached "
+                        "view identity");
+              } else {
+                first = binding;
+                first_view = view;
+              }
+              auto &image = cache.GetImage(binding.image_id);
+              image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                            vk::AccessFlagBits2::eTransferWrite, {},
+                            scheduler.Current().Handle());
+              for (u32 layer = 0; layer < (array ? 2u : 1u); ++layer) {
+                vk::ClearColorValue clear{};
+                clear.float32[0] = layer == 0 ? 0.25f : 0.75f;
+                const vk::ImageSubresourceRange range{
+                    vk::ImageAspectFlagBits::eColor, 0, 1, layer, 1};
+                scheduler.Current().Handle().clearColorImage(
+                    image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                    &clear, 1, &range);
+              }
+              cache.MarkGpuWritten(binding.image_id);
+              image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                            vk::AccessFlagBits2::eShaderRead, {},
+                            scheduler.Current().Handle());
+              scheduler.Finish();
+              Image sampled;
+              sampled.view = view;
+              sampled.layout = image.backing.state.layout;
+              auto output = CreateStorageBuffer(test.name, {}, 1);
+              const auto sampler = sample
+                                       ? context.GetSamplerCache().GetSampler(
+                                             sampler_descriptor, false)
+                                       : vk::Sampler{};
+              Dispatch(test, compiled, output, nullptr, &sampled, nullptr,
+                       nullptr, sampler);
+              Require(test.name, "GPU read through cached view",
+                      ReadBuffer(test.name, output, 1) ==
+                          std::vector<u32>{std::bit_cast<u32>(
+                              array && base_layer == 1u ? 0.75f : 0.25f)},
+                      "BASE_ARRAY selected the wrong texel through the "
+                      "renderer's cached view");
+              if (!array && base_layer == 0u) {
+                auto compact_test = test;
+                compact_test.code[image_instruction] |= 1u << 15u;
+                std::fill_n(compact_test.user_data.begin() + 4, 4, UINT32_MAX);
+                const auto compact = CompileCase(compact_test, SubgroupSize());
+                const auto &compact_value = compact.resources.images.at(0);
+                Require(test.name, "four-word R128 materialization",
+                        compact.program.info.images.at(0).r128 &&
+                            compact_value.dword_count == 8u &&
+                            std::all_of(compact_value.dwords.begin() + 4,
+                                        compact_value.dwords.end(),
+                                        [](u32 word) { return word == 0u; }),
+                        "compact T# materialization consumed adjacent poisoned "
+                        "SGPRs");
+                const auto compact_binding =
+                    RenderExecutorTestAccess::ResolveTexture(
+                        executor, compact.program.info.images.at(0),
+                        compact_value);
+                Require(
+                    test.name, "compact renderer view",
+                    compact_binding.image_id == binding.image_id &&
+                        cache.FindTexture(compact_binding.image_id,
+                                          compact_binding.desc) == view &&
+                        compact_binding.desc.view_info.base_layer == 0u &&
+                        compact_binding.desc.view_info.layer_count == 1u,
+                    "four-word T# selected a different backing or cached view");
+                auto compact_output = CreateStorageBuffer(test.name, {}, 1);
+                Dispatch(compact_test, compact, compact_output, nullptr,
+                         &sampled, nullptr, nullptr, sampler);
+                Require(test.name, "compact GPU read through cached view",
+                        ReadBuffer(test.name, compact_output, 1) ==
+                            std::vector<u32>{std::bit_cast<u32>(0.25f)},
+                        "four-word T# did not read its cached renderer view");
+                DestroyBuffer(&compact_output);
+              }
+              DestroyBuffer(&output);
+              RenderExecutorTestAccess::ResetBindings(executor);
+              std::printf("[gpu]     %s array=%u sample=%u reverse=%u "
+                          "BASE_ARRAY=%u ok\n",
+                          test.name, array, sample, reverse, base_layer);
+            }
+            context.UnmapMemory(base, allocation_size);
+            scheduler.Finish();
+          }
+        }
+      }
+    }
     {
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();

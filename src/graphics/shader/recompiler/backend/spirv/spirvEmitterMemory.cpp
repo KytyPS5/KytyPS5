@@ -167,17 +167,30 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
-void RecordBdaFault(EmitterState& state, uint32_t page) {
-	const auto word =
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
+void SetFaultBit(EmitterState& state, uint32_t word, uint32_t index) {
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
-	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
-	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), index, ConstantU32(state, 31)));
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+	                          FaultElementPointer(state, word),
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+}
+
+// Sets the page bit and its summary bit; the processing pass scans only summarized words.
+void RecordBdaFault(EmitterState& state, uint32_t page) {
+	constexpr auto span_bits = std::countr_zero(BufferCache::FAULT_SUMMARY_SPAN);
+	SetFaultBit(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
+	    page);
+	const auto group = Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+	                          ConstantU32(state, 5 + span_bits));
+	SetFaultBit(state,
+	            Binary(state, spv::OpIAdd, TypeU32(state),
+	                   Binary(state, spv::OpShiftRightLogical, TypeU32(state), group,
+	                          ConstantU32(state, 5)),
+	                   ConstantU32(state, static_cast<uint32_t>(BufferCache::FAULT_BITMAP_WORDS))),
+	            group);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {

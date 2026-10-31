@@ -27,6 +27,38 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+constexpr uint64_t HotFlips      = 8;
+constexpr size_t   HotPagesMax   = 1024;
+constexpr uint64_t HotNotePages  = 16;
+constexpr uint64_t PublishBudget = 1 * MiB;
+
+void RecordDownloadCopies(vk::CommandBuffer native, const Buffer& source, const Buffer& target,
+                          std::span<const vk::BufferCopy> copies, uint64_t offset, uint64_t size) {
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = source.Handle();
+	before.offset              = 0;
+	before.size                = source.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.copyBuffer(source.Handle(), target.Handle(), static_cast<uint32_t>(copies.size()),
+	                  copies.data());
+
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = target.Handle();
+	after.offset        = offset;
+	after.size          = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands |
+	                           vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+}
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -175,6 +207,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
+		    SupersedePublishes(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
@@ -197,31 +230,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto              native = command.Handle();
-	vk::BufferMemoryBarrier before {};
-	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
-	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.buffer              = buffer.Handle();
-	before.offset              = 0;
-	before.size                = buffer.Size();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                       nullptr);
-	native.copyBuffer(buffer.Handle(), download.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
-
-	auto after          = before;
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = download.Handle();
-	after.offset        = offset;
-	after.size          = total_size;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	RecordDownloadCopies(command.Handle(), buffer, download, copies, offset, total_size);
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -316,12 +325,149 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			NoteReadHot(vaddr, size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			QueueBdaSync(vaddr, size);
 		}
 	});
+}
+
+void BufferCache::NoteReadHot(uint64_t vaddr, uint64_t size) {
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (last - first > HotNotePages * TRACKER_PAGE_SIZE) {
+		return;
+	}
+	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+		if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
+			it->second = m_hot_flip;
+		} else if (m_hot_pages.size() < HotPagesMax) {
+			m_hot_pages.emplace(page, m_hot_flip);
+			m_hot_ranges.Add(page, TRACKER_PAGE_SIZE);
+		}
+	}
+}
+
+void BufferCache::DecayReadHot() {
+	m_hot_flip++;
+	std::erase_if(m_hot_pages, [this](const auto& page) {
+		if (m_hot_flip - page.second <= HotFlips) {
+			return false;
+		}
+		m_hot_ranges.Subtract(page.first, TRACKER_PAGE_SIZE);
+		return true;
+	});
+}
+
+void BufferCache::SupersedePublishes(uint64_t vaddr, uint64_t size) {
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto& batch: m_inflight_publishes) {
+		for (auto& entry: *batch) {
+			entry.superseded |=
+			    Common::AlignDown(entry.vaddr, TRACKER_PAGE_SIZE) < last &&
+			    first < Common::AlignUp(entry.vaddr + entry.size, TRACKER_PAGE_SIZE);
+		}
+	}
+}
+
+void BufferCache::SupersedeAllPublishes() {
+	for (auto& batch: m_inflight_publishes) {
+		for (auto& entry: *batch) {
+			entry.superseded = true;
+		}
+	}
+}
+
+void BufferCache::PublishReadHot() {
+	if (m_publish_ranges.Empty()) {
+		return;
+	}
+	struct Target {
+		uint64_t vaddr;
+		uint64_t offset;
+		uint64_t size;
+	};
+	std::vector<std::pair<BufferId, std::vector<vk::BufferCopy>>> copies;
+	std::vector<Target>                                           targets;
+	auto     batch = std::make_shared<PublishBatch>();
+	uint64_t total = 0;
+	m_publish_ranges.ForEach([&](uint64_t start, uint64_t end) {
+		const auto* owner = m_page_table.Find(start >> PageTable::kPageBits);
+		if (owner == nullptr || IsBufferInvalid(*owner) ||
+		    !m_slot_buffers[*owner].IsInBounds(start, end - start)) {
+			return;
+		}
+		const auto id      = *owner;
+		const auto address = m_slot_buffers[id].CpuAddress();
+		m_gpu_modified_ranges.ForEachInRange(
+		    start, end - start, [&](uint64_t first, uint64_t last) {
+			    const auto bytes = last - first;
+			    if (total + bytes > PublishBudget) {
+				    return;
+			    }
+			    if (copies.empty() || copies.back().first != id) {
+				    copies.emplace_back(id, std::vector<vk::BufferCopy> {});
+			    }
+			    copies.back().second.emplace_back(first - address, total, bytes);
+			    targets.push_back({first, total, bytes});
+			    batch->push_back({first, bytes, false});
+			    total += Common::AlignUp(bytes, 64);
+		    });
+	});
+	m_publish_ranges.Clear();
+	if (batch->empty()) {
+		return;
+	}
+	auto [mapped, offset] = m_download_buffer.Map(total, 64);
+	if (mapped == nullptr) {
+		return;
+	}
+	m_download_buffer.Commit();
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	for (auto& [id, list]: copies) {
+		for (auto& copy: list) {
+			copy.dstOffset += offset;
+		}
+		RecordDownloadCopies(command.Handle(), m_slot_buffers[id], m_download_buffer, list, offset,
+		                     total);
+	}
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total, targets = std::move(targets)] {
+		m_download_buffer.Invalidate(offset, total);
+		for (const auto& target: targets) {
+			Libs::LibKernel::Memory::WriteBacking(target.vaddr, mapped + target.offset,
+			                                      target.size);
+		}
+	});
+	m_inflight_publishes.push_back(batch);
+	m_scheduler.DeferOperation([this, batch] { ConfirmPublish(batch); });
+}
+
+void BufferCache::ConfirmPublish(const std::shared_ptr<PublishBatch>& batch) {
+	std::erase(m_inflight_publishes, batch);
+	for (const auto& entry: *batch) {
+		if (entry.superseded) {
+			continue;
+		}
+		m_gpu_modified_ranges.Subtract(entry.vaddr, entry.size);
+		ForgetColorMetadataChecks(entry.vaddr, entry.size);
+	}
+	for (const auto& entry: *batch) {
+		if (entry.superseded) {
+			continue;
+		}
+		const auto last = Common::AlignUp(entry.vaddr + entry.size, TRACKER_PAGE_SIZE);
+		for (auto page = Common::AlignDown(entry.vaddr, TRACKER_PAGE_SIZE); page < last;
+		     page += TRACKER_PAGE_SIZE) {
+			if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+			    m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			}
+		}
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -523,6 +669,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		SupersedePublishes(vaddr, size);
+		m_hot_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
+			m_publish_ranges.Add(start, end - start);
+		});
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

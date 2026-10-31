@@ -27,6 +27,7 @@ bool                               haptics_handles_rumble = false;
 std::array<Rumble, 6>               pad_rumble {};
 std::vector<int>                    closed_pads;
 std::array<std::array<Uint8, 3>, 6> pad_colors {};
+std::array<bool, 6>                 mono_led_only {};
 } // namespace
 
 namespace Fake {
@@ -66,6 +67,18 @@ void CloseGamepad(SDL_Gamepad* pad) {
 	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
 }
 void Delay(Uint32) {}
+SDL_PropertiesID GetGamepadProperties(SDL_Gamepad* pad) {
+	return static_cast<SDL_PropertiesID>(reinterpret_cast<uintptr_t>(pad));
+}
+bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool default_value) {
+	if (std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0) {
+		return mono_led_only[pad];
+	}
+	if (std::strcmp(name, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN) == 0) {
+		return !mono_led_only[pad];
+	}
+	return default_value;
+}
 } // namespace Fake
 
 #define SDL_GetTicks                Fake::GetTicks
@@ -78,6 +91,8 @@ void Delay(Uint32) {}
 #define SDL_SetGamepadSensorEnabled Fake::SetGamepadSensorEnabled
 #define SDL_CloseGamepad            Fake::CloseGamepad
 #define SDL_Delay                   Fake::Delay
+#define SDL_GetGamepadProperties    Fake::GetGamepadProperties
+#define SDL_GetBooleanProperty      Fake::GetBooleanProperty
 #include "libs/controller.cpp"
 #undef SDL_GetTicks
 #undef SDL_GetGamepadFromID
@@ -89,6 +104,8 @@ void Delay(Uint32) {}
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
+#undef SDL_GetGamepadProperties
+#undef SDL_GetBooleanProperty
 
 namespace Libs::Controller {
 // No virtual headset in these tests (padVr.cpp is not linked here).
@@ -433,6 +450,18 @@ void TestIndependentOutputsAndPadSwitch() {
 	}
 }
 
+void TestMonoLedPadGetsNoLightBar() {
+	Controller controller;
+	const PadLightBarParam color {10, 20, 30, 0};
+	Check(PadSetLightBar(1, &color) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a pad with an RGB LED did not receive the light bar");
+	mono_led_only[1] = true;
+	const PadLightBarParam next {40, 50, 60, 0};
+	Check(PadSetLightBar(1, &next) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a pad with only a mono LED received the light bar");
+	mono_led_only[1] = false;
+}
+
 void TestPlayerUserIds() {
 	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
 	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
@@ -742,6 +771,7 @@ int main() {
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestUnreadPressSurvivesStickBurst();
 	TestMultiplayerRouting();

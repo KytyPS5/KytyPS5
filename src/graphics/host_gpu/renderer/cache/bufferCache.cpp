@@ -576,7 +576,12 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Invalidate cached buffers, images and image heaps for the whole range in one call.
+		// Letting the write fault page by page costs one fault per page on the GPU thread.
+		// The exact range is checked here, so an image that starts mid-page is marked CPU dirty
+		// where a fault on its first page might only have marked it maybe dirty.
+		// If the range is not fully mapped, fill anyway so the write faults as it did before.
+		(void)m_scheduler.Context().InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
@@ -602,6 +607,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		// Invalidate the destination in one call rather than faulting on each page. The source
+		// is not GPU modified so reading it cannot fault. An unmapped range falls through to a
+		// write that faults as before.
+		(void)m_scheduler.Context().InvalidateMemory(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;

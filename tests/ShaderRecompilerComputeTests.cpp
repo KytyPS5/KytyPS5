@@ -28674,6 +28674,31 @@ TestCase CvtPkrtzF16F32RuntimeEdges() {
   return test;
 }
 
+TestCase Vop3OutputModifierFlushesNegativeZero() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x80000000u); // -0.0
+  AppendVMovLiteral(&code, 1, 0x3f800000u); // 1.0
+  AppendVMovLiteral(&code, 2, 0xbf000000u); // -0.5
+  AppendVop3(&code, 0x108, 10, Vgpr(0), Vgpr(1), 0, 0, 0, false, 1); // v_mul_f32 mul:2
+  AppendVop3(&code, 0x103, 11, Vgpr(0), Vgpr(0), 0, 0, 0, false, 3); // v_add_f32 div:2
+  AppendVop3(&code, 0x108, 12, Vgpr(2), Vgpr(1), 0, 0, 0, false, 2); // v_mul_f32 mul:4
+  AppendVop3(&code, 0x108, 13, Vgpr(0), Vgpr(1));                    // v_mul_f32
+  code.push_back(EncodeVop2(0x08, 14, 249, 1));                      // v_mul_f32_sdwa
+  code.push_back(EncodeVop2Sdwa(0, 6, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)); // mul:2
+  for (u32 dst = 10; dst <= 14; dst++) {
+    AppendStoreVgpr(&code, dst, dst - 10);
+  }
+  AppendEnd(&code);
+
+  return {"Vop3OutputModifierFlushesNegativeZero",
+          code,
+          {},
+          {0x00000000u, 0x00000000u, 0xc0000000u, 0x80000000u, 0x00000000u},
+          {O::V_MOV_B32, O::V_MUL_F32, O::V_ADD_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase CvtPkrtzF16F32SdwaAndOutputModifiers() {
   using O = ShaderOpcode;
 
@@ -47029,6 +47054,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32RuntimeEdges);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
+  AddCase(Vop3OutputModifierFlushesNegativeZero);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtF16U16ByteSource);

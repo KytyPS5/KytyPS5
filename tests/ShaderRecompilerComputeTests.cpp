@@ -35505,12 +35505,54 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   test.name = "BufferStoreFormatXyzwFloat16ConvertsComponents";
   test.code = std::move(code);
   test.initial = std::vector<u32>(4, 0xdeadbeefu);
-  test.expected = {0xc0003c04u, 0x34003800u, 0x4200c400u, 0x40000000u};
+  test.expected = {0xc0003c03u, 0x34003800u, 0x4200c400u, 0x40000000u};
   test.user_data = MakeStructuredStorageBufferData(
       8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
-  test.required_spirv = {"PackHalf2x16"};
+  test.forbidden_spirv = {"PackHalf2x16"};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwFloat16RoundsTowardZero() {
+  using O = ShaderOpcode;
+  // Inputs and results of native 16-bit float stores on RDNA2 and RDNA4: round toward zero,
+  // finite values clamp to the largest finite one, NaN keeps its payload (at least 1).
+  constexpr u32 inputs[32] = {
+      0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u,
+      0x3f807e63u, 0x3f801001u, 0x3f803000u, 0x3f801000u,
+      0xbf807e63u, 0xbf803000u, 0x477fe000u, 0x477ff000u,
+      0x47800000u, 0x7f7fffffu, 0xc77ff000u, 0x7f800000u,
+      0xff800000u, 0x7fc00000u, 0x7fc12000u, 0x7f8dc000u,
+      0x7f800100u, 0xff800001u, 0x387fe000u, 0x38800000u,
+      0x33800000u, 0x33c00000u, 0x337fffffu, 0x00000001u,
+      0x80000001u, 0xb3800000u, 0x40490fd0u, 0x3dcccccdu};
+  constexpr u32 expected[16] = {
+      0x80000000u, 0xbc003c00u, 0x3c003c03u, 0x3c003c01u,
+      0xbc01bc03u, 0x7bff7bffu, 0x7bff7bffu, 0x7c00fbffu,
+      0x7e00fc00u, 0x7c6e7e09u, 0xfc017c01u, 0x040003ffu,
+      0x00010001u, 0x00000000u, 0x80018000u, 0x2e664248u};
+  std::vector<u32> code;
+  for (u32 record = 0; record < std::size(inputs) / 4; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component, inputs[record * 4 + component]);
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwFloat16RoundsTowardZero";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(std::size(expected), 0xdeadbeefu);
+  test.expected.assign(std::begin(expected), std::end(expected));
+  test.user_data = MakeStructuredStorageBufferData(
+      8, std::size(inputs) / 4, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16"};
   return test;
 }
 
@@ -42436,7 +42478,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
             valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
         if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
           if (wide) {
-            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
+            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c03u;
             test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
           } else expected_bytes[slot * (row + 1u) + lane] =
               std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
@@ -47251,6 +47293,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwPackedUnormSkinningVectors);
   AddCase(BufferStoreFormatXZeroFillsPackedRecord);
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
+  AddCase(BufferStoreFormatXyzwFloat16RoundsTowardZero);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
   for (auto &test : BufferLoadFormatD16XCases()) {
@@ -53719,6 +53762,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwPackedUnormSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXZeroFillsPackedRecord());
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
+    RunCase(&vulkan, BufferStoreFormatXyzwFloat16RoundsTowardZero());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
     for (const auto &test : BufferLoadFormatD16XCases()) {
@@ -53751,6 +53795,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
+    RunCase(&vulkan, BufferStoreFormatXyzwFloat16RoundsTowardZero());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-ashr-i64-only") == 0) {

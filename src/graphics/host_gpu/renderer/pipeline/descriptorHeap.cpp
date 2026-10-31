@@ -8,12 +8,13 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+constexpr uint32_t DescriptorHeapCount = 1024;
+// Sized for layouts with large texture arrays: a set must fit in a fresh pool.
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 32768},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},
 };
 
 } // namespace
@@ -59,27 +60,25 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 }
 
 bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
-	std::array<vk::DescriptorSetLayout, DescriptorSetBatch> layouts;
-	layouts.fill(layout);
-
 	vk::DescriptorSetAllocateInfo allocate {};
-	allocate.descriptorPool = m_current_pool;
-	allocate.pSetLayouts    = layouts.data();
+	allocate.descriptorPool     = m_current_pool;
+	allocate.descriptorSetCount = 1;
+	allocate.pSetLayouts        = &layout;
 
-	for (;;) {
-		allocate.descriptorSetCount = batch.allocation;
-		const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
-		if (result == vk::Result::eSuccess) {
-			batch.size = batch.allocation;
-			return true;
+	// Allocate one set at a time: a multi-set allocation that runs out of pool memory can keep
+	// the memory of the sets it made before failing, leaving no room for a smaller retry.
+	batch.size = 0;
+	while (batch.size < batch.allocation) {
+		const auto result =
+		    m_graphics.device.allocateDescriptorSets(&allocate, &batch.sets[batch.size]);
+		if (result != vk::Result::eSuccess) {
+			EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
+			        result != vk::Result::eErrorFragmentedPool);
+			break;
 		}
-		EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
-		        result != vk::Result::eErrorFragmentedPool);
-		if (batch.allocation == 1) {
-			return false;
-		}
-		batch.allocation /= 2;
+		batch.size++;
 	}
+	return batch.size != 0;
 }
 
 void DescriptorHeap::CreateDescriptorPool() {

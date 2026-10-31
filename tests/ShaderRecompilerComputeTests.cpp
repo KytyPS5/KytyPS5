@@ -354,7 +354,7 @@ struct TextureCacheTestAccess {
   }
 
   static bool PendingDownload(const TextureCache &cache, ImageId id) {
-    return cache.m_download_images.contains(id);
+    return cache.m_download_images.contains(id) || cache.m_storage_downloads.contains(id);
   }
 
   static void TrackDownload(TextureCache &cache, ImageId id) {
@@ -9764,7 +9764,7 @@ public:
                          Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
       submit_readback_desc.type = BindingType::Storage;
       submit_readback_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
-      TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       const auto submit_readback_image =
           texture_cache.FindImage(submit_readback_desc);
       auto submit_buffer = resources.GetBufferCache().ObtainBuffer(
@@ -9794,14 +9794,11 @@ public:
                       submit_readback_desc.info.data.size) ==
                       submit_readback_image,
               "historical GPU Buffer dirtiness rejected newer image contents");
-      TextureCacheTestAccess::TrackDownload(texture_cache,
-                                            submit_readback_image);
       Libs::LibKernel::Memory::WriteBacking(
           submit_readback_desc.info.data.address, &submit_readback_stale,
           sizeof(submit_readback_stale));
       const auto submit_readback_tick = scheduler.CurrentTick();
-      texture_cache.ProcessDownloadImages();
-      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+      texture_cache.ProcessStorageDownloads();
       uint32_t submit_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
           submit_readback_desc.info.data.address, &submit_before_completion,

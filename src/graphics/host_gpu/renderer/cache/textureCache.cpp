@@ -36,6 +36,7 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+constexpr uint64_t SmallStorageReadbackBytes = 512 * 1024;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -267,6 +268,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
+	m_storage_downloads.erase(id);
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(image.info.metadata.range.address);
 	}
@@ -418,7 +420,9 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
-		m_download_images.insert(id);
+		if (!m_storage_downloads.contains(id)) {
+			m_download_images.insert(id);
+		}
 	}
 }
 
@@ -1465,7 +1469,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			CommitGpuWrite(image);
-			TrackImageDownload(id, image);
+			if (!image.info.IsTiled() && image.info.data.size <= SmallStorageReadbackBytes) {
+				m_download_images.erase(id);
+				m_storage_downloads.insert(id);
+			} else {
+				TrackImageDownload(id, image);
+			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -2071,17 +2080,24 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images && !m_readback_tiled_images) {
-		return;
-	}
+void TextureCache::ProcessStorageDownloads() {
 	std::scoped_lock lock {m_lock};
-	for (const auto id: m_download_images) {
+	DownloadImages(m_storage_downloads);
+}
+
+void TextureCache::ProcessDownloadImages() {
+	std::scoped_lock lock {m_lock};
+	DownloadImages(m_storage_downloads);
+	DownloadImages(m_download_images);
+}
+
+void TextureCache::DownloadImages(std::unordered_set<ImageId>& images) {
+	for (const auto id: images) {
 		if (m_slot_images[id].IsGpuModified()) {
 			(void)DownloadImageMemory(id);
 		}
 	}
-	m_download_images.clear();
+	images.clear();
 }
 
 } // namespace Libs::Graphics

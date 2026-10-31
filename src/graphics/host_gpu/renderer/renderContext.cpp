@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -50,6 +51,14 @@ GuestGpu& RenderContext::GetGpu() const {
 	return *m_gpu;
 }
 
+void RenderContext::RunGpuCommandSync(Common::UniqueFunction<void>&& command) {
+	if (m_gpu == nullptr) {
+		command();
+	} else {
+		m_gpu->SendCommandSync(std::move(command));
+	}
+}
+
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	EXIT_IF(m_video_out == nullptr);
 	return *m_video_out;
@@ -59,16 +68,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	if (access == PageFaultAccess::Write) {
+		return InvalidateMemory(fault_vaddr, fault_size);
+	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
-	}
+	m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	return true;
 }
 
@@ -77,7 +83,16 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
-	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (!m_texture_cache.InvalidateMemory(vaddr, size, !GuestGpu::IsGpuThread())) {
+		if (CommandScheduler::InDeferredOperation()) {
+			EXIT("unsupported storage image write fault from an asynchronous GPU completion\n");
+		}
+		RunGpuCommandSync([this, vaddr, size] {
+			m_texture_cache.PublishStorageImages();
+			m_buffer_cache.InvalidateMemory(vaddr, size);
+			m_texture_cache.InvalidateMemory(vaddr, size);
+		});
+	}
 	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -121,11 +136,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
-	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+	if (m_gpu != nullptr && m_gpu->IsStopping()) {
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	RunGpuCommandSync(unmap);
 }
 
 void RenderContext::PrepareBda() {

@@ -354,7 +354,7 @@ struct TextureCacheTestAccess {
   }
 
   static bool PendingDownload(const TextureCache &cache, ImageId id) {
-    return cache.m_download_images.contains(id);
+    return cache.m_download_images.contains(id) || cache.m_storage_downloads.contains(id);
   }
 
   static void TrackDownload(TextureCache &cache, ImageId id) {
@@ -2324,7 +2324,7 @@ public:
       EndSubmitAndFree(name, "draw", cmd);
       return ReadImage(name, &target);
     };
-    const auto near = [](const std::vector<u32> &actual, const std::vector<u32> &expected) {
+    const auto pixelsMatch = [](const std::vector<u32> &actual, const std::vector<u32> &expected) {
       for (size_t i = 0; i < expected.size(); i++) {
         for (u32 shift = 0; shift < 32; shift += 8) {
           if (std::abs(static_cast<int>((actual[i] >> shift) & 0xffu) -
@@ -2344,8 +2344,8 @@ public:
         {pq(0, 0, 0), pq(520, 520, 520), pq(616, 616, 616), pq(560, 500, 440)}, 1,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "PQ source",
-            near(render(pq_source, 4u | 16u),
-                 {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}),
+            pixelsMatch(render(pq_source, 4u | 16u),
+                        {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}),
             "PQ pixels were not converted to opaque sRGB");
     // Half-float nits: 0, 100, 250 and (150, 90, 40).
     auto nit_source = CreateImage2D(
@@ -2353,8 +2353,8 @@ public:
         {0, 0, 0x56405640u, 0x5640u, 0x5bd05bd0u, 0x5bd0u, 0x55a058b0u, 0x5100u}, 2,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "linear source",
-            near(render(nit_source, 4u | 8u | 16u),
-                 {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
+            pixelsMatch(render(nit_source, 4u | 8u | 16u),
+                        {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
             "linear-nit pixels were not converted to opaque sRGB");
 
     DestroyImage(&nit_source);
@@ -8083,6 +8083,63 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
+      auto storage_alias_desc = buffer_alias_desc;
+      storage_alias_desc.type = BindingType::Storage;
+      storage_alias_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      (void)texture_cache.FindTexture(buffer_alias_image, storage_alias_desc);
+      vk::ClearValue storage_clear{};
+      storage_clear.color.uint32[0] = buffer_alias_image_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), buffer_alias_image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, storage_clear);
+      const auto alias_range = storage_alias_desc.info.data;
+      texture_cache.InvalidateMemory(alias_range.End(), 1);
+      Require(name, "storage alias pending page check",
+              texture_cache.GetImage(buffer_alias_image).IsMaybeCpuDirty() &&
+                  !texture_cache.GetImage(buffer_alias_image).IsTracked(),
+              "a write beside the image did not take it off the page watch");
+      texture_cache.PublishStorageImages();
+      Require(name, "storage alias restored after a neighboring write",
+              !texture_cache.GetImage(buffer_alias_image).IsCpuDirty() &&
+                  texture_cache.GetImage(buffer_alias_image).IsTracked(),
+              "publishing did not resolve and re-track the unchanged image");
+      resources.GetBufferCache().FillBuffer(alias_range.address + 2 * sizeof(u32),
+                                             sizeof(u32), buffer_alias_write_value, false);
+      (void)texture_cache.FindTexture(buffer_alias_image, storage_alias_desc);
+      texture_cache.PublishStorageImages();
+      resources.GetBufferCache().ReadMemory(alias_range.address, alias_range.size);
+      std::array<u32, 4> published_alias{};
+      Require(name, "storage alias preserves a partial buffer write",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  alias_range.address, published_alias.data(), sizeof(published_alias)) &&
+                  published_alias == std::array{buffer_alias_image_value, buffer_alias_image_value,
+                                                buffer_alias_write_value, buffer_alias_image_value},
+              "republishing lost the interior buffer write or an untouched image texel");
+
+      (void)texture_cache.FindTexture(buffer_alias_image, storage_alias_desc);
+      constexpr u32 pending_image_value = 0x10293847u;
+      storage_clear.color.uint32[0] = pending_image_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), buffer_alias_image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, storage_clear);
+      const auto guest_store = alias_range.address + sizeof(u32);
+      Require(name, "guest write before storage publication",
+              !resources.GetBufferCache().IsRegionGpuModified(guest_store, sizeof(u32)) &&
+                  TextureCacheTestAccess::PendingDownload(texture_cache, buffer_alias_image) &&
+                  resources.HandleFault(PageFaultAccess::Write, guest_store),
+              "expected a write fault with an unpublished storage result");
+      std::memcpy(memory + buffer_alias_offset + sizeof(u32), &buffer_alias_write_value,
+                  sizeof(buffer_alias_write_value));
+      texture_cache.PublishStorageImages();
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "pre-publication guest write preserves neighboring texels",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  alias_range.address, published_alias.data(), sizeof(published_alias)) &&
+                  published_alias == std::array{pending_image_value, buffer_alias_write_value,
+                                                pending_image_value, pending_image_value},
+              "handling the guest write lost the rest of the pending image");
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
@@ -9764,7 +9821,7 @@ public:
                          Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
       submit_readback_desc.type = BindingType::Storage;
       submit_readback_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
-      TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       const auto submit_readback_image =
           texture_cache.FindImage(submit_readback_desc);
       auto submit_buffer = resources.GetBufferCache().ObtainBuffer(
@@ -9794,14 +9851,11 @@ public:
                       submit_readback_desc.info.data.size) ==
                       submit_readback_image,
               "historical GPU Buffer dirtiness rejected newer image contents");
-      TextureCacheTestAccess::TrackDownload(texture_cache,
-                                            submit_readback_image);
       Libs::LibKernel::Memory::WriteBacking(
           submit_readback_desc.info.data.address, &submit_readback_stale,
           sizeof(submit_readback_stale));
       const auto submit_readback_tick = scheduler.CurrentTick();
-      texture_cache.ProcessDownloadImages();
-      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+      texture_cache.PublishStorageImages();
       uint32_t submit_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
           submit_readback_desc.info.data.address, &submit_before_completion,
@@ -9812,6 +9866,9 @@ public:
               "submit-time linear readback published synchronously");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
+      Require(name, "storage result accessible through a guest read fault",
+              resources.HandleFault(PageFaultAccess::Read, submit_readback_desc.info.data.address),
+              "guest read fault did not resolve the updated storage image");
       uint32_t submit_after_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
           submit_readback_desc.info.data.address, &submit_after_completion,
@@ -9823,6 +9880,18 @@ public:
                   texture_cache.GetImage(submit_readback_image).IsGpuModified(),
               "submit-time readback did not publish or retained no reusable "
               "GPU-current image");
+
+      (void)texture_cache.FindTexture(submit_readback_image, submit_readback_desc);
+      texture_cache.PublishStorageImages();
+      Require(name, "guest write to pending storage result",
+              resources.HandleFault(PageFaultAccess::Write, submit_readback_desc.info.data.address),
+              "guest write fault did not resolve the pending image copy");
+      std::memcpy(memory + submit_readback_offset, &submit_readback_stale, sizeof(uint32_t));
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "newer guest write survives completion",
+              std::memcmp(memory + submit_readback_offset, &submit_readback_stale, sizeof(uint32_t)) == 0,
+              "a late storage readback overwrote the guest write");
 
       constexpr uint64_t linear_depth_offset = 0x33a000;
       constexpr uint64_t linear_stencil_offset = 0x33b000;
@@ -16167,6 +16236,8 @@ public:
                                                            ordered_sampled_id),
           "production graphics binding did not retain vertex resources "
           "before pixel resources");
+      Libs::LibKernel::Memory::WriteBacking(
+          storage_address, &storage_stale_value, sizeof(storage_stale_value));
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto graphics_bindings =
@@ -16202,6 +16273,9 @@ public:
                    vk::AccessFlagBits2::eShaderWrite),
               "a later sampled alias dropped an earlier storage write access");
       RenderExecutorTestAccess::ResetBindings(executor);
+      Require(name, "draw publishes storage writes before the next packet",
+              !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
+              "a completed draw left storage writes pending");
 
       ShaderRecompiler::IR::Program vertex_sampled_program{};
       vertex_sampled_program.stage = ShaderType::Vertex;
@@ -16425,13 +16499,6 @@ public:
                       depth_views_rendering.depth_stencil_attachment.image_layout,
               "two depth views chose different descriptor layouts or feedback aspects");
 
-      Libs::LibKernel::Memory::WriteBacking(
-          storage_address, &storage_stale_value, sizeof(storage_stale_value));
-      texture_cache.ProcessDownloadImages();
-      Require(
-          name, "storage acquisition download consumption",
-          !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
-          "submit-time processing retained an acquired storage request");
       RenderExecutorTestAccess::ResetBindings(executor);
       scheduler.Finish();
       scheduler.DrainPriorityOperations();

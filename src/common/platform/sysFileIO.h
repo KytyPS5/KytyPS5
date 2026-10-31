@@ -72,5 +72,7 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
+bool SysFileChmod(sys_file_t& f, uint32_t mode, const std::filesystem::path& name);
+bool SysFileGetPermissions(sys_file_t& f, uint16_t* perms);
 
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

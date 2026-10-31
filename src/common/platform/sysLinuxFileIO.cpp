@@ -153,9 +153,9 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 }
 
 static sys_file_t* OpenHostFile(const std::filesystem::path& file_name, const char* mode,
-                               sys_file_cache_type_t cache_type) {
+                                sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
-	ret->f = fopen(get_internal_name(file_name).c_str(), mode);
+	ret->f    = fopen(get_internal_name(file_name).c_str(), mode);
 	ret->type = ret->f == nullptr ? SYS_FILE_ERROR : SYS_FILE_FILE;
 	if (ret->f != nullptr) {
 		// Independent handles must observe writes and truncation immediately.
@@ -251,18 +251,18 @@ uint64_t SysFileSize(sys_file_t& f) {
 }
 
 bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
-	const auto path = get_internal_name(name);
+	const auto  path = get_internal_name(name);
 	struct stat info {};
 	if (stat(path.c_str(), &info) != 0) {
 		return false;
 	}
 	*is_file = !S_ISDIR(info.st_mode);
-	*size = *is_file ? static_cast<uint64_t>(info.st_size) : 0;
+	*size    = *is_file ? static_cast<uint64_t>(info.st_size) : 0;
 	return true;
 }
 
 uint64_t SysFileSize(const std::filesystem::path& file_name) {
-	bool is_file;
+	bool     is_file;
 	uint64_t size = 0;
 	SysFileGetInfo(file_name, &is_file, &size);
 	return size;
@@ -317,13 +317,13 @@ bool SysFileIsError(sys_file_t& f) {
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	bool is_file;
+	bool     is_file;
 	uint64_t size;
 	return SysFileGetInfo(path, &is_file, &size) && !is_file;
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	bool is_file;
+	bool     is_file;
 	uint64_t size;
 	return SysFileGetInfo(name, &is_file, &size) && is_file;
 }
@@ -619,6 +619,31 @@ void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	}
 
 	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
+}
+
+bool SysFileChmod(sys_file_t& f, uint32_t mode, const std::filesystem::path& name) {
+	if (f.type == SYS_FILE_FILE && f.f != nullptr) {
+		int fd = fileno(f.f);
+		if (fd >= 0) {
+			return fchmod(fd, static_cast<mode_t>(mode & 07777)) == 0;
+		}
+	}
+	std::error_code ec;
+	std::filesystem::permissions(name, static_cast<std::filesystem::perms>(mode & 07777), ec);
+	return !ec;
+}
+
+bool SysFileGetPermissions(sys_file_t& f, uint16_t* perms) {
+	if (f.type == SYS_FILE_FILE && f.f != nullptr) {
+		struct stat st {};
+		if (fstat(fileno(f.f), &st) == 0) {
+			if (perms != nullptr) {
+				*perms = static_cast<uint16_t>(st.st_mode & 07777);
+			}
+			return true;
+		}
+	}
+	return false;
 }
 
 #endif

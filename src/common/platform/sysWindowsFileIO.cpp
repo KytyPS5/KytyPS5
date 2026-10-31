@@ -283,7 +283,7 @@ bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* 
 }
 
 uint64_t SysFileSize(const std::filesystem::path& file_name) {
-	bool is_file;
+	bool     is_file;
 	uint64_t size = 0;
 	SysFileGetInfo(file_name, &is_file, &size);
 	return size;
@@ -354,13 +354,13 @@ bool SysFileIsError(sys_file_t& f) {
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	bool is_file;
+	bool     is_file;
 	uint64_t size;
 	return SysFileGetInfo(path, &is_file, &size) && !is_file;
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	bool is_file;
+	bool     is_file;
 	uint64_t size;
 	return SysFileGetInfo(name, &is_file, &size) && is_file;
 }
@@ -486,7 +486,7 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 	const auto pattern = path / L"*";
 
 	WIN32_FIND_DATAW data {};
-	HANDLE h = FindFirstFileW(pattern.c_str(), &data);
+	HANDLE           h = FindFirstFileW(pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
 		return;
@@ -523,6 +523,53 @@ void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	auto wide = name.wstring();
 	SetFileAttributesW(wide.c_str(), GetFileAttributesW(wide.c_str()) &
 	                                     (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
+}
+
+bool SysFileChmod(sys_file_t& f, uint32_t mode, const std::filesystem::path& name) {
+	if (f.type == SYS_FILE_FILE && f.handle != nullptr && f.handle != INVALID_HANDLE_VALUE) {
+		FILE_BASIC_INFO info {};
+		if (GetFileInformationByHandleEx(f.handle, FileBasicInfo, &info, sizeof(info))) {
+			DWORD old_attrs = info.FileAttributes;
+			if ((mode & 0222) == 0) {
+				info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+			} else {
+				info.FileAttributes &= ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY);
+			}
+			if (info.FileAttributes != old_attrs) {
+				SetFileInformationByHandle(f.handle, FileBasicInfo, &info, sizeof(info));
+			}
+		}
+		wchar_t final_path[MAX_PATH + 1] = {};
+		DWORD len = GetFinalPathNameByHandleW(f.handle, final_path, MAX_PATH, FILE_NAME_NORMALIZED);
+		if (len > 0 && len <= MAX_PATH) {
+			std::error_code       ec;
+			std::filesystem::path p(final_path);
+			std::filesystem::permissions(p, static_cast<std::filesystem::perms>(mode & 07777), ec);
+			if (!ec) {
+				return true;
+			}
+		}
+	}
+	std::error_code ec;
+	std::filesystem::permissions(name, static_cast<std::filesystem::perms>(mode & 07777), ec);
+	return !ec;
+}
+
+bool SysFileGetPermissions(sys_file_t& f, uint16_t* perms) {
+	if (f.type == SYS_FILE_FILE && f.handle != nullptr && f.handle != INVALID_HANDLE_VALUE) {
+		FILE_BASIC_INFO info {};
+		if (GetFileInformationByHandleEx(f.handle, FileBasicInfo, &info, sizeof(info))) {
+			uint16_t p = 0777u;
+			if ((info.FileAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
+				p = 0555u;
+			}
+			if (perms != nullptr) {
+				*perms = p;
+			}
+			return true;
+		}
+	}
+	return false;
 }
 
 #endif

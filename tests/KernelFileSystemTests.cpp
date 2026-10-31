@@ -338,6 +338,106 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void TestChmod(const std::filesystem::path& temp_dir) {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+
+  const auto* sceKernelChmod_rec = symbols.FindByNid("fgIsQ10xYVA", Loader::SymbolType::Func);
+  Check(sceKernelChmod_rec != nullptr, "resolve fgIsQ10xYVA (sceKernelChmod)");
+
+  const auto* posix_chmod_rec = symbols.FindByNid("z0dtnPxYgtg", Loader::SymbolType::Func);
+  Check(posix_chmod_rec != nullptr, "resolve z0dtnPxYgtg (posix_chmod)");
+
+  const auto* sceKernelFchmod_rec = symbols.FindByNid("UtszJWHrDcA", Loader::SymbolType::Func);
+  Check(sceKernelFchmod_rec != nullptr, "resolve UtszJWHrDcA (sceKernelFchmod)");
+
+  const auto* posix_fchmod_rec = symbols.FindByNid("n01yNbQO5W4", Loader::SymbolType::Func);
+  Check(posix_fchmod_rec != nullptr, "resolve n01yNbQO5W4 (posix_fchmod)");
+
+  auto sceKernelChmod = reinterpret_cast<int (KYTY_SYSV_ABI*)(const char*, uint32_t)>(sceKernelChmod_rec->vaddr);
+  auto posix_chmod = reinterpret_cast<int (KYTY_SYSV_ABI*)(const char*, uint32_t)>(posix_chmod_rec->vaddr);
+  auto sceKernelFchmod = reinterpret_cast<int (KYTY_SYSV_ABI*)(int, uint32_t)>(sceKernelFchmod_rec->vaddr);
+  auto posix_fchmod = reinterpret_cast<int (KYTY_SYSV_ABI*)(int, uint32_t)>(posix_fchmod_rec->vaddr);
+
+  FileSystem::Mount(temp_dir, "/chmod_test");
+
+  // Error checks for sceKernelChmod
+  Check(sceKernelChmod(nullptr, 0777) == Libs::LibKernel::KERNEL_ERROR_EFAULT,
+        "sceKernelChmod null path returns EFAULT");
+
+  std::string long_path(256, 'a');
+  Check(sceKernelChmod(long_path.c_str(), 0777) == Libs::LibKernel::KERNEL_ERROR_ENAMETOOLONG,
+        "sceKernelChmod long path returns ENAMETOOLONG");
+
+  Check(sceKernelChmod("/unmounted_point/file.txt", 0777) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "sceKernelChmod unmounted path returns ENOENT");
+
+  Check(sceKernelChmod("/chmod_test/nonexistent.txt", 0777) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "sceKernelChmod nonexistent file returns ENOENT");
+
+  // Create a file
+  const auto host_file = temp_dir / "sample_chmod.txt";
+  {
+    Common::File f;
+    Check(f.Create(host_file), "create host file fixture");
+    const char dummy[] = "hello chmod";
+    f.Write(dummy, sizeof(dummy));
+  }
+  Check(Common::File::IsFileExisting(host_file), "create sample_chmod file");
+
+  // Success sceKernelChmod
+  Check(sceKernelChmod("/chmod_test/sample_chmod.txt", 0644) == OK,
+        "sceKernelChmod sample file returns OK");
+
+  // posix_chmod error check
+  Check(posix_chmod(nullptr, 0777) == -1 &&
+        *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EFAULT,
+        "posix_chmod null path returns -1 with POSIX_EFAULT");
+
+  // posix_chmod success check
+  Check(posix_chmod("/chmod_test/sample_chmod.txt", 0644) == 0,
+        "posix_chmod sample file returns 0");
+
+  // fchmod error checks
+  Check(sceKernelFchmod(-1, 0644) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "sceKernelFchmod invalid fd returns EBADF");
+  Check(posix_fchmod(-1, 0644) == -1 &&
+        *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "posix_fchmod invalid fd returns -1 with POSIX_EBADF");
+
+  // Boundary check: cannot escape mount with ..
+  Check(sceKernelChmod("/chmod_test/../../outside.txt", 0777) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "chmod outside mount returns ENOENT");
+
+  // Status check: stat reflects permissions
+  FileSystem::FileStat sb {};
+  Check(FileSystem::KernelStat("/chmod_test/sample_chmod.txt", &sb) == OK && (sb.st_mode & 0777) != 0,
+        "stat reflects initial permissions");
+  Check(sceKernelChmod("/chmod_test/sample_chmod.txt", 0444) == OK,
+        "chmod readonly returns OK");
+  Check(FileSystem::KernelStat("/chmod_test/sample_chmod.txt", &sb) == OK && (sb.st_mode & 0222) == 0,
+        "stat reflects read-only mode");
+  Check(sceKernelChmod("/chmod_test/sample_chmod.txt", 0644) == OK,
+        "restore writable mode");
+
+  // fchmod open file check
+  int fd = FileSystem::KernelOpen("/chmod_test/sample_chmod.txt", 0x0002 /* O_RDWR */, 0644);
+  Check(fd >= 0, "open sample_chmod for fchmod");
+  Check(sceKernelFchmod(fd, 0600) == OK, "sceKernelFchmod open fd returns OK");
+  FileSystem::FileStat fsb {};
+  Check(FileSystem::KernelFstat(fd, &fsb) == OK, "fstat reflects fchmod");
+
+  // Rename while open: fchmod operates on the open handle
+  Check(FileSystem::KernelRename("/chmod_test/sample_chmod.txt", "/chmod_test/renamed_chmod.txt") == OK,
+        "rename file while descriptor is open");
+  Check(sceKernelFchmod(fd, 0644) == OK, "fchmod operates on open file even after rename");
+  Check(FileSystem::KernelFstat(fd, &fsb) == OK, "fstat on open handle succeeds after rename");
+  Check(posix_fchmod(fd, 0644) == 0, "posix_fchmod open fd returns 0");
+  Check(FileSystem::KernelClose(fd) == OK, "close sample_chmod");
+
+  FileSystem::Umount("/chmod_test");
+}
+
 void TestRandomDevices() {
   namespace Net = Libs::Network::Net;
   for (const auto* path : {"/dev/urandom", "/dev/random"}) {
@@ -2733,6 +2833,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (argc == 2 && std::string_view(argv[1]) == "--chmod-only") {
+    FileSystem::Initialize();
+    TempDirectory temporary;
+    TestChmod(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: chmod cases passed\n");
+    return 0;
+  }
+
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
@@ -2753,6 +2863,7 @@ int main(int argc, char** argv) {
   TempDirectory temporary;
   CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
+  TestChmod(temporary.Path());
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
   TestAddContent(temporary.Path());

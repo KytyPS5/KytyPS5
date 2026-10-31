@@ -1969,6 +1969,44 @@ void TestGuardedDirectImageTable() {
   }
 }
 
+void TestIrMutationEpoch() {
+  Fixture fixture;
+  const auto a = fixture.UserData(0);
+  const auto b = fixture.UserData(1);
+  auto *sum = fixture.Emit(ValueOpcode::IAdd32, {a, b}).TryInstruction();
+  auto *user =
+      fixture.Emit(ValueOpcode::IAdd32, {Value(sum), b}).TryInstruction();
+  auto *phi = fixture.Emit(ValueOpcode::Phi).TryInstruction();
+  auto *successor = fixture.AddBlock();
+  const auto changes = [](auto &&mutation) {
+    const auto before = g_ir_mutation_epoch;
+    mutation();
+    return g_ir_mutation_epoch != before;
+  };
+  Check(!changes([&] {
+    (void)sum->Arg(0);
+    (void)sum->Uses();
+  }),
+        "reading changed the epoch");
+  Check(changes([&] { sum->SetArg(1, a); }), "SetArg kept the epoch");
+  Check(changes([&] { sum->SetFlags<uint32_t>(7u); }),
+        "SetFlags kept the epoch");
+  Check(changes([&] { phi->AddPhiOperand(fixture.block, a); }),
+        "AddPhiOperand kept the epoch");
+  Check(changes([&] { fixture.block->AddBranch(successor); }),
+        "AddBranch kept the epoch");
+  Check(!changes([&] { user->SetParent(user->Parent()); }),
+        "same-block SetParent changed the epoch");
+  Check(changes([&] { user->SetParent(successor); }),
+        "moving a block kept the epoch");
+  Check(changes([&] { user->SetParent(nullptr); }),
+        "removing a block kept the epoch");
+  Check(changes([&] { sum->ReplaceUsesWith(a); }),
+        "ReplaceUsesWith kept the epoch");
+  Check(user->Arg(0).Resolve() == a, "replacement not applied");
+  Check(changes([&] { user->Invalidate(); }), "Invalidate kept the epoch");
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Clamp { None, Right, Left, Dynamic };
@@ -9002,6 +9040,8 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
+void TestLoopProofCache();
+
 int main() {
   try {
     const auto Run = [](const char *name, auto test) {
@@ -9011,6 +9051,7 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("loop proof cache contract", TestLoopProofCache);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
@@ -9031,6 +9072,7 @@ int main() {
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("IR mutation epoch", TestIrMutationEpoch);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);

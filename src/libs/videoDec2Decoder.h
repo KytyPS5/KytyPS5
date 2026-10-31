@@ -23,6 +23,9 @@ struct Config {
 	int32_t  max_width          = -1;
 	int32_t  max_height         = -1;
 	uint32_t max_pending_frames = 2;
+	// A decoder opened in a 10-bit profile hands out P010 frames — 16 bits per sample, the
+	// value in the high bits — whatever the stream's own depth (HighBitDepthProfile).
+	bool sixteen_bit = false;
 };
 
 struct Input {
@@ -46,6 +49,7 @@ struct Output {
 	uint32_t codec_type      = 0;
 	uint32_t width           = 0;
 	uint32_t pitch           = 0;
+	uint32_t pitch_in_bytes  = 0;
 	uint32_t height          = 0;
 	void*    buffer          = nullptr;
 	size_t   buffer_size     = 0;
@@ -144,6 +148,11 @@ static_assert(sizeof(AvcPictureInfo) == 120);
 class Instance;
 
 [[nodiscard]] bool      IsCodecSupported(uint32_t codec_type);
+// The profiles whose frames the game reads as P010: VP9 profiles 2 and 3, HEVC Main 10. Final
+// Fantasy VII Remake opens its VP9 movies in profile 2 and copies each frame as P010 — luma
+// rows of twice the pitch in bytes, the interleaved chroma right after — even for an 8-bit
+// stream; an NV12 frame left its chroma texture empty, and the video green.
+[[nodiscard]] bool      HighBitDepthProfile(uint32_t codec_type, uint32_t profile);
 [[nodiscard]] Instance* Create(const Config& config);
 void                    Destroy(Instance* instance);
 [[nodiscard]] uint32_t  GetCodecType(const Instance* instance);

@@ -163,6 +163,24 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
+// A storage image in its own format applies the swizzle only to stores (see StoreTexel), and a
+// store keeps just the channels the format has. A swizzle that stores each of them from its own
+// component is the identity, so an RG target written as (R, G, 0, 1) shares the program of an
+// RGBA target written as (R, G, B, A).
+uint32_t CanonicalStorageSwizzle(uint32_t swizzle, Prospero::BufferFormat format) {
+	const auto info = Format::GetFormatInfo(format);
+	if (info.type == Format::ComponentType::Unknown || info.component_count == 0u ||
+	    info.component_count > 4u) {
+		return swizzle;
+	}
+	for (uint32_t channel = 0; channel < info.component_count; channel++) {
+		uint32_t source = 0;
+		while (source < 4u && ((swizzle >> (source * 3u)) & 7u) != 4u + channel) source++;
+		if (source != channel) return swizzle;
+	}
+	return ShaderImageIdentitySwizzle;
+}
+
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	return Prospero::RemapTextureFormat(format) != format ? format
 	                                                      : Prospero::BufferFormat::kInvalid;
@@ -1462,6 +1480,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
+		if (storage && image.conversion_format == Prospero::BufferFormat::kInvalid) {
+			image.shader_swizzle = CanonicalStorageSwizzle(image.shader_swizzle, format);
+		}
 		image.numeric_class = Prospero::SampledTextureNumericClass(
 		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {

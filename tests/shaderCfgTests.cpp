@@ -3915,6 +3915,28 @@ void TestNullImageKeepsShaderDimension() {
         "a null image changed the program of a shader that samples a 3D image");
 }
 
+void TestStorageSwizzleOfAbsentChannelsKeepsProgram() {
+  // Wolverine's ray tracing shader stores to one storage image that is an RGBA8 target written
+  // as (R, G, B, A) in some frames and an RG16F target written as (R, G, 0, 1) in others. Both
+  // store the format's channels from the same components, so they share one program.
+  const uint32_t shader[] = {
+      EncodeMimg0(0x08, 0xf, false, 1),
+      EncodeMimg1(0, 0, 0, 4), // image_store 2D
+      0xbf810000u,
+  };
+  const std::array<uint32_t, 64> rgba8{0x11630600u, 0xc3800000u, 0x00b3c13fu, 0x91b00facu,
+                                       0u,          0x00700000u, 0u,          0u};
+  const std::array<uint32_t, 64> rg16f{0x11643800u, 0xc1d00000u, 0x00b3c13fu, 0x91b0022cu,
+                                       0u,          0x00700000u, 0u,          0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = rgba8;
+  const auto four_channels = RecompileForTest(shader, options);
+  options.user_data = rg16f;
+  const auto two_channels = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(two_channels.spirv);
+  Check(four_channels.spirv == two_channels.spirv,
+        "a swizzle of channels the storage format lacks changed the program");
+}
 void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   constexpr uint32_t OpImageSampleImplicitLod = 87;
   constexpr uint32_t OpImageSampleExplicitLod = 88;
@@ -14196,6 +14218,7 @@ int main() {
   TestCallTableSharedBodies();
   TestInlinedCallTargetsBecomeFunctions();
   TestNullImageKeepsShaderDimension();
+  TestStorageSwizzleOfAbsentChannelsKeepsProgram();
 
   return 0;
 }

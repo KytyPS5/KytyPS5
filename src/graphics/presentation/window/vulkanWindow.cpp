@@ -687,9 +687,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// }
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
-#if defined(__APPLE__)
-	robustness2.pNext = &features12;
-#else
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
 	if (barycentric_supported) {
 		fragment_barycentric.pNext                     = &features12;
@@ -698,7 +695,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	} else {
 		robustness2.pNext = &features12;
 	}
-#endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = VK_TRUE;

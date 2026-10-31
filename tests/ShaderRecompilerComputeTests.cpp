@@ -1442,6 +1442,11 @@ struct GraphicsCase {
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
   u32 width = 1;
+  u32 height = 1;
+  // SPI_PS_INPUT_ENA bits 14 and 15 and the first VGPR that follows the barycentrics.
+  bool pixel_sample_coverage_input = false;
+  bool pixel_pos_fixed_pt = false;
+  u32 pixel_system_input_base = 2;
   std::vector<u32> object_ids;
   std::vector<u32> gds_initial;
 };
@@ -1936,7 +1941,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_front_face_all_bits = test.pixel_front_face_all_bits;
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
-  pixel_info.ps_system_input_base = 2;
+  pixel_info.ps_system_input_base = test.pixel_system_input_base;
+  pixel_info.ps_sample_coverage_input = test.pixel_sample_coverage_input;
+  pixel_info.ps_pos_fixed_pt = test.pixel_pos_fixed_pt;
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
@@ -20591,7 +20598,7 @@ public:
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, test.width, 1, vk::Format::eR32G32B32A32Sfloat,
+        CreateImageMips(test.name, test.width, test.height, vk::Format::eR32G32B32A32Sfloat,
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -20599,7 +20606,7 @@ public:
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
-          test.name, test.width, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
+          test.name, test.width, test.height, target.format, vk::ImageUsageFlagBits::eColorAttachment,
           {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
@@ -20607,7 +20614,7 @@ public:
     Image primitive_target;
     if (object_id) {
       primitive_target = CreateImageMips(
-          test.name, test.width, 1, vk::Format::eR32Uint,
+          test.name, test.width, test.height, vk::Format::eR32Uint,
           vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
           vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -20726,12 +20733,12 @@ public:
     viewport.x = 0.0f;
     viewport.y = 0.0f;
     viewport.width = static_cast<float>(test.width);
-    viewport.height = 1.0f;
+    viewport.height = static_cast<float>(test.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vk::Rect2D scissor{};
     scissor.extent.width = test.width;
-    scissor.extent.height = 1;
+    scissor.extent.height = test.height;
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
     viewport_state.viewportCount = 1;
@@ -20811,7 +20818,7 @@ public:
     }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
-    rendering.renderArea.extent = {test.width, 1};
+    rendering.renderArea.extent = {test.width, test.height};
     rendering.layerCount = test.layers;
     rendering.colorAttachmentCount = color_blend.attachmentCount;
     rendering.pColorAttachments = colors.data();
@@ -46415,6 +46422,101 @@ GraphicsCase GraphicsAncillarySampleId() {
   return test;
 }
 
+// Reads the two halves of a POS_FIXED_PT register with V_CVT_F32_U32 SDWA word selects.
+// The y half lands in v8 and the x half in v9, clear of the input VGPRs.
+void AppendFixedPtHalfReadout(std::vector<u32> *code, u32 packed_vgpr) {
+  constexpr u32 v_cvt_f32_u32 = 0x06;
+  constexpr u32 sdwa_marker_src = 0xf9;
+  constexpr u32 sdwa_dword = 6;
+  constexpr u32 sdwa_word0 = 4;
+  constexpr u32 sdwa_word1 = 5;
+  code->push_back(EncodeVop1(v_cvt_f32_u32, 8, sdwa_marker_src));
+  code->push_back(EncodeVop1Sdwa(packed_vgpr, sdwa_dword, 0, sdwa_word1));
+  code->push_back(EncodeVop1(v_cvt_f32_u32, 9, sdwa_marker_src));
+  code->push_back(EncodeVop1Sdwa(packed_vgpr, sdwa_dword, 0, sdwa_word0));
+}
+
+// Each pixel exports its decoded x and y plus a layer value and one. Pixels are read back
+// layer by layer and row by row, so every pixel has a distinct expected position.
+void AppendFixedPtExpectedPixels(GraphicsCase *test, bool positions_present) {
+  for (u32 layer = 0; layer < test->layers; ++layer) {
+    for (u32 y = 0; y < test->height; ++y) {
+      for (u32 x = 0; x < test->width; ++x) {
+        const float shown_x = positions_present ? static_cast<float>(x) : 0.0f;
+        const float shown_y = positions_present ? static_cast<float>(y) : 0.0f;
+        test->expected_pixel.insert(
+            test->expected_pixel.end(),
+            {std::bit_cast<u32>(shown_x), std::bit_cast<u32>(shown_y),
+             std::bit_cast<u32>(static_cast<float>(layer)), 0x3f800000u});
+      }
+    }
+  }
+}
+
+// SPI_PS_INPUT_ENA = 0x8080 puts the line stipple in v0 and POS_FIXED_PT in v1. Clearing
+// bit 15 leaves v1 unwritten, so the same shader must then see no pixel positions.
+GraphicsCase GraphicsPosFixedPt(bool enabled) {
+  GraphicsCase test;
+  test.name = enabled ? "GraphicsPosFixedPt" : "GraphicsPosFixedPtDisabled";
+  test.pixel_pos_fixed_pt = enabled;
+  test.pixel_system_input_base = 1;
+  test.width = 5;
+  test.height = 3;
+  AppendFixedPtHalfReadout(&test.fragment_code, 1);
+  AppendVMovLiteral(&test.fragment_code, 2, 0);
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(9, 8, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_CVT_F32_U32, ShaderOpcode::V_MOV_B32, ShaderOpcode::EXP,
+                  ShaderOpcode::S_ENDPGM};
+  AppendFixedPtExpectedPixels(&test, enabled);
+  return test;
+}
+
+// POS_FIXED_PT follows every enabled input VGPR before it in ENA bit order. The line
+// stipple takes v0, ancillary and sample coverage each take one more when enabled.
+GraphicsCase GraphicsPosFixedPtLayout(bool ancillary, bool sample_coverage,
+                                      bool front_face = false) {
+  GraphicsCase test;
+  // Case names are static strings because GraphicsCase keeps a const char pointer.
+  test.name = front_face ? "GraphicsPosFixedPtAfterAllSystemInputs"
+              : ancillary && sample_coverage ? "GraphicsPosFixedPtAfterAncillaryAndCoverage"
+              : ancillary                    ? "GraphicsPosFixedPtAfterAncillary"
+                                             : "GraphicsPosFixedPtAfterSampleCoverage";
+  test.pixel_front_face = front_face;
+  test.pixel_ancillary = ancillary;
+  test.pixel_sample_coverage_input = sample_coverage;
+  test.pixel_pos_fixed_pt = true;
+  test.pixel_system_input_base = 1;
+  test.width = 3;
+  test.height = 2;
+  test.layers = ancillary ? 2 : 1;
+  // The front face precedes the ancillary, so the ancillary shifts up by one with it.
+  const u32 ancillary_vgpr = 1u + (front_face ? 1u : 0u);
+  const u32 packed_vgpr = ancillary_vgpr + (ancillary ? 1u : 0u) + (sample_coverage ? 1u : 0u);
+  AppendFixedPtHalfReadout(&test.fragment_code, packed_vgpr);
+  if (ancillary) {
+    // The layer is bits 16..26 of ancillary, which follows the line stipple and front face.
+    AppendVop3(&test.fragment_code, 0x148, 6, Vgpr(ancillary_vgpr), InlineU32(16),
+               InlineU32(11));
+    test.fragment_code.push_back(EncodeVop1(0x06, 2, Vgpr(6)));
+  } else {
+    AppendVMovLiteral(&test.fragment_code, 2, 0);
+  }
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(9, 8, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_CVT_F32_U32, ShaderOpcode::V_MOV_B32, ShaderOpcode::EXP,
+                  ShaderOpcode::S_ENDPGM};
+  if (ancillary) {
+    test.opcodes.push_back(ShaderOpcode::V_BFE_U32);
+  }
+  AppendFixedPtExpectedPixels(&test, true);
+  return test;
+}
+
 // SPI_BARYC_CNTL[24] selects all-bits mode for uint/bool S_FRONT_FACE;
 // float S_FRONT_FACE and __getSpecialVgprFloat(__v_front_face) leave it clear.
 GraphicsCase GraphicsFrontFaceBits(bool reversed, bool all_bits) {
@@ -47529,6 +47631,12 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
+      GraphicsPosFixedPt(true),
+      GraphicsPosFixedPt(false),
+      GraphicsPosFixedPtLayout(true, false),
+      GraphicsPosFixedPtLayout(false, true),
+      GraphicsPosFixedPtLayout(true, true),
+      GraphicsPosFixedPtLayout(true, true, true),
       GraphicsFrontFaceBits(false, false),
       GraphicsFrontFaceBits(true, false),
       GraphicsFrontFaceBits(false, true),
@@ -54082,6 +54190,16 @@ int main(int argc, char **argv) {
       }
     }
     RunGraphicsCase(&vulkan, GraphicsAncillaryLayer(true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ps-pos-fixed-pt-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPosFixedPt(true));
+    RunGraphicsCase(&vulkan, GraphicsPosFixedPt(false));
+    RunGraphicsCase(&vulkan, GraphicsPosFixedPtLayout(true, false));
+    RunGraphicsCase(&vulkan, GraphicsPosFixedPtLayout(false, true));
+    RunGraphicsCase(&vulkan, GraphicsPosFixedPtLayout(true, true));
+    RunGraphicsCase(&vulkan, GraphicsPosFixedPtLayout(true, true, true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {

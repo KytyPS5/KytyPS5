@@ -10,6 +10,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+// POS_FIXED_PT packs the integer pixel position with x in the low half and y in the high half.
+constexpr uint32_t PsFixedPtHalfMask   = 0xffffu;
+constexpr uint32_t PsFixedPtYShiftBits = 16u;
+
 static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	return {
 	    .control        = operand.dpp_ctrl,
@@ -1382,8 +1386,29 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::FrontFacing));
 			}
 			if (ps->ps_ancillary) {
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::PackedAncillary));
+			}
+			if (ps->ps_sample_coverage_input) {
+				// No coverage builtin is modelled as a pixel input yet. The register is only
+				// reserved so POS_FIXED_PT keeps its hardware slot, and it reads as zero.
+				// ShaderGetStaticInputInfoPS logs this once as not implemented.
+				reg++;
+			}
+			if (ps->ps_pos_fixed_pt) {
+				// FragCoord sits on the pixel centre, so truncation yields the integer pixel.
+				const auto pixel_x = entry_ir.Emit(
+				    IR::ValueOpcode::ConvertU32F32,
+				    {entry_ir.BitCastF32(builtin(IR::StageInputKind::FragCoord, 0))});
+				const auto pixel_y = entry_ir.Emit(
+				    IR::ValueOpcode::ConvertU32F32,
+				    {entry_ir.BitCastF32(builtin(IR::StageInputKind::FragCoord, 1))});
+				const auto masked_x =
+				    entry_ir.BitwiseAnd(IR::U32(pixel_x), IR::U32(IR::Value(PsFixedPtHalfMask)));
+				const auto shifted_y = entry_ir.ShiftLeftLogical(
+				    IR::U32(pixel_y), IR::U32(IR::Value(PsFixedPtYShiftBits)));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
+				                      entry_ir.BitwiseOr(masked_x, shifted_y));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.

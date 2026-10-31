@@ -210,6 +210,10 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_front_face                = false;
 	bool                                           ps_front_face_all_bits       = false;
 	bool                                           ps_ancillary                 = false;
+	// SPI_PS_INPUT_ENA.SAMPLE_COVERAGE_ENA reserves a VGPR the recompiler does not fill yet.
+	bool                                           ps_sample_coverage_input     = false;
+	// SPI_PS_INPUT_ENA.POS_FIXED_PT_ENA delivers the integer pixel position packed with y above x.
+	bool                                           ps_pos_fixed_pt              = false;
 	bool                                           ps_no_perspective            = false;
 	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	bool                                           ps_pixel_kill_enable         = false;
@@ -224,7 +228,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 
-	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
+	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w || ps_pos_fixed_pt; }
 };
 
 union ShaderStageInputInfo {

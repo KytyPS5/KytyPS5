@@ -7294,6 +7294,72 @@ void TestPixelAncillaryLayerInput() {
 #endif
 }
 
+// Builds pixel input info from SPI_PS_INPUT_ENA the way a draw does.
+static ShaderPixelInputInfo PreparePixelInputForEna(const std::vector<uint32_t> &shader,
+                                                    uint32_t ena) {
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = shader.size() * sizeof(uint32_t);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+  sh.ps_input_ena = sh.ps_input_addr = ena;
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  ShaderPixelInputInfo pixel{};
+  (void)PrepareProgram(regs, sh, mappings, pixel);
+  return pixel;
+}
+
+// POS_FIXED_PT (bit 15) and SAMPLE_COVERAGE (bit 14) must reach the pixel input info, the
+// shader cache key, and bit 15 must declare FragCoord. GraphicsPosFixedPt proves the value.
+void TestPixelPosFixedPtInput() {
+  using namespace ShaderRecompiler::IR;
+  const std::vector<uint32_t> shader = {
+      EncodeVop1(0x06, 4, 0xf9), EncodeVop1Sdwa(1, 6, 0, 5), // v4 = float(v1.y)
+      EncodeVop1(0x06, 5, 0xf9), EncodeVop1Sdwa(1, 6, 0, 4), // v5 = float(v1.x)
+      EncodeExp0(0x00, 0x3), EncodeExp1(5, 4, 0, 0), EncodeSopp(0x01),
+  };
+  // ENA 0x8080 puts line stipple in v0 and POS_FIXED_PT in v1.
+  auto pixel = PreparePixelInputForEna(shader, 0x8080u);
+  Check(pixel.ps_system_input_base == 1 && pixel.ps_pos_fixed_pt &&
+            !pixel.ps_sample_coverage_input && !pixel.ps_pos_x && !pixel.ps_pos_y &&
+            !pixel.ps_ancillary,
+        "ENA 0x8080 did not report only POS_FIXED_PT after the line stipple");
+  const auto fixed_key = MakeStageStaticKey(pixel);
+  pixel.ps_pos_fixed_pt = false;
+  Check(fixed_key != MakeStageStaticKey(pixel),
+        "POS_FIXED_PT is missing from the shader cache key");
+  pixel.ps_pos_fixed_pt = true;
+  pixel.ps_sample_coverage_input = true;
+  Check(fixed_key != MakeStageStaticKey(pixel),
+        "SAMPLE_COVERAGE is missing from the shader cache key");
+  pixel.ps_sample_coverage_input = false;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  auto result = RecompileForTest(shader, options);
+  // This only shows that ENA bit 15 declares FragCoord. GraphicsPosFixedPt in the GPU tests
+  // proves the packed value itself.
+  Check(ProgramHasInput(result.program, StageInputKind::FragCoord),
+        "ENA bit 15 did not declare the fragment coordinate input");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // The same code without bit 15 must not read a position.
+  auto without = PreparePixelInputForEna(shader, 0x0080u);
+  Check(!without.ps_pos_fixed_pt && without.ps_system_input_base == 1,
+        "ENA 0x0080 reported POS_FIXED_PT");
+  auto without_options = MakeCompileOptions(ShaderType::Pixel);
+  without_options.input_info.pixel = &without;
+  auto without_result = RecompileForTest(shader, without_options);
+  Check(!ProgramHasInput(without_result.program, StageInputKind::FragCoord),
+        "a shader without ENA bit 15 still declared the fragment coordinate input");
+
+  // Coverage is reserved ahead of POS_FIXED_PT without moving the system input base.
+  auto both = PreparePixelInputForEna(shader, 0xc080u);
+  Check(both.ps_system_input_base == 1 && both.ps_pos_fixed_pt && both.ps_sample_coverage_input,
+        "ENA 0xc080 did not report SAMPLE_COVERAGE and POS_FIXED_PT");
+}
+
 void TestGraphicsCreateInterpolantMapping() {
   ShaderRegister regs[32] = {};
 
@@ -17358,6 +17424,7 @@ int main() {
   TestFloatComparisonInputModes();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
+  TestPixelPosFixedPtInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();

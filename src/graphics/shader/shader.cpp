@@ -18,6 +18,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -229,29 +230,34 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	}
 }
 
-static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
-	constexpr uint32_t ps_input_persp_sample    = 0x00000001u;
-	constexpr uint32_t ps_input_persp_center    = 0x00000002u;
-	constexpr uint32_t ps_input_persp_centroid  = 0x00000004u;
-	constexpr uint32_t ps_input_persp_pull      = 0x00000008u;
-	constexpr uint32_t ps_input_linear_sample   = 0x00000010u;
-	constexpr uint32_t ps_input_linear_center   = 0x00000020u;
-	constexpr uint32_t ps_input_linear_centroid = 0x00000040u;
-	constexpr uint32_t ps_input_line_stipple    = 0x00000080u;
-	constexpr uint32_t ps_input_pos_xy          = 0x00000300u;
-	constexpr uint32_t ps_input_pos_z           = 0x00000400u;
-	constexpr uint32_t ps_input_pos_w           = 0x00000800u;
-	constexpr uint32_t ps_input_front_face      = 0x00001000u;
-	constexpr uint32_t ps_input_ancillary       = 0x00002000u;
-	constexpr uint32_t ps_input_sample_coverage = 0x00004000u;
-	constexpr uint32_t ps_input_pos_fixed_pt    = 0x00008000u;
-	constexpr uint32_t supported_ps_input_bits =
-	    ps_input_persp_sample | ps_input_persp_center | ps_input_persp_centroid |
-	    ps_input_persp_pull | ps_input_linear_sample | ps_input_linear_center |
-	    ps_input_linear_centroid | ps_input_line_stipple | ps_input_pos_xy | ps_input_pos_z |
-	    ps_input_pos_w | ps_input_front_face | ps_input_ancillary | ps_input_sample_coverage |
-	    ps_input_pos_fixed_pt;
+// SPI_PS_INPUT_ENA bits in the order the hardware packs the enabled input VGPRs from v0.
+constexpr uint32_t ps_input_persp_sample    = 0x00000001u;
+constexpr uint32_t ps_input_persp_center    = 0x00000002u;
+constexpr uint32_t ps_input_persp_centroid  = 0x00000004u;
+constexpr uint32_t ps_input_persp_pull      = 0x00000008u;
+constexpr uint32_t ps_input_linear_sample   = 0x00000010u;
+constexpr uint32_t ps_input_linear_center   = 0x00000020u;
+constexpr uint32_t ps_input_linear_centroid = 0x00000040u;
+constexpr uint32_t ps_input_line_stipple    = 0x00000080u;
+constexpr uint32_t ps_input_pos_x           = 0x00000100u;
+constexpr uint32_t ps_input_pos_y           = 0x00000200u;
+constexpr uint32_t ps_input_pos_xy          = ps_input_pos_x | ps_input_pos_y;
+constexpr uint32_t ps_input_pos_z           = 0x00000400u;
+constexpr uint32_t ps_input_pos_w           = 0x00000800u;
+constexpr uint32_t ps_input_front_face      = 0x00001000u;
+constexpr uint32_t ps_input_ancillary       = 0x00002000u;
+constexpr uint32_t ps_input_sample_coverage = 0x00004000u;
+constexpr uint32_t ps_input_pos_fixed_pt    = 0x00008000u;
+constexpr uint32_t supported_ps_input_bits =
+    ps_input_persp_sample | ps_input_persp_center | ps_input_persp_centroid |
+    ps_input_persp_pull | ps_input_linear_sample | ps_input_linear_center |
+    ps_input_linear_centroid | ps_input_line_stipple | ps_input_pos_xy | ps_input_pos_z |
+    ps_input_pos_w | ps_input_front_face | ps_input_ancillary | ps_input_sample_coverage |
+    ps_input_pos_fixed_pt;
 
+// Returns the first VGPR after the barycentric and line-stipple inputs, which is where the
+// system inputs (position, front face, ancillary and so on) start.
+static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	EXIT_NOT_IMPLEMENTED((regs.ps_input_ena & ~supported_ps_input_bits) != 0);
 	EXIT_NOT_IMPLEMENTED((regs.ps_input_addr & ~supported_ps_input_bits) != 0);
 	EXIT_NOT_IMPLEMENTED(regs.ps_input_ena != regs.ps_input_addr);
@@ -366,14 +372,23 @@ static void ShaderGetStaticInputInfoPS(
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
 	}
-	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
-	ps_info.ps_pos_y                     = (active_inputs & 0x00000200u) != 0;
-	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
-	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
-	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
+	ps_info.ps_pos_x                     = (active_inputs & ps_input_pos_x) != 0;
+	ps_info.ps_pos_y                     = (active_inputs & ps_input_pos_y) != 0;
+	ps_info.ps_pos_z                     = (active_inputs & ps_input_pos_z) != 0;
+	ps_info.ps_pos_w                     = (active_inputs & ps_input_pos_w) != 0;
+	ps_info.ps_front_face                = (active_inputs & ps_input_front_face) != 0;
 	// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects integer masks instead of float +/-1.
 	ps_info.ps_front_face_all_bits       = (sh.baryc_cntl & 0x01000000u) != 0;
-	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
+	ps_info.ps_ancillary                 = (active_inputs & ps_input_ancillary) != 0;
+	ps_info.ps_sample_coverage_input     = (active_inputs & ps_input_sample_coverage) != 0;
+	ps_info.ps_pos_fixed_pt              = (active_inputs & ps_input_pos_fixed_pt) != 0;
+	if (ps_info.ps_sample_coverage_input) {
+		static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+		if (!logged.test_and_set(std::memory_order_relaxed)) {
+			LOGF("ShaderGetStaticInputInfoPS(): temporary: SPI_PS_INPUT_ENA.SAMPLE_COVERAGE is "
+			     "reserved but not implemented yet; the register reads as zero\n");
+		}
+	}
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
@@ -501,6 +516,8 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_front_face));
 	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
+	key.push_back(static_cast<uint32_t>(info.ps_sample_coverage_input));
+	key.push_back(static_cast<uint32_t>(info.ps_pos_fixed_pt));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.parameter_mode));
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
@@ -774,6 +791,8 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_front_face        = %s\n"
 	     "\t ps_front_face_all_bits = %s\n"
 	     "\t ps_ancillary         = %s\n"
+	     "\t ps_sample_coverage_input = %s\n"
+	     "\t ps_pos_fixed_pt      = %s\n"
 	     "\t ps_sample_shading    = %s\n"
 	     "\t ps_no_perspective    = %s\n"
 	     "\t ps_pixel_kill_enable = %s\n"
@@ -786,6 +805,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
 	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
 	     info.ps_front_face_all_bits ? "true" : "false", info.ps_ancillary ? "true" : "false",
+	     info.ps_sample_coverage_input ? "true" : "false", info.ps_pos_fixed_pt ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
 	     info.ps_execute_on_noop ? "true" : "false", info.lds_size_dwords);

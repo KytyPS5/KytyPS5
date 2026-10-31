@@ -1533,6 +1533,9 @@ bool PipelineCache::WaitForCompile(const ProgramKey& key) {
 	const auto copy = key;
 	do {
 		UnlockPrograms();
+		// The worker reads the shader code from guest memory: on a page the GPU owns, it faults
+		// and waits for this thread to read the GPU's bytes back.
+		GuestGpu::RunUrgentCommandsWhileWaiting();
 		std::this_thread::yield();
 		LockPrograms();
 	} while (m_in_flight.contains(copy));

@@ -50,6 +50,9 @@ public:
 
 	// The thread that owns the renderer: the execution thread of a pipelined GPU.
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// Execution thread, while it waits for another thread: runs the urgent commands queued so
+	// far, which that thread may be waiting for (a read of guest memory the GPU owns).
+	static void RunUrgentCommandsWhileWaiting();
 
 	// A pipelined GPU parses command buffers on its command processor thread and executes the
 	// operations they produce, in order, on its execution thread.

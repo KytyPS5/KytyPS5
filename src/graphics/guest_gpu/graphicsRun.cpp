@@ -41,6 +41,8 @@ namespace Libs::Graphics {
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
+// The pipelined GPU whose execution thread this is.
+static thread_local GuestGpu*         g_executing_gpu     = nullptr;
 // The command processor thread of a pipelined GPU.
 static thread_local bool              g_cp_thread         = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
@@ -350,7 +352,8 @@ void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
-	g_gpu_thread = true;
+	g_gpu_thread    = true;
+	g_executing_gpu = this;
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
@@ -380,7 +383,8 @@ void GuestGpu::ExecutionThread() {
 		}
 	}
 	m_executed.Notify();
-	g_gpu_thread = false;
+	g_gpu_thread    = false;
+	g_executing_gpu = nullptr;
 }
 
 static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectOffsets& offsets);
@@ -2037,6 +2041,12 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 		GetScheduler().Flush();
 	});
+}
+
+void GuestGpu::RunUrgentCommandsWhileWaiting() {
+	if (g_executing_gpu != nullptr) {
+		g_executing_gpu->RunUrgentCommands();
+	}
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

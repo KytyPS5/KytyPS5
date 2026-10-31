@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
+#include "libs/libcStdio.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
 #include "loader/runtimeLinker.h"
@@ -630,9 +631,7 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 int KYTY_SYSV_ABI fflush(FILE* stream) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
-
-	return ::fflush(stream);
+	return LibcStdio::Fflush(stream, stdout);
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
@@ -808,6 +807,11 @@ LIB_DEFINE(InitLibC_1) {
 	LibcInternal::InitLibcInternal_1(s);
 
 	LIB_OBJECT("P330P3dFF68", &LibC::g_need_flag);
+
+	// Games read these slots to get the FILE* of the guest libc, filled in by RuntimeLinker.
+	LIB_OBJECT("bgAcsbcEznc", &LibcStdio::Slots().stdin_file);  // __stdinp
+	LIB_OBJECT("zqJhBxAKfsc", &LibcStdio::Slots().stdout_file); // __stdoutp
+	LIB_OBJECT("as8Od-tH1BI", &LibcStdio::Slots().stderr_file); // __stderrp
 
 	LIB_FUNC("uMei1W9uyNo", LibC::exit);
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);

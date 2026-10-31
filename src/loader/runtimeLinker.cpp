@@ -18,6 +18,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/libcStdio.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -896,12 +897,14 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
-	if (patched && stubbed) {
-		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
+	if (patched && !ri.resolved) {
+		// Unresolved objects point at no-access memory, so the first read faults far from here.
+		// This line names the missing data export.
+		LOGF("Relocate: unresolved %s import patched to %s [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
-		     jmprela_table ? "PLT" : "non-PLT", index, ri.vaddr, value, ri.name.c_str(),
-		     magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-		     Common::PathToString(program->file_name).c_str());
+		     jmprela_table ? "PLT" : "non-PLT", stubbed ? "stub" : "invalid memory", index,
+		     ri.vaddr, value, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
 	}
 
 	if (program->dbg_print_reloc && patched && !ri.bind_self &&
@@ -1123,6 +1126,8 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 	auto it = std::find(m_programs.begin(), m_programs.end(), program);
 	EXIT_IF(it == m_programs.end());
 	m_programs.erase(it);
+	// The stdio slots and fflush point into the module that is about to be unmapped.
+	Libs::LibcStdio::ResetGuestLibc(program);
 
 	for (auto* importer: m_programs) {
 		const auto& info = *importer->dynamic_info;
@@ -1248,6 +1253,18 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+/// Points the HLE __stdinp, __stdoutp and __stderrp slots and fflush at the given libc.prx.
+/// Passing nullptr leaves them null, which is logged.
+void RuntimeLinker::BindGuestLibc(Program* libc) {
+	Libs::LibcStdio::BindGuestLibc(libc != nullptr ? libc->export_symbols.get() : nullptr, libc);
+}
+
+/// Lets a libc.prx that fills its own stdio variables in its initializer override the bind.
+void RuntimeLinker::RefreshGuestLibc(Program* libc) {
+	Libs::LibcStdio::RefreshGuestLibc(libc != nullptr ? libc->export_symbols.get() : nullptr,
+	                                  libc);
+}
+
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
@@ -1270,6 +1287,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
+	// Binding needs finished relocations so that variables defined by libc.prx hold real values.
+	// Nothing that could read a slot runs before this point, and the game patch and the libc
+	// initializers come after it.
+	BindGuestLibc(libc);
 
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
@@ -1280,6 +1301,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
+	// A libc that fills its own stdio variables in its initializer is only visible now.
+	RefreshGuestLibc(libc);
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1307,6 +1330,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	Libs::LibcStdio::ResetGuestLibc(nullptr);
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);

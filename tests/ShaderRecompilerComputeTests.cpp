@@ -29884,6 +29884,60 @@ TestCase Vop1MoveRelDestination() {
   return test;
 }
 
+// V_SWAP_B32 v1, v2 on a four-lane wave. exec_mask picks the lanes that run the
+// instruction, and use_move replaces it with V_MOV_B32 v1, v2 as the baseline
+// for the one-way copy.
+TestCase Vop1SwapProgram(const char *name, u32 exec_mask, bool use_move,
+                         std::vector<u32> expected) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 17);
+  AppendVMovU32(&code, 2, 34);
+  code.push_back(EncodeSMovB32(126, InlineU32(exec_mask)));
+  code.push_back(use_move ? EncodeVop1(0x01, 1, Vgpr(2))
+                          : EncodeVop1(0x65, 1, Vgpr(2)));
+  code.push_back(EncodeSMovB32(126, InlineU32(15)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = code;
+  test.expected = std::move(expected);
+  test.opcodes = {O::V_MOV_B32,
+                  O::S_MOV_B32,
+                  use_move ? O::V_MOV_B32 : O::V_SWAP_B32,
+                  O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// All lanes swap, so v1 holds the old v2 and v2 holds the old v1.
+TestCase Vop1SwapAllLanes() {
+  return Vop1SwapProgram("Vop1SwapAllLanes", 15, false,
+                         {34, 34, 34, 34, 17, 17, 17, 17});
+}
+
+// Lanes 0 and 2 swap. Lanes 1 and 3 keep both registers.
+TestCase Vop1SwapPartialExec() {
+  return Vop1SwapProgram("Vop1SwapPartialExec", 5, false,
+                         {34, 17, 34, 17, 17, 34, 17, 34});
+}
+
+// The same lanes with a plain move. Only v1 changes, so v2 stays as it was.
+TestCase Vop1SwapBaselineMove() {
+  return Vop1SwapProgram("Vop1SwapBaselineMove", 5, true,
+                         {34, 17, 34, 17, 34, 34, 34, 34});
+}
+
 TestCase CubeIdCapturedNegationAndOutputScale() {
   using O = ShaderOpcode;
 
@@ -47075,6 +47129,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
+  AddCase(Vop1SwapAllLanes);
+  AddCase(Vop1SwapPartialExec);
+  AddCase(Vop1SwapBaselineMove);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -54614,6 +54671,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vop1-swap-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SwapAllLanes());
+    RunCase(&vulkan, Vop1SwapPartialExec());
+    RunCase(&vulkan, Vop1SwapBaselineMove());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--rt1d-only") == 0) {

@@ -18,6 +18,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MOV_B32: MOV_B32(inst, true); return;
 		case O::V_MOVRELS_B32: V_MOVRELS_B32(inst); return;
 		case O::V_MOVRELD_B32: V_MOVRELD_B32(inst); return;
+		case O::V_SWAP_B32: V_SWAP_B32(inst); return;
 		case O::V_READFIRSTLANE_B32: V_READFIRSTLANE_B32(inst); return;
 		case O::V_READLANE_B32: V_READLANE_B32(inst); return;
 		case O::V_WRITELANE_B32: V_WRITELANE_B32(inst); return;

@@ -2035,6 +2035,64 @@ void TestNggVertexEntryState() {
   }
 }
 
+void TestVop1SwapB32() {
+  using namespace ShaderRecompiler;
+  // A sample encoding, v_swap_b32 v2, v4.
+  constexpr uint32_t sample = 0x7e04cb04u;
+  Check(sample == EncodeVop1(0x65, 2, 256 + 4),
+        "the sample V_SWAP_B32 encoding changed");
+  const std::array decode_only = {sample, EncodeSopp(0x01)};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(decode_only, decoded);
+  const auto &swap = decoded.instructions.front();
+  Check(swap.opcode == Decoder::Opcode::V_SWAP_B32 &&
+            swap.family == Decoder::Family::VOP1 && swap.opcode_id == 0x65u &&
+            swap.dst.kind == Decoder::OperandKind::Vgpr && swap.dst.reg == 2u &&
+            swap.src0.kind == Decoder::OperandKind::Vgpr &&
+            swap.src0.reg == 4u && swap.src_count == 1u,
+        "V_SWAP_B32 did not decode its two VGPR operands");
+
+  // The source is written too, so scalar, constant, SDWA and DPP sources are
+  // rejected.
+  for (const uint32_t source : {4u, 128u, 249u, 250u}) {
+    const std::array bad = {EncodeVop1(0x65, 2, source), 0u, EncodeSopp(0x01)};
+    Decoder::Program rejected;
+    Decoder::DecodeProgram(bad, rejected);
+    Check(rejected.instructions.front().opcode ==
+                  Decoder::Opcode::UNSUPPORTED &&
+              rejected.instructions.front().unsupported_reason.find("VGPR") !=
+                  std::string_view::npos,
+          "V_SWAP_B32 accepted a source that is not a VGPR");
+  }
+
+  // v2 = 1 and v4 = 2, then each is stored. With the swap the stored values
+  // trade places.
+  const auto stored_order = [&](bool with_swap) {
+    std::vector<uint32_t> program = {EncodeVop1(0x01, 2, 129),
+                                     EncodeVop1(0x01, 4, 130)};
+    if (with_swap) {
+      program.push_back(sample);
+    }
+    program.insert(program.end(),
+                   {EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(2, 12, 0),
+                    EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(4, 12, 0),
+                    EncodeSopp(0x01)});
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    const auto result = RecompileForTest(program, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto one = result.ir_dump.find(", 0x00000001, true");
+    const auto two = result.ir_dump.find(", 0x00000002, true");
+    Check(one != std::string::npos && two != std::string::npos,
+          "the swap program lost a stored value");
+    return one < two;
+  };
+  Check(stored_order(false),
+        "the program without the swap stores v2 then v4 in the wrong order");
+  Check(!stored_order(true),
+        "V_SWAP_B32 did not exchange the two stored values");
+}
+
 void TestNativeDataCacheInvalidation() {
   using namespace ShaderRecompiler;
   // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT. The S_DCACHE_INV
@@ -17350,6 +17408,7 @@ int main() {
   TestSopkCompareImmediateExtension();
   TestNativeDataCacheInvalidation();
   TestNativeStoreCompletion();
+  TestVop1SwapB32();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestVopcCmpxClassF16Decoder();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();

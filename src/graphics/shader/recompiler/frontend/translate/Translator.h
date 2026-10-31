@@ -241,6 +241,7 @@ private:
 	void S_WQM(const Decoder::Instruction& inst, bool wide);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
+	void V_SWAP_B32(const Decoder::Instruction& inst);
 	void V_READFIRSTLANE_B32(const Decoder::Instruction& inst);
 	void V_READLANE_B32(const Decoder::Instruction& inst);
 	void V_WRITELANE_B32(const Decoder::Instruction& inst);

@@ -437,6 +437,25 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 }
 
+/// V_SWAP_B32 exchanges two VGPRs. Both old values are read before either write, and the
+/// ordinary VGPR write keeps the old value in lanes that EXEC masks off, so inactive lanes keep
+/// both registers. The encoding is VOP1-only, so the source is always a plain VGPR.
+void Translator::V_SWAP_B32(const Decoder::Instruction& inst) {
+	if (inst.dst.kind != Decoder::OperandKind::Vgpr ||
+	    inst.src0.kind != Decoder::OperandKind::Vgpr) {
+		EXIT("V_SWAP_B32 requires VGPR operands at pc 0x%08x", inst.pc);
+	}
+	if (inst.dst.sdwa_sel != 6u || inst.dst.omod != 0u || inst.dst.clamp ||
+	    inst.src0.sdwa_sel != 6u || inst.src0.sdwa_sext || inst.src0.negate || inst.src0.absolute ||
+	    inst.src0.dpp) {
+		EXIT("V_SWAP_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
+	}
+	const auto destination_old = ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
+	const auto source_old      = ReadU32(inst.src0);
+	WriteOperand(inst.dst, source_old);
+	WriteOperand(inst.src0, destination_old);
+}
+
 void Translator::V_READFIRSTLANE_B32(const Decoder::Instruction& inst) {
 	const auto result = ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), ir.GetExec()});
 	WriteOperand(DestinationOperand(inst), result);

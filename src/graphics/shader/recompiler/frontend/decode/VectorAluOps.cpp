@@ -148,6 +148,8 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x5fu, Opcode::V_FRACT_F16},
     {0x60u, Opcode::V_SIN_F16},
     {0x61u, Opcode::V_COS_F16},
+    // VOP1-only on gfx10, so it has no VOP3, SDWA or DPP form.
+    {0x65u, Opcode::V_SWAP_B32},
 };
 
 constexpr auto VOP1_OPS = Detail::MakeOpcodeTable<0x100>(VOP1_OPCODE_LIST);
@@ -1763,6 +1765,11 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::V_NOP) {
 		inst.dst.kind  = OperandKind::Null;
 		inst.src_count = 0;
+		return;
+	}
+	if (inst.opcode == Opcode::V_SWAP_B32 && src0 < 256u) {
+		// The source is written too, so it must be a VGPR. The SDWA and DPP codes are below 256.
+		SetUnsupported(inst, Family::VOP1, opcode, "V_SWAP_B32 requires a VGPR source");
 		return;
 	}
 	switch (src0) {

@@ -209,6 +209,12 @@ struct BufferCacheTestAccess {
   }
 };
 
+struct DescriptorHeapTestAccess {
+  static vk::DescriptorPool CurrentPool(const DescriptorHeap &heap) {
+    return heap.m_current_pool;
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -2517,6 +2523,131 @@ public:
             reentrant == 2 && concurrent_completed.load(),
             "shutdown lost reentrant or concurrent deferred work");
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
+  }
+
+  void CheckSchedulerIdlePolling() {
+    constexpr const char *name = "SchedulerIdlePolling";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &master = scheduler.GetMasterSemaphore();
+    // Waits on the device only, leaving the scheduler's known GPU tick behind.
+    const auto WaitOnDevice = [&](uint64_t tick) {
+      const auto semaphore = master.Handle();
+      vk::SemaphoreWaitInfo wait{};
+      wait.sType = vk::StructureType::eSemaphoreWaitInfo;
+      wait.semaphoreCount = 1;
+      wait.pSemaphores = &semaphore;
+      wait.pValues = &tick;
+      Require(name, "device wait",
+              m_runtime_context.device.waitSemaphores(&wait, UINT64_MAX) ==
+                  vk::Result::eSuccess,
+              "vkWaitSemaphores failed");
+    };
+
+    const auto first = scheduler.CurrentTick();
+    scheduler.Flush();
+    WaitOnDevice(first);
+    const auto known = master.KnownGpuTick();
+    scheduler.PopPendingOperations();
+    Require(name, "empty queue",
+            known < first && master.KnownGpuTick() == known,
+            "an empty operation queue polled the timeline");
+
+    bool released = false;
+    const auto open = scheduler.CurrentTick();
+    scheduler.DeferOperation([&released] { released = true; });
+    scheduler.PopPendingOperations();
+    Require(name, "open tick",
+            !released && master.KnownGpuTick() == known,
+            "an operation of the unsubmitted tick polled the timeline");
+
+    scheduler.Flush();
+    WaitOnDevice(open);
+    scheduler.PopPendingOperations();
+    Require(name, "submitted tick",
+            released && master.KnownGpuTick() >= open,
+            "a completed operation was not released by the next poll");
+
+    // A submitted tick that has not completed is polled once, then left for a
+    // later call.
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    RequireVk(name, "gate",
+              m_runtime_context.device.createSemaphore(&timeline_create, nullptr,
+                                                       &gate),
+              "vkCreateSemaphore");
+    bool gated_released = false;
+    const auto gated = scheduler.CurrentTick();
+    scheduler.DeferOperation([&gated_released] { gated_released = true; });
+    SubmitInfo gated_submit;
+    gated_submit.AddWait(gate, 1);
+    scheduler.Flush(gated_submit);
+    scheduler.PopPendingOperations();
+    Require(name, "running tick", !gated_released && !master.IsFree(gated),
+            "an operation was released before its tick completed");
+    vk::SemaphoreSignalInfo signal{};
+    signal.sType = vk::StructureType::eSemaphoreSignalInfo;
+    signal.semaphore = gate;
+    signal.value = 1;
+    RequireVk(name, "gate signal", m_runtime_context.device.signalSemaphore(&signal),
+              "vkSignalSemaphore");
+    WaitOnDevice(gated);
+    scheduler.PopPendingOperations();
+    Require(name, "completed tick", gated_released,
+            "a completed operation was not released by the next poll");
+    m_runtime_context.device.destroySemaphore(gate, nullptr);
+
+    // A descriptor pool retired before the poll is reused once its tick completed.
+    vk::DescriptorSetLayoutBinding binding{};
+    binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    binding.descriptorCount = 1;
+    binding.stageFlags = vk::ShaderStageFlagBits::eCompute;
+    vk::DescriptorSetLayoutCreateInfo create{};
+    create.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+    create.bindingCount = 1;
+    create.pBindings = &binding;
+    vk::DescriptorSetLayout layout = nullptr;
+    RequireVk(name, "layout",
+              m_runtime_context.device.createDescriptorSetLayout(&create, nullptr,
+                                                                 &layout),
+              "vkCreateDescriptorSetLayout");
+    {
+      DescriptorHeap heap(m_runtime_context, master);
+      const auto Rollover = [&] {
+        const auto pool = DescriptorHeapTestAccess::CurrentPool(heap);
+        for (uint32_t i = 0; i < 4096; i++) {
+          Require(name, "descriptor set", heap.Commit(layout) != nullptr,
+                  "the descriptor heap could not allocate a set");
+          if (DescriptorHeapTestAccess::CurrentPool(heap) != pool) {
+            return;
+          }
+        }
+        Require(name, "pool rollover", false, "the descriptor pool never filled");
+      };
+      const auto retired = DescriptorHeapTestAccess::CurrentPool(heap);
+      const auto retired_tick = scheduler.CurrentTick();
+      Rollover();
+      scheduler.Flush();
+      WaitOnDevice(retired_tick);
+      const auto stale = master.KnownGpuTick();
+      Rollover();
+      Require(name, "pool reuse",
+              stale < retired_tick &&
+                  DescriptorHeapTestAccess::CurrentPool(heap) == retired,
+              "the descriptor heap created a pool instead of reusing a completed one");
+      scheduler.Finish();
+    }
+    m_runtime_context.device.destroyDescriptorSetLayout(layout, nullptr);
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckGpuMappedRangeLifecycle() {
@@ -53726,6 +53857,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckSchedulerIdlePolling();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
@@ -54382,6 +54514,7 @@ int main(int argc, char **argv) {
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckSchedulerIdlePolling();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();

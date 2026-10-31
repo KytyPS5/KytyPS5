@@ -14,8 +14,10 @@
 #include "common/stringUtils.h"
 #include "libs/vaContext.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace Libs {
@@ -441,6 +443,20 @@ static size_t _strnlen_s(const Char* str, size_t maxsize) {
 	return size;
 }
 
+/// Copies formatted output into a snprintf destination the way C99 requires. At most n-1
+/// bytes are written and a terminator always follows, unless n is 0 and nothing is written.
+/// The bytes are copied by length, not as a C string, so a %c of 0 does not cut the output
+/// short.
+static void CopyTruncated(char* dest, size_t dest_size, const std::vector<char>& formatted,
+                          size_t formatted_length) {
+	if (dest_size == 0) {
+		return;
+	}
+	const size_t copy_length = std::min({formatted_length, formatted.size(), dest_size - 1});
+	std::memcpy(dest, formatted.data(), copy_length);
+	dest[copy_length] = '\0';
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* format,
                                 VaList* va_list) {
@@ -773,8 +789,7 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 	out(static_cast<char>(0), &buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
 
 	if (sn) {
-		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
-		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		CopyTruncated(sn_s, sn_n, buffer, idx);
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}

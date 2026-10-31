@@ -612,6 +612,13 @@ target_include_directories(libc_stdio_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(libc_registration_tests "${KYTY_TESTS_DIR}/LibcRegistrationTests.cpp")
 
+add_executable(guest_snprintf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestSnprintfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/guestPrintf.cpp"
+)
+target_link_libraries(guest_snprintf_tests common fmt::fmt)
+target_include_directories(guest_snprintf_tests PRIVATE ${inc_headers})
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -699,6 +706,7 @@ if(BUILD_TESTING)
 	add_test(NAME libc_stdio COMMAND $<TARGET_FILE:libc_stdio_tests>)
 	set_tests_properties(libc_stdio PROPERTIES TIMEOUT 60)
 	add_test(NAME libc_registration COMMAND $<TARGET_FILE:libc_registration_tests>)
+	add_test(NAME guest_snprintf COMMAND $<TARGET_FILE:guest_snprintf_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
@@ -810,6 +818,7 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		libc_stdio_tests
 		libc_registration_tests
+		guest_snprintf_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests

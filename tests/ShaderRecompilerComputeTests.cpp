@@ -5999,6 +5999,82 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Checks that deferred BDA events stay out of TakeBdaSync until PromoteBdaSync, and that
+  // promotion moves them exactly once, both into an empty and a non-empty immediate set.
+  void CheckBdaSyncDeferredEvents() {
+    constexpr const char *name = "BdaSyncDeferredEvents";
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    // The queue only records ranges, so no memory has to be mapped here.
+    constexpr uint64_t address = 0x0000000208000000ull;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &cache = context.GetBufferCache();
+    (void)cache.TakeBdaSync();
+
+    // A game-thread write holds its BDA event back until the command processor promotes it.
+    cache.QueueBdaSync(address + 7, 1, true);
+    Require(name, "held back", cache.TakeBdaSync().Empty(),
+            "deferred BDA event was visible before promotion");
+    cache.QueueBdaSync(address + page + 7, 1);
+    auto pending = cache.TakeBdaSync();
+    Require(name, "immediate event",
+            pending.Contains(address + page, page) && !pending.Intersects(address, page),
+            "immediate BDA event waited for, or released, a deferred one");
+    cache.PromoteBdaSync();
+    pending = cache.TakeBdaSync();
+    Require(name, "promotion",
+            pending.Contains(address, page) && !pending.Intersects(address + page, page),
+            "promotion lost or widened a deferred BDA event");
+    cache.PromoteBdaSync();
+    Require(name, "single promotion", cache.TakeBdaSync().Empty(),
+            "promotion replayed an already promoted event");
+    cache.QueueBdaSync(address, page, true);
+    cache.QueueBdaSync(address + page, page);
+    cache.PromoteBdaSync();
+    Require(name, "merge", cache.TakeBdaSync().Contains(address, 2 * page),
+            "promotion did not merge with pending immediate events");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Checks that the GPU thread promotes held-back game-thread BDA events when it starts a
+  // submission, so the BDA draws it records see writes made before it was submitted.
+  void CheckBdaSyncSubmissionPromotes() {
+    constexpr const char *name = "BdaSyncSubmissionPromotes";
+    // The queue only records ranges, so no memory has to be mapped here.
+    constexpr uint64_t held_back = 0x0000000208000000ull;
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    constexpr uint32_t done_value = 7;
+    constexpr auto timeout = std::chrono::seconds(10);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &cache = context.GetBufferCache();
+    context.InitializeGpu(nullptr);
+    (void)cache.TakeBdaSync();
+    cache.QueueBdaSync(held_back, page, true);
+    Require(name, "held back", cache.TakeBdaSync().Empty(),
+            "a held-back BDA event was visible before the submission");
+
+    // The submission only writes a marker, so the test can tell it has started.
+    volatile uint32_t done = 0;
+    const auto done_address = reinterpret_cast<uint64_t>(&done);
+    const std::array<uint32_t, 5> commands{
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(done_address),
+        static_cast<uint32_t>(done_address >> 32u), done_value};
+    context.GetGpu().Submit(commands);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (done != done_value && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    Require(name, "submission ran", done == done_value, "the submission did not run");
+    // The marker only shows progress. Waiting for idle orders the GPU thread's promotion before
+    // this thread's TakeBdaSync through the GPU queue mutex.
+    context.GetGpu().WaitForIdle();
+    Require(name, "promotion", cache.TakeBdaSync().Contains(held_back, page),
+            "starting a submission did not promote held-back BDA events");
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -6043,9 +6119,16 @@ public:
     snapshot(0, 0);
     snapshot(2 * page, 1);
 
+    // This thread is not the GPU thread, so the write is queued like a game thread's: BDA
+    // synchronization skips it until the command processor starts or resumes a submission.
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
     words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.PrepareBda();
+    Require(name, "deferred game-thread write",
+            cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a game-thread write reached BDA synchronization before promotion");
+    cache.PromoteBdaSync();
     context.PrepareBda();
     snapshot(16, 2);
     snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
@@ -53386,6 +53469,73 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Checks that each packet that acts on a guest value a game thread may have written promotes the
+// game-thread BDA events held back before it.
+void CheckPm4ControlReadsPromoteBdaSync(RenderContext &renderer) {
+  constexpr const char *name = "Pm4ControlReadsPromoteBdaSync";
+  // The queue only records ranges, so no memory has to be mapped here.
+  constexpr uint64_t held_back = 0x0000000208000000ull;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  constexpr uint32_t one_dword_nop = 0xffff1000u;
+  constexpr uint32_t compare_equal = 3;
+  constexpr uint32_t rewind_valid = 0x80000000u;
+  constexpr uint32_t predication_value_op = 3;
+  constexpr uint32_t wait_memory_space = 0x10u;
+  constexpr uint32_t branch_then_only = 1u;
+  constexpr uint32_t predication_skip_when_zero = 1u;
+  constexpr uint32_t semaphore_wait = 7u << 29u;
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  auto &cache = renderer.GetBufferCache();
+  // Every packet below tests this value and finds it equal to 1.
+  alignas(16) uint64_t value = 1;
+  const auto address = reinterpret_cast<uint64_t>(&value);
+  const auto low = static_cast<uint32_t>(address);
+  const auto high = static_cast<uint32_t>(address >> 32u);
+  const auto check = [&](const char *packet, std::span<const uint32_t> commands) {
+    (void)cache.TakeBdaSync();
+    cache.QueueBdaSync(held_back, page, true);
+    Pm4Execution execution;
+    const bool complete =
+        processor.Process(execution, commands) == Pm4ProcessResult::Complete;
+    Require(name, packet, complete && cache.TakeBdaSync().Contains(held_back, page),
+            "a packet that read a guest value did not promote held-back BDA events");
+  };
+
+  const std::array<uint32_t, 7> wait{KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0),
+                                     wait_memory_space | compare_equal, low, high, 1, UINT32_MAX,
+                                     0};
+  check("WAIT_REG_MEM", wait);
+  // An execute count of 0 skips nothing either way. The NOP keeps the packet inside the buffer.
+  const std::array<uint32_t, 6> cond_exec{KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), low, high, 0, 0,
+                                          one_dword_nop};
+  check("COND_EXEC", cond_exec);
+  const std::array<uint32_t, 1> then_commands{one_dword_nop};
+  const auto then_address = reinterpret_cast<uint64_t>(then_commands.data());
+  const std::array<uint32_t, 14> branch{KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0),
+                                        branch_then_only | (compare_equal << 8u), low, high,
+                                        UINT32_MAX,
+                                        UINT32_MAX, 1, 0, static_cast<uint32_t>(then_address),
+                                        static_cast<uint32_t>(then_address >> 32u),
+                                        static_cast<uint32_t>(then_commands.size()), 0, 0, 0};
+  check("BRANCH", branch);
+  const std::array<uint32_t, 2> rewind{KYTY_PM4(2, Pm4::IT_REWIND, 0), rewind_valid};
+  check("REWIND", rewind);
+  const std::array<uint32_t, 4> predication{
+      KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0),
+      (predication_value_op << 16u) | (predication_skip_when_zero << 8u), low, high};
+  check("SET_PREDICATION", predication);
+  // A wait on a counter of 1 passes and consumes the count.
+  alignas(8) uint64_t semaphore = 1;
+  const auto semaphore_address = reinterpret_cast<uint64_t>(&semaphore);
+  const std::array<uint32_t, 4> semaphore_packet{
+      KYTY_PM4(4, Pm4::IT_MEM_SEMAPHORE, 0), static_cast<uint32_t>(semaphore_address),
+      static_cast<uint32_t>(semaphore_address >> 32u), semaphore_wait};
+  check("MEM_SEMAPHORE", semaphore_packet);
+  Require(name, "MEM_SEMAPHORE count", semaphore == 0, "the semaphore wait did not consume its count");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -54449,6 +54599,7 @@ int main(int argc, char **argv) {
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4LodStats(vulkan.RuntimeRenderer());
     CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+    CheckPm4ControlReadsPromoteBdaSync(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
@@ -54560,6 +54711,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
+    vulkan.CheckBdaSyncDeferredEvents();
+    vulkan.CheckBdaSyncSubmissionPromotes();
     vulkan.CheckBdaSyncUploads();
     return 0;
   }
@@ -54761,6 +54914,7 @@ int main(int argc, char **argv) {
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4LodStats(vulkan.RuntimeRenderer());
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+  CheckPm4ControlReadsPromoteBdaSync(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
@@ -54816,6 +54970,8 @@ int main(int argc, char **argv) {
   vulkan.CheckNullStorageBufferDescriptor();
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaSyncDeferredEvents();
+  vulkan.CheckBdaSyncSubmissionPromotes();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();

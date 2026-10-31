@@ -1736,8 +1736,11 @@ static int ResolverStartNtoaInternal(int rid, const char* hostname, const Resolv
 			network->ResolverEndLookup(rid, generation, deliver_res);
 			return deliver_res;
 		}
-		network->ResolverEndLookup(rid, generation, res);
-		return res;
+		if (network->ResolverCheckValidForDelivery(rid, generation, nullptr)) {
+			network->ResolverEndLookup(rid, generation, res);
+			return res;
+		}
+		return NET_ERROR_EINTR;
 	}
 
 	std::string host_copy = hostname;

@@ -89,6 +89,14 @@ struct Fixture {
 		Check(QueueBlocks(data, &block, 1, flags) == OK, "sampler queue failed");
 	}
 
+	void QueueFloat(const float* data, uint32_t frames, uint32_t flags, uint32_t repeats = 0,
+	                uint32_t skip = 0) {
+		const Ngs2WaveformBlock block {
+		    0, size_t(frames + skip) * voice.channels * sizeof(float), repeats, skip, frames, 0,
+		    123};
+		Check(QueueBlocks(data, &block, 1, flags) == OK, "sampler queue float failed");
+	}
+
 	void Render(uint32_t frames) {
 		voice.rendered = false;
 		Ngs2RenderVoice(voice, {}, frames);
@@ -656,6 +664,11 @@ void TestWaveformBlockGeometry() {
 	          block.data_offset == 16384 && block.data_size == 16384 &&
 	          block.num_skip_samples == 0 && block.num_samples == 4096,
 	      "PCM block calculation omitted the sample frames");
+	const Ngs2WaveformFormat float_pcm {0x18, 2, 48000};
+	Check(Ngs2CalcWaveformBlock(&float_pcm, 2048, 2048, &block) == OK &&
+	          block.data_offset == 16384 && block.data_size == 16384 &&
+	          block.num_skip_samples == 0 && block.num_samples == 2048,
+	      "float PCM block calculation omitted the sample frames");
 	Fixture f(24000);
 	const int16_t silence = 0;
 	f.Queue(&silence, 0, 0, UINT32_MAX);
@@ -775,6 +788,24 @@ struct RenderRack {
 		return *reinterpret_cast<Ngs2VoiceInternal*>(reinterpret_cast<Ngs2RackInternal*>(handle) + 1);
 	}
 };
+
+void TestFloatPcmPlayback() {
+	Fixture f(48000, 2);
+	f.voice.SetupSampler({0x18, 2, 48000});
+	f.voice.state = Ngs2VoicePlayState::Playing;
+	std::vector<float> pcm(1024 * 2);
+	for (size_t i = 0; i < 1024; ++i) {
+		pcm[i * 2]     = static_cast<float>(i) / 1024.0f;
+		pcm[i * 2 + 1] = -static_cast<float>(i) / 1024.0f;
+	}
+	f.QueueFloat(pcm.data(), 1024, 0);
+	f.Render(512);
+	for (size_t i = 0; i < 512; ++i) {
+		const float expected = static_cast<float>(i) / 1024.0f;
+		Check(f.voice.samples[i] == expected && f.voice.samples[512 + i] == -expected,
+		      "float PCM playback delivered incorrect samples or channel order");
+	}
+}
 
 void TestPcm16RenderOutput() {
 	Ngs2Internal system;
@@ -1998,6 +2029,7 @@ int main() {
 	TestAtrac9Vibration();
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
+	TestFloatPcmPlayback();
 	TestPatchToRackHandle();
 	TestMasteringGain();
 	TestMasteringDownmix();

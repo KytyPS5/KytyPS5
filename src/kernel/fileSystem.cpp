@@ -1229,6 +1229,23 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	return OK;
 }
 
+// Windows reports a path that runs through a regular file as not found, where POSIX hosts
+// report ENOTDIR. Decide from the nearest existing ancestor.
+static int MissingPathError(const std::filesystem::path& real_name) {
+	for (auto parent = real_name.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+		std::error_code error;
+		const auto      status = std::filesystem::status(parent, error);
+		if (!error && std::filesystem::exists(status)) {
+			return std::filesystem::is_directory(status) ? KERNEL_ERROR_ENOENT
+			                                             : KERNEL_ERROR_ENOTDIR;
+		}
+		if (parent == parent.parent_path()) {
+			break;
+		}
+	}
+	return KERNEL_ERROR_ENOENT;
+}
+
 int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	PRINT_NAME();
 	if (path == nullptr) {
@@ -1274,7 +1291,7 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	}
 	if (error) {
 		switch (static_cast<std::errc>(error.default_error_condition().value())) {
-			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+			case std::errc::no_such_file_or_directory: return MissingPathError(real_name);
 			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
 			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
 			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;

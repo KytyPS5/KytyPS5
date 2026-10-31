@@ -31,7 +31,7 @@ static int KYTY_SYSV_ABI RazorCpuNamedSync(const char*) {
 // What it does: It is part of Razor CPU, the CPU profiler/analyzer in the Sony SDK. It is used to
 // insert a marker into the code. Implemented with a stub that logs the call and returns OK.
 static int KYTY_SYSV_ABI sceRazorCpuPushMarkerStatic(const char*) {
-	LOGF("(Lib_RazorCpu): sceRazorCpuPushMarkerStatic() STUBBED called");
+	LOGF("(Lib_RazorCpu): sceRazorCpuPushMarkerStatic() STUBBED called\n");
 	return 0;
 }
 

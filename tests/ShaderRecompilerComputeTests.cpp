@@ -4475,7 +4475,8 @@ public:
                !cache.IsRegionGpuModified(base + offset, sizeof(uint32_t));
       };
       const auto Dirty = [&](uint64_t offset) {
-        return cache.HasGpuDirtyBytes(base + offset, sizeof(uint32_t));
+        return cache.HasGpuDirtyBytes(base + offset, sizeof(uint32_t)) &&
+               cache.IsRegionGpuModified(base + offset, sizeof(uint32_t));
       };
 
       GpuWrite(hot_offset, 0x11111111u);
@@ -4545,7 +4546,7 @@ public:
       scheduler.Finish();
       Require(name, "only the hot page of a buffer",
               Backing(owner_offset) == 0x2468ace1u && Clean(owner_offset) &&
-                  Backing(neighbor_offset) != 0x2468ace1u &&
+                  Backing(neighbor_offset) == stale &&
                   Dirty(neighbor_offset),
               "a publish crossed into a page that was never read");
       cache.ReadMemory(base + neighbor_offset, sizeof(uint32_t));

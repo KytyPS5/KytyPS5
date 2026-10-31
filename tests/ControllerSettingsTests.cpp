@@ -710,6 +710,46 @@ void TestUnreadPressSurvivesStickBurst() {
 	      "a stick move after a read did not add a sample");
 }
 
+void TestLightBarSettings() {
+	Controller controller;
+	for (int player = 1; player < Config::MAX_PLAYERS; player++) {
+		Check(PadOpen(Config::GetPlayerUserId(player), 0, 0, nullptr) == player + 1,
+		      "a guest could not open its own pad port");
+		Connect(player + 1);
+	}
+
+	static constexpr uint8_t default_colors[Config::MAX_PLAYERS][3] = {
+		{0, 0, 255},   // Player 1: Blue
+		{255, 0, 0},   // Player 2: Red
+		{0, 255, 0},   // Player 3: Green
+		{255, 0, 255}, // Player 4: Pink
+	};
+
+	const PadLightBarParam custom {12, 34, 56};
+	Check(PadSetLightBar(1, nullptr) == PAD_ERROR_INVALID_ARG, "PadSetLightBar accepted null param");
+	Check(PadSetLightBar(99, &custom) == PAD_ERROR_INVALID_HANDLE, "PadSetLightBar accepted invalid handle");
+	Check(PadResetLightBar(99) == PAD_ERROR_INVALID_HANDLE, "PadResetLightBar accepted invalid handle");
+
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		const int handle = player + 1;
+		const int pad_id = player + 1;
+		const PadLightBarParam p_color {static_cast<uint8_t>(50 + player * 10),
+		                                static_cast<uint8_t>(60 + player * 10),
+		                                static_cast<uint8_t>(70 + player * 10)};
+		Check(PadSetLightBar(handle, &p_color) == OK, "PadSetLightBar failed for player");
+		Check(pad_colors[pad_id][0] == p_color.r &&
+		          pad_colors[pad_id][1] == p_color.g &&
+		          pad_colors[pad_id][2] == p_color.b,
+		      "PadSetLightBar set incorrect color for player");
+
+		Check(PadResetLightBar(handle) == OK, "PadResetLightBar failed for player");
+		Check(pad_colors[pad_id][0] == default_colors[player][0] &&
+		          pad_colors[pad_id][1] == default_colors[player][1] &&
+		          pad_colors[pad_id][2] == default_colors[player][2],
+		      "PadResetLightBar did not restore default player color");
+	}
+}
+
 } // namespace
 
 int main() {
@@ -726,6 +766,7 @@ int main() {
 	TestUnreadPressSurvivesStickBurst();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
+	TestLightBarSettings();
 	Config::Shutdown();
 	return 0;
 }

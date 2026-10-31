@@ -1,6 +1,5 @@
 #include "libs/controller.h"
 
-#include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -13,6 +12,7 @@
 #include "libs/libs.h"
 #include "libs/padData.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -93,10 +93,10 @@ struct ControllerState {
 		uint16_t y    = 0;
 	};
 
-	uint64_t time                                  = 0;
-	uint32_t buttons                               = 0;
-	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
-	Touch    touch[2];
+	uint64_t             time                                  = 0;
+	uint32_t             buttons                               = 0;
+	int                  axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	Touch                touch[2];
 	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
 	std::array<float, 3> gyro {};
 	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
@@ -116,32 +116,32 @@ public:
 	int ClosePort(int handle);
 	int CheckPortHandle(int handle);
 
-	void SetDevices(int active_id);
-	void Button(int id, uint32_t button, bool down);
-	void Axis(int id, Axis axis, int value);
-	void RightStick(int id, int x, int y);
-	void TouchPad(int id, int finger, bool down, float x, float y);
-	void Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
-	void SetMotionSensorState(bool enable);
-	void ResetOrientation();
-	void ToggleGyroEmulation(int id);
-	void ResetInputState();
-	void GetConnectionInfo(bool* flag, int* count);
-	void SetVibration(uint8_t large_motor, uint8_t small_motor);
-	int  GetActiveControllerId();
-	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
-	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	void  SetDevices(int active_id);
+	void  Button(int id, uint32_t button, bool down);
+	void  Axis(int id, Axis axis, int value);
+	void  RightStick(int id, int x, int y);
+	void  TouchPad(int id, int finger, bool down, float x, float y);
+	void  Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
+	void  SetMotionSensorState(bool enable);
+	void  ResetOrientation();
+	void  ToggleGyroEmulation(int id);
+	void  ResetInputState();
+	void  GetConnectionInfo(bool* flag, int* count);
+	void  SetVibration(uint8_t large_motor, uint8_t small_motor);
+	int   GetActiveControllerId();
+	void  SetLightBar(uint8_t r, uint8_t g, uint8_t b);
+	bool  SetTriggerEffect(const PadTriggerEffectParam& param);
 	void  GetTriggerEffectState(PadTriggerEffectStateInformation* info);
 	void  CycleSetting(Setting setting);
 	float GetSettingScale(Setting setting) const;
-	void ReadState(ControllerState* state, bool* flag, int* count);
-	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
+	void  ReadState(ControllerState* state, bool* flag, int* count);
+	int   ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
 private:
 	static constexpr uint32_t STATES_MAX = 64;
 	enum class PortState { Uninitialized, Closed, Open };
 
-	int CheckPortHandleLocked(int handle) const;
+	int                CheckPortHandleLocked(int handle) const;
 	[[nodiscard]] bool PadOpenArgsAreValid(int user_id, int type, int index) const;
 
 	const int m_player;
@@ -154,29 +154,29 @@ private:
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
 	void UpdateTriggerEffectState();
 
-	Common::Mutex    m_mutex;
-	PortState        m_port_state      = PortState::Uninitialized;
-	int              m_active_id       = -1;
-	bool             m_connected       = false;
-	int              m_connected_count = 0;
-	bool             m_motion_enabled  = true;
-	uint64_t         m_gyro_time       = 0;
-	bool             m_gyro_emulation  = false;
-	uint64_t         m_emulated_time   = 0;
+	Common::Mutex      m_mutex;
+	PortState          m_port_state      = PortState::Uninitialized;
+	int                m_active_id       = -1;
+	bool               m_connected       = false;
+	int                m_connected_count = 0;
+	bool               m_motion_enabled  = true;
+	uint64_t           m_gyro_time       = 0;
+	bool               m_gyro_emulation  = false;
+	uint64_t           m_emulated_time   = 0;
 	std::array<int, 2> m_emulated_stick {128, 128};
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
-	ControllerState  m_state;
-	ControllerState  m_states[STATES_MAX];
-	bool             m_obtained[STATES_MAX] {};
-	uint32_t         m_states_num    = 0;
-	uint32_t         m_first_state   = 0;
-	uint8_t          m_next_touch_id = 1;
+	ControllerState      m_state;
+	ControllerState      m_states[STATES_MAX];
+	bool                 m_obtained[STATES_MAX] {};
+	uint32_t             m_states_num    = 0;
+	uint32_t             m_first_state   = 0;
+	uint8_t              m_next_touch_id = 1;
 	// The game's last requests, re-sent when their intensity setting changes.
-	std::array<uint8_t, 2> m_vibration {};
-	uint64_t               m_vibration_until = 0;
-	PadTriggerEffectParam  m_trigger_effect {};
+	std::array<uint8_t, 2>           m_vibration {};
+	uint64_t                         m_vibration_until = 0;
+	PadTriggerEffectParam            m_trigger_effect {};
 	PadTriggerEffectStateInformation m_trigger_state {};
 	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
@@ -185,7 +185,7 @@ private:
 static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
 
 // Maps host gamepads to players; the keyboard follows the configured keyboard player.
-static Common::Mutex g_router_mutex;
+static Common::Mutex                    g_router_mutex;
 static std::vector<std::pair<int, int>> g_pad_players;
 
 static uint32_t g_keyboard_player = 0;
@@ -224,13 +224,13 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
-	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->buttons            = state.buttons;
+	data->left_stick_x       = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y       = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x      = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y      = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2  = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2  = state.axes[static_cast<int>(Axis::TriggerRight)];
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -502,17 +502,17 @@ void GameController::SetDevices(int active_id) {
 	if (!m_connected && new_connected) {
 		m_connected_count++;
 	}
-	m_active_id     = active_id;
-	m_connected     = new_connected;
-	m_state         = {};
-	m_gyro_time     = 0;
-	m_gyro_emulation = false;
-	m_emulated_time  = 0;
-	m_emulated_stick = {128, 128};
+	m_active_id          = active_id;
+	m_connected          = new_connected;
+	m_state              = {};
+	m_gyro_time          = 0;
+	m_gyro_emulation     = false;
+	m_emulated_time      = 0;
+	m_emulated_stick     = {128, 128};
 	m_up_reference_valid = false;
-	m_states_num    = 0;
-	m_first_state   = 0;
-	m_next_touch_id = 1;
+	m_states_num         = 0;
+	m_first_state        = 0;
+	m_next_touch_id      = 1;
 	m_vibration          = {};
 	m_vibration_until    = 0;
 	m_trigger_effect     = {};
@@ -567,7 +567,8 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 
 		EXIT_IF(axis_id < 0 || axis_id >= static_cast<int>(Controller::Axis::AxisMax));
 
-		if (m_gyro_emulation && (axis == Controller::Axis::RightX || axis == Controller::Axis::RightY)) {
+		if (m_gyro_emulation &&
+		    (axis == Controller::Axis::RightX || axis == Controller::Axis::RightY)) {
 			m_emulated_stick[axis == Controller::Axis::RightY ? 1 : 0] = value;
 			UpdateEmulatedTilt();
 			return;
@@ -741,7 +742,7 @@ static Quat QuatMultiply(const Quat& a, const Quat& b) {
 void GameController::UpdateEmulatedTilt() {
 	constexpr float max_angle = 0.7853982f; // 45 degrees at full stick deflection
 	const auto      angle     = [](int value) {
-        return std::clamp((value - 128) / 127.0f, -1.0f, 1.0f) * max_angle;
+		return std::clamp((value - 128) / 127.0f, -1.0f, 1.0f) * max_angle;
 	};
 	const float roll  = angle(m_emulated_stick[0]);
 	const float pitch = angle(m_emulated_stick[1]);
@@ -753,8 +754,8 @@ void GameController::UpdateEmulatedTilt() {
 	const uint64_t now = LibKernel::KernelGetProcessTime();
 	Vec3           rate {};
 	if (m_emulated_time != 0 && now > m_emulated_time) {
-		const float dt = std::clamp(static_cast<float>(now - m_emulated_time) * 0.000001f,
-		                            0.001f, 0.1f);
+		const float dt =
+		    std::clamp(static_cast<float>(now - m_emulated_time) * 0.000001f, 0.001f, 0.1f);
 		auto delta = QuatMultiply(QuatConjugate(m_state.orientation), q);
 		if (delta[3] < 0.0f) {
 			for (auto& v: delta) {
@@ -797,9 +798,9 @@ void GameController::ToggleGyroEmulation(int id) {
 		m_state.axes[static_cast<int>(Axis::RightY)] = 128;
 		UpdateEmulatedTilt();
 	} else {
-		m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-		m_state.accel       = {0.0f, 1.0f, 0.0f};
-		m_state.gyro        = {};
+		m_state.orientation                          = {0.0f, 0.0f, 0.0f, 1.0f};
+		m_state.accel                                = {0.0f, 1.0f, 0.0f};
+		m_state.gyro                                 = {};
 		m_state.axes[static_cast<int>(Axis::RightX)] = m_emulated_stick[0];
 		m_state.axes[static_cast<int>(Axis::RightY)] = m_emulated_stick[1];
 		AddState();
@@ -812,7 +813,7 @@ void GameController::ResetOrientation() {
 	m_state.orientation  = {0.0f, 0.0f, 0.0f, 1.0f};
 	m_gyro_time          = 0;
 	m_up_reference_valid = false;
-	m_state.time        = LibKernel::KernelGetProcessTime();
+	m_state.time         = LibKernel::KernelGetProcessTime();
 	AddState();
 }
 
@@ -835,7 +836,7 @@ void GameController::ResetInputState() {
 static void StopHostPad(SDL_Gamepad* pad) {
 	if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 		DualSenseEffects effect {};
-		effect.enable_bits     = 0x0c;
+		effect.enable_bits      = 0x0c;
 		effect.right_trigger[0] = 0x05;
 		effect.left_trigger[0]  = 0x05;
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
@@ -1016,7 +1017,7 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 // Caller holds g_router_mutex.
 static void RefreshPlayers() {
 	std::array<bool, Config::MAX_PLAYERS> taken {};
-	const int keyboard = KeyboardPlayer();
+	const int                             keyboard = KeyboardPlayer();
 	if (g_keyboard_player != 0) {
 		taken[keyboard] = true;
 	}
@@ -1436,9 +1437,32 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 
 int KYTY_SYSV_ABI PadResetLightBar(int handle) {
 	PRINT_NAME();
+	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
+	}
+
+	auto* player = PlayerForHandle(handle);
+	if (player == nullptr) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+
+	static constexpr uint8_t default_colors[Config::MAX_PLAYERS][3] = {
+	    {0, 0, 255},   // Player 1: Blue
+	    {255, 0, 0},   // Player 2: Red
+	    {0, 255, 0},   // Player 3: Green
+	    {255, 0, 255}, // Player 4: Pink
+	};
+
+	int player_idx = 0;
+	if (handle >= PAD_HANDLE && handle < PAD_HANDLE + Config::MAX_PLAYERS) {
+		player_idx = handle - PAD_HANDLE;
+	}
+
+	if (player_idx >= 0 && player_idx < Config::MAX_PLAYERS) {
+		player->SetLightBar(default_colors[player_idx][0], default_colors[player_idx][1],
+		                    default_colors[player_idx][2]);
 	}
 
 	return OK;

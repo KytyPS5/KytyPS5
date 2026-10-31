@@ -2444,7 +2444,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer) continue;
 			const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-			if (memory.kind == ResourceKind::ScalarBuffer &&
+			// Descriptor and SRT reads only plan resources: they hold no buffer index.
+			if (memory.kind == ResourceKind::ScalarBuffer && !memory.planning_only &&
 			    specialization.buffers[memory.resource].scalar_empty &&
 			    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer)
 				inst.ReplaceUsesWith(Value(0u));

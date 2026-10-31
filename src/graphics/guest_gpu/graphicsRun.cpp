@@ -200,9 +200,10 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 		});
 		m_urgent_pending.fetch_add(1, std::memory_order_release);
 	}
-	// A busy execution thread runs the command before its next operation; an idle one waits for
-	// operations, so queue one that runs it too.
-	SendCommand([this] { RunUrgentCommands(); });
+	// A busy execution thread runs the command before its next operation; wake an idle one directly.
+	// Queuing an operation to wake it deadlocks when the caller is the resolve thread: the operation
+	// would wait behind the draw being resolved.
+	(m_resolving ? m_resolved : m_operations).Interrupt();
 	done.acquire();
 }
 
@@ -369,7 +370,11 @@ void GuestGpu::ExecutionThread() {
 			unnotified = 0;
 			operation  = operations.Pop();
 			if (!operation) {
-				break;
+				if (operations.IsStopped()) {
+					break;
+				}
+				// Interrupted for urgent commands.
+				continue;
 			}
 		}
 		operation->processor->Execute(*operation);
@@ -2051,6 +2056,10 @@ void GuestGpu::RunUrgentCommandsWhileWaiting() {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
+}
+
+bool GuestGpu::IsCommandProcessorThread() noexcept {
+	return g_cp_thread;
 }
 
 } // namespace Libs::Graphics

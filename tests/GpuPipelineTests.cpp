@@ -247,6 +247,21 @@ void TestSpscQueue() {
 	leftover.Stop();
 	auto first = leftover.Pop();
 	Check(first && **first == 1, "a stopped queue drains before it reports the stop");
+
+	// Interrupt() wakes a consumer that sleeps on an empty ring without stopping the queue.
+	Common::SpscQueue<std::unique_ptr<uint64_t>> interrupted(4);
+	std::atomic_bool                             woke {false};
+	std::jthread                                 sleeper([&] {
+		auto value = interrupted.Pop();
+		woke       = !value && !interrupted.IsStopped();
+	});
+	Stall(std::chrono::milliseconds(20));
+	interrupted.Interrupt();
+	sleeper.join();
+	Check(woke, "an interrupt wakes a consumer waiting on an empty queue");
+	interrupted.Push(std::make_unique<uint64_t>(7));
+	auto after = interrupted.Pop();
+	Check(after && **after == 7, "an interrupted queue keeps delivering elements");
 }
 
 // A waiter sees the writes made before the counter reached its target.

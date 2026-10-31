@@ -214,7 +214,8 @@ public:
 		return true;
 	}
 
-	// Returns nothing once Stop() was called and the ring is empty.
+	// Returns nothing once Stop() was called and the ring is empty, or when Interrupt() was called
+	// while the ring is empty.
 	[[nodiscard]] std::optional<T> Pop() {
 		const auto head = m_head.load(std::memory_order_relaxed);
 		if (m_consumer_tail == head) {
@@ -243,6 +244,19 @@ public:
 		m_stopped.store(true, std::memory_order_seq_cst);
 		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);
 		m_consumer_signal.notify_all();
+	}
+
+	// Any thread: wakes a consumer that waits on an empty ring without stopping the queue; its Pop()
+	// returns nothing once, so it can look at other work. An interrupt that finds the consumer busy
+	// ends its next wait on an empty ring instead.
+	void Interrupt() {
+		m_interrupted.store(true, std::memory_order_seq_cst);
+		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);
+		m_consumer_signal.notify_all();
+	}
+
+	[[nodiscard]] bool IsStopped() const noexcept {
+		return m_stopped.load(std::memory_order_acquire);
 	}
 
 	[[nodiscard]] size_t Capacity() const noexcept { return m_capacity; }
@@ -309,7 +323,7 @@ private:
 		m_producer_sleeping.store(false, std::memory_order_relaxed);
 	}
 
-	// False when stopped with nothing left to pop.
+	// False when stopped or interrupted with nothing left to pop.
 	bool WaitForElement(uint64_t head) {
 		// The producer may be asleep on a full ring the consumer drained without a check.
 		WakeProducer();
@@ -319,7 +333,8 @@ private:
 			if (m_consumer_tail != head) {
 				return true;
 			}
-			if (m_stopped.load(std::memory_order_relaxed)) {
+			if (m_stopped.load(std::memory_order_relaxed) ||
+			    m_interrupted.load(std::memory_order_relaxed)) {
 				break;
 			}
 		}
@@ -332,12 +347,16 @@ private:
 				available = true;
 				break;
 			}
-			if (m_stopped.load(std::memory_order_seq_cst)) {
+			if (m_stopped.load(std::memory_order_seq_cst) ||
+			    m_interrupted.load(std::memory_order_seq_cst)) {
 				break;
 			}
 			m_consumer_signal.wait(signal, std::memory_order_seq_cst);
 		}
 		m_consumer_sleeping.store(false, std::memory_order_relaxed);
+		if (!available) {
+			m_interrupted.store(false, std::memory_order_relaxed);
+		}
 		return available;
 	}
 
@@ -352,6 +371,7 @@ private:
 	std::atomic_bool     m_consumer_sleeping {false};
 	std::atomic_uint32_t m_consumer_signal {0};
 	std::atomic_bool     m_stopped {false};
+	std::atomic_bool     m_interrupted {false};
 
 	// Producer side.
 	alignas(64) std::atomic_uint64_t m_tail {0};

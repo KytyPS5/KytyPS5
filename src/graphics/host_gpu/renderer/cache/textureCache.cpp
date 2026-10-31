@@ -1836,7 +1836,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
+		if (image.info.data.address != address && !image.HasBufferMirror()) {
 			continue;
 		}
 		image.ClearGpuModified();
@@ -2001,7 +2001,14 @@ void TextureCache::PublishStorageImages() {
 		std::scoped_lock lock {m_lock};
 		for (const auto id: m_storage_downloads) {
 			auto& image = m_slot_images[id];
-			if (image.SafeToDownload() && CopyImageToBufferCache(image) && m_readback_linear_images) {
+			if (image.IsMaybeCpuDirty()) {
+				TrackImage(id);
+				(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
+			}
+			if (!image.SafeToDownload() || !CopyImageToBufferCache(image)) {
+				continue;
+			}
+			if (m_readback_linear_images) {
 				eager_readbacks.push_back(image.info.data);
 			}
 		}
@@ -2019,6 +2026,7 @@ bool TextureCache::CopyImageToBufferCache(Image& image) {
 	const auto range = image.info.data;
 	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, true);
 	DownloadImage(image, *buffer, offset, range.size, image.info.resources.levels);
+	image.MarkBufferMirrored();
 	return true;
 }
 

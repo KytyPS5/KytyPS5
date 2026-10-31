@@ -3188,6 +3188,59 @@ int PthreadGetCurrentPriorityForKernel() {
 	return PthreadGetPriorityForKernel(g_pthread_self);
 }
 
+// Returns from the guest entry of the current thread with |value| when the thread runs on its
+// guest stack; returns normally otherwise.
+static void LeaveGuestEntry(void* value) {
+#if defined(__x86_64__) || defined(_M_X64)
+	if (g_guest_entry_return_rsp != 0) {
+		const auto return_rsp    = g_guest_entry_return_rsp;
+		g_guest_entry_return_rsp = 0;
+
+		if (g_pthread_self != nullptr && g_pthread_self->guest_host_rsp != 0) {
+			const auto host_rbx = g_pthread_self->guest_host_rbx;
+			const auto host_rsp = g_pthread_self->guest_host_rsp;
+			const auto host_rbp = g_pthread_self->guest_host_rbp;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			const auto host_gs8  = g_pthread_self->guest_host_gs8;
+			const auto host_gs10 = g_pthread_self->guest_host_gs10;
+#endif
+
+			asm volatile("movq %2, %%rbx\n\t"
+			             "movq %3, %%r12\n\t"
+			             "movq %4, %%r13\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			             "movq %5, %%r14\n\t"
+			             "movq %6, %%r15\n\t"
+#endif
+			             "movq %0, %%rax\n\t"
+			             "movq %1, %%rsp\n\t"
+			             "retq\n\t"
+			             :
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp),
+			               "m"(host_gs8), "m"(host_gs10)
+#else
+			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp)
+#endif
+			             : "rax", "memory");
+			__builtin_unreachable();
+		}
+	}
+#endif
+	(void)value;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// winpthreads runs the cleanup handlers of a canceled thread on its current stack and then
+// longjmps to the start routine, which unwinds with RtlUnwind. Guest frames have no unwind data
+// and RunOnGuestStack clears the TEB stack limits, so that unwind raises STATUS_BAD_STACK.
+// Leave the guest entry instead, like PthreadExit; RunThread then runs the remaining cleanup and
+// returns the canceled value the guest sees on other hosts.
+static void CancelGuestEntry(void* /*arg*/) {
+	LeaveGuestEntry(reinterpret_cast<void*>(static_cast<intptr_t>(-1)));
+}
+#endif
+
 static void CleanupThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 
@@ -3252,7 +3305,15 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
+	pthread_cleanup_push(CancelGuestEntry, nullptr);
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
+	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
+	pthread_cleanup_pop(0);
+#else
+	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
+#endif
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_pop(1);
@@ -3558,42 +3619,7 @@ void KYTY_SYSV_ABI PthreadTestcancel() {
 void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PRINT_NAME();
 
-#if defined(__x86_64__) || defined(_M_X64)
-	if (g_guest_entry_return_rsp != 0) {
-		const auto return_rsp    = g_guest_entry_return_rsp;
-		g_guest_entry_return_rsp = 0;
-
-		if (g_pthread_self != nullptr && g_pthread_self->guest_host_rsp != 0) {
-			const auto host_rbx = g_pthread_self->guest_host_rbx;
-			const auto host_rsp = g_pthread_self->guest_host_rsp;
-			const auto host_rbp = g_pthread_self->guest_host_rbp;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			const auto host_gs8  = g_pthread_self->guest_host_gs8;
-			const auto host_gs10 = g_pthread_self->guest_host_gs10;
-#endif
-
-			asm volatile("movq %2, %%rbx\n\t"
-			             "movq %3, %%r12\n\t"
-			             "movq %4, %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			             "movq %5, %%r14\n\t"
-			             "movq %6, %%r15\n\t"
-#endif
-			             "movq %0, %%rax\n\t"
-			             "movq %1, %%rsp\n\t"
-			             "retq\n\t"
-			             :
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp),
-			               "m"(host_gs8), "m"(host_gs10)
-#else
-			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp)
-#endif
-			             : "rax", "memory");
-			__builtin_unreachable();
-		}
-	}
-#endif
+	LeaveGuestEntry(value);
 
 	pthread_exit(value);
 }

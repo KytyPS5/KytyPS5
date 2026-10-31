@@ -37,6 +37,7 @@ sys_file_t* SysFileOpen(uint8_t* buf, uint32_t buf_size);
 sys_file_t* SysFileCreate();
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type = SYS_FILE_CACHE_AUTO);
+sys_file_t* SysFileOpenDir(const std::filesystem::path& dir_name);
 void        SysFileClose(sys_file_t* f);
 uint64_t    SysFileSize(sys_file_t& f);                    // NOLINT(google-runtime-references)
 bool        SysFileSeek(sys_file_t& f, uint64_t offset);   // NOLINT(google-runtime-references)
@@ -72,5 +73,7 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
+bool SysFileChmod(sys_file_t& f, uint32_t mode, const std::filesystem::path& name);
+bool SysFileGetPermissions(sys_file_t& f, uint16_t* perms);
 
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

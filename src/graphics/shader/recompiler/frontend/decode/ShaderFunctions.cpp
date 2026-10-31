@@ -18,7 +18,7 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 constexpr uint32_t MaxFunctionWords  = 4096;
-constexpr uint32_t MaxExpandedWords  = 131072;
+constexpr uint32_t MaxExpandedWords  = 524288;
 constexpr uint64_t MaxCallTableBytes = 16u * 1024u * 1024u;
 constexpr size_t   MaxCallTargets    = 256;
 
@@ -721,7 +721,8 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				relocations.emplace_back(at, result.size());
 		}
 		if (result.size() > MaxExpandedWords) {
-			reason = "expanded shader exceeds the bounded code size";
+			reason = "expanded shader exceeds the bounded code size (" +
+			         std::to_string(result.size()) + " words so far)";
 			return false;
 		}
 	}

@@ -601,8 +601,10 @@ struct Bindings {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
-	static constexpr uint32_t MaxImages       = 64;
-	static constexpr uint32_t MaxSamplers     = 32;
+	// Programs with inlined call targets (ray tracing hit groups) gather the images and samplers
+	// of every target: Wolverine's cs 1a04c58a9fbc2052 has more than 64 sampler roots.
+	static constexpr uint32_t MaxImages       = 256;
+	static constexpr uint32_t MaxSamplers     = 256;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;

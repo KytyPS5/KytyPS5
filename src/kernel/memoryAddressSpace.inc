@@ -421,9 +421,6 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const uint64_t left_size  = vaddr - old.vaddr;
-		const uint64_t right_addr = vaddr + size;
-		const uint64_t right_size = old.vaddr + old.size - right_addr;
 		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
 		if (exact_unmap) {
 			const bool unmapped =
@@ -436,41 +433,7 @@ public:
 
 			return true;
 		}
-
-		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
-			bool ok = true;
-			if (left_size != 0 && left_size != old.size) {
-				ok = SplitPlaceholder(old.vaddr, left_size) && ok;
-			}
-			if (right_size != 0) {
-				ok = SplitPlaceholder(vaddr, size) && ok;
-			}
-			if (left_size != 0) {
-				ok = MapFixed(old.vaddr, left_size, old.backing_offset, old.mode) && ok;
-			}
-			if (right_size != 0) {
-				ok = MapFixed(right_addr, right_size,
-				              old.backing_offset + (right_addr - old.vaddr), old.mode) &&
-				     ok;
-			}
-			if (ok) {
-				return true;
-			}
-
-			if (left_size != 0 && Contains(old.vaddr, left_size)) {
-				EXIT_IF(!UnmapOne(old.vaddr, left_size));
-			}
-			if (right_size != 0 && Contains(right_addr, right_size)) {
-				EXIT_IF(!UnmapOne(right_addr, right_size));
-			}
-			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
-			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
-			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
-			return false;
-		}
-		std::lock_guard lock(m_mutex);
-		m_maps.emplace(old.vaddr, old);
-		return false;
+		return UnmapPartialView(old, vaddr, size);
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
 		// protections on the surviving mappings remain intact.
@@ -592,6 +555,103 @@ private:
 	static bool ApplyProtection(void* ptr, uint64_t size, VirtualMemory::Mode mode) {
 		DWORD old_protect = 0;
 		return VirtualProtect(ptr, size, GetProtect(mode), &old_protect) != 0;
+	}
+
+	// One run of pages that share a host protection.
+	struct ProtectionRun {
+		uint64_t vaddr;
+		uint64_t size;
+		DWORD    protect;
+	};
+
+	// Records the host protection of a mapped range. A view that is mapped again starts with its
+	// map protection, so a remap uses this to bring back what VirtualProtect set on the old view,
+	// such as guest mprotect calls and GPU page-tracker write watches. It fails if any part cannot be
+	// read as committed memory, so the caller can give up before the old view is gone.
+	static bool SnapshotProtection(uint64_t vaddr, uint64_t size, std::vector<ProtectionRun>* runs) {
+		const uint64_t end = vaddr + size;
+		for (uint64_t current = vaddr; current < end;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<void*>(current), &info, sizeof(info)) == 0 ||
+			    info.State != MEM_COMMIT) {
+				return false;
+			}
+			const auto region_end =
+			    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+			runs->push_back({current, region_end - current, info.Protect});
+			current = region_end;
+		}
+		return true;
+	}
+
+	// Re-applies the recorded protection that falls inside a newly mapped range. Runs that already
+	// have the protection a fresh view of this mode starts with need no call.
+	static bool RestoreProtection(const std::vector<ProtectionRun>& runs, uint64_t vaddr,
+	                              uint64_t size, VirtualMemory::Mode mode) {
+		const DWORD fresh = GetProtect(mode);
+		const auto  end   = vaddr + size;
+		bool        ok    = true;
+		for (const auto& run: runs) {
+			const auto begin  = std::max(run.vaddr, vaddr);
+			const auto finish = std::min(run.vaddr + run.size, end);
+			if (begin >= finish || run.protect == fresh) {
+				continue;
+			}
+			DWORD old_protect = 0;
+			ok = VirtualProtect(reinterpret_cast<void*>(begin), finish - begin, run.protect,
+			                    &old_protect) != 0 &&
+			     ok;
+		}
+		return ok;
+	}
+
+	// Unmaps part of one view. Windows cannot unmap part of a view, so the whole view goes and the
+	// surviving pieces are mapped again, with the old view's protection restored on them. The only
+	// caller of Unmap, GuestAddressSpace::UnmapBacking, holds the address-space lock exclusively,
+	// and tracker protections take it shared, so they cannot change between the snapshot and the
+	// restore. A new caller must hold that lock too. On failure the whole view comes back as it was.
+	bool UnmapPartialView(const MapEntry& old, uint64_t vaddr, uint64_t size) {
+		const uint64_t             left_size  = vaddr - old.vaddr;
+		const uint64_t             right_addr = vaddr + size;
+		const uint64_t             right_size = old.vaddr + old.size - right_addr;
+		std::vector<ProtectionRun> protection;
+		if (!SnapshotProtection(old.vaddr, old.size, &protection) ||
+		    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
+		}
+		bool ok = true;
+		if (left_size != 0 && left_size != old.size) {
+			ok = SplitPlaceholder(old.vaddr, left_size) && ok;
+		}
+		if (right_size != 0) {
+			ok = SplitPlaceholder(vaddr, size) && ok;
+		}
+		if (left_size != 0) {
+			ok = MapFixed(old.vaddr, left_size, old.backing_offset, old.mode) &&
+			     RestoreProtection(protection, old.vaddr, left_size, old.mode) && ok;
+		}
+		if (right_size != 0) {
+			ok = MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
+			              old.mode) &&
+			     RestoreProtection(protection, right_addr, right_size, old.mode) && ok;
+		}
+		if (ok) {
+			return true;
+		}
+
+		if (left_size != 0 && Contains(old.vaddr, left_size)) {
+			EXIT_IF(!UnmapOne(old.vaddr, left_size));
+		}
+		if (right_size != 0 && Contains(right_addr, right_size)) {
+			EXIT_IF(!UnmapOne(right_addr, right_size));
+		}
+		EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
+		                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
+		EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+		EXIT_IF(!RestoreProtection(protection, old.vaddr, old.size, old.mode));
+		return false;
 	}
 
 	static bool SplitPlaceholder(uint64_t vaddr, uint64_t size) {

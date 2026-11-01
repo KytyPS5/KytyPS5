@@ -118,15 +118,14 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
-	// Planning expressions can refer to block values but outlive block storage in the base class.
+	// Planning expressions can refer to block values but outlive block storage in the base class,
+	// and values cross block boundaries: detach everything before any storage is destroyed.
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		inst.DropArgs();
 	}
-	// Values may cross block boundaries. Detach all arguments before any block starts destroying
-	// its instruction storage so reverse-use links always point to live definitions.
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
-			inst.Invalidate();
+			inst.DropArgs();
 		}
 	}
 }
@@ -169,6 +168,8 @@ bool EquivalentSelectorDomain(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& right) {
 	return left.selector == right.selector && left.signed_count == right.signed_count &&
 	       left.workgroup_axis == right.workgroup_axis &&
+	       left.workgroup_multiplier == right.workgroup_multiplier &&
+	       left.workgroup_shift == right.workgroup_shift &&
 	       EquivalentValue(program, left.key_count, right.key_count) &&
 	       EquivalentValue(program, left.selector_first, right.selector_first) &&
 	       EquivalentValue(program, left.selector_mask, right.selector_mask);
@@ -243,7 +244,7 @@ bool HasShaderMemoryWrites(const Program& program) {
 	return false;
 }
 
-void ValidateProgram(const Program& program, bool require_ssa) {
+void ValidateProgram(const Program& program) {
 	if (program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");
 	}
@@ -399,7 +400,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 			} else {
 				saw_non_phi = true;
 			}
-			if (require_ssa && IsRegisterStatePseudo(inst.GetOpcode())) {
+			if (IsRegisterStatePseudo(inst.GetOpcode())) {
 				return Fail(fmt::format("register-state pseudo {} survived SSA rewrite",
 				                        ValueOpcodeName(inst.GetOpcode())));
 			}

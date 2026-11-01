@@ -488,16 +488,15 @@ void TextureCache::RefreshCopySource(ImageId id) {
 }
 
 bool TextureCache::CopyD16(Image& destination, Image& source) {
-	const bool source_depth      = source.info.IsDepth();
-	const bool destination_depth = destination.info.IsDepth();
-	if (source_depth == destination_depth) {
+	// Converts guest D16 between a four-byte host depth aspect and two-byte color or D16 depth.
+	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
+	if (source_wide == (DepthAspectTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
 		return false;
 	}
-	auto&      depth          = source_depth ? source : destination;
-	auto&      color          = source_depth ? destination : source;
-	const auto transfer_bytes = DepthAspectTransferBytes(depth.backing.format);
+	auto& depth  = source_wide ? source : destination;
+	auto& narrow = source_wide ? destination : source;
 	if (depth.info.bytes_per_block != sizeof(uint16_t) ||
-	    color.info.bytes_per_block != sizeof(uint16_t) || transfer_bytes != sizeof(uint32_t)) {
+	    narrow.info.bytes_per_block != sizeof(uint16_t)) {
 		return false;
 	}
 	EXIT_IF(source.backing.samples != 1 || destination.backing.samples != 1 ||
@@ -507,42 +506,42 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 
 	const auto     layers = depth.info.resources.layers;
 	const uint64_t depth_slice =
-	    static_cast<uint64_t>(depth.info.pitch) * depth.info.extent.height * transfer_bytes;
-	const uint64_t color_slice =
-	    static_cast<uint64_t>(color.info.pitch) * color.info.extent.height * sizeof(uint16_t);
-	EXIT_IF(layers == 0 || depth_slice > UINT64_MAX / layers || color_slice > UINT64_MAX / layers);
-	const auto                       depth_size = depth_slice * layers;
-	const auto                       color_size = color_slice * layers;
-	const std::array                 depth_copies {
+	    static_cast<uint64_t>(depth.info.pitch) * depth.info.extent.height * sizeof(uint32_t);
+	const uint64_t narrow_slice =
+	    static_cast<uint64_t>(narrow.info.pitch) * narrow.info.extent.height * sizeof(uint16_t);
+	EXIT_IF(layers == 0 || depth_slice > UINT64_MAX / layers || narrow_slice > UINT64_MAX / layers);
+	const std::array depth_copies {
 	    vk::BufferImageCopy {0,
 	                         depth.info.pitch,
 	                         depth.info.extent.height,
 	                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers},
 	                         {},
 	                         depth.info.extent}};
-	const std::array color_copies {
+	const std::array narrow_copies {
 	    vk::BufferImageCopy {0,
-	                         color.info.pitch,
-	                         color.info.extent.height,
-	                         {vk::ImageAspectFlagBits::eColor, 0, 0, layers},
+	                         narrow.info.pitch,
+	                         narrow.info.extent.height,
+	                         {narrow.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                                                : vk::ImageAspectFlagBits::eColor,
+	                          0, 0, layers},
 	                         {},
-	                         color.info.extent}};
+	                         narrow.info.extent}};
 
-	auto                         depth_buffer = m_tiler.GetScratchBuffer(depth_size);
-	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size, depth_buffer.buffer);
+	auto depth_buffer  = m_tiler.GetScratchBuffer(depth_slice * layers);
+	auto narrow_buffer = m_tiler.GetScratchBuffer(narrow_slice * layers, depth_buffer.buffer);
 	const TileManager::D16Layout promote_layout {
 	    .width               = depth.info.extent.width,
 	    .height              = depth.info.extent.height,
 	    .layers              = layers,
-	    .source_row_stride   = static_cast<uint64_t>(color.info.pitch) * sizeof(uint16_t),
-	    .target_row_stride   = static_cast<uint64_t>(depth.info.pitch) * transfer_bytes,
-	    .source_slice_stride = color_slice,
+	    .source_row_stride   = static_cast<uint64_t>(narrow.info.pitch) * sizeof(uint16_t),
+	    .target_row_stride   = static_cast<uint64_t>(depth.info.pitch) * sizeof(uint32_t),
+	    .source_slice_stride = narrow_slice,
 	    .target_slice_stride = depth_slice,
 	};
 	const bool d32 = DepthAspectTransferFormat(depth.backing.format) == vk::Format::eD32Sfloat;
-	if (source_depth) {
+	if (source_wide) {
 		source.Download(depth_copies, depth_buffer.buffer, depth_buffer.offset, depth_buffer.size);
-		m_tiler.ConvertD16(depth_buffer, color_buffer, TileManager::D16Direction::Demote, d32,
+		m_tiler.ConvertD16(depth_buffer, narrow_buffer, TileManager::D16Direction::Demote, d32,
 		                   {.width               = promote_layout.width,
 		                    .height              = promote_layout.height,
 		                    .layers              = promote_layout.layers,
@@ -550,11 +549,12 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 		                    .target_row_stride   = promote_layout.source_row_stride,
 		                    .source_slice_stride = promote_layout.target_slice_stride,
 		                    .target_slice_stride = promote_layout.source_slice_stride});
-		destination.Upload(color_copies, color_buffer.buffer, color_buffer.offset,
-		                   color_buffer.size);
+		destination.Upload(narrow_copies, narrow_buffer.buffer, narrow_buffer.offset,
+		                   narrow_buffer.size);
 	} else {
-		source.Download(color_copies, color_buffer.buffer, color_buffer.offset, color_buffer.size);
-		m_tiler.ConvertD16(color_buffer, depth_buffer, TileManager::D16Direction::Promote, d32,
+		source.Download(narrow_copies, narrow_buffer.buffer, narrow_buffer.offset,
+		                narrow_buffer.size);
+		m_tiler.ConvertD16(narrow_buffer, depth_buffer, TileManager::D16Direction::Promote, d32,
 		                   promote_layout);
 		destination.Upload(depth_copies, depth_buffer.buffer, depth_buffer.offset,
 		                   depth_buffer.size);
@@ -629,17 +629,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
-	// PPSA04264
-	const bool raw_d16_texture =
-	    binding == BindingType::Texture && cached.info.IsDepth() &&
-	    cached.info.guest_format == Prospero::BufferFormat::k16UNorm &&
-	    requested.guest_format == Prospero::BufferFormat::k16UInt &&
-	    requested.pixel_format == vk::Format::eR16Uint && cached.backing.samples == 1 &&
-	    requested.samples == 1 && requested.data == cached.info.data &&
-	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
-	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.
@@ -663,12 +652,20 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	// Depth bytes sampled through a color format no depth view provides (16_UINT, 8_8_UNORM)
+	// need a color copy of the whole single-sample depth layout.
+	const bool raw_depth_texture =
+	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasStencil() &&
+	    !requested.HasMetadata() && cached.backing.samples == 1 && requested.samples == 1 &&
+	    requested.pitch == cached.info.pitch &&
+	    (requested.resources == cached.info.resources || retain_cached_layout) &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
-			recreate |= raw_d16_texture;
+			recreate |= raw_depth_texture;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
@@ -783,7 +780,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (!cached.registered) {
 		return {merged_id};
 	}
-	if (BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
+	// PS5: image heaps keep BC images and raw block views of their layers resident together, so a
+	// raw read of a layer subset with the same levels views the BC image instead of evicting it.
+	const bool raw_view = binding == BindingType::Texture && !requested.IsBlock() &&
+	                      requested.type == cached.info.type &&
+	                      requested.data.address == cached.info.data.address &&
+	                      requested.BlockExtent() == cached.info.BlockExtent() &&
+	                      requested.resources.levels == cached.info.resources.levels &&
+	                      requested.resources.layers < cached.info.resources.layers;
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
@@ -1035,34 +1040,51 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
-	const auto range = desc.info.metadata.range;
+	const auto  range = desc.info.metadata.range;
+	const auto& view  = desc.view_info;
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1) {
+		if (range.size == 0 || view.level_count != 1) {
 			return;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
-	// These one-mip surfaces use complete 4 KiB color metadata blocks.
+	// Color metadata slices consist of complete 4 KiB blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = desc.view_info;
-	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
-	const auto  first          = volume_texture ? 0u : metadata_base_layer;
-	const auto  image_first    = volume_texture ? 0u : view.base_layer;
-	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
+	const bool volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
+	const auto first          = volume_texture ? 0u : metadata_base_layer;
+	const auto image_first    = volume_texture ? 0u : view.base_layer;
+	const auto count =
+	    volume_texture ? std::max(desc.info.extent.depth >> view.base_level, 1u) : view.layer_count;
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	const auto       slice_size = range.size / layers;
-	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
+	const auto slice_size = range.size / layers;
+	// Each slice holds the viewed mip's metadata in one run; DCC mips past the first tail mip
+	// have none. FindImage moves base_level only for one-mip descriptors, which keep the slice.
+	TileSizeOffset mip {.size = static_cast<uint32_t>(slice_size)};
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc && desc.info.resources.levels > 1) {
+		std::array<TileSizeOffset, 16> mips {};
+		TileSizeAlign                  total {};
+		(void)TileGetDccSize(desc.info.extent.width, desc.info.extent.height, layers,
+		                     desc.info.bytes_per_block, desc.info.resources.levels,
+		                     desc.info.tile_mode, total, 0, mips.data());
+		mip = mips[view.base_level];
+	}
+	if (mip.size == 0) {
+		return;
+	}
+	const GuestRange viewed {range.address + slice_size * first + mip.offset,
+	                         slice_size * (count - 1) + mip.size};
+	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
@@ -1074,7 +1096,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 		// No selected key to clear, or none left since the last check.
-		if (m_buffer_cache.IsColorMetadataChecked(viewed.address, viewed.size, keys)) {
+		bool checked = true;
+		for (uint32_t slice = 0; slice < count && checked; slice++) {
+			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+		}
+		if (checked) {
 			return;
 		}
 		{
@@ -1099,9 +1125,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				const auto [buffer, offset] =
 				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
-				    {buffer->Handle(), offset, viewed.size}, count, keys, expand);
-				if (expand) {
-					m_buffer_cache.MarkColorMetadataChecked(viewed.address, viewed.size, keys);
+				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
+				for (uint32_t slice = 0; slice < count && expand; slice++) {
+					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
 				}
 				const auto command = m_scheduler.Current().Handle();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
@@ -1134,7 +1160,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
-		const auto address = range.address + slice_size * (first + slice);
+		const auto address = run(slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
@@ -1143,7 +1169,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
+		std::vector<uint8_t> bytes(mip.size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
@@ -1167,7 +1193,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
+			m_buffer_cache.InvalidateMemory(address, bytes.size());
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
@@ -1301,6 +1327,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					view_mip   = overlap.mip;
 					view_layer = overlap.layer;
 				}
+			}
+			// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
+			// and only one extent at an address holds data, so heap lookups create no second one.
+			if (!result && desc.heap &&
+			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+				    const auto* image = m_slot_images.try_get(id);
+				    return image != nullptr && image->registered &&
+					       image->heap_refs.load(std::memory_order_relaxed) != 0u &&
+					       image->info.data.address == desc.info.data.address &&
+					       image->info.type == desc.info.type &&
+					       image->info.extent != desc.info.extent;
+			    })) {
+				return {};
 			}
 		} else if (block_alias) {
 			for (const auto candidate: candidates) {

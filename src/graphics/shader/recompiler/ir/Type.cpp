@@ -31,6 +31,7 @@ std::string TypeName(Type type) {
 	    "SamplerResource",
 	    "ImageAddress",
 	    "F64",
+	    "Bvh8Result",
 	};
 	const auto bits = static_cast<uint32_t>(type);
 	if (bits == 0) {

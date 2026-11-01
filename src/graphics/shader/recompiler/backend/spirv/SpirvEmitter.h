@@ -15,6 +15,8 @@ struct Profile {
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
+	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.
+	bool robust_buffer_access = false;
 };
 
 inline constexpr Profile DefaultProfile {};

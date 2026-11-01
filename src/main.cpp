@@ -48,6 +48,9 @@ static void PrintUsage() {
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
+	::printf(
+	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
+	    "                                       <dir>, or license only without <dir>. Repeatable.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
@@ -67,16 +70,23 @@ static void PrintUsage() {
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf(
+	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
+	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
+	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
+	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -195,13 +205,18 @@ static constexpr Flag FLAGS[] = {
     {"--fullscreen", &ConfigOptions::fullscreen_enabled},
     {"--hdr", &ConfigOptions::hdr_enabled},
     {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
+    {"--stretch", &ConfigOptions::stretch_enabled},
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
+    {"--trinity", &ConfigOptions::pro_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
+    {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
+    {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
+    {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
@@ -303,6 +318,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--addcont") {
+			auto entry = Common::ParseAddContent(value);
+			if (!entry) {
+				::printf("--addcont needs <16-character A-Z/0-9 label>[=<existing folder>]: %s\n",
+				         value.c_str());
+				return false;
+			}
+			options.addcont.push_back(std::move(*entry));
 		} else if (arg == "--screen-width") {
 			if (!ParseUint32(value, options.config.screen_width) ||
 			    options.config.screen_width == 0) {

@@ -56,6 +56,7 @@ EMIT_NATIVE(BitFieldSExtract, OpBitFieldSExtract, U32, uint32_t, uint32_t, uint3
 EMIT_NATIVE(SelectU1, OpSelect, U1, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(SelectU32, OpSelect, U32, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(SelectF32, OpSelect, F32, uint32_t, uint32_t, uint32_t)
+EMIT_NATIVE(SelectF64, OpSelect, F64, uint32_t, uint32_t, uint32_t)
 EMIT_NATIVE(IAdd32, OpIAdd, U32, uint32_t, uint32_t)
 EMIT_NATIVE(ISub32, OpISub, U32, uint32_t, uint32_t)
 EMIT_NATIVE(IMul32, OpIMul, U32, uint32_t, uint32_t)
@@ -229,10 +230,13 @@ uint32_t              EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitWqmU64(EmitterState& state, uint32_t value);
 uint32_t              EmitLaneId(EmitterState& state);
 uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
+uint32_t              EmitLiveMask(EmitterState& state);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -288,6 +292,7 @@ inline constexpr auto EmitBufferAtomicIAdd32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicISub32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicSMin32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicUMin32    = EmitAtomic32;
+inline constexpr auto EmitBufferAtomicUMin64    = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicSMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd32     = EmitAtomic32;
@@ -334,6 +339,9 @@ inline constexpr auto EmitDataConsume           = EmitAppendConsume;
 uint32_t              EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

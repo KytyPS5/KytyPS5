@@ -73,43 +73,41 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_CMP_EQ_U32:
 		case O::S_CMP_EQ_I32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_LG_U32:
 		case O::S_CMP_LG_I32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_GT_U32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_GE_U32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual32, IR::Type::U32, true,
-			                   false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_LT_U32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_LE_U32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_GT_I32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThan32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThan32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_GE_I32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThanEqual32, IR::Type::U32, true,
-			                   false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThanEqual32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_LT_I32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_LE_I32:
-			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, true);
 			return;
 		case O::S_CMP_EQ_U64:
-			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, true);
 			return;
 		case O::S_CMP_LG_U64:
-			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, true, false);
+			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, true);
 			return;
 
 		case O::S_AND_B64:
@@ -250,7 +248,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BITSET0_B64: return S_BITSET_B64(inst, false);
 		case O::S_BITSET1_B64: return S_BITSET_B64(inst, true);
 		case O::S_BITREPLICATE_B64_B32: return S_BITREPLICATE_B64_B32(inst);
-		case O::S_QUADMASK_B64: return S_QUADMASK_B64(inst);
+		case O::S_QUADMASK_B32: return S_QUADMASK(inst, false);
+		case O::S_QUADMASK_B64: return S_QUADMASK(inst, true);
 		case O::S_BFM_B32: return BFM_B32(inst);
 		case O::S_BFM_B64: return S_BFM_B64(inst);
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);
@@ -268,7 +267,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: return;
+		case O::S_WAITCNT_DEPCTR:
+		case O::S_CLAUSE: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;

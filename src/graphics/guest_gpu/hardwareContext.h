@@ -412,8 +412,8 @@ struct ScreenViewport {
 	uint16_t clip_rect_rule                       = 0xffffu;
 	int      clip_rect_left[4]                    = {};
 	int      clip_rect_top[4]                     = {};
-	int      clip_rect_right[4]                   = {};
-	int      clip_rect_bottom[4]                  = {};
+	int      clip_rect_right[4]                   = {16384, 16384, 16384, 16384};
+	int      clip_rect_bottom[4]                  = {16384, 16384, 16384, 16384};
 	bool     clip_rect_window_offset_enable[4]    = {};
 };
 

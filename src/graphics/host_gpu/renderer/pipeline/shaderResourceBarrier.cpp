@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -90,7 +91,7 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
-	const auto& program   = *runtime.program;
+	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
 	// Address writes reach memory outside the bound buffer descriptors.

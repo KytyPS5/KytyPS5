@@ -81,6 +81,7 @@ constexpr uint32_t R_WRITE_DATA     = 0x15;
 constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_DMA_DATA       = 0x19;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
+constexpr uint32_t R_PSSR           = 0x1B;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 

@@ -20,6 +20,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -160,6 +161,18 @@ void GuestGpu::SuspendPoint() {
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
+	// Dead Cells reuses one GPU label address every frame and resets it from the CPU while building
+	// the next frame. With frames overlapping, that reset can land between the GPU's write and wait
+	// on the label and deadlock the queue, so the submitted frame must finish first.
+	static const bool drain_every_frame = [] {
+		std::string title_id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) &&
+		       Common::EqualNoCase(title_id, "PPSA15552");
+	}();
+	if (drain_every_frame) {
+		m_suspend_point_ready->acquire();
+		m_suspend_point_ready->release();
+	}
 	m_done_num++;
 }
 

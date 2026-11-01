@@ -862,6 +862,10 @@ static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& ins
 	return result;
 }
 
+uint32_t EmitSubgroupIAddU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformIAdd, EmitIAdd32>(ctx, inst);
+}
+
 uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMin, EmitUMin32>(ctx, inst);
 }
@@ -870,8 +874,24 @@ uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst);
 }
 
+uint32_t EmitSubgroupSMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformSMin, EmitSMin32>(ctx, inst);
+}
+
+uint32_t EmitSubgroupSMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformSMax, EmitSMax32>(ctx, inst);
+}
+
+uint32_t EmitSubgroupAndU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseAnd, EmitBitwiseAnd32>(ctx, inst);
+}
+
 uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseOr, EmitOrU32>(ctx, inst);
+}
+
+uint32_t EmitSubgroupXorU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseXor, EmitBitwiseXor32>(ctx, inst);
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

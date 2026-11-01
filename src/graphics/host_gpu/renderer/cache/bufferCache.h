@@ -102,6 +102,10 @@ public:
 	// and returns its offset there.
 	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Writes destination[i] = source[i % pattern] (dwords, i < count) in guest memory when neither
+	// range holds GPU writes; false otherwise (the caller lets the GPU do it).
+	[[nodiscard]] bool ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t source,
+	                                   uint64_t pattern);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

@@ -17,7 +17,9 @@ struct DescriptorValue {
 	}
 };
 
-enum class UniformFillKind { None, Buffer, Image };
+// Replicate: destination[i] = source[i % pattern_elements] for i < bounded_elements, both 32-bit
+// formatted buffers (a verified shader, see RecognizeReplicateFill()).
+enum class UniformFillKind { None, Buffer, Image, Replicate };
 
 struct UniformFill {
 	UniformFillKind          kind         = UniformFillKind::None;
@@ -26,6 +28,8 @@ struct UniformFill {
 	uint32_t                 words        = 0;
 	uint32_t                 value        = 0;
 	uint32_t                 bounded_elements = 0;
+	uint32_t                 source           = 0;
+	uint32_t                 pattern_elements = 0;
 
 	bool operator==(const UniformFill&) const = default;
 };

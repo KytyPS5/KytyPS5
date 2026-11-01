@@ -1117,6 +1117,34 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+bool BufferCache::ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t source,
+                                  uint64_t pattern) {
+	const auto size = count * sizeof(uint32_t);
+	const auto from = pattern * sizeof(uint32_t);
+	if (destination == 0 || source == 0 || ((destination | source) & 3u) != 0 || count == 0 ||
+	    pattern == 0 || (destination < source + from && source < destination + size) ||
+	    IsRegionGpuModified(destination, size) || IsRegionGpuModified(source, from) ||
+	    m_texture_cache.FindImageFromRange(source, from)) {
+		return false;
+	}
+	m_gpu_write_generation++;
+	(void)m_texture_cache.ClearMeta(destination);
+	// As FillBuffer(): invalidate the cached buffers and images up front.
+	InvalidateMemory(destination, size);
+	m_texture_cache.InvalidateMemory(destination, size);
+	// The pattern once, then copies of the bytes already written, each twice as long as the one
+	// before: a whole number of patterns precedes every copy, so it continues the pattern.
+	auto*      target = reinterpret_cast<uint8_t*>(destination);
+	const auto first  = std::min(size, from);
+	std::memcpy(target, reinterpret_cast<const void*>(source), first);
+	for (uint64_t written = first; written < size;) {
+		const auto chunk = std::min(written, size - written);
+		std::memcpy(target + written, target, chunk);
+		written += chunk;
+	}
+	return true;
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	m_gpu_write_generation++;

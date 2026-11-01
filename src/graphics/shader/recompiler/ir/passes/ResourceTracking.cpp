@@ -5374,12 +5374,75 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 	return result;
 }
 
+// Verified variants implement, for id = workgroup * 64 + lane below count:
+// destination[id] = source[id % pattern_size], with count and pattern_size the first two dwords
+// of a scalar buffer and both buffers read and written as formatted single components.
+UniformFillPlan RecognizeReplicateFill(Program& program, const Decoder::Program& decoded,
+                                     ShaderStageInputInfo input) {
+	struct Pattern {
+		size_t   code_words;
+		uint64_t hash;
+	};
+	constexpr std::array patterns {
+		// Demon's Souls (PPSA01341): s[0:3] source, s[4:7] destination, s[8:11] count and size.
+		Pattern {.code_words = 38, .hash = 0x545178a4c2031fa2ull},
+	};
+	if (program.stage != ShaderType::Compute || input.compute == nullptr ||
+	    decoded.instructions.empty() || program.user_data_base != 0 ||
+	    program.user_data_count < 12 || !program.info.images.empty() || program.wave_size != 64)
+		return {};
+	const auto& cs = *input.compute;
+	if (cs.workgroup_register != 12 || cs.thread_ids_num != 1 || !cs.group_id[0] ||
+	    cs.group_id[1] || cs.group_id[2] || cs.threads_num[0] != 64 || cs.threads_num[1] != 1 ||
+	    cs.threads_num[2] != 1 || cs.dispatch_thread_dimensions)
+		return {};
+	const auto&  last  = decoded.instructions.back();
+	const size_t words = last.pc / sizeof(uint32_t) + last.word_count;
+	if (words > decoded.code.size()) return {};
+	const auto hash = XXH3_64bits(decoded.code.data(), words * sizeof(uint32_t));
+	if (std::ranges::none_of(patterns, [&](const Pattern& candidate) {
+		    return candidate.code_words == words && candidate.hash == hash;
+	    }))
+		return {};
+	// The two scalar loads, in program order: the count, then the pattern size.
+	std::vector<Value> loads;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) loads.emplace_back(&inst);
+		}
+	}
+	uint32_t source = UINT32_MAX, destination = UINT32_MAX;
+	for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+		const auto& buffer = program.info.buffers[index];
+		if (buffer.written) {
+			if (destination != UINT32_MAX) return {};
+			destination = index;
+		} else if (buffer.read && buffer.formatted && !buffer.scalar) {
+			if (source != UINT32_MAX) return {};
+			source = index;
+		}
+	}
+	if (loads.size() != 2 || source == UINT32_MAX || destination == UINT32_MAX) return {};
+	UniformFillPlan result;
+	result.fill.kind            = UniformFillKind::Replicate;
+	result.fill.words           = 1;
+	result.fill.group_stride[0] = 64;
+	result.fill.resource        = destination;
+	result.fill.source          = source;
+	result.element_count        = loads[0];
+	result.pattern_size         = loads[1];
+	return result;
+}
+
 } // namespace
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
                     ShaderStageInputInfo input) {
 	Tracker(program, decoded, native_cfg, input).Run();
 	program.uniform_fill = RecognizePatternFill(program, decoded, input);
+	if (program.uniform_fill.fill.kind == UniformFillKind::None) {
+		program.uniform_fill = RecognizeReplicateFill(program, decoded, input);
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

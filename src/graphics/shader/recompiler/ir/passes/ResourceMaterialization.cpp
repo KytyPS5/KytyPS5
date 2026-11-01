@@ -2159,7 +2159,17 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
-	auto words = fill.fill.words;
+	if (fill.fill.kind == UniformFillKind::Replicate) {
+		uint32_t count = 0;
+		uint32_t size  = 0;
+		if (WalkedValue(program, fill.element_count, count) &&
+		    WalkedValue(program, fill.pattern_size, size) && count != 0 && size != 0) {
+			snapshot.uniform_fill                  = fill.fill;
+			snapshot.uniform_fill.bounded_elements = count;
+			snapshot.uniform_fill.pattern_elements = size;
+		}
+	}
+	auto words = fill.fill.kind == UniformFillKind::Replicate ? 0u : fill.fill.words;
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	if (uniform_fill && !fill.pattern_size.IsEmpty())

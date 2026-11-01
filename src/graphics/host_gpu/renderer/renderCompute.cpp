@@ -176,6 +176,37 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
+	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Replicate) {
+		// Its result is known here: write it in guest memory, so readers on the CPU (the SRT walks
+		// of the draws that read the table) find it there instead of waiting for the GPU.
+		if (!(mode == 0x41u && !input.dispatch_thread_dimensions &&
+		      input.threads_num[0] == 64 && input.threads_num[1] == 1 && input.threads_num[2] == 1 &&
+		      group_y == 1 && group_z == 1))
+			return false;
+		const auto destination =
+		    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+		const auto source =
+		    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.source]);
+		const auto plain = [](const ShaderBufferResource& buffer) {
+			const auto format = buffer.Format();
+			return buffer.Stride() == 4 && !buffer.SwizzleEnabled() && buffer.IndexStride() == 0 &&
+			       !buffer.AddTid() && buffer.Base48() != 0 &&
+			       (format == Prospero::BufferFormat::k32UInt ||
+			        format == Prospero::BufferFormat::k32SInt ||
+			        format == Prospero::BufferFormat::k32Float);
+		};
+		const uint64_t count   = fill.bounded_elements;
+		const uint64_t pattern = fill.pattern_elements;
+		if (!plain(destination) || !plain(source) || destination.Format() != source.Format() ||
+		    destination.DstSelX() != source.DstSelX() || uint64_t {group_x} * 64u < count ||
+		    count > destination.NumRecords() || pattern > source.NumRecords() ||
+		    !m_context.IsMapped(destination.Base48(), count * 4u) ||
+		    !m_context.IsMapped(source.Base48(), pattern * 4u) ||
+		    cache.IsRegionRegistered(destination.Base48(), count * 4u))
+			return false;
+		return m_context.GetBufferCache().ReplicateBuffer(destination.Base48(), count,
+		                                                  source.Base48(), pattern);
+	}
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
 		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||
 		    input.threads_num[2] != 1)

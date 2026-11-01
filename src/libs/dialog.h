@@ -40,16 +40,17 @@ int KYTY_SYSV_ABI SigninDialogGetResult(void* result);
 
 namespace SaveDataDialog {
 
-int KYTY_SYSV_ABI SaveDataDialogInitialize();
-int KYTY_SYSV_ABI SaveDataDialogGetStatus();
-int KYTY_SYSV_ABI SaveDataDialogUpdateStatus();
-int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result);
-int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param);
-int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param);
-int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay();
-int KYTY_SYSV_ABI SaveDataDialogTerminate();
-int KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta);
-int KYTY_SYSV_ABI SaveDataDialogProgressBarSetValue(int target, uint32_t rate);
+int KYTY_SYSV_ABI      SaveDataDialogInitialize();
+int KYTY_SYSV_ABI      SaveDataDialogGetStatus();
+int KYTY_SYSV_ABI      SaveDataDialogUpdateStatus();
+int KYTY_SYSV_ABI      SaveDataDialogGetResult(void* result);
+int KYTY_SYSV_ABI      SaveDataDialogOpen(const void* param);
+int KYTY_SYSV_ABI      SaveDataDialogClose(const void* close_param);
+int KYTY_SYSV_ABI      SaveDataDialogIsReadyToDisplay();
+int KYTY_SYSV_ABI      SaveDataDialogTerminate();
+int KYTY_SYSV_ABI      SaveDataDialogProgressBarInc(int target, uint32_t delta);
+int KYTY_SYSV_ABI      SaveDataDialogProgressBarSetValue(int target, uint32_t rate);
+uint32_t KYTY_SYSV_ABI SaveDataDialogGetProgressBarValue(int target);
 
 } // namespace SaveDataDialog
 

@@ -172,6 +172,7 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 thread_local bool                         t_walker_ahead   = false;
 thread_local bool                         t_walker_faulted = false;
+thread_local bool (*t_gpu_produced)(uint64_t address)   = nullptr;
 // Guest memory starts here: a table pointer below it is null.
 constexpr uint64_t GuestMemoryStart = 0x40000;
 
@@ -274,6 +275,36 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_
 	code.L(direct);
 	code.mov(code.eax, code.dword[code.r10]);
 	code.L(done);
+}
+
+// Nonzero: a walk ahead of execution does not read this load, whose value only decides control
+// flow (see SrtRuntime).
+uint64_t KYTY_SYSV_ABI ProbeZeroTestedLoad(uint64_t address) {
+	return t_walker_ahead && t_gpu_produced != nullptr && address >= GuestMemoryStart && t_gpu_produced(address)
+	           ? 1u
+	           : 0u;
+}
+
+// Jumps to `skip` when ProbeZeroTestedLoad() declines the load at `address`; every register is kept.
+void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& skip) {
+	code.lea(code.r10, code.ptr[address]);
+	for (const auto& reg: {code.rax, code.rcx, code.rdx, code.rsi, code.rdi, code.r8, code.r9, code.r10,
+	                       code.r11, code.rbp}) {
+		code.push(reg);
+	}
+	code.mov(code.rbp, code.rsp);
+	code.and_(code.rsp, -16);
+	code.mov(code.rdi, code.r10);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeZeroTestedLoad));
+	code.call(code.rax);
+	code.mov(code.rsp, code.rbp);
+	code.test(code.rax, code.rax);
+	// Pops keep the flags.
+	for (const auto& reg: {code.rbp, code.r11, code.r10, code.r9, code.r8, code.rdi, code.rsi, code.rdx,
+	                       code.rcx, code.rax}) {
+		code.pop(reg);
+	}
+	code.jnz(skip, Xbyak::CodeGenerator::T_NEAR);
 }
 
 class RuntimeValidator {
@@ -563,8 +594,12 @@ private:
 	uint32_t m_shader_base = 0, m_page_cache = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 	bool     m_body = true;
-	// By node: the flattened SRT dword that is the only use of its value, else NoFlatSlot.
+	// By node: the flattened SRT dword that is the only use of its value (or ZeroTestSlot), else
+	// NoFlatSlot.
 	std::vector<uint32_t> m_flat_slots;
+	// Loads whose value only decides control flow, such as the bound of a zero test (see
+	// SrtRuntime::gpu_produced).
+	std::vector<bool>     m_zero_tested;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -681,14 +716,79 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 		if (m_flat_slots[index] != NoFlatSlot) used[index] = true; // Two dwords.
 		m_flat_slots[index] = m_plan.srt_reads[slot].flat_offset;
 	}
+	// A zero test: `other < bound` (or `bound <= other`) with the other operand unknown; the node
+	// is unknown unless the bound is 0.
+	std::vector<uint32_t> uses(m_nodes.size(), 0), zero_uses(m_nodes.size(), 0);
+	const auto count_use = [&](const Operand& operand) {
+		if (operand.kind == Kind::Node && operand.value < uses.size()) uses[operand.value]++;
+	};
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		const auto  op   = node.inst->GetOpcode();
+		// A node whose result is another's (a context's alias of the root context's value) never runs.
+		if (node.result != Operand {Kind::Node, index}) continue;
+		const bool  zero_test = (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) &&
+		                       node.args.size() == 2 && node.args[1].kind == Kind::Unknown;
+		for (size_t k = 0; k < node.args.size(); ++k) {
+			count_use(node.args[k]);
+			if (zero_test && k == 0 && node.args[0].kind == Kind::Node && node.args[0].value < zero_uses.size()) {
+				zero_uses[node.args[0].value]++;
+			}
+		}
+	}
+	for (const auto& operand: conditions) count_use(operand);
+	for (const auto& words: descriptors) {
+		for (const auto& operand: words) count_use(operand);
+	}
+	for (const auto& operand: outputs) count_use(operand);
+	for (const auto& operand: reads) count_use(operand);
+	// Nodes whose value only decides control flow: no descriptor word, output, flattened SRT read
+	// or EXEC mask uses them, and every node using them tests them as a zero-test bound or decides
+	// only control flow itself (branch conditions do). Unknown, they leave both sides reachable.
+	std::vector<bool> control(m_nodes.size(), true);
+	const auto not_control = [&](const Operand& operand) {
+		if (operand.kind == Kind::Node && operand.value < control.size()) control[operand.value] = false;
+	};
+	for (const auto& words: descriptors) {
+		for (const auto& operand: words) not_control(operand);
+	}
+	for (const auto& operand: outputs) not_control(operand);
+	for (const auto& operand: reads) not_control(operand);
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		if (m_nodes[index].referenced || masks.contains(m_nodes[index].inst)) control[index] = false;
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (size_t index = 0; index < m_nodes.size(); ++index) {
+			const auto& node = m_nodes[index];
+			if (node.result != Operand {Kind::Node, index} || control[index]) continue;
+			const auto op        = node.inst->GetOpcode();
+			const bool zero_test = (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) &&
+			                       node.args.size() == 2 && node.args[1].kind == Kind::Unknown;
+			for (size_t k = 0; k < node.args.size(); ++k) {
+				const auto& arg = node.args[k];
+				if ((zero_test && k == 0) || arg.kind != Kind::Node || arg.value >= control.size() ||
+				    !control[arg.value]) {
+					continue;
+				}
+				control[arg.value] = false;
+				changed            = true;
+			}
+		}
+	}
+	m_zero_tested.assign(m_nodes.size(), false);
 	for (size_t index = 0; index < m_nodes.size(); ++index) {
 		const auto& node = m_nodes[index];
 		const auto  op   = node.inst->GetOpcode();
 		const bool  load = !node.referenced && !masks.contains(node.inst) &&
 		                  (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
 		                   op == ValueOpcode::LoadBufferU32);
+		m_zero_tested[index] = load && uses[index] != 0 && (uses[index] == zero_uses[index] || control[index]);
 		if (used[index] || !load) {
 			m_flat_slots[index] = NoFlatSlot;
+		}
+		if (load && uses[index] != 0 && uses[index] == zero_uses[index] && m_flat_slots[index] == NoFlatSlot) {
+			m_flat_slots[index] = ZeroTestSlot;
 		}
 		if (load && m_flat_slots[index] == NoFlatSlot && !other_use[index] &&
 		    word_uses[index] == 1 && word_slot[index] != NoFlatSlot && flat_reads[index] <= 1) {
@@ -1205,6 +1305,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 		}
+		if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.r10, m_ret);
 		LoadGuest(c, c.r10, m_page_cache, m_bias);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1699,11 +1800,13 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_running_walker = plan.srt_code.get();
 	t_walker_ahead   = runtime.record_load != nullptr;
 	t_walker_faulted = false;
+	t_gpu_produced   = runtime.gpu_produced;
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	t_walker_ahead   = false;
+	t_gpu_produced   = nullptr;
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {

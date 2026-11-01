@@ -519,6 +519,68 @@ void TestAheadWalkNamesDescriptorWordLoads() {
         "descriptor refresh masks changed");
 }
 
+void TestAheadWalkNamesZeroTestedBounds() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  // `lane < count` decides a branch: the walk reads the count only to know whether it is 0, and
+  // reports the load as such. A walk ahead of execution leaves a GPU-produced count unread.
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(0x42000u), Value(0u)});
+  auto &count = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(0u), Value(0u), Value(true)});
+  count.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+  auto &lane = block.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  auto &test = block.AppendNewInst(ValueOpcode::ULessThan32, {Value(&lane), Value(&count)});
+  auto &condition = block.AppendNewInst(ValueOpcode::ConditionRef, {Value(&test)});
+  AddValueBlock(program);
+  AddValueBlock(program);
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind = TerminatorKind::ConditionalBranch;
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+  static uint32_t memory_count = 0;
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address != 0x42000u) return false;
+        words[0] = memory_count;
+        return true;
+      });
+  struct Load {
+    uint64_t address = 0;
+    uint32_t value = 0;
+    uint32_t flat_slot = 0;
+  };
+  std::vector<Load> loads;
+  const auto record = +[](void *data, uint64_t address, uint32_t value, uint32_t flat_slot) {
+    static_cast<std::vector<Load> *>(data)->push_back({address, value, flat_slot});
+  };
+  for (const uint32_t value : {5u, 0u}) {
+    auto plan = Extract(program);
+    memory_count = value;
+    loads.clear();
+    Check(ReachedBlocks(plan, {.userdata = &loads, .record_load = record}) ==
+              (value != 0 ? std::vector<uint8_t>{1, 1, 1} : std::vector<uint8_t>{1, 0, 1}),
+          "a zero-tested bound did not decide the reachable blocks");
+    Check(loads.size() == 1 && loads[0].address == 0x42000u && loads[0].value == value &&
+              loads[0].flat_slot == ZeroTestSlot && !IsDescriptorSlot(ZeroTestSlot),
+          "ahead walk did not name the zero-tested bound load");
+  }
+  // GPU-produced: unread ahead of execution, so a zero count still reaches both sides.
+  auto plan = Extract(program);
+  memory_count = 0;
+  loads.clear();
+  Check(ReachedBlocks(plan, {.userdata = &loads,
+                             .record_load = record,
+                             .gpu_produced = +[](uint64_t address) { return address == 0x42000u; }}) ==
+                std::vector<uint8_t>{1, 1, 1} &&
+            loads.empty(),
+        "ahead walk read a GPU-produced zero-tested bound");
+}
+
 void TestUniformVectorDescriptorRead() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -1635,6 +1697,7 @@ int main() {
   TestSrtAliasesShareReads();
   TestAheadWalkNamesFlatOnlyLoads();
   TestAheadWalkNamesDescriptorWordLoads();
+  TestAheadWalkNamesZeroTestedBounds();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();

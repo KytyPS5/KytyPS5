@@ -53,8 +53,8 @@ public:
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
 	// A plain load the SRT walker made for the stage being resolved; flat_slot names the
-	// flattened SRT dword that is its only use (NoFlatSlot otherwise), or a descriptor word with
-	// refreshable bits (DescriptorSlot()).
+	// flattened SRT dword that is its only use (NoFlatSlot otherwise), a descriptor word with
+	// refreshable bits (DescriptorSlot()) or a bound tested for zero (ZeroTestSlot).
 	void               RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot);
 	void SetStage(uint32_t stage, const ShaderRecompiler::IR::ResourcePlan* plan = nullptr) {
 		m_stage = stage;
@@ -68,6 +68,7 @@ public:
 	// Execution thread: whether every read still gives the recorded bytes. The loads that only
 	// fill flattened SRT dwords are not compared: RefreshFlatLoads() reads them again. Neither are
 	// the refreshable bits of descriptor words: RefreshDescriptorWords() writes their new values.
+	// A bound tested for zero only has to stay zero or nonzero.
 	[[nodiscard]] bool StillValid() const;
 	// Execution thread, after StillValid(): writes the refreshable bits that changed (the guest
 	// rewrites V# bases and T# statistics fields after it submits the draws) into the stage's
@@ -88,6 +89,8 @@ private:
 		uint32_t size    = 0;
 		uint32_t offset  = 0;
 		bool     strict  = false;
+		// One dword whose value is only a bound tested for zero (see ZeroTestSlot).
+		bool     zero_test = false;
 		// The descriptor words with refreshable bits among its dwords: m_words[words_begin, words_end).
 		uint32_t words_begin = 0;
 		uint32_t words_end   = 0;
@@ -111,7 +114,10 @@ private:
 		uint32_t slot    = 0;
 		uint32_t count   = 1;
 	};
-	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict);
+	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict,
+	                             bool zero_test = false);
+	// Whether a bound tested for zero is still zero, or still nonzero.
+	[[nodiscard]] bool ZeroTestHolds(const Entry& entry) const;
 	std::vector<Entry>    m_entries;
 	std::vector<uint8_t>  m_bytes;
 	std::vector<FlatLoad> m_flat_loads;

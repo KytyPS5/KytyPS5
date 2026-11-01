@@ -16,11 +16,14 @@ inline constexpr uint32_t NoFlatSlot = UINT32_MAX;
 // A load whose value is only one descriptor word with bits the execution thread may refresh
 // (DescriptorRefreshMask()) reports DescriptorSlot(source, word) instead of a flat slot.
 inline constexpr uint32_t DescriptorSlotFlag = 0x80000000u;
+// A load whose value is only a bound tested for zero (`lane < n` with an unknown lane) reports
+// ZeroTestSlot: the resolution depends only on whether the value is 0.
+inline constexpr uint32_t ZeroTestSlot = UINT32_MAX - 1u;
 constexpr uint32_t DescriptorSlot(uint32_t source, uint32_t word) {
 	return DescriptorSlotFlag | (source << 3u) | word;
 }
 constexpr bool IsDescriptorSlot(uint32_t slot) {
-	return slot != NoFlatSlot && (slot & DescriptorSlotFlag) != 0;
+	return slot != NoFlatSlot && slot != ZeroTestSlot && (slot & DescriptorSlotFlag) != 0;
 }
 constexpr uint32_t DescriptorSlotSource(uint32_t slot) {
 	return (slot & ~DescriptorSlotFlag) >> 3u;
@@ -85,6 +88,12 @@ struct SrtRuntime {
 	// above the null page with the value it read. A load whose value only fills a flattened SRT
 	// dword reports that dword: nothing else the walk resolved depends on its bytes.
 	SrtLoadRecorder           record_load           = nullptr;
+	// A walk ahead of execution: whether the GPU produces the dword at an address (a dispatch
+	// resolved lately writes it). A load whose value only decides control flow is not read there:
+	// a bound tested for zero (`lane < n` with an unknown lane: no lane when n is 0) or a value
+	// that only branch conditions depend on stays unknown, which reaches both sides. Its bytes may
+	// not be written yet.
+	bool (*gpu_produced)(uint64_t address) = nullptr;
 	// The runtime words of an expanded program (ShaderSource::call_words): they follow the
 	// walked SRT words in the flattened SRT, where ReadCallWord reads them.
 	std::span<const uint32_t> call_words;

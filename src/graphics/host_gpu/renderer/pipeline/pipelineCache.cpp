@@ -141,6 +141,103 @@ bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
+// The buffer ranges the dispatches and draws resolved lately ahead of execution write (resolution
+// thread only): the GPU produces their bytes, and a walk ahead does not read there a load that
+// only decides control flow (see SrtRuntime::gpu_produced), as the writer may not have run yet.
+// Walks ask for most such loads, nearly all of them outside these ranges: a counting filter of
+// the 64 KB blocks the ranges cover answers those without scanning the ranges.
+struct AheadWrites {
+	static constexpr size_t   Capacity        = 256;
+	static constexpr uint64_t BlockShift      = 16;
+	static constexpr size_t   FilterBits      = 12;
+	static constexpr uint64_t MaxFilterBlocks = 4096; // Wider ranges (256 MB) are always scanned.
+	std::array<std::pair<uint64_t, uint64_t>, Capacity> ranges {};
+	std::array<uint16_t, size_t {1} << FilterBits>     filter {};
+	uint32_t                                            wide = 0;
+	size_t                                              next = 0;
+
+	static size_t Slot(uint64_t block) {
+		return static_cast<size_t>((block * 0x9e3779b97f4a7c15ull) >> (64u - FilterBits));
+	}
+	void Count(uint64_t begin, uint64_t end, int delta) {
+		if (begin >= end) return;
+		const auto first = begin >> BlockShift;
+		const auto last  = (end - 1) >> BlockShift;
+		if (last - first >= MaxFilterBlocks) {
+			wide = static_cast<uint32_t>(static_cast<int>(wide) + delta);
+			return;
+		}
+		for (auto block = first; block <= last; block++) {
+			auto& count = filter[Slot(block)];
+			count       = static_cast<uint16_t>(count + delta);
+		}
+	}
+	void Add(uint64_t begin, uint64_t end) {
+		for (const auto& [b, e]: ranges) {
+			if (b == begin && e == end) return;
+		}
+		Count(ranges[next].first, ranges[next].second, -1);
+		ranges[next] = {begin, end};
+		Count(begin, end, 1);
+		next = (next + 1) % Capacity;
+	}
+	[[nodiscard]] bool Contains(uint64_t address) const {
+		if (wide == 0 && filter[Slot(address >> BlockShift)] == 0) return false;
+		for (const auto& [begin, end]: ranges) {
+			if (address >= begin && address < end) return true;
+		}
+		return false;
+	}
+};
+thread_local AheadWrites t_ahead_writes;
+
+// Bounds tested for zero that the execution thread found on pages the GPU owns (see
+// GuestReadLog::ZeroTestHolds()): a walk ahead of execution reads them before their writer runs.
+// Few addresses: GTA V's ray tracing passes count their work lists at fixed addresses, which
+// dispatches write on the GPU that a walk ahead may not have resolved.
+struct GpuProducedBounds {
+	static constexpr size_t                     Capacity = 64;
+	std::array<std::atomic<uint64_t>, Capacity> addresses {};
+	std::atomic<uint32_t>                       count {0};
+
+	[[nodiscard]] bool Contains(uint64_t address) const {
+		const auto known = std::min<size_t>(count.load(std::memory_order_acquire), Capacity);
+		for (size_t i = 0; i < known; i++) {
+			if (addresses[i].load(std::memory_order_relaxed) == address) return true;
+		}
+		return false;
+	}
+	// Execution thread only.
+	void Add(uint64_t address) {
+		if (Contains(address)) return;
+		const auto index = count.load(std::memory_order_relaxed);
+		addresses[index % Capacity].store(address, std::memory_order_relaxed);
+		count.store(index + 1, std::memory_order_release);
+	}
+};
+GpuProducedBounds g_gpu_produced_bounds;
+
+void LearnGpuProducedBound(uint64_t address) {
+	g_gpu_produced_bounds.Add(address);
+}
+
+bool AheadGpuProduced(uint64_t address) {
+	return t_ahead_writes.Contains(address);
+}
+
+void NoteAheadWrites(const ShaderRecompiler::IR::ResourcePlan&     plan,
+                     const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	for (size_t i = 0; i < plan.info.buffers.size() && i < resources.buffers.size(); i++) {
+		const auto& descriptor = resources.buffers[i];
+		if (!plan.info.buffers[i].written || descriptor.dword_count != 4u) continue;
+		// The V#'s base and size (NUM_RECORDS records of STRIDE bytes, or bytes without a stride).
+		const uint64_t base    = descriptor.dwords[0] | (uint64_t {descriptor.dwords[1] & 0xffffu} << 32u);
+		const uint32_t stride  = (descriptor.dwords[1] >> 16u) & 0x3fffu;
+		const uint64_t size    = uint64_t {descriptor.dwords[2]} * (stride != 0u ? stride : 1u);
+		if (base != 0 && size != 0) t_ahead_writes.Add(base, base + size);
+	}
+}
+
 void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t flat_slot) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
 }
@@ -318,23 +415,25 @@ std::filesystem::path ShaderStorePath() {
 	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
 }
 
-void GuestReadLog::Append(uint64_t address, const void* data, uint32_t size, bool strict) {
+void GuestReadLog::Append(uint64_t address, const void* data, uint32_t size, bool strict,
+                          bool zero_test) {
 	m_gpu_written = m_gpu_written || Libs::LibKernel::Memory::MayBeGpuWritten(address, size);
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
 	m_bytes.insert(m_bytes.end(), static_cast<const uint8_t*>(data),
 	               static_cast<const uint8_t*>(data) + size);
 	// Contiguous reads of the same kind are checked as one (strict reads up to the size the
 	// check reads at once).
-	if (!m_entries.empty()) {
+	if (!m_entries.empty() && !zero_test) {
 		auto& last = m_entries.back();
-		if (last.strict == strict && last.address + last.size == address &&
+		if (last.strict == strict && !last.zero_test && last.address + last.size == address &&
 		    last.offset + last.size == offset &&
 		    (!strict || last.size + size <= StrictCheckBytes)) {
 			last.size += size;
 			return;
 		}
 	}
-	m_entries.push_back({address, size, offset, strict});
+	m_entries.push_back({.address = address, .size = size, .offset = offset, .strict = strict,
+	                     .zero_test = zero_test});
 }
 
 bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict) {
@@ -348,6 +447,10 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 }
 
 void GuestReadLog::RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot) {
+	if (flat_slot == ShaderRecompiler::IR::ZeroTestSlot) {
+		Append(address, &value, sizeof(value), false, true);
+		return;
+	}
 	if (ShaderRecompiler::IR::IsDescriptorSlot(flat_slot)) {
 		const auto source = ShaderRecompiler::IR::DescriptorSlotSource(flat_slot);
 		const auto word   = ShaderRecompiler::IR::DescriptorSlotWord(flat_slot);
@@ -441,6 +544,19 @@ void GuestReadLog::ReadNow(const Entry& entry, uint8_t* bytes) const {
 	    !Libs::LibKernel::Memory::TryReadAroundGpuWrites(entry.address, bytes, entry.size)) {
 		std::memcpy(bytes, reinterpret_cast<const void*>(entry.address), entry.size);
 	}
+}
+
+bool GuestReadLog::ZeroTestHolds(const Entry& entry) const {
+	uint32_t previous = 0;
+	uint32_t current  = 0;
+	std::memcpy(&previous, m_bytes.data() + entry.offset, sizeof(previous));
+	// A bound the GPU writes: later walks ahead of execution leave it unread (see
+	// AheadGpuProduced()), as they read its bytes before the writer runs.
+	if (Libs::LibKernel::Memory::MayFaultOnGpuRead(entry.address, sizeof(current))) {
+		LearnGpuProducedBound(entry.address);
+	}
+	ReadNow(entry, reinterpret_cast<uint8_t*>(&current));
+	return (current != 0) == (previous != 0);
 }
 
 bool GuestReadLog::OnlyRefreshableBitsChanged(const Entry& entry) const {
@@ -565,6 +681,12 @@ bool GuestReadLog::StillValid() const {
 	};
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
+		if (entry.zero_test) {
+			if (!ZeroTestHolds(entry)) {
+				return false;
+			}
+			continue;
+		}
 		if (!entry.strict) {
 			const auto  first_page   = entry.address >> 12u;
 			const auto  last_page    = (entry.address + entry.size - 1) >> 12u;
@@ -1502,6 +1624,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	    .userdata                   = &ahead.reads,
 	    .read_specialization_memory = ReadAheadStrict,
 	    .record_load                = RecordAheadLoad,
+	    .gpu_produced               = AheadGpuProduced,
 	};
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		// As GetProgram(): descriptor tables indexed by the workgroup id probe one entry per group.
@@ -1513,6 +1636,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.Fail();
 		return nullptr;
 	}
+	NoteAheadWrites(entry->second.resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		return layout.push_data_start_dword ==

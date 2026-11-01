@@ -1066,6 +1066,28 @@ static int SetHostSocketError() {
 #endif
 }
 
+static int SetHostSocketOptionError(NativeSocket socket, int level, int optname) {
+#if defined(_WIN32)
+	// Winsock reports an unknown option as WSAEINVAL, which setsockopt also uses for invalid
+	// values. getsockopt with a large buffer fails with WSAEINVAL only for an unknown option.
+	const int error = WSAGetLastError();
+	if (error == WSAEINVAL) {
+		std::array<char, 64> value {};
+		auto                 len = static_cast<SocketLength>(value.size());
+		if (::getsockopt(socket, level, optname, value.data(), &len) != 0 &&
+		    WSAGetLastError() == WSAEINVAL) {
+			return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
+		}
+	}
+	return SetGuestSocketError(ConvertHostSocketError(error));
+#else
+	(void)socket;
+	(void)level;
+	(void)optname;
+	return SetHostSocketError();
+#endif
+}
+
 static int ConvertFamily(int family) {
 	switch (family) {
 		case 2: return AF_INET;
@@ -2220,7 +2242,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(value),
 	                 &len) != 0) {
-		return SetHostSocketError();
+		return SetHostSocketOptionError(socket, ConvertSocketOptionLevel(level), optname);
 	}
 	if (send_timeout) {
 #if defined(_WIN32)
@@ -2340,7 +2362,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
 	                 static_cast<const char*>(optval), static_cast<SocketLength>(optlen)) != 0) {
-		return SetHostSocketError();
+		return SetHostSocketOptionError(socket, ConvertSocketOptionLevel(level), optname);
 	}
 
 	return 0;

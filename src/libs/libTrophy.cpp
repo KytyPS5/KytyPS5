@@ -155,10 +155,10 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 			     package.event_rules.size(), uds_filename.c_str());
 		}
 	}
-	const bool guest = Config::IsGuestUserId(key.first);
-	auto       path  = guest ? std::filesystem::path {}
-	                         : Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
+	const bool guest   = Config::IsGuestUserId(key.first);
+	auto       path    = guest ? std::filesystem::path {}
+	                           : Trophies::UnlocksPath({}, title_id, key.first, key.second);
+	auto       unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
 	return &g_states
 	            .emplace(key, TrophyState {&package, std::move(unlocks), std::move(path), guest})
 	            .first->second;
@@ -200,8 +200,10 @@ static void FillTrophyInfo(const TrophyState& state, const Trophies::Trophy& tro
 			data->timestamp_tick = timestamp->second;
 		}
 		if (trophy.progressive && trophy.target) {
-			data->progress.type  = 1;
-			data->progress.value = data->unlocked ? *trophy.target : 0;
+			data->progress.type = 1;
+			data->progress.value =
+			    data->unlocked ? *trophy.target
+			                   : Trophies::StatProgress(trophy, state.unlocks.stats).value_or(0);
 		}
 	}
 }
@@ -714,12 +716,20 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
 			LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id);
 		}
-	} else if (!uds_event.properties.integers.empty()) {
+	} else {
+		// Count stats tally events even when they carry no integer properties.
 		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
-			const auto ids = LibNpTrophy2::Trophies::FindUdsTrophies(
-			    *state->package, uds_event.name, uds_event.properties.integers);
+			bool       stats_changed = false;
+			const auto ids = LibNpTrophy2::Trophies::ApplyUdsEvent(*state->package, uds_event.name,
+			                                                       uds_event.properties.integers,
+			                                                       state->unlocks, stats_changed);
+			// Each recorded unlock also saves the updated stats.
 			for (const auto trophy_id: ids) {
 				LibNpTrophy2::RecordTrophyUnlock(*state, trophy_id, true);
+			}
+			if (stats_changed && ids.empty() && !state->guest &&
+			    !LibNpTrophy2::Trophies::SaveUnlockData(state->path, state->unlocks)) {
+				LOGF("[Trophy] could not save UDS stats to %s\n", state->path.string().c_str());
 			}
 		}
 	}
@@ -901,7 +911,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetInteger(key, std::nullopt);
+	object->SetInteger(key, value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"

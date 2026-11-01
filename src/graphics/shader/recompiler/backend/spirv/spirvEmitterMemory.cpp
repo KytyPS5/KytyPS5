@@ -196,6 +196,15 @@ void RecordBdaPageBit(EmitterState& state, uint32_t page, uint64_t bitmap_offset
 	const auto pointer = FaultElementPointer(state, word);
 	const auto scope   = ConstantU32(state, spv::ScopeDevice);
 	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	// Shaders that walk BVHs read device addresses in long dependent chains (node after node): the
+	// load of the bitmap word before each access cost them up to a third of their time. They OR
+	// without looking, with no branch. Other shaders keep the check, which saves the atomic traffic
+	// of shaders that read the same pages from many lanes.
+	if (state.program.info.bvh) {
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+		                          pointer, scope, relaxed, bit);
+		return;
+	}
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, scope, relaxed);
 	const auto missing =

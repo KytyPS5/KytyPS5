@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
+#include "libs/guestStdio.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
 #include "loader/runtimeLinker.h"
@@ -607,11 +608,46 @@ LIB_DEFINE(InitLibcInternalExt_1) {
 
 } // namespace LibcInternalExt
 
+namespace GuestStdio {
+
+int Flush(File* file, std::FILE* host_stream) noexcept {
+	if (file == nullptr || host_stream == nullptr || file->buffer_base == nullptr ||
+	    file->buffer_limit == nullptr || file->write_pointer == nullptr ||
+	    file->write_pointer < file->buffer_base || file->write_pointer > file->buffer_limit) {
+		return EOF;
+	}
+
+	const auto pending = static_cast<size_t>(file->write_pointer - file->buffer_base);
+	if (pending != 0) {
+		const auto written = std::fwrite(file->buffer_base, 1, pending, host_stream);
+		if (written < pending) {
+			const auto remaining = pending - written;
+			std::memmove(file->buffer_base, file->buffer_base + written, remaining);
+			file->write_pointer = file->buffer_base + remaining;
+			(void)std::fflush(host_stream);
+			return EOF;
+		}
+		file->write_pointer = file->buffer_base;
+	}
+
+	file->buffer_base_copy  = file->buffer_base;
+	file->write_limit       = file->buffer_limit;
+	file->auxiliary_base_50 = file->buffer_base;
+	file->auxiliary_base_58 = file->buffer_base;
+	return (std::fflush(host_stream) == 0 ? 0 : EOF);
+}
+
+} // namespace GuestStdio
+
 namespace LibcInternal {
 
 LIB_VERSION("LibcInternal", 1, "LibcInternal", 1, 1);
 
-static uint32_t g_need_flag = 1;
+static uint32_t           g_need_flag = 1;
+static GuestStdio::Stream g_standard_output_storage {1};
+static GuestStdio::Stream g_standard_error_storage {2};
+static GuestStdio::File*  g_standard_output_stream = &g_standard_output_storage.file;
+static GuestStdio::File*  g_standard_error_stream  = &g_standard_error_storage.file;
 
 int KYTY_SYSV_ABI vprintf(const char* str, VaList* c) {
 	PRINT_NAME();
@@ -627,12 +663,23 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 	return GetGuestSnprintfCtxFunc()(&ctx);
 }
 
-int KYTY_SYSV_ABI fflush(FILE* stream) {
+int KYTY_SYSV_ABI fflush(GuestStdio::File* stream) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
+	if (stream == nullptr) {
+		const int out_result = GuestStdio::Flush(g_standard_output_stream, stdout);
+		const int err_result = GuestStdio::Flush(g_standard_error_stream, stderr);
+		return (out_result == 0 && err_result == 0 ? 0 : EOF);
+	}
+	if (stream == g_standard_output_stream) {
+		return GuestStdio::Flush(stream, stdout);
+	}
+	if (stream == g_standard_error_stream) {
+		return GuestStdio::Flush(stream, stderr);
+	}
 
-	return ::fflush(stream);
+	EXIT_NOT_IMPLEMENTED(true);
+	return EOF;
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
@@ -763,7 +810,11 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LibcInternalExt::InitLibcInternalExt_1(s);
 
 	LIB_OBJECT("ZT4ODD2Ts9o", &LibcInternal::g_need_flag);
-	LIB_OBJECT("2sWzhYqFH4E", stdout);
+	LIB_OBJECT("2sWzhYqFH4E", &LibcInternal::g_standard_output_stream);
+	// Legacy imports address FILE* slots; point them at guest-layout stream objects, not host
+	// FILEs.
+	LIB_OBJECT("zqJhBxAKfsc", &LibcInternal::g_standard_output_stream);
+	LIB_OBJECT("as8Od-tH1BI", &LibcInternal::g_standard_error_stream);
 
 	LIB_FUNC("GMpvxPFW924", LibcInternal::vprintf);
 	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);

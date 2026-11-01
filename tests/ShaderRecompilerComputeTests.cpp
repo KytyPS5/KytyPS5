@@ -28874,6 +28874,75 @@ TestCase CvtPkrtzF16F32RuntimeEdges() {
   return test;
 }
 
+TestCase CvtF16F32RoundsToNearestEven() {
+  using O = ShaderOpcode;
+  // Inputs and results of v_cvt_f16_f32 on RDNA2 and RDNA4: round to nearest even, finite values
+  // from 65520 up become infinity, NaN is quieted.
+  constexpr std::array<std::array<u32, 2>, 24> inputs{{
+      {0x3f807e63u, 0x3c04u}, {0x3f801000u, 0x3c00u}, {0x3f803000u, 0x3c02u},
+      {0x3f801001u, 0x3c01u}, {0xbf803000u, 0xbc02u}, {0x477fe000u, 0x7bffu},
+      {0x477ff000u, 0x7c00u}, {0x477fefffu, 0x7bffu}, {0x47800000u, 0x7c00u},
+      {0x7f7fffffu, 0x7c00u}, {0x387fe000u, 0x0400u}, {0x33000000u, 0x0000u},
+      {0x33000001u, 0x0001u}, {0x33c00000u, 0x0002u}, {0xb3c00000u, 0x8002u},
+      {0x7f8dc000u, 0x7e6eu}, {0x7f800100u, 0x7e00u}, {0x7fc12000u, 0x7e09u},
+      {0xff800000u, 0xfc00u}, {0x00000001u, 0x0000u}, {0x80000001u, 0x8000u},
+      {0x3dcccccdu, 0x2e66u}, {0x40490fdbu, 0x4248u}, {0x3f2aaaabu, 0x3955u},
+  }};
+  TestCase test;
+  test.name = "CvtF16F32RoundsToNearestEven";
+  for (const auto &input : inputs) test.initial.push_back(input[0]);
+  test.expected = test.initial;
+  for (u32 i = 0; i < inputs.size(); ++i) {
+    AppendVMovU32(&test.code, 30, i * 4u);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    AppendVMovU32(&test.code, 1, 0);
+    test.code.push_back(EncodeVop1(0x0a, 1, Vgpr(0)));
+    AppendStoreVgpr(&test.code, 1, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(inputs[i][1]);
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_F16_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16"};
+  return test;
+}
+
+TestCase F16AddRoundsToNearestEven() {
+  using O = ShaderOpcode;
+  // Sums halfway between two halves, and one past the largest, as RDNA2 and RDNA4 round them.
+  constexpr std::array<std::array<u32, 3>, 4> pairs{{
+      {0x3c01u, 0x1000u, 0x3c02u}, {0x3c00u, 0x1000u, 0x3c00u},
+      {0x3c03u, 0x1000u, 0x3c04u}, {0x7bffu, 0x4c00u, 0x7c00u},
+  }};
+  TestCase test;
+  test.name = "F16AddRoundsToNearestEven";
+  for (const auto &pair : pairs) test.initial.insert(test.initial.end(), {pair[0], pair[1]});
+  test.initial.insert(test.initial.end(), {pairs[2][0] << 16 | pairs[0][0], 0x10001000u});
+  test.expected = test.initial;
+  const auto load_pair = [&](u32 word) {
+    AppendVMovU32(&test.code, 30, word * 4u);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    AppendVMovU32(&test.code, 30, word * 4u + 4u);
+    AppendBufferLoadDword(&test.code, 1, 30);
+    AppendVMovU32(&test.code, 2, 0);
+  };
+  for (u32 i = 0; i < pairs.size(); ++i) {
+    load_pair(i * 2u);
+    test.code.push_back(EncodeVop2(0x32, 2, Vgpr(0), 1));
+    AppendStoreVgpr(&test.code, 2, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(pairs[i][2]);
+  }
+  load_pair(static_cast<u32>(pairs.size()) * 2u);
+  AppendVop3p(&test.code, 0x0f, 2, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendStoreVgpr(&test.code, 2, static_cast<u32>(test.expected.size()));
+  test.expected.push_back(pairs[2][2] << 16 | pairs[0][2]);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_ADD_F16, O::V_PK_ADD_F16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16"};
+  return test;
+}
+
 TestCase CvtPkrtzF16F32SdwaAndOutputModifiers() {
   using O = ShaderOpcode;
 
@@ -29254,7 +29323,7 @@ TestCase VectorFractF16CapturedAndEdges() {
                   O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
+  test.required_spirv = {" Fract ", " UnpackHalf2x16 "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -29328,7 +29397,7 @@ TestCase VectorFractF16Modifiers() {
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {{"V_FRACT_F16", 10}};
   test.ir_counts = {{" = FPFract32 ", 10}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract "};
   return test;
 }
 
@@ -29366,7 +29435,7 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", " Cos "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -29412,7 +29481,7 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -47228,6 +47297,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32RuntimeEdges);
+  AddCase(CvtF16F32RoundsToNearestEven);
+  AddCase(F16AddRoundsToNearestEven);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);

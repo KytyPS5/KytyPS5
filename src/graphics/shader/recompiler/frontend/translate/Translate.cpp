@@ -1287,7 +1287,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto& offsets  = options.input_info.vertex->indirect_offsets;
 			for (const auto [slot, parameter]:
 			     {std::pair {offsets.vertex, 1u},
-			      std::pair {offsets.instance, IR::PushData::MeshDrawDwordCount}}) {
+			      std::pair {offsets.instance, IR::PushData::MeshTaskPayloadDwordCount - 1u}}) {
 				if (indirect && 8u + slot < options.user_data_count) {
 					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(8u + slot), draw(parameter));
 				}
@@ -1295,11 +1295,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto vertex_index = [&](IR::U32 index) {
 				return indirect ? index : entry_ir.IAdd(draw(1), index);
 			};
+			// The workgroup row is the instance within the host draw; a direct draw split in several adds
+			// its first instance (draw(5)). Indirect records pass theirs as the start instance above.
+			const auto instance_index = [&](IR::U32 row) {
+				return indirect ? row : entry_ir.IAdd(draw(5), row);
+			};
 			if (mesh.fast_launch) {
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), vertex_index(group));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				                      instance_index(builtin(IR::StageInputKind::WorkgroupId, 1)));
 			} else {
 				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 				// center in every subgroup; strip winding follows the global primitive.
@@ -1345,7 +1350,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      vertex_index(entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				                      instance_index(builtin(IR::StageInputKind::WorkgroupId, 1)));
 			}
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), active_lane_count());

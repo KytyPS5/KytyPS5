@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/meshDrawSplit.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1681,11 +1682,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		// Instances are workgroup rows: draws with more instances than a host draw takes are split
+		// into several (ASTRO BOT's world 3 boss draws 77,054 instances; NVIDIA takes 65,535 rows).
 		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		    mesh_groups > limits.maxMeshWorkGroupTotalCount) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
@@ -1797,7 +1798,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
 			             static_cast<uint32_t>(mesh_indices),
-			             static_cast<uint32_t>(mesh_indices >> 32u)};
+			             static_cast<uint32_t>(mesh_indices >> 32u),
+			             0u};
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
@@ -1836,7 +1838,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		const auto  rows   = MeshDrawSplit::RowsPerDraw(limits.maxMeshWorkGroupCount[1],
+		                                                limits.maxMeshWorkGroupTotalCount, mesh_groups);
+		MeshDrawSplit::ForEachDraw(draw.instance_count, rows, [&](uint32_t first, uint32_t count) {
+			if (first != 0) {
+				// The first instance of this host draw (the mesh draw parameters' last dword).
+				vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+				                        (PushData::MeshDrawDwordCount - 1u) * sizeof(uint32_t),
+				                        sizeof(uint32_t), &first);
+			}
+			vk_buffer.drawMeshTasksEXT(mesh_groups, count, 1);
+		});
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	} else if (count_buffer.first != nullptr) {

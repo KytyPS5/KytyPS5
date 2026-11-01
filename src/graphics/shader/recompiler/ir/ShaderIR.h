@@ -407,10 +407,12 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 5;
-	// Indirect mesh draws read the draw parameters, then the record's first instance, from the
-	// task payload (gpu_mesh_indirect.task).
-	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;
+	// Mesh draws: vertex count, vertex offset, index size, index address (2), first instance of the
+	// host draw (draws with more instances than the host allows go in several host draws).
+	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Indirect mesh draws read the first five draw parameters, then the record's first instance,
+	// from the task payload (gpu_mesh_indirect.task).
+	static constexpr uint32_t MeshTaskPayloadDwordCount = 6;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 

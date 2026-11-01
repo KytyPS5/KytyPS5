@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/hostCopyQueue.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/lodStatsReport.h"
+#include "graphics/host_gpu/renderer/meshDrawSplit.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
 #include <array>
@@ -687,6 +688,36 @@ void TestPackedColorClear16() {
 	      "R16G16_UNORM clear decodes both channels");
 }
 
+// Mesh draws with more instances than a host draw takes (ASTRO BOT's world 3 boss: 77,054
+// instances, NVIDIA: 65,535 rows) go in host draws that cover every instance once, in order.
+void TestMeshDrawSplit() {
+	namespace Split = Libs::Graphics::MeshDrawSplit;
+	constexpr uint64_t MaxRows  = 65535;
+	constexpr uint64_t MaxTotal = uint64_t {1} << 22u;
+	struct Case {
+		uint32_t groups;
+		uint32_t instances;
+		uint32_t rows;
+		uint32_t draws;
+	};
+	for (const auto& test: {Case {1, 77054, 65535, 2}, Case {1, 65535, 65535, 1}, Case {1, 1, 65535, 1},
+	                        Case {100, 77054, 41943, 2}, Case {1000, 9000, 4194, 3},
+	                        Case {1, 200000, 65535, 4}}) {
+		const auto rows = Split::RowsPerDraw(MaxRows, MaxTotal, test.groups);
+		Check(rows == test.rows, "mesh draw rows per host draw");
+		uint32_t next  = 0;
+		uint32_t draws = 0;
+		Split::ForEachDraw(test.instances, rows, [&](uint32_t first, uint32_t count) {
+			Check(first == next && count != 0 && count <= rows &&
+			          uint64_t {count} * test.groups <= MaxTotal,
+			      "mesh host draws cover the instances in order within the limits");
+			next = first + count;
+			draws++;
+		});
+		Check(next == test.instances && draws == test.draws, "mesh host draw count");
+	}
+}
+
 int main() {
 	TestCommandStreamOrder();
 	TestCommandStreamArraysStayInChunk();
@@ -699,6 +730,7 @@ int main() {
 	TestOcclusionCounters();
 	TestLodStatsReport();
 	TestPackedColorClear16();
+	TestMeshDrawSplit();
 	std::printf("GpuPipelineTests: all tests passed\n");
 	return 0;
 }

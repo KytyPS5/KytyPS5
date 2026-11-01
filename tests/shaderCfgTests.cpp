@@ -8746,8 +8746,12 @@ void TestMeshInputAssembly() {
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
+    // The last parameter is the host draw's first instance: the second host draw of a draw split
+    // at NVIDIA's 65,535 workgroup rows.
+    constexpr uint32_t FirstInstance = 65535;
     const uint32_t draw[] = {test.count, test.base_vertex, test.width,
-                             test.address_low, 0x12};
+                             test.address_low, 0x12, FirstInstance};
+    static_assert(std::size(draw) == PushData::MeshDrawDwordCount);
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
@@ -8787,8 +8791,9 @@ void TestMeshInputAssembly() {
     Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
               vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-              vgprs[test.fast_launch ? 6 : 8] == 2u,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+              vgprs[test.fast_launch ? 6 : 8] == FirstInstance + 2u,
+          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID "
+          "(the host draw's first instance plus the workgroup row)");
   }
 }
 

@@ -5500,6 +5500,408 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Everything the suspend and resume cases observe about one range.
+  struct SuspendSnapshot {
+    bool mapped = false;
+    bool every_page_cpu_dirty = false;
+    bool no_page_cpu_dirty = false;
+    bool gpu_dirty_bytes = false;
+    bool operator==(const SuspendSnapshot &) const = default;
+  };
+
+  enum class HostPageProtection { ReadOnly, ReadWrite, Other, Unknown };
+
+  static constexpr uint64_t kSuspendAreaStride = 0x10000;
+  // The cached buffer covers four tracker pages. The extra tail stays unwatched.
+  static constexpr uint64_t kSuspendBufferSize = 0x4000;
+  static constexpr uint64_t kSuspendRangeSize = 0x8000;
+  static constexpr uint64_t kSuspendPageSize = 0x1000;
+  static constexpr uint32_t kSuspendPages =
+      static_cast<uint32_t>(kSuspendBufferSize / kSuspendPageSize);
+  static constexpr uint32_t kSuspendPatternBase = 0x11110000u;
+  static constexpr uint32_t kSuspendPatternStep = 0x00010101u;
+  static constexpr uint32_t kSuspendChangedValue = 0xc0ffee00u;
+  static constexpr uint32_t kSuspendGpuValue = 0x5a5a1234u;
+  static constexpr uint64_t kSuspendValueOffset = 0x10;
+  // Guest read-write protection and the fixed-address flag, as the dirty-GC fixture passes them.
+  static constexpr int kSuspendMapProtection = 0x3;
+  static constexpr int kSuspendMapFixed = 0x10;
+  static constexpr uint64_t kSuspendMapAlignment = 0x10000;
+
+  struct SuspendRig {
+    RenderContext &context;
+    CommandScheduler &scheduler;
+    uint64_t base;
+    int64_t direct_offset;
+    // Each case owns one area so earlier cases cannot satisfy a later case's checks.
+    uint64_t Area(uint32_t index) const {
+      return base + uint64_t{index} * kSuspendAreaStride;
+    }
+  };
+
+  static uint32_t SuspendPattern(uint32_t page) {
+    return kSuspendPatternBase + page * kSuspendPatternStep;
+  }
+
+  // Reports the host protection of the page at an address, where the platform can tell.
+  static HostPageProtection QueryHostProtection(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof(info)) == 0) {
+      return HostPageProtection::Other;
+    }
+    if (info.Protect == PAGE_READONLY) {
+      return HostPageProtection::ReadOnly;
+    }
+    return info.Protect == PAGE_READWRITE ? HostPageProtection::ReadWrite
+                                          : HostPageProtection::Other;
+#else
+    (void)address;
+    return HostPageProtection::Unknown;
+#endif
+  }
+
+  // Releases the host view of a range, as a guest release does before the physical memory is
+  // freed. The kernel skips its GPU hooks here because the fixture installs no GPU resources.
+  static void ReleaseHostView(const char *name, uint64_t address, uint64_t size) {
+    Require(name, "release view", Libs::LibKernel::Memory::KernelMunmap(address, size) == 0,
+            "could not release the host view");
+  }
+
+  // Maps the same physical offset back at the same address, which creates a real fresh view.
+  static void MapFreshView(const char *name, const SuspendRig &rig, uint64_t address,
+                           uint64_t size) {
+    void *mapped = reinterpret_cast<void *>(address);
+    Require(name, "fresh view",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, kSuspendMapProtection, kSuspendMapFixed,
+                rig.direct_offset + static_cast<int64_t>(address - rig.base),
+                kSuspendMapAlignment) == 0 &&
+                mapped == reinterpret_cast<void *>(address),
+            "could not map the same physical memory back");
+  }
+
+  // Replaces a range's host view with a fresh read-write one over the same physical memory.
+  static void RemapFreshView(const char *name, const SuspendRig &rig, uint64_t address,
+                             uint64_t size) {
+    ReleaseHostView(name, address, size);
+    MapFreshView(name, rig, address, size);
+  }
+
+  // Requires each page to have the given protection. Skipped where the platform cannot report it.
+  static void RequirePageProtection(const char *name, const char *stage, uint64_t area,
+                                    uint32_t pages, HostPageProtection expected) {
+    if (QueryHostProtection(area) == HostPageProtection::Unknown) {
+      return;
+    }
+    for (uint32_t page = 0; page < pages; ++page) {
+      Require(name, stage,
+              QueryHostProtection(area + page * kSuspendPageSize) == expected,
+              "a page does not have the expected host protection");
+    }
+  }
+
+  // Captures mapped state and per-page dirtiness so cases can compare whole outcomes.
+  static SuspendSnapshot TakeSuspendSnapshot(const SuspendRig &rig, uint64_t area) {
+    auto &cache = rig.context.GetBufferCache();
+    SuspendSnapshot snapshot;
+    snapshot.mapped = rig.context.IsMapped(area, kSuspendBufferSize);
+    snapshot.every_page_cpu_dirty = true;
+    snapshot.no_page_cpu_dirty = true;
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      const bool dirty =
+          cache.IsRegionCpuModified(area + page * kSuspendPageSize, kSuspendPageSize);
+      snapshot.every_page_cpu_dirty &= dirty;
+      snapshot.no_page_cpu_dirty &= !dirty;
+    }
+    snapshot.gpu_dirty_bytes = cache.HasGpuDirtyBytes(area, kSuspendBufferSize);
+    return snapshot;
+  }
+
+  // Copies one word of a native buffer back to the host, as the dirty-GC fixture does.
+  uint32_t ReadSuspendNativeValue(const char *name, CommandScheduler &scheduler,
+                                  const Libs::Graphics::Buffer &buffer, uint64_t offset) {
+    auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                     vk::BufferUsageFlagBits::eTransferDst, {0});
+    const vk::BufferCopy copy{offset, 0, sizeof(uint32_t)};
+    scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+        nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    const auto value = ReadBuffer(name, readback, 1)[0];
+    DestroyBuffer(&readback);
+    return value;
+  }
+
+  // Writes a distinct word into every page and uploads them into a clean cached buffer.
+  void PrimeCleanSuspendBuffer(const char *name, const SuspendRig &rig, uint64_t area) {
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      const uint32_t value = SuspendPattern(page);
+      std::memcpy(reinterpret_cast<void *>(area + page * kSuspendPageSize + kSuspendValueOffset),
+                  &value, sizeof(value));
+    }
+    auto &cache = rig.context.GetBufferCache();
+    // A read-only acquisition may stream instead of caching, so write-acquire and then publish.
+    const auto buffer = cache.ObtainBuffer(area, kSuspendBufferSize, true, false);
+    cache.ReadMemory(area, kSuspendBufferSize);
+    Require(name, "prime",
+            buffer.first != nullptr && TakeSuspendSnapshot(rig, area).no_page_cpu_dirty,
+            "could not cache a clean buffer");
+  }
+
+  // Requires each page of the cached buffer to hold the primed word, except the pages in the
+  // changed mask, which must hold the changed word. Syncing first uploads any CPU-dirty page.
+  void RequireNativePages(const char *name, const char *stage, const SuspendRig &rig,
+                          uint64_t area, uint32_t changed_mask) {
+    auto &cache = rig.context.GetBufferCache();
+    // Not a read-only ObtainBuffer, which streams a fresh copy of guest memory when any page is
+    // CPU-dirty and would compare guest memory with itself. This syncs the registered owner.
+    const auto buffer = cache.ObtainBufferForImage(area, kSuspendBufferSize);
+    Require(name, stage,
+            buffer.first == &cache.GetBuffer(cache.FindBuffer(area, kSuspendBufferSize)),
+            "the native read did not come from the registered buffer");
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      const bool changed = ((changed_mask >> page) & 1u) != 0;
+      const uint32_t expected = changed ? kSuspendChangedValue : SuspendPattern(page);
+      const auto offset = buffer.second + page * kSuspendPageSize + kSuspendValueOffset;
+      Require(name, stage,
+              ReadSuspendNativeValue(name, rig.scheduler, *buffer.first, offset) == expected,
+              "native buffer page holds the wrong word");
+    }
+  }
+
+  // Overwrites the marker word of one page in guest memory.
+  static void WriteChangedWord(uint64_t area, uint32_t page) {
+    const uint32_t value = kSuspendChangedValue;
+    std::memcpy(reinterpret_cast<void *>(area + page * kSuspendPageSize + kSuspendValueOffset),
+                &value, sizeof(value));
+  }
+
+  // Today's behaviour. Returns the state after the unmap so other cases can compare to it.
+  SuspendSnapshot CheckSuspendBaseline(const char *name, const SuspendRig &rig,
+                                       SuspendSnapshot &after_map) {
+    const auto area = rig.Area(0);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    rig.context.UnmapMemory(area, kSuspendRangeSize);
+    const auto after_unmap = TakeSuspendSnapshot(rig, area);
+    Require(name, "baseline unmapped",
+            !after_unmap.mapped && after_unmap.every_page_cpu_dirty &&
+                rig.context.GetBufferCache().IsRegionCpuModified(area, kSuspendBufferSize),
+            "an unmap did not mark the cache CPU-dirty");
+    WriteChangedWord(area, 0);
+    rig.context.MapMemory(area, kSuspendRangeSize);
+    after_map = TakeSuspendSnapshot(rig, area);
+    RequireNativePages(name, "baseline re-upload", rig, area, 0x1);
+    return after_unmap;
+  }
+
+  // A resumed range keeps its cache clean, re-arms protection and uploads nothing.
+  void CheckSuspendResume(const char *name, const SuspendRig &rig) {
+    const auto area = rig.Area(1);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    const auto unwatched = area + kSuspendBufferSize;
+    RequirePageProtection(name, "watched before suspend", area, kSuspendPages,
+                          HostPageProtection::ReadOnly);
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    Require(name, "suspended",
+            rig.context.IsSuspended(area, kSuspendRangeSize) &&
+                !rig.context.IsMapped(area, kSuspendBufferSize) &&
+                TakeSuspendSnapshot(rig, area).no_page_cpu_dirty,
+            "suspend unmapped wrongly or dirtied the cache");
+    RemapFreshView(name, rig, area, kSuspendRangeSize);
+    RequirePageProtection(name, "fresh view writable", area, kSuspendPages,
+                          HostPageProtection::ReadWrite);
+    // Changing the guest word makes a re-upload visible, because only an upload could show it.
+    WriteChangedWord(area, 0);
+    rig.context.ResumeMemory(area, kSuspendRangeSize);
+    Require(name, "resumed",
+            rig.context.IsMapped(area, kSuspendRangeSize) &&
+                !rig.context.IsSuspended(area, kSuspendRangeSize) &&
+                TakeSuspendSnapshot(rig, area).no_page_cpu_dirty,
+            "resume did not map the range back clean");
+    RequirePageProtection(name, "protection re-armed", area, kSuspendPages,
+                          HostPageProtection::ReadOnly);
+    RequirePageProtection(name, "unwatched untouched", unwatched, 1,
+                          HostPageProtection::ReadWrite);
+    RequireNativePages(name, "no re-upload", rig, area, 0x0);
+  }
+
+  // A write fault after resume dirties only its page, and the next sync uploads only that page.
+  void CheckSuspendWriteAfterResume(const char *name, const SuspendRig &rig) {
+    const auto area = rig.Area(2);
+    auto &cache = rig.context.GetBufferCache();
+    PrimeCleanSuspendBuffer(name, rig, area);
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    RemapFreshView(name, rig, area, kSuspendRangeSize);
+    rig.context.ResumeMemory(area, kSuspendRangeSize);
+    constexpr uint32_t written_page = 2;
+    const auto written = area + written_page * kSuspendPageSize + kSuspendValueOffset;
+    Require(name, "write fault", rig.context.HandleFault(PageFaultAccess::Write, written),
+            "a write fault in a resumed range was not handled");
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      Require(name, "only the written page is dirty",
+              cache.IsRegionCpuModified(area + page * kSuspendPageSize, kSuspendPageSize) ==
+                  (page == written_page),
+              "the dirty pages are not exactly the written page");
+    }
+    WriteChangedWord(area, written_page);
+    RequireNativePages(name, "uploaded write", rig, area, 1u << written_page);
+  }
+
+  // GPU-written bytes reach guest memory at suspend without turning into CPU-dirty pages.
+  void CheckSuspendPublishesGpuData(const char *name, const SuspendRig &rig) {
+    const auto area = rig.Area(3);
+    auto &cache = rig.context.GetBufferCache();
+    constexpr uint32_t gpu_page = 1;
+    const auto gpu_address = area + gpu_page * kSuspendPageSize + kSuspendValueOffset;
+    const uint32_t stale = SuspendPattern(gpu_page);
+    std::memcpy(reinterpret_cast<void *>(gpu_address), &stale, sizeof(stale));
+    Require(name, "gpu-written allocation",
+            cache.ObtainBuffer(area, kSuspendBufferSize, true, false).first != nullptr,
+            "could not cache a written buffer");
+    cache.FillBuffer(gpu_address, sizeof(uint32_t), kSuspendGpuValue, false);
+    Require(name, "gpu dirty before suspend",
+            cache.HasGpuDirtyBytes(gpu_address, sizeof(uint32_t)),
+            "the fill did not leave GPU-dirty bytes");
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    uint32_t published = 0;
+    std::memcpy(&published, reinterpret_cast<void *>(gpu_address), sizeof(published));
+    const auto after = TakeSuspendSnapshot(rig, area);
+    Require(name, "gpu data published",
+            published == kSuspendGpuValue && !after.gpu_dirty_bytes && after.no_page_cpu_dirty &&
+                !cache.IsRegionGpuModified(area, kSuspendBufferSize),
+            "suspend lost GPU data, kept GPU ownership or dirtied the pages");
+    RemapFreshView(name, rig, area, kSuspendRangeSize);
+    rig.context.ResumeMemory(area, kSuspendRangeSize);
+    Require(name, "gpu data resumed", TakeSuspendSnapshot(rig, area).no_page_cpu_dirty,
+            "resume dirtied pages that suspend had published");
+  }
+
+  // Cancel must leave the same state that an unmap leaves.
+  void CheckSuspendCancel(const char *name, const SuspendRig &rig,
+                          const SuspendSnapshot &baseline_unmapped) {
+    const auto area = rig.Area(4);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    Require(name, "suspended is clean", TakeSuspendSnapshot(rig, area).no_page_cpu_dirty,
+            "suspend dirtied the cache, so cancel cannot be told apart from it");
+    // The host view is really gone while the cancel runs, as it is when the kernel cancels.
+    ReleaseHostView(name, area, kSuspendRangeSize);
+    rig.context.CancelSuspendedMemory(area, kSuspendRangeSize);
+    Require(name, "cancel equals baseline", TakeSuspendSnapshot(rig, area) == baseline_unmapped,
+            "cancel did not reproduce the unmap outcome");
+    Require(name, "cancel unsuspends", !rig.context.IsSuspended(area, kSuspendRangeSize),
+            "cancel left the range suspended");
+    MapFreshView(name, rig, area, kSuspendRangeSize);
+    rig.context.MapMemory(area, kSuspendRangeSize);
+    Require(name, "map after cancel", rig.context.IsMapped(area, kSuspendRangeSize),
+            "mapping after a cancel failed");
+  }
+
+  // A plain map over a suspended range cancels it first, so it ends like the baseline.
+  void CheckSuspendMapSafetyNet(const char *name, const SuspendRig &rig,
+                                const SuspendSnapshot &baseline_mapped) {
+    const auto area = rig.Area(5);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    // The guest maps a fresh view and changes a word before the map reaches the GPU.
+    RemapFreshView(name, rig, area, kSuspendRangeSize);
+    WriteChangedWord(area, 0);
+    rig.context.MapMemory(area, kSuspendRangeSize);
+    Require(name, "map equals baseline", TakeSuspendSnapshot(rig, area) == baseline_mapped,
+            "a map over suspended memory did not behave like unmap then map");
+    RequireNativePages(name, "map re-upload", rig, area, 0x1);
+  }
+
+  // An unmap over a suspended range invalidates it like today and ends the suspension.
+  void CheckSuspendUnmapEndsSuspension(const char *name, const SuspendRig &rig,
+                                       const SuspendSnapshot &baseline_unmapped) {
+    const auto area = rig.Area(6);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    Require(name, "suspended before unmap", rig.context.IsSuspended(area, kSuspendRangeSize),
+            "the range was not suspended, so the unmap probe proves nothing");
+    rig.context.UnmapMemory(area, kSuspendRangeSize);
+    Require(name, "unmap ends suspension",
+            !rig.context.IsSuspended(area, kSuspendRangeSize) &&
+                TakeSuspendSnapshot(rig, area) == baseline_unmapped,
+            "an unmap left the range suspended or kept its cache clean");
+  }
+
+  // With the GPU stopped, a suspend must behave exactly like an unmap and suspend nothing.
+  void CheckSuspendAtShutdown(const char *name, const SuspendRig &rig,
+                              const SuspendSnapshot &baseline_unmapped) {
+    // The cache was primed before the GPU stopped, because caching needs the GPU thread.
+    const auto area = rig.Area(7);
+    rig.context.SuspendMemory(area, kSuspendRangeSize);
+    Require(name, "shutdown suspend is an unmap",
+            !rig.context.IsSuspended(area, kSuspendRangeSize) &&
+                TakeSuspendSnapshot(rig, area) == baseline_unmapped,
+            "a suspend with the GPU stopped kept the cache instead of invalidating it");
+  }
+
+  // Runs every suspend and resume case against a real direct-memory mapping. Where the host
+  // cannot report page protection (Linux and macOS, a follow-up) the protection checks are skipped.
+  void CheckBufferCacheSuspendResume() {
+    constexpr const char *name = "BufferCacheSuspendResume";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, kSuspendMapProtection, kSuspendMapFixed,
+                direct_offset, allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    context.MapMemory(base, allocation_size);
+    const SuspendRig rig{context, scheduler, base, direct_offset};
+    SuspendSnapshot baseline_mapped;
+    const auto baseline_unmapped = CheckSuspendBaseline(name, rig, baseline_mapped);
+    CheckSuspendResume(name, rig);
+    CheckSuspendWriteAfterResume(name, rig);
+    CheckSuspendPublishesGpuData(name, rig);
+    CheckSuspendCancel(name, rig, baseline_unmapped);
+    CheckSuspendMapSafetyNet(name, rig, baseline_mapped);
+    CheckSuspendUnmapEndsSuspension(name, rig, baseline_unmapped);
+    scheduler.Finish();
+    PrimeCleanSuspendBuffer(name, rig, rig.Area(7));
+    context.ShutdownGpu();
+    CheckSuspendAtShutdown(name, rig, baseline_unmapped);
+    context.UnmapMemory(base, allocation_size);
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckResidentImageHeap() {
     constexpr const char *name = "ResidentImageHeap";
     constexpr uintptr_t base = 0x0000000206800000ull;
@@ -54762,6 +55164,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheSuspendResume();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {

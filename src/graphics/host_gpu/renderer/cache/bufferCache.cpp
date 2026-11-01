@@ -304,6 +304,43 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	QueueBdaSync(vaddr, size);
 }
 
+// Downloads the GPU-dirty bytes of every buffer overlapping the range, then clears their
+// ownership. Pages are not marked CPU-dirty, so the cached data stays valid for a later resume.
+void BufferCache::FlushGpuDirtyForSuspend(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid suspend range\n");
+	}
+	// Guest releases are cache-page aligned, so anything else means the caller got the range wrong.
+	if ((vaddr | size) % CACHING_PAGESIZE != 0) {
+		EXIT("BufferCache: suspend range is not cache-page aligned\n");
+	}
+	const auto end    = vaddr + size;
+	bool       queued = false;
+	auto       it     = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	// Walk the registered buffers only. FindBuffer would create or merge buffers over the range.
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			queued |= DownloadBufferMemory<true>(buffer, start, finish - start);
+		}
+	}
+	if (queued) {
+		// Publish every queued download before the host view goes away, as the garbage collector does.
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		EXIT("BufferCache: suspend retained GPU-dirty bytes\n");
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "

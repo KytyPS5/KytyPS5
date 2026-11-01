@@ -90,42 +90,138 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+// Reports whether the whole range is suspended.
+bool RenderContext::IsSuspended(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_suspended.Contains(vaddr, size);
+}
+
+// Records a range as mapped and queues its BDA sync. Suspended parts are cancelled first.
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+	// A new mapping over suspended memory cannot be a verified resume, so its cache is dropped first.
+	// The cancel needs the GPU thread, which the guest thread calling here is not. Checking and then
+	// cancelling is race free because the kernel holds g_memory_operation_mutex and only the GPU
+	// thread writes m_suspended.
+	bool overlaps_suspended = false;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		overlaps_suspended = m_suspended.Intersects(vaddr, size);
+	}
+	if (overlaps_suspended) {
+		LOGF("GPU: map over suspended memory cancelled its cache, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+		CancelSuspendedMemory(vaddr, size);
+	}
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
-void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+// Runs a memory operation on the GPU thread, or inline when shutdown has closed the command lane.
+void RenderContext::RunMemoryOperation(const char* name, uint64_t vaddr, uint64_t size,
+                                       Common::UniqueFunction<void>&& operation) {
 	if (CommandScheduler::InDeferredOperation()) {
-		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
+		EXIT("unsupported memory %s from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
+		     name, vaddr, size);
 	}
-	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
+	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
+	// longer accepts external work. Use the guest GPU's state for the teardown route.
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		operation();
+		return;
+	}
+	m_gpu->SendCommandSync(std::move(operation));
+}
+
+// Waits for native work and priority operations when the range has cached data or work is pending.
+void RenderContext::DrainBeforeUnmap(uint64_t vaddr, uint64_t size) {
+	// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+	// access a range with no cached data, so they must finish before it is unmapped.
+	if (m_command_scheduler.Active() &&
+	    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+	     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+	     m_command_scheduler.HasPendingPriorityOperations())) {
+		const auto tick = m_command_scheduler.CurrentTick();
+		m_command_scheduler.Finish();
+		m_command_scheduler.WaitPriorityOperations(tick);
+	}
+}
+
+// Unmaps a range and fully invalidates its caches, including any suspension over it.
+void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	RunMemoryOperation("unmap", vaddr, size, [this, vaddr, size] {
+		DrainBeforeUnmap(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
-	};
-	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
-	// longer accepts external work. Use the guest GPU's state for the teardown route.
+		// Nothing is suspended unless a release was suspended earlier, so this is usually a no-op.
+		// The invalidate above already covered any suspended cache here.
+		m_suspended.Subtract(vaddr, size);
+	});
+}
+
+// Unmaps a range like UnmapMemory but keeps its buffer cache valid for a later exact resume.
+void RenderContext::SuspendMemory(uint64_t vaddr, uint64_t size) {
+	// Suspending at shutdown is pointless, and the waits it needs are unsafe off the GPU thread.
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
-		unmap();
+		UnmapMemory(vaddr, size);
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	RunMemoryOperation("suspend", vaddr, size, [this, vaddr, size] {
+		DrainBeforeUnmap(vaddr, size);
+		// The host view is about to go away, so GPU-written bytes must reach it first.
+		m_buffer_cache.FlushGpuDirtyForSuspend(vaddr, size);
+		m_texture_cache.UnmapMemory(vaddr, size);
+		m_image_heap.UnmapMemory(vaddr, size);
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Subtract(vaddr, size);
+		m_suspended.Add(vaddr, size);
+	});
+}
+
+// Maps a suspended range back after the same memory was mapped at the same address read-write.
+void RenderContext::ResumeMemory(uint64_t vaddr, uint64_t size) {
+	RunMemoryOperation("resume", vaddr, size, [this, vaddr, size] {
+		{
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			if (!m_suspended.Contains(vaddr, size)) {
+				EXIT("RenderContext: resume of memory that is not suspended, "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     vaddr, size);
+			}
+			m_suspended.Subtract(vaddr, size);
+			m_mapped_ranges.Add(vaddr, size);
+		}
+		// The fresh view is read-write, so watched pages need their protection back before the
+		// guest can run. This must not hold the address-space mutex, and no lock is held here.
+		m_page_manager.ReapplyProtection(vaddr, size);
+		m_buffer_cache.QueueBdaSync(vaddr, size);
+	});
+}
+
+// Applies the full invalidation that an UnmapMemory would have done to the suspended parts.
+// Normally the range is unmapped, so protection changes skip it. As a last resort the MapMemory
+// safety net also calls this with a fresh view already present, where the invalidate may loosen
+// a guest read-only mapping to read-write. The kernel cancels earlier than that.
+void RenderContext::CancelSuspendedMemory(uint64_t vaddr, uint64_t size) {
+	RunMemoryOperation("cancel", vaddr, size, [this, vaddr, size] {
+		std::vector<std::pair<uint64_t, uint64_t>> parts;
+		{
+			std::shared_lock lock(m_mapped_ranges_mutex);
+			m_suspended.ForEachInRange(vaddr, size, [&parts](uint64_t begin, uint64_t end) {
+				parts.emplace_back(begin, end - begin);
+			});
+		}
+		for (const auto& [begin, bytes]: parts) {
+			m_buffer_cache.InvalidateMemory(begin, bytes);
+		}
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_suspended.Subtract(vaddr, size);
+	});
 }
 
 void RenderContext::PrepareBda() {

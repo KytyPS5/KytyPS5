@@ -348,6 +348,14 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
+BufferId BufferCache::FindBufferForShaderRead(uint64_t vaddr, uint64_t size) {
+	const auto id = FindBuffer(vaddr, size);
+	if (!IsBufferInvalid(id)) {
+		TouchBuffer(m_slot_buffers[id]);
+	}
+	return id;
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int      StreamLeapThreshold = 16;
 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
@@ -669,8 +677,85 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+bool BufferCache::IsStaleReleaseCandidate(const Buffer& buffer) {
+	return !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) &&
+	       !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size()) &&
+	       !m_release_protected.Intersects(buffer.CpuAddress(), buffer.Size());
+}
+
+void BufferCache::RememberReleasedRange(uint64_t begin, uint64_t end) {
+	m_recent_releases.push_back({begin, end});
+	if (m_recent_releases.size() > RECENT_RELEASE_CAPACITY) {
+		m_recent_releases.pop_front();
+	}
+}
+
+void BufferCache::RecreateFaultedRange(uint64_t vaddr, uint64_t size) {
+	// A shader read zeros here, from a range stale release dropped. It is read only through BDA,
+	// where no binding marks it as used, so it would only be released again.
+	const auto end       = vaddr + size;
+	uint64_t   refaulted = 0;
+	std::erase_if(m_recent_releases, [&](const ReleasedRange& range) {
+		if (range.end <= vaddr || range.begin >= end) {
+			return false;
+		}
+		m_release_protected.Add(range.begin, range.end - range.begin);
+		refaulted++;
+		return true;
+	});
+	if (refaulted != 0) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReleaseRefaults,
+		                           refaulted);
+		const auto message = fmt::format(
+		    "GPU: a shader read a released buffer at 0x{:016x}, keeping that range cached\n",
+		    vaddr);
+		if (m_refaults_logged++ < REFAULT_CONSOLE_LOG_LIMIT) {
+			Log::WriteToConsoleAndLog(message);
+		} else {
+			LOGF("%s", message.c_str());
+		}
+	}
+	(void)FindBuffer(vaddr, size);
+}
+
+void BufferCache::ForgetReleasedRanges(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	m_release_protected.Subtract(begin, end - begin);
+	std::erase_if(m_recent_releases, [&](const ReleasedRange& range) {
+		return range.begin < end && range.end > begin;
+	});
+}
+
+// A cached buffer keeps its pages write-protected. Once the game reuses that memory for other
+// data, every CPU write there faults and re-uploads into a buffer nothing reads any more.
+void BufferCache::ReleaseStaleBuffers(uint64_t tick) {
+	if (tick < STALE_RELEASE_AGE_TICKS || tick % STALE_RELEASE_INTERVAL_TICKS != 0) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("BufferCache::ReleaseStaleBuffers");
+	// Dropping a clean buffer without a download is safe only because shaders never write guest
+	// memory through BDA (ShaderInfoCollection rejects them), so every GPU write is tracked.
+	// Nothing in this loop may wait on the scheduler. A wait can run deferred operations that
+	// create or join buffers and change the LRU list while it is being walked.
+	uint32_t released = 0;
+	m_lru_cache.ForEachItemBelow(tick - STALE_RELEASE_AGE_TICKS, [&](BufferId id) {
+		auto& buffer = m_slot_buffers[id];
+		EXIT_IF(buffer.is_deleted);
+		if (!IsStaleReleaseCandidate(buffer)) {
+			return false;
+		}
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		RememberReleasedRange(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size());
+		DeleteBuffer(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReleases);
+		return ++released == STALE_RELEASE_MAX_PER_PASS;
+	});
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	ReleaseStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

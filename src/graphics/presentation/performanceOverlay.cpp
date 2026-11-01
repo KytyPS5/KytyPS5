@@ -514,6 +514,12 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		TransferRow(shown, "Buffer transfers", Counter::BufferUploadBytes,
 		            Counter::BufferDownloadBytes);
 		Row("Buffer evictions", Fmt("%.0f/s", Rate(shown, Counter::BufferEvictions)));
+		// A refault means a shader read zeros for a frame or so from a released buffer.
+		const auto refaults = Total(shown, Counter::BufferReleaseRefaults);
+		Row("Buffer releases",
+		    Fmt("%.0f/s  (%llu refaults)", Rate(shown, Counter::BufferReleases),
+		        static_cast<unsigned long long>(refaults)),
+		    refaults > 0 ? MEDIUM : GOOD);
 		ImGui::EndTable();
 	}
 }

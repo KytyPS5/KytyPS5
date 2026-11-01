@@ -79,6 +79,7 @@ constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
 constexpr char CONF_GAME_DIRS[]    = "game_dirs";
 constexpr char CONF_ADDONS_DIR[]   = "addons_dir";
+constexpr char CONF_ADDCONT[]      = "AdditionalContent";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
 
@@ -348,6 +349,13 @@ void ConfigurationListWidget::WriteSettings() {
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
 
+	s->remove(CONF_ADDCONT);
+	s->beginGroup(CONF_ADDCONT);
+	for (auto it = m_addcont.constBegin(); it != m_addcont.constEnd(); ++it) {
+		s->setValue(it.key(), it.value());
+	}
+	s->endGroup();
+
 	s->remove(CONF_GLOBAL);
 	s->beginGroup(CONF_GLOBAL);
 	m_global_info.WriteSettings(s.get());
@@ -393,6 +401,13 @@ void ConfigurationListWidget::ReadSettings() {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
 	m_addons_dir = NormalizeGameDirectory(s->value(CONF_ADDONS_DIR).toString());
+	s->endGroup();
+
+	m_addcont.clear();
+	s->beginGroup(CONF_ADDCONT);
+	for (const auto& title_id: s->childKeys()) {
+		m_addcont.insert(title_id, SettingsStringList(s->value(title_id)));
+	}
 	s->endGroup();
 
 	s->beginGroup(CONF_GLOBAL);
@@ -458,6 +473,7 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	}
 	info->host_input_mapping = m_global_info.host_input_mapping;
 	info->addons_dir         = m_addons_dir;
+	info->addcont            = m_addcont.value(item.GetInfo().title_id.trimmed().toUpper());
 	return info;
 }
 
@@ -1273,11 +1289,22 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	connect(action_addcont, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {
-			        auto* dialog = new AdditionalContentDialog(item->GetInfo(), m_addons_dir, this);
+			        const auto title_id = item->GetInfo().title_id.trimmed().toUpper();
+			        auto*      dialog   = new AdditionalContentDialog(
+			            item->GetInfo(), m_addons_dir, m_addcont.value(title_id),
+			            [this, title_id](const QStringList& entries) {
+				            if (entries.isEmpty()) {
+					            m_addcont.remove(title_id);
+				            } else {
+					            m_addcont.insert(title_id, entries);
+				            }
+				            WriteSettings();
+			            },
+			            this);
 			        dialog->show();
 		        }
 	        });
-	action_addcont->setEnabled(item != nullptr);
+	action_addcont->setEnabled(item != nullptr && !item->GetInfo().title_id.trimmed().isEmpty());
 	QAction* action_compress =
 	    menu.addAction(tr("Compress to ZAR..."), this, SLOT(compress_game()));
 	QAction* action_remove_save_data =

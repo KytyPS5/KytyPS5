@@ -300,8 +300,12 @@ void TestOperandMutationLifecycle() {
   auto *source = definition.TryInstruction();
   const auto inserted = fixture.Emit(ValueOpcode::BitFieldInsert,
       {definition, definition, Value(4u), Value(4u)});
-  Check(source->UseCount() == 2, "inline operands lost distinct reverse-use indices");
-  inserted.TryInstruction()->SetArg(1, Value(3u));
+  auto *consumer = inserted.TryInstruction();
+  Check(source->Uses() == std::vector<Use>({{consumer, 0}, {consumer, 1}}),
+        "inline operands lost distinct reverse-use indices");
+  consumer->SetArg(0, definition);
+  Check(source->UseCount() == 2, "re-setting an operand to its value duplicated its use");
+  consumer->SetArg(1, Value(3u));
   Check(source->UseCount() == 1, "inline operand mutation did not detach its old use");
   source->ReplaceUsesWith(Value(0xaau));
   uint32_t result = 0;
@@ -347,6 +351,35 @@ void TestOperandMutationLifecycle() {
   Check(source->UseCount() == 0 && phi.NumPhiBlocks() == 0 && phi.NumArgs() == 1 &&
             EvaluateSrtValue(fixture.program, {}, sum, result) && result == 11,
         "Phi replacement retained incoming uses or changed the consumer value");
+}
+
+void TestReplacementKeepsUseOrder() {
+  Fixture fixture(2);
+  const auto base = fixture.Emit(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
+  auto *before = fixture.Emit(ValueOpcode::IAdd32, {base, Value(3u)}).TryInstruction();
+  auto *identity = fixture.Emit(ValueOpcode::Identity, {base}).TryInstruction();
+  auto *pair = fixture.Emit(ValueOpcode::IAdd32, {Value(identity), Value(identity)}).TryInstruction();
+  auto *after = fixture.Emit(ValueOpcode::IAdd32, {Value(4u), base}).TryInstruction();
+  auto &large = fixture.program.value_storage.emplace_back(ValueOpcode::GetImageResource);
+  const auto last = large.NumArgs() - 1;
+  large.SetArg(last, Value(identity));
+  identity->ReplaceUsesWith(base, false);
+  Check(!identity->HasUses() && identity->NumArgs() == 0 && pair->Arg(0) == base &&
+            pair->Arg(1) == base && large.Arg(last) == base &&
+            base.TryInstruction()->Uses() ==
+                std::vector<Use>({{before, 0}, {after, 1}, {pair, 0}, {pair, 1}, {&large, last}}),
+        "identity removal lost or reordered the uses of its argument");
+
+  auto &phi = fixture.BlockAt(1).AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  phi.AddPhiOperand(&fixture.BlockAt(0), Value(after));
+  phi.AddPhiOperand(&fixture.BlockAt(1), Value(&phi));
+  auto *user = fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(&phi)}, 0, 1).TryInstruction();
+  phi.ReplaceUsesWith(Value(after));
+  Check(phi.GetOpcode() == ValueOpcode::Identity && phi.Arg(0) == Value(after) && !phi.HasUses() &&
+            user->Arg(0) == Value(after) && user->Arg(1) == Value(after) &&
+            after->Uses() == std::vector<Use>({{user, 0}, {user, 1}, {&phi, 0}}),
+        "self-referencing Phi replacement kept a use of itself or reordered the moved uses");
 }
 
 void TestControlDependentStandaloneLoadStaysTyped() {
@@ -515,6 +548,34 @@ void TestFloatComparisonDescriptorInputs() {
   }
 }
 
+void TestSignedConversionDescriptorInputs() {
+  // 3.75 and -3.75 truncate, the largest float below 2^31 converts exactly, 2^31 and +inf
+  // saturate up, -2^31 and -1e10 saturate down, and -0.0, a denormal and both NaNs read zero.
+  constexpr std::array<std::pair<uint32_t, uint32_t>, 11> inputs = {{
+      {0x40700000u, 3u},          {0xc0700000u, 0xfffffffdu}, {0x4effffffu, 0x7fffff80u},
+      {0x4f000000u, 0x7fffffffu}, {0x7f800000u, 0x7fffffffu}, {0xcf000000u, 0x80000000u},
+      {0xd01502f9u, 0x80000000u}, {0x80000000u, 0u},          {0x00000001u, 0u},
+      {0x7fc00000u, 0u},          {0xffc00000u, 0u}}};
+  Fixture fixture;
+  const auto user = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  const auto converted = fixture.Emit(
+      ValueOpcode::ConvertS32F32, {fixture.Emit(ValueOpcode::BitCastF32U32, {user})});
+  Check(ValidateRuntimeValue(fixture.program, converted),
+        "signed float conversion was rejected as a runtime value");
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {converted}, .dword_count = 1});
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  for (const auto [bits, expected] : inputs) {
+    const std::array user_data{bits};
+    DescriptorValue result;
+    Check(EvaluateSource(plan, {.user_data = user_data}, 0, result) &&
+              result.dwords[0] == expected,
+          "descriptor signed conversion disagrees with the native conversion");
+  }
+}
+
 void TestSharedIntegerRuntimeDependencies() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::LaneId);
@@ -630,161 +691,187 @@ void TestReadLaneElimination() {
 
 void TestCompleteWaveReduction() {
   enum class Case {
-    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
-    UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
-    Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
+    Masked, ScalarExec, Wave32, Wave32Rows, Wave32Maximum, Or, Wave32Or, RowMask,
+    BankMask, Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
-    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation,
-    CarryAdd, ShapeEndpoints
+    Endpoint, EndpointSource, CrossBlock, WrongOperation, MixedOperation,
+    CarryAdd, CarryLive, ShapeEndpoints, SameHalf, DynamicEndpoint, WrongNeutral, Literal,
+    DuplicateStep
   };
   struct Fold {
     ValueOpcode operation;
-    uint32_t identity;
+    ValueOpcode reduction;
+    uint32_t    identity;
   };
-  static constexpr std::array<Fold, 8> folds{{
-      {ValueOpcode::UMin32, UINT32_MAX}, {ValueOpcode::UMax32, 0u},
-      {ValueOpcode::SMin32, 0x7fffffffu}, {ValueOpcode::SMax32, 0x80000000u},
-      {ValueOpcode::IAdd32, 0u}, {ValueOpcode::BitwiseAnd32, UINT32_MAX},
-      {ValueOpcode::BitwiseOr32, 0u}, {ValueOpcode::BitwiseXor32, 0u}}};
-  for (const auto fold : folds) {
-  for (const bool butterfly : {false, true}) {
-  for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
-       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
-       Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
-       Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
-       Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
-       Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
-       Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
-       Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
-       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation,
-       Case::CarryAdd, Case::ShapeEndpoints}) {
-    const bool carry = test == Case::CarryAdd;
-    if (carry && fold.operation != ValueOpcode::IAdd32) continue;
-    const uint32_t row_control = butterfly ? 0x160u : 0x110u;
-    Fixture fixture(test == Case::CrossBlock ? 2 : 1);
-    const auto source = fixture.Emit(ValueOpcode::LaneId);
-    const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
-    const auto other_mask = fixture.Emit(ValueOpcode::IEqual32, {source, Value(7u)});
-    const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
-    const bool literal = test == Case::Literal || test == Case::LiteralMasked;
-    const auto enabled = literal ? Value(true) :
-        fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
-    auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
-    if (test == Case::Subset)
-      seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
-    const uint32_t wrong_identity = fold.identity == 0u ? UINT32_MAX : 0u;
-    const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
-        fixture.Emit(ValueOpcode::SelectU32,
-            {seed_mask, source, Value(test == Case::WrongNeutral ? wrong_identity : fold.identity)});
-    auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
-    Value preserved;
-    const auto step_operation = test != Case::WrongOperation ? fold.operation :
-        fold.operation == ValueOpcode::IAdd32 ? ValueOpcode::UMax32 : ValueOpcode::IAdd32;
-    for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
-      DppMoveFlags flags{.control = row_control + shift};
-      if (shift == 2) {
-        if (test == Case::RowMask) flags.row_mask = 7;
-        if (test == Case::BankMask) flags.bank_mask = 7;
-        if (test == Case::Shift) flags.control = row_control + 3u;
-        if (test == Case::FetchInactive) flags.fetch_inactive = true;
-        if (test == Case::BoundControl) flags.bound_control = true;
-        if (test == Case::Dpp8) flags.dpp8 = true;
+  static constexpr Fold folds[] {
+    {ValueOpcode::UMin32, ValueOpcode::SubgroupUMinU32, UINT32_MAX},
+    {ValueOpcode::UMax32, ValueOpcode::SubgroupUMaxU32, 0u},
+    {ValueOpcode::SMin32, ValueOpcode::SubgroupSMinU32, 0x7fffffffu},
+    {ValueOpcode::SMax32, ValueOpcode::SubgroupSMaxU32, 0x80000000u},
+    {ValueOpcode::IAdd32, ValueOpcode::SubgroupIAddU32, 0u},
+    {ValueOpcode::BitwiseAnd32, ValueOpcode::SubgroupAndU32, UINT32_MAX},
+    {ValueOpcode::BitwiseOr32, ValueOpcode::SubgroupOrU32, 0u},
+    {ValueOpcode::BitwiseXor32, ValueOpcode::SubgroupXorU32, 0u},
+  };
+  for (const auto fold: folds) {
+    for (const bool butterfly: {false, true}) {
+      for (const auto test: {Case::Masked, Case::ScalarExec, Case::Wave32,
+           Case::Wave32Rows, Case::Wave32Maximum, Case::Or, Case::Wave32Or,
+           Case::RowMask, Case::BankMask, Case::Shift, Case::FetchInactive,
+           Case::BoundControl, Case::Dpp8, Case::MoveExec, Case::UpdateExec,
+           Case::Previous, Case::DppSource, Case::CrossExec, Case::CrossRow,
+           Case::CrossSelectorLow, Case::CrossSelectorHigh, Case::CrossFetch,
+           Case::CrossBound, Case::CrossSource, Case::FinalExec, Case::Endpoint,
+           Case::EndpointSource, Case::CrossBlock, Case::WrongOperation,
+           Case::MixedOperation, Case::CarryAdd, Case::CarryLive, Case::ShapeEndpoints,
+           Case::SameHalf, Case::DynamicEndpoint, Case::WrongNeutral, Case::Literal, Case::DuplicateStep}) {
+        const bool carry = test == Case::CarryAdd || test == Case::CarryLive;
+        if (carry && fold.operation != ValueOpcode::IAdd32) continue;
+        auto selected = fold;
+        if (test == Case::Wave32Maximum) selected = folds[1];
+        if (test == Case::Or || test == Case::Wave32Or) selected = folds[6];
+        const auto other = selected.operation == ValueOpcode::IAdd32
+                               ? ValueOpcode::UMax32 : ValueOpcode::IAdd32;
+        const auto operation = test == Case::WrongOperation ? other : selected.operation;
+        const uint32_t row_control = butterfly ? 0x160u : 0x110u;
+        Fixture fixture(test == Case::CrossBlock ? 2 : 1);
+        const auto source = fixture.Emit(ValueOpcode::LaneId);
+        const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
+        const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
+        auto enabled = fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
+        if (test == Case::ScalarExec) {
+          // s_orn2_saveexec of a mask that is not a ballot, read back as a lane bit.
+          const auto exec = fixture.Emit(ValueOpcode::GetUserData,
+              {Value(static_cast<ScalarReg>(2))});
+          const auto full = fixture.Emit(ValueOpcode::BitwiseOr32,
+              {fixture.Emit(ValueOpcode::BitwiseNot32, {exec}), exec});
+          const auto bit = fixture.Emit(ValueOpcode::BitwiseAnd32, {source, Value(31u)});
+          const auto shifted = fixture.Emit(ValueOpcode::ShiftRightLogical32, {full, bit});
+          enabled = fixture.Emit(ValueOpcode::INotEqual32,
+              {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
+        }
+        const uint32_t neutral = test == Case::WrongNeutral
+                                     ? (selected.identity == 0u ? UINT32_MAX : 0u)
+                                     : selected.identity;
+        const auto seed = test == Case::Literal ? source :
+            fixture.Emit(ValueOpcode::SelectU32, {mask, source, Value(neutral)});
+        auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
+        Value preserved;
+        for (const uint32_t shift: {1u, 2u, 4u, 8u}) {
+          DppMoveFlags flags{.control = row_control + shift};
+          if (shift == 2) {
+            if (test == Case::RowMask) flags.row_mask = 7;
+            if (test == Case::BankMask) flags.bank_mask = 7;
+            if (test == Case::Shift) flags.control = row_control + 3u;
+            if (test == Case::DuplicateStep) flags.control = row_control + 1u;
+            if (test == Case::FetchInactive) flags.fetch_inactive = true;
+            if (test == Case::BoundControl) flags.bound_control = true;
+            if (test == Case::Dpp8) flags.dpp8 = true;
+          }
+          const auto move = fixture.Emit(ValueOpcode::DppMoveU32,
+              {test == Case::DppSource ? source : prefix,
+               test == Case::MoveExec ? mask : enabled});
+          move.Instruction()->SetFlags(flags);
+          const auto combined = fixture.Emit(operation, {move, prefix});
+          const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
+              {combined, test == Case::Previous ? source : prefix,
+               test == Case::UpdateExec ? mask : enabled});
+          update.Instruction()->SetFlags(flags);
+          prefix = update;
+          if (shift == 2) preserved = fixture.Emit(ValueOpcode::ReferenceU32, {prefix});
+        }
+        const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
+            {test == Case::CrossSource ? source : prefix,
+             Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
+             Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX),
+             test == Case::CrossExec ? mask : enabled, Value(0u)});
+        cross.Instruction()->SetFlags(PermlaneFlags{
+            .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
+            .bound_control = test != Case::CrossBound});
+        const auto cross_write = fixture.Emit(ValueOpcode::SelectU32, {enabled, cross, source});
+        const auto combined = fixture.Emit(operation, {prefix, cross_write});
+        const auto final = fixture.Emit(ValueOpcode::SelectU32,
+            {test == Case::FinalExec ? mask : enabled, combined, prefix});
+        const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
+        const bool rows = test == Case::Wave32Rows || test == Case::ScalarExec ||
+                          test == Case::Wave32Maximum || test == Case::Wave32Or;
+        const auto endpoints = rows ? prefix : final;
+        uint32_t low_lane = butterfly ? 5u : (rows ? 15u : 31u);
+        uint32_t high_lane = butterfly ? (rows ? 24u : 40u) : (rows ? 31u : 63u);
+        if (test == Case::Endpoint) low_lane = butterfly ? 33u : 30u;
+        if (test == Case::SameHalf) low_lane = 32u;
+        if (test == Case::ShapeEndpoints) {
+          low_lane = butterfly ? 31u : 0u;
+          high_lane = butterfly ? 63u : 32u;
+        }
+        const auto low = fixture.Emit(ValueOpcode::ReadLane,
+            {endpoints, test == Case::DynamicEndpoint ? source : Value(low_lane)}, 0, result_block);
+        const auto high = fixture.Emit(ValueOpcode::ReadLane,
+            {test == Case::EndpointSource ? prefix : endpoints, Value(high_lane)}, 0, result_block);
+        const auto result = fixture.Emit(test == Case::MixedOperation ? other : selected.operation,
+            {high, low}, 0, result_block);
+        Value carried = result;
+        Value carry_out;
+        if (carry) {
+          carry_out = fixture.Emit(ValueOpcode::ULessThan32, {result, high}, 0, result_block);
+          carried = fixture.Emit(ValueOpcode::IAdd32, {result, Value(0u)}, 0, result_block);
+          if (test == Case::CarryLive) {
+            const auto bit = fixture.Emit(ValueOpcode::SelectU32,
+                {carry_out, Value(1u), Value(0u)}, 0, result_block);
+            fixture.Emit(ValueOpcode::ReferenceU32, {bit}, 0, result_block);
+          }
+        }
+        const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {carried}, 0, result_block);
+        using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+        fixture.BlockAt(result_block).terminator.kind = Terminator::Return;
+        if (result_block != 0) {
+          fixture.BlockAt().AddBranch(&fixture.BlockAt(1));
+          fixture.BlockAt().terminator.kind = Terminator::Branch;
+          fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
+        }
+        ValidateProgram(fixture.program);
+        const uint32_t wave_size = test == Case::Wave32 || rows ? 32u : 64u;
+        ConstantPropagationPass(fixture.program.blocks, wave_size);
+        const auto stats = EliminateReadLane(fixture.program, wave_size);
+        const bool matches = test == Case::Masked || test == Case::Or || rows || carry ||
+            test == Case::WrongNeutral || test == Case::Literal ||
+            (test == Case::ShapeEndpoints && butterfly);
+        const auto label = " (operation " + std::to_string(static_cast<unsigned>(selected.operation)) +
+            (butterfly ? ", row_xmask" : ", row_shr") + ", case " +
+            std::to_string(static_cast<unsigned>(test)) + ")";
+        Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
+              ("wave reduction proof failed" + label).c_str());
+        if (matches) {
+          const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
+          Check(reduction->GetOpcode() == selected.reduction &&
+                    reduction->Arg(0).Resolve() == seed.Resolve(),
+                ("wave reduction changed its input" + label).c_str());
+          if (test == Case::CarryLive) {
+            Check(carry_out.Instruction()->Arg(0).ResolveInstruction() == reduction &&
+                      carry_out.Instruction()->Arg(1).Resolve() == high.Resolve(),
+                  "wave reduction changed the carry comparison");
+          }
+          RemoveIdentities(fixture.program);
+          EliminateDeadCode(fixture.program.blocks);
+          uint32_t updates = 0, reads = 0, crosses = 0;
+          for (const auto &inst: fixture.BlockAt()) {
+            updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
+            reads += inst.GetOpcode() == ValueOpcode::ReadLane;
+            crosses += inst.GetOpcode() == ValueOpcode::Permlane16U32;
+          }
+          const bool live = test == Case::CarryLive;
+          Check(updates == (live ? 4u : 2u) && reads == (live ? 1u : 0u) &&
+                    crosses == (live ? 1u : 0u) &&
+                    preserved.Instruction()->Arg(0).Instruction()->HasUses(),
+                ("wave reduction destroyed a live prefix/carry or retained dead operations" + label).c_str());
+          ValidateProgram(fixture.program);
+        } else {
+          Check(use.Instruction()->Arg(0).Resolve() == result.Resolve(),
+                ("rejected wave reduction proof changed its result" + label).c_str());
+        }
       }
-      const auto move = fixture.Emit(ValueOpcode::DppMoveU32,
-          {test == Case::DppSource ? source : prefix,
-           test == Case::MoveExec ? mask : test == Case::LiteralMove ? Value(true) : enabled});
-      move.Instruction()->SetFlags(flags);
-      const auto combined = fixture.Emit(step_operation, {move, prefix});
-      const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
-          {combined, test == Case::Previous ? source : prefix,
-           test == Case::UpdateExec ? mask : enabled});
-      update.Instruction()->SetFlags(flags);
-      prefix = update;
-      if (shift == 2) preserved = fixture.Emit(ValueOpcode::ReferenceU32, {prefix});
     }
-    auto cross_exec = test == Case::CrossExec ? mask : enabled;
-    if (test == Case::DifferentWitness) {
-      const auto other_not = fixture.Emit(ValueOpcode::LogicalNot, {other_mask});
-      cross_exec = fixture.Emit(ValueOpcode::LogicalOr, {other_mask, other_not});
-    }
-    const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
-        {test == Case::CrossSource ? source : prefix,
-         Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
-         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec});
-    cross.Instruction()->SetFlags(PermlaneFlags{
-        .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
-        .bound_control = test != Case::CrossBound});
-    const auto cross_write = fixture.Emit(ValueOpcode::SelectU32, {enabled, cross, source});
-    const auto combined = fixture.Emit(fold.operation, {prefix, cross_write});
-    const auto final = fixture.Emit(ValueOpcode::SelectU32,
-        {test == Case::FinalExec ? mask : enabled, combined, prefix});
-    const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
-    uint32_t low_lane = butterfly ? 5u : 31u;
-    uint32_t high_lane = butterfly ? 40u : 63u;
-    if (test == Case::Endpoint) low_lane = butterfly ? 33u : 30u;
-    if (test == Case::ShapeEndpoints) {
-      low_lane = butterfly ? 31u : 0u;
-      high_lane = butterfly ? 63u : 32u;
-    }
-    const auto low = fixture.Emit(ValueOpcode::ReadLane, {final, Value(low_lane)}, 0, result_block);
-    const auto high = fixture.Emit(ValueOpcode::ReadLane,
-        {test == Case::EndpointSource ? prefix : final, Value(high_lane)}, 0, result_block);
-    Value result;
-    Value carried;
-    if (carry) {
-      // V_ADD_CO_U32 as translated: an IAdd32 sum whose carry is a compare of it, then an add
-      // of the zero carry-in. The compare is one more use of the sum.
-      const auto sum = fixture.Emit(ValueOpcode::IAdd32, {high, low}, 0, result_block);
-      fixture.Emit(ValueOpcode::ULessThan32, {sum, high}, 0, result_block);
-      carried = fixture.Emit(ValueOpcode::IAdd32, {sum, Value(0u)}, 0, result_block);
-      result = carried;
-    } else {
-      result = fixture.Emit(fold.operation, {high, low}, 0, result_block);
-    }
-    const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
-    using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-    fixture.BlockAt(result_block).terminator.kind = Terminator::Return;
-    if (result_block != 0) {
-      fixture.BlockAt().AddBranch(&fixture.BlockAt(1));
-      fixture.BlockAt().terminator.kind = Terminator::Branch;
-      fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
-    }
-    ValidateProgram(fixture.program, true);
-    const auto stats = EliminateReadLane(fixture.program, test == Case::Wave32 ? 32u : 64u);
-    const bool matches = test == Case::Masked || test == Case::Subset ||
-        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove ||
-        test == Case::CarryAdd || (test == Case::ShapeEndpoints && butterfly);
-    const auto label = " (operation " + std::to_string(static_cast<unsigned>(fold.operation)) +
-                       (butterfly ? ", row_xmask" : ", row_shr") + ", case " +
-                       std::to_string(static_cast<unsigned>(test)) + ")";
-    Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
-          ("wave reduction proof failed" + label).c_str());
-    if (matches) {
-      const auto consumer = test == Case::CarryAdd ? carried : use;
-      const auto *reduction = consumer.Instruction()->Arg(0).ResolveInstruction();
-      Check(reduction->GetOpcode() == ValueOpcode::SubgroupReduceU32 &&
-                reduction->Flags<ValueOpcode>() == fold.operation &&
-                reduction->Arg(0).Resolve() == seed.Resolve(),
-            ("wave reduction changed the neutral-masked input" + label).c_str());
-      RemoveIdentities(fixture.program);
-      EliminateDeadCode(fixture.program.blocks);
-      uint32_t updates = 0;
-      for (const auto &inst : fixture.BlockAt()) {
-        updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
-        Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
-                  inst.GetOpcode() != ValueOpcode::Permlane16U32,
-              ("wave reduction retained unused endpoint or cross-row operations" + label).c_str());
-      }
-      Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
-            ("wave reduction destroyed an independently consumed prefix or kept its dead suffix" + label).c_str());
-      ValidateProgram(fixture.program, true);
-    } else {
-      Check(use.Instruction()->Arg(0).Resolve() == result,
-            ("rejected wave reduction proof changed its original result" + label).c_str());
-    }
-  }
-  }
   }
 }
 
@@ -841,7 +928,7 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
 
   Check(entry_info.condition == Value(true),
         "folded branch condition did not survive identity removal");
-  ValidateProgram(fixture.program, true);
+  ValidateProgram(fixture.program);
 }
 
 void TestDeadPhiCyclesAndPlanningRoots() {
@@ -918,10 +1005,12 @@ int main() {
     TestCarryAndBitFields();
     TestInvariantAndDivergentPhi();
     TestOperandMutationLifecycle();
+    TestReplacementKeepsUseOrder();
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
     TestFloatComparisonDescriptorInputs();
+    TestSignedConversionDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();

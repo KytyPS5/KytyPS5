@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -27,6 +28,7 @@ struct IndirectDrawRegisters {
 	uint32_t vertex_offset;
 	uint32_t instance_offset;
 	uint32_t index_offset;
+	uint32_t draw_index;
 };
 
 class Pm4Execution {
@@ -91,12 +93,14 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void WaitForRewind(bool valid);
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,

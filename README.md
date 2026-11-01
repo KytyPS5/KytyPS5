@@ -23,11 +23,8 @@ can change significantly between builds.
 
 ## Current Status
 
-KytyPS5 can boot 2D and 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
-planned.
-
 Development is currently focused on expanding game compatibility and improving boot reliability.
+External low-level emulation modules are neither required nor planned.
 
 Windows and Linux are the primary target platforms and receive the most testing.
 
@@ -89,6 +86,13 @@ or graphical glitches, so please include the version you tested when reporting a
 </table>
 
 <p align="center"><em>And many more...</em></p>
+
+## Notable Forks
+
+These community forks bring KytyPS5 to other platforms.
+
+- [Cosmo/KytyPS5](https://github.com/Cosmo/KytyPS5) — Xbox Series X: Direct3D 12 renderer, sleek
+  controller-first interface, and local multiplayer for up to four players.
 
 ## Contributing
 

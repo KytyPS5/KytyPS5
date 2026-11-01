@@ -12,6 +12,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -19,7 +20,7 @@ namespace {
 
 namespace IR = ShaderRecompiler::IR;
 
-// Smaller tables are cheap to materialize on each draw and are often transient.
+// Smaller tables are often written for one draw, so they enter on a second draw of a frame.
 constexpr uint64_t MinTableBytes = 64ull * 1024ull;
 constexpr uint32_t ElementMask   = (1u << IR::ImageHeapKindShift) - 1u;
 
@@ -42,6 +43,20 @@ void Widen(size_t& begin, size_t& end, size_t first, size_t last) {
 	const bool empty = begin == end;
 	begin            = empty ? first : std::min(begin, first);
 	end              = empty ? last : std::max(end, last);
+}
+
+// Probes at first + k * step whose first dword lies within a table of size bytes.
+uint64_t Probes(uint64_t size, uint64_t first, uint64_t step) {
+	return size >= first + 4u ? (size - first - 4u) / step + 1u : 0u;
+}
+
+// Tables grow a little on most frames, so their slot words get room to double.
+std::unique_ptr<Buffer> SlotBuffer(RenderContext& context, uint64_t size) {
+	return std::make_unique<Buffer>(
+	    context.GetGraphics(), context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
+	        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	    std::bit_ceil(size + 4u));
 }
 
 // Guest bytes of a table that its tracker pages [begin, end) cover.
@@ -118,26 +133,25 @@ ImageHeap::~ImageHeap() {
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
 	const auto size = request.size & ~uint64_t {3};
-	if (size < MinTableBytes || request.count == 0u || request.step == 0u ||
+	if (request.count == 0u || request.step == 0u ||
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
 		return false;
 	}
-	auto memory = std::ranges::find_if(m_memories, [&](const auto& candidate) {
-		return candidate->base == request.base && candidate->size == size;
-	});
-	if (memory == m_memories.end()) {
+	auto memory = std::ranges::find_if(
+	    m_memories, [&](const auto& candidate) { return candidate->base == request.base; });
+	if (memory == m_memories.end() && size < MinTableBytes &&
+	    m_sightings.try_emplace(request.base, m_draw).first->second == m_draw) {
+		return false;
+	}
+	// A table follows its descriptor's size, as the first program of a draw acquires it.
+	if (memory == m_memories.end() || ((*memory)->size != size && (*memory)->draw != m_draw)) {
 		if (!m_context.IsMapped(request.base, size)) return false;
-		auto created   = std::make_unique<Memory>();
-		created->base  = request.base;
-		created->size  = size;
-		created->words.resize(size / 4u);
-		created->dead.resize(size / 4u);
-		created->dirty_pages.assign((Common::AlignUp(request.base + size, TRACKER_PAGE_SIZE) -
-		                             Common::AlignDown(request.base, TRACKER_PAGE_SIZE)) /
-		                                TRACKER_PAGE_SIZE,
-		                            uint8_t {1});
-		std::scoped_lock lock {m_mutex};
-		memory = m_memories.insert(m_memories.end(), std::move(created));
+		if (memory == m_memories.end()) {
+			std::scoped_lock lock {m_mutex};
+			memory = m_memories.insert(m_memories.end(),
+			                           std::make_unique<Memory>(Memory {.base = request.base}));
+		}
+		Resize(**memory, size);
 	}
 	// A draw refreshes a table and a view takes its changes once, so all programs of the draw see
 	// one snapshot and one set of kinds.
@@ -146,27 +160,28 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		(*memory)->draw = m_draw;
 	}
 	auto&      views   = (*memory)->views;
+	const auto bytes   = (*memory)->size;
 	const auto profile = IR::ImageHeapResource(*request.root, 0u);
+	const auto probes  = Probes(size, request.first, request.step);
+	const auto limit   = request.count < probes ? request.count : UINT64_MAX;
 	auto       view    = std::ranges::find_if(views, [&](const auto& candidate) {
 		return candidate->step == request.step && candidate->first == request.first &&
-		       candidate->count == request.count && candidate->profile == profile;
+		       candidate->limit == limit && candidate->profile == profile;
 	});
 	if (view == views.end()) {
 		const auto epoch   = Image::heap_epoch.load(std::memory_order_relaxed);
+		const auto count   = std::min(limit, Probes(bytes, request.first, request.step));
 		auto       created = std::make_unique<View>(View {.memory        = **memory,
 		                                                  .step          = request.step,
 		                                                  .first         = request.first,
-		                                                  .count         = request.count,
+		                                                  .count         = count,
+		                                                  .limit         = limit,
 		                                                  .profile       = profile,
 		                                                  .resolve_epoch = epoch,
 		                                                  .layout_epoch  = epoch});
-		created->slots.resize(size / 4u + 1u);
-		created->buffer = std::make_unique<Buffer>(
-		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
-		    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
-		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
-		    size + 4u);
-		UpdateProbes(*created, 0u, size);
+		created->slots.resize(bytes / 4u + 1u);
+		created->buffer = SlotBuffer(m_context, bytes);
+		UpdateProbes(*created, 0u, bytes);
 		// The first upload also clears the slots no probe selects.
 		created->dirty_begin = 0;
 		created->dirty_end   = created->slots.size();
@@ -254,10 +269,12 @@ void ImageHeap::Unwatch(const Memory& memory) {
 void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_mutex};
 	for (auto& memory: m_memories) {
-		const auto begin = std::max(address, memory->base);
-		const auto end   = std::min(address + size, memory->base + memory->size);
-		if (begin >= end) continue;
+		// Watches cover whole pages, so a write next to the table must unwatch its page too.
 		const auto origin = Common::AlignDown(memory->base, TRACKER_PAGE_SIZE);
+		const auto begin  = std::max(address, origin);
+		const auto end    = std::min(address + size,
+		                             origin + memory->dirty_pages.size() * TRACKER_PAGE_SIZE);
+		if (begin >= end) continue;
 		MarkDirty(*memory, (begin - origin) / TRACKER_PAGE_SIZE,
 		          (end - 1u - origin) / TRACKER_PAGE_SIZE + 1u);
 	}
@@ -381,15 +398,56 @@ uint32_t ImageHeap::Allocate() {
 }
 
 void ImageHeap::Retire(View& view) {
+	if (view.released.empty()) return;
+	// A retired index is reused once its tick ends, so no held entry may keep it.
+	std::erase_if(view.held, [&](uint32_t index) { return m_elements[index].refs == 0u; });
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
 	for (const auto index: view.released) m_retired.emplace_back(tick, index);
 	view.released.clear();
+}
+
+void ImageHeap::Resize(Memory& memory, uint64_t size) {
+	{
+		std::scoped_lock lock {m_mutex};
+		Unwatch(memory);
+		memory.size = size;
+		// The next refresh rereads the whole table.
+		memory.dirty_pages.assign((Common::AlignUp(memory.base + size, TRACKER_PAGE_SIZE) -
+		                           Common::AlignDown(memory.base, TRACKER_PAGE_SIZE)) /
+		                              TRACKER_PAGE_SIZE,
+		                          uint8_t {1});
+	}
+	memory.words.resize(size / 4u);
+	memory.dead.resize(size / 4u);
+	auto& scheduler = m_context.GetCommandScheduler();
+	for (auto& view: memory.views) {
+		const auto count = std::min(view->limit, Probes(size, view->first, view->step));
+		for (auto probe = count; probe < view->count; ++probe) {
+			Assign(*view, (view->first + probe * view->step) / 4u, 0u);
+		}
+		view->count       = count;
+		const auto slots  = view->slots.size();
+		view->slots.resize(size / 4u + 1u);
+		view->dirty_end   = std::min(view->dirty_end, view->slots.size());
+		view->dirty_begin = std::min(view->dirty_begin, view->dirty_end);
+		if (view->slots.size() * sizeof(uint32_t) > view->buffer->Size()) {
+			if (scheduler.Active()) {
+				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+			}
+			view->buffer = SlotBuffer(m_context, size);
+			Widen(view->dirty_begin, view->dirty_end, 0u, view->slots.size());
+		} else if (slots < view->slots.size()) {
+			// Device words past the old end may hold stale slots.
+			Widen(view->dirty_begin, view->dirty_end, slots, view->slots.size());
+		}
+	}
 }
 
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
 	auto&      textures = m_context.GetTextureCache();
 	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
+	const auto serial   = Image::serials.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
 		bool       stale = false;
 		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
@@ -418,6 +476,19 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			mark(index);
 			return true;
 		});
+		// Held elements retry once an image is created, such as a render target of their extent.
+		if (view->held_serial != serial) {
+			view->held_serial = serial;
+			std::erase_if(view->held, [&](uint32_t index) {
+				const auto& element = m_elements[index];
+				if (element.refs == 0u || element.stale) return true;
+				const auto binding = executor.ResolveTexture(
+				    IR::ImageHeapResource(view->profile, element.kind), element.value);
+				if (binding.image_id) mark(index);
+				// An unmapped texture stays null.
+				return binding.image_id || binding.desc.info.data.Empty();
+			});
+		}
 		if (stale) {
 			// A changed image needs a new element; pending draws still read the old one. The new
 			// element keeps the old value, since a view takes table changes only when acquired.
@@ -446,6 +517,8 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 					view->dcc.push_back(index);
 				}
 				view->away.push_back(index);
+			} else if (!binding.desc.info.data.Empty()) {
+				view->held.push_back(index);
 			}
 			m_elements[index].binding = std::move(binding);
 			m_writes.push_back(index);
@@ -524,26 +597,42 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	} else {
 		m_unmapped.push_back({address, size});
 	}
-	auto&           scheduler = m_context.GetCommandScheduler();
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
 		if (address >= memory->base + memory->size || memory->base >= address + size) {
 			return false;
 		}
-		Unwatch(*memory);
-		for (auto& view: memory->views) {
-			std::erase(m_active, view.get());
-			for (const auto& [value, index]: view->elements) {
-				Unreference(m_elements[index]);
-				view->released.push_back(index);
-			}
-			Retire(*view);
-			if (scheduler.Active()) {
-				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
-			}
-		}
+		Drop(*memory);
 		return true;
 	});
+}
+
+void ImageHeap::RunGarbageCollector() {
+	// A smaller table rebuilt each frame moves to a new base. Larger ones keep their dead words.
+	std::scoped_lock lock {m_mutex};
+	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
+		if (memory->size >= MinTableBytes || memory->draw > m_suspend_draw) return false;
+		Drop(*memory);
+		return true;
+	});
+	m_suspend_draw = m_draw;
+	m_sightings.clear();
+}
+
+void ImageHeap::Drop(Memory& memory) {
+	auto& scheduler = m_context.GetCommandScheduler();
+	Unwatch(memory);
+	for (auto& view: memory.views) {
+		std::erase(m_active, view.get());
+		for (const auto& [value, index]: view->elements) {
+			Unreference(m_elements[index]);
+			view->released.push_back(index);
+		}
+		Retire(*view);
+		if (scheduler.Active()) {
+			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+		}
+	}
 }
 
 } // namespace Libs::Graphics

@@ -173,7 +173,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 		state.builder.AddFunction(spv::OpLoad, scalar_type, raw, pointer);
 	}
 
-	if (kind == VertexInputScalarKind::Uint) {
+	if (kind == Format::ComponentType::Uint) {
 		return raw;
 	}
 

@@ -9,7 +9,9 @@ namespace Loader {
 
 using AddContentEntry = Common::AddContentEntry;
 
-void AddContentLoad(const std::filesystem::path& dir, const std::string& title_id);
+// User entries replace detected packages with the same label.
+void AddContentLoad(const std::filesystem::path& dir, const std::vector<AddContentEntry>& user,
+                    const std::string& title_id);
 const std::vector<AddContentEntry>& AddContentGetAll();
 const AddContentEntry*              AddContentFind(const char* label, size_t label_size);
 

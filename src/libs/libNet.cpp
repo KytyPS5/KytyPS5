@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "kernel/eventQueue.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -20,6 +21,9 @@ namespace Libs {
 
 namespace LibNpEntitlementAccess {
 void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase* s);
+}
+namespace LibNpEntitlementAccessPft {
+void InitNet_1_NpEntitlementAccessPft(Loader::SymbolDatabase* s);
 }
 namespace LibNpTrophy2 {
 void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
@@ -133,6 +137,13 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
 }
 
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      Net::NetResolverInfo* info, int timeout,
+                                                      int retry, int flags) {
+	return FinishNetCall(
+	    Net::NetResolverStartNtoaMultipleRecords(rid, hostname, info, timeout, retry, flags));
+}
+
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
 	return FinishNetCall(Net::NetInetPton(af, src, dst));
 }
@@ -239,6 +250,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
+	LIB_FUNC("RCCY01Xd+58", LibNet::NetResolverStartNtoaMultipleRecords);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);
@@ -759,6 +771,8 @@ namespace LibHttp2 {
 
 LIB_VERSION("Http2", 1, "Http2", 1, 1);
 
+namespace EventQueue = LibKernel::EventQueue;
+
 constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
 constexpr int HTTP2_ERROR_BEFORE_SEND  = -2122641307; /* 0x817B1065 */
 constexpr int HTTP2_ERROR_TIMEOUT      = -2122641304; /* 0x817B1068 */
@@ -819,6 +833,16 @@ struct Http2AsyncResult {
 	uint8_t padding[4];
 	void*   reserved;
 };
+
+struct Http2TriggerUserEventArgs {
+	EventQueue::KernelEqueue eq;
+	int                      uniq_id;
+	uint8_t                  padding[4];
+	void*                    udata;
+	void*                    reserved;
+};
+
+static_assert(sizeof(Http2TriggerUserEventArgs) == 32);
 
 static int g_http2_next_context_id  = 1;
 static int g_http2_next_template_id = 1;
@@ -1227,8 +1251,17 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 	return request->second.send_result;
 }
 
+// Async operations complete at once; the caller's event queue gets the completion event.
+static void Http2TriggerUserEvent(const Http2TriggerUserEventArgs* kqueue_option) {
+	if (kqueue_option != nullptr) {
+		EventQueue::KernelTriggerUserEvent(kqueue_option->eq, kqueue_option->uniq_id,
+		                                   kqueue_option->udata);
+	}
+}
+
 static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
-                                               void* /*kqueue_option*/, void* /*option*/) {
+                                               const Http2TriggerUserEventArgs* kqueue_option,
+                                               void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1247,6 +1280,7 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
 	request->second.async_result = request->second.send_result;
 	request->second.async_event  = 0;
+	Http2TriggerUserEvent(kqueue_option);
 
 	return 0;
 }
@@ -1396,7 +1430,8 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 }
 
 static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
-                                            void* /*kqueue_option*/, void* /*option*/) {
+                                            const Http2TriggerUserEventArgs* kqueue_option,
+                                            void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1415,22 +1450,22 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		request->second.async_result = send_result;
-		request->second.async_event  = 1;
-		return 0;
+	} else {
+		const auto& body      = request->second.response_body;
+		const auto  remaining = request->second.read_offset < body.size()
+		                            ? body.size() - request->second.read_offset
+		                            : 0;
+		const auto  to_copy   = size < remaining ? size : remaining;
+
+		if (to_copy != 0) {
+			std::memcpy(data, body.data() + request->second.read_offset, to_copy);
+			request->second.read_offset += to_copy;
+		}
+
+		request->second.async_result = static_cast<int>(to_copy);
 	}
-
-	const auto& body = request->second.response_body;
-	const auto  remaining =
-	    request->second.read_offset < body.size() ? body.size() - request->second.read_offset : 0;
-	const auto to_copy = size < remaining ? size : remaining;
-
-	if (to_copy != 0) {
-		std::memcpy(data, body.data() + request->second.read_offset, to_copy);
-		request->second.read_offset += to_copy;
-	}
-
-	request->second.async_result = static_cast<int>(to_copy);
-	request->second.async_event  = 1;
+	request->second.async_event = 1;
+	Http2TriggerUserEvent(kqueue_option);
 
 	return 0;
 }
@@ -1639,6 +1674,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("p-o74CnoNzY", NpManager::NpGetNpId);
 	LIB_FUNC("XDncXQIJUSk", NpManager::NpGetOnlineId);
 	LIB_FUNC("rbknaUjpqWo", NpManager::NpGetAccountIdA);
+	LIB_FUNC("VgYczPGB5ss", NpManager::NpGetUserIdByAccountId);
 	LIB_FUNC("JT+t00a3TxA", NpManager::NpGetAccountCountryA);
 	LIB_FUNC("+4DegjBqV1g", NpManager::NpGetAccountAge);
 	LIB_FUNC("3Tcz5bNCfZQ", NpManager::NpGetAccountLanguage2);
@@ -1682,11 +1718,33 @@ LIB_VERSION("NpAuth", 1, "NpAuth", 1, 1);
 constexpr int NP_AUTH_MAX_REQUEST_NUM         = 16;
 constexpr int NP_AUTH_REQUEST_ID_OFFSET       = 0x10000000;
 constexpr int NP_AUTH_ERROR_INVALID_ARGUMENT  = -2141912319; /* 0x80550301 */
+constexpr int NP_AUTH_ERROR_INVALID_SIZE      = -2141912318; /* 0x80550302 */
 constexpr int NP_AUTH_ERROR_ABORTED           = -2141912316; /* 0x80550304 */
 constexpr int NP_AUTH_ERROR_REQUEST_MAX       = -2141912315; /* 0x80550305 */
 constexpr int NP_AUTH_ERROR_REQUEST_NOT_FOUND = -2141912314; /* 0x80550306 */
 constexpr int NP_AUTH_ERROR_INVALID_ID        = -2141912313; /* 0x80550307 */
+constexpr int NP_AUTH_ERROR_SERVICE_DOWN      = -2141912063; /* 0x80550401 */
 constexpr int NP_ERROR_SIGNED_OUT             = -2141913082; /* 0x80550006 */
+
+struct NpAuthGetAuthorizationCodeParameterV3 {
+	size_t      size;
+	int         user_id;
+	uint8_t     padding[4];
+	const void* client_id;
+	const char* scope;
+};
+
+struct NpAuthGetIdTokenParameterV3 {
+	size_t      size;
+	int         user_id;
+	uint8_t     padding[4];
+	const void* client_id;
+	const void* client_secret;
+	const char* scope;
+};
+
+static_assert(sizeof(NpAuthGetAuthorizationCodeParameterV3) == 32);
+static_assert(sizeof(NpAuthGetIdTokenParameterV3) == 40);
 
 enum class NpAuthRequestState {
 	None = 0,
@@ -1819,7 +1877,7 @@ static int np_auth_wait_or_poll_async(int req_id, int* result) {
 	return 0;
 }
 
-static int np_auth_complete_signed_out(NpAuthRequest* request) {
+static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 	if (request->state == NpAuthRequestState::Complete) {
 		request->result = NP_AUTH_ERROR_INVALID_ARGUMENT;
 		return NP_AUTH_ERROR_INVALID_ARGUMENT;
@@ -1830,9 +1888,11 @@ static int np_auth_complete_signed_out(NpAuthRequest* request) {
 	}
 
 	request->state  = NpAuthRequestState::Complete;
-	request->result = NP_ERROR_SIGNED_OUT;
+	// Emulating sign-in cannot provide a real authorization code or ID token.
+	request->result = Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN
+	                                                        : NP_ERROR_SIGNED_OUT;
 
-	return request->async ? 0 : NP_ERROR_SIGNED_OUT;
+	return request->async ? 0 : request->result;
 }
 
 static int KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
@@ -1853,8 +1913,9 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* param,
-                                                      void* auth_code, int* issuer_id) {
+static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
+    int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
+    int* issuer_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1862,9 +1923,17 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 	LOGF("\t auth_code = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(auth_code));
 	LOGF("\t issuer_id = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(issuer_id));
 
-	if (auth_code != nullptr) {
-		memset(auth_code, 0, 136);
+	if (req_id <= 0 || param == nullptr || auth_code == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
 	}
+	if (param->size < sizeof(*param)) {
+		return NP_AUTH_ERROR_INVALID_SIZE;
+	}
+	if (param->client_id == nullptr || param->scope == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(auth_code, 0, 136);
 	if (issuer_id != nullptr) {
 		*issuer_id = 0;
 	}
@@ -1874,46 +1943,35 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 	if (request == nullptr) {
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
-	if (request->state == NpAuthRequestState::Aborted) {
-		// request->result = 0;
-		// return 0;
-		request->result = NP_AUTH_ERROR_ABORTED;
-		return NP_AUTH_ERROR_ABORTED;
-	}
-	// request->state  = NpAuthRequestState::Complete;
-	// request->result = 0;
-
-	// return 0;
-	return np_auth_complete_signed_out(request);
+	return np_auth_complete_unavailable(request, param->user_id);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void* id_token) {
+static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
+                                        void* id_token) {
 	PRINT_NAME();
 
 	LOGF("\t req_id   = %d\n", req_id);
 	LOGF("\t param    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 	LOGF("\t id_token = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(id_token));
 
-	if (id_token != nullptr) {
-		memset(id_token, 0, 4104);
+	if (req_id <= 0 || param == nullptr || id_token == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
 	}
+	if (param->size < sizeof(*param)) {
+		return NP_AUTH_ERROR_INVALID_SIZE;
+	}
+	if (param->client_id == nullptr || param->client_secret == nullptr || param->scope == nullptr) {
+		return NP_AUTH_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(id_token, 0, 4104);
 
 	std::scoped_lock lock(g_np_auth_request_mutex);
 	auto*            request = np_auth_find_request(req_id);
 	if (request == nullptr) {
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
-	if (request->state == NpAuthRequestState::Aborted) {
-		// request->result = 0;
-		// return 0;
-		request->result = NP_AUTH_ERROR_ABORTED;
-		return NP_AUTH_ERROR_ABORTED;
-	}
-	// request->state  = NpAuthRequestState::Complete;
-	// request->result = 0;
-
-	// return 0;
-	return np_auth_complete_signed_out(request);
+	return np_auth_complete_unavailable(request, param->user_id);
 }
 
 LIB_DEFINE(InitNet_1_NpAuth) {
@@ -2344,6 +2402,25 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	return callback_id++;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filter_id) {
+	PRINT_NAME();
+
+	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
+	LOGF("\t filter_id  = %d\n", filter_id);
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
+                                                              int callback_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_context_id = %d\n", user_context_id);
+	LOGF("\t callback_id     = %d\n", callback_id);
+
+	return 0;
+}
+
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
 	// Timeout processing is an internal maintenance tick in Prospero. Requests
 	// complete synchronously in this implementation, so there is no pending
@@ -2380,6 +2457,8 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("QafxeZM3WK4", LibNpWebApi2::NpWebApi2PushEventDeletePushContext);
 	LIB_FUNC("MsaFhR+lPE4", LibNpWebApi2::NpWebApi2PushEventCreateFilter);
 	LIB_FUNC("fY3QqeNkF8k", LibNpWebApi2::NpWebApi2PushEventRegisterCallback);
+	LIB_FUNC("KJdPcOGmK58", LibNpWebApi2::NpWebApi2PushEventDeleteFilter);
+	LIB_FUNC("hOnIlcGrO6g", LibNpWebApi2::NpWebApi2PushEventUnregisterCallback);
 	LIB_FUNC("3Tt9zL3tkoc", LibNpWebApi2::NpWebApi2CheckTimeout);
 	LIB_FUNC("bEvXpcEk200", LibNpWebApi2::NpWebApi2Terminate);
 }
@@ -2846,6 +2925,7 @@ LIB_DEFINE(InitNet_1) {
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
+	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);
 	LibNpAuth::InitNet_1_NpAuth(s);
 	LibNpTrophy2::InitNet_1_NpTrophy2(s);
 	LibNpUniversalDataSystem::InitNet_1_NpUniversalDataSystem(s);

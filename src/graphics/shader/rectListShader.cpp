@@ -20,8 +20,9 @@ constexpr uint32_t SpirvVersion15 = 0x00010500u;
 
 class RectListEmitter {
 public:
-	RectListEmitter(const std::vector<RectListParameter>& parameters_, spv::ExecutionModel model)
-	    : parameters(parameters_) {
+	RectListEmitter(const std::vector<RectListParameter>& parameters_, uint32_t clip_distances,
+	                spv::ExecutionModel model)
+	    : parameters(parameters_), clip_distance_count(clip_distances) {
 		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
 		void_type       = builder.Type(spv::OpTypeVoid);
@@ -31,22 +32,32 @@ public:
 		vec4_float_type = builder.Type(spv::OpTypeVector, float_type, 4u);
 		function_type   = builder.Type(spv::OpTypeFunction, void_type);
 
-		per_vertex_type = builder.DecoratedType(
-		    spv::OpTypeStruct,
-		    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
-		     {spv::OpDecorate, {spv::DecorationBlock}}},
-		    vec4_float_type);
+		// gl_PerVertex: the position, then the clip distances (the vertex shader's block).
+		if (clip_distance_count == 0) {
+			per_vertex_type = builder.DecoratedType(
+			    spv::OpTypeStruct,
+			    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+			     {spv::OpDecorate, {spv::DecorationBlock}}},
+			    vec4_float_type);
+		} else {
+			per_vertex_type = builder.DecoratedType(
+			    spv::OpTypeStruct,
+			    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+			     {spv::OpMemberDecorate, {1u, spv::DecorationBuiltIn, spv::BuiltInClipDistance}},
+			     {spv::OpDecorate, {spv::DecorationBlock}}},
+			    vec4_float_type, Array(float_type, clip_distance_count));
+		}
 
 		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
 		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
+		ptr_input_float       = Pointer(spv::StorageClassInput, float_type);
+		ptr_output_float      = Pointer(spv::StorageClassOutput, float_type);
 		if (model == spv::ExecutionModelTessellationControl) {
-			bool_type        = builder.Type(spv::OpTypeBool);
-			vec2_bool_type   = builder.Type(spv::OpTypeVector, bool_type, 2u);
-			vec2_float_type  = builder.Type(spv::OpTypeVector, float_type, 2u);
-			ptr_output_float = Pointer(spv::StorageClassOutput, float_type);
+			bool_type       = builder.Type(spv::OpTypeBool);
+			vec2_bool_type  = builder.Type(spv::OpTypeVector, bool_type, 2u);
+			vec2_float_type = builder.Type(spv::OpTypeVector, float_type, 2u);
 		} else {
 			vec3_float_type = builder.Type(spv::OpTypeVector, float_type, 3u);
-			ptr_input_float = Pointer(spv::StorageClassInput, float_type);
 		}
 	}
 
@@ -107,6 +118,20 @@ public:
 		           Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0))));
 		Store(Access(ptr_output_vec4_float, gl_out, invocation, Int(0)), position);
 
+		// The fourth corner's distances are extrapolated like its position.
+		for (uint32_t c = 0; c < clip_distance_count; c++) {
+			std::array<uint32_t, 3> values {};
+			for (uint32_t i = 0; i < values.size(); i++) {
+				values[i] =
+				    Load(float_type, Access(ptr_input_float, gl_in, Int(i), Int(1), Int(c)));
+			}
+			const auto fourth = InterpolateScalar(values, barycentric);
+			const auto value =
+			    Result(spv::OpSelect, float_type, is_fourth, fourth,
+			           Load(float_type, Access(ptr_input_float, gl_in, index, Int(1), Int(c))));
+			Store(Access(ptr_output_float, gl_out, invocation, Int(1), Int(c)), value);
+		}
+
 		for (uint32_t i = 0; i < parameters.size(); i++) {
 			const auto input0 =
 			    Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], Int(0)));
@@ -143,6 +168,10 @@ public:
 		const auto position =
 		    Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0)));
 		Store(Access(ptr_output_vec4_float, gl_out, Int(0)), position);
+		for (uint32_t c = 0; c < clip_distance_count; c++) {
+			Store(Access(ptr_output_float, gl_out, Int(1), Int(c)),
+			      Load(float_type, Access(ptr_input_float, gl_in, index, Int(1), Int(c))));
+		}
 		for (uint32_t i = 0; i < parameters.size(); i++) {
 			Store(outputs[i],
 			      Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
@@ -206,6 +235,9 @@ private:
 	void DefineEntry(spv::ExecutionModel model) {
 		builder.RequireCapability(spv::CapabilityShader);
 		builder.RequireCapability(spv::CapabilityTessellation);
+		if (clip_distance_count != 0) {
+			builder.RequireCapability(spv::CapabilityClipDistance);
+		}
 		main = Result(spv::OpFunction, void_type, spv::FunctionControlMaskNone, function_type);
 		if (model == spv::ExecutionModelTessellationControl) {
 			builder.AddExecutionMode(main, spv::ExecutionModeOutputVertices, 4u);
@@ -279,8 +311,17 @@ private:
 		              Result(spv::OpFAdd, vec4_float_type, p1, p2));
 	}
 
+	uint32_t InterpolateScalar(const std::array<uint32_t, 3>& values,
+	                           const std::array<uint32_t, 3>& barycentric) {
+		const auto p0 = Result(spv::OpFMul, float_type, values[0], barycentric[0]);
+		const auto p1 = Result(spv::OpFMul, float_type, values[1], barycentric[1]);
+		const auto p2 = Result(spv::OpFMul, float_type, values[2], barycentric[2]);
+		return Result(spv::OpFAdd, float_type, p0, Result(spv::OpFAdd, float_type, p1, p2));
+	}
+
 	Builder                               builder {SpirvVersion15};
 	const std::vector<RectListParameter>& parameters;
+	uint32_t                              clip_distance_count = 0;
 	std::vector<uint32_t>                 interfaces;
 	std::vector<uint32_t>                 inputs;
 	std::vector<uint32_t>                 outputs;
@@ -328,8 +369,14 @@ std::vector<RectListParameter> RectListParameters(
 	return parameters;
 }
 
+uint32_t RectListClipDistances(const ShaderRecompiler::IR::CompiledShaderInfo& vertex) {
+	const auto distances =
+	    ShaderRecompiler::IR::CountOutputDistances(vertex.stage, vertex.info.outputs);
+	return distances.position ? distances.clip : 0u;
+}
+
 RectListShaders BuildRectListShaders(std::span<const RectListParameter> parameters,
-                                     uint32_t                           param_export_mask) {
+                                     uint32_t param_export_mask, uint32_t clip_distances) {
 	std::vector<RectListParameter> exported;
 	std::array<bool, 32>           output_locations {};
 	for (const auto& parameter: parameters) {
@@ -339,8 +386,8 @@ RectListShaders BuildRectListShaders(std::span<const RectListParameter> paramete
 			output_locations[parameter.output_location] = true;
 		}
 	}
-	RectListEmitter control(exported, spv::ExecutionModelTessellationControl);
-	RectListEmitter evaluation(exported, spv::ExecutionModelTessellationEvaluation);
+	RectListEmitter control(exported, clip_distances, spv::ExecutionModelTessellationControl);
+	RectListEmitter evaluation(exported, clip_distances, spv::ExecutionModelTessellationEvaluation);
 	return {control.EmitControl(), evaluation.EmitEvaluation()};
 }
 

@@ -2013,7 +2013,14 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	PRINT_NAME();
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-	return UnmapMemory(vaddr, len);
+	constexpr uint64_t page_size = 0x4000;
+	const auto         length    = static_cast<uint64_t>(len);
+	if (length == 0 || (vaddr & (page_size - 1u)) != 0 ||
+	    length > UINT64_MAX - (page_size - 1u)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	const auto unmap_size = (length + page_size - 1u) & ~(page_size - 1u);
+	return UnmapMemory(vaddr, static_cast<size_t>(unmap_size));
 }
 
 static bool IsAmmMemoryRange(uint64_t vaddr, size_t size) {

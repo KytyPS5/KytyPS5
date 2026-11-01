@@ -25,6 +25,8 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <new>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -59,6 +61,41 @@ using InitEnvParams = Loader::EntryParams;
 static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
 static const char* const* g_envp = nullptr;
+static std::mutex g_environment_mutex;
+static std::unordered_map<std::string, std::string> g_environment;
+
+static void InitializeEnvironment(const char* const* envp) {
+	std::lock_guard lock(g_environment_mutex);
+	g_environment.clear();
+	for (const char* const* entry = envp; entry != nullptr && *entry != nullptr; ++entry) {
+		const std::string variable(*entry);
+		const auto equals = variable.find('=');
+		if (equals != std::string::npos && equals != 0) {
+			g_environment.try_emplace(variable.substr(0, equals), variable.substr(equals + 1));
+		}
+	}
+}
+
+static char* GetGuestEnvironmentVariable(const char* name) {
+	if (name == nullptr || name[0] == '\0' || std::strchr(name, '=') != nullptr) {
+		return nullptr;
+	}
+
+	std::lock_guard lock(g_environment_mutex);
+	const auto variable = g_environment.find(name);
+	return variable == g_environment.end() ? nullptr : const_cast<char*>(variable->second.c_str());
+}
+
+static int SetGuestEnvironmentVariable(const char* name, const char* value, int overwrite) {
+	std::lock_guard lock(g_environment_mutex);
+	auto variable = g_environment.find(name);
+	if (variable == g_environment.end()) {
+		g_environment.emplace(name, value);
+	} else if (overwrite != 0) {
+		variable->second = value;
+	}
+	return 0;
+}
 
 int GetArgc() {
 	return g_argc;
@@ -264,6 +301,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 		g_argc = 0;
 		g_argv = nullptr;
 		g_envp = nullptr;
+		InitializeEnvironment(nullptr);
 		return;
 	}
 
@@ -272,6 +310,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 	g_argc = params->argc;
 	g_argv = params->argv;
 	g_envp = params->argv + params->argc + 1;
+	InitializeEnvironment(g_envp);
 
 	LOGF("\t argc = %d\n"
 	     "\t argv = 0x%016" PRIx64 "\n"
@@ -321,8 +360,13 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 		return -1;
 	}
 
-	// Guest environment changes must not leak into emulator host libraries.
-	return 0;
+	// Keep guest changes separate from the emulator process environment.
+	try {
+		return SetGuestEnvironmentVariable(name, value, overwrite);
+	} catch (const std::bad_alloc&) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		return -1;
+	}
 }
 
 static KYTY_SYSV_ABI int64_t libc_time(int64_t* timer) {
@@ -613,6 +657,10 @@ LIB_VERSION("LibcInternal", 1, "LibcInternal", 1, 1);
 
 static uint32_t g_need_flag = 1;
 
+char* KYTY_SYSV_ABI getenv(const char* name) {
+	return LibC::GetGuestEnvironmentVariable(name);
+}
+
 int KYTY_SYSV_ABI vprintf(const char* str, VaList* c) {
 	PRINT_NAME();
 
@@ -766,6 +814,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_OBJECT("2sWzhYqFH4E", stdout);
 
 	LIB_FUNC("GMpvxPFW924", LibcInternal::vprintf);
+	LIB_FUNC("smbQukfxYJM", LibcInternal::getenv);
 	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);
 	LIB_FUNC("8zTFvBIAIN8", LibcInternal::memset);
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);

@@ -226,6 +226,32 @@ struct ImageTestAccess {
 };
 
 struct TileManagerTestAccess {
+  struct RegionRecordSummary {
+    uint32_t total = 0;
+    uint32_t window_start = 0;
+    uint32_t window_len = 0;
+    std::vector<uint32_t> texels;
+    std::vector<std::array<uint32_t, 3>> origins;
+  };
+  static RegionRecordSummary RegionRecords(const ImageInfo &info,
+                                           std::span<const RefreshRegion> regions,
+                                           uint64_t lo, uint64_t hi,
+                                           uint64_t source_base) {
+    const TileManager::RegionSource source{nullptr, source_base, lo, hi};
+    const auto params = TileManager::BuildRegionParams(
+        info, regions, source, source_base, 0, info.LinearSize());
+    RegionRecordSummary summary;
+    summary.total = params.num_texels;
+    summary.window_start = params.window_start;
+    summary.window_len = params.window_len;
+    for (size_t index = 0; index < regions.size(); ++index) {
+      summary.texels.push_back(params.mips[index].num_texels);
+      summary.origins.push_back(
+          {params.mips[index].x0, params.mips[index].y0, params.mips[index].z0});
+    }
+    return summary;
+  }
+
   static uint32_t ConversionRows(uint64_t offset, uint64_t row_stride,
                                  uint64_t active, uint32_t remaining,
                                  uint64_t alignment, uint64_t max_range,
@@ -21573,6 +21599,357 @@ public:
     return pixel;
   }
 
+  // Region detile checks. A fixture is an image whose tiled bytes hold a hash of their own
+  // address, so the reference result of any region and window follows from the tile tables alone.
+  static constexpr uint8_t kRegionSentinel = 0xcd;
+  static constexpr const char *kRegionName = "GpuTilerRegions";
+
+  struct RegionRig {
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    CommandScheduler scheduler;
+    StreamBuffer parameters;
+    TileManager tiler;
+    explicit RegionRig(VulkanHarness &harness)
+        : scheduler(harness.Renderer(), harness.m_runtime_context),
+          parameters(harness.m_runtime_context, scheduler, MemoryUsage::Stream, 1u << 20),
+          tiler(harness.m_runtime_context, scheduler, parameters) {
+      scheduler.Begin(registers, user_config, shaders);
+    }
+  };
+
+  struct RegionFixture {
+    ImageInfo info;
+    std::vector<uint8_t> pattern;
+  };
+
+  static uint8_t RegionPatternByte(uint64_t address) {
+    const auto value = static_cast<uint8_t>(address * 131u + (address >> 8) * 7u + 17u);
+    return value == kRegionSentinel ? static_cast<uint8_t>(value + 1) : value;
+  }
+
+  // A single level, tiled image of the given format, with its pattern.
+  static RegionFixture MakeRegionFixture(Prospero::BufferFormat guest, vk::Format pixel,
+                                         Prospero::TileMode tile, uint32_t width, uint32_t height,
+                                         uint32_t layers) {
+    RegionFixture fixture;
+    auto &info = fixture.info;
+    info.data.address = 0x10000000;
+    info.pixel_format = pixel;
+    info.guest_format = guest;
+    info.extent = {width, height, 1};
+    info.resources = {1, layers};
+    info.tile_mode = tile;
+    info.UpdateSize();
+    fixture.pattern.resize(info.data.size);
+    for (uint64_t address = 0; address < info.data.size; ++address)
+      fixture.pattern[address] = RegionPatternByte(address);
+    return fixture;
+  }
+
+  // Tile table reference for level 0, the way the tiler shader addresses a texel.
+  uint64_t RegionTexelAddress(const ImageInfo &info, uint32_t layer, uint32_t x, uint32_t y) {
+    const auto &block = info.tiling.block;
+    const auto &mip = info.mip_layout[0];
+    const uint64_t columns = (mip.pitch + block.block_width - 1u) / block.block_width;
+    uint32_t local = 0, block_xor = 0;
+    Require(kRegionName, "reference address",
+            TileGetBlockOffset(block, x % block.block_width, y % block.block_height, 0, local) &&
+                TileGetBlockXor(block, x / block.block_width, y / block.block_height,
+                                mip.surface_z + layer, block_xor),
+            "tile table lookup failed");
+    return mip.offset + uint64_t{layer} * info.tiled_slice_stride +
+           ((y / block.block_height) * columns + x / block.block_width) * block.block_size +
+           (local ^ block_xor);
+  }
+
+  static uint64_t RegionLinearOffset(const ImageInfo &info, uint32_t layer, uint32_t x,
+                                     uint32_t y) {
+    const auto &mip = info.mip_layout[0];
+    const uint64_t slice = info.linear_slice_stride != 0 ? info.linear_slice_stride : mip.linear_size;
+    return mip.linear_offset + layer * slice +
+           (uint64_t{y} * mip.linear_pitch + x) * info.tiling.block.bytes_per_element;
+  }
+
+  // The linear bytes a region detile must produce: the pattern for texels whose tiled bytes lie in
+  // [lo, hi), and the sentinel everywhere else. With a null region list every texel is expected.
+  std::vector<uint8_t> ExpectedRegionBytes(const RegionFixture &fixture,
+                                           const std::vector<RefreshRegion> &regions, uint64_t lo,
+                                           uint64_t hi) {
+    const auto &info = fixture.info;
+    const uint32_t element = info.tiling.block.bytes_per_element;
+    std::vector<uint8_t> bytes(info.LinearSize(), kRegionSentinel);
+    for (const auto &r : regions)
+      for (uint32_t y = r.y0; y < r.y0 + r.height; ++y)
+        for (uint32_t x = r.x0; x < r.x0 + r.width; ++x) {
+          const auto address = RegionTexelAddress(info, r.layer, x, y);
+          if (address < lo || address >= hi) continue;
+          for (uint32_t i = 0; i < element; ++i)
+            bytes[RegionLinearOffset(info, r.layer, x, y) + i] = fixture.pattern[address + i];
+        }
+    return bytes;
+  }
+
+  static std::vector<u32> RegionWords(const std::vector<uint8_t> &bytes, uint8_t fill) {
+    std::vector<u32> words((bytes.size() + 3) / 4, fill * 0x01010101u);
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    return words;
+  }
+
+  std::vector<uint8_t> ReadRegionBytes(const Buffer &buffer, uint64_t size) {
+    const auto words = ReadBuffer(kRegionName, buffer, (size + 3) / 4);
+    std::vector<uint8_t> bytes(size);
+    std::memcpy(bytes.data(), words.data(), size);
+    return bytes;
+  }
+
+  void RegionHostBarrier(RegionRig &rig, vk::Buffer buffer, uint64_t size) {
+    vk::BufferMemoryBarrier barrier{};
+    barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = buffer;
+    barrier.size = size;
+    rig.scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+  }
+
+  // Runs DetileRegions over a sentinel filled target. The window buffer holds the image bytes from
+  // lo on, starting source_offset bytes in, so bytes past hi are real data that only the mask
+  // keeps out of the result.
+  std::vector<uint8_t> RunRegionDetile(RegionRig &rig, const RegionFixture &fixture,
+                                       const std::vector<RefreshRegion> &regions, uint64_t lo,
+                                       uint64_t hi, uint64_t source_offset) {
+    const auto &info = fixture.info;
+    std::vector<uint8_t> source(source_offset, 0x7b);
+    source.insert(source.end(), fixture.pattern.begin() + lo, fixture.pattern.end());
+    auto input = CreateHostBuffer(kRegionName, source.size(), AllFlags, RegionWords(source, 0x7b));
+    const uint64_t size = Common::AlignUp<uint64_t>(info.LinearSize(), 4);
+    auto output = CreateHostBuffer(kRegionName, size, AllFlags,
+                                   RegionWords(std::vector<uint8_t>(size, kRegionSentinel), 0));
+    rig.tiler.DetileRegions({input.buffer, source_offset, lo, hi}, info, regions,
+                            {output.buffer, 0, size});
+    RegionHostBarrier(rig, output.buffer, size);
+    rig.scheduler.Finish();
+    auto result = ReadRegionBytes(output, info.LinearSize());
+    DestroyBuffer(&output);
+    DestroyBuffer(&input);
+    return result;
+  }
+
+  // Runs one region case and returns how many bytes of the target were written.
+  size_t ExpectRegionScratch(RegionRig &rig, const char *label, const RegionFixture &fixture,
+                             const std::vector<RefreshRegion> &regions, uint64_t lo, uint64_t hi,
+                             uint64_t source_offset) {
+    const auto scratch = RunRegionDetile(rig, fixture, regions, lo, hi, source_offset);
+    const auto expected = ExpectedRegionBytes(fixture, regions, lo, hi);
+    Require(kRegionName, label, scratch == expected,
+            "texels outside the regions or the window must keep the sentinel and the rest must "
+            "match the tile tables");
+    return std::count_if(expected.begin(), expected.end(),
+                         [](uint8_t byte) { return byte != kRegionSentinel; });
+  }
+
+  // The legacy full detile, checked on texel bytes only because padding is not defined.
+  void CheckFullDetileAndTile(RegionRig &rig, const char *label, const RegionFixture &fixture) {
+    const auto &info = fixture.info;
+    const RefreshRegion whole{0, 0, 0, 0, info.extent.width, info.extent.height};
+    const auto expected = ExpectedRegionBytes(fixture, {whole}, 0, info.data.size);
+    const uint64_t linear_size = Common::AlignUp<uint64_t>(info.LinearSize(), 4);
+    auto input = CreateHostBuffer(kRegionName, fixture.pattern.size(), AllFlags,
+                                  RegionWords(fixture.pattern, 0));
+    auto output = CreateHostBuffer(kRegionName, linear_size, AllFlags,
+                                   RegionWords(std::vector<uint8_t>(linear_size, 0), 0));
+    const auto detiled = rig.tiler.Detile(input.buffer, 0, info);
+    const vk::BufferCopy copy{detiled.offset, 0, linear_size};
+    rig.scheduler.Current().Handle().copyBuffer(detiled.buffer, output.buffer, 1, &copy);
+    RegionHostBarrier(rig, output.buffer, linear_size);
+    rig.scheduler.Finish();
+    const auto actual = ReadRegionBytes(output, info.LinearSize());
+    bool equal = true;
+    for (size_t i = 0; i < expected.size(); ++i) equal &= expected[i] == kRegionSentinel || expected[i] == actual[i];
+    Require(kRegionName, label, equal, "the legacy full detile differs from the tile tables");
+    DestroyBuffer(&output);
+    DestroyBuffer(&input);
+    CheckLegacyTile(rig, label, fixture, expected);
+  }
+
+  // The legacy tile direction: linear texels in, tiled bytes out, checked at the texel addresses.
+  void CheckLegacyTile(RegionRig &rig, const char *label, const RegionFixture &fixture,
+                       const std::vector<uint8_t> &linear) {
+    const auto &info = fixture.info;
+    const uint64_t linear_size = Common::AlignUp<uint64_t>(info.LinearSize(), 4);
+    const uint64_t tiled_size = Common::AlignUp<uint64_t>(info.data.size, 4);
+    auto input = CreateHostBuffer(kRegionName, linear_size, AllFlags, RegionWords(linear, 0));
+    auto output = CreateHostBuffer(kRegionName, tiled_size, AllFlags,
+                                   RegionWords(std::vector<uint8_t>(tiled_size, kRegionSentinel), 0));
+    rig.tiler.Tile(input.buffer, 0, linear_size, output.buffer, 0, tiled_size, info);
+    RegionHostBarrier(rig, output.buffer, tiled_size);
+    rig.scheduler.Finish();
+    const auto tiled = ReadRegionBytes(output, info.data.size);
+    const uint32_t element = info.tiling.block.bytes_per_element;
+    bool equal = true;
+    for (uint32_t y = 0; y < info.extent.height; ++y)
+      for (uint32_t x = 0; x < info.extent.width; ++x) {
+        const auto address = RegionTexelAddress(info, 0, x, y);
+        for (uint32_t i = 0; i < element; ++i)
+          equal &= tiled[address + i] == fixture.pattern[address + i];
+      }
+    Require(kRegionName, label, equal, "the legacy tile differs from the tile tables");
+    DestroyBuffer(&output);
+    DestroyBuffer(&input);
+  }
+
+  // Block 0 of a 256x256 R32 RenderTarget64KB image with a window that ends half way through it.
+  void CheckRegionMaskInBlock(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    CheckFullDetileAndTile(rig, "full detile baseline", fixture);
+    const auto written = ExpectRegionScratch(rig, "window mask inside a block", fixture,
+                                             {{0, 0, 0, 0, 128, 128}}, 0, 32 * 1024, 0);
+    Require(kRegionName, "window mask inside a block count", written == 32 * 1024,
+            "half of the block must have been written");
+  }
+
+  // A rect over the whole mip with a window narrower than it, which only writes the window.
+  void CheckRegionNarrowWindow(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    const auto written = ExpectRegionScratch(rig, "whole mip rect with a narrow window", fixture,
+                                             {{0, 0, 0, 0, 256, 256}}, 64 * 1024, 96 * 1024, 52);
+    Require(kRegionName, "narrow window count", written == 32 * 1024,
+            "only the window may have been written");
+  }
+
+  void CheckRegionOrigins(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    constexpr uint64_t block = 64 * 1024;
+    (void)ExpectRegionScratch(rig, "block at x0 = 128", fixture, {{0, 0, 128, 0, 128, 128}},
+                              block, 2 * block, 20);
+    (void)ExpectRegionScratch(rig, "block at y0 = 128", fixture, {{0, 0, 0, 128, 128, 128}},
+                              2 * block, 3 * block, 36);
+  }
+
+  // Four regions in one dispatch, then 32 strips that need two chunks.
+  void CheckRegionChunks(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    const std::vector<RefreshRegion> blocks{{0, 0, 0, 0, 128, 128},     {0, 0, 128, 0, 128, 128},
+                                            {0, 0, 0, 128, 128, 128}, {0, 0, 128, 128, 128, 128}};
+    (void)ExpectRegionScratch(rig, "four regions in one dispatch", fixture, blocks, 0,
+                              fixture.info.data.size, 0);
+    std::vector<RefreshRegion> strips;
+    for (uint32_t row = 0; row < 256; row += 8) strips.push_back({0, 0, 0, row, 256, 8});
+    Require(kRegionName, "strip count", strips.size() > 16, "the case needs more than one chunk");
+    (void)ExpectRegionScratch(rig, "more than one chunk of regions", fixture, strips, 0,
+                              fixture.info.data.size, 0);
+  }
+
+  void CheckRegionLayers(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kStandard64KB, 128, 128, 2);
+    (void)ExpectRegionScratch(rig, "layer region", fixture, {{0, 1, 0, 0, 128, 128}},
+                              fixture.info.tiled_slice_stride, fixture.info.data.size, 0);
+  }
+
+  // Every family and element size a partial refresh can reach, with the legacy directions too.
+  // A pair is unsupported when the tile tables have no layout for it.
+  void CheckRegionSweep(RegionRig &rig) {
+    struct Format {
+      Prospero::BufferFormat guest;
+      vk::Format pixel;
+    };
+    const std::array formats{Format{Prospero::BufferFormat::k8UNorm, vk::Format::eR8Unorm},
+                             Format{Prospero::BufferFormat::k16UInt, vk::Format::eR16Uint},
+                             Format{Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint},
+                             Format{Prospero::BufferFormat::k32_32UInt, vk::Format::eR32G32Uint},
+                             Format{Prospero::BufferFormat::k32_32_32_32UInt,
+                                    vk::Format::eR32G32B32A32Uint}};
+    const std::array tiles{Prospero::TileMode::kStandard256B, Prospero::TileMode::kStandard4KB,
+                           Prospero::TileMode::kStandard64KB, Prospero::TileMode::kPrt,
+                           Prospero::TileMode::kRenderTarget};
+    uint32_t covered = 0, unsupported = 0;
+    for (const auto tile : tiles)
+      for (const auto &format : formats) {
+        TileSurfaceLayout surface{};
+        if (!TileGetTiledTextureLayout({format.guest, tile, TileSurfaceDimension::Dim2D, 200, 150,
+                                        1, 1, 1}, surface)) {
+          ++unsupported;
+          continue;
+        }
+        CheckRegionPair(rig, MakeRegionFixture(format.guest, format.pixel, tile, 200, 150, 1));
+        ++covered;
+      }
+    // Every family a partial refresh can reach must build and run at every element size.
+    Require(kRegionName, "sweep coverage", covered == tiles.size() * formats.size(),
+            "a family and element size pair was skipped");
+    std::printf("[gpu]     %-32s %u pairs, %u unsupported\n", "GpuTilerRegionSweep", covered,
+                unsupported);
+  }
+
+  // A full region equals the legacy detile, and one partial region with a partial window matches
+  // the reference inside the window and the sentinel outside.
+  void CheckRegionPair(RegionRig &rig, const RegionFixture &fixture) {
+    const auto &info = fixture.info;
+    const std::string label = std::to_string(static_cast<uint32_t>(info.tile_mode)) + "/" +
+                              std::to_string(info.tiling.block.bytes_per_element);
+    CheckFullDetileAndTile(rig, ("legacy " + label).c_str(), fixture);
+    (void)ExpectRegionScratch(rig, ("full region " + label).c_str(), fixture,
+                              {{0, 0, 0, 0, info.extent.width, info.extent.height}}, 0,
+                              info.data.size, 0);
+    const uint64_t lo = Common::AlignDown<uint64_t>(info.data.size / 4, 16);
+    const uint64_t hi = Common::AlignDown<uint64_t>(info.data.size / 4 * 3, 16);
+    const RefreshRegion partial{0, 0, 3, 5, info.extent.width - 3, info.extent.height - 5};
+    const auto written = ExpectRegionScratch(rig, ("partial region " + label).c_str(), fixture,
+                                             {partial}, lo, hi, 20);
+    const uint64_t texel_bytes = uint64_t{partial.width} * partial.height *
+                                 info.tiling.block.bytes_per_element;
+    Require(kRegionName, ("partial window " + label).c_str(), written > 0 && written < texel_bytes,
+            "the window must cut the region without missing it");
+  }
+
+  void CheckGpuTilerRegions() {
+    EnsureRuntimeContext();
+    RegionRig rig(*this);
+    CheckRegionMaskInBlock(rig);
+    CheckRegionNarrowWindow(rig);
+    CheckRegionOrigins(rig);
+    CheckRegionChunks(rig);
+    CheckRegionLayers(rig);
+    CheckRegionSweep(rig);
+    std::printf("[gpu]     %-32s ok\n", kRegionName);
+  }
+
+  // The window texel counts BuildMip puts in the records, for regions of several sizes.
+  void CheckTilerRegionRecords() {
+    constexpr const char *name = "TilerRegionRecords";
+    ImageInfo info{};
+    info.data.address = 0x10000000;
+    info.pixel_format = vk::Format::eR32Uint;
+    info.guest_format = Prospero::BufferFormat::k32UInt;
+    info.extent = {256, 256, 1};
+    info.resources = {1, 1};
+    info.tile_mode = Prospero::TileMode::kRenderTarget;
+    info.UpdateSize();
+    const std::vector<RefreshRegion> regions{
+        {0, 0, 0, 0, 128, 128}, {0, 0, 128, 0, 100, 50}, {0, 0, 0, 128, 10, 10}};
+    const auto records = TileManagerTestAccess::RegionRecords(info, regions, 4096, 8192, 64);
+    Require(name, "window texel totals",
+            records.total == 128 * 128 + 100 * 50 + 10 * 10 &&
+                records.texels == std::vector<uint32_t>{128 * 128, 100 * 50, 10 * 10},
+            "region records must count the texels of their windows, not of their mips");
+    Require(name, "window header", records.window_start == 64 && records.window_len == 4096 &&
+                records.origins == std::vector<std::array<uint32_t, 3>>{{0, 0, 0}, {128, 0, 0},
+                                                                         {0, 128, 0}},
+            "region records lost their window or their origin");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckGpuTilerCpuParity() {
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
@@ -22083,8 +22460,9 @@ public:
           std::max<uint64_t>(m_runtime_context.GetPhysicalDeviceProperties()
                                  .limits.nonCoherentAtomSize,
                              1);
+      // 16-byte header + N x 64-byte Mip.
       for (const auto [mips, bytes] :
-           std::array{std::pair{1u, 64u}, std::pair{2u, 112u}}) {
+           std::array{std::pair{1u, 80u}, std::pair{2u, 144u}}) {
         StreamBuffer compact_parameters(m_runtime_context, scheduler,
                                         MemoryUsage::Stream,
                                         Common::AlignUp<uint64_t>(bytes, atom));
@@ -54951,6 +55329,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    vulkan.CheckGpuTilerRegions();
+    vulkan.CheckTilerRegionRecords();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
@@ -55508,6 +55888,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
+  vulkan.CheckGpuTilerRegions();
+  vulkan.CheckTilerRegionRecords();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);

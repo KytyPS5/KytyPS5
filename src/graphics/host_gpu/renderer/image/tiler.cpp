@@ -32,9 +32,9 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
     : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
 	static_assert(FamilyCount == 9);
-	static_assert(sizeof(Mip) == 48);
+	static_assert(sizeof(Mip) == 64);
 	static_assert(offsetof(TilingParams, mips) == 16);
-	static_assert(sizeof(TilingParams) == 784);
+	static_assert(sizeof(TilingParams) == 16 + MaxMipLevels * 64);
 	static_assert(sizeof(TilingParams) <= UINT16_MAX && PipelineCount <= UINT16_MAX);
 	static_assert(sizeof(Tiling) == 16);
 	static_assert(sizeof(Conversion) == 32);
@@ -199,18 +199,22 @@ TileManager::MipWindow TileManager::FullMipWindow(const ImageInfo& info, uint32_
 
 // Builds the shader record of one mip window. used_texels is the count of the mips before it, so
 // the running total can be checked against the 32-bit limit.
-TileManager::Mip TileManager::BuildMip(const ImageInfo& info, uint32_t level,
-                                       const MipWindow& window, bool tile, uint64_t source_base,
-                                       uint64_t target_base, uint32_t used_texels,
-                                       uint64_t tiled_capacity, uint64_t linear_capacity) {
-	const auto&    block = info.tiling.block;
-	const auto&    mip   = info.mip_layout[level];
-	const uint32_t width  = window.width;
-	const uint32_t height = window.height;
-	const uint32_t depth  = window.depth;
-	const bool     tail  = level >= info.first_tail_level;
-	const auto linear = CheckLinearSide(info, mip, tail, width, height, depth, linear_capacity);
-	const auto tiled  = CheckTiledSide(info, mip, tail, width, height, depth, tiled_capacity);
+TileManager::Mip TileManager::BuildMip(const MipBuildContext& context, uint32_t level,
+                                       const MipWindow& window, uint32_t used_texels) {
+	const auto& info  = context.info;
+	const auto& block = info.tiling.block;
+	const auto& mip   = info.mip_layout[level];
+	const bool  tail  = level >= info.first_tail_level;
+	// The layout checks cover the whole mip, so a window is only valid inside a valid mip.
+	const auto full = FullMipWindow(info, level);
+	EXIT_NOT_IMPLEMENTED(window.width == 0 || window.height == 0 || window.depth == 0 ||
+	                     uint64_t {window.x0} + window.width > full.width ||
+	                     uint64_t {window.y0} + window.height > full.height ||
+	                     uint64_t {window.z0} + window.depth > full.depth);
+	const auto linear = CheckLinearSide(info, mip, tail, full.width, full.height, full.depth,
+	                                    context.linear_capacity);
+	const auto tiled  = CheckTiledSide(info, mip, tail, full.width, full.height, full.depth,
+	                                   context.tiled_capacity);
 
 	const uint32_t alignment = std::min(block.bytes_per_element, 4u);
 	EXIT_NOT_IMPLEMENTED(
@@ -218,14 +222,20 @@ TileManager::Mip TileManager::BuildMip(const ImageInfo& info, uint32_t level,
 	     (alignment - 1u)) != 0);
 	uint64_t src = 0, dst = 0, texels = 0;
 	EXIT_NOT_IMPLEMENTED(
-	    !CheckedAdd(source_base, tile ? mip.linear_offset : mip.offset, src) ||
-	    !CheckedAdd(target_base, tile ? mip.offset : mip.linear_offset, dst) ||
-	    src > UINT32_MAX || dst > UINT32_MAX || !CheckedMultiply(width, height, texels) ||
-	    !CheckedMultiply(texels, depth, texels) || texels > UINT32_MAX - used_texels);
-	return {static_cast<uint32_t>(src),
+	    !CheckedAdd(context.source_base, context.tile ? mip.linear_offset : mip.offset, src) ||
+	    !CheckedAdd(context.target_base, context.tile ? mip.offset : mip.linear_offset, dst) ||
+	    (!context.modular_source && src > UINT32_MAX) || dst > UINT32_MAX ||
+	    !CheckedMultiply(window.width, window.height, texels) ||
+	    !CheckedMultiply(texels, window.depth, texels) || texels > UINT32_MAX - used_texels);
+	// A region source is biased by the window start. The shader adds the in-mip offset back with
+	// the same wrapping arithmetic, so the wrap cancels for every address inside the window.
+	const auto     source_low = static_cast<uint32_t>(src);
+	const uint32_t source32 =
+	    context.modular_source ? source_low - static_cast<uint32_t>(context.window_lo) : source_low;
+	return {source32,
 	        static_cast<uint32_t>(dst),
-	        width,
-	        height,
+	        window.width,
+	        window.height,
 	        static_cast<uint32_t>(linear.pitch_bytes),
 	        static_cast<uint32_t>(linear.slice_bytes),
 	        static_cast<uint32_t>(tiled.slice),
@@ -233,20 +243,25 @@ TileManager::Mip TileManager::BuildMip(const ImageInfo& info, uint32_t level,
 	        mip.surface_z,
 	        tail ? mip.tail_x : 0u,
 	        tail ? mip.tail_y : 0u,
-	        static_cast<uint32_t>(texels)};
+	        static_cast<uint32_t>(texels),
+	        window.x0,
+	        window.y0,
+	        window.z0,
+	        0u};
 }
 
 // Copies the mip records into the stream buffer and picks the pipeline slot.
-TileManager::Tiling TileManager::UploadParams(const TilingParams& params, uint32_t levels,
-                                              bool tile, const TileBlockLayout& block) {
+TileManager::Tiling TileManager::UploadParams(const TilingParams& params, uint32_t records,
+                                              Direction direction, const TileBlockLayout& block) {
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto  params_size =
-	    static_cast<uint16_t>(offsetof(TilingParams, mips) + levels * sizeof(Mip));
+	    static_cast<uint16_t>(offsetof(TilingParams, mips) + records * sizeof(Mip));
 	const auto offset = m_stream_buffer.Copy(
 	    &params, params_size,
 	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, alignof(TilingParams)));
 	const auto slot =
-	    ((tile ? FamilyCount : 0u) + static_cast<uint32_t>(block.family)) * BytesPerElementCount +
+	    (static_cast<uint32_t>(direction) * FamilyCount + static_cast<uint32_t>(block.family)) *
+	        BytesPerElementCount +
 	    std::countr_zero(block.bytes_per_element);
 	return {offset, params.num_texels, params_size, static_cast<uint16_t>(slot)};
 }
@@ -265,13 +280,15 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	// ImageInfo owns the layout. Upload only the header and active mip records.
 	TilingParams params;
 	params.color_transform = static_cast<uint32_t>(info.GetColorTransform());
+	const MipBuildContext context {info,        tile,           source_base,
+	                               target_base, tiled_capacity, linear_capacity};
 	for (uint32_t level = 0; level < levels; ++level) {
-		const auto mip = BuildMip(info, level, FullMipWindow(info, level), tile, source_base,
-		                          target_base, params.num_texels, tiled_capacity, linear_capacity);
+		const auto mip = BuildMip(context, level, FullMipWindow(info, level), params.num_texels);
 		params.mips[level] = mip;
 		params.num_texels += mip.num_texels;
 	}
-	return UploadParams(params, levels, tile, info.tiling.block);
+	return UploadParams(params, levels, tile ? Direction::Tile : Direction::Detile,
+	                    info.tiling.block);
 }
 
 vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
@@ -286,9 +303,12 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const uint32_t                   element_index   = slot % BytesPerElementCount;
 	const uint32_t                   direction_index = slot / (FamilyCount * BytesPerElementCount);
 	const uint32_t                   family_index    = (slot / BytesPerElementCount) % FamilyCount;
-	const uint32_t                   values[] {1u << element_index, direction_index};
-	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
-	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
+	// Constants 1 and 2 are TILE and REGION, which the three directions select between.
+	const uint32_t values[] {1u << element_index,
+	                         direction_index == static_cast<uint32_t>(Direction::Tile),
+	                         direction_index == static_cast<uint32_t>(Direction::DetileRegion)};
+	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+	const vk::SpecializationInfo     specialization {3, entries, sizeof(values), values};
 	m_pipelines[slot] = CreatePipeline(shaders[family_index], &specialization);
 	return m_pipelines[slot];
 }
@@ -432,6 +452,58 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	                                        tiling.params_size}});
 	DispatchTexels(command, tiling.num_texels, GetPipeline(tiling.pipeline_slot), target,
 	               target_offset, target_capacity);
+}
+
+// Builds one record per region. The records count window texels, not the texels of the mips the
+// regions sit in, because the dispatch needs exactly one invocation per window texel.
+TileManager::TilingParams
+TileManager::BuildRegionParams(const ImageInfo& info, std::span<const RefreshRegion> regions,
+                               const RegionSource& source, uint64_t source_base,
+                               uint64_t target_base, uint64_t linear_capacity) {
+	EXIT_IF(regions.empty() || regions.size() > MaxMipLevels);
+	TilingParams params;
+	params.color_transform = static_cast<uint32_t>(info.GetColorTransform());
+	params.window_start    = static_cast<uint32_t>(source_base);
+	params.window_len      = static_cast<uint32_t>(source.hi - source.lo);
+	const MipBuildContext context {info,        false,           source_base,
+	                               target_base, info.data.size, linear_capacity,
+	                               true,        source.lo};
+	for (size_t index = 0; index < regions.size(); ++index) {
+		const auto& region = regions[index];
+		EXIT_IF(region.level >= info.resources.levels || region.layer >= info.resources.layers);
+		const MipWindow window {region.width, region.height, 1, region.x0, region.y0, region.layer};
+		params.mips[index] = BuildMip(context, region.level, window, params.num_texels);
+		params.num_texels += params.mips[index].num_texels;
+	}
+	return params;
+}
+
+// Detiles the regions in chunks of MaxMipLevels records, with a barrier set per chunk. The
+// shader skips any texel whose tiled address is outside the window.
+void TileManager::DetileRegions(const RegionSource& source, const ImageInfo& info,
+                                std::span<const RefreshRegion> regions, Result target) {
+	ValidateImageForTiling(info);
+	const auto element = info.tiling.block.bytes_per_element;
+	EXIT_IF(regions.empty() || source.lo >= source.hi || source.lo % element != 0 ||
+	        source.hi % element != 0 || target.size == 0);
+	EXIT_NOT_IMPLEMENTED(info.IsVolume() || info.tiling.block.family == TileBlockFamily::Depth64KB ||
+	                     source.hi > info.data.size || info.data.size > UINT32_MAX ||
+	                     target.size > UINT32_MAX);
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_base = source.offset & (descriptor_alignment - 1);
+	const uint64_t target_base = target.offset & (descriptor_alignment - 1);
+	for (size_t first = 0; first < regions.size(); first += MaxMipLevels) {
+		const auto count  = std::min<size_t>(MaxMipLevels, regions.size() - first);
+		const auto chunk  = regions.subspan(first, count);
+		const auto params =
+		    BuildRegionParams(info, chunk, source, source_base, target_base, target.size);
+		const auto tiling = UploadParams(params, static_cast<uint32_t>(chunk.size()),
+		                                 Direction::DetileRegion, info.tiling.block);
+		Record(source.buffer, source.offset, source.hi - source.lo, target.buffer, target.offset,
+		       target.size, tiling, false);
+	}
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,

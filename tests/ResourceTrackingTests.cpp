@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -18,6 +19,15 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 namespace {
 
@@ -47,6 +57,44 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
     return;
   }
   Check(false, message);
+}
+
+template <typename F> void RunOnStack(size_t bytes, F &&function) {
+  struct Context {
+    F &function;
+    std::exception_ptr error;
+    static void Run(void *opaque) {
+      auto &context = *static_cast<Context *>(opaque);
+      try {
+        context.function();
+      } catch (...) {
+        context.error = std::current_exception();
+      }
+    }
+  } context{function, {}};
+#if defined(_WIN32)
+  auto *thread = CreateThread(nullptr, bytes, [](void *opaque) -> DWORD {
+    Context::Run(opaque);
+    return 0;
+  }, &context, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  Check(thread != nullptr, "start a fixed-stack thread");
+  WaitForSingleObject(thread, INFINITE);
+  CloseHandle(thread);
+#else
+  pthread_attr_t attributes;
+  Check(pthread_attr_init(&attributes) == 0 &&
+            pthread_attr_setstacksize(&attributes, bytes) == 0,
+        "configure a fixed-stack thread");
+  pthread_t thread;
+  const auto started = pthread_create(&thread, &attributes, [](void *opaque) -> void * {
+    Context::Run(opaque);
+    return nullptr;
+  }, &context);
+  pthread_attr_destroy(&attributes);
+  Check(started == 0 && pthread_join(thread, nullptr) == 0, "run a fixed-stack thread");
+#endif
+  if (context.error)
+    std::rethrow_exception(context.error);
 }
 
 struct Fixture {
@@ -5918,6 +5966,59 @@ void TestDynamicStorageMipTracking() {
         "an inverted mip range was not normalized consistently for plain and dynamic views");
 }
 
+void TestDeepScalarReadDependencies() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *use = fixture.AddBlock();
+  entry->AddBranch(use);
+  entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = use};
+  use->terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto buffer = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1),
+       fixture.UserData(2), fixture.UserData(3)}, 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto read = fixture.Emit(ValueOpcode::ReadConstBuffer,
+      {buffer, Value(0u)}, fixture.AddMemory(scalar, 4));
+  const auto reference = fixture.Emit(ValueOpcode::ReferenceU32, {read});
+  auto value = fixture.Emit(ValueOpcode::BitCastF32U32, {read});
+  for (uint32_t depth = 0; depth < 20000u; ++depth)
+    value = fixture.Emit(ValueOpcode::FPAdd32, {value, Value::F32(1.0f)});
+  const auto low = fixture.Emit(ValueOpcode::BitCastU32F32, {value});
+
+  fixture.block = use;
+  auto &phi = use->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  phi.AddPhiOperand(entry, low);
+  const auto address = fixture.Address(Value(&phi), Value(0u), 8);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  const auto load = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {address, Value(0u), Value(0u), Value(true)},
+      fixture.AddMemory(global, 8));
+  fixture.Emit(ValueOpcode::ReferenceU32, {load});
+
+  RunOnStack(1u << 20u, [&] { fixture.PlanAndTrack(); });
+
+  Check(fixture.program.resource_tracking_complete &&
+            fixture.program.srt_plan_complete,
+        "tracking deep scalar dependencies did not complete");
+  Check(fixture.program.srt_reads.size() == 1u &&
+            fixture.program.srt_reads[0].value == read &&
+            fixture.program.srt_reads[0].flat_offset == 0u &&
+            fixture.program.memory_info[0].planning_only,
+        "the deep dependency walk did not plan its scalar read");
+  const auto *flat = reference.Instruction()->Arg(0).Resolve().TryInstruction();
+  Check(flat != nullptr && flat->GetOpcode() == ValueOpcode::ReadConst &&
+            flat->Arg(1) == Value(0u),
+        "the discovered scalar read was not replaced with SRT slot zero");
+  Check(fixture.program.info.uses_dma &&
+            !fixture.program.memory_info[1].planning_only &&
+            load.Instruction()->GetOpcode() == ValueOpcode::LoadAddressU32,
+        "the global consumer did not remain an explicit address load");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -9043,6 +9144,7 @@ int main() {
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
     Run("descending image range", TestDescendingImageRange);
+    Run("deep scalar read dependencies", TestDeepScalarReadDependencies);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

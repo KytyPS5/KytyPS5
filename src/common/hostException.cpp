@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -279,6 +280,29 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// The last resort, and the only record a fault that never reaches the vectored handler leaves
+// behind. ExceptionFilter declines everything that is not an access violation or an illegal
+// instruction -- a stack overflow, a divide by zero, a fail-fast abort, or a fault raised while the
+// handler is itself running -- and the process then terminates with an exit code and no output at
+// all. This filter only describes the exception record; there is no guest state to read safely by
+// the time it runs. It is installed behind the vectored handler, never instead of it.
+static LONG WINAPI UnhandledFaultFilter(PEXCEPTION_POINTERS exception) noexcept {
+	const auto* record = exception != nullptr ? exception->ExceptionRecord : nullptr;
+	if (record != nullptr) {
+		std::printf("--- Unhandled host fault ---\n"
+		            "code=0x%08" PRIx32 " pc=0x%016" PRIx64 " fault=0x%016" PRIx64 "\n",
+		            static_cast<uint32_t>(record->ExceptionCode),
+		            reinterpret_cast<uint64_t>(record->ExceptionAddress),
+		            record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0);
+		std::fflush(stdout);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#endif
+
 bool InstallHandler(Handler handler) {
 	if (handler == nullptr) {
 		return false;
@@ -292,6 +316,7 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetUnhandledExceptionFilter(UnhandledFaultFilter);
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);

@@ -111,16 +111,13 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 #if defined(__APPLE__)
 	// SPIRV-Cross keeps a NoContraction multiply and add apart in MSL with two calls to
 	// [[clang::optnone]] functions (spvFMul, spvFAdd); on Apple GPUs that cost GTA V about 40 % of
-	// its frame time. Pixel and compute shaders use one fused multiply-add instead (the result may
-	// differ in the last bit). Vertex stages keep the exact rounding so that positions computed by
-	// different shaders stay identical, and so do pixel shaders that export depth.
-	// input_info is a union: read the pixel member only for a pixel shader.
-	const bool pixel        = state.program.stage == ShaderType::Pixel;
-	const bool depth_export = pixel && state.input_info.pixel != nullptr &&
-	                          state.input_info.pixel->ps_depth_export_enable;
-	if ((pixel && !depth_export) || state.program.stage == ShaderType::Compute) {
-		return EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
-	}
+	// its frame time. fma(a, b, -0.0) is the rounded product (-0.0 keeps the sign of a zero
+	// product), and the Metal compiler does not contract it with the following add, as it would
+	// a plain a * b + c even in safe math mode. The result is the same as with separate roundings,
+	// except for the sign of a zero result when the GPU flushes a negative denormal addend.
+	const auto rounded_product =
+	    EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, ConstantF32(state, 0x80000000u));
+	return EmitFPAdd32(state, rounded_product, c);
 #endif
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.

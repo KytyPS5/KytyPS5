@@ -15582,35 +15582,35 @@ void TestLegacyMadStageRounding() {
                      CountSourceOccurrences(DisassembleSpirvBinary(binary),
                                             "NoContraction")};
   };
-  const auto check = [&](const CompileOptions &options, bool fused,
-                         const char *text) {
+#if defined(__APPLE__)
+  // The product is rounded by fma(a, b, -0.0), then added: no NoContraction multiply.
+  constexpr MadCounts kExpected{0u, 1u, 1u, 0u};
+#else
+  constexpr MadCounts kExpected{1u, 1u, 0u, 2u};
+#endif
+  const auto check = [&](const CompileOptions &options, const char *text) {
     const auto base = count(options, false);
     const auto mad = count(options, true);
     const bool ok =
-        mad.fmul - base.fmul == (fused ? 0u : 1u) &&
-        mad.fadd - base.fadd == (fused ? 0u : 1u) &&
-        mad.fma - base.fma == (fused ? 1u : 0u) &&
-        mad.no_contraction - base.no_contraction == (fused ? 0u : 2u);
+        mad.fmul - base.fmul == kExpected.fmul &&
+        mad.fadd - base.fadd == kExpected.fadd &&
+        mad.fma - base.fma == kExpected.fma &&
+        mad.no_contraction - base.no_contraction == kExpected.no_contraction;
     Check(ok, text);
   };
 
-#if defined(__APPLE__)
-  constexpr bool kFused = true;
-#else
-  constexpr bool kFused = false;
-#endif
-  check(MakeCompileOptions(ShaderType::Compute), kFused,
+  check(MakeCompileOptions(ShaderType::Compute),
         "compute shader MAD used the wrong rounding");
-  check(MakeCompileOptions(ShaderType::Pixel), kFused,
+  check(MakeCompileOptions(ShaderType::Pixel),
         "pixel shader MAD used the wrong rounding");
-  check(MakeCompileOptions(ShaderType::Vertex), false,
-        "vertex shader MAD must keep separate rounding");
+  check(MakeCompileOptions(ShaderType::Vertex),
+        "vertex shader MAD used the wrong rounding");
   ShaderPixelInputInfo depth_export{};
   depth_export.ps_depth_export_enable = true;
   auto depth_options = MakeCompileOptions(ShaderType::Pixel);
   depth_options.input_info.pixel = &depth_export;
-  check(depth_options, false,
-        "depth-exporting pixel shader MAD must keep separate rounding");
+  check(depth_options,
+        "depth-exporting pixel shader MAD used the wrong rounding");
 }
 
 #include "ShaderRayTracingTests.inc"

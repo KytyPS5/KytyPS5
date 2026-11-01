@@ -766,6 +766,48 @@ void TextureCache::RefreshCopySource(ImageId id) {
 	}
 }
 
+// The color formats VK_KHR_maintenance8 lets vkCmdCopyImage copy to and from the depth aspect of
+// `depth`.
+static bool DepthColorCopyCompatible(vk::Format depth, vk::Format color) {
+	switch (depth) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint:
+			return color == vk::Format::eR16Sfloat || color == vk::Format::eR16Unorm ||
+			       color == vk::Format::eR16Snorm || color == vk::Format::eR16Uint ||
+			       color == vk::Format::eR16Sint;
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
+			return color == vk::Format::eR32Sfloat || color == vk::Format::eR32Uint ||
+			       color == vk::Format::eR32Sint;
+		default: return false;
+	}
+}
+
+bool TextureCache::CopyDepthColor(Image& destination, Image& source) {
+	// Image::CopyImage() copies the depth aspect alone, as a copy through a buffer does: the stencil
+	// aspect of a depth/stencil image keeps its contents.
+	if (!m_graphics.maintenance8_enabled || source.backing.samples != destination.backing.samples ||
+	    source.info.IsDepth() == destination.info.IsDepth()) {
+		return false;
+	}
+	auto& depth = source.info.IsDepth() ? source : destination;
+	auto& color = source.info.IsDepth() ? destination : source;
+	if (!DepthColorCopyCompatible(depth.backing.format, color.backing.format)) {
+		return false;
+	}
+	// vkCmdCopyImage took 1.4 to 1.8 ms for the depth aspect of a 4K D32S8 image, shaders ~0.1 ms.
+	if (BlitHelper::CanCopyDepthColor(depth, color)) {
+		if (destination.info.IsDepth()) {
+			m_blit_helper.CopyColorToDepth(color, depth);
+		} else {
+			m_blit_helper.CopyDepthToColor(depth, color);
+		}
+		return true;
+	}
+	destination.CopyImage(source);
+	return true;
+}
+
 bool TextureCache::CopyD16(Image& destination, Image& source) {
 	// Converts guest D16 between a four-byte host depth aspect and two-byte color or D16 depth.
 	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
@@ -865,7 +907,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
 	if (direct_copy) {
 		destination.CopyImage(source);
-	} else if (!CopyD16(destination, source)) {
+	} else if (!CopyD16(destination, source) && !CopyDepthColor(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
@@ -1653,7 +1695,7 @@ void TextureCache::RefreshDepthCopy(ImageId copy_id) {
 	if (source.write_count == copy.depth_copy_writes) {
 		return;
 	}
-	if (!CopyD16(copy, source)) {
+	if (!CopyD16(copy, source) && !CopyDepthColor(copy, source)) {
 		copy.CopyImageWithBuffer(source, m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal),
 		                         m_tiler);
 	}

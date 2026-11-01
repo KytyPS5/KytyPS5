@@ -23,11 +23,21 @@ public:
 	KYTY_CLASS_NO_COPY(BlitHelper);
 
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
+	// Whether CopyDepthToColor() and CopyColorToDepth() take `depth` (D32, with or without a
+	// stencil aspect) and `color` (R32): 2D images of one level, one layer and one sample, of one
+	// extent.
+	[[nodiscard]] static bool CanCopyDepthColor(const Image& depth, const Image& color);
+	// The depth aspect of `depth` copied into `color` with a compute shader, and back with a
+	// fragment shader that writes the depth; the stencil aspect keeps its contents.
+	void CopyDepthToColor(Image& depth, Image& color);
+	void CopyColorToDepth(Image& color, Image& depth);
 
 private:
 	struct PipelineKey {
 		uint32_t   samples = 1;
 		vk::Format format  = vk::Format::eUndefined;
+		// The fragment shader: false for ReinterpretColorAsMsDepth(), true for CopyColorToDepth().
+		bool       copy    = false;
 
 		auto operator<=>(const PipelineKey&) const = default;
 	};
@@ -45,7 +55,12 @@ private:
 	vk::PipelineLayout      m_pipeline_layout   = nullptr;
 	vk::ShaderModule        m_vertex_shader     = nullptr;
 	vk::ShaderModule        m_fragment_shader   = nullptr;
+	vk::ShaderModule        m_copy_shader       = nullptr;
 	std::vector<Pipeline>   m_pipelines;
+	// CopyDepthToColor(), created on first use.
+	vk::DescriptorSetLayout m_to_color_descriptor_layout = nullptr;
+	vk::PipelineLayout      m_to_color_layout            = nullptr;
+	vk::Pipeline            m_to_color_pipeline          = nullptr;
 };
 
 } // namespace Libs::Graphics

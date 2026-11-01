@@ -37,6 +37,21 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
+[[nodiscard]] bool SameMipPlacement(const ImageMipInfo& left, const ImageMipInfo& right) {
+	return left.offset == right.offset && left.size == right.size && left.pitch == right.pitch &&
+	       left.height == right.height && left.tail_x == right.tail_x &&
+	       left.tail_y == right.tail_y && left.surface_z == right.surface_z;
+}
+
+// Guest mip chains run backwards, so a texture with fewer levels keeps its base level at a
+// different offset than one with a longer chain at the same address. Every level both layouts
+// have must be placed identically for one image to serve the other.
+[[nodiscard]] bool SharedLevelsMatch(const ImageInfo& left, const ImageInfo& right) {
+	const auto shared = std::min(left.resources.levels, right.resources.levels);
+	return std::equal(left.mip_layout.begin(), left.mip_layout.begin() + shared,
+	                  right.mip_layout.begin(), SameMipPlacement);
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -773,6 +788,36 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+// Frees a cached image that a request with a different guest layout replaces. Its GPU-written
+// contents are published to the buffer cache first, unless that could overwrite newer data.
+void TextureCache::RetireReplacedLayout(ImageId cached_id, ImageId merged_id) {
+	auto& cached = m_slot_images[cached_id];
+	auto* merged = merged_id ? &m_slot_images[merged_id] : nullptr;
+	if (cached.SafeToDownload()) {
+		// The idle replaced image is usually older than merged, so it publishes first and merged
+		// publishes over it. A buffer-modified merged already has newer bytes waiting in the
+		// buffer, and an undownloadable merged couldn't publish over the old ones.
+		const bool merged_wins_overlap =
+		    merged == nullptr ||
+		    (!merged->IsBufferModified() && (!merged->SafeToDownload() || CanDownload(*merged)));
+		if (merged_wins_overlap && BcAlias::Publish(*this, cached)) {
+			if (merged != nullptr) {
+				if (merged->SafeToDownload()) {
+					(void)BcAlias::Publish(*this, *merged);
+				}
+				merged->MarkBufferModified();
+			}
+		} else {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: dropping GPU contents of replaced image at 0x%016" PRIx64
+			           ", the replacing image has newer pending bytes or can't be downloaded\n",
+			           cached.info.data.address);
+		}
+	}
+	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	FreeImage(cached_id);
+}
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -801,23 +846,31 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		// If any level both layouts have is placed differently, the cached image cannot serve
+		// the request, even when the mip counts differ.
+		const bool shared_levels_differ =
+		    requested.resources.levels != cached.info.resources.levels &&
+		    !SharedLevelsMatch(requested, cached.info);
+		// The depth path may convert the cached image into a new one, which copies its contents
+		// across. Handing back the cached image itself is only right when its levels sit where
+		// the request expects them.
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
-			return {depth_id};
+			if (depth_id != cached_id || !shared_levels_differ) {
+				return {depth_id};
+			}
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
-		                 cached.info.mip_layout.begin(),
-		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
-			                 return left.offset == right.offset && left.size == right.size &&
-			                        left.pitch == right.pitch && left.height == right.height &&
-			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-			                        left.surface_z == right.surface_z;
-		                 }))) {
+		                 cached.info.mip_layout.begin(), SameMipPlacement)) ||
+		    shared_levels_differ) {
+			// The request becomes a separate image. An idle cached image is retired, so no stale
+			// copy is left for range lookups or texture GC to download later. Its GPU-written
+			// contents are published to the buffer cache first, so the new image uploads them.
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				RetireReplacedLayout(cached_id, merged_id);
 			}
 			return {merged_id};
 		}
@@ -1306,7 +1359,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = id;
 				break;
 			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			// Equal size and a longer chain are not enough: the levels the request uses must sit
+			// where the cached image keeps them.
+			if (SameBacking(image.info, desc.info, exact_format) &&
+			    (image.info.resources.levels == desc.info.resources.levels ||
+			     SharedLevelsMatch(image.info, desc.info))) {
 				result = id;
 			} else if (image.SafeToDownload() &&
 			           BcAlias::Matches(desc.info, image.info)) {

@@ -300,6 +300,15 @@ struct TextureCacheTestAccess {
     }
   }
 
+  static void MakeIdle(TextureCache &cache, ImageId id) {
+    cache.m_slot_images[id].tick_accessed_last = 0;
+  }
+
+  static void RetireReplacedLayout(TextureCache &cache, ImageId cached, ImageId merged) {
+    std::lock_guard lock(cache.m_lock);
+    cache.RetireReplacedLayout(cached, merged);
+  }
+
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
@@ -8110,6 +8119,348 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
+      // Guest mip chains run backwards, so a one-level texture at the same address as a cached
+      // two-level image keeps its base level at a different offset. The cached image must not
+      // serve it. (Octopath Traveler II streams one-level textures into memory that a
+      // full-chain texture used; reading the old chain's base level showed half of another
+      // texture on the ground.)
+      {
+        constexpr uint64_t chain_offset = 0x1a30000;
+        constexpr uint32_t chain_width = 64;
+        constexpr uint32_t chain_row = 256;  // linear rows align to 256 bytes
+        constexpr uint32_t chain_low_value = 0x11111111u;   // bytes [0, 256)
+        constexpr uint32_t chain_high_value = 0x22222222u;  // bytes [256, 512)
+        auto* chain_memory = reinterpret_cast<uint32_t*>(memory + chain_offset);
+        std::fill_n(chain_memory, chain_row / sizeof(uint32_t), chain_low_value);
+        std::fill_n(chain_memory + chain_row / sizeof(uint32_t), chain_row / sizeof(uint32_t),
+                    chain_high_value);
+
+        auto two_level = MakeLinearDesc(
+            base + chain_offset, 2 * chain_row, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {chain_width, 1, 1}, 1, 4, 1);
+        two_level.info.resources.levels = 2;
+        two_level.view_info.level_count = 2;
+        two_level.info.UpdateSize();
+        // The memory fill above assumes level 1 sits first and the base level after it.
+        Require(name, "two-level linear chain layout",
+                two_level.info.mip_layout[1].offset == 0 &&
+                    two_level.info.mip_layout[1].size == chain_row &&
+                    two_level.info.mip_layout[0].offset == chain_row &&
+                    two_level.info.mip_layout[0].size == chain_row,
+                "UpdateSize() no longer places a linear chain's base level after level 1");
+        const auto two_level_image = texture_cache.FindImage(two_level);
+        (void)texture_cache.FindTexture(two_level_image, two_level);
+        Require(name, "two-level chain base level",
+                ReadCachedTexel(name, context, two_level_image, {}, {chain_width, 1, 1}) ==
+                    std::vector<u32>(chain_width, chain_high_value),
+                "two-level image did not read its base level from the end of the chain");
+
+        auto one_level = MakeLinearDesc(
+            base + chain_offset, chain_row, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {chain_width, 1, 1}, 1, 4, 1);
+        const auto one_level_image = texture_cache.FindImage(one_level);
+        (void)texture_cache.FindTexture(one_level_image, one_level);
+        Require(name, "one-level texture over a longer chain",
+                one_level_image != two_level_image &&
+                    ReadCachedTexel(name, context, one_level_image, {}, {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, chain_low_value),
+                "a one-level texture was served by a cached image with a different mip layout");
+
+        // Same allocation size as the cached chain (as with padded tiled layouts): the
+        // equal-backing fast path must also check where the requested level sits.
+        auto one_level_padded = MakeLinearDesc(
+            base + chain_offset, 2 * chain_row, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {chain_width, 1, 1}, 1, 4, 1);
+        const auto padded_image = texture_cache.FindImage(one_level_padded);
+        (void)texture_cache.FindTexture(padded_image, one_level_padded);
+        Require(name, "equal-size one-level texture over a longer chain",
+                padded_image != two_level_image &&
+                    ReadCachedTexel(name, context, padded_image, {}, {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, chain_low_value),
+                "an equal-size one-level texture reused a cached image with a different mip "
+                "layout");
+
+        // An idle GPU-written chain replaced by a one-level texture is retired, and its
+        // contents reach the new image instead of being dropped or left behind as a stale
+        // copy that range lookups or GC could download over newer data.
+        // The chain's level 1 at offset 0 is 32 texels wide, so only the first half of the
+        // one-level texture's row holds GPU-written data; the rest is guest padding.
+        constexpr uint64_t written_offset = chain_offset + 0x400;
+        constexpr uint32_t written_value = 0x55555555u;
+        auto* written_memory = reinterpret_cast<uint32_t*>(memory + written_offset);
+        std::fill_n(written_memory, 2 * chain_row / sizeof(uint32_t), chain_low_value);
+        auto written_chain = two_level;
+        written_chain.info.data.address = base + written_offset;
+        written_chain.info.UpdateSize();
+        const auto written_chain_image = texture_cache.FindImage(written_chain);
+        (void)texture_cache.FindTexture(written_chain_image, written_chain);
+        vk::ClearValue written_clear{};
+        std::fill_n(written_clear.color.uint32.data(), 4, written_value);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), written_chain_image,
+            vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1},
+            written_clear);
+        texture_cache.MarkGpuWritten(written_chain_image);
+        while (scheduler.CurrentTick() <= 64) {
+          scheduler.Flush();
+        }
+        TextureCacheTestAccess::MakeIdle(texture_cache, written_chain_image);
+
+        auto written_one_level = one_level;
+        written_one_level.info.data.address = base + written_offset;
+        written_one_level.info.UpdateSize();
+        const auto written_one_level_image = texture_cache.FindImage(written_one_level);
+        (void)texture_cache.FindTexture(written_one_level_image, written_one_level);
+        Require(name, "idle GPU-written chain replaced by a one-level texture",
+                written_one_level_image != written_chain_image &&
+                    !TextureCacheTestAccess::Contains(texture_cache, written_chain_image) &&
+                    texture_cache.FindImageFromRange(base + written_offset, chain_row,
+                                                     false) ==
+                        written_one_level_image &&
+                    ReadCachedTexel(name, context, written_one_level_image, {},
+                                    {chain_width / 2, 1, 1}) ==
+                        std::vector<u32>(chain_width / 2, written_value),
+                "a retired GPU-written chain was kept or its contents were lost");
+
+        // Retiring older GPU-written chains into a newer GPU-written image at the same address
+        // must leave the newer contents in place. The second retirement finds the newer image
+        // already buffer-modified by the first, so it must not publish its old contents over it.
+        // Two identical chains stand in for two older layouts, which FindImage would never keep
+        // side by side.
+        constexpr uint64_t ordered_offset = chain_offset + 0x800;
+        constexpr uint32_t older_value = 0x66666666u;
+        constexpr uint32_t newer_value = 0x77777777u;
+        auto* ordered_memory = reinterpret_cast<uint32_t*>(memory + ordered_offset);
+        std::fill_n(ordered_memory, 2 * chain_row / sizeof(uint32_t), chain_low_value);
+        auto ordered_chain = two_level;
+        ordered_chain.info.data.address = base + ordered_offset;
+        ordered_chain.info.UpdateSize();
+        auto ordered_one_level = one_level;
+        ordered_one_level.info.data.address = base + ordered_offset;
+        ordered_one_level.info.UpdateSize();
+        // Fills every level of an inserted image on the GPU and records it as GPU-written.
+        const auto insert_written = [&](const ImageInfo &info, uint32_t value) {
+          const auto id = TextureCacheTestAccess::InsertImage(texture_cache, info);
+          vk::ClearValue clear{};
+          std::fill_n(clear.color.uint32.data(), clear.color.uint32.size(), value);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), id,
+              vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0,
+                                         info.resources.levels, 0, 1},
+              clear);
+          texture_cache.MarkGpuWritten(id);
+          return id;
+        };
+        const ImageId older_chains[] = {insert_written(ordered_chain.info, older_value),
+                                        insert_written(ordered_chain.info, older_value)};
+        const auto newer_image = insert_written(ordered_one_level.info, newer_value);
+        for (const auto older_chain : older_chains) {
+          TextureCacheTestAccess::RetireReplacedLayout(texture_cache, older_chain, newer_image);
+        }
+        (void)texture_cache.FindTexture(newer_image, ordered_one_level);
+        Require(name, "retired older chains keep a newer image's contents",
+                !TextureCacheTestAccess::Contains(texture_cache, older_chains[0]) &&
+                    !TextureCacheTestAccess::Contains(texture_cache, older_chains[1]) &&
+                    ReadCachedTexel(name, context, newer_image, {}, {chain_width, 1, 1}) ==
+                        std::vector<u32>(chain_width, newer_value),
+                "an older retired chain was published over a newer GPU-written image");
+
+        // A GPU-written image that can't be downloaded, here a multisampled one, is still
+        // retired rather than left registered beside the image that replaces it.
+        constexpr uint64_t multisampled_offset = chain_offset + 0xc00;
+        constexpr uint32_t multisampled_samples = 2;
+        auto multisampled_info = one_level.info;
+        multisampled_info.data.address = base + multisampled_offset;
+        multisampled_info.samples = multisampled_samples;
+        multisampled_info.tile_mode = Prospero::TileMode::kRenderTarget;
+        multisampled_info.UpdateSize();
+        const auto multisampled_image = insert_written(multisampled_info, older_value);
+        TextureCacheTestAccess::RetireReplacedLayout(texture_cache, multisampled_image, {});
+        Require(name, "undownloadable replaced image",
+                !TextureCacheTestAccess::Contains(texture_cache, multisampled_image),
+                "a replaced image that couldn't be published was left registered");
+
+        // Tiled chains use real UpdateSize() layouts. A 256x256 32-bit 64 KiB-swizzled chain
+        // with 7 or more levels keeps its mip tail in [0, 0x10000), level 1 in
+        // [0x10000, 0x20000) and its base level in [0x20000, 0x60000).
+        constexpr uint32_t tiled_extent = 256;
+        constexpr uint32_t tiled_block_width = 128;  // 64 KiB block of 32-bit texels
+        constexpr uint32_t tiled_single_level = 1;
+        constexpr uint32_t tiled_full_levels = 9;
+        constexpr uint64_t tiled_level1_start = 0x10000;
+        constexpr uint64_t tiled_base_start = 0x20000;
+        constexpr uint64_t tiled_chain_size = 0x60000;
+        constexpr uint32_t tiled_tail_value = 0x88888888u;
+        constexpr uint32_t tiled_level1_value = 0x99999999u;
+        constexpr uint32_t tiled_base_value = 0xaaaaaaaau;
+        // Builds a tiled 256x256 texture request with the given level count.
+        const auto make_tiled = [&](uint64_t offset, uint32_t levels) {
+          auto desc = MakeLinearDesc(base + offset, 0, vk::Format::eR32Uint,
+                                     Prospero::BufferFormat::k32UInt,
+                                     Prospero::ImageType::kColor2D,
+                                     {tiled_extent, tiled_extent, 1}, 1, sizeof(uint32_t), 1);
+          desc.info.tile_mode = Prospero::TileMode::kStandard64KB;
+          desc.info.resources.levels = levels;
+          // Lets UpdateSize() pick the tiled pitch instead of the linear one MakeLinearDesc set.
+          desc.info.pitch = 0;
+          desc.view_info.level_count = levels;
+          desc.info.UpdateSize();
+          return desc;
+        };
+        // Fills each region of a tiled chain with its own value, so reads show which region a
+        // texel came from whatever the swizzle order inside a region is.
+        const auto fill_tiled_chain = [&](uint64_t offset) {
+          auto* words = reinterpret_cast<uint32_t*>(memory + offset);
+          constexpr auto word_bytes = sizeof(uint32_t);
+          std::fill_n(words, tiled_level1_start / word_bytes, tiled_tail_value);
+          std::fill_n(words + tiled_level1_start / word_bytes,
+                      (tiled_base_start - tiled_level1_start) / word_bytes, tiled_level1_value);
+          std::fill_n(words + tiled_base_start / word_bytes,
+                      (tiled_chain_size - tiled_base_start) / word_bytes, tiled_base_value);
+        };
+
+        // Octopath Traveler II case. A one-level texture streamed into memory that a full tiled
+        // chain used keeps its base level at offset 0, which the chain uses for its mip tail and
+        // level 1. The first row's two 64 KiB blocks show those two regions.
+        constexpr uint64_t tiled_replace_offset = 0x2e80000;
+        fill_tiled_chain(tiled_replace_offset);
+        auto tiled_chain = make_tiled(tiled_replace_offset, tiled_full_levels);
+        const auto tiled_chain_image = texture_cache.FindImage(tiled_chain);
+        (void)texture_cache.FindTexture(tiled_chain_image, tiled_chain);
+        Require(name, "tiled chain base level",
+                tiled_chain.info.data.size == tiled_chain_size &&
+                    tiled_chain.info.mip_layout[0].offset == tiled_base_start &&
+                    ReadCachedTexel(name, context, tiled_chain_image, {},
+                                    {tiled_extent, 1, 1}) ==
+                        std::vector<u32>(tiled_extent, tiled_base_value),
+                "a tiled chain did not read its base level from the end of the chain");
+        auto tiled_one_level = make_tiled(tiled_replace_offset, tiled_single_level);
+        const auto tiled_one_level_image = texture_cache.FindImage(tiled_one_level);
+        (void)texture_cache.FindTexture(tiled_one_level_image, tiled_one_level);
+        auto expected_row = std::vector<u32>(tiled_block_width, tiled_tail_value);
+        expected_row.resize(tiled_extent, tiled_level1_value);
+        Require(name, "one-level texture over a tiled chain",
+                tiled_one_level_image != tiled_chain_image &&
+                    ReadCachedTexel(name, context, tiled_one_level_image, {},
+                                    {tiled_extent, 1, 1}) == expected_row,
+                "a one-level texture was served by a tiled chain with a different base level");
+
+        // Levels that differ only inside the mip tail leave every shared level in place, so the
+        // cached chain keeps serving the request instead of a separate image being created.
+        // Equal tiled sizes send this through FindImage's equal-backing path, not ResolveOverlap.
+        // A separate image would read the same values, so the image count and the cached level
+        // count are what show the chain was reused.
+        constexpr uint64_t tiled_tail_offset = 0x2f00000;
+        constexpr uint32_t tiled_tail_only_levels = tiled_full_levels - 1;
+        fill_tiled_chain(tiled_tail_offset);
+        auto tail_chain = make_tiled(tiled_tail_offset, tiled_full_levels);
+        const auto tail_chain_image = texture_cache.FindImage(tail_chain);
+        (void)texture_cache.FindTexture(tail_chain_image, tail_chain);
+        auto tail_only = make_tiled(tiled_tail_offset, tiled_tail_only_levels);
+        const auto tail_only_image = texture_cache.FindImage(tail_only);
+        (void)texture_cache.FindTexture(tail_only_image, tail_only);
+        Require(name, "tail-only level difference reuses the tiled chain",
+                tail_only_image == tail_chain_image &&
+                    TextureCacheTestAccess::FindImages(texture_cache, base + tiled_tail_offset,
+                                                       tiled_chain_size, false) ==
+                        std::vector<ImageId>{tail_chain_image} &&
+                    texture_cache.GetImage(tail_chain_image).info.resources.levels ==
+                        tiled_full_levels &&
+                    ReadCachedTexel(name, context, tail_only_image, {}, {tiled_extent, 1, 1}) ==
+                        std::vector<u32>(tiled_extent, tiled_base_value),
+                "a request differing only in its mip tail got a separate image");
+
+        // A request with another tile mode at the same address becomes a separate image. The
+        // idle cached image is retired, and its GPU-written contents go through the buffer cache
+        // first, so the new image starts from them instead of from stale guest memory. Every
+        // cleared texel holds the same value, so the result doesn't depend on swizzle order,
+        // and reading the whole image catches a publish that only covered part of it.
+        constexpr uint64_t retile_offset = 0x2f60000;
+        // 128 texels keeps the linear pitch equal to the 64 KiB tiled one, so both layouts have
+        // the same block extent and the request reaches the tile-mode check.
+        constexpr uint32_t retile_extent = 128;
+        constexpr uint64_t retile_linear_size =
+            uint64_t{retile_extent} * retile_extent * sizeof(uint32_t);
+        constexpr uint32_t retile_stale_value = 0xbbbbbbbbu;
+        constexpr uint32_t retile_written_value = 0xccccccccu;
+        std::fill_n(reinterpret_cast<uint32_t*>(memory + retile_offset),
+                    retile_linear_size / sizeof(uint32_t), retile_stale_value);
+        auto retile_linear = MakeLinearDesc(
+            base + retile_offset, retile_linear_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {retile_extent, retile_extent, 1}, 1, sizeof(uint32_t), 1);
+        retile_linear.info.UpdateSize();
+        const auto retile_linear_image = texture_cache.FindImage(retile_linear);
+        (void)texture_cache.FindTexture(retile_linear_image, retile_linear);
+        vk::ClearValue retile_clear{};
+        std::fill_n(retile_clear.color.uint32.data(), retile_clear.color.uint32.size(),
+                    retile_written_value);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), retile_linear_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, retile_clear);
+        texture_cache.MarkGpuWritten(retile_linear_image);
+        scheduler.Flush();
+        TextureCacheTestAccess::MakeIdle(texture_cache, retile_linear_image);
+
+        auto retile_tiled = MakeLinearDesc(
+            base + retile_offset, 0, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {retile_extent, retile_extent, 1}, 1,
+            sizeof(uint32_t), 1);
+        retile_tiled.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        // Lets UpdateSize() pick the tiled pitch instead of the linear one MakeLinearDesc set.
+        retile_tiled.info.pitch = 0;
+        retile_tiled.info.UpdateSize();
+        const auto retile_tiled_image = texture_cache.FindImage(retile_tiled);
+        (void)texture_cache.FindTexture(retile_tiled_image, retile_tiled);
+        Require(name, "idle GPU-written image replaced by another tile mode",
+                retile_tiled_image != retile_linear_image &&
+                    !TextureCacheTestAccess::Contains(texture_cache, retile_linear_image) &&
+                    ReadCachedTexel(name, context, retile_tiled_image, {},
+                                    {retile_extent, retile_extent, 1}) ==
+                        std::vector<u32>(size_t{retile_extent} * retile_extent,
+                                         retile_written_value),
+                "a retired GPU-written image was kept or its contents were lost on a tile "
+                "mode change");
+
+        // The depth path can hand back a cached depth image unchanged when it holds at least as
+        // many levels. A one-level depth texture at a two-level chain's address keeps its base
+        // level where the chain keeps level 1, so that result must be refused.
+        constexpr uint64_t depth_chain_offset = 0x2f70000;
+        constexpr uint32_t depth_chain_width = 64;
+        // 64 texels of 4 bytes fill exactly one 256-byte linear row.
+        constexpr uint32_t depth_chain_row = depth_chain_width * sizeof(float);
+        constexpr uint32_t depth_chain_levels = 2;
+        // Builds a linear D32 texture request at the depth chain's address.
+        const auto make_depth = [&](uint32_t levels) {
+          auto desc = MakeLinearDesc(base + depth_chain_offset, levels * depth_chain_row,
+                                     vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+                                     Prospero::ImageType::kColor2D, {depth_chain_width, 1, 1}, 1,
+                                     sizeof(float), 1);
+          desc.info.resources.levels = levels;
+          desc.view_info.level_count = levels;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+          desc.info.UpdateSize();
+          return desc;
+        };
+        auto depth_chain = make_depth(depth_chain_levels);
+        auto depth_one_level = make_depth(1);
+        Require(name, "two-level linear depth chain layout",
+                depth_chain.info.IsDepth() &&
+                    depth_chain.info.mip_layout[0].offset == depth_chain_row &&
+                    depth_one_level.info.mip_layout[0].offset == 0,
+                "the depth chain fixture no longer keeps its base level after level 1");
+        const auto depth_chain_image = texture_cache.FindImage(depth_chain);
+        (void)texture_cache.FindTexture(depth_chain_image, depth_chain);
+        const auto depth_one_level_image = texture_cache.FindImage(depth_one_level);
+        Require(name, "one-level depth texture over a longer depth chain",
+                depth_one_level_image != depth_chain_image &&
+                    texture_cache.GetImage(depth_one_level_image).info.resources.levels == 1,
+                "a cached depth image served a request with its base level in another place");
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
@@ -13215,6 +13566,12 @@ public:
           RenderExecutorTestAccess::ResetBindings(executor);
           registers.SetColorInfo(0, float_info);
           registers.SetColorAttrib2(0, single_mip);
+          if (fill_case.reuse_mips) {
+            // Guest mip chains run backwards, so the chain's base level sits after its smaller
+            // level. A one-level target renders into that base level only when it points there.
+            const auto &chain = preexisting.desc.info;
+            registers.SetColorBase(0, {.addr = chain.data.address + chain.mip_layout[0].offset});
+          }
         }
         const auto fill_metadata = [&](uint32_t count, bool raw = false) {
           const bool goat = fill_case.goat && !raw;

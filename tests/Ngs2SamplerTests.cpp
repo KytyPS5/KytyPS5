@@ -95,6 +95,29 @@ struct Fixture {
 	}
 };
 
+void TestStereoPan() {
+  Ngs2PanWork work;
+  Check(Ngs2PanInit(&work, nullptr, 360.0f, 2) == OK, "pan init failed");
+  auto pan = [&](float angle, float &l, float &r) {
+    Ngs2PanParam param{angle, 1.0f, 1.0f, 1.0f};
+    float m[2] = {};
+    Check(Ngs2PanGetVolumeMatrix(&work, &param, 1, 2, m) == OK,
+          "pan matrix failed");
+    l = m[0];
+    r = m[1];
+  };
+  float l, r;
+  pan(270.0f, l, r);
+  Check(l > 0.99f && r < 0.01f, "270 degrees should be hard left");
+  pan(90.0f, l, r);
+  Check(r > 0.99f && l < 0.01f, "90 degrees should be hard right");
+  pan(0.0f, l, r);
+  Check(std::abs(l - r) < 0.001f && std::abs(l - 0.7071f) < 0.01f,
+        "0 degrees should be centred");
+  pan(315.0f, l, r);
+  Check(l > r && r > 0.01f, "315 degrees should lean left");
+}
+
 void TestWaveformQueueCapacity() {
 	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
 	constexpr int32_t invalid_count = static_cast<int32_t>(0x804a8053u);
@@ -873,13 +896,108 @@ void TestReverbDryLevel() {
 		Ngs2VoiceParamHeader header {24, 24, 0x20010000};
 		uint32_t             channels[4] = {1, 1, 0, 0};
 		Ngs2VoiceParamHeader levels_header {96, 0, 0x20010001};
-		float                levels[22] = {0.6f, 0.4f};
-	} setup;
-	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header);
-	reverb.SetEvent(1);
-	Ngs2RenderVoice(reverb, {&f.voice, &reverb}, 1);
-	Check(reverb.has_samples && reverb.samples[0] == 0.25f * 0.4f,
+                float levels[22] = {0.0f, 0.4f};
+        } setup;
+        Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header);
+        reverb.SetEvent(1);
+        Ngs2RenderVoice(reverb, {&f.voice, &reverb}, 1);
+        Check(reverb.has_samples && reverb.samples[0] == 0.25f * 0.4f,
 	      "reverb did not pass its dry signal");
+}
+
+void TestGeomStereoPlacement() {
+  Ngs2GeomListenerParam listener;
+  Ngs2GeomListenerWork work;
+  Ngs2GeomResetListenerParam(&listener);
+  Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK,
+        "geom listener failed");
+
+  auto place = [&](float x, float z, float &l, float &r) {
+    Ngs2GeomSourceParam source;
+    Ngs2GeomResetSourceParam(&source);
+    source.matrix_format = 2;
+    source.position = {x, 0.0f, z};
+    Ngs2GeomAttribute attrib;
+    Check(Ngs2GeomApply(&work, &source, &attrib, 0) == OK, "geom apply failed");
+    l = attrib.level[0];
+    r = attrib.level[1];
+  };
+  float l, r;
+  place(0.0f, 1.0f, l, r);
+  Check(std::abs(l - r) < 0.001f && l > 0.5f, "source ahead should be centred");
+  place(1.0f, 0.0f, l, r);
+  Check(r > 0.9f * l + 0.1f && l < 0.1f,
+        "source on the right should pan right");
+  place(-1.0f, 0.0f, l, r);
+  Check(l > 0.9f * r + 0.1f && r < 0.1f, "source on the left should pan left");
+  float near_l, near_r;
+  place(2.0f, 0.0f, near_l, near_r);
+  place(20.0f, 0.0f, l, r);
+  Check(r < near_r, "a distant source should be quieter");
+}
+
+void TestGeomDoppler() {
+  Ngs2GeomListenerParam listener;
+  Ngs2GeomListenerWork work;
+  Ngs2GeomResetListenerParam(&listener);
+  Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK,
+        "geom listener failed");
+
+  auto pitch = [&](float source_vz, float listener_vz) {
+    Ngs2GeomListenerWork moving = work;
+    moving.velocity = {0.0f, 0.0f, listener_vz};
+    Ngs2GeomSourceParam source;
+    Ngs2GeomResetSourceParam(&source);
+    source.position = {0.0f, 0.0f, 10.0f};
+    source.velocity = {0.0f, 0.0f, source_vz};
+    source.doppler_factor = 1.0f;
+    Ngs2GeomAttribute attrib;
+    Check(Ngs2GeomApply(&moving, &source, &attrib, 0) == OK,
+          "geom apply failed");
+    return attrib.pitch_ratio;
+  };
+  Check(pitch(-5.0f, 0.0f) > 1.0f, "approaching source should raise pitch");
+  Check(pitch(5.0f, 0.0f) < 1.0f, "receding source should lower pitch");
+  Check(pitch(0.0f, 5.0f) > 1.0f, "approaching listener should raise pitch");
+  Check(pitch(0.0f, -5.0f) < 1.0f, "receding listener should lower pitch");
+}
+
+void TestReverbTail() {
+  Ngs2ReverbState reverb;
+  reverb.params = {0.6f, 0.4f, -1000, -602, -302, 2.91f, 1.3f, 0.015f, 0.022f};
+  reverb.Prepare(2, 48000);
+  reverb.Apply();
+  const uint32_t grain = 256;
+  std::vector<float> block(2 * grain, 0.0f);
+  Check(!reverb.Process(block, grain, false), "idle reverb produced output");
+
+  block[0] = 1.0f;
+  block[grain] = 1.0f;
+  Check(reverb.Process(block, grain, true), "reverb dropped its input");
+  Check(std::abs(block[0] - 0.4f) < 1e-6f, "reverb changed the dry level");
+
+  float early = 0.0f, late = 0.0f;
+  for (int g = 1; g < 1400; ++g) {
+    std::ranges::fill(block, 0.0f);
+    const bool out = reverb.Process(block, grain, false);
+    float peak = 0.0f;
+    for (float v : block) {
+      Check(std::isfinite(v) && std::abs(v) < 1.0f, "reverb tail is unstable");
+      peak = std::max(peak, std::abs(v));
+    }
+    if (g == 20) {
+      early = peak;
+    }
+    if (g == 400) {
+      late = peak;
+    }
+    if (!out) {
+      Check(g > 600, "reverb tail ended too early");
+      Check(late > 0.0f && late < early, "reverb tail did not decay");
+      return;
+    }
+  }
+  Check(false, "reverb tail never ended");
 }
 
 void TestCustomMasteringChannelMixer() {
@@ -1934,19 +2052,23 @@ void TestFiniteFilterTail() {
 
 int main() {
 	TestProgressDrivenWaveformRing();
-	TestWaveformQueueCapacity();
-	TestWaveformRingReuse();
-	TestAtrac9Vibration();
-	TestAtrac9Discrete();
-	TestPcm16RenderOutput();
+        TestStereoPan();
+        TestWaveformQueueCapacity();
+        TestWaveformRingReuse();
+        TestAtrac9Vibration();
+        TestAtrac9Discrete();
+        TestPcm16RenderOutput();
 	TestPatchToRackHandle();
 	TestMasteringGain();
 	TestReverbDryLevel();
-	TestCustomMasteringChannelMixer();
-	TestCustomVoiceStateCapacity();
-	TestSubmixerSetupAndRouting();
-	TestCustomSideChainUserFx();
-	TestWaveformBlockGeometry();
+        TestReverbTail();
+        TestGeomStereoPlacement();
+        TestGeomDoppler();
+        TestCustomMasteringChannelMixer();
+        TestCustomVoiceStateCapacity();
+        TestSubmixerSetupAndRouting();
+        TestCustomSideChainUserFx();
+        TestWaveformBlockGeometry();
 	TestAtrac9ResampleAfterStarvation();
 	TestAtrac9ResampleAcrossFrames();
 	TestResamplingPhaseAfterStarvation();

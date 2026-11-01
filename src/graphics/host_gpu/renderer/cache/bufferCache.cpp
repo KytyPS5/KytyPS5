@@ -27,6 +27,9 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
+constexpr uint64_t DownloadWindowSize = 512 * 1024;
+
 constexpr uint64_t HotFlips      = 8;
 constexpr size_t   HotPagesMax   = 1024;
 constexpr uint64_t HotNotePages  = 16;
@@ -322,10 +325,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-			NoteReadHot(vaddr, size);
+		if (IsRegionGpuModified(vaddr, size)) {
+			const auto start =
+			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
+			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
+			                          buffer.CpuAddress() + buffer.Size());
+			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				NoteReadHot(vaddr, size);
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

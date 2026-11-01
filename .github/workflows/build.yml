@@ -413,9 +413,11 @@ jobs:
           file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
           test -x _Build/linux/install/kyty_updater
+          test -z "$(file _Build/linux/install/kyty_* | grep 'not stripped')"
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
           readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          test -z "$(find _Build/linux/install -name '*.so.*.*' -o -name '*.a' -o -name include)"
           while IFS= read -r -d '' binary; do
             while read -r dependency; do
               test -e "_Build/linux/install/lib/$dependency"

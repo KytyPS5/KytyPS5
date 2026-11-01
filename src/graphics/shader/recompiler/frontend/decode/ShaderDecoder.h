@@ -751,6 +751,7 @@ enum class Opcode {
 	S_TRAP,
 	S_TTRACEDATA,
 	S_INST_PREFETCH,
+	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
 	COUNT

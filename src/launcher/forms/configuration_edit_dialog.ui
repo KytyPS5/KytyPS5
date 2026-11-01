@@ -306,6 +306,12 @@
              </widget>
             </item>
             <item>
+             <widget class="QCheckBox" name="checkBox_guest_tsc">
+              <property name="toolTip"><string>Run the CPU time stamp counter (TSC) at the PS5's 1.6 GHz instead of the host rate. Fixes games that run too fast.</string></property>
+              <property name="text"><string>PS5 TSC rate (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_red_zone_protection">
               <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
               <property name="text"><string>Windows SysV red zone crash protection (experimental)</string></property>

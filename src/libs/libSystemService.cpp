@@ -276,6 +276,16 @@ static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info
 	return OK;
 }
 
+static void KYTY_SYSV_ABI SystemServiceInitializePlayerDialogParam() {
+	PRINT_NAME();
+}
+
+static int KYTY_SYSV_ABI SystemServiceLaunchPlayerDialog() {
+	PRINT_NAME();
+
+	return OK;
+}
+
 } // namespace SystemService
 
 namespace SystemGesture {
@@ -590,6 +600,8 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
 	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
+	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
+	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);
 	SystemGesture::InitSystemGesture_1(s);
 }
 

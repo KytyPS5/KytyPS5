@@ -2139,8 +2139,10 @@ public:
     return m_rasterization_supported;
   }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  void SkipComputeCase() { ++m_skipped_compute_cases; }
   [[nodiscard]] bool RobustPipelinesSupported() const { return m_robust_pipelines; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
+  [[nodiscard]] u32 SkippedComputeCaseCount() const { return m_skipped_compute_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -22356,6 +22358,7 @@ private:
   bool m_rasterization_supported = true;
   bool m_robust_pipelines = true;
   u32   m_skipped_cases          = 0;
+  u32   m_skipped_compute_cases  = 0;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -23179,6 +23182,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.profile->robust_buffer_access && vulkan != nullptr &&
       !vulkan->RobustPipelinesSupported()) {
     std::printf("[compute] %-32s skipped, no byte-granular robustBufferAccess2\n", test.name);
+    vulkan->SkipComputeCase();
     return;
   }
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -55082,6 +55086,10 @@ int main(int argc, char **argv) {
   if (vulkan.SkippedCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
                 vulkan.SkippedCaseCount());
+  }
+  if (vulkan.SkippedComputeCaseCount() > 0) {
+    std::printf("ShaderRecompilerComputeTests: %u compute cases skipped\n",
+                vulkan.SkippedComputeCaseCount());
   }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

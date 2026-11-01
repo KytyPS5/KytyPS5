@@ -4513,6 +4513,44 @@ void TestFloatComparisonInputModes() {
   }
 }
 
+void TestNewShaderRecompilerF32CompareFlushSkipsNormalImmediate() {
+  // A denormal compares like a zero against 0.5, so with flushed inputs only
+  // the compare against 0 or a register flushes the other operand.
+  struct Variant {
+    uint32_t src0;
+    size_t flushes;
+  };
+  for (const auto [src0, flushes] :
+       {Variant{240u, 0u}, Variant{128u, 1u}, Variant{256u + 1u, 2u}}) {
+    const uint32_t shader[] = {
+        EncodeMubuf0(0x0c, 0, false), // buffer_load_dword v0
+        EncodeMubuf1(0, 12, 0),
+        EncodeMubuf0(0x0c, 4, false), // buffer_load_dword v1
+        EncodeMubuf1(1, 12, 0),
+        EncodeVopc(0x01, src0, 0),    // v_cmp_lt_f32 vcc, 0.5 / 0 / v1, v0
+        EncodeVop2(0x01, 3, 128, 1),  // v_cndmask_b32 v3, 0, v1, vcc
+        EncodeMubuf0(0x1c, 8, false), // buffer_store_dword v3
+        EncodeMubuf1(3, 12, 0),
+        EncodeSopp(0x01),
+    };
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    ShaderComputeInputInfo compute{};
+    compute.float_mode = 0xc0; // FP_DENORM 0: f32 inputs flush
+    options.input_info.compute = &compute;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t found = 0;
+    for (auto pos = source.find(" FAbs "); pos != std::string::npos;
+         pos = source.find(" FAbs ", pos + 1)) {
+      found++;
+    }
+    Check(
+        found == flushes,
+        "flushed f32 compare did not flush exactly its non-immediate operands");
+  }
+}
+
 void TestNewShaderRecompilerSignedCompareAlu() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 193),   // s0 = -1
@@ -17367,6 +17405,7 @@ int main() {
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerInteger64CompareEncodings();
   TestFloatComparisonInputModes();
+  TestNewShaderRecompilerF32CompareFlushSkipsNormalImmediate();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();

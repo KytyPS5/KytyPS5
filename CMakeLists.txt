@@ -836,6 +836,16 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
+if(WIN32)
+	add_kyty_full_emulator_test(pthread_priority_tests
+		"${KYTY_TESTS_DIR}/PthreadPriorityTests.cpp")
+	if(BUILD_TESTING)
+		add_test(NAME pthread_priority COMMAND $<TARGET_FILE:pthread_priority_tests>)
+		set_tests_properties(pthread_priority PROPERTIES TIMEOUT 60)
+		add_dependencies(kyty_tests pthread_priority_tests)
+	endif()
+endif()
+
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 

@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -29,6 +30,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+struct RenderContextTestAccess;
 
 class RenderContext {
 public:
@@ -75,6 +77,7 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	friend struct RenderContextTestAccess;
 	void RunMemoryOperation(const char* name, uint64_t vaddr, uint64_t size,
 	                        Common::UniqueFunction<void>&& operation);
 	void DrainBeforeUnmap(uint64_t vaddr, uint64_t size);
@@ -98,6 +101,9 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	RangeSet                  m_suspended; // guarded by m_mapped_ranges_mutex
+	// Counts maps that had to cancel suspended memory here. The kernel cancels earlier, so tests
+	// expect this to stay zero.
+	std::atomic<uint64_t>     m_suspended_map_cancels {0};
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

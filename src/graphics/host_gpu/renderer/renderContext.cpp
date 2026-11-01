@@ -108,6 +108,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 		overlaps_suspended = m_suspended.Intersects(vaddr, size);
 	}
 	if (overlaps_suspended) {
+		m_suspended_map_cancels.fetch_add(1, std::memory_order_relaxed);
 		LOGF("GPU: map over suspended memory cancelled its cache, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);

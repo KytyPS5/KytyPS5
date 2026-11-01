@@ -211,6 +211,13 @@ struct BufferCacheTestAccess {
   }
 };
 
+struct RenderContextTestAccess {
+  // Counts maps that reached the safety net over suspended memory.
+  static uint64_t SuspendedMapCancels(const RenderContext &context) {
+    return context.m_suspended_map_cancels.load();
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -5642,13 +5649,29 @@ public:
     return value;
   }
 
+  using SuspendWords = std::array<uint32_t, kSuspendPages>;
+
+  // Returns the word each page holds when page n holds first_value plus n steps.
+  static SuspendWords PatternWords(uint32_t first_value) {
+    SuspendWords words{};
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      words[page] = first_value + page * kSuspendPatternStep;
+    }
+    return words;
+  }
+
+  // Writes the pattern words into the marker slot of every page of an area.
+  static void WritePagePattern(uint64_t area, uint32_t first_value) {
+    const auto words = PatternWords(first_value);
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      std::memcpy(reinterpret_cast<void *>(area + page * kSuspendPageSize + kSuspendValueOffset),
+                  &words[page], sizeof(uint32_t));
+    }
+  }
+
   // Writes a distinct word into every page and uploads them into a clean cached buffer.
   void PrimeCleanSuspendBuffer(const char *name, const SuspendRig &rig, uint64_t area) {
-    for (uint32_t page = 0; page < kSuspendPages; ++page) {
-      const uint32_t value = SuspendPattern(page);
-      std::memcpy(reinterpret_cast<void *>(area + page * kSuspendPageSize + kSuspendValueOffset),
-                  &value, sizeof(value));
-    }
+    WritePagePattern(area, kSuspendPatternBase);
     auto &cache = rig.context.GetBufferCache();
     // A read-only acquisition may stream instead of caching, so write-acquire and then publish.
     const auto buffer = cache.ObtainBuffer(area, kSuspendBufferSize, true, false);
@@ -5658,10 +5681,11 @@ public:
             "could not cache a clean buffer");
   }
 
-  // Requires each page of the cached buffer to hold the primed word, except the pages in the
-  // changed mask, which must hold the changed word. Syncing first uploads any CPU-dirty page.
-  void RequireNativePages(const char *name, const char *stage, const SuspendRig &rig,
-                          uint64_t area, uint32_t changed_mask) {
+  // Syncs the registered buffer and requires each page to hold its expected word. Returns the
+  // buffer that was read. The sync uploads any CPU-dirty page first.
+  const Libs::Graphics::Buffer *RequireNativeWords(const char *name, const char *stage,
+                                                   const SuspendRig &rig, uint64_t area,
+                                                   const SuspendWords &expected) {
     auto &cache = rig.context.GetBufferCache();
     // Not a read-only ObtainBuffer, which streams a fresh copy of guest memory when any page is
     // CPU-dirty and would compare guest memory with itself. This syncs the registered owner.
@@ -5670,13 +5694,26 @@ public:
             buffer.first == &cache.GetBuffer(cache.FindBuffer(area, kSuspendBufferSize)),
             "the native read did not come from the registered buffer");
     for (uint32_t page = 0; page < kSuspendPages; ++page) {
-      const bool changed = ((changed_mask >> page) & 1u) != 0;
-      const uint32_t expected = changed ? kSuspendChangedValue : SuspendPattern(page);
       const auto offset = buffer.second + page * kSuspendPageSize + kSuspendValueOffset;
       Require(name, stage,
-              ReadSuspendNativeValue(name, rig.scheduler, *buffer.first, offset) == expected,
+              ReadSuspendNativeValue(name, rig.scheduler, *buffer.first, offset) ==
+                  expected[page],
               "native buffer page holds the wrong word");
     }
+    return buffer.first;
+  }
+
+  // Requires each page of the cached buffer to hold the primed word, except the pages in the
+  // changed mask, which must hold the changed word.
+  void RequireNativePages(const char *name, const char *stage, const SuspendRig &rig,
+                          uint64_t area, uint32_t changed_mask) {
+    auto words = PatternWords(kSuspendPatternBase);
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      if (((changed_mask >> page) & 1u) != 0) {
+        words[page] = kSuspendChangedValue;
+      }
+    }
+    (void)RequireNativeWords(name, stage, rig, area, words);
   }
 
   // Overwrites the marker word of one page in guest memory.
@@ -5899,6 +5936,347 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // End to end checks of --keep-gpu-cache-on-reuse. They call the real kernel release and map
+  // functions while a real RenderContext is installed, so the kernel table, the GPU side and the
+  // page protection all run together. Each case owns an area so earlier cases cannot satisfy it.
+  // First address of the case areas.
+  static constexpr uint64_t kKeepAreaBase = 0x000000020c000000ull;
+  // Distance between case areas. The different base keeps them clear of the suspend fixture.
+  static constexpr uint64_t kKeepAreaStride = 0x200000;
+  // Offset of the alias mapping. Inside one stride and past kKeepSize, so it never overlaps the area.
+  static constexpr uint64_t kKeepAliasDelta = 0x80000;
+  // Offset of the scratch mapping. Inside one stride and past kKeepSize, so it never overlaps.
+  static constexpr uint64_t kKeepScratchDelta = 0x100000;
+  // Size of every direct block and mapping in these cases.
+  static constexpr uint64_t kKeepSize = 0x10000;
+  // Alignment of every direct block.
+  static constexpr uint64_t kKeepAlignment = 0x10000;
+  // First word of the pattern that a second owner of the same physical memory writes.
+  static constexpr uint32_t kKeepForeignBase = 0x77770000u;
+  // First word the guest writes after a resume. Later writes in a case add to it.
+  static constexpr uint32_t kKeepWrittenValue = 0x0badc0deu;
+  // The page that the write-after-resume cases touch.
+  static constexpr uint32_t kKeepWrittenPage = 2;
+  // The page that the repeated-cycle case writes before its first release.
+  static constexpr uint32_t kKeepEarlyPage = 1;
+  // Mask with a bit for every cached page.
+  static constexpr uint32_t kKeepAllPages = (1u << kSuspendPages) - 1u;
+  // The rig's base and direct_offset are unused here, because these cases map their own blocks at
+  // KeepArea addresses. Its stride differs from the suspend fixture's for the same reason.
+  static constexpr int64_t kKeepNoRigOffset = -1;
+
+  // Returns the address of the area that a case owns.
+  static uint64_t KeepArea(uint32_t index) {
+    return kKeepAreaBase + uint64_t{index} * kKeepAreaStride;
+  }
+
+  // Allocates a block of direct memory and returns its physical offset.
+  static int64_t KeepAllocate(const char *name) {
+    int64_t offset = -1;
+    Require(name, "allocate",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), kKeepSize,
+                kKeepAlignment, 0, &offset) == 0,
+            "direct-memory allocation failed");
+    return offset;
+  }
+
+  // Maps a direct block read-write at a fixed address, the way a game remaps released memory.
+  static void KeepMap(const char *name, uint64_t address, int64_t offset) {
+    void *mapped = reinterpret_cast<void *>(address);
+    Require(name, "map",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, kKeepSize, kSuspendMapProtection, kSuspendMapFixed, offset,
+                kKeepAlignment) == 0 &&
+                mapped == reinterpret_cast<void *>(address),
+            "fixed direct-memory mapping failed");
+  }
+
+  // Unmaps a mapping with the real kernel call.
+  static void KeepUnmap(const char *name, uint64_t address) {
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(address, kKeepSize) == 0,
+            "direct-memory unmap failed");
+  }
+
+  // Releases a direct block, which also unmaps every alias of it.
+  static void KeepRelease(const char *name, int64_t offset) {
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(offset, kKeepSize) == 0,
+            "direct-memory release failed");
+  }
+
+  // Overwrites the marker word of one guest page through the guest mapping.
+  static void KeepWriteWord(uint64_t address, uint32_t page, uint32_t value) {
+    std::memcpy(reinterpret_cast<void *>(address + page * kSuspendPageSize + kSuspendValueOffset),
+                &value, sizeof(value));
+  }
+
+  // Reads the marker word of one guest page through the guest mapping.
+  static uint32_t KeepReadGuestWord(uint64_t address, uint32_t page) {
+    uint32_t value = 0;
+    std::memcpy(&value,
+                reinterpret_cast<void *>(address + page * kSuspendPageSize + kSuspendValueOffset),
+                sizeof(value));
+    return value;
+  }
+
+  // Returns a bit per cached page that still needs an upload. Read it before any sync, because
+  // a sync clears the bits.
+  static uint32_t KeepCpuDirtyPages(const SuspendRig &rig, uint64_t area) {
+    uint32_t mask = 0;
+    for (uint32_t page = 0; page < kSuspendPages; ++page) {
+      if (rig.context.GetBufferCache().IsRegionCpuModified(area + page * kSuspendPageSize,
+                                                           kSuspendPageSize)) {
+        mask |= 1u << page;
+      }
+    }
+    return mask;
+  }
+
+  // Returns the registered buffer over an area, to compare with the one a later sync reads.
+  static const Libs::Graphics::Buffer *KeepRegisteredBuffer(const SuspendRig &rig,
+                                                            uint64_t area) {
+    auto &cache = rig.context.GetBufferCache();
+    return &cache.GetBuffer(cache.FindBuffer(area, kSuspendBufferSize));
+  }
+
+  // Syncs and checks the words as RequireNativeWords does, and also requires the buffer to be the
+  // one registered earlier, because a kept cache must not be rebuilt.
+  void RequireKeptNative(const char *name, const char *stage, const SuspendRig &rig,
+                         uint64_t area, const SuspendWords &expected,
+                         const Libs::Graphics::Buffer *kept) {
+    Require(name, stage, RequireNativeWords(name, stage, rig, area, expected) == kept,
+            "the sync read a different buffer than the one that was kept");
+  }
+
+  // Caches the primed words at the area, then releases the block. Returns the block's offset.
+  int64_t KeepPrimeAndRelease(const char *name, const SuspendRig &rig, uint64_t area) {
+    const int64_t offset = KeepAllocate(name);
+    KeepMap(name, area, offset);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    KeepRelease(name, offset);
+    return offset;
+  }
+
+  // Requires the next allocation to return the offset that was just released.
+  static void KeepRequireSameOffset(const char *name, int64_t released) {
+    Require(name, "same offset", KeepAllocate(name) == released,
+            "the allocator did not return the released offset, so the case proves nothing");
+  }
+
+  // Counts maps that fell back to the RenderContext safety net.
+  static uint64_t KeepSafetyNetCount(const SuspendRig &rig) {
+    return RenderContextTestAccess::SuspendedMapCancels(rig.context);
+  }
+
+  // Releases a mapped block and maps it back at the same address, which the kernel may resume.
+  void KeepReleaseAndRemap(const char *name, const SuspendRig &rig, uint64_t area,
+                           int64_t offset) {
+    KeepRelease(name, offset);
+    Require(name, "suspended", rig.context.IsSuspended(area, kKeepSize),
+            "release did not suspend, so the case proves nothing");
+    KeepRequireSameOffset(name, offset);
+    KeepMap(name, area, offset);
+  }
+
+  // Release and exact remap. The cache stays clean with the flag on and is invalidated without it.
+  void CheckKeepExactRemap(const char *name, const SuspendRig &rig, uint32_t index, bool keep) {
+    const auto area = KeepArea(index);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(keep);
+    const int64_t offset = KeepAllocate(name);
+    KeepMap(name, area, offset);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    const Libs::Graphics::Buffer *kept = KeepRegisteredBuffer(rig, area);
+    KeepRelease(name, offset);
+    Require(name, "suspended only with the flag",
+            rig.context.IsSuspended(area, kKeepSize) == keep &&
+                !rig.context.IsMapped(area, kSuspendBufferSize),
+            "release did not suspend with the flag on, or suspended with it off");
+    KeepRequireSameOffset(name, offset);
+    KeepMap(name, area, offset);
+    Require(name, "mapped again",
+            rig.context.IsMapped(area, kKeepSize) && !rig.context.IsSuspended(area, kKeepSize),
+            "the remap did not map the range back");
+    Require(name, keep ? "no re-upload pending" : "re-upload pending",
+            KeepCpuDirtyPages(rig, area) == (keep ? 0u : kKeepAllPages),
+            "the dirty pages do not match the flag");
+    const auto *synced = RequireNativeWords(name, "exact remap data", rig, area,
+                                            PatternWords(kSuspendPatternBase));
+    Require(name, "same buffer kept", !keep || synced == kept,
+            "the flag-on remap did not keep the registered buffer");
+    KeepUnmap(name, area);
+    KeepRelease(name, offset);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // A different physical offset at the same address must not see the old cache.
+  void CheckKeepDifferentOffset(const char *name, const SuspendRig &rig, uint32_t index) {
+    const auto area = KeepArea(index);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    const int64_t released = KeepPrimeAndRelease(name, rig, area);
+    Require(name, "suspended", rig.context.IsSuspended(area, kKeepSize),
+            "release did not suspend, so the case proves nothing");
+    // Taking the released offset forces the next allocation to a different one.
+    KeepRequireSameOffset(name, released);
+    const int64_t other = KeepAllocate(name);
+    Require(name, "different offset", other != released, "the allocator returned the same offset");
+    const auto scratch = area + kKeepScratchDelta;
+    KeepMap(name, scratch, other);
+    WritePagePattern(scratch, kKeepForeignBase);
+    KeepUnmap(name, scratch);
+    KeepMap(name, area, other);
+    Require(name, "guest sees the new words",
+            KeepReadGuestWord(area, 0) == kKeepForeignBase,
+            "the guest does not see the other block, so the case proves nothing");
+    (void)RequireNativeWords(name, "different offset data", rig, area,
+                             PatternWords(kKeepForeignBase));
+    KeepUnmap(name, area);
+    KeepRelease(name, other);
+    KeepRelease(name, released);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // Bytes changed through another alias while the range was released must not be hidden.
+  void CheckKeepAliasWrite(const char *name, const SuspendRig &rig, uint32_t index) {
+    const auto area = KeepArea(index);
+    const auto alias = area + kKeepAliasDelta;
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    const int64_t offset = KeepPrimeAndRelease(name, rig, area);
+    Require(name, "suspended", rig.context.IsSuspended(area, kKeepSize),
+            "release did not suspend, so the case proves nothing");
+    KeepRequireSameOffset(name, offset);
+    KeepMap(name, alias, offset);
+    WritePagePattern(alias, kKeepForeignBase);
+    KeepUnmap(name, alias);
+    KeepMap(name, area, offset);
+    Require(name, "guest sees the alias words",
+            KeepReadGuestWord(area, 0) == kKeepForeignBase,
+            "the guest does not see the alias write, so the case proves nothing");
+    (void)RequireNativeWords(name, "alias data", rig, area, PatternWords(kKeepForeignBase));
+    KeepUnmap(name, area);
+    KeepRelease(name, offset);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // A guest write after a resume must fault, dirty only its page and reach the GPU.
+  void CheckKeepWriteAfterResume(const char *name, const SuspendRig &rig, uint32_t index) {
+    const auto area = KeepArea(index);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    const int64_t offset = KeepAllocate(name);
+    KeepMap(name, area, offset);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    const Libs::Graphics::Buffer *kept = KeepRegisteredBuffer(rig, area);
+    KeepReleaseAndRemap(name, rig, area, offset);
+    // A plain remap leaves every page dirty, so this pins the case to the resume path.
+    Require(name, "resumed", KeepCpuDirtyPages(rig, area) == 0u,
+            "the remap did not resume, so the case proves nothing");
+    KeepWriteWord(area, kKeepWrittenPage, kKeepWrittenValue);
+    Require(name, "only the written page is dirty",
+            KeepCpuDirtyPages(rig, area) == (1u << kKeepWrittenPage),
+            "the guest write was not seen by the protection on the resumed view");
+    auto words = PatternWords(kSuspendPatternBase);
+    words[kKeepWrittenPage] = kKeepWrittenValue;
+    RequireKeptNative(name, "write after resume data", rig, area, words, kept);
+    KeepUnmap(name, area);
+    KeepRelease(name, offset);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // Several cycles with guest writes between them. A dirty bit must survive a suspend, and
+  // protection must work again after a resume and after an earlier fault.
+  void CheckKeepRepeatedCycles(const char *name, const SuspendRig &rig, uint32_t index) {
+    const auto area = KeepArea(index);
+    constexpr uint32_t early_bit = 1u << kKeepEarlyPage;
+    constexpr uint32_t late_bit = 1u << kKeepWrittenPage;
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    const int64_t offset = KeepAllocate(name);
+    KeepMap(name, area, offset);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    const Libs::Graphics::Buffer *kept = KeepRegisteredBuffer(rig, area);
+    auto words = PatternWords(kSuspendPatternBase);
+    // Cycle 1 writes before the release and does not sync, so the dirty bit must cross the suspend.
+    KeepWriteWord(area, kKeepEarlyPage, kKeepWrittenValue);
+    words[kKeepEarlyPage] = kKeepWrittenValue;
+    KeepReleaseAndRemap(name, rig, area, offset);
+    Require(name, "dirty bit crossed the suspend", KeepCpuDirtyPages(rig, area) == early_bit,
+            "the page written before the release is not exactly the dirty one");
+    RequireKeptNative(name, "cycle 1 data", rig, area, words, kept);
+    // Cycle 2 writes a second page after the resume, then syncs.
+    KeepWriteWord(area, kKeepWrittenPage, kKeepWrittenValue + 1);
+    words[kKeepWrittenPage] = kKeepWrittenValue + 1;
+    Require(name, "write after resume", KeepCpuDirtyPages(rig, area) == late_bit,
+            "the write after the resume is not exactly the dirty page");
+    RequireKeptNative(name, "cycle 2 data", rig, area, words, kept);
+    Require(name, "synced clean", KeepCpuDirtyPages(rig, area) == 0u, "the sync left dirty pages");
+    // Cycle 3 is a release and remap with no write first, then the same page faults again.
+    KeepReleaseAndRemap(name, rig, area, offset);
+    Require(name, "clean after cycle 3", KeepCpuDirtyPages(rig, area) == 0u,
+            "a clean cache was dirty after the remap");
+    KeepWriteWord(area, kKeepWrittenPage, kKeepWrittenValue + 2);
+    words[kKeepWrittenPage] = kKeepWrittenValue + 2;
+    Require(name, "protection re-armed after a fault", KeepCpuDirtyPages(rig, area) == late_bit,
+            "a page that faulted earlier was not protected again");
+    RequireKeptNative(name, "cycle 3 data", rig, area, words, kept);
+    KeepUnmap(name, area);
+    KeepRelease(name, offset);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // A release while the GPU is stopping must not be suspended, and a remap then is a plain map.
+  // "Not suspended" only discriminates here because case 1 proved that the same release does
+  // suspend when the GPU is running.
+  void CheckKeepGpuStopping(const char *name, const SuspendRig &rig, uint32_t index) {
+    const auto area = KeepArea(index);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    const int64_t offset = KeepAllocate(name);
+    KeepMap(name, area, offset);
+    PrimeCleanSuspendBuffer(name, rig, area);
+    rig.scheduler.Finish();
+    rig.context.ShutdownGpu();
+    KeepRelease(name, offset);
+    Require(name, "not suspended while stopping",
+            !rig.context.IsSuspended(area, kKeepSize),
+            "a release with the GPU stopping suspended the range");
+    KeepRequireSameOffset(name, offset);
+    KeepMap(name, area, offset);
+    Require(name, "plain map after stopping",
+            KeepCpuDirtyPages(rig, area) == kKeepAllPages &&
+                !rig.context.IsSuspended(area, kKeepSize),
+            "the remap after a stopping release kept the cache");
+    KeepUnmap(name, area);
+    KeepRelease(name, offset);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // Runs the end to end cases against the real kernel with a real RenderContext installed.
+  void CheckKeepGpuCacheOnReuse() {
+    constexpr const char *name = "KeepGpuCacheOnReuse";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    Libs::LibKernel::Memory::InstallGpuResources(&context);
+    const SuspendRig rig{context, scheduler, kKeepAreaBase, kKeepNoRigOffset};
+    CheckKeepExactRemap(name, rig, 0, true);
+    CheckKeepExactRemap(name, rig, 1, false);
+    CheckKeepDifferentOffset(name, rig, 2);
+    CheckKeepAliasWrite(name, rig, 3);
+    CheckKeepWriteAfterResume(name, rig, 4);
+    CheckKeepRepeatedCycles(name, rig, 5);
+    // The kernel cancels before any map, so the last resort in MapMemory must never have run.
+    Require(name, "safety net did not fire", KeepSafetyNetCount(rig) == 0,
+            "a map reached the RenderContext safety net over suspended memory");
+    CheckKeepGpuStopping(name, rig, 6);
+    Require(name, "safety net did not fire when stopping", KeepSafetyNetCount(rig) == 0,
+            "a map reached the RenderContext safety net over suspended memory");
+    Libs::LibKernel::Memory::InstallGpuResources(nullptr);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -55165,6 +55543,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheSuspendResume();
+    vulkan.CheckKeepGpuCacheOnReuse();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {

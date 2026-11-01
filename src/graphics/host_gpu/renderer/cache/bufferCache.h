@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -91,8 +92,19 @@ public:
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
+	void               PublishReadHot();
+	void               DecayReadHot();
+	void               SupersedeAllPublishes();
+	void               SupersedePublishes(uint64_t vaddr, uint64_t size);
 
 private:
+	struct PublishEntry {
+		uint64_t vaddr      = 0;
+		uint64_t size       = 0;
+		bool     superseded = false;
+	};
+	using PublishBatch = std::vector<PublishEntry>;
+
 	friend struct BufferCacheTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
@@ -127,6 +139,8 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	void               NoteReadHot(uint64_t vaddr, uint64_t size);
+	void               ConfirmPublish(const std::shared_ptr<PublishBatch>& batch);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -152,6 +166,11 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::map<uint64_t, uint64_t>                      m_hot_pages;
+	RangeSet                                          m_hot_ranges;
+	RangeSet                                          m_publish_ranges;
+	std::vector<std::shared_ptr<PublishBatch>>        m_inflight_publishes;
+	uint64_t                                          m_hot_flip = 0;
 };
 
 } // namespace Libs::Graphics

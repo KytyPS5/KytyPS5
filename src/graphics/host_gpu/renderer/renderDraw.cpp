@@ -1234,6 +1234,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
+	if (std::any_of(
+	        vertex_stages.begin(), vertex_stages.end(),
+	        [](const auto& stage) { return stage.stage.module->info.has_address_writes; }) ||
+	    (state.ps_active && state.ps_input_info.stage.module->info.has_address_writes)) {
+		m_context.GetBufferCache().SupersedeAllPublishes();
+	}
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {

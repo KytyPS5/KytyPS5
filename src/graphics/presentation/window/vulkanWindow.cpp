@@ -518,6 +518,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		shader_clock.pNext = supported_features2.pNext;
 		supported_features2.pNext = &shader_clock;
 	}
+	const bool compute_derivatives_extension =
+	    HasExtension(device_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_derivatives {};
+	if (compute_derivatives_extension) {
+		compute_derivatives.pNext = supported_features2.pNext;
+		supported_features2.pNext = &compute_derivatives;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -622,6 +629,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
+	const bool compute_derivatives_enabled =
+	    compute_derivatives_extension && compute_derivatives.computeDerivativeGroupLinear;
+	LOGF("Vulkan compute derivatives support: %s\n",
+	     compute_derivatives_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -747,6 +758,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
+	}
+	if (compute_derivatives_enabled) {
+		compute_derivatives.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &compute_derivatives;
 	}
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
@@ -1136,6 +1151,7 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
 		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

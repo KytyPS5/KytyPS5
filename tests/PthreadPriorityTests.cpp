@@ -1,6 +1,5 @@
 #include "common/common.h"
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
 
 #include "common/emulatorConfig.h"
@@ -119,10 +118,8 @@ void TestPriorities() {
 }
 
 }
-#endif
 
 int main() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -136,6 +133,5 @@ int main() {
   TestPriorities();
   subsystems.Destroy();
   std::printf("PthreadPriorityTests: all cases passed\n");
-#endif
   return 0;
 }

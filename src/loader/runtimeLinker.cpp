@@ -1697,7 +1697,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const uint64_t tsc_multiplier =
+	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1815,20 +1818,21 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
-			                module_name));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
+			    module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result = PatchGuestInstructions(
+			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+			    GetGuestInstructionHostFeatures(), tsc_multiplier);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
+			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -1841,6 +1845,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (totals.rdtsc.found != 0) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
+			                totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};

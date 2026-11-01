@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/logging/log.h"
+#include "common/parallelFor.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -80,8 +81,9 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters);
+	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
+	       mesh_task] = stage;
+	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
 } // namespace
@@ -153,35 +155,41 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
-	Log::WriteToConsoleAndLog(
-	    fmt::format("Shader cache: compiling shaders and pipelines from {} ({:.1f} MB)\n",
-	                Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0));
-	std::vector<GraphicsPipelineKey> pipelines;
-	auto                             records = std::span<const uint8_t>(bytes);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
+	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
+	    Common::ParallelThreads()));
+	auto       records = std::span<const uint8_t>(bytes);
 	const bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (reusable) {
 		records = records.subspan(header.size());
-		while (LoadRecord(records, pipelines)) {
+		while (LoadRecord(records)) {
 		}
 	}
 	// A damaged record ends the store; the records before it stay.
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
 
 	const auto modules = MapModules();
-	for (const auto& key: pipelines) {
-		Pipeline pipeline;
-		if (CreateGraphicsPipeline(pipeline, key, modules)) {
-			m_graphics_pipelines.emplace(key, pipeline);
-		}
+	std::vector<Common::UniqueFunction<void>> jobs;
+	jobs.reserve(m_graphics_pipelines.size() + modules.size());
+	for (auto& node: m_graphics_pipelines) {
+		jobs.emplace_back([this, &modules, &node] {
+			CreateGraphicsPipeline(node.second, node.first, modules);
+		});
 	}
 	// A compute pipeline depends only on its module.
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-			CreatePipelineInternal(m_graphics, m_compute_pipelines[module->id], *module,
-			                       m_driver_cache);
+			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
+				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
+			});
 		}
 	}
+	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	// A key with a stage missing from the store keeps no pipeline.
+	std::erase_if(m_graphics_pipelines,
+	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
 	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
 		CheckpointDriverCache();
 	}
@@ -194,8 +202,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	        .count()));
 }
 
-bool PipelineCache::LoadRecord(std::span<const uint8_t>&        records,
-                               std::vector<GraphicsPipelineKey>& pipelines) {
+bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 	Frame frame;
 	if (records.size() < sizeof(frame)) {
 		return false;
@@ -249,7 +256,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>&        records,
 			if (!complete()) {
 				return false;
 			}
-			pipelines.push_back(key);
+			// WarmUp creates the pipeline once every record is loaded.
+			m_graphics_pipelines.try_emplace(key);
 			break;
 		}
 		case Record::TessellationLayout: {

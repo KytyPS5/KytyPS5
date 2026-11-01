@@ -380,7 +380,7 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
@@ -399,7 +399,7 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index), [&]() {
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
 	    });
 }
@@ -561,11 +561,14 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
-	EmitIfCondition(
-	    ctx.state, BufferIndexInBounds(ctx, inst, mem, resource,
-	        EmitMemoryElementInBounds(ctx.state, resource, index)), [&]() {
-		    StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
-	    });
+	// 32-bit views merge subwords in a compare-exchange loop, and out-of-range atomics return
+	// undefined values.
+	const auto in_bounds = resource.element_bits < 32u
+	                           ? EmitStorageElementInBounds(ctx.state, resource, index)
+	                           : EmitMemoryElementInBounds(ctx.state, resource, index);
+	EmitIfCondition(ctx.state, BufferIndexInBounds(ctx, inst, mem, resource, in_bounds), [&]() {
+		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
+	});
 }
 
 void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
@@ -632,7 +635,7 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	if (resource.object_pointer == 0u) return;
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
-	    EmitMemoryElementInBounds(ctx.state, resource, index));
+	    EmitStorageElementInBounds(ctx.state, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -1604,10 +1607,18 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
-	const auto element = Binary(
+	auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	const auto condition = EmitMemoryElementInBounds(state, access, element);
+	// The device computes byte offsets in 32 bits, so elements from 2^30 on would wrap back into
+	// the range; the host prefix adds at most 63.
+	constexpr uint32_t last_element = UINT32_MAX >> 2u;
+	if (state.profile.robust_buffer_access &&
+	    (!offset.IsImmediate() || (offset.U32() >> 2u) + (mem.offset >> 2u) > last_element - 63u)) {
+		element = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, element,
+		                                                  ConstantU32(state, last_element));
+	}
+	const auto condition = EmitStorageElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
 		               state, EmitMemoryElementPointer(state, access, element));

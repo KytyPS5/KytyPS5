@@ -1720,9 +1720,9 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uin
 	return InstructionWritesScalarCode(inst, code);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, uint32_t wave_size,
-                              std::vector<uint32_t>& crossed_calls) {
+std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                                             uint32_t before, uint32_t code, uint32_t wave_size,
+                                             std::vector<uint32_t>& crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1748,7 +1748,7 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
 		}
 		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			EXIT_IF(definition && *definition != index);
+			if (definition && *definition != index) return std::nullopt;
 			definition = index;
 			continue;
 		}
@@ -1758,7 +1758,7 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		}
 	}
 	EXIT_IF(!definition);
-	return *definition;
+	return definition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

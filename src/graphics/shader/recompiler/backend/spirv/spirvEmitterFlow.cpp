@@ -738,10 +738,21 @@ uint32_t EmitLaneId(EmitterState& state) {
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto index  = inst.Arg(0).U32();
-	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+	const auto count  = state.mesh_payload != 0 ? IR::PushData::MeshTaskPayloadDwordCount
+	                                            : IR::PushData::MeshDrawDwordCount;
+	if (state.program.stage != ShaderType::Mesh || index >= count) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	return EmitPushDataLoad(state, ConstantU32(state, index));
+	if (state.mesh_payload == 0) {
+		return EmitPushDataLoad(state, ConstantU32(state, index));
+	}
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassTaskPayloadWorkgroupEXT),
+	    pointer, state.mesh_payload, ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {

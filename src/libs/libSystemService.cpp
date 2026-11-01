@@ -262,10 +262,26 @@ static int KYTY_SYSV_ABI SystemServiceDisableMusicPlayer() {
 	return OK;
 }
 
+// The counterpart of sceSystemServiceDisableMusicPlayer(). A title can disable the system
+// background music player, and this call re-enables it. It's implemented whit a stub and returns 0.
+static int KYTY_SYSV_ABI sceSystemServiceReenableMusicPlayer() {
+	return OK;
+}
+
 static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info) {
 	PRINT_NAME();
 
 	LOGF("\t info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
+
+	return OK;
+}
+
+static void KYTY_SYSV_ABI SystemServiceInitializePlayerDialogParam() {
+	PRINT_NAME();
+}
+
+static int KYTY_SYSV_ABI SystemServiceLaunchPlayerDialog() {
+	PRINT_NAME();
 
 	return OK;
 }
@@ -582,7 +598,10 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("Q3utJvma4Mo", SystemService::SystemServiceSetNoticeScreenSkipFlag);
 	LIB_FUNC("XbbJC3E+L5M", SystemService::SystemServicePowerTick);
 	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
+	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
+	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
+	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);
 	SystemGesture::InitSystemGesture_1(s);
 }
 

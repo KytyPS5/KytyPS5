@@ -239,7 +239,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
 	return {.maintenance8           = graphics.maintenance8_enabled,
 	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
-	        .device_clock_period_ps = graphics.device_clock_period_ps};
+	        .device_clock_period_ps = graphics.device_clock_period_ps,
+	        .robust_buffer_access   = graphics.robust_buffer_access_enabled};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -343,6 +344,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	} else if (key.stage == ShaderType::Pixel &&
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
+	} else if (key.stage == ShaderType::Mesh) {
+		module.mesh_task = options.input_info.vertex->indirect_draw;
 	}
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
@@ -722,6 +725,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				    vertex_params[0].hash));
 			}
 			return;
+		}
+		// A task shader launches each record's groups and passes its draw parameters in a
+		// payload beside the LDS, the allocation pair and the Layer array; without room for
+		// it, the CPU reads the records.
+		if (state.indirect_draw &&
+		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
+		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+		        limits.maxMeshPayloadAndSharedMemorySize) {
+			vertex_info[0].indirect_offsets = state.indirect_offsets;
+			vertex_info[0].indirect_draw    = true;
 		}
 	}
 	ShaderParams pixel_params;

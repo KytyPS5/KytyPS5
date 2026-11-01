@@ -1125,12 +1125,6 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
-	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
-		Log::WriteToConsoleAndLog(
-		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
-		    "displaying PQ video-out pixels unchanged.\n");
-	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,

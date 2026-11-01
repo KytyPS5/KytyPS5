@@ -37,6 +37,23 @@ struct NetEpollEvent {
 static_assert(sizeof(NetEpollData) == 8);
 static_assert(sizeof(NetEpollEvent) == 24);
 
+struct NetResolverAddr {
+	uint32_t addr;
+	uint32_t addr_reserved[3];
+	int      af;
+	int      reserved[3];
+};
+
+struct NetResolverInfo {
+	NetResolverAddr addrs[10];
+	int             records;
+	int             dns4records;
+	int             reserved[14];
+};
+
+static_assert(sizeof(NetResolverAddr) == 32);
+static_assert(sizeof(NetResolverInfo) == 384);
+
 int KYTY_SYSV_ABI NetInit();
 int KYTY_SYSV_ABI NetTerm();
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
@@ -46,6 +63,9 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      NetResolverInfo* info, int timeout, int retry,
+                                                      int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
 const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size);
 int KYTY_SYSV_ABI         NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len);
@@ -197,6 +217,7 @@ int KYTY_SYSV_ABI  NpRegisterNpReachabilityStateCallback(void* callback, void* u
 int KYTY_SYSV_ABI  NpGetNpId(int user_id, NpId* np_id);
 int KYTY_SYSV_ABI  NpGetOnlineId(int user_id, NpOnlineId* online_id);
 int KYTY_SYSV_ABI  NpGetAccountIdA(int user_id, uint64_t* account_id);
+int KYTY_SYSV_ABI  NpGetUserIdByAccountId(uint64_t account_id, int* user_id);
 int KYTY_SYSV_ABI  NpGetAccountCountryA(int user_id, void* country_code);
 int KYTY_SYSV_ABI  NpGetAccountAge(int req_id, int user_id, uint8_t* age);
 int KYTY_SYSV_ABI  NpGetAccountLanguage2(int req_id, int user_id, void* language_code);

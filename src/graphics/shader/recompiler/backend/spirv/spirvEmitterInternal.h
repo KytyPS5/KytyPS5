@@ -144,6 +144,7 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_payload                          = 0;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -449,6 +450,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+// EmitMemoryElementInBounds, or true for storage buffers the device bounds-checks; only
+// loads and plain stores may use it.
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

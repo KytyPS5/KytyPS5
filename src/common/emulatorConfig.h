@@ -69,6 +69,7 @@ struct ConfigOptions {
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
 	uint32_t               vblank_frequency            = 60;
@@ -132,6 +133,7 @@ bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
 bool     AmdCpuEnabled();
+bool     GuestTscEnabled();
 bool     IsNetworkConnected();
 bool     PsnEmulationEnabled();
 uint32_t GetVblankFrequency();

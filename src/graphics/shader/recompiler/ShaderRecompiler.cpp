@@ -504,8 +504,11 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code,
-		                                             source.wave_size, crossed_calls);
+		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code,
+		                                                  source.wave_size, crossed_calls);
+		// Several reaching definitions select the value on the GPU, so no SRT walk evaluates it.
+		if (!definition) return Value(&block.AppendNewInst(ValueOpcode::UndefU32));
+		const auto index = *definition;
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}

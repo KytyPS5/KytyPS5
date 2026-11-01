@@ -2245,6 +2245,17 @@ void TestDisabledDebugBranches() {
   }
 }
 
+void TestOrderedPsDoneEndsProgram() {
+  using namespace ShaderRecompiler;
+  // Captured PPSA05366 POPS pixel shaders end in s_endpgm_ordered_ps_done, padded to 16 bytes.
+  const std::array shader = {EncodeSopp(0x1e), 0u, 0u, 0u};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 1u &&
+            decoded.instructions.front().opcode == Decoder::Opcode::S_ENDPGM,
+        "s_endpgm_ordered_ps_done did not end the program");
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -11125,6 +11136,14 @@ void TestMemoryFedScalarLeafCall() {
   const auto skipped = PrepareShaderSource(gpu_callable, options);
   Check(skipped.unsupported_call_pc == 12u && skipped.calls.empty(),
         "GPU-buffer callable did not report its unsupported call site");
+  // The table index s20 is loop-carried, so two definitions reach the call.
+  const uint32_t loop_callable[] = {EncodeSmem0(0x08, 20, 0), 0xfa000000u,
+      EncodeSmem0(0x09, 14, 0), 20u << 25u, EncodeSop1(0x21, 14, 14),
+      EncodeSmem0(0x08, 20, 0), 20u << 25u, EncodeSopc(0x07, 20, 128),
+      EncodeSopp(0x05, 0xfff9u), EncodeSopp(0x01)};
+  const auto loop_skipped = PrepareShaderSource(loop_callable, options);
+  Check(loop_skipped.unsupported_call_pc == 16u && loop_skipped.calls.empty(),
+        "loop-selected GPU-buffer callable did not report its unsupported call site");
   auto source = PrepareShaderSource(shader, options);
   Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
             source.decoded.instructions[source.calls.front().instruction].branch_target == UINT32_MAX,
@@ -17414,6 +17433,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
+  TestOrderedPsDoneEndsProgram();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

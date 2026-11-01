@@ -119,7 +119,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		// Null descriptors read zero and drop writes, with or without shader bounds checks.
+		return {nullptr, 0, vk::WholeSize};
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
@@ -908,13 +909,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
-	constexpr auto                 GraphicsStages =
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eMeshEXT |
-	    vk::ShaderStageFlagBits::eTessellationControl |
-	    vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eFragment;
-	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-	                                       ? vk::ShaderStageFlagBits::eFragment
-	                                       : vk::ShaderStageFlags {};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = prepared->runtime->module->info;
@@ -927,12 +921,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image_descriptor_count += count;
 			}
 		}
-		const auto shader_stage = NativeShaderStage(program.stage);
-		push_stages |= shader_stage;
-		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
-		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
-		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
-		         shader_stage != vk::ShaderStageFlagBits::eCompute));
+		EXIT_IF(!(pipeline.push_stages & NativeShaderStage(program.stage)));
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
@@ -1017,7 +1006,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
 						for (const auto& view: descriptors.buffers) {
-							EXIT_IF(view.buffer == nullptr);
+							EXIT_IF(view.range == 0);
 						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;
@@ -1086,8 +1075,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+		                        sizeof(push_data), push_data.dwords.data());
 	}
 
 	if (!m_descriptor_writes.empty()) {

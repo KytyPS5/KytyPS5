@@ -625,6 +625,20 @@ struct DrawIndexBufferSource {
 	uint32_t      guest_element_size = 0;
 };
 
+// The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
+struct MeshTaskParams {
+	vk::DeviceAddress records        = 0;
+	uint64_t          index_address  = 0;
+	uint32_t          stride         = 0;
+	uint32_t          index_size     = 0;
+	uint32_t          index_limit    = 0;
+	uint32_t          primitive_size = 0;
+	uint32_t          group_step     = 0;
+	uint32_t          max_groups     = 0;
+	uint32_t          max_instances  = 0;
+	uint32_t          max_total      = 0;
+};
+
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
@@ -1072,11 +1086,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
-	const auto vertex_stages = state.VertexStages();
-	const bool mesh_active = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
-	uint32_t   mesh_groups = 0;
+	const auto  vertex_stages = state.VertexStages();
+	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
+	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
+	const auto& mesh          = state.vertex_info[0].mesh;
+	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
+	uint32_t    mesh_groups   = 0;
 	if (mesh_active) {
-		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
 		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
@@ -1088,12 +1104,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
+	}
+	if (mesh_task) {
+		EXIT_NOT_IMPLEMENTED(emit.indirect.count > std::min(limits.maxTaskWorkGroupCount[0],
+		                                                    limits.maxTaskWorkGroupTotalCount));
+	} else if (mesh_active) {
 		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
 		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
@@ -1148,6 +1168,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	vk::DeviceAddress task_params = 0;
+	if (mesh_task) {
+		const MeshTaskParams params {
+		    .records        = args_buffer.first->BufferDeviceAddress() + args_buffer.second,
+		    .index_address  = index_source.address,
+		    .stride         = emit.indirect.stride,
+		    .index_size     = index_source.guest_element_size,
+		    .index_limit    = draw.index_count,
+		    .primitive_size = mesh.InputPrimitiveSize(),
+		    .group_step     = mesh.primitives_per_group * mesh.InputPrimitiveStep(),
+		    .max_groups     = limits.maxMeshWorkGroupCount[0],
+		    .max_instances  = limits.maxMeshWorkGroupCount[1],
+		    .max_total      = limits.maxMeshWorkGroupTotalCount,
+		};
+		auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		task_params  = stream.BufferDeviceAddress() + stream.Copy(&params, sizeof(params), 8);
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1165,14 +1202,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
-	const auto draw_stages =
-	    vk::ShaderStageFlagBits::eFragment |
-	    (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex);
 	const auto draw_dwords =
 	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
 	if (draw_dwords != 0) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
-		if (mesh_active) {
+		if (mesh_task) {
+			draw_data[0] = static_cast<uint32_t>(task_params);
+			draw_data[1] = static_cast<uint32_t>(task_params >> 32u);
+		} else if (mesh_active) {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
@@ -1181,11 +1218,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages,
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
 		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());
@@ -1222,7 +1259,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_active) {
+	if (mesh_task) {
+		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1250,9 +1289,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-// Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU: mesh
-// and quad-list draws for counts, tessellation draws for the index/SGPR prolog. Indirect records
-// carry their own offsets.
+// Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
+// quad-list draws for counts, tessellation draws for the index/SGPR prolog and mesh draws without
+// room for the task payload. Indirect records carry their own offsets.
 static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
                                                    const ShaderVertexInputInfo& vs,
                                                    DrawOffsetSource             source,
@@ -1270,7 +1309,6 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	}
 	if (indirect.address != 0) {
 		if (!vs.indirect_draw ||
-		    vs.stage.module->info.stage == ShaderType::Mesh ||
 		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
 		    vs.indirect_offsets != indirect.offsets) {
 			return std::nullopt;

@@ -567,7 +567,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    features12.shaderSharedInt64Atomics != VK_FALSE,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
-	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Indirect mesh draws launch their records' groups from a task shader.
+	graphics.mesh_shader_enabled =
+	    mesh_extension && supported_mesh.meshShader && supported_mesh.taskShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -718,6 +720,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = graphics.mesh_shader_enabled;
+	mesh_features.taskShader            = graphics.mesh_shader_enabled;
 	feedback_dynamic.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	create_info.pNext = graphics.attachment_feedback_loop_enabled

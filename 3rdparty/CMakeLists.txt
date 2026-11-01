@@ -8,7 +8,6 @@ include(FetchContent)
 set(kyty_build_testing_saved "${BUILD_TESTING}")
 set(BUILD_TESTING OFF)
 set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
-set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
 	# Opus assumes MSVC accepts SSE4.1 intrinsics without per-file flags, but
@@ -34,8 +33,6 @@ FetchContent_Declare(openxr
 	GIT_TAG f2448a8797c85814aa892efc1ab8707900fbcc78 # release-1.1.63
 	GIT_SHALLOW FALSE)
 FetchContent_MakeAvailable(openxr)
-# Keep the loader's headers and library out of the installed package.
-set_property(DIRECTORY "${openxr_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
 # The loader uses exceptions internally.
 if(NOT KYTY_CLANG_CL)
 	target_compile_options(openxr_loader PRIVATE -fexceptions)
@@ -115,6 +112,12 @@ FetchContent_Declare(
 	SOURCE_SUBDIR kyty-library-only
 )
 FetchContent_MakeAvailable(zstd zarchive_source)
+
+# Keep the fetched libraries' install rules out of the package.
+foreach(kyty_dir "${opus_SOURCE_DIR}" "${openxr_SOURCE_DIR}" "${xbyak_SOURCE_DIR}" "${zydis_SOURCE_DIR}"
+		"${zstd_SOURCE_DIR}/build/cmake")
+	set_property(DIRECTORY "${kyty_dir}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+endforeach()
 
 add_library(zarchive STATIC
 	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"

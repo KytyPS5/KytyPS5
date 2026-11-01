@@ -144,6 +144,7 @@ public:
 	bool                   renderdoc_enabled           = false;
 	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -189,6 +190,7 @@ public:
 		renderdoc_enabled           = other.renderdoc_enabled;
 		pro_enabled                 = other.pro_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
+		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif

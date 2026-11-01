@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "kernel/eventQueue.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -136,6 +137,13 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
 }
 
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      Net::NetResolverInfo* info, int timeout,
+                                                      int retry, int flags) {
+	return FinishNetCall(
+	    Net::NetResolverStartNtoaMultipleRecords(rid, hostname, info, timeout, retry, flags));
+}
+
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
 	return FinishNetCall(Net::NetInetPton(af, src, dst));
 }
@@ -242,6 +250,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
+	LIB_FUNC("RCCY01Xd+58", LibNet::NetResolverStartNtoaMultipleRecords);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);
@@ -762,6 +771,8 @@ namespace LibHttp2 {
 
 LIB_VERSION("Http2", 1, "Http2", 1, 1);
 
+namespace EventQueue = LibKernel::EventQueue;
+
 constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
 constexpr int HTTP2_ERROR_BEFORE_SEND  = -2122641307; /* 0x817B1065 */
 constexpr int HTTP2_ERROR_TIMEOUT      = -2122641304; /* 0x817B1068 */
@@ -822,6 +833,16 @@ struct Http2AsyncResult {
 	uint8_t padding[4];
 	void*   reserved;
 };
+
+struct Http2TriggerUserEventArgs {
+	EventQueue::KernelEqueue eq;
+	int                      uniq_id;
+	uint8_t                  padding[4];
+	void*                    udata;
+	void*                    reserved;
+};
+
+static_assert(sizeof(Http2TriggerUserEventArgs) == 32);
 
 static int g_http2_next_context_id  = 1;
 static int g_http2_next_template_id = 1;
@@ -1230,8 +1251,17 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 	return request->second.send_result;
 }
 
+// Async operations complete at once; the caller's event queue gets the completion event.
+static void Http2TriggerUserEvent(const Http2TriggerUserEventArgs* kqueue_option) {
+	if (kqueue_option != nullptr) {
+		EventQueue::KernelTriggerUserEvent(kqueue_option->eq, kqueue_option->uniq_id,
+		                                   kqueue_option->udata);
+	}
+}
+
 static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
-                                               void* /*kqueue_option*/, void* /*option*/) {
+                                               const Http2TriggerUserEventArgs* kqueue_option,
+                                               void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1250,6 +1280,7 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
 	request->second.async_result = request->second.send_result;
 	request->second.async_event  = 0;
+	Http2TriggerUserEvent(kqueue_option);
 
 	return 0;
 }
@@ -1399,7 +1430,8 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 }
 
 static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
-                                            void* /*kqueue_option*/, void* /*option*/) {
+                                            const Http2TriggerUserEventArgs* kqueue_option,
+                                            void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1418,22 +1450,22 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		request->second.async_result = send_result;
-		request->second.async_event  = 1;
-		return 0;
+	} else {
+		const auto& body      = request->second.response_body;
+		const auto  remaining = request->second.read_offset < body.size()
+		                            ? body.size() - request->second.read_offset
+		                            : 0;
+		const auto  to_copy   = size < remaining ? size : remaining;
+
+		if (to_copy != 0) {
+			std::memcpy(data, body.data() + request->second.read_offset, to_copy);
+			request->second.read_offset += to_copy;
+		}
+
+		request->second.async_result = static_cast<int>(to_copy);
 	}
-
-	const auto& body = request->second.response_body;
-	const auto  remaining =
-	    request->second.read_offset < body.size() ? body.size() - request->second.read_offset : 0;
-	const auto to_copy = size < remaining ? size : remaining;
-
-	if (to_copy != 0) {
-		std::memcpy(data, body.data() + request->second.read_offset, to_copy);
-		request->second.read_offset += to_copy;
-	}
-
-	request->second.async_result = static_cast<int>(to_copy);
-	request->second.async_event  = 1;
+	request->second.async_event = 1;
+	Http2TriggerUserEvent(kqueue_option);
 
 	return 0;
 }
@@ -1642,6 +1674,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("p-o74CnoNzY", NpManager::NpGetNpId);
 	LIB_FUNC("XDncXQIJUSk", NpManager::NpGetOnlineId);
 	LIB_FUNC("rbknaUjpqWo", NpManager::NpGetAccountIdA);
+	LIB_FUNC("VgYczPGB5ss", NpManager::NpGetUserIdByAccountId);
 	LIB_FUNC("JT+t00a3TxA", NpManager::NpGetAccountCountryA);
 	LIB_FUNC("+4DegjBqV1g", NpManager::NpGetAccountAge);
 	LIB_FUNC("3Tcz5bNCfZQ", NpManager::NpGetAccountLanguage2);
@@ -2369,6 +2402,25 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	return callback_id++;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filter_id) {
+	PRINT_NAME();
+
+	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
+	LOGF("\t filter_id  = %d\n", filter_id);
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
+                                                              int callback_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_context_id = %d\n", user_context_id);
+	LOGF("\t callback_id     = %d\n", callback_id);
+
+	return 0;
+}
+
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
 	// Timeout processing is an internal maintenance tick in Prospero. Requests
 	// complete synchronously in this implementation, so there is no pending
@@ -2405,6 +2457,8 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("QafxeZM3WK4", LibNpWebApi2::NpWebApi2PushEventDeletePushContext);
 	LIB_FUNC("MsaFhR+lPE4", LibNpWebApi2::NpWebApi2PushEventCreateFilter);
 	LIB_FUNC("fY3QqeNkF8k", LibNpWebApi2::NpWebApi2PushEventRegisterCallback);
+	LIB_FUNC("KJdPcOGmK58", LibNpWebApi2::NpWebApi2PushEventDeleteFilter);
+	LIB_FUNC("hOnIlcGrO6g", LibNpWebApi2::NpWebApi2PushEventUnregisterCallback);
 	LIB_FUNC("3Tt9zL3tkoc", LibNpWebApi2::NpWebApi2CheckTimeout);
 	LIB_FUNC("bEvXpcEk200", LibNpWebApi2::NpWebApi2Terminate);
 }

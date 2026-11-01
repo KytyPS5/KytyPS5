@@ -5488,6 +5488,98 @@ void TestCpuExtensionPatches() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// With --guest-tsc, guest RDTSC/RDTSCP read the counter sceKernelReadTsc() returns, at the rate
+// sceKernelGetTscFrequency() reports, and leave RFLAGS, the red zone and other registers alone.
+void TestTimeStampCounterPatches() {
+	const char*           test = "TimeStampCounterPatches";
+	Config::ConfigOptions options;
+	options.printf_direction  = Config::LogDirection::Silent;
+	options.guest_tsc_enabled = true;
+	Config::Load(options);
+	constexpr uint64_t code_size = 0x1000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x908000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "tsc_test");
+	Check(test, mapping != 0, "failed to allocate TSC fixture");
+	InstructionTestScope           restore {mapping, code_size * 2};
+	const std::array<uintptr_t, 1> starts {mapping};
+	const auto                     multiplier = Libs::LibKernel::KernelGuestTscMultiplier();
+	const auto                     patch      = [&](uint64_t capacity, uint64_t tsc_multiplier) {
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                            reinterpret_cast<void*>(mapping + code_size),
+		                                            capacity);
+		return Loader::PatchGuestInstructions(mapping, code_size, starts, false, false, {},
+		                                      tsc_multiplier)
+		    .rdtsc;
+	};
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	code.mov(code.r11, 0x0123456789abcdefull);
+	code.mov(code.qword[code.rsp - 8], code.r11);
+	code.mov(code.rax, UINT64_MAX);
+	code.mov(code.rdx, UINT64_MAX);
+	code.add(code.rax, 1); // Sets CF, PF, AF and ZF; clears SF and OF.
+	code.rdtsc();
+	code.mov(code.qword[code.rdi], code.rax);
+	code.mov(code.qword[code.rdi + 8], code.rdx);
+	code.rdtscp();
+	code.mov(code.qword[code.rdi + 16], code.rax);
+	code.mov(code.qword[code.rdi + 24], code.rdx);
+	code.mov(code.qword[code.rdi + 32], code.rcx);
+	code.mov(code.rax, code.qword[code.rsp - 8]);
+	code.mov(code.qword[code.rdi + 40], code.rax);
+	code.mov(code.qword[code.rdi + 48], code.r11);
+	code.pushfq();
+	code.pop(code.qword[code.rdi + 56]);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate TSC fixture");
+	const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+	const auto                 unchanged = [&] {
+		return std::equal(original.begin(), original.end(), code.getCode());
+	};
+
+	const auto disabled = patch(code_size, 0);
+	Check(test, disabled.found == 0 && unchanged(), "TSC scaling without a multiplier changed code");
+	const auto patched = patch(code_size, multiplier);
+	Check(test, patched.found == 2 && patched.native == 2, "RDTSC/RDTSCP were not rewritten");
+
+	using GuestFunction = void(KYTY_SYSV_ABI*)(uint64_t*);
+	std::array<uint64_t, 8> output {};
+	uint32_t                aux_before = 0;
+	uint32_t                aux_after  = 0;
+	const auto              before     = Libs::LibKernel::KernelReadTsc();
+	__rdtscp(&aux_before);
+	reinterpret_cast<GuestFunction>(mapping)(output.data());
+	__rdtscp(&aux_after);
+	const auto after = Libs::LibKernel::KernelReadTsc();
+	Check(test, ((output[0] | output[1] | output[2] | output[3] | output[4]) >> 32u) == 0,
+	      "RDTSC/RDTSCP left the upper register halves set");
+	const auto rdtsc  = output[0] | (output[1] << 32u);
+	const auto rdtscp = output[2] | (output[3] << 32u);
+	Check(test, before <= rdtsc && rdtsc <= rdtscp && rdtscp <= after,
+	      "guest RDTSC/RDTSCP differ from sceKernelReadTsc()");
+	Check(test, aux_before != aux_after || output[4] == aux_before, "RDTSCP lost TSC_AUX");
+	Check(test, output[5] == 0x0123456789abcdefull && output[6] == 0x0123456789abcdefull,
+	      "TSC rewrite changed the red zone or another register");
+	Check(test, (output[7] & 0x8d5u) == 0x55u, "TSC rewrite changed RFLAGS");
+
+	const auto start_tsc  = Libs::LibKernel::KernelReadTsc();
+	const auto start_time = std::chrono::steady_clock::now();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const auto ticks   = static_cast<double>(Libs::LibKernel::KernelReadTsc() - start_tsc);
+	const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time);
+	const auto frequency = static_cast<double>(Libs::LibKernel::KernelGetTscFrequency());
+	Check(test, frequency == 1600000000 && std::abs(ticks / seconds.count() / frequency - 1) < 0.1,
+	      "guest counter does not run at the reported rate");
+
+	// The trap fallback would fit here, but it would read the counter at the host rate.
+	std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+	const auto exhausted = patch(16, multiplier);
+	Check(test, exhausted.found == 2 && exhausted.Skipped() == 2 && unchanged(),
+	      "RDTSC without trampoline space was not left unpatched");
+	options.guest_tsc_enabled = false;
+	Config::Load(options);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -5792,6 +5884,7 @@ int main(int argc, char** argv) {
 		RunTest(TestCpuExtensionContexts);
 		RunTest(TestPackedBitFieldInsert);
 		RunTest(TestCpuExtensionPatches);
+		RunTest(TestTimeStampCounterPatches);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
@@ -5818,6 +5911,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionContexts);
 	RunTest(TestPackedBitFieldInsert);
 	RunTest(TestCpuExtensionPatches);
+	RunTest(TestTimeStampCounterPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);

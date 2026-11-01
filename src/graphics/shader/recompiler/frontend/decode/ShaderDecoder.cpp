@@ -553,6 +553,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SENDMSG:
 		case Opcode::S_TTRACEDATA:
 		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_CLAUSE:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.src0).c_str()));

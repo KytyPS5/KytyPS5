@@ -524,11 +524,8 @@ inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Typ
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match);
-
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
-uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
+uint32_t EmitClassMaskF32(ValueEmitContext& ctx, uint32_t value, IR::Value mask);
+uint32_t EmitClassMaskF16(ValueEmitContext& ctx, uint32_t bits, IR::Value mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 

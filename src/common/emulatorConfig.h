@@ -99,6 +99,8 @@ struct ConfigOptions {
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
+	// Experimental. Keeps GPU buffer caches when direct memory is released and mapped back unchanged.
+	bool                   keep_gpu_cache_on_reuse     = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -170,6 +172,8 @@ bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
+// Whether released direct memory keeps its GPU buffer caches for an exact remap. Default off.
+bool KeepGpuCacheOnReuse();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

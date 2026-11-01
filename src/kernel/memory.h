@@ -139,6 +139,10 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+// Opt-in. When on, releasing direct memory keeps the GPU buffer caches of its mappings, and a
+// fixed read-write map of the same memory at the same address picks them up again. Turning it off
+// drops anything still kept.
+void                   SetKeepGpuCacheOnReuse(bool enabled) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
@@ -213,13 +217,24 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+// What the kernel asked of the GPU for a range that it holds, resumes or gives up on.
+enum class TestGpuSuspendEvent { Suspend, Resume, Cancel };
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
+// Reports every suspend, resume and cancel the kernel requests. Pass nullptr to stop.
+void     TestSetGpuSuspendCallback(void (*callback)(TestGpuSuspendEvent event, uint64_t addr,
+                                                    size_t size));
+// Turns the keep-GPU-cache feature on or off without going through Config.
+void     TestSetKeepGpuCacheOnReuse(bool enabled);
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
 void     TestFailNextFixedReserveRangeRegistration();
+// Makes the next physical memory map fail, after the host view of a direct map already exists.
+void     TestFailNextPhysicalMemoryMap();
+// How many suspended ranges the kernel keeps before it cancels the oldest.
+size_t   TestSuspendedRangeCapacity();
 void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);

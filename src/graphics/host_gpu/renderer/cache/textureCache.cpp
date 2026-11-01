@@ -1520,6 +1520,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		// Keep the larger size, so binding a smaller image at the same base doesn't turn away
+		// clears of a larger one that is still alive.
+		metadata->second.size = std::max(metadata->second.size, desc.info.metadata.range.size);
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1964,6 +1967,44 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask.set();
+	return true;
+}
+
+// Checks and clears a compute dispatch's metadata targets under one lock. Another thread can
+// unmap memory and drop a surface, so a check and a clear taken under separate locks could
+// consume a dispatch whose surface is gone, losing both the clear and the dispatch's writes.
+bool TextureCache::ClearMetaSurfaces(std::span<const MetaClearTarget> targets) {
+	std::scoped_lock lock {m_lock};
+	bool             any_written = false;
+	for (const auto& target: targets) {
+		const auto found   = m_surface_metas.find(target.address);
+		const bool is_meta = found != m_surface_metas.end();
+		if (!target.written) {
+			// A metadata surface bound without being written is input to the dispatch, so the
+			// dispatch is not a full overwrite.
+			if (is_meta) {
+				return false;
+			}
+			continue;
+		}
+		// A written binding must be a metadata surface, or the dispatch writes other memory that
+		// a clear would drop. Its size must be known so something bounds the write, and a bounded
+		// descriptor must not reach past it into other data.
+		if (!is_meta || found->second.size == 0 ||
+		    (target.bounded && target.size > found->second.size)) {
+			return false;
+		}
+		any_written = true;
+	}
+	if (!any_written) {
+		return false;
+	}
+	// Clear only once every target has passed, so a rejected dispatch leaves no surface marked.
+	for (const auto& target: targets) {
+		if (target.written) {
+			m_surface_metas.find(target.address)->second.clear_mask.set();
+		}
+	}
 	return true;
 }
 

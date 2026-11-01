@@ -36,6 +36,42 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+// A buffer write over more than 1 / this of an image refreshes the whole image, because a partial
+// refresh then costs about as much as a full one.
+constexpr uint64_t PartialRefreshMaxFraction = 2;
+
+// Marks a whole image as newer in a buffer. gpu_mod is cleared first so that the next bind
+// treats the buffer as the source of truth, which is how every non-partial write behaves.
+void MarkWholeBufferWrite(Image& image) {
+	if (image.IsGpuModified()) {
+		image.ClearGpuModified();
+	}
+	image.MarkBufferModified();
+}
+
+// Tells whether a range-limited refresh is exact for this image. Layouts whose byte ranges do not
+// map to a contiguous set of texels stay on the full refresh, and so do images that other
+// objects share or convert, such as depth and stencil, video-out, Fmask and compressed images.
+[[nodiscard]] bool IsPartialRefreshEligible(const Image& image) {
+	const auto& info = image.info;
+	if (info.IsVolume() || info.samples != 1 || image.backing.samples != 1 || info.IsDepth() ||
+	    info.HasStencil() || info.pixel_format == vk::Format::eS8Uint || image.depth_id ||
+	    !image.stencil_ids.empty() || info.IsBlock() || info.HasMetadata() ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed || image.usage.video_out ||
+	    info.GetColorTransform() != ColorTransform::None) {
+		return false;
+	}
+	switch (info.tile_mode) {
+		case Prospero::TileMode::kLinear: return true;
+		case Prospero::TileMode::kStandard256B:
+		case Prospero::TileMode::kStandard4KB:
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt:
+		case Prospero::TileMode::kRenderTarget:
+			return !Prospero::IsFmaskTextureFormat(info.guest_format);
+		default: return false;
+	}
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -125,7 +161,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_partial_buffer_refresh(Config::PartialBufferRefreshEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -573,6 +610,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	PrepareImageCopy(destination);
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
+			// A source range mark is passed on as a whole mark, which is correct but conservative.
 			destination.MarkBufferModified();
 		}
 		return;
@@ -1021,6 +1059,11 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		if (image.BufferModifiedRange()) {
+			// The upload below is still a full one, so the image must stop counting as newer than
+			// the buffer, as it would after a whole mark.
+			image.ClearGpuModified();
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1913,10 +1956,35 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		if (image.info.data.address != address) {
 			continue;
 		}
-		if (image.IsGpuModified()) {
-			image.ClearGpuModified();
+		MarkWholeBufferWrite(image);
+	}
+}
+
+// Records a storage-buffer write over an image. Without the opt-in flag this is the whole mark.
+// With it, a small write on an eligible image records only its byte range and leaves gpu_mod set,
+// since the image is still newer than the buffer outside that range. Everything else falls back
+// to the whole mark and clears gpu_mod first, exactly as InvalidateMemoryFromGPU does.
+void TextureCache::InvalidateBufferWrite(uint64_t address, uint64_t size) {
+	if (!m_partial_buffer_refresh) {
+		InvalidateMemoryFromGPU(address, size);
+		return;
+	}
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, true)) {
+		auto& image = m_slot_images[id];
+		if (image.info.data.address != address) {
+			continue;
 		}
-		image.MarkBufferModified();
+		const bool partial = IsPartialRefreshEligible(image) &&
+		                     size <= image.info.data.size / PartialRefreshMaxFraction;
+		if (partial) {
+			image.MarkBufferModifiedRange(0, size);
+			continue;
+		}
+		MarkWholeBufferWrite(image);
 	}
 }
 

@@ -372,6 +372,10 @@ struct TextureCacheTestAccess {
     cache.m_readback_linear_images = enabled;
   }
 
+  static void SetPartialBufferRefresh(TextureCache &cache, bool enabled) {
+    cache.m_partial_buffer_refresh = enabled;
+  }
+
   static std::pair<uint8_t *, uint64_t>
   MapDownload(TextureCache &cache, uint64_t size, uint64_t alignment) {
     auto &download =
@@ -8109,6 +8113,199 @@ public:
                 exact_base ? "exact-base buffer write did not refresh the native image"
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
+
+      // With --partial-buffer-refresh a small base write records only its byte range and keeps
+      // gpu_mod, while a big write or an ineligible image takes the whole mark as before. The
+      // upload is still a full one in this step, so texels must match the flag-off result.
+      constexpr uint64_t partial_refresh_base_offset = 0x2f00000;
+      constexpr uint64_t partial_refresh_stride = 0x10000;
+      constexpr uint32_t partial_refresh_texels = 4;
+      constexpr uint32_t partial_refresh_small_write = sizeof(uint32_t);
+      constexpr uint32_t partial_refresh_big_write = 3 * sizeof(uint32_t);
+      constexpr uint32_t partial_refresh_half_write = 2 * sizeof(uint32_t);
+      struct PartialRefreshResult {
+        std::optional<GuestRange> range;
+        bool whole = false;
+        bool painted_gpu_modified = false;
+        bool gpu_modified_after_write = false;
+        bool gpu_modified_after_bind = false;
+        std::vector<u32> texels;
+      };
+      uint32_t partial_refresh_slot = 0;
+      const auto run_partial_refresh = [&](bool flag, uint32_t write_size) {
+        TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, flag);
+        const uint64_t offset =
+            partial_refresh_base_offset + partial_refresh_slot++ * partial_refresh_stride;
+        std::memset(memory + offset, 0, partial_refresh_texels * sizeof(uint32_t));
+        auto desc = MakeLinearDesc(
+            base + offset, partial_refresh_texels * sizeof(uint32_t), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {partial_refresh_texels, 1, 1}, 1, 4, 1);
+        const auto image_id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        PartialRefreshResult result;
+        result.painted_gpu_modified = texture_cache.GetImage(image_id).IsGpuModified();
+        auto writable = resources.GetBufferCache().ObtainBuffer(desc.info.data.address,
+                                                                write_size, true, false);
+        Require(name, "partial refresh buffer allocation", writable.first != nullptr,
+                "failed to allocate the partial refresh write buffer");
+        writable.first->Fill(writable.second, write_size, buffer_alias_write_value);
+        texture_cache.InvalidateBufferWrite(desc.info.data.address, write_size);
+        const auto &marked = texture_cache.GetImage(image_id);
+        result.range = marked.BufferModifiedRange();
+        result.whole = marked.IsBufferModified() && !result.range;
+        result.gpu_modified_after_write = marked.IsGpuModified();
+        (void)texture_cache.FindTexture(image_id, desc);
+        result.gpu_modified_after_bind = texture_cache.GetImage(image_id).IsGpuModified();
+        result.texels = ReadCachedTexel(name, context, image_id, {},
+                                        {partial_refresh_texels, 1, 1});
+        return result;
+      };
+      const auto partial_off = run_partial_refresh(false, partial_refresh_small_write);
+      const auto partial_on = run_partial_refresh(true, partial_refresh_small_write);
+      const auto partial_big = run_partial_refresh(true, partial_refresh_big_write);
+      Require(name, "partial refresh fixture",
+              partial_off.painted_gpu_modified && partial_on.painted_gpu_modified,
+              "the painted image was not GPU-modified, so keeping gpu_mod proves nothing");
+      Require(name, "partial refresh flag off baseline",
+              !partial_off.range && partial_off.whole && !partial_off.gpu_modified_after_write,
+              "with the flag off a buffer write must be a whole mark that clears gpu_mod");
+      Require(name, "partial refresh records the written range",
+              partial_on.range && partial_on.range->address ==
+                                      base + partial_refresh_base_offset + partial_refresh_stride &&
+                  partial_on.range->size == partial_refresh_small_write && !partial_on.whole &&
+                  partial_on.gpu_modified_after_write,
+              "with the flag on a small base write must record (base, size) and keep gpu_mod");
+      Require(name, "partial refresh upload matches the flag-off result",
+              partial_on.texels == partial_off.texels &&
+                  partial_on.texels.front() == buffer_alias_write_value &&
+                  partial_on.gpu_modified_after_bind == partial_off.gpu_modified_after_bind &&
+                  !partial_on.gpu_modified_after_bind,
+              "the full upload after a range mark differs from today's texels or gpu_mod");
+      Require(name, "partial refresh threshold",
+              !partial_big.range && partial_big.whole && !partial_big.gpu_modified_after_write,
+              "a write over half the image must take the whole mark even with the flag on");
+      // Exactly half the image still gets a range, so the limit is inclusive.
+      const auto partial_half = run_partial_refresh(true, partial_refresh_half_write);
+      Require(name, "partial refresh threshold boundary",
+              partial_half.range && partial_half.range->size == partial_refresh_half_write &&
+                  !partial_half.whole && partial_half.gpu_modified_after_write,
+              "a write of exactly half the image must record a range");
+
+      // A depth image shares its contents with stencil and HTILE handling, so it stays whole.
+      constexpr uint64_t partial_depth_offset = partial_refresh_base_offset + 8 * partial_refresh_stride;
+      auto partial_depth_desc = MakeLinearDesc(
+          base + partial_depth_offset, partial_refresh_texels * sizeof(float),
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {partial_refresh_texels, 1, 1}, 1, sizeof(float), 1);
+      partial_depth_desc.type = BindingType::DepthTarget;
+      partial_depth_desc.view_info.format = vk::Format::eD32Sfloat;
+      partial_depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      partial_depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, true);
+      const auto partial_depth_image = texture_cache.FindImage(partial_depth_desc);
+      (void)texture_cache.FindDepthTarget(partial_depth_image, partial_depth_desc);
+      texture_cache.MarkGpuWritten(partial_depth_image);
+      texture_cache.InvalidateBufferWrite(partial_depth_desc.info.data.address,
+                                          partial_refresh_small_write);
+      const auto &partial_depth_marked = texture_cache.GetImage(partial_depth_image);
+      Require(name, "partial refresh skips depth images",
+              partial_depth_marked.IsBufferModified() &&
+                  !partial_depth_marked.BufferModifiedRange() &&
+                  !partial_depth_marked.IsGpuModified(),
+              "a small write over a depth image must take the whole mark even with the flag on");
+      // Each excluded trait is applied in place to a painted colour image whose baseline gets a
+      // range, then restored. The write goes through InvalidateBufferWrite, so a trait that the
+      // eligibility check forgets shows up as a range instead of a whole mark.
+      struct PartialTraitCase {
+        const char *label;
+        void (*apply)(Libs::Graphics::Image &);
+        bool expect_range;
+      };
+      const std::array partial_trait_cases{
+          PartialTraitCase{"linear colour baseline", [](Libs::Graphics::Image &) {}, true},
+          PartialTraitCase{"tiled colour baseline",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.tile_mode = Prospero::TileMode::kStandard4KB;
+                           },
+                           true},
+          PartialTraitCase{"volume",
+                           [](Libs::Graphics::Image &image) { image.info.type = Prospero::ImageType::kColor3D; },
+                           false},
+          PartialTraitCase{"info samples", [](Libs::Graphics::Image &image) { image.info.samples = 2; }, false},
+          PartialTraitCase{"backing samples",
+                           [](Libs::Graphics::Image &image) { image.backing.samples = 2; }, false},
+          PartialTraitCase{"block compressed",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.guest_format = Prospero::BufferFormat::kBc1UNorm;
+                           },
+                           false},
+          PartialTraitCase{"metadata kind",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Htile;
+                           },
+                           false},
+          PartialTraitCase{"metadata compression",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
+                           },
+                           false},
+          PartialTraitCase{"video out", [](Libs::Graphics::Image &image) { image.usage.video_out = true; },
+                           false},
+          PartialTraitCase{"colour transform", [](Libs::Graphics::Image &image) { image.info.bgra16 = true; },
+                           false},
+          PartialTraitCase{"kDepth tile mode",
+                           [](Libs::Graphics::Image &image) { image.info.tile_mode = Prospero::TileMode::kDepth; },
+                           false},
+          PartialTraitCase{"Fmask format",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.tile_mode = Prospero::TileMode::kStandard4KB;
+                             image.info.guest_format = Prospero::BufferFormat::kFmask8_S2_F1;
+                           },
+                           false},
+      };
+      constexpr uint64_t partial_trait_offset = partial_refresh_base_offset + 0x90000;
+      constexpr uint64_t partial_trait_stride = 0x1000;
+      uint32_t partial_trait_slot = 0;
+      for (const auto &trait : partial_trait_cases) {
+        const uint64_t offset = partial_trait_offset + partial_trait_slot++ * partial_trait_stride;
+        std::memset(memory + offset, 0, partial_refresh_texels * sizeof(uint32_t));
+        auto desc = MakeLinearDesc(
+            base + offset, partial_refresh_texels * sizeof(uint32_t), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {partial_refresh_texels, 1, 1}, 1, 4, 1);
+        const auto trait_id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), trait_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        auto &trait_image = texture_cache.GetImage(trait_id);
+        Require(name, trait.label, trait_image.IsGpuModified(),
+                "the painted trait image was not GPU-modified");
+        const auto saved_info = trait_image.info;
+        const auto saved_usage = trait_image.usage;
+        const auto saved_samples = trait_image.backing.samples;
+        trait.apply(trait_image);
+        texture_cache.InvalidateBufferWrite(desc.info.data.address, partial_refresh_small_write);
+        const bool has_range = trait_image.BufferModifiedRange().has_value();
+        const bool whole = trait_image.IsBufferModified() && !has_range;
+        const bool kept_gpu_modified = trait_image.IsGpuModified();
+        trait_image.info = saved_info;
+        trait_image.usage = saved_usage;
+        trait_image.backing.samples = saved_samples;
+        Require(name, trait.label,
+                trait.expect_range ? (has_range && kept_gpu_modified)
+                                   : (whole && !kept_gpu_modified),
+                trait.expect_range
+                    ? "an eligible image did not record a range"
+                    : "an excluded trait must take the whole mark and clear gpu_mod");
+      }
+      TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, false);
 
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;

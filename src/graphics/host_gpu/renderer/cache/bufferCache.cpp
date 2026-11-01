@@ -1036,6 +1036,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (written != nullptr) {
+		*written = {.vaddr        = vaddr,
+		            .size         = size,
+		            .buffer_epoch = m_buffer_set_epoch,
+		            .cpu_epoch    = written_cpu_epoch,
+		            .gpu_epoch    = written_gpu_epoch,
+		            .id           = id};
+	}
 	if (plain_read) {
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,

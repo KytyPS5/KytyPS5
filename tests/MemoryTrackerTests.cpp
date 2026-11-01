@@ -568,6 +568,47 @@ void TestRegionCpuDirtyEpoch() {
   Release(memory);
 }
 
+void TestRegionGpuCleanEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto index = address / Libs::Graphics::TRACKER_REGION_SIZE;
+  Check(tracker.RegionGpuCleanEpoch(index) == 0,
+        "untracked region reported a GPU-clean epoch");
+
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto written = tracker.RegionGpuCleanEpoch(index);
+  Check(written != 0, "tracked region reported no GPU-clean epoch");
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.RegionGpuCleanEpoch(index) == written,
+        "GPU-clean epoch advanced when the GPU wrote GPU-dirty pages again");
+
+  const auto global = Libs::Graphics::RegionManager::GpuCleanEpoch();
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  const auto cleaned = tracker.RegionGpuCleanEpoch(index);
+  Check(cleaned != written, "GPU-clean epoch did not advance when pages stopped being GPU dirty");
+  Check(Libs::Graphics::RegionManager::GpuCleanEpoch() != global,
+        "global GPU-clean epoch did not advance when pages stopped being GPU dirty");
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  bool downloaded = false;
+  tracker.ForEachDownloadRange<true>(address, page_size,
+                                     [&](uint64_t, uint64_t) noexcept { downloaded = true; });
+  Check(downloaded && tracker.RegionGpuCleanEpoch(index) != cleaned,
+        "GPU-clean epoch did not advance when a download cleaned the pages");
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Release(memory);
+}
+
 std::vector<std::pair<uint64_t, uint64_t>>
 ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
@@ -1404,6 +1445,7 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRegionCpuDirtyEpoch();
+  TestRegionGpuCleanEpoch();
   TestConsumeCpuWrites();
   TestGpuMarkingSkipsCpuDirtyPages();
   TestRangeInvalidation();

@@ -95,6 +95,16 @@ public:
 		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
 	}
 
+	// The GPU-clean epoch of the tracking region `index`, which advances whenever its pages stop
+	// being GPU dirty; 0 while the region is untracked.
+	[[nodiscard]] uint64_t RegionGpuCleanEpoch(uint64_t index) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->RegionGpuCleanEpoch() : 0;
+	}
+
 	// Calls func(address, size) for maximal runs of pages that may hold CPU writes not yet
 	// uploaded, after releasing the region locks. Untracked regions count as dirty, as a new
 	// region starts dirty. Runs at most max_gap bytes apart come as one, with the clean pages

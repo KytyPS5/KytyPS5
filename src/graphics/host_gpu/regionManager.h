@@ -98,6 +98,17 @@ public:
 		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
 	}
 
+	// Advances whenever pages of any region stop being GPU dirty.
+	[[nodiscard]] static uint64_t GpuCleanEpoch() {
+		return s_gpu_clean_epoch.load(std::memory_order_acquire);
+	}
+
+	// Advances, after the pages change under the lock, whenever pages of this region stop being
+	// GPU dirty; a new region starts at 1.
+	[[nodiscard]] uint64_t RegionGpuCleanEpoch() const {
+		return m_gpu_clean_epoch.load(std::memory_order_acquire);
+	}
+
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	template <DirtySource source>
@@ -130,6 +141,10 @@ public:
 			m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 			UpdateProtection<!enable, false>(changed);
 		} else {
+			if constexpr (!enable) {
+				m_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
+				s_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
+			}
 			UpdateProtection<enable, true>(changed);
 		}
 	}
@@ -148,6 +163,8 @@ public:
 				m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 				UpdateProtection<true, false>(mask);
 			} else {
+				m_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
+				s_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
 				UpdateProtection<false, true>(mask);
 			}
 		}
@@ -252,8 +269,10 @@ private:
 	std::atomic_bool      m_has_cpu_dirty {true};
 	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
+	std::atomic<uint64_t> m_gpu_clean_epoch {1};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
+	inline static std::atomic<uint64_t> s_gpu_clean_epoch {0};
 };
 
 } // namespace Libs::Graphics

@@ -464,6 +464,15 @@ private:
 		uint64_t offset       = 0;
 		BufferId id;
 	};
+	// The last synchronization of a range bound as written (see ObtainBuffer()).
+	struct WrittenMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t buffer_epoch = 0;
+		uint64_t cpu_epoch    = 0;
+		uint64_t gpu_epoch    = 0;
+		BufferId id;
+	};
 	// The stream copy a range got within the current draw window (see ObtainBuffer()).
 	struct StreamMemo {
 		uint64_t vaddr            = 0;
@@ -479,6 +488,9 @@ private:
 	static constexpr size_t                                  ObtainMemoSlots = 4096;
 	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
 	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
+	static constexpr size_t                                    WrittenMemoSlots = 1024;
+	std::unique_ptr<std::array<WrittenMemo, WrittenMemoSlots>> m_written_memo =
+	    std::make_unique<std::array<WrittenMemo, WrittenMemoSlots>>();
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

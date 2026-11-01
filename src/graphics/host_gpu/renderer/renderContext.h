@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -52,6 +53,12 @@ public:
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
+	/// Count of end-of-pipe signals deferred behind readbacks that have not landed yet, on any
+	/// queue. Every command processor shares it, so one queue's labels wait behind another's
+	/// earlier ones.
+	[[nodiscard]] const std::shared_ptr<std::atomic<uint32_t>>& GetPendingSignals() const noexcept {
+		return m_pending_signals;
+	}
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -85,6 +92,10 @@ private:
 	OcclusionQueries          m_occlusion_queries;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	// Shared rather than a plain member so command processors and the signals they defer can keep
+	// the same count without reaching back through the renderer.
+	std::shared_ptr<std::atomic<uint32_t>> m_pending_signals =
+	    std::make_shared<std::atomic<uint32_t>>(0);
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

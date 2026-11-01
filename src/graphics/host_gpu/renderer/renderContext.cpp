@@ -34,6 +34,14 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// Deferred EOP labels hand their writes to the GPU object, so let them run before it goes.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.Finish();
+		}
+		m_command_scheduler.DrainPriorityOperations();
+		// Every deferred signal has now landed or been dropped. The count outlives this GPU, so a
+		// leaked one would defer every queue's signals from here on.
+		EXIT_IF(m_pending_signals->load(std::memory_order_acquire) != 0);
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
@@ -103,6 +111,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// Labels held back behind readbacks write guest memory when they land, possibly inside this
+		// range, so they land before it goes. Nothing is held back with readbacks off.
+		const bool signals_pending = m_pending_signals->load(std::memory_order_acquire) != 0;
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
@@ -113,14 +124,20 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
+		// With no signal callback left, every pending signal is queued as ready. Land all of them,
+		// not only those in this range, so signals still land in order.
+		if (signals_pending && m_gpu != nullptr && GuestGpu::IsGpuThread()) {
+			m_gpu->LandReadySignals();
+		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};
-	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
-	// longer accepts external work. Use the guest GPU's state for the teardown route.
+	// While the GPU is stopping, its thread may already have stopped taking work, and
+	// SendCommandSync would then exit the process. So unmap on this thread instead. This can race
+	// with work the GPU thread is still draining, which is a known gap left for a later change.
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
 		return;

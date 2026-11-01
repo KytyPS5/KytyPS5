@@ -305,36 +305,41 @@ private:
 		const auto width       = static_cast<uint32_t>(frame->width);
 		const auto height      = static_cast<uint32_t>(frame->height);
 		const auto pitch       = AlignUp(width, 256);
+		const auto sample      = m_config.sixteen_bit ? 2u : 1u;
+		const auto row_bytes   = pitch * sample;
 		const auto chroma_rows = (static_cast<uint64_t>(height) + 1u) / 2u;
-		const auto required =
-		    static_cast<uint64_t>(pitch) * height + static_cast<uint64_t>(pitch) * chroma_rows;
+		const auto required    = static_cast<uint64_t>(row_bytes) * height +
+		                         static_cast<uint64_t>(row_bytes) * chroma_rows;
 		if (required > frame_buffer.size) {
 			return Result::FrameBufferSize;
 		}
 
 		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
 		std::memset(dst, 0, static_cast<size_t>(required));
-		if (frame->format == AV_PIX_FMT_NV12) {
+		const auto target = m_config.sixteen_bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+		if (frame->format == target) {
 			for (uint32_t y = 0; y < height; y++) {
-				std::memcpy(dst + static_cast<size_t>(y) * pitch,
-				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0], width);
+				std::memcpy(dst + static_cast<size_t>(y) * row_bytes,
+				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0],
+				            static_cast<size_t>(width) * sample);
 			}
-			auto* chroma = dst + static_cast<size_t>(pitch) * height;
+			auto* chroma = dst + static_cast<size_t>(row_bytes) * height;
 			for (uint32_t y = 0; y < chroma_rows; y++) {
-				std::memcpy(chroma + static_cast<size_t>(y) * pitch,
-				            frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1], width);
+				std::memcpy(chroma + static_cast<size_t>(y) * row_bytes,
+				            frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1],
+				            static_cast<size_t>(width) * sample);
 			}
 		} else {
-			m_sws = sws_getCachedContext(m_sws, frame->width, frame->height,
-			                             static_cast<AVPixelFormat>(frame->format), frame->width,
-			                             frame->height, AV_PIX_FMT_NV12, SWS_FAST_BILINEAR, nullptr,
-			                             nullptr, nullptr);
+			m_sws = sws_getCachedContext(
+			    m_sws, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+			    frame->width, frame->height, target, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 			if (m_sws == nullptr) {
 				return Result::ApiFail;
 			}
-			uint8_t* output_planes[4]  = {dst, dst + static_cast<size_t>(pitch) * height, nullptr,
-			                              nullptr};
-			int      output_strides[4] = {static_cast<int>(pitch), static_cast<int>(pitch), 0, 0};
+			uint8_t* output_planes[4] = {dst, dst + static_cast<size_t>(row_bytes) * height,
+			                             nullptr, nullptr};
+			int output_strides[4] = {static_cast<int>(row_bytes), static_cast<int>(row_bytes), 0,
+			                         0};
 			if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, output_planes,
 			              output_strides) != frame->height) {
 				return Result::ApiFail;
@@ -347,6 +352,7 @@ private:
 		output->codec_type      = m_config.codec_type;
 		output->width           = width;
 		output->pitch           = pitch;
+		output->pitch_in_bytes  = row_bytes;
 		output->height          = height;
 		output->buffer          = frame_buffer.data;
 		output->buffer_size     = frame_buffer.size;
@@ -379,6 +385,11 @@ private:
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };
+
+bool HighBitDepthProfile(uint32_t codec_type, uint32_t profile) {
+	return (codec_type == CODEC_TYPE_VP9 && profile >= 2u) ||
+	       (codec_type == CODEC_TYPE_HEVC && profile == 2u);
+}
 
 bool IsCodecSupported(uint32_t codec_type) {
 	return GetAvCodecId(codec_type) != AV_CODEC_ID_NONE;

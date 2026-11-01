@@ -120,6 +120,28 @@ private:
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
 	                             uint64_t target_base);
+	// The part of a mip that one Mip record covers, in storage elements.
+	struct MipWindow {
+		uint32_t width;
+		uint32_t height;
+		uint32_t depth;
+	};
+	static void ValidateImageForTiling(const ImageInfo& info);
+	[[nodiscard]] static MipWindow FullMipWindow(const ImageInfo& info, uint32_t level);
+	[[nodiscard]] static Mip       BuildMip(const ImageInfo& info, uint32_t level,
+	                                        const MipWindow& window, bool tile,
+	                                        uint64_t source_base, uint64_t target_base,
+	                                        uint32_t used_texels, uint64_t tiled_capacity,
+	                                        uint64_t linear_capacity);
+	[[nodiscard]] Tiling           UploadParams(const TilingParams& params, uint32_t levels,
+	                                            bool tile, const TileBlockLayout& block);
+	void RecordBarriers(vk::CommandBuffer command, vk::Buffer source, uint64_t source_offset,
+	                    uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
+	                    uint64_t target_capacity, const Tiling& tiling, bool clear_target);
+	void BindTilerDescriptors(vk::CommandBuffer command,
+	                          const std::array<vk::DescriptorBufferInfo, 3>& infos);
+	void DispatchTexels(vk::CommandBuffer command, uint32_t num_texels, vk::Pipeline pipeline,
+	                    vk::Buffer target, uint64_t target_offset, uint64_t target_capacity);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);

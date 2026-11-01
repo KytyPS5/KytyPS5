@@ -582,6 +582,188 @@ void TestConcurrentSharedWatchers() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// Simulates a fresh host view by making the range read-write while the counts survive.
+void MakeRangeWritable(void *address, size_t size) {
+  DWORD old_protection = 0;
+  Check(VirtualProtect(address, size, PAGE_READWRITE, &old_protection) != 0,
+        "VirtualProtect read-write failed");
+}
+
+constexpr uint64_t kReapplyPages = 5;
+constexpr uint64_t kReapplyGuardPages = 8;
+
+// Allocates two tracking regions and returns the region boundary inside them.
+uint64_t AllocateAcrossBoundary(uint8_t *&memory) {
+  memory = Allocate(TRACKER_REGION_SIZE * 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  const auto boundary =
+      (base + TRACKER_REGION_SIZE - 1) & ~(TRACKER_REGION_SIZE - 1);
+  Check(boundary >= base + TRACKER_PAGE_SIZE * kReapplyGuardPages &&
+            boundary + TRACKER_PAGE_SIZE * kReapplyGuardPages <=
+                base + TRACKER_REGION_SIZE * 2,
+        "test allocation does not contain a region boundary");
+  return boundary;
+}
+
+// Adds or removes a read watcher on the single page at the given address.
+template <bool track> void WatchRead(PageManager &manager, uint64_t address) {
+  const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
+  RegionBits mask;
+  mask.Set(static_cast<size_t>((address - region_base) / TRACKER_PAGE_SIZE));
+  manager.UpdatePageWatchersForRegion<track, true>(region_base, mask);
+}
+
+// Pages 1, 2 and 3 need read-only, no-access and read-only, which are not the
+// same protection, so reapply must issue exactly three one-page calls.
+void CheckSingleRunCalls(uint64_t first_page) {
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  Check(g_protection_calls == 3 && g_protection_ranges.size() == 3 &&
+            g_protection_ranges[0].address == first_page + page_size &&
+            g_protection_ranges[0].size == page_size &&
+            g_protection_ranges[1].address == first_page + page_size * 2 &&
+            g_protection_ranges[1].size == page_size &&
+            g_protection_ranges[2].address == first_page + page_size * 3 &&
+            g_protection_ranges[2].size == page_size,
+        "reapply did not issue one call per protection run");
+}
+
+// Write, read and double-write watched pages each get the protection their
+// counts imply, and unwatched pages stay untouched.
+void TestReapplySingleRuns() {
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  PageManager manager;
+  uint8_t *memory = nullptr;
+  const auto boundary = AllocateAcrossBoundary(memory);
+  const auto first_page = boundary - page_size * kReapplyGuardPages;
+  auto *first_memory = reinterpret_cast<uint8_t *>(first_page);
+  manager.UpdatePageWatchers<true>(first_page + page_size, page_size);
+  WatchRead<true>(manager, first_page + page_size * 2);
+  manager.UpdatePageWatchers<true>(first_page + page_size * 3, page_size);
+  manager.UpdatePageWatchers<true>(first_page + page_size * 3, page_size);
+
+  // Baseline, the simulated fresh view must really be writable everywhere.
+  MakeRangeWritable(first_memory, page_size * kReapplyPages);
+  for (uint64_t page = 0; page < kReapplyPages; page++) {
+    Check(IsWritable(first_memory + page * page_size),
+          "fresh view simulation left a page protected");
+  }
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.ReapplyProtection(first_page, page_size * kReapplyPages);
+  Check(IsWritable(first_memory), "unwatched page 0 was protected");
+  Check(Protection(first_memory + page_size) == PAGE_READONLY,
+        "write-watched page was not re-armed read-only");
+  Check(Protection(first_memory + page_size * 2) == PAGE_NOACCESS,
+        "read-watched page was not re-armed no-access");
+  Check(Protection(first_memory + page_size * 3) == PAGE_READONLY,
+        "page with two write watchers was not re-armed read-only");
+  Check(IsWritable(first_memory + page_size * 4),
+        "unwatched page 4 was protected");
+  CheckSingleRunCalls(first_page);
+
+  // Counts must be untouched, so one unwatch of page 3 keeps it read-only. The
+  // increment case relies on the PageManager destructor rejecting live state.
+  manager.UpdatePageWatchers<false>(first_page + page_size * 3, page_size);
+  Check(Protection(first_memory + page_size * 3) == PAGE_READONLY,
+        "reapply changed the watcher counts");
+  manager.UpdatePageWatchers<false>(first_page + page_size * 3, page_size);
+  WatchRead<false>(manager, first_page + page_size * 2);
+  manager.UpdatePageWatchers<false>(first_page + page_size, page_size);
+
+  // A range of only unwatched pages in a known region issues no calls.
+  g_protection_calls = 0;
+  manager.ReapplyProtection(first_page + page_size * 4, page_size * 2);
+  Check(g_protection_calls == 0, "unwatched range issued protect calls");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Adjacent pages needing the same protection share one call, and a page with
+// both a read and a write watcher is a separate no-access run.
+void TestReapplyMergesRuns() {
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  PageManager manager;
+  uint8_t *memory = nullptr;
+  const auto boundary = AllocateAcrossBoundary(memory);
+  const auto first_page = boundary - page_size * kReapplyGuardPages;
+  auto *first_memory = reinterpret_cast<uint8_t *>(first_page);
+  // Page 0 has one write watcher and page 1 has two, both read-only.
+  manager.UpdatePageWatchers<true>(first_page, page_size * 2);
+  manager.UpdatePageWatchers<true>(first_page + page_size, page_size);
+  // Page 2 has read and write watchers and so is no-access, page 3 is read-only.
+  manager.UpdatePageWatchers<true>(first_page + page_size * 2, page_size * 2);
+  WatchRead<true>(manager, first_page + page_size * 2);
+
+  MakeRangeWritable(first_memory, page_size * kReapplyPages);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.ReapplyProtection(first_page, page_size * kReapplyPages);
+  Check(Protection(first_memory) == PAGE_READONLY &&
+            Protection(first_memory + page_size) == PAGE_READONLY &&
+            Protection(first_memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(first_memory + page_size * 3) == PAGE_READONLY &&
+            IsWritable(first_memory + page_size * 4),
+        "merged runs were protected incorrectly");
+  Check(g_protection_calls == 3 && g_protection_ranges.size() == 3 &&
+            g_protection_ranges[0].address == first_page &&
+            g_protection_ranges[0].size == page_size * 2 &&
+            g_protection_ranges[1].address == first_page + page_size * 2 &&
+            g_protection_ranges[1].size == page_size &&
+            g_protection_ranges[2].address == first_page + page_size * 3 &&
+            g_protection_ranges[2].size == page_size,
+        "adjacent pages with the same protection were not one call");
+
+  manager.UpdatePageWatchers<false>(first_page, page_size * 2);
+  manager.UpdatePageWatchers<false>(first_page + page_size, page_size);
+  manager.UpdatePageWatchers<false>(first_page + page_size * 2, page_size * 2);
+  WatchRead<false>(manager, first_page + page_size * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// A range crossing a tracking region boundary is split into one call per side.
+void TestReapplyCrossesRegions() {
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  PageManager manager;
+  uint8_t *memory = nullptr;
+  const auto boundary = AllocateAcrossBoundary(memory);
+  manager.UpdatePageWatchers<true>(boundary - page_size, page_size * 2);
+  MakeRangeWritable(reinterpret_cast<void *>(boundary - page_size * 2),
+                    page_size * 4);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.ReapplyProtection(boundary - page_size * 2, page_size * 4);
+  Check(Protection(reinterpret_cast<void *>(boundary - page_size)) ==
+                PAGE_READONLY &&
+            Protection(reinterpret_cast<void *>(boundary)) == PAGE_READONLY,
+        "reapply missed a page on one side of the region boundary");
+  Check(IsWritable(reinterpret_cast<void *>(boundary - page_size * 2)) &&
+            IsWritable(reinterpret_cast<void *>(boundary + page_size)),
+        "reapply protected an unwatched page near the region boundary");
+  Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+            g_protection_ranges[0].address == boundary - page_size &&
+            g_protection_ranges[0].size == page_size &&
+            g_protection_ranges[1].address == boundary &&
+            g_protection_ranges[1].size == page_size,
+        "reapply did not split calls at the region boundary");
+  manager.UpdatePageWatchers<false>(boundary - page_size, page_size * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// A manager that never watched anything has no regions and issues no calls.
+void TestReapplyFreshManager() {
+  PageManager untouched;
+  g_protection_calls = 0;
+  untouched.ReapplyProtection(0x0000000200010000ull, TRACKER_PAGE_SIZE * 4);
+  Check(g_protection_calls == 0, "manager without watchers issued protect calls");
+}
+
+void TestReapplyProtection() {
+  TestReapplySingleRuns();
+  TestReapplyMergesRuns();
+  TestReapplyCrossesRegions();
+  TestReapplyFreshManager();
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -705,6 +887,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
+  TestReapplyProtection();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

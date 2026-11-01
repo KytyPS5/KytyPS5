@@ -4,10 +4,12 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -1070,6 +1073,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 
 	{
+		// A compile on the GPU command thread stops all guest rendering, so guest audio may wait
+		// for it. One on any other thread leaves the game running and must not hold audio.
+		std::optional<Common::GpuStall::Scope> stall;
+		if (GuestGpu::IsGpuThread()) {
+			stall.emplace();
+		}
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
@@ -1098,6 +1107,12 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	}
 
 	{
+		// A compile on the GPU command thread stops all guest rendering, so guest audio may wait
+		// for it. One on any other thread leaves the game running and must not hold audio.
+		std::optional<Common::GpuStall::Scope> stall;
+		if (GuestGpu::IsGpuThread()) {
+			stall.emplace();
+		}
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);

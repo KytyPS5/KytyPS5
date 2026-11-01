@@ -586,6 +586,12 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		    Fmt("%.0f/s  (%llu total)", underruns,
 		        static_cast<unsigned long long>(Total(shown, Counter::AudioUnderruns))),
 		    underruns > 0.0 ? BAD : GOOD);
+		// A hold is deliberate silence during a freeze the user already sees, so it is not
+		// coloured as a fault.
+		Row("Audio holds",
+		    Fmt("%llu  (%.1f s held)",
+		        static_cast<unsigned long long>(Total(shown, Counter::AudioHolds)),
+		        static_cast<double>(Total(shown, Counter::AudioHoldNs)) / 1e9));
 		ImGui::EndTable();
 	}
 }

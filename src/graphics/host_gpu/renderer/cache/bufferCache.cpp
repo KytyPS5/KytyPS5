@@ -402,6 +402,7 @@ void BufferCache::PublishReadHot() {
 	std::vector<Target>                                           targets;
 	auto     batch = std::make_shared<PublishBatch>();
 	uint64_t total = 0;
+	RangeSet retained;
 	m_publish_ranges.ForEach([&](uint64_t start, uint64_t end) {
 		const auto* owner = m_page_table.Find(start >> PageTable::kPageBits);
 		if (owner == nullptr || IsBufferInvalid(*owner) ||
@@ -414,6 +415,7 @@ void BufferCache::PublishReadHot() {
 		    start, end - start, [&](uint64_t first, uint64_t last) {
 			    const auto bytes = last - first;
 			    if (total + bytes > PublishBudget) {
+				    retained.Add(first, bytes);
 				    return;
 			    }
 			    if (copies.empty() || copies.back().first != id) {
@@ -425,14 +427,15 @@ void BufferCache::PublishReadHot() {
 			    total += Common::AlignUp(bytes, 64);
 		    });
 	});
-	m_publish_ranges.Clear();
 	if (batch->empty()) {
+		m_publish_ranges = std::move(retained);
 		return;
 	}
 	auto [mapped, offset] = m_download_buffer.Map(total, 64);
 	if (mapped == nullptr) {
 		return;
 	}
+	m_publish_ranges = std::move(retained);
 	m_download_buffer.Commit();
 	auto& command = m_scheduler.Current();
 	command.EndRendering();

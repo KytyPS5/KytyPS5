@@ -95,6 +95,7 @@ public:
 	void               PublishReadHot();
 	void               DecayReadHot();
 	void               SupersedeAllPublishes();
+	void               SupersedePublishes(uint64_t vaddr, uint64_t size);
 
 private:
 	struct PublishEntry {
@@ -139,7 +140,6 @@ private:
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 	void               NoteReadHot(uint64_t vaddr, uint64_t size);
-	void               SupersedePublishes(uint64_t vaddr, uint64_t size);
 	void               ConfirmPublish(const std::shared_ptr<PublishBatch>& batch);
 
 	GraphicContext&                                   m_graphics;

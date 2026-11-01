@@ -123,6 +123,14 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
 #endif
+enum class UnwindFrameType { RbpFrame, LeafOrSpFrame };
+
+bool   PthreadRegisterFunctionTable(uint64_t base_address, uint64_t size,
+                                    UnwindFrameType frame_type = UnwindFrameType::RbpFrame);
+bool   PthreadUnregisterFunctionTable(uint64_t base_address);
+bool   PthreadIsFunctionTableRegistered(uint64_t base_address);
+size_t PthreadGetRegisteredFunctionTableCount();
+
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();
 

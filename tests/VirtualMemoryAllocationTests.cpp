@@ -4424,6 +4424,116 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestStackFunctionTableRegistrationAndUnwind() {
+	const char* test = "GuestStackFunctionTableRegistrationAndUnwind";
+
+	// 1. Initial validation
+	Check(test, !Libs::LibKernel::PthreadIsFunctionTableRegistered(0x123456780000ULL),
+	      "Nonexistent table should not be registered");
+	Check(test, !Libs::LibKernel::PthreadRegisterFunctionTable(0, 0x1000),
+	      "Zero base should fail registration");
+	Check(test, !Libs::LibKernel::PthreadRegisterFunctionTable(0x100000, 0),
+	      "Zero size should fail registration");
+	Check(test, !Libs::LibKernel::PthreadUnregisterFunctionTable(0),
+	      "Zero base should fail unregister");
+	Check(test, !Libs::LibKernel::PthreadUnregisterFunctionTable(0xDEADBEEFULL),
+	      "Nonexistent base should fail unregister");
+
+	const size_t initial_count = Libs::LibKernel::PthreadGetRegisteredFunctionTableCount();
+
+	// 2. Allocate test code buffer and fill with NOPs (0x90) so unwinder does not misinterpret as epilogue
+	constexpr uint64_t TEST_CODE_SIZE = 0x20000; // 128 KB
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void* code_mem = VirtualAlloc(nullptr, TEST_CODE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	Check(test, code_mem != nullptr, "code allocation failed");
+	std::memset(code_mem, 0x90, TEST_CODE_SIZE);
+	const uint64_t code_base = reinterpret_cast<uint64_t>(code_mem);
+
+	// 3. Register RbpFrame table
+	const bool reg_rbp = Libs::LibKernel::PthreadRegisterFunctionTable(
+	    code_base, TEST_CODE_SIZE, Libs::LibKernel::UnwindFrameType::RbpFrame);
+	Check(test, reg_rbp, "PthreadRegisterFunctionTable(RbpFrame) failed");
+	Check(test, Libs::LibKernel::PthreadIsFunctionTableRegistered(code_base),
+	      "PthreadIsFunctionTableRegistered returned false for RBP frame");
+	Check(test, Libs::LibKernel::PthreadGetRegisteredFunctionTableCount() == initial_count + 1,
+	      "Table count should increment by 1");
+
+	// Re-registering the same base address should be idempotent
+	Check(test,
+	      Libs::LibKernel::PthreadRegisterFunctionTable(code_base, TEST_CODE_SIZE,
+	                                                    Libs::LibKernel::UnwindFrameType::RbpFrame),
+	      "Re-registering existing table should succeed idempotently");
+	Check(test, Libs::LibKernel::PthreadGetRegisteredFunctionTableCount() == initial_count + 1,
+	      "Idempotent re-registration should not increase count");
+
+	// 4. Validate lookup with RtlLookupFunctionEntry
+	DWORD64           image_base = 0;
+	PRUNTIME_FUNCTION fn_entry   = RtlLookupFunctionEntry(code_base + 0x500, &image_base, nullptr);
+	Check(test, fn_entry != nullptr, "RtlLookupFunctionEntry failed to find entry");
+	Check(test, image_base != 0, "RtlLookupFunctionEntry returned zero image_base");
+
+	// 5. Unwind simulated RBP frame
+	void* stack_mem = VirtualAlloc(nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	Check(test, stack_mem != nullptr, "stack allocation failed");
+	const uint64_t rbp_val = reinterpret_cast<uint64_t>(stack_mem) + 0x8000;
+	*reinterpret_cast<uint64_t*>(rbp_val)     = 0xFEEDFACECAFEBABEULL; // Saved RBP
+	*reinterpret_cast<uint64_t*>(rbp_val + 8) = 0x1234567812345678ULL; // Caller RIP
+
+	CONTEXT ctx {};
+	ctx.Rip = code_base + 0x500;
+	ctx.Rbp = rbp_val;
+	ctx.Rsp = rbp_val - 0x20;
+
+	PVOID   handler_data      = nullptr;
+	ULONG64 establisher_frame = 0;
+	RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn_entry, &ctx, &handler_data,
+	                 &establisher_frame, nullptr);
+	Check(test, ctx.Rip == 0x1234567812345678ULL, "Unwound RIP mismatch for RbpFrame");
+	Check(test, ctx.Rbp == 0xFEEDFACECAFEBABEULL, "Unwound RBP mismatch for RbpFrame");
+	Check(test, ctx.Rsp == rbp_val + 16, "Unwound RSP mismatch for RbpFrame");
+
+	// 6. Unregister table and verify lookup fails
+	Check(test, Libs::LibKernel::PthreadUnregisterFunctionTable(code_base),
+	      "PthreadUnregisterFunctionTable failed");
+	Check(test, !Libs::LibKernel::PthreadIsFunctionTableRegistered(code_base),
+	      "PthreadIsFunctionTableRegistered returned true after unregister");
+	Check(test, Libs::LibKernel::PthreadGetRegisteredFunctionTableCount() == initial_count,
+	      "Table count should return to initial_count");
+
+	PRUNTIME_FUNCTION fn_entry_deleted = RtlLookupFunctionEntry(code_base + 0x500, &image_base, nullptr);
+	Check(test, fn_entry_deleted == nullptr, "RtlLookupFunctionEntry found unregistered function");
+
+	// 7. Register LeafOrSpFrame table
+	const bool reg_leaf = Libs::LibKernel::PthreadRegisterFunctionTable(
+	    code_base, TEST_CODE_SIZE, Libs::LibKernel::UnwindFrameType::LeafOrSpFrame);
+	Check(test, reg_leaf, "PthreadRegisterFunctionTable(LeafOrSpFrame) failed");
+
+	DWORD64           leaf_image_base = 0;
+	PRUNTIME_FUNCTION leaf_fn         = RtlLookupFunctionEntry(code_base + 0x300, &leaf_image_base, nullptr);
+	Check(test, leaf_fn != nullptr, "Lookup leaf function failed");
+
+	const uint64_t rsp_val = reinterpret_cast<uint64_t>(stack_mem) + 0x8000;
+	*reinterpret_cast<uint64_t*>(rsp_val) = 0xCAFEBABE11223344ULL; // Caller RIP on top of stack
+
+	CONTEXT leaf_ctx {};
+	leaf_ctx.Rip = code_base + 0x300;
+	leaf_ctx.Rsp = rsp_val;
+
+	RtlVirtualUnwind(UNW_FLAG_NHANDLER, leaf_image_base, leaf_ctx.Rip, leaf_fn, &leaf_ctx, &handler_data,
+	                 &establisher_frame, nullptr);
+	Check(test, leaf_ctx.Rip == 0xCAFEBABE11223344ULL, "Unwound RIP mismatch for LeafOrSpFrame");
+	Check(test, leaf_ctx.Rsp == rsp_val + 8, "Unwound RSP mismatch for LeafOrSpFrame");
+
+	// Cleanup
+	Check(test, Libs::LibKernel::PthreadUnregisterFunctionTable(code_base),
+	      "Cleanup unregister leaf table failed");
+	VirtualFree(stack_mem, 0, MEM_RELEASE);
+	VirtualFree(code_mem, 0, MEM_RELEASE);
+#endif
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestModuleSegmentsUseFlexibleMemory() {
 	const char* test = "ModuleSegmentsUseFlexibleMemory";
 	using namespace Loader;
@@ -5988,6 +6098,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFragmentedPoolDecommitOnSmallStack);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+	RunTest(TestGuestStackFunctionTableRegistrationAndUnwind);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

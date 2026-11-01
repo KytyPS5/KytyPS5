@@ -2638,7 +2638,8 @@ int KYTY_SYSV_ABI Ngs2GeomApply(const Ngs2GeomListenerWork* listener,
 	// Doppler shift from the speed of both ends along the line between them.
 	if (distance > 0.0f && source->doppler_factor > 0.0f) {
 		const float sound = std::max(listener->sound_speed, 1.0f);
-		const auto  axis  = GeomScale(offset, 1.0f / distance);
+		// Source-to-listener direction, as in the DS3D/OpenAL Doppler model.
+		const auto  axis  = GeomScale(offset, -1.0f / distance);
 		const float vl =
 		    std::min(GeomDot(listener->velocity, axis), sound / source->doppler_factor - 1.0f);
 		const float vs =

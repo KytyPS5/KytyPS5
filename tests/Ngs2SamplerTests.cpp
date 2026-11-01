@@ -936,6 +936,32 @@ void TestGeomStereoPlacement() {
   Check(r < near_r, "a distant source should be quieter");
 }
 
+void TestGeomDoppler() {
+  Ngs2GeomListenerParam listener;
+  Ngs2GeomListenerWork work;
+  Ngs2GeomResetListenerParam(&listener);
+  Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK,
+        "geom listener failed");
+
+  auto pitch = [&](float source_vz, float listener_vz) {
+    Ngs2GeomListenerWork moving = work;
+    moving.velocity = {0.0f, 0.0f, listener_vz};
+    Ngs2GeomSourceParam source;
+    Ngs2GeomResetSourceParam(&source);
+    source.position = {0.0f, 0.0f, 10.0f};
+    source.velocity = {0.0f, 0.0f, source_vz};
+    source.doppler_factor = 1.0f;
+    Ngs2GeomAttribute attrib;
+    Check(Ngs2GeomApply(&moving, &source, &attrib, 0) == OK,
+          "geom apply failed");
+    return attrib.pitch_ratio;
+  };
+  Check(pitch(-5.0f, 0.0f) > 1.0f, "approaching source should raise pitch");
+  Check(pitch(5.0f, 0.0f) < 1.0f, "receding source should lower pitch");
+  Check(pitch(0.0f, 5.0f) > 1.0f, "approaching listener should raise pitch");
+  Check(pitch(0.0f, -5.0f) < 1.0f, "receding listener should lower pitch");
+}
+
 void TestReverbTail() {
   Ngs2ReverbState reverb;
   reverb.params = {0.6f, 0.4f, -1000, -602, -302, 2.91f, 1.3f, 0.015f, 0.022f};
@@ -2036,6 +2062,8 @@ int main() {
 	TestMasteringGain();
 	TestReverbDryLevel();
         TestReverbTail();
+        TestGeomStereoPlacement();
+        TestGeomDoppler();
         TestCustomMasteringChannelMixer();
         TestCustomVoiceStateCapacity();
         TestSubmixerSetupAndRouting();

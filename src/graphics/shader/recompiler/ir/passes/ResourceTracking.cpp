@@ -222,6 +222,36 @@ public:
 	}
 
 private:
+	static uint64_t Mix(uint64_t value) {
+		value ^= value >> 33;
+		value *= 0xff51afd7ed558ccdull;
+		value ^= value >> 33;
+		value *= 0xc4ceb9fe1a85ec53ull;
+		return value ^ (value >> 33);
+	}
+
+	struct TripleHash {
+		size_t operator()(const std::array<uint32_t, 3>& key) const noexcept {
+			return static_cast<size_t>(
+			    Mix((static_cast<uint64_t>(key[0]) << 32 | key[1]) ^ Mix(key[2])));
+		}
+	};
+
+	struct PredicateKey {
+		ValueOpcode opcode;
+		uint64_t    flags;
+		uint32_t    left;
+		uint32_t    right;
+		bool        operator==(const PredicateKey&) const = default;
+	};
+
+	struct PredicateHash {
+		size_t operator()(const PredicateKey& key) const noexcept {
+			return static_cast<size_t>(Mix(key.flags ^ Mix(static_cast<uint64_t>(key.opcode))) ^
+			                           Mix(static_cast<uint64_t>(key.left) << 32 | key.right));
+		}
+	};
+
 	struct Node {
 		uint32_t variable = UINT32_MAX;
 		uint32_t low = 0;
@@ -266,7 +296,7 @@ private:
 			if (inst.GetOpcode() == ValueOpcode::IEqual32) return 1u;
 			if (inst.GetOpcode() == ValueOpcode::INotEqual32) return 0u;
 		}
-		const auto key = std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), left, right};
+		const PredicateKey key {inst.GetOpcode(), inst.Flags<uint64_t>(), left, right};
 		if (const auto found = m_predicates.find(key); found != m_predicates.end()) return found->second;
 		const auto variable = std::min(m_nodes[left].variable, m_nodes[right].variable);
 		uint32_t result;
@@ -303,7 +333,8 @@ private:
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
 			return found->second;
 		}
-		const auto cached = values.emplace(inst, UINT32_MAX).first;
+		// References survive rehashing while the recursion below inserts more values.
+		auto&      cached = values.emplace(inst, UINT32_MAX).first->second;
 		auto result = UINT32_MAX;
 		const auto arg = [&](uint32_t index) { return Evaluate(inst->Arg(index), current); };
 		switch (inst->GetOpcode()) {
@@ -351,10 +382,10 @@ private:
 		}
 		// Only unsupported values and cycles need free variables.
 		if (result == UINT32_MAX) {
-			if (cached->second == UINT32_MAX) cached->second = Unknown(value.GetType());
-			return cached->second;
+			if (cached == UINT32_MAX) cached = Unknown(value.GetType());
+			return cached;
 		}
-		cached->second = result;
+		cached = result;
 		return result;
 	}
 
@@ -366,13 +397,17 @@ private:
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
-	std::array<std::map<const Inst*, uint32_t>, 2> m_values;
-	std::map<std::array<uint32_t, 3>, uint32_t> m_nodes_by_key;
-	std::map<std::array<uint32_t, 3>, uint32_t> m_choices;
-	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
+	using Values = std::unordered_map<const Inst*, uint32_t>;
+	std::array<Values, 2>                                             m_values;
+	std::unordered_map<std::array<uint32_t, 3>, uint32_t, TripleHash> m_nodes_by_key;
+	std::unordered_map<std::array<uint32_t, 3>, uint32_t, TripleHash> m_choices;
+	std::unordered_map<PredicateKey, uint32_t, PredicateHash>         m_predicates;
 };
 
 class Tracker {
+#if defined(KYTY_LOOP_PROOF_TESTING)
+	friend struct LoopProofTestAccess;
+#endif
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
 	        ShaderStageInputInfo input)
@@ -407,6 +442,7 @@ public:
 		}
 		for (const auto& patch: m_memory_patches) {
 			auto& memory    = m_program.memory_info[patch.index];
+			NoteIrMutation();
 			memory.resource = patch.resource;
 			if (patch.has_sampler) {
 				memory.sampler = patch.sampler;
@@ -528,6 +564,7 @@ public:
 				}
 			}
 			if (plan.reads[0] != nullptr && !plan.retain_reads) {
+				NoteIrMutation();
 				for (uint32_t word = 0; word < plan.read_dwords; ++word)
 					m_program.memory_info[plan.memory[word]].planning_only = true;
 			}
@@ -930,6 +967,7 @@ private:
 			EXIT_IF(resolved == m_resolved_handles.end());
 			uint32_t bad_dword = 0;
 			if (!ValidateSource(resolved->source, bad_dword)) continue;
+			NoteIrMutation();
 			memory.planning_only = true;
 			uint32_t slot = 0;
 			for (; slot < m_program.srt_reads.size(); ++slot) {
@@ -962,8 +1000,14 @@ private:
 						entry.source.dwords[word] = flat;
 			}
 			for (auto* block: m_program.blocks) {
-				if (block->condition.Resolve() == Value(read)) block->condition = flat;
-				if (block->indirect_target.Resolve() == Value(read)) block->indirect_target = flat;
+				if (block->condition.Resolve() == Value(read)) {
+					NoteIrMutation();
+					block->condition = flat;
+				}
+				if (block->indirect_target.Resolve() == Value(read)) {
+					NoteIrMutation();
+					block->indirect_target = flat;
+				}
 			}
 			if (keep) {
 				if (resolved->planning_handle.IsEmpty()) {
@@ -1762,6 +1806,41 @@ private:
 		return {};
 	}
 
+	struct IncrementGuard {
+		uint64_t epoch   = 0;
+		bool     guarded = false;
+	};
+
+	bool ComputeIncrementGuard(const Inst& phi, const Inst& compare,
+	                           const Block* increment_block) const {
+		LoopBoundProof proof(m_program, phi, compare);
+		return GuardedOnEntry(
+		    increment_block, [&](const Block* block) { return block == phi.Parent(); },
+		    [&](const EdgePredicate& edge) {
+			    return proof.Excludes(edge.condition, edge.positive);
+		    });
+	}
+
+	// Tracker-local fact: all increment paths exclude the failed current bound.
+	// stops is derived from phi; use, step and lane checks stay in BoundedInduction.
+	// Both verdicts depend on IR operands/flags/ownership and CFG edges/conditions.
+	// Direct writes to those dependencies during Run must notify the mutation epoch.
+	bool IncrementGuarded(const Inst& phi, const Inst& compare,
+	                      const Block* increment_block) const {
+		const auto epoch = g_ir_mutation_epoch;
+		const auto key   = std::tuple {&phi, &compare, increment_block};
+		if (const auto found = m_increment_guards.find(key);
+		    found != m_increment_guards.end() && found->second.epoch == epoch) {
+#if defined(KYTY_LOOP_PROOF_VERIFY)
+			EXIT_IF(found->second.guarded != ComputeIncrementGuard(phi, compare, increment_block));
+#endif
+			return found->second.guarded;
+		}
+		const bool guarded = ComputeIncrementGuard(phi, compare, increment_block);
+		m_increment_guards.insert_or_assign(key, IncrementGuard {epoch, guarded});
+		return guarded;
+	}
+
 	const Inst* BoundedInduction(Value key, const Block* use, const auto& accepts_step,
 	                             const auto& accepts_bound,
 	                             LaneQuantifier lanes = LaneQuantifier::Any) const {
@@ -1786,16 +1865,16 @@ private:
 			const auto* compare = use_of_key.user;
 			if (use_of_key.operand != 0u ||
 			    !accepts_bound(*compare, initial_arm)) continue;
-			if (!GuardedOnEntry(use != nullptr ? use : increment_block, stops, [&](const EdgePredicate& edge) {
-				return edge.positive && (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
-				       Implies(edge.condition, Value(use_of_key.user));
-			})) continue;
-			LoopBoundProof proof(m_program, *phi, *compare);
+			if (!GuardedOnEntry(use != nullptr ? use : increment_block, stops,
+			                    [&](const EdgePredicate& edge) {
+				                    return edge.positive &&
+				                           (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
+				                           Implies(edge.condition, Value(use_of_key.user));
+			                    }))
+				continue;
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
-				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare;
+			if (IncrementGuarded(*phi, *compare, increment_block)) return compare;
 		}
 		return {};
 	}
@@ -4223,6 +4302,7 @@ private:
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
 				}
+				NoteIrMutation();
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
 				return;
@@ -4245,6 +4325,7 @@ private:
 				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
 					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
 				}
+				NoteIrMutation();
 				m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
 				return;
 			}
@@ -4361,6 +4442,8 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
+	mutable std::map<std::tuple<const Inst*, const Inst*, const Block*>, IncrementGuard>
+	    m_increment_guards;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,

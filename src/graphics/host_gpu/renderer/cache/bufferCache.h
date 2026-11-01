@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -87,9 +88,13 @@ public:
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	// Queue after the range's state change becomes visible, or a drain could consume it first. A
+	// deferred event (a write from any thread but the GPU thread) is held back until
+	// PromoteBdaSync().
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size, bool deferred = false);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// Makes game-thread writes visible to the next BDA synchronization.
+	void               PromoteBdaSync();
 	void               RunGarbageCollector();
 
 private:
@@ -143,6 +148,9 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	RangeSet                                          m_bda_sync_deferred;
+	// Set while m_bda_sync_deferred may be non-empty. Allows PromoteBdaSync to skip the lock.
+	std::atomic<bool>                                 m_has_deferred_bda_sync {false};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

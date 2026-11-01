@@ -97,6 +97,10 @@ public:
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void WaitForRewind(bool valid);
+	/// Call after reading a value from guest memory that a game thread may have written, such as
+	/// a flag that COND_EXEC or BRANCH tests. The game thread wrote the data the value guards
+	/// first, so its held-back BDA events are promoted for the draws that follow.
+	void PromoteGuestWrites();
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);

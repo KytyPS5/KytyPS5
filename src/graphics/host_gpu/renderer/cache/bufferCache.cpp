@@ -301,7 +301,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size);
+	// Writes from threads other than the GPU thread (game threads, file I/O and so on) land before
+	// the work that reads them is submitted, or before a wait the command processor is blocked on
+	// is released. So their BDA synchronization events can wait until the command processor starts
+	// or resumes a submission. Synchronizing them at every BDA draw instead uploads data meant for
+	// later frames again and again.
+	QueueBdaSync(vaddr, size, !GuestGpu::IsGpuThread());
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -728,11 +733,39 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+// Queues the pages of [vaddr, vaddr + size) for the next BDA synchronization. A deferred event
+// waits in its own set until PromoteBdaSync.
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool deferred) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
+	if (deferred) {
+		m_bda_sync_deferred.Add(begin, end - begin);
+		m_has_deferred_bda_sync.store(true, std::memory_order_release);
+	} else {
+		m_bda_sync.Add(begin, end - begin);
+	}
+}
+
+// Moves the deferred BDA events into the set TakeBdaSync() returns.
+void BufferCache::PromoteBdaSync() {
+	// The command processor calls this at every submission slice and every passing wait. Most of
+	// the time nothing was deferred since the last call, so we can skip the lock. A game thread
+	// sets the flag before it submits or releases the wait, so its event will not be missed.
+	if (!m_has_deferred_bda_sync.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard lock(m_bda_sync_mutex);
+	m_has_deferred_bda_sync.store(false, std::memory_order_relaxed);
+	// The immediate set is typically empty here, since every BDA draw takes it. Then, instead of
+	// moving the deferred set range by range, it is moved as a whole.
+	if (m_bda_sync.Empty()) {
+		std::swap(m_bda_sync, m_bda_sync_deferred);
+	} else {
+		m_bda_sync_deferred.ForEach(
+		    [this](uint64_t begin, uint64_t end) { m_bda_sync.Add(begin, end - begin); });
+	}
+	m_bda_sync_deferred.Clear();
 }
 
 RangeSet BufferCache::TakeBdaSync() {

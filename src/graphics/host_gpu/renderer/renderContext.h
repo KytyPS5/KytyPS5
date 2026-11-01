@@ -66,6 +66,9 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	[[nodiscard]] bool NeedsUnmapDrain(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsUnmapDrainRedundant(uint64_t vaddr, uint64_t size);
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
@@ -89,6 +92,8 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	// Read once so shutdown never reaches for a released config.
+	const bool                m_skip_redundant_unmap_drains;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

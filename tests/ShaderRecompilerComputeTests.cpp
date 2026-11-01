@@ -5500,6 +5500,185 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // One mapped fixture for the redundant-unmap drain checks.
+  struct UnmapDrainRig {
+    const char *name;
+    bool skip;
+    RenderContext *context;
+    static constexpr uintptr_t base = 0x000000020a000000ull;
+    static constexpr uint64_t span = 0x10000;
+    // Each case owns its own range so no case inherits another's state.
+    static constexpr uint64_t clean_offset = 0x00000;
+    static constexpr uint64_t image_offset = 0x20000;
+    static constexpr uint64_t dirty_offset = 0x40000;
+    static constexpr uint64_t baseline_offset = 0x60000;
+    static constexpr uint64_t priority_offset = 0x80000;
+    static constexpr uint64_t allocation_size = 0x100000;
+  };
+
+  // Counts the queue submits that one UnmapMemory call causes.
+  static uint64_t CountUnmapSubmits(RenderContext &context, uint64_t address) {
+    using Counter = Common::DebugCounters::Counter;
+    const auto before = Common::DebugCounters::Get(Counter::QueueSubmits);
+    context.UnmapMemory(address, UnmapDrainRig::span);
+    return Common::DebugCounters::Get(Counter::QueueSubmits) - before;
+  }
+
+  // Registers a clean buffer over a mapped range and unmaps it once, returning that unmap's submits.
+  static uint64_t UnmapRegisteredBuffer(const UnmapDrainRig &rig, uint64_t address) {
+    auto &cache = rig.context->GetBufferCache();
+    (void)cache.ObtainBuffer(address, UnmapDrainRig::span, false, false);
+    Require(rig.name, "registered clean buffer",
+            cache.IsRegionRegistered(address, UnmapDrainRig::span) &&
+                !cache.HasGpuDirtyBytes(address, UnmapDrainRig::span) &&
+                rig.context->IsMapped(address, UnmapDrainRig::span),
+            "fixture buffer is not registered, clean and mapped");
+    const auto submits = CountUnmapSubmits(*rig.context, address);
+    // Synchronizing again marks the retained buffer CPU-clean, so the next unmap must dirty it itself.
+    (void)cache.ObtainBuffer(address, UnmapDrainRig::span, false, false);
+    return submits;
+  }
+
+  // Cases 1 and 2 show a mapped range drains in both modes while a repeat unmap drains only without the flag.
+  void CheckRepeatedUnmapDrain(const UnmapDrainRig &rig) {
+    const auto address = UnmapDrainRig::base + UnmapDrainRig::clean_offset;
+    auto &cache = rig.context->GetBufferCache();
+    const auto first = UnmapRegisteredBuffer(rig, address);
+    Require(rig.name, "mapped range drains", first >= 1,
+            "unmapping a mapped registered range did not drain");
+    Require(rig.name, "repeat precondition",
+            !rig.context->IsMapped(address, UnmapDrainRig::span) &&
+                cache.IsRegionRegistered(address, UnmapDrainRig::span) &&
+                !cache.IsRegionCpuModified(address, UnmapDrainRig::span),
+            "range is not unmapped, still registered and CPU-clean");
+    (void)cache.TakeBdaSync();
+    const auto second = CountUnmapSubmits(*rig.context, address);
+    const auto bda = cache.TakeBdaSync();
+    Require(rig.name, "repeat unmap drain count",
+            rig.skip ? second == 0 : second >= 1,
+            rig.skip ? "flag on still drained a repeated unmap"
+                     : "flag off skipped the drain of a repeated unmap");
+    Require(rig.name, "repeat unmap post-state",
+            cache.IsRegionRegistered(address, UnmapDrainRig::span) &&
+                cache.IsRegionCpuModified(address, UnmapDrainRig::span) &&
+                !cache.HasGpuDirtyBytes(address, UnmapDrainRig::span) &&
+                bda.Intersects(address, UnmapDrainRig::span),
+            "a repeated unmap did not invalidate the buffer and queue a BDA sync");
+  }
+
+  // Case 3a shows an image registered over an unmapped range keeps the drain.
+  void CheckImageKeepsUnmapDrain(const UnmapDrainRig &rig) {
+    const auto address = UnmapDrainRig::base + UnmapDrainRig::image_offset;
+    (void)UnmapRegisteredBuffer(rig, address);
+    auto &textures = rig.context->GetTextureCache();
+    auto desc = MakeLinearDesc(address, 4, vk::Format::eR8G8B8A8Srgb,
+                               Prospero::BufferFormat::k8_8_8_8Srgb,
+                               Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+    (void)textures.FindImage(desc);
+    Require(rig.name, "image over unmapped range",
+            textures.IsRegionRegistered(address, UnmapDrainRig::span) &&
+                !rig.context->IsMapped(address, UnmapDrainRig::span),
+            "fixture image is not registered over an unmapped range");
+    Require(rig.name, "image keeps drain",
+            CountUnmapSubmits(*rig.context, address) >= 1,
+            "an unmapped range with a registered image skipped the drain");
+  }
+
+  // Dirties a buffer with GPU writes over a range that is already unmapped.
+  static void DirtyUnmappedBuffer(const UnmapDrainRig &rig, uint64_t address) {
+    auto &cache = rig.context->GetBufferCache();
+    (void)UnmapRegisteredBuffer(rig, address);
+    (void)cache.ObtainBuffer(address, UnmapDrainRig::span, true, false);
+    cache.FillBuffer(address, UnmapDrainRig::span, 0x5a5a5a5au, false);
+    Require(rig.name, "dirty over unmapped range",
+            cache.HasGpuDirtyBytes(address, UnmapDrainRig::span) &&
+                !rig.context->IsMapped(address, UnmapDrainRig::span),
+            "fixture bytes are not GPU-dirty over an unmapped range");
+  }
+
+  // Case 3b shows GPU-written bytes keep the drain, measured against the readback's own submits.
+  void CheckGpuDirtyKeepsUnmapDrain(const UnmapDrainRig &rig) {
+    using Counter = Common::DebugCounters::Counter;
+    const auto baseline_address = UnmapDrainRig::base + UnmapDrainRig::baseline_offset;
+    DirtyUnmappedBuffer(rig, baseline_address);
+    const auto before = Common::DebugCounters::Get(Counter::QueueSubmits);
+    rig.context->GetBufferCache().ReadMemory(baseline_address, UnmapDrainRig::span);
+    const auto readback_submits = Common::DebugCounters::Get(Counter::QueueSubmits) - before;
+    const auto address = UnmapDrainRig::base + UnmapDrainRig::dirty_offset;
+    DirtyUnmappedBuffer(rig, address);
+    // The unmap's own download submits readback_submits, so only a real drain adds one more.
+    Require(rig.name, "dirty bytes keep drain",
+            CountUnmapSubmits(*rig.context, address) >= readback_submits + 1,
+            "an unmapped range with GPU-dirty bytes skipped the drain");
+  }
+
+  // Case 3c shows a pending priority operation keeps the drain and is completed by it.
+  void CheckPriorityOperationKeepsUnmapDrain(const UnmapDrainRig &rig) {
+    const auto address = UnmapDrainRig::base + UnmapDrainRig::priority_offset;
+    (void)UnmapRegisteredBuffer(rig, address);
+    auto &scheduler = rig.context->GetCommandScheduler();
+    scheduler.DeferPriorityOperation([] {});
+    Require(rig.name, "priority operation pending",
+            scheduler.HasPendingPriorityOperations(),
+            "fixture priority operation is not pending");
+    Require(rig.name, "priority operation keeps drain",
+            CountUnmapSubmits(*rig.context, address) >= 1 &&
+                !scheduler.HasPendingPriorityOperations(),
+            "an unmapped range with a pending priority operation skipped the drain");
+  }
+
+  // Runs every redundant-unmap drain case once with the flag set as given.
+  void CheckSkipRedundantUnmapDrainsMode(bool skip) {
+    constexpr const char *name = "SkipRedundantUnmapDrains";
+    constexpr uint64_t alignment = 0x10000;
+    // Submit counters only advance while the performance overlay enables them.
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .skip_redundant_unmap_drains = skip,
+                  .perf_overlay_enabled = true});
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    void *mapped = reinterpret_cast<void *>(UnmapDrainRig::base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                UnmapDrainRig::allocation_size, alignment, 0, &direct_offset) == 0 &&
+                Libs::LibKernel::Memory::KernelMapDirectMemory(
+                    &mapped, UnmapDrainRig::allocation_size, 0x3, 0x10, direct_offset,
+                    alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(UnmapDrainRig::base),
+            "fixed direct-memory mapping failed");
+    context.MapMemory(UnmapDrainRig::base, UnmapDrainRig::allocation_size);
+    const UnmapDrainRig rig{name, skip, &context};
+    CheckRepeatedUnmapDrain(rig);
+    CheckImageKeepsUnmapDrain(rig);
+    CheckGpuDirtyKeepsUnmapDrain(rig);
+    CheckPriorityOperationKeepsUnmapDrain(rig);
+    context.UnmapMemory(UnmapDrainRig::base, UnmapDrainRig::allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(UnmapDrainRig::base,
+                                                  UnmapDrainRig::allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, UnmapDrainRig::allocation_size) == 0,
+            "direct-memory release failed");
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+  }
+
+  // Checks the redundant-unmap drain skip with the flag off and on.
+  void CheckSkipRedundantUnmapDrains() {
+    CheckSkipRedundantUnmapDrainsMode(false);
+    CheckSkipRedundantUnmapDrainsMode(true);
+    std::printf("[host]    %-32s ok\n", "SkipRedundantUnmapDrains");
+  }
+
   void CheckResidentImageHeap() {
     constexpr const char *name = "ResidentImageHeap";
     constexpr uintptr_t base = 0x0000000206800000ull;
@@ -54762,6 +54941,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckSkipRedundantUnmapDrains();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -55030,6 +55210,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckSkipRedundantUnmapDrains();
   } else {
     skipped_device_checks = true;
   }

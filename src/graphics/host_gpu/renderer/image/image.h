@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -107,11 +108,50 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
+	// Marks the whole image as newer in a buffer. A whole mark always wins over a range.
 	void               MarkBufferModified() noexcept {
+		m_buffer_modified = true;
+		m_buffer_whole    = true;
+		HeapChanged();
+	}
+	// Marks only [offset, offset + size) of info.data as newer in a buffer. The range is clamped
+	// to the image so a binding that overhangs it cannot widen the refresh. Overlapping marks
+	// merge into their hull because the caller only needs one bounding range per image, and a
+	// whole mark is never downgraded because the rest of the image is already stale.
+	void               MarkBufferModifiedRange(uint64_t offset, uint64_t size) noexcept {
+		if (offset >= info.data.size || size == 0) {
+			return;
+		}
+		const uint64_t end = offset + std::min(size, info.data.size - offset);
+		if (m_buffer_whole) {
+			return;
+		}
+		if (m_buffer_modified) {
+			m_buffer_range_offset = std::min(m_buffer_range_offset, offset);
+			m_buffer_range_end    = std::max(m_buffer_range_end, end);
+		} else {
+			m_buffer_range_offset = offset;
+			m_buffer_range_end    = end;
+		}
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	// The absolute guest range written through a buffer, or nullopt when nothing is marked or the
+	// whole image is.
+	[[nodiscard]] std::optional<GuestRange> BufferModifiedRange() const noexcept {
+		if (!m_buffer_modified || m_buffer_whole) {
+			return std::nullopt;
+		}
+		return GuestRange {info.data.address + m_buffer_range_offset,
+		                   m_buffer_range_end - m_buffer_range_offset};
+	}
+	// Drops both the whole mark and the range mark.
+	void               ClearBufferModified() noexcept {
+		m_buffer_modified     = false;
+		m_buffer_whole        = false;
+		m_buffer_range_offset = 0;
+		m_buffer_range_end    = 0;
+	}
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -178,6 +218,10 @@ private:
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+	// Set by a whole mark. The range below is meaningful only while a range mark is active.
+	bool              m_buffer_whole        = false;
+	uint64_t          m_buffer_range_offset = 0;
+	uint64_t          m_buffer_range_end    = 0;
 };
 
 namespace ImageOps {

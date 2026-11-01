@@ -8196,6 +8196,87 @@ public:
               "cleared image could not be read or written after ownership "
               "transfer");
 
+      // Buffer-written byte range tracking on an image large enough to hold distinct ranges.
+      constexpr uint64_t range_size = 0x8000;
+      auto range_desc = MakeLinearDesc(
+          base + 0x800000, range_size, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {128, 64, 1}, 1, 4, 1);
+      auto &range_image = texture_cache.GetImage(texture_cache.FindImage(range_desc));
+      const auto range_address = range_image.info.data.address;
+      const auto RangeIs = [&](uint64_t offset, uint64_t size) {
+        const auto range = range_image.BufferModifiedRange();
+        return range && range->address == range_address + offset && range->size == size;
+      };
+      range_image.ClearBufferModified();
+      const bool clean_before_whole =
+          !range_image.IsBufferModified() && !range_image.BufferModifiedRange();
+      range_image.MarkBufferModified();
+      Require(name, "buffer range baseline whole mark",
+              clean_before_whole && range_image.IsBufferModified() &&
+                  !range_image.BufferModifiedRange(),
+              "a whole mark reported a range or did not mark the image");
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(0, range_size);
+      range_image.MarkBufferModifiedRange(0, 4);
+      Require(name, "buffer range hull keeps the larger range",
+              range_image.IsBufferModified() && RangeIs(0, range_size),
+              "a later small range replaced the earlier large range");
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(64, 16);
+      range_image.MarkBufferModifiedRange(0, 8);
+      Require(name, "buffer range hull of disjoint ranges", RangeIs(0, 80),
+              "disjoint ranges did not merge into their hull");
+      // The higher range second, so a hull that took the newest start would lose offset 0.
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(0, 8);
+      range_image.MarkBufferModifiedRange(64, 16);
+      Require(name, "buffer range hull keeps the lowest start", RangeIs(0, 80),
+              "a later higher range moved the start of the hull");
+      range_image.MarkBufferModified();
+      range_image.MarkBufferModifiedRange(0, 4);
+      Require(name, "buffer range cannot downgrade a whole mark",
+              range_image.IsBufferModified() && !range_image.BufferModifiedRange(),
+              "a range mark downgraded a whole mark");
+      range_image.ClearBufferModified();
+      Require(name, "buffer range clear",
+              !range_image.IsBufferModified() && !range_image.BufferModifiedRange(),
+              "clear left a mark or a range behind");
+      range_image.MarkBufferModifiedRange(range_size - 8, 0x100);
+      Require(name, "buffer range clamp", RangeIs(range_size - 8, 8),
+              "a range past the image was not clamped");
+      // Past the end, an unsigned wrap would otherwise widen the hull.
+      range_image.MarkBufferModifiedRange(range_size + 0x100, 4);
+      range_image.MarkBufferModifiedRange(range_size, 4);
+      range_image.MarkBufferModifiedRange(0, 0);
+      Require(name, "buffer range empty marks ignored", RangeIs(range_size - 8, 8),
+              "an empty or out-of-image range changed the mark");
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(range_size + 0x100, 4);
+      range_image.MarkBufferModifiedRange(0, 0);
+      Require(name, "buffer range ignored marks leave a clean image clean",
+              !range_image.IsBufferModified() && !range_image.BufferModifiedRange(),
+              "an ignored range mark marked a clean image");
+
+      // Resident image heaps must be told when a range mark changes the image.
+      range_image.heap_refs.store(1u);
+      const auto epoch_before = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModifiedRange(0, 0);
+      range_image.MarkBufferModifiedRange(range_size + 0x100, 4);
+      const auto epoch_ignored = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModifiedRange(0, 16);
+      const auto epoch_marked = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModified();
+      const auto epoch_whole = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModifiedRange(0, 16);
+      const auto epoch_after_whole = Libs::Graphics::Image::heap_epoch.load();
+      range_image.heap_refs.store(0u);
+      Require(name, "buffer range notifies image heaps",
+              epoch_ignored == epoch_before && epoch_marked > epoch_ignored &&
+                  epoch_whole > epoch_marked && epoch_after_whole == epoch_whole,
+              "a range mark did not bump the heap epoch or an ignored mark did");
+      range_image.ClearBufferModified();
+
       auto stencil_clear_desc = MakeLinearDesc(
           base + 0x27e0000, 0x1000, vk::Format::eD32SfloatS8Uint,
           Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,

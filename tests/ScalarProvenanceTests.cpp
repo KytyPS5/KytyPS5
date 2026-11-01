@@ -733,7 +733,7 @@ void TestCompleteWaveReduction() {
       operation = ValueOpcode::BitwiseOr32;
       reduction_opcode = ValueOpcode::SubgroupOrU32;
     }
-    if (test == Case::WrongOperation) operation = ValueOpcode::IAdd32;
+    if (test == Case::WrongOperation) operation = ValueOpcode::BitwiseXor32;
     for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
       DppMoveFlags flags{.control = 0x110u + shift};
       if (shift == 2) {

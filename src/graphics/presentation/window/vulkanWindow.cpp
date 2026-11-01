@@ -77,6 +77,7 @@ vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noe
 	vk::PhysicalDeviceVulkan13Features features {};
 	features.dynamicRendering = VK_TRUE;
 	features.synchronization2 = VK_TRUE;
+	features.maintenance4 = VK_TRUE;
 	return features;
 }
 
@@ -316,6 +317,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features13.dynamicRendering);
 		check_feature(features13.synchronization2, "synchronization2",
 		              required_features13.synchronization2);
+		check_feature(features13.maintenance4, "maintenance4",
+        			  required_features13.maintenance4);
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");

@@ -167,6 +167,10 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// Caller holds m_lock. Refresh only the buffer-written range of an image, returning false
+	// when the full upload has to run instead.
+	[[nodiscard]] bool TryPartialRefresh(Image& image);
+	void               RefreshLinearRange(Image& image, GuestRange range);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;

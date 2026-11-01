@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/refreshRegions.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -47,6 +48,11 @@ void MarkWholeBufferWrite(Image& image) {
 		image.ClearGpuModified();
 	}
 	image.MarkBufferModified();
+}
+
+// Tells whether a written range is small enough for a partial refresh to pay off.
+[[nodiscard]] bool WithinPartialLimit(const Image& image, uint64_t size) {
+	return size <= image.info.data.size / PartialRefreshMaxFraction;
 }
 
 // Tells whether a range-limited refresh is exact for this image. Layouts whose byte ranges do not
@@ -1045,6 +1051,61 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
+// Refreshes an image from only the bytes a buffer wrote into it, keeping the rest of the image
+// as the GPU left it. gpu_mod stays set, because the image is still newer than the buffer outside
+// that range. Returns false for anything this path cannot do exactly, so the caller falls back to
+// the full upload. Only linear layouts are handled for now.
+bool TextureCache::TryPartialRefresh(Image& image) {
+	const auto range = image.BufferModifiedRange();
+	if (!m_partial_buffer_refresh || !range) {
+		return false;
+	}
+	namespace Counters = Common::DebugCounters;
+	// A hull of several writes can pass the limit that each write alone respected.
+	const bool usable = IsPartialRefreshEligible(image) && !image.IsCpuDirty() &&
+	                    !image.info.IsTiled() && WithinPartialLimit(image, range->size);
+	if (!usable) {
+		Counters::Add(Counters::Counter::TexturePartialFallbacks);
+		return false;
+	}
+	RefreshLinearRange(image, *range);
+	return true;
+}
+
+// Copies the rounded written range of a linear image from its source buffer, one rectangle per
+// region from LinearRefreshRegions, and then drops the buffer mark. The image's other texels are
+// not touched, since Upload transitions from the current layout rather than from undefined.
+void TextureCache::RefreshLinearRange(Image& image, GuestRange range) {
+	namespace Counters = Common::DebugCounters;
+	const auto& info    = image.info;
+	const auto  first   = range.address - info.data.address;
+	const auto  rounded = RoundRefreshRange(info, first, first + range.size);
+	const auto  regions = LinearRefreshRegions(info, rounded.lo, rounded.hi);
+	if (!regions.empty()) {
+		const uint64_t size = rounded.hi - rounded.lo;
+		const auto [source, source_offset] =
+		    m_buffer_cache.ObtainBufferForImage(info.data.address + rounded.lo, size);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain partial image upload source\n");
+		}
+		// The copies address bytes by their offset into the image data, but the buffer starts at
+		// the rounded range, so the base is shifted back by that start. The subtraction can wrap
+		// when source_offset is smaller than rounded.lo. That is fine, because every region starts
+		// at or after rounded.lo and uint64 arithmetic is modular, so each final bufferOffset is
+		// right. Do not clamp it.
+		const auto copies = RegionCopies(info, regions, source_offset - rounded.lo);
+		image.Upload(copies, source->Handle(), source_offset, size);
+		uint64_t bytes = 0;
+		for (const auto& region: regions) {
+			bytes += uint64_t {region.width} * region.height * info.tiling.block.bytes_per_element;
+		}
+		Counters::Add(Counters::Counter::TexturePartialUploadBytes, bytes);
+		Counters::Add(Counters::Counter::TextureUploadBytes, bytes);
+	}
+	Counters::Add(Counters::Counter::TexturePartialRefreshes);
+	image.ClearBufferModified();
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	TrackImage(id);
@@ -1058,7 +1119,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
-	if (upload) {
+	if (upload && !TryPartialRefresh(image)) {
 		if (image.BufferModifiedRange()) {
 			// The upload below is still a full one, so the image must stop counting as newer than
 			// the buffer, as it would after a whole mark.
@@ -1978,8 +2039,7 @@ void TextureCache::InvalidateBufferWrite(uint64_t address, uint64_t size) {
 		if (image.info.data.address != address) {
 			continue;
 		}
-		const bool partial = IsPartialRefreshEligible(image) &&
-		                     size <= image.info.data.size / PartialRefreshMaxFraction;
+		const bool partial = IsPartialRefreshEligible(image) && WithinPartialLimit(image, size);
 		if (partial) {
 			image.MarkBufferModifiedRange(0, size);
 			continue;
@@ -2110,6 +2170,8 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
+				// A range-marked image is not safe to download, so it is freed without a
+				// readback exactly as a whole-marked one was before partial refresh existed.
 				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
 					continue;
@@ -2144,12 +2206,20 @@ void TextureCache::ProcessDownloadImages() {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: m_download_images) {
-		if (m_slot_images[id].IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+	std::erase_if(m_download_images, [this](ImageId id) {
+		const auto& image = m_slot_images[id];
+		if (!image.IsGpuModified()) {
+			return true;
 		}
-	}
-	m_download_images.clear();
+		// A range mark makes the image unsafe to download until its next bind refreshes it, but
+		// the image is still newer than guest memory outside that range. Dropping the id here
+		// would lose the readback, so it stays pending for the next pass.
+		if (image.BufferModifiedRange()) {
+			return false;
+		}
+		(void)DownloadImageMemory(id);
+		return true;
+	});
 }
 
 } // namespace Libs::Graphics

@@ -387,6 +387,11 @@ struct TextureCacheTestAccess {
     return mapping;
   }
 
+  static bool IsDownloadPending(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.m_download_images.contains(id);
+  }
+
   static bool TryDownload(TextureCache &cache, ImageId id) {
     return cache.DownloadImageMemory(id);
   }
@@ -8180,12 +8185,12 @@ public:
                   partial_on.range->size == partial_refresh_small_write && !partial_on.whole &&
                   partial_on.gpu_modified_after_write,
               "with the flag on a small base write must record (base, size) and keep gpu_mod");
-      Require(name, "partial refresh upload matches the flag-off result",
-              partial_on.texels == partial_off.texels &&
-                  partial_on.texels.front() == buffer_alias_write_value &&
-                  partial_on.gpu_modified_after_bind == partial_off.gpu_modified_after_bind &&
-                  !partial_on.gpu_modified_after_bind,
-              "the full upload after a range mark differs from today's texels or gpu_mod");
+      Require(name, "partial refresh binds the written texel",
+              partial_on.texels.front() == buffer_alias_write_value &&
+                  partial_off.texels.front() == buffer_alias_write_value &&
+                  partial_on.gpu_modified_after_bind && !partial_off.gpu_modified_after_bind,
+              "a range mark must refresh the written texel and keep gpu_mod, which the whole mark "
+              "baseline clears");
       Require(name, "partial refresh threshold",
               !partial_big.range && partial_big.whole && !partial_big.gpu_modified_after_write,
               "a write over half the image must take the whole mark even with the flag on");
@@ -8305,6 +8310,234 @@ public:
                     ? "an eligible image did not record a range"
                     : "an excluded trait must take the whole mark and clear gpu_mod");
       }
+      // Linear partial refresh. A small buffer write over a linear image uploads only its own
+      // rectangles and leaves every other texel as the GPU painted it.
+      constexpr uint64_t linear_refresh_base = 0x2fa0000;
+      constexpr uint64_t linear_refresh_stride = 0x4000;
+      constexpr uint32_t linear_refresh_guest = 0x5000u;
+      constexpr uint32_t linear_refresh_pitch_padding = 4;
+      using DebugCounter = Common::DebugCounters::Counter;
+      struct LinearRefreshCase {
+        bool flag = true;
+        uint32_t width = 64;
+        uint32_t height = 4;
+        uint32_t pitch = 64;
+        uint64_t mark_offset = 0;
+        uint64_t mark_size = sizeof(uint32_t);
+        bool direct_mark = false;
+        bool track_download = false;
+        // Leave the guest bytes in the buffer, so every element is different and a copy with
+        // the wrong row length or origin shows up.
+        bool fill = true;
+        // Gives the image a stencil association for the bind, which makes it ineligible while
+        // every other gate still passes.
+        bool ineligible = false;
+        // Marks the guest bytes as changed by the CPU before the bind.
+        bool cpu_dirty = false;
+        // A Standard4KB tiled image. Its bind still takes the full upload for now.
+        bool tiled = false;
+      };
+      struct LinearRefreshResult {
+        std::vector<u32> texels;
+        std::vector<u32> backing;
+        bool gpu_modified_after_bind = false;
+        bool downloaded = false;
+        bool pending_after_process = false;
+        uint64_t data_size = 0;
+        uint64_t upload_bytes = 0;
+        uint64_t partial_bytes = 0;
+        uint64_t refreshes = 0;
+        uint64_t fallbacks = 0;
+      };
+      uint32_t linear_refresh_slot = 0;
+      const auto run_linear_refresh = [&](const LinearRefreshCase &c) {
+        TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, c.flag);
+        const uint64_t offset = linear_refresh_base + linear_refresh_slot++ * linear_refresh_stride;
+        const uint64_t bytes = uint64_t{c.pitch} * c.height * sizeof(uint32_t);
+        std::vector<u32> guest(c.pitch * c.height);
+        for (uint32_t index = 0; index < guest.size(); ++index)
+          guest[index] = linear_refresh_guest + index;
+        std::memcpy(memory + offset, guest.data(), bytes);
+        Libs::LibKernel::Memory::WriteBacking(base + offset, guest.data(), bytes);
+        auto desc = MakeLinearDesc(base + offset, bytes, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {c.width, c.height, 1}, 1, 4, 1);
+        desc.info.pitch = c.pitch;
+        if (c.tiled) {
+          desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+          desc.info.data.size = 0;
+          desc.info.pitch = 0;
+        }
+        desc.info.UpdateSize();
+        Require(name, "linear refresh fixture",
+                c.tiled ? desc.info.IsTiled() && desc.info.data.size == bytes
+                        : (c.pitch == c.width ||
+                           desc.info.mip_layout[0].linear_pitch >=
+                               c.width + linear_refresh_pitch_padding) &&
+                              desc.info.mip_layout[0].linear_pitch == c.pitch,
+                "the padded linear fixture lost its row padding or the tiled one its size");
+        const auto image_id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        if (c.track_download) {
+          TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+          TextureCacheTestAccess::TrackDownload(texture_cache, image_id);
+        }
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            desc.info.data.address + c.mark_offset, c.mark_size, true, false);
+        Require(name, "linear refresh buffer allocation", writable.first != nullptr,
+                "failed to allocate the linear refresh write buffer");
+        if (c.fill)
+          writable.first->Fill(writable.second, c.mark_size, buffer_alias_write_value);
+        if (c.direct_mark)
+          texture_cache.GetImage(image_id).MarkBufferModifiedRange(c.mark_offset, c.mark_size);
+        else
+          texture_cache.InvalidateBufferWrite(desc.info.data.address, c.mark_size);
+        LinearRefreshResult result;
+        result.data_size = desc.info.data.size;
+        if (c.track_download) {
+          texture_cache.ProcessDownloadImages();
+          result.pending_after_process =
+              TextureCacheTestAccess::IsDownloadPending(texture_cache, image_id);
+        }
+        Common::DebugCounters::SetEnabled(true);
+        const auto counter = [](DebugCounter which) { return Common::DebugCounters::Get(which); };
+        const auto upload_before = counter(DebugCounter::TextureUploadBytes);
+        const auto partial_before = counter(DebugCounter::TexturePartialUploadBytes);
+        const auto refresh_before = counter(DebugCounter::TexturePartialRefreshes);
+        const auto fallback_before = counter(DebugCounter::TexturePartialFallbacks);
+        if (c.cpu_dirty)
+          texture_cache.GetImage(image_id).MarkCpuDirty();
+        if (c.ineligible)
+          texture_cache.GetImage(image_id).stencil_ids.push_back(image_id);
+        (void)texture_cache.FindTexture(image_id, desc);
+        if (c.ineligible)
+          texture_cache.GetImage(image_id).stencil_ids.clear();
+        result.upload_bytes = counter(DebugCounter::TextureUploadBytes) - upload_before;
+        result.partial_bytes = counter(DebugCounter::TexturePartialUploadBytes) - partial_before;
+        result.refreshes = counter(DebugCounter::TexturePartialRefreshes) - refresh_before;
+        result.fallbacks = counter(DebugCounter::TexturePartialFallbacks) - fallback_before;
+        Common::DebugCounters::SetEnabled(false);
+        result.gpu_modified_after_bind = texture_cache.GetImage(image_id).IsGpuModified();
+        result.texels = ReadCachedTexel(name, context, image_id, {}, {c.width, c.height, 1});
+        if (c.track_download)
+          texture_cache.ProcessDownloadImages();
+        else
+          result.downloaded = TextureCacheTestAccess::TryDownload(texture_cache, image_id);
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        result.backing.resize(guest.size());
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, result.backing.data(), bytes);
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+        return result;
+      };
+      // The painted value everywhere, except the given element range which holds the write.
+      const auto painted_but = [&](uint32_t count, uint32_t first, uint32_t last) {
+        std::vector<u32> expected(count, buffer_alias_image_value);
+        std::fill(expected.begin() + first, expected.begin() + last, buffer_alias_write_value);
+        return expected;
+      };
+      const auto linear_on = run_linear_refresh({});
+      const auto linear_off = run_linear_refresh({.flag = false});
+      Require(name, "linear partial refresh keeps the image's own texels",
+              linear_on.texels == painted_but(256, 0, 1) && linear_off.texels.front() ==
+                  buffer_alias_write_value && linear_off.texels[1] != buffer_alias_image_value,
+              "a one texel write must change only that texel with the flag on, while the flag off "
+              "baseline re-uploads the rest from the buffer or guest bytes");
+      Require(name, "linear partial refresh uploads the written range",
+              linear_on.refreshes == 1 && linear_on.fallbacks == 0 &&
+                  linear_on.texels.front() == buffer_alias_write_value,
+              "the written texel was not refreshed through the partial path");
+      Require(name, "linear partial refresh upload bytes",
+              linear_on.upload_bytes == sizeof(uint32_t) &&
+                  linear_on.partial_bytes == sizeof(uint32_t) &&
+                  linear_off.upload_bytes == linear_off.data_size && linear_off.partial_bytes == 0,
+              "the partial path must copy only the region bytes while the full path copies the image");
+      Require(name, "linear partial refresh download consistency",
+              linear_on.gpu_modified_after_bind && linear_on.downloaded &&
+                  linear_on.backing == painted_but(256, 0, 1) && !linear_off.gpu_modified_after_bind,
+              "the image must stay GPU-modified and download as the written texel plus its own "
+              "texels");
+      // Marks are normally exact-base, so a hull above the limit is built on the image directly.
+      const auto linear_big = run_linear_refresh(
+          {.mark_size = 600, .direct_mark = true});
+      Require(name, "linear partial refresh threshold fallback",
+              linear_big.fallbacks == 1 && linear_big.refreshes == 0 &&
+                  linear_big.upload_bytes == linear_big.data_size &&
+                  linear_big.texels[5] != buffer_alias_image_value &&
+                  !linear_big.gpu_modified_after_bind,
+              "a range over half the image must take the full upload and count a fallback");
+      // Width 60 at pitch 64 puts 16 bytes of padding after each row. The write covers three
+      // rows, the padding between them and ten texels of a fourth.
+      constexpr uint32_t padded_write_bytes = 3 * 64 * sizeof(uint32_t) + 10 * sizeof(uint32_t);
+      const auto linear_padded = run_linear_refresh(
+          {.width = 60, .height = 8, .pitch = 64, .mark_size = padded_write_bytes, .fill = false});
+      std::vector<u32> padded_expected(60 * 8, buffer_alias_image_value);
+      for (uint32_t row = 0; row < 4; ++row)
+        for (uint32_t column = 0; column < (row < 3 ? 60u : 10u); ++column)
+          padded_expected[row * 60 + column] = linear_refresh_guest + row * 64 + column;
+      Require(name, "linear partial refresh padded rows",
+              linear_padded.texels == padded_expected &&
+                  linear_padded.upload_bytes == (3 * 60 + 10) * sizeof(uint32_t),
+              "a write reaching into row padding must refresh only the real texels of its rows");
+      // A range from texel 10 of row 0 to texel 42 of row 2 splits into three rectangles.
+      constexpr uint32_t multi_first = 10;
+      constexpr uint32_t multi_last = 2 * 64 + 43;
+      std::vector<u32> multi_expected(64 * 8, buffer_alias_image_value);
+      for (uint32_t index = multi_first; index < multi_last; ++index)
+        multi_expected[index] = linear_refresh_guest + index;
+      const auto linear_multi = run_linear_refresh(
+          {.height = 8, .mark_offset = multi_first * sizeof(uint32_t),
+           .mark_size = (multi_last - multi_first) * sizeof(uint32_t), .direct_mark = true,
+           .fill = false});
+      Require(name, "linear partial refresh multi-row split",
+              linear_multi.texels == multi_expected &&
+                  linear_multi.upload_bytes == (multi_last - multi_first) * sizeof(uint32_t),
+              "a range over several rows must refresh a partial row, the full rows and a partial "
+              "row with the right texels");
+      // The same direct mark on an image that fails one eligibility trait must not refresh in
+      // parts, with the eligible image of the same shape as the baseline.
+      const auto direct_small = run_linear_refresh({.direct_mark = true});
+      const auto direct_ineligible = run_linear_refresh({.direct_mark = true, .ineligible = true});
+      Require(name, "linear partial refresh skips ineligible images",
+              direct_small.refreshes == 1 && direct_small.fallbacks == 0 &&
+                  direct_ineligible.refreshes == 0 && direct_ineligible.fallbacks == 1 &&
+                  direct_ineligible.upload_bytes == direct_ineligible.data_size &&
+                  !direct_ineligible.gpu_modified_after_bind,
+              "a range mark on an ineligible image must count a fallback, upload the whole image "
+              "and clear gpu_mod");
+      // A CPU write since the range mark makes the rest of the image stale too, so the bind must
+      // upload all of it. The mark without a CPU write is the baseline above.
+      const auto direct_dirty = run_linear_refresh({.direct_mark = true, .cpu_dirty = true});
+      Require(name, "linear partial refresh skips CPU-dirty images",
+              direct_dirty.refreshes == 0 && direct_dirty.fallbacks == 1 &&
+                  direct_dirty.upload_bytes == direct_dirty.data_size &&
+                  direct_dirty.texels.front() == buffer_alias_write_value &&
+                  direct_dirty.texels[1] == linear_refresh_guest + 1 &&
+                  !direct_dirty.gpu_modified_after_bind,
+              "a CPU-dirty range-marked image must fall back and show the guest bytes outside "
+              "the range");
+      // Tiled images keep the full upload until their partial path exists. Change the expected
+      // counters here when that lands.
+      const auto tiled_small = run_linear_refresh({.width = 32, .height = 32, .pitch = 32,
+                                                   .tiled = true});
+      Require(name, "linear partial refresh leaves tiled images on the full upload",
+              tiled_small.refreshes == 0 && tiled_small.fallbacks == 1 &&
+                  tiled_small.upload_bytes == tiled_small.data_size &&
+                  tiled_small.texels.front() == buffer_alias_write_value &&
+                  !tiled_small.gpu_modified_after_bind,
+              "a tiled range-marked image must fall back to the full upload and clear gpu_mod");
+      // A pending readback of a range-marked image must survive until the refresh lands.
+      const auto pending_on = run_linear_refresh({.track_download = true});
+      const auto pending_off = run_linear_refresh({.flag = false, .track_download = true});
+      Require(name, "range-marked image keeps its pending readback",
+              pending_on.pending_after_process && !pending_off.pending_after_process &&
+                  pending_on.backing == painted_but(256, 0, 1),
+              "a range-marked image lost its queued download before the refresh, or the baseline "
+              "no longer drops a whole-marked one");
       TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, false);
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

@@ -548,9 +548,22 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
 	if (bits == 16u && info.type == Format::ComponentType::Float) {
-		const auto pair = EmitCompositeConstructF32x2(
-		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
-		return EmitPackHalf2x16(state, pair);
+		// Native 16-bit float stores round toward zero as EmitF32BitsToF16RtzBits does, but keep a
+		// NaN's top mantissa bits (1 if those are 0) without quieting it.
+		const auto magnitude = EmitAndConstant(state, data, 0x7fffffffu);
+		const auto sign      = EmitAndConstant(
+		    state, EmitBinaryU32(state, spv::OpShiftRightLogical, data, ConstantU32(state, 16u)),
+		    0x8000u);
+		const auto payload = EmitUMax32(state,
+		                                EmitBinaryU32(state, spv::OpShiftRightLogical,
+		                                              EmitAndConstant(state, data, 0x7fffffu),
+		                                              ConstantU32(state, 13u)),
+		                                ConstantU32(state, 1u));
+		return Select(
+		    state, TypeU32(state),
+		    EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x7f800000u),
+		    EmitOrU32(state, sign, EmitOrU32(state, payload, ConstantU32(state, 0x7c00u))),
+		    EmitF32BitsToF16RtzBits(state, data));
 	}
 	return data;
 }

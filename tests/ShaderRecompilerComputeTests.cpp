@@ -209,6 +209,15 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static size_t HotReadbackCount(const BufferCache &cache) {
+    return cache.m_hot_readbacks.Size();
+  }
+
+  static bool HotReadbackTick(const BufferCache &cache, uint64_t address,
+                              uint64_t &tick) {
+    return cache.m_hot_readbacks.TickOf(address, tick);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -4432,6 +4441,121 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  /// Maps guest memory, loads the flag, then drives real readbacks through ReadMemory and checks
+  /// what the hot table recorded. The scenario helper holds the checks.
+  void CheckHotReadbackRecording(bool flag_enabled) {
+    constexpr const char *name = "HotReadbackRecording";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.batch_hot_readbacks = flag_enabled;
+    Config::Load(options);
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "hot-readback direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "hot-readback fixed direct-memory mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      context.MapMemory(base, allocation_size);
+      CheckHotReadbackScenario(context, flag_enabled, base);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "hot-readback mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "hot-readback allocation release failed");
+    options.batch_hot_readbacks = false;
+    Config::Load(options);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  /// Reads back a clean region and then a GPU-written one, checking what the hot table recorded.
+  void CheckHotReadbackScenario(RenderContext &context, bool flag_enabled,
+                                uint64_t base) {
+    constexpr const char *name = "HotReadbackRecording";
+    constexpr uint64_t dirty_offset = 0x1000;
+    constexpr uint64_t clean_offset = 0x100000;
+    constexpr uint64_t region_size = 0x1000;
+    constexpr uint64_t value_offset = 0x10;
+    constexpr uint32_t stale_value = 0x0badf00du;
+    constexpr uint32_t gpu_value = 0x13572468u;
+    auto &cache = context.GetBufferCache();
+    auto &scheduler = context.GetCommandScheduler();
+    Libs::LibKernel::Memory::WriteBacking(base + dirty_offset + value_offset,
+                                          &stale_value, sizeof(stale_value));
+
+    // The clean region differs from the dirty one only in having no GPU-written bytes.
+    (void)cache.FindBuffer(base + clean_offset, region_size);
+    cache.ReadMemory(base + clean_offset, sizeof(gpu_value));
+    Require(name, "clean readback records nothing",
+            BufferCacheTestAccess::HotReadbackCount(cache) == 0,
+            "a readback with nothing to download should not mark a buffer hot");
+
+    Require(name, "dirty allocation",
+            cache.ObtainBuffer(base + dirty_offset, region_size, true, false).first != nullptr,
+            "hot-readback buffer allocation failed");
+    cache.FillBuffer(base + dirty_offset + value_offset, sizeof(gpu_value), gpu_value, false);
+    // A CPU-side fill would put the value in guest memory without any readback, so the published
+    // value below only proves a download if the bytes were GPU-written first.
+    Require(name, "dirty before readback",
+            cache.IsRegionGpuModified(base + dirty_offset + value_offset, sizeof(gpu_value)),
+            "the fill did not leave GPU-written bytes to read back");
+    const auto tick_before = scheduler.CurrentTick();
+    cache.ReadMemory(base + dirty_offset + value_offset, sizeof(gpu_value));
+    uint32_t published = 0;
+    std::memcpy(&published, reinterpret_cast<void *>(base + dirty_offset + value_offset),
+                sizeof(published));
+    Require(name, "readback ran", published == gpu_value,
+            "the GPU write should have been downloaded, or the test checks nothing");
+    CheckHotReadbackEntry(cache, flag_enabled, base + dirty_offset, region_size, tick_before,
+                          scheduler.CurrentTick());
+  }
+
+  /// Checks the hot table after the dirty readback. With the flag on it holds one entry for the
+  /// buffer start whose tick lies in the readback window, and with it off the table is empty.
+  void CheckHotReadbackEntry(BufferCache &cache, bool flag_enabled, uint64_t address,
+                             uint64_t size, uint64_t tick_before, uint64_t tick_after) {
+    constexpr const char *name = "HotReadbackRecording";
+    const auto count = BufferCacheTestAccess::HotReadbackCount(cache);
+    if (!flag_enabled) {
+      Require(name, "flag off records nothing", count == 0,
+              "only --batch-hot-readbacks should record hot readbacks");
+      return;
+    }
+    const auto buffer_address = cache.GetBuffer(cache.FindBuffer(address, size)).CpuAddress();
+    uint64_t tick = 0;
+    const bool found = BufferCacheTestAccess::HotReadbackTick(cache, buffer_address, tick);
+    Require(name, "dirty readback records the buffer start",
+            count == 1 && found, "the readback should record exactly one entry for its buffer");
+    // A start tick of zero would let a recorded constant of zero pass the window check.
+    Require(name, "recorded tick is the readback tick",
+            tick_before > 0 && tick >= tick_before && tick <= tick_after,
+            "the entry should carry the scheduler tick of the readback");
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -51678,6 +51802,82 @@ void CheckDynamicRenderingState() {
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 
+// Counts the entries that ForEachHot reports at one tick.
+size_t CountHotReadbacks(HotReadbackTable &table, uint64_t now_tick) {
+  size_t count = 0;
+  table.ForEachHot(now_tick, [&](uint64_t, uint64_t) { ++count; });
+  return count;
+}
+
+// An entry is hot at exactly HotReadbackTicks old and gone one tick later.
+void CheckHotReadbackAging() {
+  constexpr const char *name = "HotReadbackTable";
+  constexpr uint64_t address = 0x1000;
+  constexpr uint64_t range_size = 0x100;
+  constexpr uint64_t first_tick = 100;
+  // The baseline is the same table queried at the last hot tick, so only age differs.
+  HotReadbackTable at_limit;
+  at_limit.Note(address, range_size, first_tick);
+  Require(name, "entry is hot at the age limit",
+          CountHotReadbacks(at_limit, first_tick + HotReadbackTicks) == 1,
+          "an entry at exactly HotReadbackTicks should still be hot");
+  HotReadbackTable aged;
+  aged.Note(address, range_size, first_tick);
+  Require(name, "entry ages out",
+          CountHotReadbacks(aged, first_tick + HotReadbackTicks + 1) == 0 && aged.Size() == 0,
+          "an entry older than HotReadbackTicks should be dropped");
+}
+
+// One entry past the cap evicts only the oldest.
+void CheckHotReadbackCap() {
+  constexpr const char *name = "HotReadbackTable";
+  constexpr uint64_t first_address = 0x1000;
+  constexpr uint64_t range_size = 0x100;
+  constexpr uint64_t first_tick = 100;
+  HotReadbackTable capped;
+  for (uint64_t index = 0; index <= MaxHotReadbackEntries; ++index) {
+    capped.Note(first_address + index * range_size, range_size, first_tick + index);
+  }
+  bool oldest_present = false;
+  bool newest_present = false;
+  capped.ForEachHot(first_tick, [&](uint64_t address, uint64_t) {
+    oldest_present |= address == first_address;
+    newest_present |= address == first_address + MaxHotReadbackEntries * range_size;
+  });
+  Require(name, "entry cap evicts the oldest",
+          capped.Size() == MaxHotReadbackEntries && !oldest_present && newest_present,
+          "the table should hold the cap and drop only the oldest entry");
+}
+
+// Noting a buffer again updates its tick and does not add a second entry.
+void CheckHotReadbackRefresh() {
+  constexpr const char *name = "HotReadbackTable";
+  constexpr uint64_t first_address = 0x1000;
+  constexpr uint64_t second_address = 0x2000;
+  constexpr uint64_t range_size = 0x100;
+  constexpr uint64_t first_tick = 100;
+  HotReadbackTable refreshed;
+  refreshed.Note(first_address, range_size, first_tick);
+  refreshed.Note(second_address, range_size, first_tick + 1);
+  refreshed.Note(first_address, range_size, first_tick + 2);
+  // Both entries are counted before any aging, so a duplicate entry shows up in Size.
+  const size_t entries_before_aging = refreshed.Size();
+  // One tick past the original note of the first buffer. Only its refreshed tick keeps it hot,
+  // so a refresh that leaves the old tick in place would count one entry instead of two.
+  const size_t hot_after_refresh = CountHotReadbacks(refreshed, first_tick + HotReadbackTicks + 1);
+  Require(name, "re-noting refreshes without duplicating",
+          entries_before_aging == 2 && hot_after_refresh == 2,
+          "a second Note of one buffer should update its tick and keep one entry");
+}
+
+// Covers the pure hot readback table behaviour, which needs no GPU.
+void CheckHotReadbackTableLogic() {
+  CheckHotReadbackAging();
+  CheckHotReadbackCap();
+  CheckHotReadbackRefresh();
+  std::printf("[host]    %-32s ok\n", "HotReadbackTable");
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -55104,6 +55304,13 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--hot-readback-only") == 0) {
+    CheckHotReadbackTableLogic();
+    VulkanHarness vulkan;
+    vulkan.CheckHotReadbackRecording(false);
+    vulkan.CheckHotReadbackRecording(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -55266,6 +55473,8 @@ int main(int argc, char **argv) {
   const bool rasterization = vulkan.RasterizationSupported();
   bool skipped_device_checks = false;
 #endif
+  // Pure table logic, so every platform runs it whether or not a device is present.
+  CheckHotReadbackTableLogic();
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
@@ -55376,6 +55585,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckHotReadbackRecording(false);
+    vulkan.CheckHotReadbackRecording(true);
   } else {
     skipped_device_checks = true;
   }

@@ -622,6 +622,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
@@ -636,6 +637,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_LOAD_UBYTE:
 		case Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_USHORT:
 		case Opcode::BUFFER_LOAD_SHORT_D16:
 		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
@@ -678,6 +680,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_FMIN:
 		case Opcode::BUFFER_ATOMIC_FMAX:
 		case Opcode::BUFFER_LOAD_SBYTE:
+		case Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_SSHORT:
 		case Opcode::FLAT_LOAD_UBYTE:
 		case Opcode::FLAT_LOAD_SBYTE:

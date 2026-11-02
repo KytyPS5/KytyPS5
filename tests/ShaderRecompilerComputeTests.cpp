@@ -34337,6 +34337,28 @@ TestCase BufferLoadD16Captured(ShaderOpcode opcode, u32 wave_size = 32) {
   return test;
 }
 
+TestCase BufferLoadByteD16Halves() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferLoadByteD16Halves";
+  AppendVMovU32(&test.code, 1, 0);
+  // Byte 0x80 zero- or sign-extended into one half; the other half of v0 stays.
+  for (u32 index = 0; index < 3; ++index) {
+    AppendVMovLiteral(&test.code, 0, 0xabcd1234u);
+    test.code.push_back(EncodeMubuf0(0x21u + index, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 0, 1));
+    AppendStoreVgpr(&test.code, 0, 1 + index);
+  }
+  AppendEnd(&test.code);
+  test.initial = {0x00007f80u, 0, 0, 0};
+  test.expected = {0x00007f80u, 0x00801234u, 0xabcdff80u, 0xff801234u};
+  test.user_data = MakeStructuredStorageBufferData(4, 1);
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_UBYTE_D16_HI, O::BUFFER_LOAD_SBYTE_D16,
+                  O::BUFFER_LOAD_SBYTE_D16_HI, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferSubwordLoadsAtHostOffset(u32 bytes, u32 component, bool sign) {
   using O = ShaderOpcode;
   TestCase test;
@@ -35858,6 +35880,7 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
     bool active = true;
     bool overlap = false;
     u32 stride = 4;
+    u32 opcode = 0x80u;
   };
   constexpr LoadCase inputs[] = {
       {"BufferLoadFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xabcdc000u},
@@ -35882,6 +35905,8 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
       {"BufferLoadFormatD16XZeroStrideUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 0, true, false, 0},
       {"BufferLoadFormatD16XInactive", F::k32Float, 0u, 0xabcd1234u, 4, 0, false},
       {"BufferLoadFormatD16XOverlappingAddress", F::k16UInt, 7u, 7u, 4, 0, true, true},
+      {"BufferLoadFormatD16HiXFloat32", F::k32Float, 0x3f000000u, 0x38001234u, 4, 0, true, false, 4, 0x26u},
+      {"BufferLoadFormatD16HiXOverlappingAddress", F::k16UInt, 7u, 0x00070000u, 4, 0, true, true, 4, 0x26u},
   };
   std::vector<TestCase> cases;
   for (const auto &input : inputs) {
@@ -35892,7 +35917,7 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
     if (!input.active) {
       test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
     }
-    test.code.push_back(EncodeMubuf0(0x80u, 0, true, false));
+    test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false));
     test.code.push_back(EncodeMubuf1(0, 0, input.overlap ? 0 : 1));
     if (!input.active) {
       test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
@@ -35905,7 +35930,8 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
     test.user_data = MakeStructuredStorageBufferData(input.stride, 4, false, BufferFormat(input.format));
     test.user_data[3] = (test.user_data[3] & ~0x30000007u) | input.selector;
     test.has_user_data = true;
-    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_X,
+    test.opcodes = {O::V_MOV_B32,
+                    input.opcode == 0x26u ? O::BUFFER_LOAD_FORMAT_D16_HI_X : O::BUFFER_LOAD_FORMAT_D16_X,
                     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     cases.push_back(std::move(test));
   }
@@ -47474,6 +47500,7 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(BufferLoadD16Captured(opcode));
   for (const u32 wave : {32u, 64u})
     cases.push_back(BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
+  AddCase(BufferLoadByteD16Halves);
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
   }
@@ -54209,6 +54236,7 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, BufferLoadD16Captured(opcode));
     for (const u32 wave : {32u, 64u})
       RunCase(&vulkan, BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
+    RunCase(&vulkan, BufferLoadByteD16Halves());
     RunCase(&vulkan, FlatStoreSlcCaptured());
     RunCase(&vulkan, FlatLoadDlcCaptured(32));
     RunCase(&vulkan, FlatLoadDlcCaptured(64));

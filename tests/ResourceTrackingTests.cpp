@@ -1480,7 +1480,7 @@ void TestGuardedDirectImageTable() {
     Bounded, BoundMissing, BoundUnrelated, BoundBypass, BoundAnyLane,
     BoundDiamond, BoundBranchSpecific, BoundMismatched,
     BoundExec, BoundExecUnguarded, BoundExecMismatched, BoundExecAnd, BoundExecUnprovenActive,
-    BoundExecFactored,
+    BoundExecFactored, BoundExecShared,
     BoundExecBranch, BoundExecBranchUnproven, BoundExecBranchUnguarded, BoundExecBranchMismatched,
     Finite, FiniteZero, FiniteMissing, FiniteWrong, FiniteSigned, FiniteAdd, FiniteXor,
     FiniteShared, FiniteSharedBypass, FiniteLate
@@ -1581,11 +1581,16 @@ void TestGuardedDirectImageTable() {
           auto vcc = fixture.Emit(ValueOpcode::LogicalAnd,
               operand_order & 1u ? std::initializer_list<Value>{stopped_lane, previous}
                                  : std::initializer_list<Value>{previous, stopped_lane});
-          if (guard == Guard::BoundExecFactored) {
+          if (guard == Guard::BoundExecFactored || guard == Guard::BoundExecShared) {
             const auto empty = fixture.Emit(ValueOpcode::IEqual32, {key, Value(UINT32_MAX)});
             const auto sentinel = fixture.Emit(ValueOpcode::LogicalAnd,
                 operand_order & 2u ? std::initializer_list<Value>{empty, previous}
                                    : std::initializer_list<Value>{previous, empty});
+            if (guard == Guard::BoundExecShared) {
+              // Ballots of both arms keep their shared lane predicate from being factored out.
+              fixture.Emit(ValueOpcode::Ballot, {vcc});
+              fixture.Emit(ValueOpcode::Ballot, {sentinel});
+            }
             vcc = fixture.Emit(ValueOpcode::LogicalOr,
                 operand_order & 4u ? std::initializer_list<Value>{sentinel, vcc}
                                    : std::initializer_list<Value>{vcc, sentinel});
@@ -1744,7 +1749,8 @@ void TestGuardedDirectImageTable() {
                    fixture.AddMemory(memory, 0x130));
     }
     if (exec_bound || packed_key) ConstantPropagationPass(fixture.program.blocks);
-    if (guard == Guard::BoundExec || guard == Guard::BoundExecFactored) {
+    if (guard == Guard::BoundExec || guard == Guard::BoundExecFactored ||
+        guard == Guard::BoundExecShared) {
       std::vector<const Inst *> pending{active.ResolveInstruction()};
       uint32_t conjunctions = 0;
       for (size_t index = 0; index < pending.size(); ++index) {
@@ -1759,7 +1765,8 @@ void TestGuardedDirectImageTable() {
             pending.push_back(operand);
         }
       }
-      Check(conjunctions == 1u, "EXEC bound retained repeated active-lane conjunctions");
+      Check(conjunctions == (guard == Guard::BoundExecShared ? 3u : 1u),
+            "EXEC bound has unexpected active-lane conjunctions");
     }
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
@@ -1777,7 +1784,10 @@ void TestGuardedDirectImageTable() {
   auto plan = make_plan(Guard::Nonzero);
   make_plan(Guard::SccNonZero);
   make_plan(Guard::Plain);
-  for (uint32_t order = 0; order < 8u; ++order) make_plan(Guard::BoundExecFactored, order);
+  for (uint32_t order = 0; order < 8u; ++order) {
+    make_plan(Guard::BoundExecFactored, order);
+    make_plan(Guard::BoundExecShared, order);
+  }
   for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
                            Guard::ExecZero, Guard::VccZero, Guard::BoundMissing,
                            Guard::BoundUnrelated, Guard::BoundBypass, Guard::BoundAnyLane,
@@ -1883,7 +1893,7 @@ void TestGuardedDirectImageTable() {
 
   make_plan(Guard::Bounded);
   for (const auto guard : {Guard::BoundDiamond, Guard::BoundExec, Guard::BoundExecFactored,
-                           Guard::BoundExecBranch}) {
+                           Guard::BoundExecShared, Guard::BoundExecBranch}) {
     auto bounded = make_plan(guard);
     Check(bounded.capture_specialization_reads && bounded.info.images[1].written,
           "bounded table with image writes omitted specialization read capture");

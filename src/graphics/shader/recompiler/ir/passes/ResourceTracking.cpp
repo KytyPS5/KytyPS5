@@ -2155,9 +2155,10 @@ private:
 			if (candidate.IsEmpty()) candidate = UnsignedBoundOnEntry(key, access.Parent(), false, active);
 			if (candidate.IsEmpty()) {
 				// A waterfall key inherits the local value's bound only where this same
-				// EXEC predicate proves both their equality and the local range.
+				// EXEC predicate proves both their equality and the local range. Otherwise
+				// the key itself is bounded, with this predicate witnessing its own !(A & Q).
 				const auto local = EqualLocalKey(active, key);
-				if (!local.IsEmpty()) candidate = UnsignedBound(active, local, true, false, active);
+				candidate = UnsignedBound(active, local.IsEmpty() ? key : local, true, false, active);
 			}
 			if (candidate.IsEmpty() ||
 			    !ValidateRuntimeValue(m_program, candidate, RuntimeValueType::Integer)) return {};

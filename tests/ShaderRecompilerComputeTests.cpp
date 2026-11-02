@@ -40345,6 +40345,34 @@ TestCase DsGdsSubdwordAndAtomicWrites() {
   return test;
 }
 
+TestCase DsGdsM0Base() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsGdsM0Base";
+  auto &code = test.code;
+  // M0[31:16] places GDS address 0 at byte 0x10.
+  AppendSMovLiteral(&code, 124, 0x00100000u);
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x11111111u);
+  AppendVMovU32(&code, 3, 5);
+  AppendVMovLiteral(&code, 4, 0x22222222u);
+  code.insert(code.end(), {EncodeDs0(0x0d, 0, true), EncodeDs1(0, 2, 1),
+                           EncodeDs0(0x0e, (2u << 8u) | 1u, true), EncodeDs1Ex(0, 4, 3, 1),
+                           EncodeDs0(0x20, 12, true), EncodeDs1(5, 3, 1),
+                           EncodeDs0(0x36, 0, true), EncodeDs1(6, 0, 1),
+                           EncodeDs0(0x37, (3u << 8u) | 1u, true), EncodeDs1(7, 0, 1)});
+  for (u32 reg = 5; reg <= 8; ++reg) AppendStoreVgpr(&code, reg, reg - 5u);
+  AppendEnd(&code);
+  test.initial.assign(4, 0u);
+  test.expected = {7, 0x11111111u, 5, 12};
+  test.gds_initial = {0, 0, 0, 0, 0, 0, 0, 7};
+  test.expected_gds = {0, 0, 0, 0, 0x11111111u, 5, 0x22222222u, 12};
+  test.opcodes = {O::S_MOV_B32,     O::V_MOV_B32,   O::DS_WRITE_B32,
+                  O::DS_WRITE2_B32, O::DS_ADD_RTN_U32, O::DS_READ_B32,
+                  O::DS_READ2_B32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   using O = ShaderOpcode;
 
@@ -47658,6 +47686,7 @@ std::vector<TestCase> MakeCases() {
   }
   AddCase(DsAppendConsumeGdsRegionBounds);
   AddCase(DsGdsSubdwordAndAtomicWrites);
+  AddCase(DsGdsM0Base);
   AddCase(DsReadWrite2Variants);
   AddCase(DsWideReadSnapshotsOverlappingAddress);
   AddCase(DsReadWrite2EqualOffsetsUseData0);

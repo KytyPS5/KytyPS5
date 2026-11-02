@@ -527,9 +527,11 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		if (count < domain_count) keys.push_back(0u); // An out-of-bounds scalar read returns zero.
 	}
 	if (selector->byte_ranges.empty()) {
-		if (selector->bit_offset != 0u || selector->bit_mask != UINT32_MAX || selector->maximum != UINT32_MAX)
-			for (auto& key: keys)
-				key = std::min((key >> selector->bit_offset) & selector->bit_mask, selector->maximum);
+		for (auto& key: keys) {
+			auto field = (key >> selector->bit_offset) & selector->bit_mask;
+			if (selector->non_negative && static_cast<int32_t>(field) < 0) field = 0u;
+			key = std::min(field, selector->maximum);
+		}
 		if (selector->excluded) std::erase(keys, *selector->excluded);
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());

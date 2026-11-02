@@ -3615,8 +3615,8 @@ void TestIndexedMaterialImageKeys() {
 
 void TestPointerTableIndexedMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  // A waterfall scalarizes one lane's indexed x3 key; matching lanes sample the
-  // descriptor at the user-data pointer plus key * 32.
+  // A waterfall scalarizes one lane's indexed x3 key clamped at zero; matching lanes
+  // sample the descriptor at the user-data pointer plus key * 32.
   Fixture f;
   auto *entry = f.block, *body = f.AddBlock(), *done = f.AddBlock();
   entry->AddBranch(body);
@@ -3632,7 +3632,8 @@ void TestPointerTableIndexedMaterialKeys() {
   const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x3,
       {material, lane, Value(0u), Value(0u), active}, f.AddMemory(request, 0x28));
   const auto selected = f.Emit(ValueOpcode::SelectU32,
-      {active, f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)}), Value(0u)});
+      {active, f.Emit(ValueOpcode::SMax32,
+          {f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)}), Value(0u)}), Value(0u)});
   const auto key = f.Emit(ValueOpcode::ReadLane, {selected, f.UserData(6)});
   const auto guard = f.Emit(ValueOpcode::LogicalAnd,
       {active, f.Emit(ValueOpcode::IEqual32, {key, selected})});
@@ -3682,6 +3683,7 @@ void TestPointerTableIndexedMaterialKeys() {
   for (const uint32_t key : {0u, 5u, 9u}) put(key);
   for (uint32_t row = 0; row < records; ++row)
     memory.words[(row * 12u + 8u) / 4u] = row % 2u == 0u ? 9u : 5u;
+  memory.words[((records - 1u) * 12u + 8u) / 4u] = UINT32_MAX; // A negative field selects key 0.
   const std::array<uint32_t, 7> user_data{base, 12u << 16u, records, 0x5204u, heap, 0u, 0u};
   const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     auto &m = *static_cast<Memory *>(data);

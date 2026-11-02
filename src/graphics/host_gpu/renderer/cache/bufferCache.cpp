@@ -435,6 +435,12 @@ void BufferCache::NoteHotReadback(uint64_t address, uint64_t size) {
 	}
 }
 
+void BufferCache::NoteRecentWrite(uint64_t address, uint64_t size) {
+	if (m_batch_hot_readbacks) {
+		m_recent_writes.Note(address, size, m_scheduler.CurrentTick());
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -663,6 +669,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		NoteRecentWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

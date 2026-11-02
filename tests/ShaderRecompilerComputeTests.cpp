@@ -234,6 +234,10 @@ struct BufferCacheTestAccess {
                               uint64_t &tick) {
     return cache.m_hot_readbacks.TickOf(address, tick);
   }
+
+  static const RecentGpuWriteRing &RecentWrites(const BufferCache &cache) {
+    return cache.m_recent_writes;
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -4494,6 +4498,7 @@ public:
       context.InitializeGpu(nullptr);
       context.MapMemory(base, allocation_size);
       CheckHotReadbackScenario(context, flag_enabled, base);
+      CheckRecentWriteScenario(context, flag_enabled, base);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();
@@ -4550,6 +4555,71 @@ public:
             "the GPU write should have been downloaded, or the test checks nothing");
     CheckHotReadbackEntry(cache, flag_enabled, base + dirty_offset, region_size, tick_before,
                           scheduler.CurrentTick());
+  }
+
+  /// Obtains a large write, a read and a small write in one region and checks which of them the
+  /// recent write ring recorded. Counts are compared with the count before each step, because the
+  /// hot readback scenario before this one may have recorded writes of its own.
+  void CheckRecentWriteScenario(RenderContext &context, bool flag_enabled, uint64_t base) {
+    constexpr const char *name = "RecentWriteRecording";
+    constexpr uint64_t region_offset = 0x140000;
+    constexpr uint64_t large_size = 2 * RecentWriteMaxBytes;
+    constexpr uint64_t small_size = TRACKER_PAGE_SIZE;
+    constexpr uint64_t span_offset = region_offset + small_size;
+    auto &cache = context.GetBufferCache();
+    const auto &ring = BufferCacheTestAccess::RecentWrites(cache);
+    const auto count_before = ring.Size();
+    // With the flag off nothing is recorded at all, so the flag-on run is what proves the two
+    // checks below.
+    (void)cache.ObtainBuffer(base + region_offset, large_size, true, false);
+    Require(name, "large write is not recorded", ring.Size() == count_before,
+            "a write over RecentWriteMaxBytes should not enter the ring");
+    // A clean read could be served from the stream buffer without reaching the recording code,
+    // so the read span must be GPU-dirty for the next check to mean anything.
+    Require(name, "read span is GPU-dirty",
+            cache.IsRegionGpuModified(base + span_offset, small_size),
+            "the large write should have left the read span GPU-dirty");
+    (void)cache.ObtainBuffer(base + span_offset, small_size, false, false);
+    Require(name, "read is not recorded", ring.Size() == count_before,
+            "only written buffers should enter the ring");
+    // Only the is_written argument differs from the read above.
+    const auto write_tick = context.GetCommandScheduler().CurrentTick();
+    (void)cache.ObtainBuffer(base + span_offset, small_size, true, false);
+    if (!flag_enabled) {
+      Require(name, "flag off records nothing", ring.Size() == 0,
+              "only --batch-hot-readbacks should record recent writes");
+      std::printf("[host]    %-32s ok\n", name);
+      return;
+    }
+    CheckRecentWriteNewest(ring, count_before + 1, base + span_offset, small_size, write_tick);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  /// Checks that the ring holds the expected count and that its newest entry is the given span,
+  /// finished at the given tick and not before it.
+  static void CheckRecentWriteNewest(const RecentGpuWriteRing &ring, size_t expected_count,
+                                     uint64_t address, uint64_t size, uint64_t tick) {
+    constexpr const char *name = "RecentWriteRecording";
+    uint64_t newest_address = 0;
+    uint64_t newest_size = 0;
+    bool finished_at_tick = false;
+    ring.ForEachNewest(tick, [&](uint64_t span_address, uint64_t span_size, bool finished) {
+      newest_address = span_address;
+      newest_size = span_size;
+      finished_at_tick = finished;
+      return false;
+    });
+    bool finished_before = true;
+    ring.ForEachNewest(tick - 1, [&](uint64_t, uint64_t, bool finished) {
+      finished_before = finished;
+      return false;
+    });
+    Require(name, "small write is recorded",
+            ring.Size() == expected_count && newest_address == address && newest_size == size,
+            "a small written buffer should become the newest ring entry");
+    // A tick of zero or a fixed constant would fail one side of this window.
+    Require(name, "recorded tick is the write tick", tick > 0 && finished_at_tick && !finished_before,
+            "the entry should carry the scheduler tick of the write");
   }
 
   /// Checks the hot table after the dirty readback. With the flag on it holds one entry for the

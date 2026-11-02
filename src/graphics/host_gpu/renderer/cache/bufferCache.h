@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/hotReadbackTable.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -166,6 +167,10 @@ private:
 	// Records a buffer that took a sync readback, whatever its cause. Does nothing without
 	// --batch-hot-readbacks.
 	void NoteHotReadback(uint64_t address, uint64_t size);
+	// Records a GPU write so a later sync readback can download it once finished. Does nothing
+	// without --batch-hot-readbacks. The tick is the one current when the buffer is bound, and a
+	// submit during draw setup can land the write in the next tick, so treat it as a lower bound.
+	void NoteRecentWrite(uint64_t address, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -190,6 +195,7 @@ private:
 	// Read once because the fault path is hot and the flag must not change while the cache lives.
 	const bool                                        m_batch_hot_readbacks;
 	HotReadbackTable                                  m_hot_readbacks;
+	RecentGpuWriteRing                                m_recent_writes;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

@@ -1,0 +1,10 @@
+# kyty pipeline manifest v1
+M 1d7757b2032e ps code=4ea248d43358eb86 ud=12 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 si=n:Float/d:2D ss=-
+M 1df38c7d7ca7 cs code=5c8f0444a5d24522 ud=12 t=64,1,1 tid=1 wgr=12 gx sb=-,st:4/f:32UInt/sw:204,st:4/f:32UInt/sw:4
+M 355e09b3f8ac cs code=5c8f0444a5d24522 ud=12 t=64,1,1 tid=1 wgr=12 gx sb=-,st:4/f:32UInt/sw:204,st:4/f:32UInt/sw:204
+M eb3e3538d52d cs code=664f1d5b6651b6d2 ud=9 t=8,8,1 tid=2 wgr=9 gx gy sb=st:1/f:8UInt/sw:204,st:2/f:8_8UInt/sw:22c
+M e32d780f799c cs code=8e4bc485cefbfb2d ud=8 t=64,1,1 tid=1 wgr=8 gx sb=-,st:4/f:32UInt/sw:204
+M d121356ad339 vs code=b7583c3e3443a5dd ud=16 cur=1 fa=14 fb=12 dyn attr=180000.4.4a3ac.9.4.0.0.0,180000.4.38fac.13.4.1.0.0,180000.4.4022c.17.2.2.0.0 vbuf=24.4.0 sb=-,-,-
+M 69f18126d2e6 cs code=e0834e18a3d06e9f ud=8 t=64,1,1 tid=1 wgr=8 gx sb=-,st:16/f:32_32_32_32UInt
+M 1640109d46d3 cs code=e4b264ddf945e9d4 ud=14 t=8,8,1 tid=2 wgr=14 gx gy gz sb=- si=n:Float/d:2D,n:Float/d:2D/sw:800
+P v=d121356ad339 p=1d7757b2032e plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.1.0.1 topo=TriangleList vb=24.0 va=0.0,12.0,16.0

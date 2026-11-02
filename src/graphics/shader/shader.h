@@ -353,6 +353,13 @@ void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
+// Told about each mapped shader on the thread that maps it, with its hash and the code the hash
+// covers, which is only valid during the call.
+using ShaderMapListener = void (*)(void* userdata, uint64_t hash, std::span<const uint32_t> code);
+// Installs the listener (a null one removes it) and tells it at once about the shaders mapped
+// before. No call is in progress once it returns.
+void ShaderSetMapListener(ShaderMapListener listener, void* userdata);
+
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);

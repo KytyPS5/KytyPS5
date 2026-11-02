@@ -51,6 +51,10 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Taken before g_shader_map_mutex when both are held.
+static std::mutex        g_shader_listener_mutex;
+static ShaderMapListener g_shader_listener          = nullptr;
+static void*             g_shader_listener_userdata = nullptr;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -87,8 +91,30 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		(*g_shader_map)[addr] = {mapped, hash};
+	}
+	std::scoped_lock listener_lock(g_shader_listener_mutex);
+	if (g_shader_listener != nullptr) {
+		g_shader_listener(g_shader_listener_userdata, hash,
+		                  std::span(binary, mapped.code_size_bytes / sizeof(uint32_t)));
+	}
+}
+
+void ShaderSetMapListener(ShaderMapListener listener, void* userdata) {
+	std::scoped_lock listener_lock(g_shader_listener_mutex);
+	g_shader_listener          = listener;
+	g_shader_listener_userdata = userdata;
+	if (listener == nullptr || g_shader_map == nullptr) {
+		return;
+	}
 	std::scoped_lock lock(g_shader_map_mutex);
-	(*g_shader_map)[addr] = {mapped, hash};
+	for (const auto& [addr, entry]: *g_shader_map) {
+		listener(userdata, entry.hash,
+		         std::span(reinterpret_cast<const uint32_t*>(addr),
+		                   entry.data.code_size_bytes / sizeof(uint32_t)));
+	}
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {

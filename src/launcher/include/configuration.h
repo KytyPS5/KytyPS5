@@ -101,6 +101,7 @@ public:
 	QString     addons_dir;  /* Global setting; not saved per game. */
 	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
 	bool        custom_settings = false;
+	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
 	GameStatus  game_status     = GameStatus::Unknown;
 	QString     game_comment;
 
@@ -205,6 +206,7 @@ public:
 		basedir         = other.basedir;
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
+		pro_supported   = other.pro_supported;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}

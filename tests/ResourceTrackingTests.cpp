@@ -8254,9 +8254,10 @@ void TestBoundedRelativeRegisterWrites() {
     fixture.program.blocks[1]->condition =
         fixture.Emit(ValueOpcode::ConditionRef, {in_range},
                      CFG::BranchCondition::VccNonZero, header);
+    const auto tripled = fixture.Emit(ValueOpcode::IMul32, {Value(&counter), Value(3u)}, 0, body);
     const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                       {Value(&counter), Value(1u)}, 0, body), Value(255u)}, 0, body);
+                       {tripled, Value(1u)}, 0, body), Value(255u)}, 0, body);
     const auto relative_write = [&](Value old_value, uint32_t offset) {
       const auto selected = fixture.Emit(ValueOpcode::IEqual32,
                                            {m0, Value(offset)}, 0, body);
@@ -8266,10 +8267,10 @@ void TestBoundedRelativeRegisterWrites() {
     };
     bound.AddPhiOperand(entry, initial_bound);
     bound.AddPhiOperand(body, relative_write(Value(&bound),
-        variant == Variant::BoundClobber ? 14u : 22u));
+        variant == Variant::BoundClobber ? 42u : 44u));
     records.AddPhiOperand(entry, initial_records);
     records.AddPhiOperand(body, relative_write(Value(&records),
-        variant == Variant::DescriptorClobber ? 14u : 21u));
+        variant == Variant::DescriptorClobber ? 42u : 43u));
     counter.AddPhiOperand(entry, Value(0u));
     counter.AddPhiOperand(body, fixture.Emit(ValueOpcode::IAdd32,
                                              {Value(&counter), Value(1u)}, 0, body));

@@ -398,8 +398,9 @@ void BufferCache::CollectRecentWrites(RangeSet& claimed, uint64_t& budget,
 	});
 }
 
-/// Collects the GPU-written bytes of one unclaimed piece of a recent write. A piece is skipped when
-/// no single buffer holds it or when it would cost more than budget.
+/// Collects the GPU-written bytes of one unclaimed piece of a recent write and counts it for the
+/// overlay. A piece is skipped when no single buffer holds it or when it would cost more than
+/// budget.
 void BufferCache::CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& budget,
                                      std::vector<BatchedDownload>& batch) {
 	const auto id = FindHotBuffer(address, size);
@@ -416,6 +417,9 @@ void BufferCache::CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& 
 		return;
 	}
 	budget -= std::min(budget, pending.total_size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferCoDownloads);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferCoDownloadBytes,
+	                           pending.total_size);
 	batch.push_back({&buffer, std::move(pending), address, size});
 }
 

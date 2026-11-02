@@ -23767,6 +23767,9 @@ struct RecentBatchOutcome {
   uint32_t backing = 0;
   bool dirty = false;
   uint64_t fault_submits = 0;
+  // What the co-download counters gained during the other buffer's readback.
+  uint64_t co_downloads = 0;
+  uint64_t co_download_bytes = 0;
 };
 
 // Writes a region on the GPU that never faulted, settles the given ticks, then reads back another
@@ -23779,10 +23782,16 @@ RecentBatchOutcome RunRecentBatch(VulkanHarness &harness, bool flag_enabled, uin
   bed.GpuWrite(Recent, size, RecentValue);
   SettleTicks(bed, settle_ticks);
   bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  using Common::DebugCounters::Counter;
+  const auto ranges_before = Common::DebugCounters::Get(Counter::BufferCoDownloads);
+  const auto bytes_before = Common::DebugCounters::Get(Counter::BufferCoDownloadBytes);
   (void)bed.Fault(Faulting);
   Require("RecentBatch", "faulting buffer published", bed.Backing(Faulting) == FaultingValue,
           "the faulting readback should still download its own buffer");
   RecentBatchOutcome outcome;
+  outcome.co_downloads = Common::DebugCounters::Get(Counter::BufferCoDownloads) - ranges_before;
+  outcome.co_download_bytes =
+      Common::DebugCounters::Get(Counter::BufferCoDownloadBytes) - bytes_before;
   outcome.backing = bed.Backing(Recent);
   outcome.dirty = bed.Dirty(Recent, size);
   outcome.fault_submits = bed.Fault(Recent);
@@ -23804,6 +23813,17 @@ void CheckRecentBatchCoDownload(VulkanHarness &harness) {
   Require(name, "flag on downloads the finished write",
           on.backing == RecentValue && !on.dirty && on.fault_submits == 0,
           "a finished small write should be downloaded with the faulting buffer");
+  // The flag-off run is the baseline that counts nothing.
+  Require(name, "the co-download is counted",
+          on.co_downloads == 1 && on.co_download_bytes == size && off.co_downloads == 0 &&
+              off.co_download_bytes == 0,
+          "one co-downloaded write should add one range and its bytes to the counters");
+  // A sub-page write is claimed as a whole page, so this tells the downloaded bytes from the span.
+  constexpr uint64_t sub_page_size = 0x100;
+  const auto sub_page = RunRecentBatch(harness, true, sub_page_size, FinishedTicks);
+  Require(name, "the counted bytes are the downloaded bytes",
+          sub_page.co_downloads == 1 && sub_page.co_download_bytes == sub_page_size,
+          "the byte counter should count what was downloaded, not the page it sits in");
   // One settled tick only completes the write's own tick, which the strict check treats as pending.
   const auto one_tick = RunRecentBatch(harness, true, size, FinishedTicks - 1);
   Require(name, "a write in the last completed tick is pending",
@@ -23872,7 +23892,18 @@ void CheckRecentBatchSharedBudget(VulkanHarness &harness) {
   }
   SettleTicks(bed, FinishedTicks);
   bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  using Common::DebugCounters::Counter;
+  const auto ranges_before = Common::DebugCounters::Get(Counter::BufferCoDownloads);
+  const auto bytes_before = Common::DebugCounters::Get(Counter::BufferCoDownloadBytes);
   (void)bed.Fault(Faulting);
+  // The hot buffer shares the batch but is not a recent write, so only the ring pieces that fit
+  // are counted. The walk ends once they spend the budget, so the oldest write is never counted.
+  Require(name, "only the collected recent writes are counted",
+          Common::DebugCounters::Get(Counter::BufferCoDownloads) - ranges_before ==
+                  write_count - 1 &&
+              Common::DebugCounters::Get(Counter::BufferCoDownloadBytes) - bytes_before ==
+                  (write_count - 1) * RecentWriteMaxBytes,
+          "the counters should hold the recent writes that were downloaded and nothing else");
   Require(name, "the hot buffer was co-downloaded", !bed.Dirty(Hot, HotBatchBed::BigRegion),
           "the hot buffer did not take its share, so the checks below prove nothing");
   uint64_t cleaned = 0;
@@ -23996,6 +24027,31 @@ void CheckRecentBatchWindowEdge(VulkanHarness &harness) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A second readback walks past ring entries that an earlier readback already downloaded. Their
+// pieces have nothing left to collect, so they are skipped and not counted.
+void CheckRecentBatchStaleCount(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchStaleCount";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  using Common::DebugCounters::Counter;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.GpuWrite(Recent, HotBatchBed::SmallRegion, RecentValue);
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the first readback co-downloads the write",
+          bed.Backing(Recent) == RecentValue && !bed.Dirty(Recent, HotBatchBed::SmallRegion),
+          "the write was not co-downloaded, so the check below proves nothing");
+  // The second readback differs from the first only in finding the ring entry already clean.
+  bed.GpuWrite(SecondHot, HotBatchBed::SmallRegion, ThirdValue);
+  const auto ranges_before = Common::DebugCounters::Get(Counter::BufferCoDownloads);
+  (void)bed.Fault(SecondHot);
+  Require(name, "a clean ring entry is not counted",
+          Common::DebugCounters::Get(Counter::BufferCoDownloads) == ranges_before,
+          "a piece with nothing to download should not count as a co-download");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // Runs the recent write co-download tests, which need a device.
 void CheckRecentBatchReadbacks(VulkanHarness &harness) {
   CheckRecentBatchCoDownload(harness);
@@ -24006,6 +24062,7 @@ void CheckRecentBatchReadbacks(VulkanHarness &harness) {
   CheckRecentBatchClaims(harness);
   CheckRecentBatchSamePage(harness);
   CheckRecentBatchWindowEdge(harness);
+  CheckRecentBatchStaleCount(harness);
 }
 
 void CheckHotBatchReadbacks(VulkanHarness &harness) {

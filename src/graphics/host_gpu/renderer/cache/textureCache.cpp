@@ -1860,28 +1860,41 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
-	auto& image = m_slot_images[id];
-	if (image.depth_id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool unlocked_copy) {
+	auto* image = &m_slot_images[id];
+	if (image->depth_id) {
 		return false;
 	}
-	if (!image.SafeToDownload() || !CanDownload(image)) {
+	if (!image->SafeToDownload() || !CanDownload(*image)) {
 		return false;
 	}
-	const auto range    = image.info.data;
+	const auto range    = image->info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	    download.Map(range.size, std::max<uint64_t>(image->info.bytes_per_block, 4));
 	if (mapped == nullptr) {
 		EXIT("TextureCache: failed to map reusable download buffer\n");
 	}
 	download.Commit();
-	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+	if (unlocked_copy) {
+		// Guest write faults wait for m_lock in InvalidateMemory and would spin for the whole copy.
+		// A write that lands meanwhile marks the image CPU dirty, and a freed slot can be reused,
+		// so look the image up again before recording the download.
+		const auto serial = image->serial;
+		m_lock.unlock();
+		const bool read = LibKernel::Memory::TryReadBacking(range.address, mapped, range.size);
+		m_lock.lock();
+		image = m_slot_images.try_get(id);
+		if (!read || image == nullptr || image->serial != serial || !image->registered ||
+		    !image->SafeToDownload()) {
+			return false;
+		}
+	} else if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	DownloadImage(*image, download, offset, range.size, image->info.resources.levels);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
@@ -2049,7 +2062,8 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !pressured) {
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id)) {
+				// Drops m_lock for the copy, so owner is not used after this.
+				if (safe && !DownloadImageMemory(id, true)) {
 					continue;
 				}
 			}

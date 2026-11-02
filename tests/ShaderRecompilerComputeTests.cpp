@@ -417,6 +417,11 @@ struct TextureCacheTestAccess {
     return mapping;
   }
 
+  static bool TryPartialRefresh(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.TryPartialRefresh(cache.m_slot_images[id]);
+  }
+
   static bool IsDownloadPending(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     return cache.m_download_images.contains(id);
@@ -8284,6 +8289,28 @@ public:
                              image.info.metadata.kind = ImageMetadataKind::Htile;
                            },
                            false},
+          PartialTraitCase{"Dcc kind",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Dcc;
+                           },
+                           true},
+          PartialTraitCase{"Cmask kind",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Cmask;
+                           },
+                           true},
+          PartialTraitCase{"Dcc kind with video out",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Dcc;
+                             image.usage.video_out = true;
+                           },
+                           false},
+          PartialTraitCase{"Cmask kind with kDepth tile mode",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Cmask;
+                             image.info.tile_mode = Prospero::TileMode::kDepth;
+                           },
+                           false},
           PartialTraitCase{"metadata compression",
                            [](Libs::Graphics::Image &image) {
                              image.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
@@ -8367,11 +8394,16 @@ public:
         // The tile mode of the image. Tiled images use the big fixture addresses.
         Prospero::TileMode tile = Prospero::TileMode::kLinear;
         uint32_t levels = 1;
+        // The colour metadata kind the image wears, applied in place after it is created.
+        ImageMetadataKind metadata = ImageMetadataKind::None;
+        // Turns the metadata into video-out DCC between the mark and the refresh.
+        bool flip_compression = false;
       };
       struct LinearRefreshResult {
         std::vector<u32> texels;
         std::vector<u32> backing;
         ImageInfo info;
+        bool refused = false;
         std::vector<std::vector<u32>> mips;
         bool gpu_modified_after_bind = false;
         bool downloaded = false;
@@ -8420,6 +8452,7 @@ public:
         std::memcpy(memory + offset, guest.data(), bytes);
         Libs::LibKernel::Memory::WriteBacking(base + offset, guest.data(), bytes);
         const auto image_id = texture_cache.FindImage(desc);
+        texture_cache.GetImage(image_id).info.metadata.kind = c.metadata;
         vk::ClearValue painted{};
         painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
         TextureCacheTestAccess::ClearImage(
@@ -8454,6 +8487,16 @@ public:
         const auto partial_before = counter(DebugCounter::TexturePartialUploadBytes);
         const auto refresh_before = counter(DebugCounter::TexturePartialRefreshes);
         const auto fallback_before = counter(DebugCounter::TexturePartialFallbacks);
+        if (c.flip_compression) {
+          auto &flipped = texture_cache.GetImage(image_id);
+          flipped.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
+          result.refused = !TextureCacheTestAccess::TryPartialRefresh(texture_cache, image_id);
+          result.refreshes = counter(DebugCounter::TexturePartialRefreshes) - refresh_before;
+          result.fallbacks = counter(DebugCounter::TexturePartialFallbacks) - fallback_before;
+          flipped.info.metadata.compression = VideoOutCompression::Uncompressed;
+          Common::DebugCounters::SetEnabled(false);
+          return result;
+        }
         if (c.cpu_dirty)
           texture_cache.GetImage(image_id).MarkCpuDirty();
         if (c.ineligible)
@@ -8658,6 +8701,40 @@ public:
               tiled_pending.pending_after_process && !tiled_pending_off.pending_after_process &&
                   tiled_pending.backing == painted_but(32 * 32, 0, 1),
               "a range-marked tiled image lost its queued download before the refresh");
+      // Colour metadata kinds on the 256x256 image, each with a 4 byte write at the base. DCC and
+      // CMASK take the partial path. HTILE is depth only, so a colour image with it stays whole.
+      const LinearRefreshCase metadata_case{.width = 256, .height = 256, .pitch = 256, .fill = false,
+                                            .tile = Prospero::TileMode::kRenderTarget};
+      auto with_metadata = [&](ImageMetadataKind kind) {
+        auto c = metadata_case;
+        c.metadata = kind;
+        return run_linear_refresh(c);
+      };
+      const auto dcc_small = with_metadata(ImageMetadataKind::Dcc);
+      const auto cmask_small = with_metadata(ImageMetadataKind::Cmask);
+      const auto htile_small = with_metadata(ImageMetadataKind::Htile);
+      Require(name, "DCC tiled image takes the partial path",
+              dcc_small.refreshes == 1 && dcc_small.fallbacks == 0 &&
+                  dcc_small.partial_bytes == 64 * 1024 && dcc_small.partial_bytes < dcc_small.data_size &&
+                  dcc_small.texels == window_expected(dcc_small.info, 0, 4) &&
+                  dcc_small.gpu_modified_after_bind,
+              "a 4 byte base write on a DCC tile mode 27 image must upload only its block");
+      Require(name, "CMASK image takes the partial path",
+              cmask_small.refreshes == 1 && cmask_small.fallbacks == 0 &&
+                  cmask_small.texels == window_expected(cmask_small.info, 0, 4),
+              "a CMASK image must refresh only the written texels");
+      Require(name, "HTILE on a colour image stays whole",
+              htile_small.refreshes == 0 && htile_small.upload_bytes == htile_small.data_size &&
+                  !htile_small.gpu_modified_after_bind,
+              "a colour image with HTILE must take the whole mark and the full upload");
+      // A flip to video-out DCC between the mark and the refresh makes the image ineligible.
+      auto flip_case = metadata_case;
+      flip_case.metadata = ImageMetadataKind::Dcc;
+      flip_case.flip_compression = true;
+      const auto flipped = run_linear_refresh(flip_case);
+      Require(name, "compression flip refuses the partial path",
+              flipped.refused && flipped.refreshes == 0 && flipped.fallbacks == 1,
+              "an image that became compressed must not be refreshed in parts");
       // Standard64KB with mips. The guest chain runs backwards, so a write at the base lands in
       // the shared tail block. The first bytes of that block belong to no texel, because the tail
       // mips sit at offsets inside it, so the write is long enough to reach the first of them.
@@ -13679,6 +13756,10 @@ public:
       uint32_t samples_log2 = 0;
       bool goat = false;
       bool dcc_mips = false;
+      // A small buffer write marks the image before the CMASK clear binds it, and `partial`
+      // turns --partial-buffer-refresh on for the case.
+      bool range_mark = false;
+      bool partial = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
@@ -13687,6 +13768,12 @@ public:
         FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
                  .layout = Prospero::ChannelLayout::k8_8_8_8,
                  .type = Prospero::ChannelType::kUNorm, .goat = true},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .range_mark = true, .partial = true},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .range_mark = true},
         FillCase{.fill = 0, .texel = {0, 0}, .cmask = true,
                  .eliminate_fast_clear = true},
         FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
@@ -13842,7 +13929,8 @@ public:
         resources.MapMemory(base, allocation_size);
         ImageId preexisting_id{};
         RenderColorInfo color{};
-        if (fill_case.reuse_unorm || fill_case.reuse_mips || fill_case.eliminate_fast_clear) {
+        if (fill_case.reuse_unorm || fill_case.reuse_mips || fill_case.eliminate_fast_clear ||
+            fill_case.range_mark) {
           const auto float_info = registers.GetRenderTarget(0).info;
           const auto single_mip = registers.GetRenderTarget(0).attrib2;
           auto initial_info = float_info;
@@ -13861,6 +13949,19 @@ public:
           preexisting_id = preexisting.image_id;
           color = preexisting;
           (void)texture_cache.FindRenderTarget(preexisting_id, preexisting.desc);
+          if (fill_case.range_mark) {
+            // The image is GPU-written, then a 4 byte buffer write at its base marks it.
+            vk::ClearValue gpu_paint{};
+            gpu_paint.color.float32 = std::array{0.25f, 0.5f, 0.75f, 1.0f};
+            TextureCacheTestAccess::ClearImage(
+                texture_cache, scheduler.Current(), preexisting_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2}, gpu_paint);
+            TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, fill_case.partial);
+            auto writable = resources.GetBufferCache().ObtainBuffer(base, sizeof(uint32_t), true,
+                                                                    false);
+            writable.first->Fill(writable.second, sizeof(uint32_t), 0x12345678u);
+            texture_cache.InvalidateBufferWrite(base, sizeof(uint32_t));
+          }
           if (fill_case.reuse_mips) {
             Require(name, "mip chain excludes metadata",
                     preexisting.desc.info.data.address + preexisting.desc.info.data.size <=
@@ -13985,11 +14086,20 @@ public:
           scheduler.Finish();
           return;
         }
+        using ClearCounter = Common::DebugCounters::Counter;
+        Common::DebugCounters::SetEnabled(fill_case.range_mark);
+        const auto refreshes_before = Common::DebugCounters::Get(ClearCounter::TexturePartialRefreshes);
+        const auto fallbacks_before = Common::DebugCounters::Get(ClearCounter::TexturePartialFallbacks);
         RenderExecutorTestAccess::ResolveRenderColorTarget(
             executor, scheduler.Current(), color, 0);
         RenderDepthInfo no_depth{};
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &color, 1, no_depth);
+        const auto partial_refreshes =
+            Common::DebugCounters::Get(ClearCounter::TexturePartialRefreshes) - refreshes_before;
+        const auto partial_fallbacks =
+            Common::DebugCounters::Get(ClearCounter::TexturePartialFallbacks) - fallbacks_before;
+        Common::DebugCounters::SetEnabled(false);
         if (fill_case.reuse_unorm) {
           Require(name, "FLOAT clear reuses UNORM image",
                   color.image_id == preexisting_id &&
@@ -14015,6 +14125,17 @@ public:
                                     {static_cast<int32_t>(512 - probe_width), 255, 0},
                                     {probe_width, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
+        if (fill_case.range_mark) {
+          // The register clear wins at both corners with or without the partial refresh.
+          Require(name, "CMASK range mark refresh",
+                  partial_refreshes == (fill_case.partial ? 1u : 0u) && partial_fallbacks == 0,
+                  "a marked CMASK target must take exactly one partial refresh with the flag on "
+                  "and none with it off");
+          TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, false);
+          resources.UnmapMemory(base, allocation_size);
+          scheduler.Finish();
+          return;
+        }
         if (fill_case.reuse_mips) {
           const auto &image = texture_cache.GetImage(color.image_id);
           Require(name, "single-mip clear reuses mip chain",
@@ -14506,6 +14627,168 @@ public:
     Require(name, "release",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "MSAA allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A colour DCC image with a base write. A pending fast clear must still win over the refreshed
+  // texels, and an applied and checked clear must survive a later base write.
+  struct ColorMetadataRefreshResult {
+    std::vector<u32> pending_texels;
+    std::vector<u32> later_texels;
+    uint64_t pending_refreshes = 0;
+    uint64_t later_refreshes = 0;
+    uint64_t later_fallbacks = 0;
+    uint64_t later_checks = 0;
+    uint64_t third_checks = 0;
+    std::vector<u32> third_texels;
+  };
+
+  ColorMetadataRefreshResult RunColorMetadataRefresh(bool flag, bool gpu_metadata) {
+    constexpr const char *name = "PartialRefreshColorMetadata";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t dcc_address = base + 0x10000;
+    constexpr uint64_t dcc_bytes = 0x1000;
+    constexpr uint64_t color_bytes = 0x4000;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint32_t guest_base = 0x6000u;
+    constexpr uint32_t first_write = std::bit_cast<uint32_t>(0.5f);
+    constexpr uint32_t later_write = std::bit_cast<uint32_t>(1.0f);
+    using DebugCounter = Common::DebugCounters::Counter;
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x10000, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    // Distinct guest words, so a texel from a full refresh cannot pass for the clear or the paint.
+    std::vector<u32> guest(color_bytes / sizeof(u32));
+    for (uint32_t index = 0; index < guest.size(); ++index) guest[index] = guest_base + index;
+    std::memcpy(mapped, guest.data(), color_bytes);
+    std::memset(reinterpret_cast<void *>(dcc_address), 0xff, dcc_bytes);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    auto &cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    TextureCacheTestAccess::SetPartialBufferRefresh(cache, flag);
+    const ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+        0xc1600000u, 0x000fc00fu, 0x91b00204u, 0, 0x00700000u,
+        0x002b0000u | (static_cast<uint32_t>(dcc_address >> 8u) << 24u),
+        static_cast<uint32_t>(dcc_address >> 16u)}};
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy_n(descriptor.fields, 8, value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.written = true;
+    const auto bind = [&] {
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      return binding;
+    };
+    const auto corners = [&](ImageId id) {
+      auto texels = ReadCachedTexel(name, context, id, {0, 0, 0});
+      const auto last = ReadCachedTexel(name, context, id, {63, 63, 0});
+      texels.insert(texels.end(), last.begin(), last.end());
+      return texels;
+    };
+    const auto write_base = [&](uint32_t bits) {
+      auto writable = context.GetBufferCache().ObtainBuffer(base, sizeof(uint32_t), true, false);
+      writable.first->Fill(writable.second, sizeof(uint32_t), bits);
+      cache.InvalidateBufferWrite(base, sizeof(uint32_t));
+    };
+    const auto counter = [](DebugCounter which) { return Common::DebugCounters::Get(which); };
+    const auto first = bind();
+    Require(name, "DCC fixture", cache.GetImage(first.image_id).info.metadata.kind ==
+                                     ImageMetadataKind::Dcc,
+            "the fixture lost its DCC metadata");
+    vk::ClearValue paint{};
+    paint.color.float32 = std::array{0.375f, 0.f, 0.f, 0.f};
+    TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), first.image_id,
+                                       {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, paint);
+    ColorMetadataRefreshResult result;
+    Common::DebugCounters::SetEnabled(true);
+    // A write at the base, then a fast clear to code 0 that is pending when the image is bound.
+    write_base(first_write);
+    if (gpu_metadata) {
+      // A GPU write of the clear key, which sends the bind down the conditional rendering path.
+      auto keys = context.GetBufferCache().ObtainBuffer(dcc_address, dcc_bytes, true, false);
+      keys.first->Fill(keys.second, dcc_bytes, 0u);
+    } else {
+      WriteMetadata(context, dcc_address, dcc_bytes, 0u);
+    }
+    auto refreshes = counter(DebugCounter::TexturePartialRefreshes);
+    const auto pending = bind();
+    result.pending_refreshes = counter(DebugCounter::TexturePartialRefreshes) - refreshes;
+    result.pending_texels = corners(pending.image_id);
+    // The clear is now applied and checked. A later base write then binds again.
+    write_base(later_write);
+    refreshes = counter(DebugCounter::TexturePartialRefreshes);
+    const auto fallbacks = counter(DebugCounter::TexturePartialFallbacks);
+    const auto checks = counter(DebugCounter::ColorMetadataChecks);
+    const auto later = bind();
+    result.later_refreshes = counter(DebugCounter::TexturePartialRefreshes) - refreshes;
+    result.later_fallbacks = counter(DebugCounter::TexturePartialFallbacks) - fallbacks;
+    result.later_checks = counter(DebugCounter::ColorMetadataChecks) - checks;
+    result.later_texels = corners(later.image_id);
+    // The refresh must not have forgotten the checked clear, so a third bind neither checks nor
+    // clears again.
+    const auto third_before = counter(DebugCounter::ColorMetadataChecks);
+    const auto third = bind();
+    result.third_checks = counter(DebugCounter::ColorMetadataChecks) - third_before;
+    Common::DebugCounters::SetEnabled(false);
+    result.third_texels = corners(third.image_id);
+    TextureCacheTestAccess::SetPartialBufferRefresh(cache, false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0, "release failed");
+    return result;
+  }
+
+  void CheckPartialRefreshColorMetadata() {
+    constexpr const char *name = "PartialRefreshColorMetadata";
+    const auto on = RunColorMetadataRefresh(true, true);
+    const auto off = RunColorMetadataRefresh(false, true);
+    const auto cpu_on = RunColorMetadataRefresh(true, false);
+    constexpr u32 later_write = std::bit_cast<uint32_t>(1.0f);
+    // A pending clear wins over the refreshed write, as it does after a full refresh.
+    Require(name, "pending clear wins over the refresh",
+            on.pending_texels == std::vector<u32>{0u, 0u} &&
+                off.pending_texels == std::vector<u32>{0u, 0u} && on.pending_refreshes == 1,
+            "the DCC clear must cover the viewed mip, and the refresh must run before it");
+    Require(name, "clear kept outside the written range",
+            on.later_texels == std::vector<u32>{later_write, 0u} && on.later_refreshes == 1 &&
+                on.later_fallbacks == 0 && off.later_texels[0] == later_write &&
+                off.later_texels[1] != 0u,
+            "a base write after an applied clear must change only its own texel, while the whole "
+            "refresh baseline loses the clear");
+    Require(name, "checked state kept",
+            on.later_checks == 0 && on.third_checks == 0 &&
+                on.third_texels == std::vector<u32>{later_write, 0u},
+            "a data write must not make the clear check run again or clear the refreshed texel");
+    Require(name, "pending clear through the readback path",
+            cpu_on.pending_texels == std::vector<u32>{0u, 0u} &&
+                cpu_on.later_texels == std::vector<u32>{later_write, 0u},
+            "the CPU readback clear must give the same results");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -55692,6 +55975,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckPartialRefreshColorMetadata();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -55734,6 +56018,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckPartialRefreshColorMetadata();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -56046,6 +56331,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckPartialRefreshColorMetadata();
     vulkan.CheckDepthBitsCopy();
     vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();

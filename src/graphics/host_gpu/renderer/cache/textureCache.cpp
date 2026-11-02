@@ -64,6 +64,16 @@ void MarkWholeBufferWrite(Image& image) {
 	return size <= image.info.data.size / PartialRefreshMaxFraction;
 }
 
+// Colour DCC and CMASK live at their own addresses, so a write at the image base is a data write
+// that never touches them. Their keys only matter to MaterializeColorClear, which runs after the
+// refresh and so wins in the viewed region exactly as it does after a full refresh, and which
+// keeps its checked state because a data write cannot change a key. HTILE is depth only. A
+// whitelist makes any metadata kind added later default to the full refresh.
+[[nodiscard]] bool IsPartialRefreshMetadata(ImageMetadataKind kind) {
+	return kind == ImageMetadataKind::None || kind == ImageMetadataKind::Dcc ||
+	       kind == ImageMetadataKind::Cmask;
+}
+
 // Tells whether a range-limited refresh is exact for this image. Layouts whose byte ranges do not
 // map to a contiguous set of texels stay on the full refresh, and so do images that other
 // objects share or convert, such as depth and stencil, video-out, Fmask and compressed images.
@@ -71,7 +81,8 @@ void MarkWholeBufferWrite(Image& image) {
 	const auto& info = image.info;
 	if (info.IsVolume() || info.samples != 1 || image.backing.samples != 1 || info.IsDepth() ||
 	    info.HasStencil() || info.pixel_format == vk::Format::eS8Uint || image.depth_id ||
-	    !image.stencil_ids.empty() || info.IsBlock() || info.HasMetadata() ||
+	    !image.stencil_ids.empty() || info.IsBlock() ||
+	    !IsPartialRefreshMetadata(info.metadata.kind) ||
 	    info.metadata.compression != VideoOutCompression::Uncompressed || image.usage.video_out ||
 	    info.GetColorTransform() != ColorTransform::None) {
 		return false;

@@ -14,6 +14,7 @@
 
 #include <bitset>
 #include <map>
+#include <optional>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -130,6 +131,8 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	// Colour attachment uploads need whole layers of single sample images. Other bindings pass.
+	[[nodiscard]] static bool IsValidColorAttachmentUpload(const Image& image, BindingType binding);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -171,6 +174,19 @@ private:
 	// when the full upload has to run instead.
 	[[nodiscard]] bool TryPartialRefresh(Image& image);
 	void               RefreshLinearRange(Image& image, GuestRange range);
+	// What a tiled partial refresh touches. The range is relative to the image data.
+	struct TiledRefreshPlan {
+		RefreshByteRange           range;
+		std::vector<RefreshRegion> regions;
+	};
+	[[nodiscard]] static std::optional<TiledRefreshPlan> PlanTiledRefresh(const Image& image,
+	                                                                      GuestRange   range);
+	[[nodiscard]] bool RefreshTiledRange(Image& image, GuestRange range);
+	void               MergeTiledRegions(Image& image, const TiledRefreshPlan& plan);
+	void DownloadForMerge(Image& image, const TileManager::Result& scratch,
+	                      std::span<const RefreshRegion> regions);
+	void UploadMerged(Image& image, const TileManager::Result& scratch,
+	                  std::span<const RefreshRegion> regions);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;

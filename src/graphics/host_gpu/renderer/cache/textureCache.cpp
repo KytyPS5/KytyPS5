@@ -50,6 +50,15 @@ void MarkWholeBufferWrite(Image& image) {
 	image.MarkBufferModified();
 }
 
+// The bytes a set of refresh rectangles copies, for the transfer counters.
+[[nodiscard]] uint64_t RegionBytes(const ImageInfo& info, std::span<const RefreshRegion> regions) {
+	uint64_t bytes = 0;
+	for (const auto& region: regions) {
+		bytes += uint64_t {region.width} * region.height * info.tiling.block.bytes_per_element;
+	}
+	return bytes;
+}
+
 // Tells whether a written range is small enough for a partial refresh to pay off.
 [[nodiscard]] bool WithinPartialLimit(const Image& image, uint64_t size) {
 	return size <= image.info.data.size / PartialRefreshMaxFraction;
@@ -985,14 +994,21 @@ bool TextureCache::CanDownload(const Image& image) const {
 	       info.LinearSize() != 0;
 }
 
+bool TextureCache::IsValidColorAttachmentUpload(const Image& image, BindingType binding) {
+	if (binding != BindingType::RenderTarget && binding != BindingType::VideoOut) {
+		return true;
+	}
+	const auto& info = image.info;
+	return info.resources.layers != 0 && info.data.size % info.resources.layers == 0 &&
+	       info.samples == 1 && image.backing.samples == 1;
+}
+
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
 	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	if (binding != BindingType::DepthTarget) {
-		if ((binding == BindingType::RenderTarget || binding == BindingType::VideoOut) &&
-		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
-		     info.samples != 1 || image.backing.samples != 1)) {
+		if (!IsValidColorAttachmentUpload(image, binding)) {
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
 		if (binding == BindingType::VideoOut &&
@@ -1054,7 +1070,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 // Refreshes an image from only the bytes a buffer wrote into it, keeping the rest of the image
 // as the GPU left it. gpu_mod stays set, because the image is still newer than the buffer outside
 // that range. Returns false for anything this path cannot do exactly, so the caller falls back to
-// the full upload. Only linear layouts are handled for now.
+// the full upload.
 bool TextureCache::TryPartialRefresh(Image& image) {
 	const auto range = image.BufferModifiedRange();
 	if (!m_partial_buffer_refresh || !range) {
@@ -1063,13 +1079,16 @@ bool TextureCache::TryPartialRefresh(Image& image) {
 	namespace Counters = Common::DebugCounters;
 	// A hull of several writes can pass the limit that each write alone respected.
 	const bool usable = IsPartialRefreshEligible(image) && !image.IsCpuDirty() &&
-	                    !image.info.IsTiled() && WithinPartialLimit(image, range->size);
-	if (!usable) {
-		Counters::Add(Counters::Counter::TexturePartialFallbacks);
-		return false;
+	                    WithinPartialLimit(image, range->size);
+	if (usable && !image.info.IsTiled()) {
+		RefreshLinearRange(image, *range);
+		return true;
 	}
-	RefreshLinearRange(image, *range);
-	return true;
+	if (usable && RefreshTiledRange(image, *range)) {
+		return true;
+	}
+	Counters::Add(Counters::Counter::TexturePartialFallbacks);
+	return false;
 }
 
 // Copies the rounded written range of a linear image from its source buffer, one rectangle per
@@ -1095,15 +1114,79 @@ void TextureCache::RefreshLinearRange(Image& image, GuestRange range) {
 		// right. Do not clamp it.
 		const auto copies = RegionCopies(info, regions, source_offset - rounded.lo);
 		image.Upload(copies, source->Handle(), source_offset, size);
-		uint64_t bytes = 0;
-		for (const auto& region: regions) {
-			bytes += uint64_t {region.width} * region.height * info.tiling.block.bytes_per_element;
-		}
+		const uint64_t bytes = RegionBytes(info, regions);
 		Counters::Add(Counters::Counter::TexturePartialUploadBytes, bytes);
 		Counters::Add(Counters::Counter::TextureUploadBytes, bytes);
 	}
 	Counters::Add(Counters::Counter::TexturePartialRefreshes);
 	image.ClearBufferModified();
+}
+
+// Decides what a tiled partial refresh touches, or nothing when the full upload has to run. The
+// colour attachment checks are the ones UploadImage makes, so an invalid image still reaches them.
+std::optional<TextureCache::TiledRefreshPlan> TextureCache::PlanTiledRefresh(const Image& image,
+                                                                              GuestRange   range) {
+	const auto& info    = image.info;
+	if (!info.IsTiled() || info.tiling.block.family == TileBlockFamily::Depth64KB ||
+	    info.data.size > UINT32_MAX || info.LinearSize() > UINT32_MAX ||
+	    !IsValidColorAttachmentUpload(image, UploadBinding(image))) {
+		return std::nullopt;
+	}
+	const auto first = range.address - info.data.address;
+	TiledRefreshPlan plan;
+	plan.range   = RoundRefreshRange(info, first, first + range.size);
+	plan.regions = TiledRefreshRegions(info, plan.range.lo, plan.range.hi);
+	return plan;
+}
+
+// Brings the image's current texels for the touched rectangles into the linear scratch, so the
+// texels of a touched block that lie outside the written window keep the image's own values.
+void TextureCache::DownloadForMerge(Image& image, const TileManager::Result& scratch,
+                                    std::span<const RefreshRegion> regions) {
+	image.Download(RegionCopies(image.info, regions, scratch.offset), scratch.buffer, scratch.offset,
+	               scratch.size);
+}
+
+// Writes the merged rectangles of the linear scratch back into the image.
+void TextureCache::UploadMerged(Image& image, const TileManager::Result& scratch,
+                                std::span<const RefreshRegion> regions) {
+	image.Upload(RegionCopies(image.info, regions, scratch.offset), scratch.buffer, scratch.offset,
+	             scratch.size);
+}
+
+// Download, masked detile and upload run in that order on the GPU. Each step's barriers cover the
+// scratch, and the scratch is never shared with the window source, so nothing reuses it between.
+void TextureCache::MergeTiledRegions(Image& image, const TiledRefreshPlan& plan) {
+	namespace Counters = Common::DebugCounters;
+	const auto& info = image.info;
+	const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(
+	    info.data.address + plan.range.lo, plan.range.hi - plan.range.lo);
+	if (source == nullptr) {
+		EXIT("TextureCache: failed to obtain partial image upload source\n");
+	}
+	const auto scratch = m_tiler.GetScratchBuffer(info.LinearSize(), source->Handle());
+	DownloadForMerge(image, scratch, plan.regions);
+	m_tiler.DetileRegions({source->Handle(), source_offset, plan.range.lo, plan.range.hi}, info,
+	                      plan.regions, scratch);
+	UploadMerged(image, scratch, plan.regions);
+	const uint64_t bytes = RegionBytes(info, plan.regions);
+	Counters::Add(Counters::Counter::TexturePartialUploadBytes, bytes);
+	Counters::Add(Counters::Counter::TextureUploadBytes, bytes);
+}
+
+// Refreshes a tiled image from only the blocks its written range touches, then drops the buffer
+// mark and keeps gpu_mod. Returns false when the plan does not apply.
+bool TextureCache::RefreshTiledRange(Image& image, GuestRange range) {
+	const auto plan = PlanTiledRefresh(image, range);
+	if (!plan) {
+		return false;
+	}
+	if (!plan->regions.empty()) {
+		MergeTiledRegions(image, *plan);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TexturePartialRefreshes);
+	image.ClearBufferModified();
+	return true;
 }
 
 void TextureCache::InitializeImage(ImageId id) {

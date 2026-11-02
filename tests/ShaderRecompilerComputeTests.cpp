@@ -398,6 +398,10 @@ struct TextureCacheTestAccess {
     cache.m_readback_linear_images = enabled;
   }
 
+  static void SetTiledReadback(TextureCache &cache, bool enabled) {
+    cache.m_readback_tiled_images = enabled;
+  }
+
   static void SetPartialBufferRefresh(TextureCache &cache, bool enabled) {
     cache.m_partial_buffer_refresh = enabled;
   }
@@ -6363,7 +6367,7 @@ public:
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x3000000;
+    constexpr uint64_t allocation_size = 0x3800000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -8360,12 +8364,15 @@ public:
         bool ineligible = false;
         // Marks the guest bytes as changed by the CPU before the bind.
         bool cpu_dirty = false;
-        // A Standard4KB tiled image. Its bind still takes the full upload for now.
-        bool tiled = false;
+        // The tile mode of the image. Tiled images use the big fixture addresses.
+        Prospero::TileMode tile = Prospero::TileMode::kLinear;
+        uint32_t levels = 1;
       };
       struct LinearRefreshResult {
         std::vector<u32> texels;
         std::vector<u32> backing;
+        ImageInfo info;
+        std::vector<std::vector<u32>> mips;
         bool gpu_modified_after_bind = false;
         bool downloaded = false;
         bool pending_after_process = false;
@@ -8375,41 +8382,52 @@ public:
         uint64_t refreshes = 0;
         uint64_t fallbacks = 0;
       };
+      constexpr uint64_t tiled_refresh_base = 0x3000000;
+      constexpr uint64_t tiled_refresh_stride = 0x80000;
       uint32_t linear_refresh_slot = 0;
+      uint32_t tiled_refresh_slot = 0;
       const auto run_linear_refresh = [&](const LinearRefreshCase &c) {
         TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, c.flag);
-        const uint64_t offset = linear_refresh_base + linear_refresh_slot++ * linear_refresh_stride;
-        const uint64_t bytes = uint64_t{c.pitch} * c.height * sizeof(uint32_t);
-        std::vector<u32> guest(c.pitch * c.height);
-        for (uint32_t index = 0; index < guest.size(); ++index)
-          guest[index] = linear_refresh_guest + index;
-        std::memcpy(memory + offset, guest.data(), bytes);
-        Libs::LibKernel::Memory::WriteBacking(base + offset, guest.data(), bytes);
-        auto desc = MakeLinearDesc(base + offset, bytes, vk::Format::eR32Uint,
+        const bool tiled = c.tile != Prospero::TileMode::kLinear;
+        const uint64_t offset = tiled ? tiled_refresh_base + tiled_refresh_slot++ * tiled_refresh_stride
+                                      : linear_refresh_base + linear_refresh_slot++ * linear_refresh_stride;
+        const uint64_t provisional = uint64_t{c.pitch} * c.height * sizeof(uint32_t);
+        auto desc = MakeLinearDesc(base + offset, provisional, vk::Format::eR32Uint,
                                    Prospero::BufferFormat::k32UInt,
                                    Prospero::ImageType::kColor2D, {c.width, c.height, 1}, 1, 4, 1);
         desc.info.pitch = c.pitch;
-        if (c.tiled) {
-          desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        desc.info.resources.levels = c.levels;
+        desc.view_info.level_count = c.levels;
+        if (tiled) {
+          desc.info.tile_mode = c.tile;
           desc.info.data.size = 0;
           desc.info.pitch = 0;
         }
         desc.info.UpdateSize();
+        const uint64_t bytes = desc.info.data.size;
         Require(name, "linear refresh fixture",
-                c.tiled ? desc.info.IsTiled() && desc.info.data.size == bytes
-                        : (c.pitch == c.width ||
-                           desc.info.mip_layout[0].linear_pitch >=
-                               c.width + linear_refresh_pitch_padding) &&
-                              desc.info.mip_layout[0].linear_pitch == c.pitch,
+                bytes <= tiled_refresh_stride &&
+                    (tiled ? desc.info.IsTiled() && (c.levels > 1 || bytes == provisional)
+                           : (c.pitch == c.width ||
+                              desc.info.mip_layout[0].linear_pitch >=
+                                  c.width + linear_refresh_pitch_padding) &&
+                                 desc.info.mip_layout[0].linear_pitch == c.pitch),
                 "the padded linear fixture lost its row padding or the tiled one its size");
+        // Distinct guest words, so a copy from the wrong place cannot hide behind uniform data.
+        std::vector<u32> guest(bytes / sizeof(u32));
+        for (uint32_t index = 0; index < guest.size(); ++index)
+          guest[index] = linear_refresh_guest + index;
+        std::memcpy(memory + offset, guest.data(), bytes);
+        Libs::LibKernel::Memory::WriteBacking(base + offset, guest.data(), bytes);
         const auto image_id = texture_cache.FindImage(desc);
         vk::ClearValue painted{};
         painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
         TextureCacheTestAccess::ClearImage(
             texture_cache, scheduler.Current(), image_id,
-            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+            {vk::ImageAspectFlagBits::eColor, 0, c.levels, 0, 1}, painted);
         if (c.track_download) {
           TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+          TextureCacheTestAccess::SetTiledReadback(texture_cache, true);
           TextureCacheTestAccess::TrackDownload(texture_cache, image_id);
         }
         auto writable = resources.GetBufferCache().ObtainBuffer(
@@ -8423,6 +8441,7 @@ public:
         else
           texture_cache.InvalidateBufferWrite(desc.info.data.address, c.mark_size);
         LinearRefreshResult result;
+        result.info = desc.info;
         result.data_size = desc.info.data.size;
         if (c.track_download) {
           texture_cache.ProcessDownloadImages();
@@ -8449,6 +8468,10 @@ public:
         Common::DebugCounters::SetEnabled(false);
         result.gpu_modified_after_bind = texture_cache.GetImage(image_id).IsGpuModified();
         result.texels = ReadCachedTexel(name, context, image_id, {}, {c.width, c.height, 1});
+        for (uint32_t level = 1; level < c.levels; ++level)
+          result.mips.push_back(ReadCachedTexel(
+              name, context, image_id, {},
+              {std::max(c.width >> level, 1u), std::max(c.height >> level, 1u), 1}, 0, level));
         if (c.track_download)
           texture_cache.ProcessDownloadImages();
         else
@@ -8458,6 +8481,7 @@ public:
         result.backing.resize(guest.size());
         Libs::LibKernel::Memory::TryReadBacking(base + offset, result.backing.data(), bytes);
         TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+        TextureCacheTestAccess::SetTiledReadback(texture_cache, false);
         return result;
       };
       // The painted value everywhere, except the given element range which holds the write.
@@ -8546,16 +8570,122 @@ public:
                   !direct_dirty.gpu_modified_after_bind,
               "a CPU-dirty range-marked image must fall back and show the guest bytes outside "
               "the range");
-      // Tiled images keep the full upload until their partial path exists. Change the expected
-      // counters here when that lands.
+      // A tiled image refreshes the blocks the write touched and merges them with its own texels.
       const auto tiled_small = run_linear_refresh({.width = 32, .height = 32, .pitch = 32,
-                                                   .tiled = true});
-      Require(name, "linear partial refresh leaves tiled images on the full upload",
-              tiled_small.refreshes == 0 && tiled_small.fallbacks == 1 &&
-                  tiled_small.upload_bytes == tiled_small.data_size &&
-                  tiled_small.texels.front() == buffer_alias_write_value &&
-                  !tiled_small.gpu_modified_after_bind,
-              "a tiled range-marked image must fall back to the full upload and clear gpu_mod");
+                                                   .tile = Prospero::TileMode::kStandard4KB});
+      Require(name, "tiled partial refresh of a one block image",
+              tiled_small.refreshes == 1 && tiled_small.fallbacks == 0 &&
+                  tiled_small.partial_bytes == tiled_small.data_size &&
+                  tiled_small.texels == painted_but(32 * 32, 0, 1) &&
+                  tiled_small.gpu_modified_after_bind,
+              "a tiled range-marked image must refresh its touched block, keep its other texels "
+              "and keep gpu_mod");
+      // A 256x256 R32 RenderTarget image takes a 32 KB write at its base. Its first block holds
+      // tiled bytes 0 to 64K, so the write covers half of block 0 and nothing else.
+      constexpr uint32_t tiled_write_bytes = 32 * 1024;
+      const LinearRefreshCase rt_case{.width = 256, .height = 256, .pitch = 256,
+                                      .mark_size = tiled_write_bytes,
+                                      .tile = Prospero::TileMode::kRenderTarget};
+      auto rt_off_case = rt_case;
+      rt_off_case.flag = false;
+      const auto rt_on = run_linear_refresh(rt_case);
+      const auto rt_off = run_linear_refresh(rt_off_case);
+      // The texels by their tiled address: below the write they hold W, above it I or the guest.
+      std::vector<u32> rt_expected_on(256 * 256), rt_expected_off(256 * 256);
+      for (uint32_t y = 0; y < 256; ++y)
+        for (uint32_t x = 0; x < 256; ++x) {
+          const auto address = RegionTexelAddress(rt_on.info, 0, x, y);
+          const bool written = address < tiled_write_bytes;
+          rt_expected_on[y * 256 + x] = written ? buffer_alias_write_value : buffer_alias_image_value;
+          rt_expected_off[y * 256 + x] =
+              written ? buffer_alias_write_value : linear_refresh_guest + address / 4;
+        }
+      Require(name, "tiled partial refresh keeps the image's own texels",
+              rt_on.texels == rt_expected_on && rt_off.texels == rt_expected_off,
+              "texels outside the written bytes, in block 0 and in the other blocks, must keep "
+              "the painted value with the flag on, and take the guest bytes with it off");
+      Require(name, "tiled partial refresh bytes",
+              rt_on.refreshes == 1 && rt_on.fallbacks == 0 && rt_on.partial_bytes == 64 * 1024 &&
+                  rt_on.upload_bytes == 64 * 1024 && rt_off.upload_bytes == rt_off.data_size &&
+                  rt_off.data_size == 256 * 1024,
+              "the write must upload the one block it touches, and the flag off baseline the image");
+      Require(name, "tiled partial refresh download consistency",
+              rt_on.gpu_modified_after_bind && rt_on.downloaded &&
+                  rt_on.backing == painted_but(256 * 256, 0, tiled_write_bytes / 4) &&
+                  !rt_off.gpu_modified_after_bind,
+              "the image must stay GPU-modified and download as the merged contents");
+      // The same write with the guest words left in the buffer, so every written texel is
+      // different and a copy from the wrong place cannot hide behind the uniform value.
+      const auto window_expected = [&](const ImageInfo &info, uint64_t first, uint64_t last) {
+        std::vector<u32> expected(256 * 256, buffer_alias_image_value);
+        for (uint32_t y = 0; y < 256; ++y)
+          for (uint32_t x = 0; x < 256; ++x) {
+            const auto address = RegionTexelAddress(info, 0, x, y);
+            if (address >= first && address < last)
+              expected[y * 256 + x] = linear_refresh_guest + address / 4;
+          }
+        return expected;
+      };
+      const auto rt_words = run_linear_refresh({.width = 256, .height = 256, .pitch = 256,
+                                                .mark_size = tiled_write_bytes, .fill = false,
+                                                .tile = Prospero::TileMode::kRenderTarget});
+      Require(name, "tiled partial refresh with distinct words",
+              rt_words.texels == window_expected(rt_words.info, 0, tiled_write_bytes) &&
+                  rt_words.partial_bytes == 64 * 1024,
+              "each written texel must take its own guest word and every other texel the painted "
+              "value");
+      // A range that starts inside the image, so the window source must start at that offset.
+      constexpr uint64_t offset_window_start = 64 * 1024 + 0x100;
+      constexpr uint32_t offset_window_bytes = 0x4000;
+      const auto rt_offset = run_linear_refresh({.width = 256, .height = 256, .pitch = 256,
+                                                 .mark_offset = offset_window_start,
+                                                 .mark_size = offset_window_bytes,
+                                                 .direct_mark = true, .fill = false,
+                                                 .tile = Prospero::TileMode::kRenderTarget});
+      Require(name, "tiled partial refresh of a range inside the image",
+              rt_offset.texels == window_expected(rt_offset.info, offset_window_start,
+                                                  offset_window_start + offset_window_bytes) &&
+                  rt_offset.refreshes == 1 && rt_offset.fallbacks == 0,
+              "only the texels of the written window may change, with their own guest words");
+      // A pending readback of a range-marked tiled image survives until the refresh lands.
+      const auto tiled_pending = run_linear_refresh({.width = 32, .height = 32, .pitch = 32,
+                                                     .track_download = true,
+                                                     .tile = Prospero::TileMode::kStandard4KB});
+      const auto tiled_pending_off = run_linear_refresh(
+          {.flag = false, .width = 32, .height = 32, .pitch = 32, .track_download = true,
+           .tile = Prospero::TileMode::kStandard4KB});
+      Require(name, "range-marked tiled image keeps its pending readback",
+              tiled_pending.pending_after_process && !tiled_pending_off.pending_after_process &&
+                  tiled_pending.backing == painted_but(32 * 32, 0, 1),
+              "a range-marked tiled image lost its queued download before the refresh");
+      // Standard64KB with mips. The guest chain runs backwards, so a write at the base lands in
+      // the shared tail block. The first bytes of that block belong to no texel, because the tail
+      // mips sit at offsets inside it, so the write is long enough to reach the first of them.
+      constexpr uint32_t mipped_write_bytes = 0x2800;
+      const auto mipped = run_linear_refresh({.width = 256, .height = 256, .pitch = 256,
+                                              .mark_size = mipped_write_bytes,
+                                              .tile = Prospero::TileMode::kStandard64KB,
+                                              .levels = 5});
+      std::vector<std::vector<u32>> mip_expected;
+      uint32_t changed_texels = 0, changed_tail_texels = 0;
+      for (uint32_t level = 0; level < 5; ++level) {
+        const uint32_t size = std::max(256u >> level, 1u);
+        mip_expected.emplace_back(size * size, buffer_alias_image_value);
+        for (uint32_t y = 0; y < size; ++y)
+          for (uint32_t x = 0; x < size; ++x)
+            if (RegionTexelAddress(mipped.info, 0, x, y, level) < mipped_write_bytes) {
+              mip_expected[level][y * size + x] = buffer_alias_write_value;
+              ++changed_texels;
+              changed_tail_texels += level >= mipped.info.first_tail_level;
+            }
+      }
+      Require(name, "tiled partial refresh of a mipped texture",
+              changed_texels > 0 && changed_texels == changed_tail_texels &&
+                  mipped.texels == mip_expected[0] &&
+                  std::equal(mipped.mips.begin(), mipped.mips.end(), mip_expected.begin() + 1) &&
+                  mipped.refreshes == 1 && mipped.fallbacks == 0,
+              "a base write must change only the tail level texels it covers and leave every other "
+              "texel of every mip alone");
       // A pending readback of a range-marked image must survive until the refresh lands.
       const auto pending_on = run_linear_refresh({.track_download = true});
       const auto pending_off = run_linear_refresh({.flag = false, .track_download = true});
@@ -21649,19 +21779,22 @@ public:
   }
 
   // Tile table reference for level 0, the way the tiler shader addresses a texel.
-  uint64_t RegionTexelAddress(const ImageInfo &info, uint32_t layer, uint32_t x, uint32_t y) {
+  uint64_t RegionTexelAddress(const ImageInfo &info, uint32_t layer, uint32_t x, uint32_t y,
+                              uint32_t level = 0) {
     const auto &block = info.tiling.block;
-    const auto &mip = info.mip_layout[0];
+    const auto &mip = info.mip_layout[level];
+    const bool tail = level >= info.first_tail_level;
     const uint64_t columns = (mip.pitch + block.block_width - 1u) / block.block_width;
+    const uint32_t bx = tail ? 0 : x / block.block_width;
+    const uint32_t by = tail ? 0 : y / block.block_height;
     uint32_t local = 0, block_xor = 0;
     Require(kRegionName, "reference address",
-            TileGetBlockOffset(block, x % block.block_width, y % block.block_height, 0, local) &&
-                TileGetBlockXor(block, x / block.block_width, y / block.block_height,
-                                mip.surface_z + layer, block_xor),
+            TileGetBlockOffset(block, tail ? x + mip.tail_x : x % block.block_width,
+                               tail ? y + mip.tail_y : y % block.block_height, 0, local) &&
+                TileGetBlockXor(block, bx, by, mip.surface_z + layer, block_xor),
             "tile table lookup failed");
     return mip.offset + uint64_t{layer} * info.tiled_slice_stride +
-           ((y / block.block_height) * columns + x / block.block_width) * block.block_size +
-           (local ^ block_xor);
+           (by * columns + bx) * block.block_size + (local ^ block_xor);
   }
 
   static uint64_t RegionLinearOffset(const ImageInfo &info, uint32_t layer, uint32_t x,

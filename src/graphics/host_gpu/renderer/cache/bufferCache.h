@@ -134,14 +134,26 @@ private:
 		uint64_t                    buffer_address = 0;
 		uint64_t                    offset         = 0;
 		uint8_t*                    mapped         = nullptr;
-		// Owns the memory behind mapped when the stream buffer was too full to serve it.
-		std::unique_ptr<Buffer>     temporary;
+		// Owns the memory behind mapped when the stream buffer was too full to serve it. The
+		// downloads of one batch share it, because the batch makes a single reservation.
+		std::shared_ptr<Buffer> temporary;
 	};
 	[[nodiscard]] PendingDownload CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr,
 	                                                    uint64_t size);
-	void ReserveDownloadMemory(PendingDownload& pending);
+	// A buffer's pending download inside a batch of downloads that share one GPU wait.
+	struct BatchedDownload {
+		Buffer*         buffer = nullptr;
+		PendingDownload pending;
+	};
+	void ReserveDownloadMemory(std::span<PendingDownload* const> items);
 	void RecordDownload(const Buffer& buffer, const PendingDownload& pending);
 	void PublishDownload(const PendingDownload& pending);
+	// Resolves a hot entry to the buffer that now owns it, without creating one on a miss.
+	[[nodiscard]] BufferId FindHotBuffer(uint64_t address, uint64_t size);
+	[[nodiscard]] uint64_t EstimateDownloadBytes(const Buffer& buffer) const;
+	void               CollectHotDownloads(BufferId main_id, std::vector<BatchedDownload>& batch);
+	[[nodiscard]] bool DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
+	                                          uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);

@@ -210,6 +210,21 @@ struct BufferCacheTestAccess {
     return cache.m_slot_buffers.is_allocated(id);
   }
 
+  static void NoteHotReadback(BufferCache &cache, uint64_t address, uint64_t size) {
+    cache.NoteHotReadback(address, size);
+  }
+
+  static size_t BufferCount(const BufferCache &cache) {
+    return cache.m_buffers.size();
+  }
+
+  // Called immediately after cache construction, before any download reservation.
+  static void ReplaceDownloadBuffer(BufferCache &cache, uint64_t size) {
+    std::destroy_at(&cache.m_download_buffer);
+    std::construct_at(&cache.m_download_buffer, cache.m_graphics, cache.m_scheduler,
+                      MemoryUsage::Download, size);
+  }
+
   static size_t HotReadbackCount(const BufferCache &cache) {
     return cache.m_hot_readbacks.Size();
   }
@@ -23300,6 +23315,366 @@ private:
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
+
+// A guest memory mapping with a render context, for tests that fault GPU-written buffers through
+// the real ReadMemory path. The flag is loaded before the context so the cache reads it.
+class HotBatchBed {
+public:
+  static constexpr uintptr_t Base = 0x0000000208000000ull;
+  static constexpr uint64_t MappingSize = 0x1000000;
+  static constexpr uint64_t Alignment = 0x10000;
+  static constexpr uint64_t SmallRegion = 0x1000;
+  static constexpr uint64_t BigRegion = 0x100000;
+  static constexpr uint32_t StaleValue = 0x0badf00du;
+
+  HotBatchBed(GraphicContext &graphics, bool flag_enabled)
+      : context((LoadConfig(flag_enabled), graphics)) {
+    constexpr const char *name = "HotBatchBed";
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                MappingSize, Alignment, 0, &m_direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(Base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, MappingSize, 0x3, 0x10, m_direct_offset, Alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(Base),
+            "fixed direct-memory mapping failed");
+    auto &scheduler = context.GetCommandScheduler();
+    scheduler.Begin(m_registers, m_user_config, m_shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(Base, MappingSize);
+    Common::DebugCounters::SetEnabled(true);
+  }
+
+  ~HotBatchBed() {
+    Common::DebugCounters::SetEnabled(false);
+    context.UnmapMemory(Base, MappingSize);
+    context.GetCommandScheduler().Finish();
+    context.ShutdownGpu();
+    Require("HotBatchBed", "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(Base, MappingSize) == 0,
+            "mapping release failed");
+    Require("HotBatchBed", "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(m_direct_offset,
+                                                               MappingSize) == 0,
+            "allocation release failed");
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    Config::Load(options);
+  }
+
+  HotBatchBed(const HotBatchBed &) = delete;
+  HotBatchBed &operator=(const HotBatchBed &) = delete;
+
+  BufferCache &Cache() { return context.GetBufferCache(); }
+  CommandScheduler &Scheduler() { return context.GetCommandScheduler(); }
+  static uint64_t Address(uint64_t offset) { return Base + offset; }
+
+  // Writes a stale value to the backing, then makes the GPU write the new value over a region.
+  void GpuWrite(uint64_t offset, uint64_t size, uint32_t value) {
+    Libs::LibKernel::Memory::WriteBacking(Address(offset), &StaleValue, sizeof(StaleValue));
+    Require("HotBatchBed", "gpu write allocation",
+            Cache().ObtainBuffer(Address(offset), size, true, false).first != nullptr,
+            "buffer allocation for a GPU write failed");
+    Cache().FillBuffer(Address(offset), size, value, false);
+  }
+
+  [[nodiscard]] uint32_t Backing(uint64_t offset) const {
+    // Reads the backing directly, because touching a GPU-dirty guest page would fault and
+    // download it, which is the very thing these tests observe.
+    uint32_t value = 0;
+    Require("HotBatchBed", "backing read",
+            Libs::LibKernel::Memory::TryReadSparseBacking(Address(offset), &value, sizeof(value)),
+            "the guest backing could not be read");
+    return value;
+  }
+
+  [[nodiscard]] bool Dirty(uint64_t offset, uint64_t size) {
+    return Cache().IsRegionGpuModified(Address(offset), size);
+  }
+
+  // Faults a word and returns how many queue submits that readback caused.
+  uint64_t Fault(uint64_t offset) {
+    const auto before = Common::DebugCounters::Get(Common::DebugCounters::Counter::QueueSubmits);
+    Cache().ReadMemory(Address(offset), sizeof(uint32_t));
+    return Common::DebugCounters::Get(Common::DebugCounters::Counter::QueueSubmits) - before;
+  }
+
+  // Writes a region on the GPU, then reads it back once so its buffer becomes hot.
+  void MakeHot(uint64_t offset, uint64_t size, uint32_t value) {
+    GpuWrite(offset, size, value);
+    (void)Fault(offset);
+  }
+
+  // Submits empty commands so the scheduler tick moves forward.
+  void AdvanceTicks(uint64_t count) {
+    for (uint64_t index = 0; index < count; ++index) {
+      Scheduler().Flush();
+    }
+  }
+
+  RenderContext context;
+
+private:
+  static void LoadConfig(bool flag_enabled) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.batch_hot_readbacks = flag_enabled;
+    Config::Load(options);
+  }
+
+  int64_t m_direct_offset = -1;
+  HW::Context m_registers{};
+  HW::UserConfig m_user_config{};
+  HW::Shader m_shaders{};
+};
+
+namespace HotBatchOffsets {
+constexpr uint64_t Faulting = 0x0;
+constexpr uint64_t Hot = 0x100000;
+constexpr uint64_t Neighbour = Hot + 0x4000;
+constexpr uint64_t SecondHot = 0x200000;
+constexpr uint32_t FirstValue = 0x11111111u;
+constexpr uint32_t SecondValue = 0x22222222u;
+constexpr uint32_t ThirdValue = 0x33333333u;
+constexpr uint32_t FaultingValue = 0x44444444u;
+} // namespace HotBatchOffsets
+
+// Reads back a faulting buffer after a hot one was rewritten. Returns the submits that the
+// faulting readback cost, and fills in what the hot buffer looked like afterwards.
+struct HotBatchOutcome {
+  uint64_t faulting_submits = 0;
+  uint64_t hot_fault_submits = 0;
+  uint32_t hot_backing = 0;
+  bool hot_dirty = false;
+};
+
+HotBatchOutcome RunHotBatch(VulkanHarness &harness, bool flag_enabled, uint64_t entry_age) {
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), flag_enabled);
+  bed.MakeHot(Hot, HotBatchBed::SmallRegion, FirstValue);
+  bed.GpuWrite(Hot, HotBatchBed::SmallRegion, SecondValue);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  if (entry_age != 0) {
+    // The fault below collects at the current tick, so land the hot entry on an exact age.
+    uint64_t entry_tick = 0;
+    Require("HotBatch", "hot entry recorded",
+            BufferCacheTestAccess::HotReadbackTick(bed.Cache(), HotBatchBed::Address(Hot),
+                                                   entry_tick) &&
+                bed.Scheduler().CurrentTick() <= entry_tick + entry_age,
+            "the hot entry should exist and be no older than the age under test");
+    bed.AdvanceTicks(entry_tick + entry_age - bed.Scheduler().CurrentTick());
+  }
+  HotBatchOutcome outcome;
+  outcome.faulting_submits = bed.Fault(Faulting);
+  Require("HotBatch", "faulting buffer published",
+          bed.Backing(Faulting) == FaultingValue && !bed.Dirty(Faulting, 4),
+          "the faulting readback should still download its own buffer");
+  outcome.hot_backing = bed.Backing(Hot);
+  outcome.hot_dirty = bed.Dirty(Hot, HotBatchBed::SmallRegion);
+  outcome.hot_fault_submits = bed.Fault(Hot);
+  return outcome;
+}
+
+// T1 and T2. A readback that waits also clears a recently read-back buffer, and one that is
+// older than HotReadbackTicks is left alone.
+void CheckHotBatchCoDownload(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchCoDownload";
+  using namespace HotBatchOffsets;
+  const auto off = RunHotBatch(harness, false, 0);
+  Require(name, "flag off leaves the hot buffer stale",
+          off.hot_backing != SecondValue && off.hot_dirty && off.hot_fault_submits > 0,
+          "without the flag only the faulting buffer should be downloaded");
+  const auto on = RunHotBatch(harness, true, 0);
+  Require(name, "flag on downloads the hot buffer in the same wait",
+          on.hot_backing == SecondValue && !on.hot_dirty,
+          "the hot buffer's GPU write should have been downloaded with the faulting one");
+  Require(name, "the hot buffer's next fault costs no submit", on.hot_fault_submits == 0,
+          "a co-downloaded buffer should fault without waiting");
+  Require(name, "the batch shares one wait", on.faulting_submits == off.faulting_submits,
+          "the co-download should not add a GPU wait");
+  // The ages straddle the limit by one tick, so a comparison off by one fails one of them.
+  const auto at_limit = RunHotBatch(harness, true, HotReadbackTicks);
+  Require(name, "an entry at the age limit is co-downloaded",
+          at_limit.hot_backing == SecondValue && !at_limit.hot_dirty,
+          "a buffer exactly HotReadbackTicks old should still be hot");
+  const auto aged = RunHotBatch(harness, true, HotReadbackTicks + 1);
+  Require(name, "an aged entry is not co-downloaded",
+          aged.hot_backing != SecondValue && aged.hot_dirty && aged.hot_fault_submits > 0,
+          "a buffer older than HotReadbackTicks should be left for its own fault");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T4 and T5. A co-download clears exactly the buffer it read, marks nothing CPU-modified, and a
+// later GPU rewrite is downloaded again.
+void CheckHotBatchTracking(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchTracking";
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(Hot, HotBatchBed::SmallRegion, FirstValue);
+  bed.GpuWrite(Neighbour, HotBatchBed::SmallRegion, ThirdValue);
+  bed.GpuWrite(Hot, HotBatchBed::SmallRegion, SecondValue);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  Require(name, "hot buffer starts CPU-clean",
+          !bed.Cache().IsRegionCpuModified(HotBatchBed::Address(Hot), HotBatchBed::SmallRegion),
+          "the hot buffer should not be CPU-modified before the batch");
+  (void)bed.Fault(Faulting);
+  Require(name, "hot buffer was co-downloaded", bed.Backing(Hot) == SecondValue,
+          "the batch did not download the hot buffer, so the checks below prove nothing");
+  Require(name, "co-download does not mark CPU-modified",
+          !bed.Cache().IsRegionCpuModified(HotBatchBed::Address(Hot), HotBatchBed::SmallRegion),
+          "only a faulting write may mark guest memory CPU-modified");
+  Require(name, "neighbour stays GPU-dirty",
+          bed.Dirty(Neighbour, HotBatchBed::SmallRegion),
+          "the co-download cleared a buffer it did not read");
+  // The two checks below guard against regressions in the dirty tracking and do not prove T5.
+  bed.GpuWrite(Hot, HotBatchBed::SmallRegion, FirstValue);
+  Require(name, "rewrite is GPU-dirty again", bed.Dirty(Hot, HotBatchBed::SmallRegion),
+          "a GPU write after a co-download should mark the buffer dirty");
+  (void)bed.Fault(Hot);
+  (void)bed.Fault(Neighbour);
+  Require(name, "rewrite and neighbour are downloaded",
+          bed.Backing(Hot) == FirstValue && bed.Backing(Neighbour) == ThirdValue,
+          "a later fault should download the rewrite and the untouched neighbour");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T3. Hot buffers beyond MaxHotReadbackBytes are left for their own faults.
+void CheckHotBatchByteCap(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchByteCap";
+  using namespace HotBatchOffsets;
+  constexpr uint64_t hot_count = MaxHotReadbackBytes / HotBatchBed::BigRegion + 1;
+  constexpr uint64_t spacing = 0x200000;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  for (uint64_t index = 1; index <= hot_count; ++index) {
+    bed.MakeHot(index * spacing, HotBatchBed::BigRegion, FirstValue);
+  }
+  for (uint64_t index = 1; index <= hot_count; ++index) {
+    bed.GpuWrite(index * spacing, HotBatchBed::BigRegion, SecondValue);
+  }
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  uint64_t cleaned = 0;
+  for (uint64_t index = 1; index <= hot_count; ++index) {
+    cleaned += bed.Dirty(index * spacing, HotBatchBed::BigRegion) ? 0 : 1;
+  }
+  Require(name, "extras stop at the byte cap", cleaned == hot_count - 1,
+          "all but the last hot buffer fit the cap and the last must be left dirty");
+  Require(name, "the buffer past the cap is still dirty",
+          bed.Dirty(hot_count * spacing, HotBatchBed::BigRegion),
+          "the buffer that did not fit must stay GPU-dirty for its own fault");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T6. A batch bigger than the download ring must not reuse ring bytes before they are
+// published, so every download still lands with the right value.
+void CheckHotBatchSmallRing(VulkanHarness &harness, uint64_t ring_units) {
+  constexpr const char *name = "HotBatchSmallRing";
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  const auto &limits = harness.RuntimeContext().physical_device_properties.limits;
+  const uint64_t unit = std::max<uint64_t>(64, limits.nonCoherentAtomSize);
+  // Each download is one word. Two units cannot hold a batch of three, so it uses a temporary
+  // buffer. Four units hold it only after the ring wraps, so the reservation waits and wraps.
+  BufferCacheTestAccess::ReplaceDownloadBuffer(bed.Cache(), unit * ring_units);
+  bed.MakeHot(Hot, sizeof(uint32_t), FirstValue);
+  bed.MakeHot(SecondHot, sizeof(uint32_t), FirstValue);
+  bed.GpuWrite(Hot, sizeof(uint32_t), SecondValue);
+  bed.GpuWrite(SecondHot, sizeof(uint32_t), ThirdValue);
+  bed.GpuWrite(Faulting, sizeof(uint32_t), FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "every download in the wrapped batch published",
+          bed.Backing(Faulting) == FaultingValue && bed.Backing(Hot) == SecondValue &&
+              bed.Backing(SecondHot) == ThirdValue,
+          "a batch that outgrew the ring lost or mixed up downloaded bytes");
+  Require(name, "the hot buffers were co-downloaded",
+          !bed.Dirty(Hot, HotBatchBed::SmallRegion) &&
+              !bed.Dirty(SecondHot, HotBatchBed::SmallRegion),
+          "the batch did not include the hot buffers, so the ring was never stressed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T7. A hot entry for a range that no buffer covers is skipped without creating a buffer.
+void CheckHotBatchStaleEntry(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchStaleEntry";
+  using namespace HotBatchOffsets;
+  constexpr uint64_t uncovered_offset = 0x800000;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  // The entry stands in for a buffer that was deleted after it took a readback.
+  BufferCacheTestAccess::NoteHotReadback(bed.Cache(), HotBatchBed::Address(uncovered_offset),
+                                         HotBatchBed::SmallRegion);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  const auto buffers_before = BufferCacheTestAccess::BufferCount(bed.Cache());
+  (void)bed.Fault(Faulting);
+  Require(name, "faulting buffer published", bed.Backing(Faulting) == FaultingValue,
+          "the readback should still run with a stale hot entry");
+  Require(name, "stale entry creates no buffer",
+          BufferCacheTestAccess::BufferCount(bed.Cache()) == buffers_before,
+          "resolving a hot entry created a buffer for a range that has none");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// The faulting buffer is almost always hot itself. It must not be collected again, or the bytes
+// outside its readback window would be downloaded without being unmarked or accounted for.
+void CheckHotBatchMainBuffer(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchMainBuffer";
+  constexpr uint64_t main_offset = 0x400000;
+  constexpr uint64_t main_size = 0x200000;
+  // One MiB in is outside the 512 KiB window of a fault at the start of the buffer.
+  constexpr uint64_t far_offset = main_offset + 0x100000;
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(main_offset, main_size, FirstValue);
+  Require(name, "far range is still GPU-dirty after the first window",
+          bed.Dirty(far_offset, HotBatchBed::SmallRegion),
+          "the first readback should only have taken its own window");
+  bed.GpuWrite(main_offset, sizeof(uint32_t), SecondValue);
+  (void)bed.Fault(main_offset);
+  Require(name, "the faulting window was downloaded",
+          bed.Backing(main_offset) == SecondValue && !bed.Dirty(main_offset, 4),
+          "the second readback should download the rewritten start of the buffer");
+  Require(name, "the hot main buffer is not collected again",
+          bed.Dirty(far_offset, HotBatchBed::SmallRegion),
+          "a hot faulting buffer must not have its far bytes downloaded as an extra");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Two hot keys inside one buffer download it once. Collecting is destructive, so a repeat finds
+// nothing and the bytes match with or without the dedupe. This guards that equivalence and does
+// not prove the dedupe, which only saves the repeated lookup and estimate.
+void CheckHotBatchDuplicateKeys(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchDuplicateKeys";
+  constexpr uint64_t copy_alignment = 64;
+  constexpr uint64_t second_key_offset = HotBatchOffsets::Hot + 0x2000;
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(Hot, sizeof(uint32_t), FirstValue);
+  BufferCacheTestAccess::NoteHotReadback(bed.Cache(), HotBatchBed::Address(second_key_offset),
+                                         HotBatchBed::SmallRegion);
+  bed.GpuWrite(Hot, sizeof(uint32_t), SecondValue);
+  bed.GpuWrite(Faulting, sizeof(uint32_t), FaultingValue);
+  const auto counter = Common::DebugCounters::Counter::BufferDownloadBytes;
+  const auto bytes_before = Common::DebugCounters::Get(counter);
+  (void)bed.Fault(Faulting);
+  const auto bytes = Common::DebugCounters::Get(counter) - bytes_before;
+  Require(name, "the buffer is downloaded once",
+          bed.Backing(Hot) == SecondValue && bytes == 2 * copy_alignment,
+          "the faulting word and the hot word should each be counted once");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckHotBatchReadbacks(VulkanHarness &harness) {
+  CheckHotBatchCoDownload(harness);
+  CheckHotBatchTracking(harness);
+  CheckHotBatchByteCap(harness);
+  CheckHotBatchSmallRing(harness, 2);
+  CheckHotBatchSmallRing(harness, 4);
+  CheckHotBatchStaleEntry(harness);
+  CheckHotBatchMainBuffer(harness);
+  CheckHotBatchDuplicateKeys(harness);
+}
 
 void CompareWords(const TestCase &test, const char *stage,
                   const std::vector<u32> &expected,
@@ -55309,6 +55684,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckHotReadbackRecording(false);
     vulkan.CheckHotReadbackRecording(true);
+    CheckHotBatchReadbacks(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
@@ -55587,6 +55963,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckHotReadbackRecording(false);
     vulkan.CheckHotReadbackRecording(true);
+    CheckHotBatchReadbacks(vulkan);
   } else {
     skipped_device_checks = true;
   }

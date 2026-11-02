@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -16,7 +17,8 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
+      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler),
+      m_skip_redundant_unmap_drains(Config::SkipRedundantUnmapDrainsEnabled()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -96,6 +98,49 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
+/// Returns true when the range is not mapped and has no image, GPU-written byte or priority operation.
+bool RenderContext::IsUnmapDrainRedundant(uint64_t vaddr, uint64_t size) {
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (m_mapped_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+	}
+	// The GPU-dirty checks are a conservative choice. The flush in InvalidateMemory waits on
+	// its own before it publishes, and the view is already gone for an unmapped range. Only the
+	// pair of checks is tested, not each one alone.
+	return !m_texture_cache.IsRegionRegistered(vaddr, size) &&
+	       !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	       !m_buffer_cache.IsRegionGpuModified(vaddr, size) &&
+	       !m_command_scheduler.HasPendingPriorityOperations();
+}
+
+/// Returns true when unmapping the range must first drain the GPU queue and priority operations.
+bool RenderContext::NeedsUnmapDrain(uint64_t vaddr, uint64_t size) {
+	if (!m_command_scheduler.Active()) {
+		return false;
+	}
+	// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+	// access a range with no cached data, so they must finish before it is unmapped.
+	if (!m_buffer_cache.IsRegionRegistered(vaddr, size) &&
+	    !m_texture_cache.IsRegionRegistered(vaddr, size) &&
+	    !m_command_scheduler.HasPendingPriorityOperations()) {
+		return false;
+	}
+	// A fixed remap unmaps the range a second time right after the release did. By then the
+	// host view is gone and no image or GPU-written byte remains, so a full GPU drain would
+	// wait on nothing that depends on the view. Buffers stay registered after an unmap, which
+	// is why the registration check above cannot tell the two apart. The deferred
+	// non-priority operations that a drain would also run only release resources, apart from
+	// the page-fault scan that may look up a buffer, and that lookup is already unguarded
+	// for ranges that never had a buffer.
+	return !(m_skip_redundant_unmap_drains && IsUnmapDrainRedundant(vaddr, size));
+}
+
+/// Removes a guest range from the GPU side, draining in-flight work first when it could still
+/// depend on the range. With --skip-redundant-unmap-drains a range that is already unmapped and
+/// holds no images, GPU-written bytes or pending priority operations skips the drain. The cache
+/// invalidation, image unmaps and mapped-range bookkeeping always run.
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
@@ -103,12 +148,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		if (NeedsUnmapDrain(vaddr, size)) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

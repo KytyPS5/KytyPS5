@@ -213,6 +213,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool SkipRedundantUnmapDrainsEnabled() {
+	return g_config->skip_redundant_unmap_drains;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

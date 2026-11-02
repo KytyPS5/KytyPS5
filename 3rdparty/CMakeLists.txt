@@ -144,6 +144,9 @@ add_library(Vulkan::Headers ALIAS Vulkan-Headers)
 target_include_directories(Vulkan-Headers INTERFACE
 	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
 )
+target_include_directories(openxr_loader PRIVATE
+	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
+)
 
 add_library(imgui STATIC
 	imgui/imgui.cpp

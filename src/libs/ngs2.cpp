@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -44,6 +45,97 @@ constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
     static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
+
+static uint32_t Ngs2PcmSampleSize(uint32_t waveform_type) {
+	switch (waveform_type) {
+		case 0x10:
+		case 0x11: return 1;
+		case 0x12:
+		case 0x13: return 2;
+		case 0x14:
+		case 0x15: return 3;
+		case 0x16:
+		case 0x17:
+		case 0x18:
+		case 0x19: return 4;
+		case 0x1a:
+		case 0x1b: return 8;
+		default: return 0;
+	}
+}
+
+static uint16_t Ngs2ReadLe16(const uint8_t* data) {
+	return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8u);
+}
+
+static uint32_t Ngs2ReadLe32(const uint8_t* data) {
+	return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8u) |
+	       (static_cast<uint32_t>(data[2]) << 16u) | (static_cast<uint32_t>(data[3]) << 24u);
+}
+
+static float Ngs2DecodePcmSample(const uint8_t* data, uint32_t waveform_type) {
+	switch (waveform_type) {
+		case 0x10: {
+			const int32_t sample =
+			    data[0] < 0x80 ? data[0] : static_cast<int32_t>(data[0]) - 256;
+			return static_cast<float>(sample) / 128.0f;
+		}
+		case 0x11: return (static_cast<float>(data[0]) - 128.0f) / 128.0f;
+		case 0x12:
+		case 0x13: {
+			const uint16_t bits = waveform_type == 0x12
+			                          ? Ngs2ReadLe16(data)
+			                          : static_cast<uint16_t>((uint16_t(data[0]) << 8u) | data[1]);
+			const int32_t sample = bits < 0x8000 ? bits : static_cast<int32_t>(bits) - 0x10000;
+			return static_cast<float>(sample) / 32768.0f;
+		}
+		case 0x14:
+		case 0x15: {
+			const uint32_t bits = waveform_type == 0x14
+			                          ? uint32_t(data[0]) | (uint32_t(data[1]) << 8u) |
+			                                (uint32_t(data[2]) << 16u)
+			                          : (uint32_t(data[0]) << 16u) | (uint32_t(data[1]) << 8u) |
+			                                uint32_t(data[2]);
+			const int32_t sample =
+			    bits < 0x800000u ? static_cast<int32_t>(bits) : static_cast<int32_t>(bits) - 0x1000000;
+			return static_cast<float>(sample) / 8388608.0f;
+		}
+		case 0x16:
+		case 0x17: {
+			const uint32_t bits = waveform_type == 0x16
+			                          ? Ngs2ReadLe32(data)
+			                          : (uint32_t(data[0]) << 24u) | (uint32_t(data[1]) << 16u) |
+			                                (uint32_t(data[2]) << 8u) | uint32_t(data[3]);
+			return static_cast<float>(static_cast<double>(std::bit_cast<int32_t>(bits)) /
+			                          2147483648.0);
+		}
+		case 0x18:
+		case 0x19: {
+			const uint32_t bits = waveform_type == 0x18
+			                          ? Ngs2ReadLe32(data)
+			                          : (uint32_t(data[0]) << 24u) | (uint32_t(data[1]) << 16u) |
+			                                (uint32_t(data[2]) << 8u) | uint32_t(data[3]);
+			const float sample = std::bit_cast<float>(bits);
+			return std::isfinite(sample) ? sample : 0.0f;
+		}
+		case 0x1a:
+		case 0x1b: {
+			uint64_t bits = 0;
+			for (uint32_t i = 0; i < sizeof(bits); ++i) {
+				const auto index = waveform_type == 0x1a ? i : sizeof(bits) - i - 1;
+				bits |= uint64_t(data[index]) << (i * 8u);
+			}
+			const double sample = std::bit_cast<double>(bits);
+			if (!std::isfinite(sample) ||
+			    std::abs(sample) > std::numeric_limits<float>::max()) {
+				return 0.0f;
+			}
+			const float converted = static_cast<float>(sample);
+			return std::isfinite(converted) ? converted : 0.0f;
+		}
+		default: return 0.0f;
+	}
+}
 
 struct Ngs2SystemOption {
 	size_t    size                     = 0;
@@ -739,6 +831,7 @@ struct Ngs2VoiceInternal {
 	std::vector<float>              mix_samples;
 	std::vector<float>              output_matrix;
 	uint32_t                        channels        = 0;
+	uint32_t                        waveform_type  = 0;
 	uint32_t                        output_id       = 0;
 	float                           fbw_level       = 1.0f;
 	float                           lfe_level       = 1.0f;
@@ -778,8 +871,10 @@ struct Ngs2VoiceInternal {
 		const auto skip = block.info.num_samples != 0 && block.data_cursor == 0
 		                      ? block.info.num_skip_samples
 		                      : skip_remaining;
-		return block.data + std::min(block.data_cursor + size_t(skip) * channels * sizeof(int16_t),
-		                             block.info.data_size);
+		return block.data +
+		       std::min(block.data_cursor + size_t(skip) * channels *
+		                                        Ngs2PcmSampleSize(waveform_type),
+		                block.info.data_size);
 	}
 
 	// Custom racks keep num_buffers consecutive channel-major buffers; other racks keep one.
@@ -844,6 +939,7 @@ struct Ngs2VoiceInternal {
 		ResetSetupState();
 		ClearWaveformBlocks();
 		channels        = format.num_channels;
+		waveform_type   = format.waveform_type;
 		sample_rate     = format.sample_rate;
 		sample_step     = uint64_t(sample_rate) << 32u;
 		decoded_samples = 0;
@@ -873,7 +969,7 @@ struct Ngs2VoiceInternal {
 			decoded_frame.resize(info.frame_samples * channels);
 			compressed_input.reserve(info.super_frame_size);
 		} else {
-			EXIT_NOT_IMPLEMENTED(format.waveform_type != 0x12);
+			EXIT_NOT_IMPLEMENTED(Ngs2PcmSampleSize(format.waveform_type) == 0);
 		}
 	}
 
@@ -1788,16 +1884,17 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 		if (voice.decoder == nullptr) {
 			// PCM has no encoded frame size, so stage at most one system grain.
 			const auto quantum     = std::max(voice.rack->ngs->option.num_grain_samples, 1u);
-			const auto frame_bytes = voice.channels * sizeof(int16_t);
+			const auto sample_size = Ngs2PcmSampleSize(voice.waveform_type);
+			EXIT_NOT_IMPLEMENTED(sample_size == 0);
+			const auto frame_bytes = voice.channels * sample_size;
 			const auto available   = (block.info.data_size - block.data_cursor) / frame_bytes;
 			const auto skip        = std::min<size_t>(voice.skip_remaining, available);
 			const auto count =
 			    std::min<size_t>({available - skip, voice.duration_remaining, quantum});
 			frame.resize(size_t(quantum) * voice.channels);
-			const auto* pcm = reinterpret_cast<const int16_t*>(block.data + block.data_cursor) +
-			                  skip * voice.channels;
+			const auto* pcm = block.data + block.data_cursor + skip * frame_bytes;
 			for (size_t i = 0; i < count * voice.channels; ++i) {
-				frame[i] = pcm[i] / 32768.0f;
+				frame[i] = Ngs2DecodePcmSample(pcm + i * sample_size, voice.waveform_type);
 			}
 			voice.skip_remaining -= skip;
 			voice.duration_remaining -= count;
@@ -2158,20 +2255,22 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
 		const auto& output = buffer_info[voice->output_id];
 		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
-		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x18);
+		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x13 &&
+		                     output.waveform_type != 0x18 && output.waveform_type != 0x19);
 		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering &&
 		                     output.num_channels != voice->channels);
-		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
-		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
-		                                                                             : sizeof(float)));
+		const auto output_sample_size = Ngs2PcmSampleSize(output.waveform_type);
+		EXIT_NOT_IMPLEMENTED(output.buffer_size <
+		                     grain * output.num_channels * output_sample_size);
 		float* pcm = nullptr;
-		if (output.waveform_type == 0x12) {
+		if (output.waveform_type == 0x12 || output.waveform_type == 0x13 ||
+		    output.waveform_type == 0x19) {
 			auto& mix = output_mix[voice->output_id];
 			if (mix.empty()) {
 				mix.resize(grain * output.num_channels);
 			}
 			pcm = mix.data();
-		} else {
+		} else if (output.waveform_type == 0x18) {
 			pcm = static_cast<float*>(output.buffer);
 		}
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
@@ -2196,11 +2295,32 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		if (mix.empty()) {
 			continue;
 		}
-		auto* pcm = static_cast<int16_t*>(buffer_info[i].buffer);
-		for (size_t sample = 0; sample < mix.size(); ++sample) {
-			pcm[sample] = static_cast<int16_t>(std::clamp(
-			    std::lrintf(std::clamp(mix[sample], -1.0f, 1.0f) * 32768.0f), -32768l,
-			    32767l));
+		if (buffer_info[i].waveform_type == 0x12) {
+			auto* pcm = static_cast<int16_t*>(buffer_info[i].buffer);
+			for (size_t sample = 0; sample < mix.size(); ++sample) {
+				pcm[sample] = static_cast<int16_t>(std::clamp(
+				    std::lrintf(std::clamp(mix[sample], -1.0f, 1.0f) * 32768.0f), -32768l,
+				    32767l));
+			}
+		} else if (buffer_info[i].waveform_type == 0x13) {
+			auto* bytes = static_cast<uint8_t*>(buffer_info[i].buffer);
+			for (size_t sample = 0; sample < mix.size(); ++sample) {
+				const auto quantized = static_cast<int16_t>(std::clamp(
+				    std::lrintf(std::clamp(mix[sample], -1.0f, 1.0f) * 32768.0f), -32768l,
+				    32767l));
+				const auto bits = std::bit_cast<uint16_t>(quantized);
+				bytes[sample * 2] = static_cast<uint8_t>(bits >> 8u);
+				bytes[sample * 2 + 1] = static_cast<uint8_t>(bits);
+			}
+		} else if (buffer_info[i].waveform_type == 0x19) {
+			auto* bytes = static_cast<uint8_t*>(buffer_info[i].buffer);
+			for (size_t sample = 0; sample < mix.size(); ++sample) {
+				const auto bits = std::bit_cast<uint32_t>(mix[sample]);
+				bytes[sample * 4] = static_cast<uint8_t>(bits >> 24u);
+				bytes[sample * 4 + 1] = static_cast<uint8_t>(bits >> 16u);
+				bytes[sample * 4 + 2] = static_cast<uint8_t>(bits >> 8u);
+				bytes[sample * 4 + 3] = static_cast<uint8_t>(bits);
+			}
 		}
 	}
 	for (auto* voice: voices) {
@@ -2212,15 +2332,6 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	}
 	++ngs->render_count;
 	return OK;
-}
-
-static uint16_t Ngs2ReadLe16(const uint8_t* data) {
-	return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8u);
-}
-
-static uint32_t Ngs2ReadLe32(const uint8_t* data) {
-	return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8u) |
-	       (static_cast<uint32_t>(data[2]) << 16u) | (static_cast<uint32_t>(data[3]) << 24u);
 }
 
 static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
@@ -2381,9 +2492,9 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 		                       : ((skip + num_samples + frame_samples - 1) / frame_samples) *
 		                             codec.superframeSize;
 		block->num_skip_samples = num_samples == 0 ? 0 : static_cast<uint32_t>(skip);
-	} else if (format->waveform_type == 0x12) {
-		// 16-bit PCM has fixed-size frames, so the block starts exactly at the sample.
-		const uint64_t frame_size = uint64_t(format->num_channels) * sizeof(int16_t);
+	} else if (const auto sample_size = Ngs2PcmSampleSize(format->waveform_type);
+	           sample_size != 0) {
+		const uint64_t frame_size = uint64_t(format->num_channels) * sample_size;
 		block->data_offset        = uint64_t(sample_pos) * frame_size;
 		block->data_size          = uint64_t(num_samples) * frame_size;
 	} else {

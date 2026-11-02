@@ -329,6 +329,97 @@ void TestStreamingResample() {
 	      "streaming progress does not match consumed source data");
 }
 
+void TestPcmWaveformFormats() {
+	struct Case {
+		uint32_t type;
+		std::array<uint8_t, 8> bytes;
+		uint32_t size;
+	};
+	constexpr Case cases[] = {
+	    {0x10, {0x40}, 1},
+	    {0x11, {0xc0}, 1},
+	    {0x12, {0x00, 0x40}, 2},
+	    {0x13, {0x40, 0x00}, 2},
+	    {0x14, {0x00, 0x00, 0x40}, 3},
+	    {0x15, {0x40, 0x00, 0x00}, 3},
+	    {0x16, {0x00, 0x00, 0x00, 0x40}, 4},
+	    {0x17, {0x40, 0x00, 0x00, 0x00}, 4},
+	    {0x18, {0x00, 0x00, 0x00, 0x3f}, 4},
+	    {0x19, {0x3f, 0x00, 0x00, 0x00}, 4},
+	    {0x1a, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f}, 8},
+	    {0x1b, {0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 8},
+	};
+
+	for (const auto& test: cases) {
+		Fixture f(48000, 1);
+		f.voice.SetupSampler({test.type, 1, 48000});
+		f.voice.state = Ngs2VoicePlayState::Playing;
+		const Ngs2WaveformBlock block {0, test.size, 0, 0, 1, 0, 0};
+		Check(f.QueueBlocks(test.bytes.data(), &block, 1, 0) == OK,
+		      "supported PCM waveform format was rejected");
+		f.Render(1);
+		Check(f.voice.samples[0] == 0.5f && f.voice.decoded_samples == 1 &&
+		          f.voice.decoded_bytes == test.size,
+		      "PCM waveform format decoded incorrectly");
+
+		Ngs2WaveformFormat format {test.type, 2, 48000};
+		Ngs2WaveformBlock calculated {};
+		Check(Ngs2CalcWaveformBlock(&format, 3, 2, &calculated) == OK &&
+		          calculated.data_offset == uint64_t(3) * test.size * 2 &&
+		          calculated.data_size == uint64_t(2) * test.size * 2 &&
+		          calculated.num_samples == 2,
+		      "PCM waveform block geometry used the wrong sample width");
+	}
+
+	struct EdgeCase {
+		uint32_t type;
+		std::array<uint8_t, 8> bytes;
+		uint32_t size;
+		float expected;
+	};
+	constexpr EdgeCase edge_cases[] = {
+	    {0x10, {0x80}, 1, -1.0f},
+	    {0x11, {0x00}, 1, -1.0f},
+	    {0x14, {0x00, 0x00, 0x80}, 3, -1.0f},
+	    {0x15, {0x80, 0x00, 0x00}, 3, -1.0f},
+	    {0x16, {0x00, 0x00, 0x00, 0x80}, 4, -1.0f},
+	    {0x17, {0x80, 0x00, 0x00, 0x00}, 4, -1.0f},
+	};
+	for (const auto& test: edge_cases) {
+		Fixture f(48000, 1);
+		f.voice.SetupSampler({test.type, 1, 48000});
+		f.voice.state = Ngs2VoicePlayState::Playing;
+		const Ngs2WaveformBlock block {0, test.size, 0, 0, 1, 0, 0};
+		Check(f.QueueBlocks(test.bytes.data(), &block, 1, 0) == OK,
+		      "PCM edge-case waveform block was rejected");
+		f.Render(1);
+		Check(f.voice.samples[0] == test.expected,
+		      "PCM signedness or full-scale normalization was incorrect");
+	}
+
+	Fixture f(48000, 1);
+	f.voice.SetupSampler({0x18, 1, 48000});
+	f.voice.state = Ngs2VoicePlayState::Playing;
+	const std::array<uint8_t, 4> nan_sample {0x00, 0x00, 0xc0, 0x7f};
+	const Ngs2WaveformBlock block {0, nan_sample.size(), 0, 0, 1, 0, 0};
+	Check(f.QueueBlocks(nan_sample.data(), &block, 1, 0) == OK,
+	      "float PCM waveform block was rejected");
+	f.Render(1);
+	Check(f.voice.samples[0] == 0.0f, "non-finite float PCM was not silenced");
+
+	Fixture double_fixture(48000, 1);
+	double_fixture.voice.SetupSampler({0x1a, 1, 48000});
+	double_fixture.voice.state = Ngs2VoicePlayState::Playing;
+	const std::array<uint8_t, 8> infinite_double {0x00, 0x00, 0x00, 0x00,
+	                                              0x00, 0x00, 0xf0, 0x7f};
+	const Ngs2WaveformBlock double_block {0, infinite_double.size(), 0, 0, 1, 0, 0};
+	Check(double_fixture.QueueBlocks(infinite_double.data(), &double_block, 1, 0) == OK,
+	      "double PCM waveform block was rejected");
+	double_fixture.Render(1);
+	Check(double_fixture.voice.samples[0] == 0.0f,
+	      "non-finite double PCM was not silenced");
+}
+
 // One encoded mono block with one nonzero spectral coefficient.
 constexpr std::array<uint8_t, 36> ATRAC9_MONO_BLOCK {0, 0, 0x04, 0x20, 0x04, 0xc0, 0, 0, 0x1f, 0xc0};
 
@@ -833,6 +924,49 @@ void TestPcm16RenderOutput() {
 	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
 	          std::ranges::all_of(output_samples, [](int16_t sample) { return sample == 0; }),
 	      "PCM16 output retained samples from the previous render");
+}
+
+void TestEndianRenderOutput() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 1;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 1;
+	sampler_option.common.max_ports  = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& source    = sampler.Voice();
+	auto& mastering = master.Voice();
+	mastering.channels = 1;
+	mastering.state    = Ngs2VoicePlayState::Playing;
+	const int16_t input = 16384;
+
+	struct Case {
+		uint32_t type;
+		std::array<uint8_t, 4> expected;
+		size_t size;
+	};
+	constexpr Case cases[] = {
+	    {0x12, {0x00, 0x40, 0x00, 0x00}, 2},
+	    {0x13, {0x40, 0x00, 0x00, 0x00}, 2},
+	    {0x18, {0x00, 0x00, 0x00, 0x3f}, 4},
+	    {0x19, {0x3f, 0x00, 0x00, 0x00}, 4},
+	};
+	for (const auto& test: cases) {
+		source.SetupSampler({0x12, 1, 48000});
+		source.ports[0].dest = &mastering;
+		source.blocks.push_back(
+		    {reinterpret_cast<const uint8_t*>(&input), {0, sizeof(input), 0, 0, 1}});
+		source.SetEvent(1);
+		std::array<uint8_t, 4> output_bytes {};
+		Ngs2RenderBufferInfo output {output_bytes.data(), test.size, test.type, 1};
+		Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
+		          std::equal(test.expected.begin(), test.expected.begin() + test.size,
+		                     output_bytes.begin()),
+		      "mastering did not encode the requested PCM byte order");
+	}
 }
 
 void TestPatchToRackHandle() {
@@ -2058,6 +2192,7 @@ int main() {
         TestAtrac9Vibration();
         TestAtrac9Discrete();
         TestPcm16RenderOutput();
+        TestEndianRenderOutput();
 	TestPatchToRackHandle();
 	TestMasteringGain();
 	TestReverbDryLevel();
@@ -2091,6 +2226,7 @@ int main() {
 	TestCallbackPauseDuringLookahead();
 	TestCallbackReplacesSource();
 	TestStreamingResample();
+	TestPcmWaveformFormats();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestStarvationAndPause();

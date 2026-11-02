@@ -53,6 +53,37 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	return {buffer, 0};
 }
 
+/// Calls visit(address, size) for each part of the range that claimed does not cover, in address
+/// order.
+template <class Visit>
+void ForEachUnclaimed(const RangeSet& claimed, uint64_t address, uint64_t size, Visit&& visit) {
+	const uint64_t end    = address + size;
+	uint64_t       cursor = address;
+	claimed.ForEachInRange(address, size, [&](uint64_t begin, uint64_t last) {
+		if (begin > cursor) {
+			visit(cursor, begin - cursor);
+		}
+		cursor = last;
+	});
+	if (cursor < end) {
+		visit(cursor, end - cursor);
+	}
+}
+
+/// Returns the tracker pages a batch already downloads. The main window is rounded out to whole
+/// pages, because its caller unmarks it only after the batch and a recent write that shares one of
+/// its pages must not collect that page a second time.
+template <class Batch>
+RangeSet ClaimedDownloadPages(const Batch& batch, uint64_t vaddr, uint64_t size) {
+	RangeSet   claimed;
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	claimed.Add(begin, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - begin);
+	for (size_t index = 1; index < batch.size(); ++index) {
+		claimed.Add(batch[index].unmark_address, batch[index].unmark_size);
+	}
+	return claimed;
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -289,27 +320,26 @@ BufferId BufferCache::FindHotBuffer(uint64_t address, uint64_t size) {
 	return *owner;
 }
 
-/// Returns an upper bound on the bytes that downloading a buffer would add to the ring. It counts
-/// every GPU-written range of the buffer, which is at least what the page tracker lets through.
-uint64_t BufferCache::EstimateDownloadBytes(const Buffer& buffer) const {
+/// Returns an upper bound on the bytes that downloading a range would add to the ring. It counts
+/// every GPU-written range inside it, which is at least what the page tracker lets through.
+uint64_t BufferCache::EstimateDownloadBytes(uint64_t address, uint64_t size) const {
 	uint64_t bytes = 0;
-	m_gpu_modified_ranges.ForEachInRange(
-	    buffer.CpuAddress(), buffer.Size(), [&](uint64_t start, uint64_t end) {
-		    bytes += Common::AlignUp(end - start, DownloadCopyAlignment);
-	    });
+	m_gpu_modified_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) {
+		bytes += Common::AlignUp(end - start, DownloadCopyAlignment);
+	});
 	return bytes;
 }
 
 /// Adds the GPU-written bytes of recently read-back buffers to a batch, so the wait that the main
 /// download needs anyway also clears their next fault. A buffer is skipped when it is the main
-/// buffer, was already added, no longer exists, or would push the extras over MaxHotReadbackBytes.
+/// buffer, was already added, no longer exists, or would cost more than what is left of budget.
 /// The main-buffer skip is needed for correctness. The main buffer is nearly always hot, and
 /// collecting it again would revisit window pages the caller has not unmarked yet, which breaks the
 /// debug invariant in ValidateGpuDirtyPages and downloads bytes outside the main window. The
 /// duplicate skip only saves a repeated estimate, since the first collect already removed the
 /// buffer's ranges.
-void BufferCache::CollectHotDownloads(BufferId main_id, std::vector<BatchedDownload>& batch) {
-	uint64_t              budget = MaxHotReadbackBytes;
+void BufferCache::CollectHotDownloads(BufferId main_id, uint64_t& budget,
+                                      std::vector<BatchedDownload>& batch) {
 	std::vector<BufferId> seen;
 	seen.reserve(MaxHotReadbackEntries + 1);
 	seen.push_back(main_id);
@@ -321,7 +351,7 @@ void BufferCache::CollectHotDownloads(BufferId main_id, std::vector<BatchedDownl
 		}
 		seen.push_back(id);
 		auto&      hot      = m_slot_buffers[id];
-		const auto estimate = EstimateDownloadBytes(hot);
+		const auto estimate = EstimateDownloadBytes(hot.CpuAddress(), hot.Size());
 		if (estimate == 0 || estimate > budget) {
 			return;
 		}
@@ -336,9 +366,63 @@ void BufferCache::CollectHotDownloads(BufferId main_id, std::vector<BatchedDownl
 	});
 }
 
-/// Downloads the main window and the GPU-written bytes of hot buffers with one GPU wait. The
-/// extras are marked clean here, and the caller does that for the main window. Nothing is marked
-/// CPU-modified, since only a faulting write does that. Returns false when the window had nothing.
+/// Walks the recent write ring newest first and collects each finished span that is not claimed
+/// yet. Every visited span is claimed afterwards, so an older entry under it is clipped to what it
+/// adds. Pending spans are claimed without being collected, which keeps an older finished write
+/// that the GPU is rewriting out of the download. Claims are whole tracker pages, so a pending
+/// write also holds back finished bytes that share its pages. That only leaves them for their own
+/// fault. The walk ends once the budget is spent.
+void BufferCache::CollectRecentWrites(RangeSet& claimed, uint64_t& budget,
+                                      std::vector<BatchedDownload>& batch) {
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto known_tick = master.KnownGpuTick();
+	if (known_tick == 0) {
+		return;
+	}
+	// An entry carries the tick that was current when its buffer was bound, and a submit during
+	// draw setup can put the write itself in the next tick. Only ticks before the known one are
+	// treated as finished, so the entry's own write is done. That says nothing about a later
+	// write the ring never records, such as a large buffer or an image, that is bound but not yet
+	// recorded. Like the hot buffers, this relies on no readback running between such a bind and
+	// its recording.
+	m_recent_writes.ForEachNewest(known_tick - 1, [&](uint64_t address, uint64_t size,
+	                                                  bool finished) {
+		if (finished) {
+			ForEachUnclaimed(claimed, address, size, [&](uint64_t piece, uint64_t piece_size) {
+				CollectRecentPiece(piece, piece_size, budget, batch);
+			});
+		}
+		claimed.Add(address, size);
+		return budget > 0;
+	});
+}
+
+/// Collects the GPU-written bytes of one unclaimed piece of a recent write. A piece is skipped when
+/// no single buffer holds it or when it would cost more than budget.
+void BufferCache::CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& budget,
+                                     std::vector<BatchedDownload>& batch) {
+	const auto id = FindHotBuffer(address, size);
+	if (!id) {
+		return;
+	}
+	const auto estimate = EstimateDownloadBytes(address, size);
+	if (estimate == 0 || estimate > budget) {
+		return;
+	}
+	auto& buffer  = m_slot_buffers[id];
+	auto  pending = CollectDownloadCopies(buffer, address, size);
+	if (pending.copies.empty()) {
+		return;
+	}
+	budget -= std::min(budget, pending.total_size);
+	batch.push_back({&buffer, std::move(pending), address, size});
+}
+
+/// Downloads the main window, the GPU-written bytes of hot buffers and the finished recent small
+/// writes with one GPU wait. The extras are marked clean here, and the caller does that for the
+/// main window. Nothing is marked CPU-modified, since only a faulting write does that. Returns
+/// false when the window had nothing.
 bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
                                          uint64_t size) {
 	auto main_pending = CollectDownloadCopies(buffer, vaddr, size);
@@ -348,7 +432,10 @@ bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint6
 	std::vector<BatchedDownload> batch;
 	batch.reserve(MaxHotReadbackEntries + 1);
 	batch.push_back({&buffer, std::move(main_pending)});
-	CollectHotDownloads(main_id, batch);
+	uint64_t budget = MaxHotReadbackBytes;
+	CollectHotDownloads(main_id, budget, batch);
+	auto claimed = ClaimedDownloadPages(batch, vaddr, size);
+	CollectRecentWrites(claimed, budget, batch);
 	// The pointers are taken once the batch has stopped growing, so none can be invalidated.
 	std::vector<PendingDownload*> pendings;
 	pendings.reserve(batch.size());

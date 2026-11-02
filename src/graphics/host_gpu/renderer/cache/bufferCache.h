@@ -156,8 +156,15 @@ private:
 	void PublishDownload(const PendingDownload& pending);
 	// Resolves a hot entry to the buffer that now owns it, without creating one on a miss.
 	[[nodiscard]] BufferId FindHotBuffer(uint64_t address, uint64_t size);
-	[[nodiscard]] uint64_t EstimateDownloadBytes(const Buffer& buffer) const;
-	void               CollectHotDownloads(BufferId main_id, std::vector<BatchedDownload>& batch);
+	[[nodiscard]] uint64_t EstimateDownloadBytes(uint64_t address, uint64_t size) const;
+	void CollectHotDownloads(BufferId main_id, uint64_t& budget, std::vector<BatchedDownload>& batch);
+	// Adds the finished small GPU writes the recent write ring remembers to a batch, skipping
+	// spans already in claimed and charging what it collects to budget.
+	void CollectRecentWrites(RangeSet& claimed, uint64_t& budget,
+	                         std::vector<BatchedDownload>& batch);
+	// Collects one unclaimed piece of a recent write when a single buffer holds it and it fits.
+	void CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& budget,
+	                        std::vector<BatchedDownload>& batch);
 	[[nodiscard]] bool DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
 	                                          uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.

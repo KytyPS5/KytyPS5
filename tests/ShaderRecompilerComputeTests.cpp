@@ -238,6 +238,11 @@ struct BufferCacheTestAccess {
   static const RecentGpuWriteRing &RecentWrites(const BufferCache &cache) {
     return cache.m_recent_writes;
   }
+
+  // Forgets every recent write, for tests that must observe the hot table alone.
+  static void ClearRecentWrites(BufferCache &cache) {
+    cache.m_recent_writes = RecentGpuWriteRing{};
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -23537,6 +23542,9 @@ HotBatchOutcome RunHotBatch(VulkanHarness &harness, bool flag_enabled, uint64_t 
                 bed.Scheduler().CurrentTick() <= entry_tick + entry_age,
             "the hot entry should exist and be no older than the age under test");
     bed.AdvanceTicks(entry_tick + entry_age - bed.Scheduler().CurrentTick());
+    // The advanced ticks finish the hot buffer's rewrite, so the recent write ring would download
+    // it whatever its hot entry's age. Clearing the ring keeps these runs about the hot table.
+    BufferCacheTestAccess::ClearRecentWrites(bed.Cache());
   }
   HotBatchOutcome outcome;
   outcome.faulting_submits = bed.Fault(Faulting);
@@ -23736,6 +23744,270 @@ void CheckHotBatchDuplicateKeys(VulkanHarness &harness) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+namespace RecentBatchOffsets {
+constexpr uint64_t Recent = 0x300000;
+constexpr uint64_t CapBase = 0x400000;
+constexpr uint64_t CapSpacing = 0x20000;
+constexpr uint32_t RecentValue = 0x55555555u;
+constexpr uint32_t NewerValue = 0x66666666u;
+// A write's own tick and the one after it must complete before the ring treats it as finished.
+constexpr uint64_t FinishedTicks = 2;
+} // namespace RecentBatchOffsets
+
+// Submits and waits on the current tick, count times. A write is finished for the recent write
+// ring only once a tick after its own has completed, because its tick is the bind-time tick.
+void SettleTicks(HotBatchBed &bed, uint64_t count) {
+  for (uint64_t index = 0; index < count; ++index) {
+    bed.Scheduler().Wait(bed.Scheduler().CurrentTick());
+  }
+}
+
+// What a recent write looked like after another buffer's readback.
+struct RecentBatchOutcome {
+  uint32_t backing = 0;
+  bool dirty = false;
+  uint64_t fault_submits = 0;
+};
+
+// Writes a region on the GPU that never faulted, settles the given ticks, then reads back another
+// buffer and reports what the region looked like.
+RecentBatchOutcome RunRecentBatch(VulkanHarness &harness, bool flag_enabled, uint64_t size,
+                                  uint64_t settle_ticks) {
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), flag_enabled);
+  bed.GpuWrite(Recent, size, RecentValue);
+  SettleTicks(bed, settle_ticks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require("RecentBatch", "faulting buffer published", bed.Backing(Faulting) == FaultingValue,
+          "the faulting readback should still download its own buffer");
+  RecentBatchOutcome outcome;
+  outcome.backing = bed.Backing(Recent);
+  outcome.dirty = bed.Dirty(Recent, size);
+  outcome.fault_submits = bed.Fault(Recent);
+  return outcome;
+}
+
+// T8 and T10. A finished small write that never faulted is downloaded in another readback's wait,
+// and a write that is not finished yet is left alone.
+void CheckRecentBatchCoDownload(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchCoDownload";
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t size = HotBatchBed::SmallRegion;
+  const auto off = RunRecentBatch(harness, false, size, FinishedTicks);
+  Require(name, "flag off leaves the write stale",
+          off.backing != RecentValue && off.dirty && off.fault_submits > 0,
+          "without the flag only the faulting buffer should be downloaded");
+  // Only the flag differs from the baseline above.
+  const auto on = RunRecentBatch(harness, true, size, FinishedTicks);
+  Require(name, "flag on downloads the finished write",
+          on.backing == RecentValue && !on.dirty && on.fault_submits == 0,
+          "a finished small write should be downloaded with the faulting buffer");
+  // One settled tick only completes the write's own tick, which the strict check treats as pending.
+  const auto one_tick = RunRecentBatch(harness, true, size, FinishedTicks - 1);
+  Require(name, "a write in the last completed tick is pending",
+          one_tick.backing != RecentValue && one_tick.dirty,
+          "the write's own tick completing is not enough to treat it as finished");
+  const auto pending = RunRecentBatch(harness, true, size, 0);
+  Require(name, "an unsubmitted write is pending", pending.backing != RecentValue && pending.dirty,
+          "a write from the current tick should be left for its own fault");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T9. Only writes up to RecentWriteMaxBytes are co-downloaded.
+void CheckRecentBatchSizeEdge(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchSizeEdge";
+  using namespace RecentBatchOffsets;
+  const auto at_limit = RunRecentBatch(harness, true, RecentWriteMaxBytes, FinishedTicks);
+  Require(name, "a write at the limit is co-downloaded",
+          at_limit.backing == RecentValue && !at_limit.dirty,
+          "a write of exactly RecentWriteMaxBytes should be downloaded with the readback");
+  // Only the size differs from the case above.
+  const auto over =
+      RunRecentBatch(harness, true, RecentWriteMaxBytes + TRACKER_PAGE_SIZE, FinishedTicks);
+  Require(name, "a larger write is left alone", over.backing != RecentValue && over.dirty,
+          "a write over RecentWriteMaxBytes should not enter the ring");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T11. Recent writes share the MaxHotReadbackBytes budget and the newest are taken first, so the
+// one write past the budget is the oldest.
+void CheckRecentBatchBudget(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchBudget";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t write_count = MaxHotReadbackBytes / RecentWriteMaxBytes + 1;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  for (uint64_t index = 0; index < write_count; ++index) {
+    bed.GpuWrite(CapBase + index * CapSpacing, RecentWriteMaxBytes, RecentValue);
+  }
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  uint64_t cleaned = 0;
+  for (uint64_t index = 1; index < write_count; ++index) {
+    cleaned += bed.Dirty(CapBase + index * CapSpacing, RecentWriteMaxBytes) ? 0 : 1;
+  }
+  Require(name, "the newest writes fill the budget exactly", cleaned == write_count - 1,
+          "every write but the oldest fits the budget and should be downloaded");
+  Require(name, "the oldest write is left dirty", bed.Dirty(CapBase, RecentWriteMaxBytes),
+          "the write past the budget should be the oldest and stay GPU-dirty");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T11b. A hot buffer's download is charged to the same budget, so with one hot megabyte one fewer
+// megabyte of recent writes fits and the oldest of them is left dirty.
+void CheckRecentBatchSharedBudget(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchSharedBudget";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t write_count = (MaxHotReadbackBytes - HotBatchBed::BigRegion) /
+                                       RecentWriteMaxBytes + 1;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(Hot, HotBatchBed::BigRegion, FirstValue);
+  bed.GpuWrite(Hot, HotBatchBed::BigRegion, SecondValue);
+  for (uint64_t index = 0; index < write_count; ++index) {
+    bed.GpuWrite(CapBase + index * CapSpacing, RecentWriteMaxBytes, RecentValue);
+  }
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the hot buffer was co-downloaded", !bed.Dirty(Hot, HotBatchBed::BigRegion),
+          "the hot buffer did not take its share, so the checks below prove nothing");
+  uint64_t cleaned = 0;
+  for (uint64_t index = 1; index < write_count; ++index) {
+    cleaned += bed.Dirty(CapBase + index * CapSpacing, RecentWriteMaxBytes) ? 0 : 1;
+  }
+  // This rules out a ring that collected nothing, which would also leave the oldest write dirty.
+  Require(name, "the newest recent writes fill what is left", cleaned == write_count - 1,
+          "every recent write but the oldest should fit beside the hot buffer");
+  // A separate budget for recent writes would fit them all.
+  Require(name, "the oldest recent write is left dirty", bed.Dirty(CapBase, RecentWriteMaxBytes),
+          "recent writes should get only what the hot buffer left of the budget");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T12. A co-downloaded write clears only its own pages, so GPU-written bytes beside it that the
+// ring never saw stay dirty for their own fault.
+void CheckRecentBatchExactUnmark(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchExactUnmark";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t neighbour = Recent + TRACKER_PAGE_SIZE;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  // The large write is too big for the ring and leaves the whole buffer GPU-dirty.
+  bed.GpuWrite(Recent, 2 * RecentWriteMaxBytes, FirstValue);
+  bed.GpuWrite(Recent, TRACKER_PAGE_SIZE, RecentValue);
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the recent page was co-downloaded",
+          bed.Backing(Recent) == RecentValue && !bed.Dirty(Recent, TRACKER_PAGE_SIZE),
+          "the batch did not download the recent write, so the check below proves nothing");
+  Require(name, "the neighbouring page stays dirty", bed.Dirty(neighbour, TRACKER_PAGE_SIZE),
+          "the co-download cleared GPU-written bytes it did not download");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T13. The claimed set clips an older write to the part a newer one does not cover, and a newer
+// pending write holds back an older finished one under it.
+void CheckRecentBatchClaims(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchClaims";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  {
+    HotBatchBed bed(harness.RuntimeContext(), true);
+    bed.GpuWrite(Recent, 2 * page, RecentValue);
+    bed.GpuWrite(Recent + page, 2 * page, NewerValue);
+    SettleTicks(bed, FinishedTicks);
+    bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+    (void)bed.Fault(Faulting);
+    // Skipping the older write whole would leave its first page dirty.
+    Require(name, "an older partly covered write keeps its own page",
+            bed.Backing(Recent) == RecentValue && !bed.Dirty(Recent, page) &&
+                bed.Backing(Recent + page) == NewerValue && !bed.Dirty(Recent + page, 2 * page),
+            "both writes should be downloaded, the older one clipped to its first page");
+  }
+  {
+    HotBatchBed bed(harness.RuntimeContext(), true);
+    bed.GpuWrite(Recent, page, RecentValue);
+    SettleTicks(bed, FinishedTicks);
+    // Without this pending write the older one is co-downloaded, as RecentBatchCoDownload shows.
+    bed.GpuWrite(Recent, 2 * page, NewerValue);
+    bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+    (void)bed.Fault(Faulting);
+    Require(name, "a pending write holds back the older one under it", bed.Dirty(Recent, page),
+            "an older finished write under a pending one should be left for its own fault");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T13c. Two small writes in one page are both downloaded. The older one finds no bytes left in
+// the page, so it is skipped by its estimate whether or not the page is claimed. This guards the
+// result and does not prove the claim, which RecentBatchClaims and RecentBatchWindowEdge do.
+void CheckRecentBatchSamePage(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchSamePage";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t first_offset = Recent + 0x100;
+  constexpr uint64_t second_offset = Recent + 0x800;
+  constexpr uint64_t write_size = 0x100;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.GpuWrite(first_offset, write_size, RecentValue);
+  bed.GpuWrite(second_offset, write_size, NewerValue);
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the shared page is downloaded",
+          bed.Backing(first_offset) == RecentValue && bed.Backing(second_offset) == NewerValue &&
+              !bed.Dirty(Recent, TRACKER_PAGE_SIZE),
+          "both writes in the page should be downloaded with the faulting buffer");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T13d. A readback window that ends inside a page claims the whole page, so a recent write that
+// starts in that page is not collected over it a second time. The write runs one page past it,
+// so an unrounded claim leaves a piece that still has dirty bytes and is collected. A release
+// build only checks both pages are downloaded. A debug build's dirty-page validation is what
+// fails when the window is not rounded out.
+void CheckRecentBatchWindowEdge(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchWindowEdge";
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t buffer_offset = 0x600000;
+  // Must match DownloadWindowSize in bufferCache.cpp, or the readback stops straddling the edge
+  // and this test passes without proving anything.
+  constexpr uint64_t window_size = 0x80000;
+  constexpr uint64_t edge_page = buffer_offset + window_size;
+  // A word that straddles the window end makes the readback window end two bytes into a page.
+  constexpr uint64_t straddling_offset = edge_page - sizeof(uint16_t);
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  // The large write is too big for the ring and makes one buffer that holds the whole window.
+  bed.GpuWrite(buffer_offset, HotBatchBed::BigRegion, NewerValue);
+  bed.GpuWrite(edge_page, 2 * TRACKER_PAGE_SIZE, RecentValue);
+  SettleTicks(bed, FinishedTicks);
+  (void)bed.Fault(straddling_offset);
+  Require(name, "the edge page and the one after it are downloaded",
+          bed.Backing(edge_page) == RecentValue &&
+              bed.Backing(edge_page + TRACKER_PAGE_SIZE) == RecentValue &&
+              !bed.Dirty(edge_page, 2 * TRACKER_PAGE_SIZE),
+          "the window should take the edge page and the recent write the page after it");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Runs the recent write co-download tests, which need a device.
+void CheckRecentBatchReadbacks(VulkanHarness &harness) {
+  CheckRecentBatchCoDownload(harness);
+  CheckRecentBatchSizeEdge(harness);
+  CheckRecentBatchBudget(harness);
+  CheckRecentBatchSharedBudget(harness);
+  CheckRecentBatchExactUnmark(harness);
+  CheckRecentBatchClaims(harness);
+  CheckRecentBatchSamePage(harness);
+  CheckRecentBatchWindowEdge(harness);
+}
+
 void CheckHotBatchReadbacks(VulkanHarness &harness) {
   CheckHotBatchCoDownload(harness);
   CheckHotBatchTracking(harness);
@@ -23745,6 +24017,7 @@ void CheckHotBatchReadbacks(VulkanHarness &harness) {
   CheckHotBatchStaleEntry(harness);
   CheckHotBatchMainBuffer(harness);
   CheckHotBatchDuplicateKeys(harness);
+  CheckRecentBatchReadbacks(harness);
 }
 
 void CompareWords(const TestCase &test, const char *stage,

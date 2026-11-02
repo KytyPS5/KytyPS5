@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -52253,6 +52254,216 @@ void CheckHotReadbackTableLogic() {
   std::printf("[host]    %-32s ok\n", "HotReadbackTable");
 }
 
+// Ring tests place writes this far apart so each one sits in its own pages.
+constexpr uint64_t RecentWriteTestStride = 0x10000;
+// A known tick past every tick the ring tests note, so every entry counts as finished.
+constexpr uint64_t RecentWriteAllFinished = 1000;
+
+// Collects the finished spans that ForEachNewest yields, in order.
+std::vector<std::pair<uint64_t, uint64_t>> FinishedRecentWrites(const RecentGpuWriteRing &ring,
+                                                                uint64_t known_tick) {
+  std::vector<std::pair<uint64_t, uint64_t>> spans;
+  ring.ForEachNewest(known_tick, [&](uint64_t address, uint64_t size, bool finished) {
+    if (finished) {
+      spans.emplace_back(address, size);
+    }
+    return true;
+  });
+  return spans;
+}
+
+// Entries come out newest first, and the visitor can stop the walk.
+void CheckRecentWriteOrder() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t base = 0x100000;
+  constexpr uint64_t stride = RecentWriteTestStride;
+  RecentGpuWriteRing ring;
+  for (uint64_t index = 0; index < 3; ++index) {
+    ring.Note(base + index * stride, TRACKER_PAGE_SIZE, 10 + index);
+  }
+  const auto spans = FinishedRecentWrites(ring, RecentWriteAllFinished);
+  Require(name, "walks newest first",
+          spans.size() == 3 && spans[0].first == base + 2 * stride &&
+              spans[1].first == base + stride && spans[2].first == base,
+          "the newest write should be visited first");
+  size_t visits = 0;
+  ring.ForEachNewest(RecentWriteAllFinished,
+                     [&](uint64_t, uint64_t, bool) { return ++visits < 2; });
+  Require(name, "visitor false stops the walk", visits == 2,
+          "returning false should end the walk after that entry");
+}
+
+// One write past the capacity overwrites only the oldest.
+void CheckRecentWriteWraparound() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t base = 0x100000;
+  constexpr uint64_t stride = RecentWriteTestStride;
+  RecentGpuWriteRing ring;
+  for (uint64_t index = 0; index <= RecentGpuWriteCapacity; ++index) {
+    ring.Note(base + index * stride, TRACKER_PAGE_SIZE, index);
+  }
+  const auto spans = FinishedRecentWrites(ring, RecentGpuWriteCapacity);
+  Require(name, "wraparound overwrites the oldest",
+          ring.Size() == RecentGpuWriteCapacity && spans.size() == RecentGpuWriteCapacity &&
+              spans.front().first == base + RecentGpuWriteCapacity * stride &&
+              spans.back().first == base + stride,
+          "the ring should hold the capacity, newest first, without the oldest entry");
+  // Exactly full puts the newest entry in the last slot, so its index wraps past zero.
+  RecentGpuWriteRing full;
+  for (uint64_t index = 0; index < RecentGpuWriteCapacity; ++index) {
+    full.Note(base + index * stride, TRACKER_PAGE_SIZE, index);
+  }
+  const uint64_t last = base + (RecentGpuWriteCapacity - 1) * stride;
+  full.Note(last, TRACKER_PAGE_SIZE, RecentGpuWriteCapacity);
+  const auto known_before = FinishedRecentWrites(full, RecentGpuWriteCapacity - 1);
+  Require(name, "refresh works in the last slot",
+          full.Size() == RecentGpuWriteCapacity &&
+              FinishedRecentWrites(full, RecentGpuWriteCapacity).size() ==
+                  RecentGpuWriteCapacity &&
+              known_before.size() == RecentGpuWriteCapacity - 1 &&
+              known_before.front().first != last,
+          "repeating the newest span in the last slot should refresh it, not overwrite the oldest");
+}
+
+// An entry is finished at exactly the known tick and not one tick later.
+void CheckRecentWriteFinished() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  constexpr uint64_t known_tick = 50;
+  RecentGpuWriteRing at_known;
+  at_known.Note(address, TRACKER_PAGE_SIZE, known_tick);
+  Require(name, "tick equal to known is finished",
+          FinishedRecentWrites(at_known, known_tick).size() == 1,
+          "an entry whose tick equals the known tick should be yielded");
+  // Only the tick differs from the baseline above.
+  RecentGpuWriteRing pending;
+  pending.Note(address, TRACKER_PAGE_SIZE, known_tick + 1);
+  Require(name, "tick past known is skipped", FinishedRecentWrites(pending, known_tick).empty(),
+          "an entry newer than the known tick should not be yielded");
+  // A pending newest entry must not hide an older finished one.
+  RecentGpuWriteRing mixed;
+  mixed.Note(address, TRACKER_PAGE_SIZE, known_tick);
+  mixed.Note(address + RecentWriteTestStride, TRACKER_PAGE_SIZE, known_tick + 1);
+  const auto spans = FinishedRecentWrites(mixed, known_tick);
+  Require(name, "pending entry does not hide older finished one",
+          spans.size() == 1 && spans[0].first == address,
+          "the walk should continue past an unfinished entry");
+  // The caller needs pending spans too, to keep older finished writes under them out.
+  std::vector<std::pair<uint64_t, bool>> visited;
+  mixed.ForEachNewest(known_tick, [&](uint64_t span_address, uint64_t, bool finished) {
+    visited.emplace_back(span_address, finished);
+    return true;
+  });
+  Require(name, "pending entry is visited as unfinished",
+          visited.size() == 2 && visited[0].first == address + RecentWriteTestStride &&
+              !visited[0].second &&
+              visited[1].first == address && visited[1].second,
+          "the walk should yield the pending entry flagged unfinished, then the finished one");
+}
+
+// Noting the newest span again refreshes its tick and adds no entry.
+void CheckRecentWriteRefresh() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  constexpr uint64_t first_tick = 5;
+  RecentGpuWriteRing ring;
+  ring.Note(address, TRACKER_PAGE_SIZE, first_tick);
+  ring.Note(address, TRACKER_PAGE_SIZE, first_tick + 1);
+  // The tick check separates a refresh from an ignored repeat, and the count from a duplicate.
+  Require(name, "repeat refreshes the tick",
+          FinishedRecentWrites(ring, first_tick).empty() &&
+              FinishedRecentWrites(ring, first_tick + 1).size() == 1,
+          "the repeated write should carry the later tick");
+  Require(name, "repeat adds no entry", ring.Size() == 1,
+          "a repeated newest span should not use a second slot");
+  // Each case below differs from the repeat above in one thing, so each must add an entry.
+  RecentGpuWriteRing other_size;
+  other_size.Note(address, TRACKER_PAGE_SIZE, first_tick);
+  other_size.Note(address, 2 * TRACKER_PAGE_SIZE, first_tick + 1);
+  Require(name, "same address with another size is a new entry", other_size.Size() == 2,
+          "a refresh should match the size as well as the address");
+  RecentGpuWriteRing not_newest;
+  not_newest.Note(address, TRACKER_PAGE_SIZE, first_tick);
+  not_newest.Note(address + RecentWriteTestStride, TRACKER_PAGE_SIZE, first_tick + 1);
+  not_newest.Note(address, TRACKER_PAGE_SIZE, first_tick + 2);
+  Require(name, "repeat of an older entry is a new entry", not_newest.Size() == 3,
+          "only the newest entry should be refreshed");
+}
+
+// Note keeps writes up to RecentWriteMaxBytes and drops empty or larger ones.
+void CheckRecentWriteSizeGate() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  RecentGpuWriteRing at_limit;
+  at_limit.Note(address, RecentWriteMaxBytes, 1);
+  Require(name, "write at the size limit is kept", at_limit.Size() == 1,
+          "a write of exactly RecentWriteMaxBytes should enter the ring");
+  // Only the size differs from the baseline above.
+  RecentGpuWriteRing over_limit;
+  over_limit.Note(address, RecentWriteMaxBytes + 1, 1);
+  Require(name, "write over the size limit is dropped", over_limit.Size() == 0,
+          "a write larger than RecentWriteMaxBytes should not enter the ring");
+  RecentGpuWriteRing empty;
+  empty.Note(address, 0, 1);
+  Require(name, "empty write is dropped", empty.Size() == 0,
+          "a zero-size write should not enter the ring");
+}
+
+// Overlapping spans all come out, because the caller drops spans it has already claimed.
+void CheckRecentWriteOverlap() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  constexpr uint64_t two_pages = 2 * TRACKER_PAGE_SIZE;
+  RecentGpuWriteRing overlapping;
+  overlapping.Note(address, two_pages, 1);
+  overlapping.Note(address + TRACKER_PAGE_SIZE, two_pages, 2);
+  const auto spans = FinishedRecentWrites(overlapping, RecentWriteAllFinished);
+  Require(name, "overlapping spans are both yielded",
+          spans.size() == 2 && spans[0].first == address + TRACKER_PAGE_SIZE &&
+              spans[1].first == address,
+          "the ring should not drop an overlapping older span");
+}
+
+// Spans are rounded out to whole tracker pages.
+void CheckRecentWriteRounding() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  RecentGpuWriteRing inside;
+  inside.Note(address + 0x800, 0x100, 1);
+  const auto inside_spans = FinishedRecentWrites(inside, 1);
+  Require(name, "span inside a page rounds to the page",
+          inside_spans.size() == 1 && inside_spans[0].first == address &&
+              inside_spans[0].second == TRACKER_PAGE_SIZE,
+          "a small span should widen to its whole page");
+  RecentGpuWriteRing crossing;
+  crossing.Note(address + TRACKER_PAGE_SIZE - 0x100, 0x200, 1);
+  const auto crossing_spans = FinishedRecentWrites(crossing, 1);
+  Require(name, "span across a page boundary covers both pages",
+          crossing_spans.size() == 1 && crossing_spans[0].first == address &&
+              crossing_spans[0].second == 2 * TRACKER_PAGE_SIZE,
+          "a span that crosses a boundary should cover both pages");
+  // An aligned end must stay put rather than grow by a page.
+  RecentGpuWriteRing aligned;
+  aligned.Note(address, 2 * TRACKER_PAGE_SIZE, 1);
+  const auto aligned_spans = FinishedRecentWrites(aligned, 1);
+  Require(name, "aligned span keeps its size",
+          aligned_spans.size() == 1 && aligned_spans[0].first == address &&
+              aligned_spans[0].second == 2 * TRACKER_PAGE_SIZE,
+          "a page-aligned span should not be widened");
+}
+
+// Covers the pure recent GPU write ring behaviour, which needs no GPU.
+void CheckRecentGpuWriteRingLogic() {
+  CheckRecentWriteOrder();
+  CheckRecentWriteWraparound();
+  CheckRecentWriteFinished();
+  CheckRecentWriteRefresh();
+  CheckRecentWriteSizeGate();
+  CheckRecentWriteOverlap();
+  CheckRecentWriteRounding();
+  std::printf("[host]    %-32s ok\n", "RecentGpuWriteRing");
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -55681,6 +55892,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--hot-readback-only") == 0) {
     CheckHotReadbackTableLogic();
+    CheckRecentGpuWriteRingLogic();
     VulkanHarness vulkan;
     vulkan.CheckHotReadbackRecording(false);
     vulkan.CheckHotReadbackRecording(true);
@@ -55851,6 +56063,7 @@ int main(int argc, char **argv) {
 #endif
   // Pure table logic, so every platform runs it whether or not a device is present.
   CheckHotReadbackTableLogic();
+  CheckRecentGpuWriteRingLogic();
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();

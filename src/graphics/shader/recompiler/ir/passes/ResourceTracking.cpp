@@ -1667,7 +1667,7 @@ private:
 
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
-	                                DescriptorSource& material_source, bool indexed) {
+	                                DescriptorSource& material_source, bool indexed, bool heap = false) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
@@ -1675,17 +1675,18 @@ private:
 		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
 		if (indexed) {
 			read = IndexedMaterialRead(read, active, selector);
-			// Bounded heaps fall back when the material aliases a written buffer; pointer
-			// tables rely on the renderer's specialization-read alias check. Other stages
-			// and unbounded/image writes keep the original domain.
+			// Bounded heaps keep their full domain when the material may alias a write: written
+			// buffers are checked at dispatch, storage images and address writes here. Pointer
+			// tables have no such domain, so a key that a same-dispatch write changes selects
+			// the root descriptor. Other stages keep the original domain.
 			if (read == nullptr || m_program.stage != ShaderType::Compute ||
-			    std::ranges::any_of(m_program.blocks, [](const Block* block) {
+			    (heap && std::ranges::any_of(m_program.blocks, [](const Block* block) {
 				    return std::ranges::any_of(*block, [](const Inst& inst) {
 					    const auto op = inst.GetOpcode();
 					    return ImageOpcodeInfoOf(op).resource_class == ImageResourceClass::Storage ||
 					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
 				    });
-			    }) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			    })) || !MakeRuntimeTableSource(*read, material_source)) return false;
 			selector.source = InternSource(material_source);
 			indirect.selector = std::move(selector);
 			return true;
@@ -3243,7 +3244,7 @@ private:
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
 		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
-		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true)) {
+		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true, true)) {
 			// Preserve the heap's byte-offset key so runtime geometry can choose the
 			// tighter selector domain without changing the GPU's descriptor reads.
 			indirect.table_scalar = true;

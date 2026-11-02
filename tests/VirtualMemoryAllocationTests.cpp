@@ -3245,7 +3245,9 @@ constexpr size_t   RemapEventTextSize     = 96;
 // A far away address that no earlier mapping in the test shares, for views of the same memory.
 constexpr uint64_t RemapAliasDistance     = 0x10000000ull;
 // The PRT aperture only accepts addresses from 0xf00000000, so entries under it need one there.
-constexpr uint64_t RemapPrtTestAddress    = 0x1000000000ull;
+// Linux and Windows start their user range at 0x1000000000, but x86-64 macOS has a gap from
+// 0xfc0000000 up to 0x7000000000, so this is the first address that is a user address everywhere.
+constexpr uint64_t RemapPrtTestAddress    = 0x7000000000ull;
 
 // Events from the GPU range hook and the suspend hook share one list so their order is visible.
 // U and M are unmap and map, S, R and C are suspend, resume and cancel.

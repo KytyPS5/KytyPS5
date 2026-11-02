@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <string>
 
 namespace Libs::LibKernel::FileSystem {
 
@@ -58,6 +59,10 @@ void                  Umount(const std::string& folder_or_point);
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 // Returns whether d is an open file, directory or device descriptor.
 bool                  IsOpenDescriptor(int d);
+
+// An Unreal Engine game's command line (/app0/ue4commandline.txt, /app0/uecommandline.txt) with
+// r.ScreenPercentage=<percentage> appended, its trailing line ends and NULs removed.
+std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t percentage);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);

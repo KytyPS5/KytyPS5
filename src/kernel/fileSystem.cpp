@@ -25,6 +25,7 @@
 #include <optional>
 #include <random>
 #include <system_error>
+#include <string>
 #include <vector>
 
 namespace Libs::LibKernel::FileSystem {
@@ -416,6 +417,47 @@ bool IsOpenDescriptor(int d) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t percentage) {
+	while (!command_line.empty() && (command_line.back() == '\n' || command_line.back() == '\r' ||
+	                                 command_line.back() == '\0')) {
+		command_line.pop_back();
+	}
+	// The engine takes the console variable from either form, depending on its version.
+	const auto option = "r.ScreenPercentage=" + std::to_string(percentage);
+	return command_line + " -ini:Engine:[SystemSettings]:" + option + " -dpcvars=" + option;
+}
+
+// With --unreal-screen-percentage, an Unreal Engine game reads a host copy of its command line
+// that sets r.ScreenPercentage: the engine renders its scene at that share of its output and
+// upscales it, as its own settings would. The game's files are not touched.
+static std::filesystem::path UnrealCommandLineCopy(const std::string&           guest_path,
+                                                   const std::filesystem::path& real_name) {
+	const auto percentage = Config::UnrealScreenPercentage();
+	if (percentage == 0 || !guest_path.starts_with("/app0/") ||
+	    !guest_path.ends_with("commandline.txt")) {
+		return {};
+	}
+	std::string  content;
+	Common::File original;
+	if (original.Open(real_name, Common::File::Mode::Read)) {
+		content.resize(original.Size());
+		original.Read(content.data(), static_cast<uint32_t>(content.size()));
+		original.Close();
+	}
+	content = AppendUnrealScreenPercentage(std::move(content), percentage);
+	const auto copy_path =
+	    std::filesystem::temp_directory_path() /
+	    ("kyty-" + std::to_string(percentage) + "-" + Common::PathToString(real_name.filename()));
+	Common::File copy;
+	if (!copy.Create(copy_path)) {
+		return {};
+	}
+	copy.Write(content.data(), static_cast<uint32_t>(content.size()));
+	copy.Close();
+	LOGF("\t Unreal command line: %s\n", content.c_str());
+	return copy_path;
+}
+
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
@@ -485,6 +527,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
+	}
+	if (rw_mode == Common::File::Mode::Read && !directory) {
+		if (auto copy = UnrealCommandLineCopy(file->name, file->real_name); !copy.empty()) {
+			file->real_name = std::move(copy);
+		}
 	}
 	if (Common::IsArchivePath(file->real_name) &&
 	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {

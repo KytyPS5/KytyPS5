@@ -2715,6 +2715,21 @@ void CheckSocketWakeup() {
 
 } // namespace
 
+static void TestUnrealScreenPercentage() {
+  namespace FileSystem = Libs::LibKernel::FileSystem;
+  Check(FileSystem::AppendUnrealScreenPercentage("../../../End/End.uproject -async", 50) ==
+            "../../../End/End.uproject -async -ini:Engine:[SystemSettings]:r.ScreenPercentage=50 "
+            "-dpcvars=r.ScreenPercentage=50",
+        "Unreal command line gains r.ScreenPercentage");
+  Check(FileSystem::AppendUnrealScreenPercentage(std::string("-project=a.uproject\r\n\0", 22), 75) ==
+            "-project=a.uproject -ini:Engine:[SystemSettings]:r.ScreenPercentage=75 "
+            "-dpcvars=r.ScreenPercentage=75",
+        "Unreal command line drops trailing line ends and NULs");
+  Check(FileSystem::AppendUnrealScreenPercentage("", 10) ==
+            " -ini:Engine:[SystemSettings]:r.ScreenPercentage=10 -dpcvars=r.ScreenPercentage=10",
+        "empty Unreal command line");
+}
+
 int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
@@ -2735,6 +2750,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  TestUnrealScreenPercentage();
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {

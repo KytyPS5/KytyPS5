@@ -588,6 +588,9 @@ struct DescriptorSource {
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
+			// V#-strided reads select records first_record + k * record_step.
+			uint32_t first_record = 0;
+			uint32_t record_step = 1;
 			uint32_t maximum = UINT32_MAX;
 			bool non_negative = false; // Signed-negative fields read as zero before the maximum.
 			uint32_t bit_offset = 0;

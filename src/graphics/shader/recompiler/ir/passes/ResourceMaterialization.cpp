@@ -505,10 +505,13 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) ||
 		    !CanReadIndexedSelector(material, selector->offset)) return false;
-		if (material.Format() != Prospero::BufferFormat::kInvalid && material.NumRecords() != 0u &&
+		const auto records = material.NumRecords();
+		if (material.Format() != Prospero::BufferFormat::kInvalid && records > selector->first_record &&
 		    selector->offset < material.Stride() &&
-		    !read_keys(material.Base48(), material.GetSize(), selector->offset,
-		               material.Stride(), material.NumRecords())) return false;
+		    !read_keys(material.Base48(), material.GetSize(),
+		               uint64_t {selector->first_record} * material.Stride() + selector->offset,
+		               uint64_t {selector->record_step} * material.Stride(),
+		               (records - selector->first_record - 1u) / selector->record_step + 1u)) return false;
 		keys.push_back(0u); // Every out-of-bounds indexed load returns zero.
 	} else {
 		ShaderBufferResource material;

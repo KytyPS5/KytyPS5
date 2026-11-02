@@ -3631,8 +3631,9 @@ void TestIndexedMaterialImageKeys() {
 
 void TestPointerTableIndexedMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  // A waterfall scalarizes one lane's indexed x3 key clamped at zero; matching lanes
-  // sample the descriptor at the user-data pointer plus key * 32 and write a storage image.
+  // A waterfall scalarizes one lane's x3 key from record 2 * lane + 1, clamped at zero;
+  // matching lanes sample the descriptor at the user-data pointer plus key * 32 and write
+  // a storage image.
   Fixture f;
   auto *entry = f.block, *body = f.AddBlock(), *done = f.AddBlock();
   entry->AddBranch(body);
@@ -3645,8 +3646,10 @@ void TestPointerTableIndexedMaterialKeys() {
   MemoryInfo request;
   request.kind = ResourceKind::Buffer;
   request.idxen = true;
+  const auto record = f.Emit(ValueOpcode::IAdd32,
+      {f.Emit(ValueOpcode::ShiftLeftLogical32, {lane, Value(1u)}), Value(1u)});
   const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x3,
-      {material, lane, Value(0u), Value(0u), active}, f.AddMemory(request, 0x28));
+      {material, record, Value(0u), Value(0u), active}, f.AddMemory(request, 0x28));
   const auto selected = f.Emit(ValueOpcode::SelectU32,
       {active, f.Emit(ValueOpcode::SMax32,
           {f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)}), Value(0u)}), Value(0u)});
@@ -3706,9 +3709,9 @@ void TestPointerTableIndexedMaterialKeys() {
     texture[3] = (9u << 28u) | Libs::Graphics::DstSel(4, 5, 6, 7);
   };
   for (const uint32_t key : {0u, 5u, 9u}) put(key);
-  for (uint32_t row = 0; row < records; ++row)
-    memory.words[(row * 12u + 8u) / 4u] = row % 2u == 0u ? 9u : 5u;
-  memory.words[((records - 1u) * 12u + 8u) / 4u] = UINT32_MAX; // A negative field selects key 0.
+  // Even records hold another field, with no descriptor; a negative field selects key 0.
+  const std::array<uint32_t, records> fields{7u, 9u, 7u, 5u, 7u, UINT32_MAX};
+  for (uint32_t row = 0; row < records; ++row) memory.words[(row * 12u + 8u) / 4u] = fields[row];
   const std::array<uint32_t, 7> user_data{base, 12u << 16u, records, 0x5204u, heap, 0u, 0u};
   const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     auto &m = *static_cast<Memory *>(data);
@@ -3728,7 +3731,7 @@ void TestPointerTableIndexedMaterialKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
             snapshot.images.size() == 4u,
         "pointer-table selector did not read exactly the zero and material-key descriptors");
-  Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 8u, 64u}) !=
+  Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 20u, 52u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");
   const auto mapping = specialization.images[0].indirect_mapping_offset;

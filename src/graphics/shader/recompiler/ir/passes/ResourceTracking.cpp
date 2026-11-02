@@ -1687,6 +1687,13 @@ private:
 					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
 				    });
 			    })) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			// The record index is assumed not to wrap U32; an affine one then reaches only
+			// records offset + k * stride.
+			AffineOffset row;
+			if (MatchAffineOffset(read->Arg(1), active, row) && row.stride != 0u) {
+				selector.first_record = static_cast<uint32_t>(row.offset);
+				selector.record_step = static_cast<uint32_t>(row.stride);
+			}
 			selector.source = InternSource(material_source);
 			indirect.selector = std::move(selector);
 			return true;

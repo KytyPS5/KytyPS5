@@ -27,6 +27,9 @@ int GetThreadIdUnique();
 // Current thread: raises its priority to "highest", and restricts it to one logical
 // processor (when `logical_cpu` is not negative). No-ops where unsupported.
 void RaiseCurrentPriority();
+// Current thread: lowers its priority below normal, for background work that must not take
+// processors from the emulated machine. No-op where unsupported.
+void LowerCurrentPriority();
 void PinCurrent(int logical_cpu);
 
 // Keeps the threads of the process that pick no processors themselves off the physical cores

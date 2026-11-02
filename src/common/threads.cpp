@@ -121,6 +121,12 @@ void Thread::RaiseCurrentPriority() {
 #endif
 }
 
+void Thread::LowerCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
 void Thread::PinCurrent(int logical_cpu) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (logical_cpu >= 0 && logical_cpu < 64) {

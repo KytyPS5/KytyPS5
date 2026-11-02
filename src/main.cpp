@@ -108,8 +108,9 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
-	::printf("  --unreal-screen-percentage <10-200>  Render Unreal Engine games at this share of their\n"
-	         "                                       output (r.ScreenPercentage).\n");
+	::printf(
+	    "  --unreal-screen-percentage <10-200>  Render Unreal Engine games at this share of their\n"
+	    "                                       output (r.ScreenPercentage).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif

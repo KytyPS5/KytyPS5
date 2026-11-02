@@ -10740,6 +10740,8 @@ public:
         TargetCase{128, 128, 1, 128, 0x2be00, Prospero::TileMode::kLinear, 7, true},
         // PPSA03541: the single texel still occupies a padded 128x64 block.
         TargetCase{1, 1, 1, 128, 0x10000, Prospero::TileMode::kRenderTarget, 1, true},
+        // Mips of a single stored level keep mip 0's one-tile pitch and alias it.
+        TargetCase{128, 128, 1, 128, 0x20000, Prospero::TileMode::kRenderTarget, 1, true},
     };
     constexpr uint64_t allocation_size = 0x410000;
 
@@ -10935,6 +10937,17 @@ public:
             RenderExecutorTestAccess::ResetBindings(executor);
           }
         }
+      }
+
+      if (width == 128 && target.levels == 1) {
+        registers.SetColorView(0, {.current_mip_level = 7});
+        RenderColorInfo aliased{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), aliased, 0);
+        Require(name, "single-level mip alias",
+                aliased.image_id == color.image_id && aliased.guest_mip_level == 0 &&
+                    aliased.desc.view_info.base_level == 0,
+                "a mip beyond a single stored level did not alias mip 0");
       }
 
       RenderExecutorTestAccess::ResetBindings(executor);

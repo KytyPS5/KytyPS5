@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -123,6 +124,23 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// A download in four stages, so several buffers can share one GPU wait. Collect takes the
+	// dirty ranges, Reserve picks the download memory, Record queues the copies, and Publish
+	// writes the finished bytes to guest memory.
+	struct PendingDownload {
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size     = 0;
+		uint64_t                    buffer_address = 0;
+		uint64_t                    offset         = 0;
+		uint8_t*                    mapped         = nullptr;
+		// Owns the memory behind mapped when the stream buffer was too full to serve it.
+		std::unique_ptr<Buffer>     temporary;
+	};
+	[[nodiscard]] PendingDownload CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr,
+	                                                    uint64_t size);
+	void ReserveDownloadMemory(PendingDownload& pending);
+	void RecordDownload(const Buffer& buffer, const PendingDownload& pending);
+	void PublishDownload(const PendingDownload& pending);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);

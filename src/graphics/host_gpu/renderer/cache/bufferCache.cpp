@@ -30,6 +30,8 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
+// Packed download ranges start on their own cache line, as in shadPS4.
+constexpr uint64_t DownloadCopyAlignment = 64;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -152,41 +154,56 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+/// Takes the GPU-dirty ranges of a buffer window out of the tracking sets and lists the copies
+/// that download them. The result has no copies when nothing in the window was GPU-dirty.
+BufferCache::PendingDownload BufferCache::CollectDownloadCopies(const Buffer& buffer,
+                                                                uint64_t vaddr, uint64_t size) {
+	PendingDownload pending;
+	pending.buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    pending.copies.emplace_back(start - pending.buffer_address, pending.total_size,
+			                                end - start);
 			    // Start each packed range on its own 64-byte cache line.
-			    total_size += Common::AlignUp(end - start, 64);
+			    pending.total_size += Common::AlignUp(end - start, DownloadCopyAlignment);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
-	if (copies.empty()) {
-		return false;
-	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	return pending;
+}
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
+/// Reserves download memory for the pending copies, from the stream buffer or from a temporary
+/// buffer that the pending download then owns.
+void BufferCache::ReserveDownloadMemory(PendingDownload& pending) {
+	// A second reservation would orphan the first one's temporary buffer and offsets.
+	EXIT_IF(pending.mapped != nullptr);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes,
+	                           pending.total_size);
+	auto [mapped, offset] = m_download_buffer.Map(pending.total_size, DownloadCopyAlignment);
 	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
+		pending.temporary = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eTransferDst, pending.total_size);
+		mapped = pending.temporary->Mapped().data();
 	} else {
 		m_download_buffer.Commit();
 	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
-	for (auto& copy: copies) {
+	pending.mapped = mapped;
+	pending.offset = offset;
+	for (auto& copy: pending.copies) {
 		copy.dstOffset += offset;
 	}
+}
+
+/// Records the reserved copies into the current command, wrapped in the barriers that make the
+/// GPU writes visible to the transfer and the downloaded bytes visible to the host.
+void BufferCache::RecordDownload(const Buffer& buffer, const PendingDownload& pending) {
+	EXIT_IF(pending.mapped == nullptr);
+	const auto& download = pending.temporary ? *pending.temporary : m_download_buffer;
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -203,33 +220,47 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), download.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	                  static_cast<uint32_t>(pending.copies.size()), pending.copies.data());
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	after.buffer        = download.Handle();
-	after.offset        = offset;
-	after.size          = total_size;
+	after.offset        = pending.offset;
+	after.size          = pending.total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
-		}
-	};
+}
+
+/// Copies finished download bytes into guest memory. The GPU must have completed the copies.
+void BufferCache::PublishDownload(const PendingDownload& pending) {
+	(pending.temporary ? *pending.temporary : m_download_buffer)
+	    .Invalidate(pending.offset, pending.total_size);
+	for (const auto& copy: pending.copies) {
+		Libs::LibKernel::Memory::WriteBacking(pending.buffer_address + copy.srcOffset,
+		                                      pending.mapped + (copy.dstOffset - pending.offset),
+		                                      copy.size);
+	}
+}
+
+template <bool async>
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	auto pending = CollectDownloadCopies(buffer, vaddr, size);
+	if (pending.copies.empty()) {
+		return false;
+	}
+	ReserveDownloadMemory(pending);
+	RecordDownload(buffer, pending);
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(
+		    [this, pending = std::move(pending)] { PublishDownload(pending); });
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
-		publish();
+		PublishDownload(pending);
 	}
 	return true;
 }

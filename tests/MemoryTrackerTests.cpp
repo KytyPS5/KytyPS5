@@ -407,6 +407,67 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+
+void FaultWrite(MemoryTracker &tracker, uint64_t address) {
+  tracker.InvalidateWriteFault(address, [] { Check(false, "unexpected flush"); });
+}
+
+// Writes the pages front to back the way a faulting guest thread would; returns the faults.
+uint32_t WriteSequentially(MemoryTracker &tracker, uint8_t *memory, uint32_t first,
+                           uint32_t count) {
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  uint32_t faults = 0;
+  for (uint32_t page = first; page < first + count; page++) {
+    if (Protection(memory + page * page_size) == PAGE_READONLY) {
+      FaultWrite(tracker, reinterpret_cast<uint64_t>(memory) + page * page_size + 8);
+      faults++;
+    }
+    Check(IsWritable(memory + page * page_size), "fault did not release its page");
+  }
+  return faults;
+}
+
+void TestWriteFaultReadahead() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 64);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto arm = [&] {
+    tracker.ForEachUploadRange(address, page_size * 64, false,
+                               [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  };
+  arm();
+
+  // Front-to-back writes fault at pages 0, 1, 3, 7, 15 and 31.
+  Check(WriteSequentially(tracker, memory, 0, 32) == 6, "sequential writes were not read ahead");
+  Check(Protection(memory + 47 * page_size) == PAGE_READONLY, "readahead went past its window");
+  uint64_t uploaded = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 64, false,
+      [&](uint64_t, uint64_t bytes) noexcept { uploaded += bytes; }, []() noexcept {});
+  Check(uploaded == page_size * 47, "pages released ahead were not uploaded");
+
+  // Writes out of order release one page each.
+  FaultWrite(tracker, address + 10 * page_size);
+  FaultWrite(tracker, address + 5 * page_size);
+  FaultWrite(tracker, address + 7 * page_size);
+  Check(IsWritable(memory + 5 * page_size) && Protection(memory + 6 * page_size) == PAGE_READONLY &&
+            Protection(memory + 8 * page_size) == PAGE_READONLY,
+        "non-sequential faults were read ahead");
+  arm();
+
+  // A GPU-owned page ahead keeps its own fault.
+  tracker.ForEachUploadRange(address + 20 * page_size, page_size, true,
+                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(WriteSequentially(tracker, memory, 16, 4) == 3, "readahead window did not grow");
+  Check(Protection(memory + 20 * page_size) == PAGE_NOACCESS,
+        "readahead released a GPU-owned page");
+  tracker.UnmarkRegionAsGpuModified(address + 20 * page_size, page_size);
+  tracker.UntrackMemory(address, page_size * 64);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1202,6 +1263,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestWriteFaultReadahead();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

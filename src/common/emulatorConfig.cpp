@@ -178,6 +178,14 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
+bool PipelineManifestEnabled() {
+	return g_config->pipeline_manifest_enabled;
+}
+
+bool PipelineManifestRecord() {
+	return g_config->pipeline_manifest_record;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }

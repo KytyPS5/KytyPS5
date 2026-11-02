@@ -119,6 +119,10 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
+	::printf("  --no-pipeline-manifest               Do not create the shaders and pipelines of the\n"
+	         "                                       title's pipeline manifest ahead of their draws.\n");
+	::printf("  --record-pipeline-manifest           Add the shaders and pipelines this session creates\n"
+	         "                                       to the title's manifest in _PipelineCache.\n");
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
@@ -262,6 +266,9 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
+    {"--pipeline-manifest", &ConfigOptions::pipeline_manifest_enabled},
+    {"--no-pipeline-manifest", &ConfigOptions::pipeline_manifest_enabled, false},
+    {"--record-pipeline-manifest", &ConfigOptions::pipeline_manifest_record},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},

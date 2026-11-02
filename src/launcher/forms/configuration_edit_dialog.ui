@@ -575,6 +575,12 @@
             <property name="clearButtonEnabled"><bool>true</bool></property>
            </widget>
           </item>
+          <item row="5" column="0" colspan="2">
+           <widget class="QCheckBox" name="checkBox_record_pipeline_manifest">
+            <property name="toolTip"><string>Add the shaders and pipelines this session compiles to the game's pipeline manifest (_PipelineCache), which later cold starts compile while the game loads.</string></property>
+            <property name="text"><string>Record the pipeline manifest</string></property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>

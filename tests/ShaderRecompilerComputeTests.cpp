@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -107,6 +108,7 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+#include <variant>
 #include <xxhash.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -1491,6 +1493,184 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+// The manifest keeps no guest addresses or dispatch sizes, gives the same bytes for the same
+// records in any order, and rejects damaged files.
+void CheckPipelineManifestFormat() {
+  constexpr const char *name = "PipelineManifestFormat";
+  PipelineManifest manifest;
+  ManifestModule vertex{.stage = ShaderType::Vertex, .code_hash = 0x1111, .user_data_count = 12};
+  auto &vertex_input = vertex.input.emplace<ShaderVertexInputInfo>();
+  vertex_input.resources_num = 2;
+  vertex_input.buffers_num = 1;
+  for (int i = 0; i < 2; i++) {
+    vertex_input.resources[i].fields[0] = 0x12340000u + static_cast<u32>(i) * 16u;
+    vertex_input.resources[i].fields[1] = 0x00200002u;
+    vertex_input.resources[i].fields[2] = 70u;
+    vertex_input.resources[i].fields[3] = 0x00012fa8u;
+    vertex_input.resources_dst[i] = {.register_start = 4 * i, .registers_num = 4, .attr_id = i};
+  }
+  vertex_input.buffers[0] = {.addr = 0x200001234ull, .stride = 32, .num_records = 9};
+  vertex.specialization.buffers.push_back({.packed_stride = 32});
+  ManifestModule mesh{.stage = ShaderType::Mesh, .code_hash = 0x3333, .back_hash = 0x4444};
+  auto &mesh_input = mesh.input.emplace<ShaderVertexInputInfo>();
+  mesh_input.logical_stage = ShaderType::Mesh;
+  mesh_input.mesh.threads_num[0] = 64;
+  mesh_input.mesh.host_subgroup_size = 32;
+  ManifestModule pixel{.stage = ShaderType::Pixel, .code_hash = 0x5555, .push_data_cursor = 3};
+  auto &pixel_input = pixel.input.emplace<ShaderPixelInputInfo>();
+  pixel_input.input_num = 2;
+  pixel_input.interpolator_settings[1] = 7;
+  pixel.specialization.images.push_back({.mip_count = 4, .cube = true});
+  ManifestModule compute{.stage = ShaderType::Compute, .code_hash = 0x6666};
+  auto &compute_input = compute.input.emplace<ShaderComputeInputInfo>();
+  compute_input.threads_num[0] = 64;
+  compute_input.workgroup_counts[0] = 99;
+  compute_input.indirect_args_address = 0x5000;
+  compute_input.host_subgroup_size = 32;
+  manifest.modules = {vertex, mesh, pixel, compute};
+  ManifestPipeline pipeline{.stages = {0, ManifestPipeline::NoStage, ManifestPipeline::NoStage, 2},
+                            .plain_pixel = true};
+  pipeline.key.rendering.color_count = 1;
+  pipeline.key.rendering.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
+  pipeline.key.static_params.blend_enable[0] = true;
+  // The vertex input of the vertex module's draws: its two attributes from one buffer.
+  pipeline.key.vertex_input.binding_count = 1;
+  pipeline.key.vertex_input.attribute_count = 2;
+  pipeline.key.vertex_input.bindings[0] = {.stride = 32};
+  pipeline.key.vertex_input.attributes[1] = {.offset = 16};
+  ManifestPipeline mesh_pipeline{.stages = {1, ManifestPipeline::NoStage, ManifestPipeline::NoStage,
+                                            ManifestPipeline::NoStage}};
+  manifest.pipelines = {pipeline, mesh_pipeline};
+  manifest.tessellation_layouts = {{0x77, {.input_control_points = 3}}};
+
+  const auto bytes = SaveManifest(manifest);
+  PipelineManifest loaded;
+  Require(name, "load", LoadManifest(bytes, loaded), "a saved manifest did not load");
+  Require(name, "records",
+          loaded.modules.size() == 4 && loaded.pipelines.size() == 2 &&
+              loaded.tessellation_layouts.size() == 1,
+          "the loaded manifest lost or added records");
+  Require(name, "round trip", SaveManifest(loaded) == bytes,
+          "saving a loaded manifest changed its bytes");
+  // Records in another order, one twice, give the same bytes.
+  PipelineManifest shuffled;
+  shuffled.modules = {compute, pixel, vertex, mesh, pixel};
+  shuffled.pipelines = {mesh_pipeline, pipeline, mesh_pipeline};
+  shuffled.pipelines[0].stages[0] = 3;
+  shuffled.pipelines[1].stages = {2, ManifestPipeline::NoStage, ManifestPipeline::NoStage, 4};
+  shuffled.pipelines[2].stages[0] = 3;
+  shuffled.tessellation_layouts = manifest.tessellation_layouts;
+  Require(name, "canonical order", SaveManifest(shuffled) == bytes,
+          "the same records in another order gave other bytes");
+
+  const auto find = [&](ShaderType stage) {
+    return *std::ranges::find(loaded.modules, stage, &ManifestModule::stage);
+  };
+  const auto loaded_vertex = std::get<ShaderVertexInputInfo>(find(ShaderType::Vertex).input);
+  const auto loaded_compute = std::get<ShaderComputeInputInfo>(find(ShaderType::Compute).input);
+  const auto loaded_mesh = std::get<ShaderVertexInputInfo>(find(ShaderType::Mesh).input);
+  Require(name, "normalized",
+          loaded_vertex.resources[1].Base48() == 0 && loaded_vertex.resources[1].fields[3] == 0x00012fa8u &&
+              loaded_vertex.resources[1].Stride() == 32 &&
+              loaded_vertex.resources[1].fields[2] == 70 && loaded_vertex.buffers[0].addr == 0 &&
+              loaded_vertex.buffers[0].num_records == 9 && loaded_compute.workgroup_counts[0] == 0 &&
+              loaded_compute.indirect_args_address == 0 && loaded_compute.host_subgroup_size == 0 &&
+              loaded_compute.threads_num[0] == 64 && loaded_mesh.mesh.host_subgroup_size == 0,
+          "a guest address, dispatch size or host limit was kept, or another field lost");
+  Require(name, "specialization",
+          find(ShaderType::Pixel).specialization == pixel.specialization &&
+              find(ShaderType::Pixel).push_data_cursor == 3,
+          "the specialization or push data cursor changed");
+  const auto &plain = *std::ranges::find(loaded.pipelines, true, &ManifestPipeline::plain_pixel);
+  Require(name, "pipeline",
+          loaded.modules[plain.stages[0]].stage == ShaderType::Vertex &&
+              loaded.modules[plain.stages[3]].stage == ShaderType::Pixel &&
+              plain.key.rendering.color_formats[0] == vk::Format::eR8G8B8A8Unorm &&
+              plain.key.static_params.blend_enable[0] && plain.key.stage_ids[0] == 0,
+          "a pipeline record lost its stages or state");
+  // The program of a GS front and back pair is named by both hashes.
+  const uint64_t pair[] = {0x3333, 0x4444};
+  Require(name, "program hash",
+          mesh.ProgramHash() == XXH3_64bits(pair, sizeof(pair)) && vertex.ProgramHash() == 0x1111,
+          "a module's program hash differs from PrepareProgram's");
+  // Only the static key and the specialization tell modules apart.
+  auto moved = vertex;
+  moved.input.emplace<ShaderVertexInputInfo>(vertex_input).buffers[0].num_records = 1;
+  const std::vector<u32> static_key{1, 2, 3};
+  Require(name, "identity",
+          ManifestModuleIdentity(moved, static_key) == ManifestModuleIdentity(vertex, static_key) &&
+              ManifestModuleIdentity(pixel, static_key) != ManifestModuleIdentity(vertex, static_key),
+          "module identity depends on fields outside the static key");
+
+  // Text, one record per line: 4 modules, 2 pipelines and a layout after the header.
+  const std::string text(bytes.begin(), bytes.end());
+  const auto line_count = std::ranges::count(text, '\n');
+  Require(name, "text", text.starts_with("# kyty pipeline manifest v1\n") && line_count == 8,
+          "the manifest is not one header and one line per record");
+  const auto load_text = [](std::string_view changed, PipelineManifest &manifest, uint32_t &skipped) {
+    return LoadManifest(std::span(reinterpret_cast<const uint8_t *>(changed.data()), changed.size()),
+                        manifest, &skipped);
+  };
+  // A missing field reads its default and an unknown one is ignored.
+  auto edited = text;
+  const auto cursor = edited.find(" cur=3");
+  Require(name, "cursor field", cursor != std::string::npos, "the pixel module wrote no cursor field");
+  edited.replace(cursor, 6, " newfield=7 flagfromlater");
+  PipelineManifest defaults;
+  uint32_t skipped = 1;
+  Require(name, "missing field",
+          load_text(edited, defaults, skipped) && skipped == 0 && defaults.modules.size() == 4 &&
+              std::ranges::find(defaults.modules, ShaderType::Pixel, &ManifestModule::stage)
+                      ->push_data_cursor == 0,
+          "a missing field did not read its default, or an unknown one failed the record");
+  // A record that does not read is left out, with the pipelines that name it; another format or
+  // a damaged header is not read.
+  auto garbled = text;
+  const auto pixel_line = garbled.find(" ps code=");
+  garbled.replace(pixel_line, 9, " ps code=zz");
+  PipelineManifest partial;
+  Require(name, "bad record",
+          load_text(garbled, partial, skipped) && skipped == 2 && partial.modules.size() == 3 &&
+              partial.pipelines.size() == 1,
+          "a bad module line did not leave out it and its pipeline alone");
+  auto other_format = text;
+  other_format.replace(other_format.find("v1"), 2, "v9");
+  PipelineManifest rejected;
+  Require(name, "format", !load_text(other_format, rejected, skipped) && rejected.modules.empty(),
+          "a manifest of another format loaded");
+  // A file cut short loses its last line only.
+  const auto truncated = text.substr(0, text.size() - 3);
+  Require(name, "truncated",
+          load_text(truncated, partial, skipped) && skipped == 1 &&
+              partial.tessellation_layouts.empty() && partial.pipelines.size() == 2,
+          "a manifest cut short lost more than its last line");
+  // A pipeline that no draw creates from the modules it names is left out and reported: a TES as
+  // its vertex stage, fewer vertex attributes than its vertex module reads, or an attribute of a
+  // binding it does not have.
+  ManifestModule evaluation{.stage = ShaderType::TessellationEvaluation, .code_hash = 0x7777};
+  evaluation.input.emplace<ShaderVertexInputInfo>().logical_stage = ShaderType::TessellationEvaluation;
+  auto mixed = manifest;
+  mixed.modules.push_back(evaluation);
+  auto wrong_stage = pipeline;
+  wrong_stage.stages[0] = 4;
+  auto fewer_attributes = pipeline;
+  fewer_attributes.key.vertex_input.attribute_count = 1;
+  auto missing_binding = pipeline;
+  missing_binding.key.vertex_input.attributes[1].binding = 1;
+  mixed.pipelines = {pipeline, mesh_pipeline, wrong_stage, fewer_attributes, missing_binding};
+  PipelineManifest linked;
+  std::vector<std::string> unlinked;
+  Require(name, "unlinked",
+          LoadManifest(SaveManifest(mixed), linked, &skipped, &unlinked) && skipped == 3 &&
+              linked.modules.size() == 5 && linked.pipelines.size() == 2 && unlinked.size() == 3 &&
+              std::ranges::any_of(unlinked,
+                                  [](const std::string &line) {
+                                    return line.find("(stages tes,-,-,ps)") != std::string::npos;
+                                  }),
+          "a pipeline whose modules do not fit it loaded, or was not reported");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 struct BdaMapping {
@@ -57667,6 +57847,7 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckPipelineManifestFormat();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

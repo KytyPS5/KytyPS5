@@ -103,20 +103,6 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
-std::string PipelineCacheTitleId() {
-	std::string title_id;
-	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
-	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		return {};
-	}
-	if (!std::ranges::all_of(title_id, [](unsigned char c) {
-		    return std::isalnum(c) != 0 || c == '-' || c == '_';
-	    })) {
-		return {};
-	}
-	return title_id;
-}
-
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
@@ -389,6 +375,20 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 }
 
 } // namespace
+
+std::string PipelineCacheTitleId() {
+	std::string title_id;
+	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
+	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
+		return {};
+	}
+	if (!std::ranges::all_of(title_id, [](unsigned char c) {
+		    return std::isalnum(c) != 0 || c == '-' || c == '_';
+	    })) {
+		return {};
+	}
+	return title_id;
+}
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
@@ -880,7 +880,9 @@ std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&       mo
 
 void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
                                 const ShaderModule& module, const std::vector<uint32_t>& spirv,
-                                const std::vector<uint32_t>& plain_spirv) {
+                                const std::vector<uint32_t>&            plain_spirv,
+                                const ShaderRecompiler::CompileOptions& options,
+                                std::span<const uint32_t> code, uint32_t push_data_cursor) {
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -894,6 +896,7 @@ void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
 		StoreModule(key, program, module, spirv, plain_spirv);
+		RecordModule(key, options, code, push_data_cursor, module);
 	}
 }
 
@@ -907,13 +910,14 @@ void PipelineCache::DestroyModule(const ShaderModule& module) const {
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
-                                           uint32_t                          push_data_cursor) {
+                                           uint32_t                          push_data_cursor,
+                                           std::span<const uint32_t>         code) {
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 	auto& module = program.modules.emplace_back(
 	    BuildModule(key, options, std::move(translated), program.specialization,
 	                program.FunctionCode(), push_data_cursor, spirv, plain_spirv));
-	AddedModule(key, program, module, spirv, plain_spirv);
+	AddedModule(key, program, module, spirv, plain_spirv, options, code, push_data_cursor);
 	return module;
 }
 
@@ -1048,7 +1052,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (failed) return skip_failure();
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data_cursor));
+	                          push_data_cursor, params.code));
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -1058,7 +1062,15 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	WarmUp(shader_store);
+	// A recording takes what the session compiles: programs the store compiled would be missing
+	// from it, as the store keeps no stage input.
+	if (Config::PipelineManifestRecord() && !shader_store.empty()) {
+		PipelineCacheLog("Shader cache: not used while the pipeline manifest records");
+		WarmUp({});
+	} else {
+		WarmUp(shader_store);
+	}
+	OpenManifest();
 	for (uint32_t i = 0; i < CompileWorkers; i++) {
 		m_workers.emplace_back([this] { CompileWorker(); });
 	}
@@ -1068,10 +1080,12 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 			m_async_threads.emplace_back([this] { AsyncPipelineWorker(); });
 		}
 	}
+	m_async_handoff = !m_async_threads.empty() || m_manifest_warm;
 }
 
 PipelineCache::~PipelineCache() {
 	StopWorkers();
+	CloseManifest();
 	StopAsyncPipelines();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -1739,9 +1753,9 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::vector<uint32_t>                             spirv;
 	std::vector<uint32_t>                             plain_spirv;
+	ShaderRecompiler::CompileOptions                  options {.wave_size = input_info.wave_size};
 	[&] {
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
-		ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.stage             = input_info.logical_stage;
 			options.input_info.vertex = &input_info;
@@ -1816,7 +1830,8 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			DestroyModule(*module);
 		} else {
 			auto& added = modules.emplace_back(std::move(*module));
-			AddedModule(job.key, entry->second, added, spirv, plain_spirv);
+			AddedModule(job.key, entry->second, added, spirv, plain_spirv, options, job.params.code,
+			            job.push_data_cursor);
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				if (!m_async_threads.empty()) {
 					CreateComputePipelineAhead(added);
@@ -1936,13 +1951,27 @@ void PipelineCache::AsyncPipelineWorker() {
 	}
 }
 
+void PipelineCache::ClaimPipeline(const GraphicsPipelineKey& key) {
+	if (m_manifest_warm) {
+		m_claimed_graphics.insert(key);
+	}
+}
+
+void PipelineCache::ClaimComputePipeline(uint64_t module_id) {
+	if (m_manifest_warm) {
+		m_claimed_compute.insert(module_id);
+	}
+}
+
 void PipelineCache::CreateComputePipelineAhead(const ShaderModule& module) {
 	{
 		std::lock_guard lock(m_async_mutex);
 		if (m_async_ready_compute.contains(module.id) ||
+		    (m_manifest_warm && m_claimed_compute.contains(module.id)) ||
 		    !m_async_pending_compute.insert(module.id).second) {
 			return;
 		}
+		ClaimComputePipeline(module.id);
 	}
 	QueueAsyncPipeline({.compute = true, .module = &module});
 }
@@ -2207,7 +2236,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                        vertex_words <= PipelineSyncUiVsWords;
 		allow_async = spirv_words > PipelineSyncWords && !layer_draw;
 	}
-	if (!m_async_threads.empty()) {
+	if (m_async_handoff) {
+		// Without background threads for them, draws wait for their pipelines.
+		allow_async = allow_async && !m_async_threads.empty();
 		std::unique_lock lock(m_async_mutex);
 		// Set when this draw queues the pipeline: it waits that long before it is skipped.
 		std::optional<std::chrono::steady_clock::time_point> wait_until;
@@ -2222,11 +2253,13 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			}
 			if (!m_async_pending_graphics.contains(key)) {
 				if (!allow_async || m_async_failed_graphics.contains(key)) {
+					ClaimPipeline(key);
 					break;
 				}
 				// The driver compiles a new pipeline for up to half a second: the draws that need
 				// it are skipped until a background thread created it.
 				m_async_pending_graphics.insert(key);
+				ClaimPipeline(key);
 				lock.unlock();
 				QueueAsyncPipeline({.key = key, .stages = stages});
 				wait_until = std::chrono::steady_clock::now() + PipelineWait;
@@ -2249,6 +2282,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				    return !job.compute && job.key == key;
 			    })) {
 				m_async_pending_graphics.erase(key);
+				ClaimPipeline(key);
 				break;
 			}
 			lock.unlock();
@@ -2288,7 +2322,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	if (const auto found = m_compute_pipelines.find(module.id); found != m_compute_pipelines.end()) {
 		return found->second;
 	}
-	if (!m_async_threads.empty()) {
+	if (m_async_handoff) {
 		// Dispatches always run: take the pipeline a background thread created, create it here
 		// while it is still queued, or wait for the thread creating it.
 		std::unique_lock lock(m_async_mutex);
@@ -2297,12 +2331,14 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 				return m_compute_pipelines.insert(std::move(node)).position->second;
 			}
 			if (!m_async_pending_compute.contains(module.id)) {
+				ClaimComputePipeline(module.id);
 				break;
 			}
 			if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
 				    return job.compute && job.module->id == module.id;
 			    })) {
 				m_async_pending_compute.erase(module.id);
+				ClaimComputePipeline(module.id);
 				break;
 			}
 			lock.unlock();

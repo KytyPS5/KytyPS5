@@ -24,6 +24,7 @@
 #include <optional>
 #include <queue>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -167,6 +168,7 @@ struct ProgramResolution {
 
 struct GraphicContext;
 struct ShaderParams;
+struct ManifestModule;
 class CommandBuffer;
 
 namespace HW {
@@ -485,7 +487,7 @@ private:
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
-	                            uint32_t                          push_data_cursor);
+	                            uint32_t push_data_cursor, std::span<const uint32_t> code);
 	// Compiles a module without touching the cache; `spirv` and `plain_spirv` receive its code and
 	// that of its plain variant (empty without one).
 	ShaderModule BuildModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
@@ -493,9 +495,12 @@ private:
 	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                         std::span<const uint32_t> function_code, uint32_t push_data_cursor,
 	                         std::vector<uint32_t>& spirv, std::vector<uint32_t>& plain_spirv) const;
-	// Under the program lock: counts a module added to `program` and records it in the store.
+	// Under the program lock: counts a module added to `program` and records it in the store and
+	// the manifest. `options`, `code` and `push_data_cursor` are those it was compiled with.
 	void AddedModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
-	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
+	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv,
+	                 const ShaderRecompiler::CompileOptions& options,
+	                 std::span<const uint32_t> code, uint32_t push_data_cursor);
 	// Destroys the Vulkan modules of `module` and of its plain variant.
 	void DestroyModule(const ShaderModule& module) const;
 	void LockPrograms();
@@ -536,6 +541,13 @@ private:
 	std::deque<AsyncPipelineJob>                                     m_async_jobs;
 	bool                                                             m_async_stopping = false;
 	std::vector<std::jthread>                                        m_async_threads;
+	// Lookups take the pipelines background threads created from the m_async_ready maps: with
+	// asynchronous pipelines, or while the manifest creates pipelines.
+	bool                                                             m_async_handoff = false;
+	// While the manifest creates pipelines: every key and compute module id some thread has
+	// created or is creating, so that none is created twice (under m_async_mutex).
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_claimed_graphics;
+	std::unordered_set<uint64_t>                                     m_claimed_compute;
 
 	void QueueAsyncPipeline(const AsyncPipelineJob& job);
 	// Under m_async_mutex: removes a queued job no thread has started; false when none matches.
@@ -545,6 +557,9 @@ private:
 	void StopAsyncPipelines();
 	// A compile worker added a compute module: its pipeline is created in the background.
 	void CreateComputePipelineAhead(const ShaderModule& module);
+	// Under m_async_mutex: notes that a thread creates the pipeline (see m_claimed_graphics).
+	void ClaimPipeline(const GraphicsPipelineKey& key);
+	void ClaimComputePipeline(uint64_t module_id);
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it; sooner
 	// after a slow creation.
@@ -568,8 +583,46 @@ private:
 	// False when a stage id of the key is not in `modules`.
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
+
+	// pipelineManifest.cpp: the title's pipeline manifest, loaded at construction. Its modules
+	// and pipelines are created on background threads once the guest maps their shaders, and with
+	// --record-pipeline-manifest what the session creates is added to it.
+	struct ManifestState;
+	struct ManifestStateDeleter {
+		void operator()(ManifestState* state) const;
+	};
+	std::unique_ptr<ManifestState, ManifestStateDeleter> m_manifest;
+	// Whether background threads create the manifest's modules and pipelines.
+	bool                           m_manifest_warm = false;
+
+	void OpenManifest();
+	// Stops the manifest's threads and writes a recording.
+	void CloseManifest();
+	// Under the program lock.
+	void RecordModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
+	                  std::span<const uint32_t> code, uint32_t push_data_cursor,
+	                  const ShaderModule& module);
+	void RecordPipeline(const GraphicsPipelineKey& key);
+	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
+	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
+	void ManifestWorker(const std::stop_token& stop);
+	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
+	                         std::span<const uint32_t> back_code);
+	void CreateManifestPipeline(uint32_t index);
+	void CreateManifestComputePipeline(const ShaderModule& module);
+	// The stage input of a manifest module with the running host's limits.
+	void SetHostInput(ManifestModule& module) const;
+	// Under the program lock: the module of `key` that the specialization and push data cursor
+	// select, or null.
+	const ShaderModule* FindCompiledModule(
+	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	    uint32_t push_data_cursor) const;
+	void ManifestProgress(bool force);
+	void SaveManifestRecording();
 };
 
+// The running title's id as cache file names use it; empty when unknown.
+std::string PipelineCacheTitleId();
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();

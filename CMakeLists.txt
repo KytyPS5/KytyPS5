@@ -1059,6 +1059,17 @@ add_custom_target(kyty_touch_cursors
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
+# Per-title pipeline manifests (<TITLE_ID>_<APP_VER>.kpm), read at boot.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/pipelines")
+	add_custom_target(kyty_pipeline_manifests
+		COMMAND ${CMAKE_COMMAND} -E copy_directory
+			"${CMAKE_CURRENT_SOURCE_DIR}/assets/pipelines"
+			"$<TARGET_FILE_DIR:kyty_emulator>/assets/pipelines"
+		VERBATIM)
+	add_dependencies(kyty_emulator kyty_pipeline_manifests)
+	install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/pipelines" DESTINATION assets)
+endif()
+
 set(KYTY_NOTO_SANS_FONTS
 	"${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
 	"${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf"

@@ -288,6 +288,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.native_rt, "--native-rt");
 	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
 	AddFlag(args, !info.async_pipelines_enabled, "--no-async-pipelines");
+	AddFlag(args, info.pipeline_manifest_record, "--record-pipeline-manifest");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");

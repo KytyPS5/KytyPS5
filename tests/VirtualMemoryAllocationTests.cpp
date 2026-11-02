@@ -366,20 +366,51 @@ size_t AvailableFlexibleMemory(const char* test) {
 	return size;
 }
 
-void ExpectHostReadOnly(const char* test, uint64_t address) {
+// Whether the host page at an address is read-only. Platforms without a query report true, so the
+// checks that use it only bite where the host can tell. On Linux the probe writes zero, which only
+// lands if the page turns out to be writable.
+bool IsHostReadOnly(uint64_t address) {
 #if defined(__linux__)
 	uint64_t value = 0;
 	iovec    local {&value, sizeof(value)};
 	iovec    remote {reinterpret_cast<void*>(address), sizeof(value)};
-	Check(test, process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == -1,
-	      "failed unmap lost read-only host protection");
+	return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == -1;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	MEMORY_BASIC_INFORMATION info {};
-	Check(test,
-	      VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
-	          info.Protect == PAGE_READONLY,
-	      "failed unmap lost read-only host protection");
+	return VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
+	       info.Protect == PAGE_READONLY;
+#else
+	(void)address;
+	return true;
 #endif
+}
+
+// Whether the host page at an address is writable, with the same platform rule as IsHostReadOnly.
+bool IsHostWritable(uint64_t address) {
+#if defined(__linux__)
+	uint64_t value = 0;
+	iovec    local {&value, sizeof(value)};
+	iovec    remote {reinterpret_cast<void*>(address), sizeof(value)};
+	uint64_t current = 0;
+	iovec    read_local {&current, sizeof(current)};
+	if (process_vm_readv(getpid(), &read_local, 1, &remote, 1, 0) == -1) {
+		return false;
+	}
+	value = current;
+	return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) != -1;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	return VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
+	       info.Protect == PAGE_READWRITE;
+#else
+	(void)address;
+	return true;
+#endif
+}
+
+// Fails the test if the host page at an address is not read-only.
+void ExpectHostReadOnly(const char* test, uint64_t address) {
+	Check(test, IsHostReadOnly(address), "failed unmap lost read-only host protection");
 }
 
 size_t ConfiguredFlexibleMemory(const char* test) {
@@ -2288,6 +2319,58 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Unmaps page 1 of a four-page direct mapping, so a left piece and a right piece survive, after
+// page 0 and page 3 were made read-only. Windows remaps the surviving pieces of a split view, and
+// the read-only pages must come back read-only while page 2 stays writable. The owner flag picks
+// how protection was set, through the guest's mprotect or through the owner path that the GPU
+// page tracker uses.
+void CheckPartialUnmapKeepsProtection(const char* test, bool owner) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t size     = 4 * page;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), size, page, SceKernelMtypeC,
+	                                   &physical),
+	        "allocate direct fixture");
+	void* address = nullptr;
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&address, size, SceKernelProtCpuRw, 0, physical, page,
+	                                   "partial_unmap_protection"),
+	        "map direct fixture");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	for (const uint64_t index: {uint64_t {0}, uint64_t {3}}) {
+		const auto target = base + index * page;
+		if (owner) {
+			Check(test, ProtectGuestHostMemory(target, page, Common::VirtualMemory::Mode::Read),
+			      "owner could not protect a page");
+		} else {
+			CheckOk(test, KernelMprotect(reinterpret_cast<void*>(target), page, SceKernelProtCpuRead),
+			        "guest mprotect of a page");
+		}
+	}
+	// Baseline. Without the unmap the protection is in place, so a later loss comes from the unmap.
+	Check(test, IsHostReadOnly(base) && IsHostReadOnly(base + 3 * page),
+	      "protection was not applied before the unmap");
+	CheckOk(test, KernelMunmap(base + page, page), "unmap page 1");
+	Check(test, IsHostReadOnly(base), "partial unmap lost read-only protection on the left piece");
+	Check(test, IsHostReadOnly(base + 3 * page),
+	      "partial unmap lost read-only protection on the right piece");
+	Check(test, IsHostWritable(base + 2 * page),
+	      "partial unmap left an unprotected surviving page not writable");
+	CheckOk(test, KernelMunmap(base, page), "unmap page 0");
+	CheckOk(test, KernelMunmap(base + 2 * page, 2 * page), "unmap pages 2 and 3");
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "release direct fixture");
+}
+
+// Partial unmaps keep read-only protection on the surviving pieces, however it was set.
+void TestDirectPartialUnmapKeepsSurvivingProtection() {
+	const char* test = "DirectPartialUnmapKeepsSurvivingProtection";
+	CheckPartialUnmapKeepsProtection(test, false);
+	CheckPartialUnmapKeepsProtection(test, true);
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5818,6 +5901,7 @@ int main(int argc, char** argv) {
 		RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+		RunTest(TestDirectPartialUnmapKeepsSurvivingProtection);
 		RunTest(TestDirectTrimmedAliasReleaseRollback);
 		RunTest(TestDirectMappingNamesTypesAndValidation);
 		RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
@@ -5845,6 +5929,7 @@ int main(int argc, char** argv) {
 		RunTest(TestFixedArenaChurnKeepsRangesExact);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+		RunTest(TestDirectPartialUnmapKeepsSurvivingProtection);
 #if defined(__linux__)
 		RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif
@@ -5947,6 +6032,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+	RunTest(TestDirectPartialUnmapKeepsSurvivingProtection);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
 #if defined(__linux__)

@@ -5418,10 +5418,10 @@ void TestScalarAndVectorBufferAlias() {
         "scalar/vector alias did not share a dense index");
 }
 
-void TestRuntimeUnsignedMinDescriptor() {
+void TestRuntimeClampedDescriptor() {
   Fixture fixture;
-  const auto word3 =
-      fixture.Emit(ValueOpcode::UMin32, {fixture.UserData(0), Value(0x100u)});
+  const auto low = fixture.Emit(ValueOpcode::SMax32, {fixture.UserData(0), Value(0u)});
+  const auto word3 = fixture.Emit(ValueOpcode::UMin32, {low, Value(0x100u)});
   const auto descriptor =
       fixture.Buffer({Value(0u), Value(0u), Value(64u), word3}, 0x330);
   MemoryInfo memory;
@@ -5436,14 +5436,14 @@ void TestRuntimeUnsignedMinDescriptor() {
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue value;
   const auto source = fixture.program.info.buffers[0].source;
-  Check(EvaluateSrtDescriptor(plan, runtime, source, value) &&
-            value.dwords[3] == 0x100u,
+  Check(EvaluateSrtDescriptor(plan, runtime, source, value) && value.dwords[3] == 0u,
+        "runtime descriptor signed maximum did not clamp a negative operand");
+  user_data[0] = 0x200u;
+  Check(EvaluateSrtDescriptor(plan, runtime, source, value) && value.dwords[3] == 0x100u,
         "runtime descriptor unsigned minimum did not clamp its first operand");
   user_data[0] = 0x80u;
-  Check(
-      EvaluateSrtDescriptor(plan, runtime, source, value) &&
-          value.dwords[3] == 0x80u,
-      "runtime descriptor unsigned minimum did not preserve its first operand");
+  Check(EvaluateSrtDescriptor(plan, runtime, source, value) && value.dwords[3] == 0x80u,
+        "runtime descriptor clamp did not preserve an in-range operand");
 }
 
 void TestImagesSamplersAndAliases() {
@@ -9014,7 +9014,7 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
-    Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
+    Run("runtime clamp", TestRuntimeClampedDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

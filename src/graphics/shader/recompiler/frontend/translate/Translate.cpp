@@ -726,9 +726,12 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value,
 		}
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi: {
+			// The per-lane EXEC takes the value as is; the words keep only the lanes the host
+			// runs (S_ORN2_SAVEEXEC, S_U64_MASK to EXEC and the like can set every bit).
+			const auto present = PresentMask();
 			ir.SetExec(value);
-			ir.SetExecLo(mask[0]);
-			ir.SetExecHi(mask[1]);
+			ir.SetExecLo(ir.BitwiseAnd(mask[0], present[0]));
+			ir.SetExecHi(ir.BitwiseAnd(mask[1], present[1]));
 			return;
 		}
 		case Decoder::OperandKind::VccLo:

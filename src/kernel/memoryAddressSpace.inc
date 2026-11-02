@@ -308,6 +308,9 @@ public:
 		return true;
 	}
 
+	// Unmaps a range inside one map entry. On Windows an exact match drops the whole view and a
+	// partial range goes through UnmapPartialView, which keeps the survivors translatable. Other
+	// platforms replace only the requested range.
 	bool UnmapOne(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
@@ -321,47 +324,25 @@ public:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MapEntry old {};
+		bool     exact = false;
 		{
 			std::lock_guard lock(m_mutex);
-			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
+			const auto      it = std::prev(m_maps.upper_bound(vaddr));
+			old                = it->second;
+			exact              = (vaddr == old.vaddr && size == old.size);
+			if (exact) {
+				m_maps.erase(it);
+			}
+		}
+		if (!exact) {
+			return UnmapPartialView(old, vaddr, size);
 		}
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			std::lock_guard lock(m_mutex);
 			m_maps.emplace(old.vaddr, old);
 			return false;
 		}
-
-		const uint64_t left_size  = vaddr - old.vaddr;
-		const uint64_t right_addr = vaddr + size;
-		const uint64_t right_size = old.vaddr + old.size - right_addr;
-		bool           ok         = true;
-		if (left_size != 0) {
-			ok = SplitPlaceholder(old.vaddr, left_size) && ok;
-		}
-		if (right_size != 0) {
-			ok = SplitPlaceholder(vaddr, size) && ok;
-		}
-		if (left_size != 0) {
-			ok = MapFixed(old.vaddr, left_size, old.backing_offset, old.mode) && ok;
-		}
-		if (right_size != 0) {
-			ok = MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
-			              old.mode) &&
-			     ok;
-		}
-		if (ok) {
-			return true;
-		}
-
-		if (left_size != 0 && Contains(old.vaddr, left_size)) {
-			EXIT_IF(!UnmapOne(old.vaddr, left_size));
-		}
-		if (right_size != 0 && Contains(right_addr, right_size)) {
-			EXIT_IF(!UnmapOne(right_addr, right_size));
-		}
-		EXIT_IF(!CoalescePlaceholders(old.vaddr, old.size));
-		EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
-		return false;
+		return true;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
 		// protections on the surviving mappings remain intact.
@@ -467,8 +448,143 @@ private:
 		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
+	// A view that is cut by a partial unmap, and the survivors that replace it. A survivor of size
+	// zero does not exist. The right piece keeps its address either way so the removed middle can
+	// be derived from the two pieces.
+	struct SplitPieces {
+		MapEntry old;
+		MapEntry left;
+		MapEntry right;
+	};
+
+	// Describes the survivors left when [vaddr, vaddr + size) is removed from one view.
+	static SplitPieces MakeSplitPieces(const MapEntry& old, uint64_t vaddr, uint64_t size) {
+		const uint64_t right_addr = vaddr + size;
+		return {old,
+		        {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode},
+		        {right_addr, old.vaddr + old.size - right_addr,
+		         old.backing_offset + (right_addr - old.vaddr), old.mode}};
+	}
+
+	// Replaces the map entry of a view with the entries of its survivors in one lock hold.
+	// Readers copy through the backing alias, so they only need the translation, and it never
+	// disappears for an address that survives.
+	void PublishSurvivors(const SplitPieces& pieces) {
+		std::lock_guard lock(m_mutex);
+		m_maps.erase(pieces.old.vaddr);
+		for (const auto* piece: {&pieces.left, &pieces.right}) {
+			if (piece->size != 0) {
+				m_maps.emplace(piece->vaddr, *piece);
+			}
+		}
+	}
+
+	// Puts the entry of a whole view back and drops its survivors' entries in one lock hold.
+	void RestoreOldEntry(const SplitPieces& pieces) {
+		std::lock_guard lock(m_mutex);
+		for (const auto* piece: {&pieces.left, &pieces.right}) {
+			if (piece->size != 0) {
+				m_maps.erase(piece->vaddr);
+			}
+		}
+		m_maps.emplace(pieces.old.vaddr, pieces.old);
+	}
+
+	// How far RemapSurvivors got. A split placeholder must be coalesced again on rollback, and a
+	// mapped survivor must be unmapped first.
+	struct RemapProgress {
+		bool split        = false;
+		bool left_mapped  = false;
+		bool right_mapped = false;
+	};
+
+	// Splits the placeholder of an unmapped view and maps the survivors into it. The map entries
+	// already describe the survivors, so this touches only the host.
+	bool RemapSurvivors(const SplitPieces& pieces, RemapProgress* progress) {
+		const uint64_t middle_addr = pieces.left.vaddr + pieces.left.size;
+		const uint64_t middle_size = pieces.right.vaddr - middle_addr;
+		if (pieces.left.size != 0) {
+			if (!SplitPlaceholder(pieces.left.vaddr, pieces.left.size)) {
+				return false;
+			}
+			progress->split = true;
+		}
+		if (pieces.right.size != 0) {
+			if (!SplitPlaceholder(middle_addr, middle_size)) {
+				return false;
+			}
+			progress->split = true;
+		}
+		for (const auto& [piece, mapped]: {std::pair {&pieces.left, &progress->left_mapped},
+		                                   std::pair {&pieces.right, &progress->right_mapped}}) {
+			if (piece->size == 0) {
+				continue;
+			}
+			if (!ReplacePlaceholderView(piece->vaddr, piece->size, piece->backing_offset,
+			                            piece->mode, nullptr)) {
+				return false;
+			}
+			*mapped = true;
+		}
+		return true;
+	}
+
+	// Puts a view back whole after its survivors could not all be mapped. Failing here would
+	// leave guest memory half unmapped, so it aborts instead of returning. The coalesce is skipped
+	// when nothing was split, because the unmapped view is still one placeholder.
+	void RestoreWholeView(const SplitPieces& pieces, const RemapProgress& progress) {
+		if (progress.left_mapped) {
+			EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(pieces.left.vaddr),
+			                                      pieces.left.size));
+		}
+		if (progress.right_mapped) {
+			EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(pieces.right.vaddr),
+			                                      pieces.right.size));
+		}
+		const auto& old = pieces.old;
+		EXIT_IF(progress.split && !CoalescePlaceholders(old.vaddr, old.size));
+		EXIT_IF(!ReplacePlaceholderView(old.vaddr, old.size, old.backing_offset, old.mode, nullptr));
+		RestoreOldEntry(pieces);
+	}
+
+	// Unmaps part of one view. Windows cannot unmap part of a view, so the whole host view goes
+	// and the survivors are mapped again. Their map entries are published before the host view
+	// is touched, so a concurrent backing read of a surviving address never sees a gap. On
+	// failure the original view and entry come back exactly.
+	bool UnmapPartialView(const MapEntry& old, uint64_t vaddr, uint64_t size) {
+		const auto pieces = MakeSplitPieces(old, vaddr, size);
+		PublishSurvivors(pieces);
+		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
+			RestoreOldEntry(pieces);
+			return false;
+		}
+		RemapProgress progress;
+		if (RemapSurvivors(pieces, &progress)) {
+			return true;
+		}
+		RestoreWholeView(pieces, progress);
+		return false;
+	}
+
+	// Maps a file view over a placeholder. The view is not recorded in m_maps, so callers that
+	// need a translation add it themselves. Tests can observe the moment before the map and make
+	// a chosen map fail.
 	bool ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                            VirtualMemory::Mode mode, FailureReason* failure_reason) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (const auto callback = g_test_before_backing_map) {
+			g_test_before_backing_map = nullptr;
+			callback(vaddr, size);
+		}
+		if (g_test_backing_remaps_before_failure == 0) {
+			g_test_backing_remaps_before_failure = UINT32_MAX;
+			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
+			return false;
+		}
+		if (g_test_backing_remaps_before_failure != UINT32_MAX) {
+			g_test_backing_remaps_before_failure--;
+		}
+#endif
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr =

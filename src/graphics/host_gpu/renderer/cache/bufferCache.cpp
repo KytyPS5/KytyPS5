@@ -325,12 +325,14 @@ void BufferCache::CollectHotDownloads(BufferId main_id, std::vector<BatchedDownl
 		if (estimate == 0 || estimate > budget) {
 			return;
 		}
-		auto pending = CollectDownloadCopies(hot, hot.CpuAddress(), hot.Size());
+		const auto hot_address = hot.CpuAddress();
+		const auto hot_size    = hot.Size();
+		auto       pending     = CollectDownloadCopies(hot, hot_address, hot_size);
 		if (pending.copies.empty()) {
 			return;
 		}
 		budget -= std::min(budget, pending.total_size);
-		batch.push_back({&hot, std::move(pending)});
+		batch.push_back({&hot, std::move(pending), hot_address, hot_size});
 	});
 }
 
@@ -364,8 +366,8 @@ bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint6
 		PublishDownload(item.pending);
 	}
 	for (size_t index = 1; index < batch.size(); ++index) {
-		m_memory_tracker.UnmarkRegionAsGpuModified(batch[index].buffer->CpuAddress(),
-		                                           batch[index].buffer->Size());
+		m_memory_tracker.UnmarkRegionAsGpuModified(batch[index].unmark_address,
+		                                           batch[index].unmark_size);
 	}
 	return true;
 }

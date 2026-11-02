@@ -144,6 +144,11 @@ private:
 	struct BatchedDownload {
 		Buffer*         buffer = nullptr;
 		PendingDownload pending;
+		// The range to mark clean once published. It must equal what was collected, because a
+		// partial span must not clear GPU-dirty pages that were never downloaded. The main
+		// entry leaves it empty, as its caller unmarks the main window.
+		uint64_t unmark_address = 0;
+		uint64_t unmark_size    = 0;
 	};
 	void ReserveDownloadMemory(std::span<PendingDownload* const> items);
 	void RecordDownload(const Buffer& buffer, const PendingDownload& pending);

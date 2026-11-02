@@ -237,6 +237,11 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
+// Reports the opt-in --keep-gpu-cache-on-reuse setting.
+bool KeepGpuCacheOnReuse() {
+	return g_config->keep_gpu_cache_on_reuse;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

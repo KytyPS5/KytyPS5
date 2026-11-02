@@ -3246,6 +3246,490 @@ void TestDirectMapUnmapReusesHostAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Large enough for one formatted event.
+constexpr size_t   RemapEventTextSize     = 96;
+// A far away address that no earlier mapping in the test shares, for views of the same memory.
+constexpr uint64_t RemapAliasDistance     = 0x10000000ull;
+// The PRT aperture only accepts addresses from 0xf00000000, so entries under it need one there.
+// Linux and Windows start their user range at 0x1000000000, but x86-64 macOS has a gap from
+// 0xfc0000000 up to 0x7000000000, so this is the first address that is a user address everywhere.
+constexpr uint64_t RemapPrtTestAddress    = 0x7000000000ull;
+
+// Events from the GPU range hook and the suspend hook share one list so their order is visible.
+// U and M are unmap and map, S, R and C are suspend, resume and cancel.
+struct RemapEvent {
+	char     kind;
+	uint64_t address;
+	size_t   size;
+	bool operator==(const RemapEvent&) const = default;
+};
+std::vector<RemapEvent> g_remap_events;
+
+// Records a GPU range unmap or map from the kernel.
+void ObserveRemapGpuRange(bool mapped, uint64_t address, size_t size) {
+	g_remap_events.push_back({mapped ? 'M' : 'U', address, size});
+}
+
+// Records a suspend, resume or cancel request from the kernel.
+void ObserveRemapSuspend(Libs::LibKernel::Memory::TestGpuSuspendEvent event, uint64_t address,
+                         size_t size) {
+	using Libs::LibKernel::Memory::TestGpuSuspendEvent;
+	const char kind = event == TestGpuSuspendEvent::Suspend  ? 'S'
+	                  : event == TestGpuSuspendEvent::Resume ? 'R'
+	                                                         : 'C';
+	g_remap_events.push_back({kind, address, size});
+}
+
+// Starts recording both hooks into a fresh list.
+void StartRemapRecording() {
+	using namespace Libs::LibKernel::Memory;
+	g_remap_events.clear();
+	TestSetGpuRangeCallback(ObserveRemapGpuRange);
+	TestSetGpuSuspendCallback(ObserveRemapSuspend);
+}
+
+// Stops recording, so setup and cleanup calls stay out of the event list.
+void StopRemapRecording() {
+	using namespace Libs::LibKernel::Memory;
+	TestSetGpuRangeCallback(nullptr);
+	TestSetGpuSuspendCallback(nullptr);
+}
+
+// Formats events as kind(address,size) for failure messages.
+std::string DescribeRemapEvents(const std::vector<RemapEvent>& events) {
+	std::string text;
+	for (const auto& event: events) {
+		char entry[RemapEventTextSize] = {};
+		std::snprintf(entry, sizeof(entry), "%c(0x%" PRIx64 ",0x%zx) ", event.kind, event.address,
+		              event.size);
+		text += entry;
+	}
+	return events.empty() ? "(none)" : text;
+}
+
+// Fails the test unless the recorded events are exactly the expected list.
+void CheckRemapEvents(const char* test, const std::vector<RemapEvent>& expected,
+                      const char* what) {
+	if (g_remap_events != expected) {
+		Fail(test, std::string(what) + ": expected " + DescribeRemapEvents(expected) +
+		               "but saw " + DescribeRemapEvents(g_remap_events));
+	}
+}
+
+// Allocates direct memory and returns its physical offset.
+int64_t AllocateRemapBlock(const char* test, uint64_t size) {
+	using namespace Libs::LibKernel::Memory;
+	int64_t physical = 0;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(SceKernelDirectMemoryStart, KernelGetDirectMemorySize(), size,
+	                                   SceKernelPageSize, SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	return physical;
+}
+
+// Maps direct memory read-write, at a fixed address when one is given.
+uint64_t MapRemapBlock(const char* test, int64_t physical, uint64_t size, uint64_t fixed_address,
+                       int protection = SceKernelProtCpuRw) {
+	using namespace Libs::LibKernel::Memory;
+	void* address = reinterpret_cast<void*>(fixed_address);
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&address, size, protection,
+	                                   fixed_address != 0 ? SceKernelMapFixed : 0, physical,
+	                                   SceKernelPageSize, "remap_suspension"),
+	        "KernelMapNamedDirectMemory");
+	if (fixed_address != 0) {
+		Check(test, reinterpret_cast<uint64_t>(address) == fixed_address,
+		      "fixed direct map moved");
+	}
+	return reinterpret_cast<uint64_t>(address);
+}
+
+// Maps a block, fills it with a pattern, and releases it so that the kernel holds it suspended.
+// Only the release is left in the event list. Returns the address it was mapped at.
+uint64_t MapFillAndRelease(const char* test, int64_t physical, uint64_t size, uint64_t pattern,
+                           uint64_t fixed_address = 0) {
+	using namespace Libs::LibKernel::Memory;
+	const auto address = MapRemapBlock(test, physical, size, fixed_address);
+	for (uint64_t offset = 0; offset < size; offset += sizeof(uint64_t)) {
+		*reinterpret_cast<uint64_t*>(address + offset) = pattern + offset;
+	}
+	g_remap_events.clear();
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "KernelReleaseDirectMemory");
+	return address;
+}
+
+// Fails the test unless the block still holds the pattern written before the release.
+void CheckRemapPattern(const char* test, uint64_t address, uint64_t size, uint64_t pattern) {
+	for (uint64_t offset = 0; offset < size; offset += sizeof(uint64_t)) {
+		Check(test, *reinterpret_cast<const uint64_t*>(address + offset) == pattern + offset,
+		      "direct memory contents changed across the release and remap");
+	}
+}
+
+// Case a, releases and maps the same memory back, with the flag off or on.
+void RunReleaseRemapSameOffset(const char* test, bool keep_gpu_cache) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size    = SceKernelPageSize * 4;
+	constexpr uint64_t pattern = 0x52454d41500000ull;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(keep_gpu_cache);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, pattern);
+	const auto again = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	MapRemapBlock(test, again, size, address);
+	StopRemapRecording();
+	if (keep_gpu_cache) {
+		CheckRemapEvents(test, {{'S', address, size}, {'R', address, size}},
+		                 "flag on, same offset: suspend and resume without an unmap and map");
+	} else {
+		CheckRemapEvents(test,
+		                 {{'U', address, size}, {'U', address, size}, {'M', address, size}},
+		                 "flag off: today's unmap, unmap and map with no suspend events");
+	}
+	CheckRemapPattern(test, address, size, pattern);
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Case b, a different physical offset must not resume.
+void RunRemapDifferentOffset(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto first  = AllocateRemapBlock(test, size);
+	const auto second = AllocateRemapBlock(test, size);
+	Check(test, first != second, "two live blocks shared an offset");
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, first, size, 0x4f4646ull);
+	MapRemapBlock(test, second, size, address);
+	StopRemapRecording();
+	CheckRemapEvents(test,
+	                 {{'S', address, size},
+	                  {'C', address, size},
+	                  {'U', address, size},
+	                  {'M', address, size}},
+	                 "different offset: cancel, then a normal unmap and map");
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(second, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Case c, a view of the physical memory elsewhere cancels, even if it is unmapped again.
+void RunRemapAfterAliasView(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, 0x414c494153ull);
+	const auto again = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	const auto alias = address + RemapAliasDistance;
+	MapRemapBlock(test, again, size, alias);
+	CheckOk(test, KernelMunmap(alias, size), "KernelMunmap(alias)");
+	MapRemapBlock(test, again, size, address);
+	StopRemapRecording();
+	CheckRemapEvents(test,
+	                 {{'S', address, size},
+	                  {'U', alias, size},
+	                  {'C', address, size},
+	                  {'M', alias, size},
+	                  {'U', alias, size},
+	                  {'U', address, size},
+	                  {'M', address, size}},
+	                 "alias view in between: cancelled when it mapped, then a plain map");
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Case d, flexible and private maps over the address cancel before they map.
+void RunRemapOverwrittenByOtherMaps(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	TestSetKeepGpuCacheOnReuse(true);
+	for (const bool flexible: {true, false}) {
+		const auto physical = AllocateRemapBlock(test, size);
+		StartRemapRecording();
+		const auto address = MapFillAndRelease(test, physical, size, 0x4f544845ull);
+		if (flexible) {
+			void* target = reinterpret_cast<void*>(address);
+			CheckOk(test,
+			        KernelMapFlexibleMemory(&target, size, SceKernelProtCpuRw, SceKernelMapFixed),
+			        "KernelMapFlexibleMemory(fixed)");
+		} else {
+			Check(test,
+			      AllocateRuntimeMemory(address, size, Common::VirtualMemory::Mode::ReadWrite,
+			                            "remap_private", true) == address,
+			      "AllocateRuntimeMemory(fixed)");
+		}
+		StopRemapRecording();
+		CheckRemapEvents(test,
+		                 {{'S', address, size},
+		                  {'C', address, size},
+		                  {'U', address, size},
+		                  {'M', address, size}},
+		                 flexible ? "flexible map over suspended memory: cancel before the map"
+		                          : "private map over suspended memory: cancel before the map");
+		if (flexible) {
+			CheckOk(test, KernelMunmap(address, size), "KernelMunmap(flexible)");
+		} else {
+			Check(test, FreeGuestMemory(address, size), "FreeGuestMemory");
+		}
+	}
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Case e, mapping part of the memory cannot resume the whole entry.
+void RunRemapSmallerSize(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, 0x48414c46ull);
+	const auto again = AllocateRemapBlock(test, size / 2);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	MapRemapBlock(test, again, size / 2, address);
+	StopRemapRecording();
+	CheckRemapEvents(test,
+	                 {{'S', address, size},
+	                  {'C', address, size},
+	                  {'U', address, size / 2},
+	                  {'M', address, size / 2}},
+	                 "half the size: cancel the whole entry, then a normal map");
+	CheckOk(test, KernelMunmap(address, size / 2), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size / 2), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Case f, a release that fails halfway puts the memory back the way it was, with nothing held.
+void RunRemapFailedRelease(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	TestSetKeepGpuCacheOnReuse(true);
+	// The first failure is before any view goes away, so only the rollback in the release path
+	// can cancel. The second is after the views are gone, where the cancel comes from the vaddr
+	// rule of MapBackingForGuest when restore_owner_aliases maps the views back.
+	for (const bool fail_after_views: {false, true}) {
+		const auto physical = AllocateRemapBlock(test, size);
+		const auto address  = MapRemapBlock(test, physical, size, 0);
+		for (uint64_t offset = 0; offset < size; offset += sizeof(uint64_t)) {
+			*reinterpret_cast<uint64_t*>(address + offset) = 0x464149ull + offset;
+		}
+		StartRemapRecording();
+		if (fail_after_views) {
+			TestFailNextPhysicalMemoryUnmap();
+		} else {
+			TestFailGuestBackingStoreUnmapAfter(0);
+		}
+		CheckFailed(test, KernelCheckedReleaseDirectMemory(physical, size),
+		            "KernelCheckedReleaseDirectMemory(injected failure)");
+		StopRemapRecording();
+		CheckRemapEvents(test,
+		                 {{'S', address, size}, {'C', address, size}, {'M', address, size}},
+		                 fail_after_views ? "failed release after the views were removed"
+		                                  : "failed release before any view was removed");
+		CheckRemapPattern(test, address, size, 0x464149ull);
+		CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+		CheckOk(test, KernelReleaseDirectMemory(physical, size), "KernelReleaseDirectMemory(cleanup)");
+	}
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Cases g and h, the table holds 32 entries and teardown cancels what is left.
+void RunRemapTableCapacityAndTeardown(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	const size_t       capacity = TestSuspendedRangeCapacity();
+	constexpr uint64_t size     = SceKernelPageSize;
+
+	std::vector<int64_t>  physical;
+	std::vector<uint64_t> address;
+	for (size_t index = 0; index < capacity + 1; ++index) {
+		physical.push_back(AllocateRemapBlock(test, size));
+		address.push_back(MapRemapBlock(test, physical.back(), size, 0));
+	}
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	std::vector<RemapEvent> expected;
+	for (size_t index = 0; index < physical.size(); ++index) {
+		CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical[index], size),
+		        "KernelReleaseDirectMemory");
+		expected.push_back({'S', address[index], size});
+	}
+	// The 33rd suspension pushes out the oldest one.
+	expected.push_back({'C', address[0], size});
+	CheckRemapEvents(test, expected, "a full table cancels its oldest entry");
+
+	g_remap_events.clear();
+	// Installing no GPU is the teardown path. Everything still held is cancelled, oldest first.
+	InstallGpuResources(nullptr);
+	StopRemapRecording();
+	expected.clear();
+	for (size_t index = 1; index < address.size(); ++index) {
+		expected.push_back({'C', address[index], size});
+	}
+	CheckRemapEvents(test, expected, "teardown cancels every entry that is left");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Case h in isolation, after teardown nothing is left to resume.
+void RunRemapAfterTeardown(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, 0x5445415244ull);
+	InstallGpuResources(nullptr);
+	CheckRemapEvents(test, {{'S', address, size}, {'C', address, size}},
+	                 "teardown cancels the suspended entry");
+	g_remap_events.clear();
+	const auto again = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	MapRemapBlock(test, again, size, address);
+	StopRemapRecording();
+	CheckRemapEvents(test, {{'U', address, size}, {'M', address, size}},
+	                 "after teardown the same remap is a plain unmap and map");
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Only a read-write remap may resume, so the same remap as read-only cancels.
+void RunRemapReadOnlyIsNotResumed(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, 0x524f4e4cull);
+	const auto again   = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	MapRemapBlock(test, again, size, address, SceKernelProtCpuRead);
+	StopRemapRecording();
+	CheckRemapEvents(test,
+	                 {{'S', address, size},
+	                  {'C', address, size},
+	                  {'U', address, size},
+	                  {'M', address, size}},
+	                 "read-only remap of the same memory: cancel, then a normal map");
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// A remap that fails after its view exists cancels, and the next remap is a plain one.
+void RunRemapFailedAfterView(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, 0x4641494cull);
+	const auto again   = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	void* target = reinterpret_cast<void*>(address);
+	TestFailNextPhysicalMemoryMap();
+	CheckFailed(test,
+	            KernelMapNamedDirectMemory(&target, size, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                       again, SceKernelPageSize, "remap_failed"),
+	            "KernelMapNamedDirectMemory(injected failure)");
+	CheckRemapEvents(test, {{'S', address, size}, {'C', address, size}},
+	                 "failed remap after the view was created: cancel");
+	g_remap_events.clear();
+	MapRemapBlock(test, again, size, address);
+	StopRemapRecording();
+	CheckRemapEvents(test, {{'U', address, size}, {'M', address, size}},
+	                 "remap after a failed one: nothing is left to resume");
+	CheckRemapPattern(test, address, size, 0x4641494cull);
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// Two views of the same memory are both held, and only the exact one resumes.
+void RunRemapOnlyExactAliasResumes(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	const auto first    = MapRemapBlock(test, physical, size, 0);
+	const auto second   = MapRemapBlock(test, physical, size, 0);
+	Check(test, first < second, "the aliases were not placed in address order");
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "KernelReleaseDirectMemory");
+	CheckRemapEvents(test, {{'S', first, size}, {'S', second, size}},
+	                 "release of two aliases suspends both");
+	const auto again = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	MapRemapBlock(test, again, size, first);
+	StopRemapRecording();
+	CheckRemapEvents(test,
+	                 {{'S', first, size}, {'S', second, size}, {'C', second, size}, {'R', first, size}},
+	                 "remap of one alias: the other is cancelled, this one resumes");
+	CheckOk(test, KernelMunmap(first, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+// A PRT aperture over held memory maps it on the GPU, so the kernel must cancel it first.
+void RunRemapPrtApertureOverEntry(const char* test) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t size = SceKernelPageSize * 4;
+
+	const auto physical = AllocateRemapBlock(test, size);
+	TestSetKeepGpuCacheOnReuse(true);
+	StartRemapRecording();
+	const auto address = MapFillAndRelease(test, physical, size, 0x505254ull, RemapPrtTestAddress);
+	CheckOk(test, KernelSetPrtAperture(0, reinterpret_cast<void*>(address), size),
+	        "KernelSetPrtAperture");
+	CheckRemapEvents(test,
+	                 {{'S', address, size}, {'C', address, size}, {'M', address, size}},
+	                 "aperture over held memory: cancel before the GPU map");
+	g_remap_events.clear();
+	const auto again = AllocateRemapBlock(test, size);
+	Check(test, again == physical, "the allocator did not hand back the released offset");
+	MapRemapBlock(test, again, size, address);
+	StopRemapRecording();
+	CheckRemapEvents(test, {{'U', address, size}, {'M', address, size}},
+	                 "remap after the aperture: nothing is left to resume");
+	CheckOk(test, KernelSetPrtAperture(0, nullptr, 0), "KernelSetPrtAperture(clear)");
+	CheckOk(test, KernelMunmap(address, size), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(again, size), "KernelReleaseDirectMemory(cleanup)");
+	TestSetKeepGpuCacheOnReuse(false);
+}
+
+void TestReleaseRemapSuspension() {
+	const char* test = "ReleaseRemapSuspension";
+	RunReleaseRemapSameOffset(test, false);
+	RunReleaseRemapSameOffset(test, true);
+	RunRemapDifferentOffset(test);
+	RunRemapAfterAliasView(test);
+	RunRemapOverwrittenByOtherMaps(test);
+	RunRemapSmallerSize(test);
+	RunRemapReadOnlyIsNotResumed(test);
+	RunRemapFailedAfterView(test);
+	RunRemapOnlyExactAliasResumes(test);
+	RunRemapPrtApertureOverEntry(test);
+	RunRemapFailedRelease(test);
+	RunRemapTableCapacityAndTeardown(test);
+	RunRemapAfterTeardown(test);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__)
 void TestFixedDirectReplacementPreservesAccess() {
 	using namespace Libs::LibKernel::Memory;
@@ -5975,6 +6459,7 @@ int main(int argc, char** argv) {
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+	RunTest(TestReleaseRemapSuspension);
 #if defined(__linux__)
 	RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif

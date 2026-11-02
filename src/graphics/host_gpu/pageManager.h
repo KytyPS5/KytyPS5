@@ -25,6 +25,14 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	/// Re-arms host protection for [vaddr, vaddr+size) from the current watcher counts.
+	/// Use it after the host view was replaced with a fresh read-write mapping while the
+	/// counts were kept. Counts are never changed. Pages with a read watcher become
+	/// no-access, pages with only write watchers become read-only and unwatched pages are
+	/// left alone. Contiguous pages needing the same protection share one host call.
+	/// A size of 0 is accepted as a no-op, unlike UpdatePageWatchers.
+	void ReapplyProtection(uint64_t vaddr, uint64_t size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

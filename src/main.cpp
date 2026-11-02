@@ -108,6 +108,8 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --keep-gpu-cache-on-reuse            Keep GPU buffer caches when released direct memory\n"
+	         "                                       is mapped back unchanged. Experimental. Default: off.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -230,6 +232,7 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+    {"--keep-gpu-cache-on-reuse", &ConfigOptions::keep_gpu_cache_on_reuse},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

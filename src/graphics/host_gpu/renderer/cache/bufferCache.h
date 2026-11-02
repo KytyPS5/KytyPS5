@@ -53,6 +53,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Publishes GPU-written bytes of a range about to lose its host view, without marking pages
+	// CPU-dirty. Registered buffers and their tracker state are otherwise left as they are.
+	void                   FlushGpuDirtyForSuspend(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);

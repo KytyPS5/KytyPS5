@@ -21,12 +21,6 @@ struct PssrParameters {
 	uint32_t output_channels[4];
 };
 
-bool IsInputFormat(Prospero::BufferFormat format) {
-	return format == Prospero::BufferFormat::k11_11_10Float ||
-	       format == Prospero::BufferFormat::k10_11_11Float ||
-	       format == Prospero::BufferFormat::k16_16_16_16Float;
-}
-
 } // namespace
 
 RenderExecutor::~RenderExecutor() {
@@ -50,7 +44,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		       descriptor.TileMode() != Prospero::TileMode::kDepth;
 	};
 	EXIT_IF(!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
-	        !IsInputFormat(input_descriptor.Format()) ||
+	        !Pssr::IsColorFormat(input_descriptor.Format()) ||
 	        output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
 	        output_descriptor.TileMode() != Prospero::TileMode::kStandard256B ||
 	        output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||

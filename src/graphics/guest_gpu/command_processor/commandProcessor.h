@@ -116,6 +116,14 @@ public:
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	/// Queues the pending GPU-to-guest image readbacks before an end-of-pipe signal and submits
+	/// them, so their data is on its way when the guest sees the signal.
+	/// @param data_sel the RELEASE_MEM data selector. A GDS read submits them itself.
+	void SubmitReadbacksBeforeLabel(uint32_t data_sel);
+	/// Queues the pending readbacks, dropping images that can't be downloaded yet.
+	/// @return true if any were queued.
+	bool QueueReadbacksBeforeLabel();
+
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	uint32_t            NumInstances();

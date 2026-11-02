@@ -377,6 +377,13 @@ struct TextureCacheTestAccess {
     cache.m_readback_linear_images = enabled;
   }
 
+  // Raises every garbage-collection threshold, so RunGarbageCollector frees nothing.
+  static void DisableGarbageCollection(TextureCache &cache) {
+    cache.m_trigger_gc_memory = UINT64_MAX;
+    cache.m_pressure_gc_memory = UINT64_MAX;
+    cache.m_critical_gc_memory = UINT64_MAX;
+  }
+
   static std::pair<uint8_t *, uint64_t>
   MapDownload(TextureCache &cache, uint64_t size, uint64_t alignment) {
     auto &download =
@@ -10654,6 +10661,246 @@ public:
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
     }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // At a label, an enrolled image that cannot be downloaded yet is dropped, not kept. Its guest
+  // memory is newer than the GPU result, and a retry would land a frame or more later.
+  void CheckTextureCacheDownloadDropAtLabel() {
+    constexpr const char *name = "TextureCacheDownloadDropAtLabel";
+    constexpr uintptr_t base = 0x0000000240c00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t cpu_value = 0x2468ace0u;
+    constexpr bool keep_unready = false;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      auto &command = scheduler.Current();
+      auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      desc.type = BindingType::Storage;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      Require(name, "image clear",
+              texture_cache.ClearImageFromBuffer(command, base, sizeof(uint32_t), gpu_value),
+              "failed to create GPU-current image contents");
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+      Libs::LibKernel::Memory::WriteBacking(base, &cpu_value, sizeof(cpu_value));
+
+      // A CPU write since the GPU one makes the image unsafe to download.
+      auto &owner = TextureCacheTestAccess::MutableImage(texture_cache, image);
+      owner.MarkCpuDirty();
+      const bool dropped = !texture_cache.ProcessDownloadImages(keep_unready) &&
+                           !TextureCacheTestAccess::PendingDownload(texture_cache, image) &&
+                           !texture_cache.HasReadbacksInFlight();
+      Require(name, "dropped at label", dropped,
+              "an image that could not be downloaded at a label was kept or queued");
+
+      // Once it could be downloaded, a later call has nothing left to write after the label.
+      owner.RefreshComplete();
+      Require(name, "no late retry",
+              !texture_cache.ProcessDownloadImages() && !texture_cache.HasReadbacksInFlight(),
+              "a dropped image was still copied by a later call");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      uint32_t current = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base, &current, sizeof(current));
+      Require(name, "guest memory kept", current == cpu_value,
+              "a dropped image overwrote guest memory");
+
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A label released with an image readback pending queues and submits the readback, and is
+  // written at once. It is never held back for the readback, since a held label shows the game the
+  // host GPU's real speed. The readback's data reaches guest memory once its GPU work is done.
+  void CheckReadbackAtLabel() {
+    constexpr const char *name = "ReadbackAtLabel";
+    constexpr uintptr_t base = 0x0000000240400000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t stale_value = 0x2468ace0u;
+    constexpr uint32_t label_value = 0x55u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, allocation_size);
+    auto &texture_cache = context.GetTextureCache();
+    CommandProcessor processor(context, 0);
+
+    alignas(uint64_t) uint32_t label = 0;
+    const auto label_address = reinterpret_cast<uint64_t>(&label);
+    // The same RELEASE_MEM layout as the PM4 tests, with an end-of-pipe event.
+    constexpr uint32_t bottom_of_pipe_event = 0x28u;
+    constexpr uint32_t event_index = 5u;
+    std::array<uint32_t, 8> release{};
+    release[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+    release[1] = bottom_of_pipe_event | (event_index << 8u);
+    release[2] = 1u << 29u; // INT_SEL 0 (none), DATA_SEL 1 (32-bit value)
+    release[3] = static_cast<uint32_t>(label_address);
+    release[4] = static_cast<uint32_t>(label_address >> 32u);
+    release[5] = label_value;
+
+    const auto read_guest = [] {
+      uint32_t value = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value));
+      return value;
+    };
+    bool baseline = false;
+    bool written = false;
+    std::binary_semaphore priority_parked{0};
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+      // The baseline release has no image enrolled for readback, so it queues and submits nothing.
+      {
+        const auto tick = scheduler.CurrentTick();
+        Pm4Execution execution;
+        baseline = processor.Process(execution, release) == Pm4ProcessResult::Complete &&
+                   label == label_value && scheduler.CurrentTick() == tick &&
+                   !texture_cache.HasReadbacksInFlight();
+      }
+      label = 0;
+      auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      desc.type = BindingType::Storage;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      Require(name, "image clear",
+              texture_cache.ClearImageFromBuffer(scheduler.Current(), base, sizeof(uint32_t),
+                                                 gpu_value),
+              "failed to create GPU-current image contents");
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+      Libs::LibKernel::Memory::WriteBacking(base, &stale_value, sizeof(stale_value));
+      // Hold the priority thread, so the readback's guest write cannot land before the checks
+      // below. The release only submits, so nothing here waits for the priority thread.
+      scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+
+      const auto tick = scheduler.CurrentTick();
+      Pm4Execution execution;
+      written = processor.Process(execution, release) == Pm4ProcessResult::Complete &&
+                label == label_value && scheduler.CurrentTick() == tick + 1 &&
+                texture_cache.HasReadbacksInFlight() && read_guest() == stale_value;
+    });
+    priority_parked.release();
+    Require(name, "baseline", baseline,
+            "a release with no readback pending queued or submitted work, or held its label");
+    Require(name, "queued and written", written,
+            "a release did not queue and submit the pending readback, or held its label");
+
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    Require(name, "landed",
+            read_guest() == gpu_value && !texture_cache.HasReadbacksInFlight(),
+            "the readback data did not reach guest memory");
+
+    // An image that cannot be downloaded yet survives a garbage-collector pass, which is the
+    // baseline, but a label drops it. Its guest memory is newer than the GPU result, and a retry
+    // would land a frame or more later.
+    bool kept_by_collector = false;
+    bool dropped_by_label = false;
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      desc.type = BindingType::Storage;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto image = texture_cache.FindImage(desc);
+      auto &owner = TextureCacheTestAccess::MutableImage(texture_cache, image);
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+      owner.MarkCpuDirty();
+      // The real collector pass, so a change to how it calls ProcessDownloadImages is caught. Its
+      // trigger is 0 in a fresh context, so raise it, or the pass would free the unused image.
+      TextureCacheTestAccess::DisableGarbageCollection(texture_cache);
+      context.RunGarbageCollector();
+      kept_by_collector = TextureCacheTestAccess::PendingDownload(texture_cache, image) &&
+                          !texture_cache.HasReadbacksInFlight();
+      Pm4Execution execution;
+      dropped_by_label = processor.Process(execution, release) == Pm4ProcessResult::Complete &&
+                         !TextureCacheTestAccess::PendingDownload(texture_cache, image) &&
+                         !texture_cache.HasReadbacksInFlight();
+      scheduler.Finish();
+    });
+    Require(name, "kept by the collector", kept_by_collector,
+            "an image that could not be downloaded yet was not kept for a retry");
+    Require(name, "dropped at the label", dropped_by_label,
+            "a label kept or queued an image that could not be downloaded yet");
+
+    TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
@@ -55558,6 +55805,8 @@ int main(int argc, char **argv) {
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckTextureCacheDownloadRetry();
+  vulkan.CheckTextureCacheDownloadDropAtLabel();
+  vulkan.CheckReadbackAtLabel();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

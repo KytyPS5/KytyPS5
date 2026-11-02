@@ -883,6 +883,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
+	SubmitReadbacksBeforeLabel(data_sel);
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
@@ -907,6 +908,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2: write_label(&data, sizeof(data)); break;
 		case 5: {
+			// Finish also submits the readbacks queued above.
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
@@ -916,13 +918,39 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
 	}
 
-	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
+	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on. Priority
+	// operations run in order, so the interrupt is raised after the readbacks queued above land.
 	if (interrupt) {
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		    });
 	}
+}
+
+// Games read GPU-written images on the CPU after an end-of-pipe signal, so the readbacks start
+// here instead of at the next garbage-collector pass, and submitting at once lands them about when
+// the signal's GPU work finishes. The signal itself is not held back for them, because a held
+// signal shows the game the host GPU's real speed, which made Astro Bot lower its resolution.
+void CommandProcessor::SubmitReadbacksBeforeLabel(uint32_t data_sel) {
+	// A GDS read runs Finish() next, which submits them anyway.
+	constexpr uint32_t DataSelGds = 5;
+	if (QueueReadbacksBeforeLabel() && data_sel != DataSelGds) {
+		GetScheduler().Flush();
+	}
+}
+
+bool CommandProcessor::QueueReadbacksBeforeLabel() {
+	auto& textures = m_renderer.GetTextureCache();
+	// Readbacks are off by default, so skip the renderer lock then.
+	if (!textures.ReadbacksEnabled()) {
+		return false;
+	}
+	Common::LockGuard lock(m_renderer.GetMutex());
+	// Drop images that can't be downloaded yet. Such an image was written by the CPU after the
+	// GPU, so its guest memory is already newer, and a retry would land a frame or more later.
+	constexpr bool KeepUnready = false;
+	return textures.ProcessDownloadImages(KeepUnready);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

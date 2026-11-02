@@ -710,8 +710,6 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	     mount->user_id, mount->dir_name->data, mount->blocks, mount->system_blocks,
 	     mount->mount_mode, mount->resource);
 
-	*mount_result = {};
-
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name  = mount->dir_name->data;
 	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id);
@@ -766,6 +764,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		created = true;
 	}
 
+	*mount_result = {};
 	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
 }
 

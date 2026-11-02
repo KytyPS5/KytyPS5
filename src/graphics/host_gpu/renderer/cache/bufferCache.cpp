@@ -1679,8 +1679,7 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 		// Partly cached: the faulting path handles it.
 		return false;
 	}
-	// Bytes the GPU wrote stay GPU-dirty: the copy below orders the new value after the GPU's
-	// writes, and a later read of them reads the buffer back. Without a buffer to copy into,
+	// The copy below orders the new value after the GPU's writes. Without a buffer to copy into,
 	// the GPU's bytes would be lost.
 	if (buffer == nullptr && HasGpuDirtyBytes(vaddr, size)) {
 		return false;
@@ -1719,6 +1718,15 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	m_gpu_write_generation++;
+	// From this point of the stream the bytes are the ones just written, which the backing store
+	// already holds: reads around the GPU's writes take them from there instead of reading the
+	// buffer back (a later GPU write marks them again). Not while a download over them is in
+	// flight: publishing it writes the buffer's earlier bytes to the backing store.
+	if (m_inflight_readbacks.empty() || InFlightReadbackTick(vaddr, vaddr + size) == 0) {
+		if (m_gpu_modified_ranges.Subtract(vaddr, size)) {
+			NoteGpuModifiedChange(vaddr, size, false);
+		}
+	}
 	return true;
 }
 

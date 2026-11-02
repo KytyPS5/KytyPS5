@@ -385,6 +385,13 @@ struct FontWritingState {
 	FontWritingLetterStep letter_step;
 	FontWritingMetrics    metrics;
 	int                   invisible_mask;
+	size_t                next_index             = 0;
+	size_t                current_index          = 0;
+	bool                  has_current_step       = false;
+	bool                  has_current_character  = false;
+	bool                  has_aggregate_metrics  = false;
+	float                 pen_x                  = 0.0f;
+	float                 pen_y                  = 0.0f;
 };
 
 struct FontWritingLineState {
@@ -399,6 +406,14 @@ static std::mutex                g_glyph_mutex;
 static std::unordered_set<void*> g_glyphs;
 static std::mutex                g_writing_mutex;
 static std::unordered_set<void*> g_writing_states;
+// Last font the guest touched. The writing-line API does not carry a font
+// handle, so use it to derive real advances instead of the old fixed 8px.
+static thread_local FontState* g_active_font  = nullptr;
+static thread_local float       g_last_advance = 8.0f;
+static std::mutex                g_font_mutex;
+static std::unordered_set<void*> g_fonts;
+static std::mutex                g_string_mutex;
+static std::unordered_set<void*> g_strings;
 
 static void register_glyph(GlyphState* glyph) {
 	std::scoped_lock lock(g_glyph_mutex);
@@ -557,18 +572,21 @@ static FontCharacterState* get_prev_character(FontCharacterState* character) {
 }
 
 static uint32_t count_characters_until(FontCharacterState* first, FontCharacterState* last) {
-	if (first == nullptr || first->string == nullptr) {
+	if (first == nullptr || first->string == nullptr ||
+	    (last != nullptr && last->string != first->string)) {
 		return 0;
 	}
 
-	uint32_t count = 0;
+	uint32_t count   = 0;
+	bool     reached = last == nullptr;
 	for (auto* c = first; c != nullptr; c = get_next_character(c)) {
+		count++;
 		if (last != nullptr && c == last) {
+			reached = true;
 			break;
 		}
-		count++;
 	}
-	return count;
+	return reached ? count : 0;
 }
 
 static void fill_text_codes(FontTextCodes* text_codes, FontCharacterState* character,
@@ -587,39 +605,54 @@ static void fill_text_codes(FontTextCodes* text_codes, FontCharacterState* chara
 static void fill_metrics(FontGlyphMetrics* metrics, const FontState* font = nullptr);
 static void fill_metrics_for_code(FontGlyphMetrics* metrics, const FontState* font, uint32_t code);
 
-static void fill_writing_metrics(FontWritingMetrics* metrics, uint32_t character_count) {
+static void fill_writing_metrics(FontWritingMetrics* metrics, uint32_t character_count,
+                                 const FontState* font = nullptr) {
 	if (metrics == nullptr) {
 		return;
 	}
 
-	const float advance    = static_cast<float>(character_count) * 8.0f;
+	// A zero-width glyph must not leave the fallback at zero: orders without
+	// metrics would then overlap at the same position.
+	float advance_per_character = g_last_advance > 0.0f ? g_last_advance : 8.0f;
+	float ascent                = 12.0f;
+	float descent               = 4.0f;
+	if (font != nullptr) {
+		FontGlyphMetrics glyph_metrics {};
+		fill_metrics_for_code(&glyph_metrics, font, static_cast<uint32_t>('M'));
+		// A single-character order with null metrics was just measured by the
+		// writing walk, so keep that advance instead of substituting 'M'.
+		if (character_count != 1 && glyph_metrics.horizontal.advance > 0.0f) {
+			advance_per_character = glyph_metrics.horizontal.advance;
+		}
+		const float scale_y = font->scale_h > 1.0f ? font->scale_h : 16.0f;
+		if (font->has_ttf) {
+			// Per-order glyph bounds are not available here; use the font's
+			// own bounding box so surfaces do not clip tall/descending glyphs.
+			int x0 = 0;
+			int y0 = 0;
+			int x1 = 0;
+			int y1 = 0;
+			stbtt_GetFontBoundingBox(&font->font_info, &x0, &y0, &x1, &y1);
+			const float sy = stbtt_ScaleForMappingEmToPixels(&font->font_info, scale_y);
+			ascent         = std::max(0.0f, static_cast<float>(y1) * sy);
+			descent        = std::max(0.0f, -static_cast<float>(y0) * sy);
+		} else {
+			ascent  = scale_y * 0.75f;
+			descent = scale_y * 0.25f;
+		}
+	}
+
+	const float advance    = static_cast<float>(character_count) * advance_per_character;
 	metrics->advance_x     = advance;
 	metrics->advance_y     = 0.0f;
-	metrics->extent.top    = -12.0f;
-	metrics->extent.bottom = 4.0f;
+	metrics->extent.top    = -ascent;
+	metrics->extent.bottom = descent;
 	metrics->extent.left   = 0.0f;
 	metrics->extent.right  = advance;
 }
 
-static void fill_writing_step(FontWritingStep* step, FontCharacterState* character) {
-	if (step == nullptr) {
-		return;
-	}
-
-	std::memset(step, 0, sizeof(FontWritingStep));
-	step->advance_x               = 8.0f;
-	step->advance_y               = 0.0f;
-	step->font                    = character != nullptr ? character->font : nullptr;
-	step->profile.character_count = character != nullptr ? 1u : 0u;
-	step->profile.invisible_glyph = 0u;
-	step->glyph_code              = character != nullptr ? character->code : 0u;
-	fill_metrics_for_code(&step->glyph_metrics,
-	                      static_cast<FontState*>(character != nullptr ? character->font : nullptr),
-	                      character != nullptr ? character->code : static_cast<uint32_t>('?'));
-}
-
 static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
-                                     FontCharacterState*    character) {
+                                     FontCharacterState* character, FontState* font) {
 	if (letter_step == nullptr) {
 		return;
 	}
@@ -632,6 +665,13 @@ static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
 		return;
 	}
 
+	FontGlyphMetrics glyph_metrics {};
+	fill_metrics_for_code(&glyph_metrics, font, character->code);
+	if (glyph_metrics.horizontal.advance > 0.0f) {
+		letter_step->advance_x = glyph_metrics.horizontal.advance;
+	}
+	g_last_advance = letter_step->advance_x;
+
 	letter_step->components.texts_count           = 1;
 	letter_step->components.texts_index           = character->index;
 	letter_step->components.glyphs_count          = 1;
@@ -640,6 +680,74 @@ static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
 	letter_step->components.base_focus_count      = 1;
 	letter_step->components.character_text_count  = 1;
 	letter_step->components.base_text_count       = 1;
+}
+
+static bool populate_writing_step(FontWritingState* state, size_t index) {
+	if (state == nullptr || state->string == nullptr) {
+		return false;
+	}
+
+	// Keep the string alive while reading it. A writing state may outlive a
+	// destroyed string, in which case there is nothing left to step through.
+	std::scoped_lock string_lock(g_string_mutex);
+	if (g_strings.count(state->string) == 0 || index >= state->string->characters.size()) {
+		return false;
+	}
+
+	auto* character       = &state->string->characters[index];
+	state->character      = character;
+	state->step           = {};
+	state->step.x         = state->pen_x;
+	state->step.y         = state->pen_y;
+	state->step.profile.character_count = 1;
+	state->step.glyph_code = character->code;
+
+	// Likewise, do not dereference a font the guest has already closed.
+	std::scoped_lock font_lock(g_font_mutex);
+	auto* font = character->font != nullptr && g_fonts.count(character->font) != 0
+	                 ? static_cast<FontState*>(character->font)
+	                 : nullptr;
+	state->step.font = font;
+	if (font != nullptr) {
+		g_active_font = font;
+	}
+	fill_metrics_for_code(&state->step.glyph_metrics, font, character->code);
+	state->step.advance_x = state->step.glyph_metrics.horizontal.advance;
+	state->step.advance_y = 0.0f;
+	state->step.positioning.x = state->step.x;
+	state->step.positioning.y = state->step.y;
+	fill_writing_letter_step(&state->letter_step, character, font);
+	state->pen_x += state->step.advance_x;
+	state->pen_y += state->step.advance_y;
+	g_last_advance = state->step.advance_x;
+	return true;
+}
+
+static void accumulate_writing_metrics(FontWritingState* state) {
+	if (state == nullptr) {
+		return;
+	}
+
+	const auto& glyph_metrics = state->step.glyph_metrics;
+	const float left          = state->step.x + glyph_metrics.horizontal.bearing_x;
+	const float right         = left + glyph_metrics.width;
+	const float top           = state->step.y - glyph_metrics.horizontal.bearing_y;
+	const float bottom        = top + glyph_metrics.height;
+
+	state->metrics.advance_x = state->step.x + state->step.advance_x;
+	state->metrics.advance_y = state->step.y + state->step.advance_y;
+	if (!state->has_aggregate_metrics) {
+		state->metrics.extent.top    = top;
+		state->metrics.extent.bottom = bottom;
+		state->metrics.extent.left   = left;
+		state->metrics.extent.right  = right;
+		state->has_aggregate_metrics = true;
+		return;
+	}
+	state->metrics.extent.top    = std::min(state->metrics.extent.top, top);
+	state->metrics.extent.bottom = std::max(state->metrics.extent.bottom, bottom);
+	state->metrics.extent.left   = std::min(state->metrics.extent.left, left);
+	state->metrics.extent.right  = std::max(state->metrics.extent.right, right);
 }
 
 static FontWritingState* get_writing_state(FontWriting* font_writing) {
@@ -657,8 +765,8 @@ static void clear_writing_line(FontWritingLineState* line) {
 	}
 
 	line->steps.clear();
-	line->cursor = 0;
-	fill_writing_metrics(&line->metrics, 0);
+	line->cursor  = 0;
+	line->metrics = {};
 }
 
 static bool font_is_bold(const FontState* font) {
@@ -1172,6 +1280,10 @@ static int open_font(FontLibrary library, const void* data, uint32_t size, uint3
 	init_image(&state->fallback_image, &state->trans_image, static_cast<uint32_t>('?'), state);
 
 	*handle = state;
+	{
+		std::scoped_lock lock(g_font_mutex);
+		g_fonts.insert(state);
+	}
 
 	LOGF("\t library = 0x%016" PRIx64 ", data = 0x%016" PRIx64 ", size = %" PRIu32
 	     ", font_set = %" PRIu32 ", open_mode = 0x%08" PRIx32 ", handle = 0x%016" PRIx64 "\n",
@@ -1217,7 +1329,16 @@ int KYTY_SYSV_ABI FontCloseFont(FontHandle font_handle) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
-	delete font;
+	if (font != nullptr) {
+		std::scoped_lock lock(g_font_mutex);
+		const bool     registered = g_fonts.erase(font) != 0;
+		if (g_active_font == font) {
+			g_active_font = nullptr;
+		}
+		if (registered) {
+			delete font;
+		}
+	}
 
 	return OK;
 }
@@ -1248,6 +1369,7 @@ int KYTY_SYSV_ABI FontBindRenderer(FontHandle font_handle, FontRenderer renderer
 	}
 
 	font->renderer = renderer;
+	g_active_font  = font;
 
 	LOGF("\t handle = 0x%016" PRIx64 ", renderer = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(font_handle), reinterpret_cast<uint64_t>(renderer));
@@ -1294,6 +1416,7 @@ int KYTY_SYSV_ABI FontSetScalePixel(FontHandle font_handle, float w, float h) {
 
 	font->scale_w = w;
 	font->scale_h = h;
+	g_active_font = font;
 
 	LOGF("\t handle = 0x%016" PRIx64 ", w = %f, h = %f\n", reinterpret_cast<uint64_t>(font_handle),
 	     static_cast<double>(w), static_cast<double>(h));
@@ -1347,6 +1470,7 @@ int KYTY_SYSV_ABI FontSetupRenderScalePixel(FontHandle font_handle, float w, flo
 
 	font->render_scale_w = w;
 	font->render_scale_h = h;
+	g_active_font        = font;
 
 	LOGF("\t handle = 0x%016" PRIx64 ", w = %f, h = %f\n", reinterpret_cast<uint64_t>(font_handle),
 	     static_cast<double>(w), static_cast<double>(h));
@@ -1564,6 +1688,9 @@ int KYTY_SYSV_ABI FontCreateString(const FontMemory* memory, FontTextSource* fon
 	state->terminate_order = nullptr;
 
 	auto      default_font = get_string_default_font(font_text_source, string_detail);
+	if (default_font != nullptr) {
+		g_active_font = static_cast<FontState*>(default_font);
+	}
 	const int ret          = parse_text_with_callback(font_text_source, default_font, state);
 	if (ret != OK) {
 		delete state;
@@ -1572,6 +1699,10 @@ int KYTY_SYSV_ABI FontCreateString(const FontMemory* memory, FontTextSource* fon
 	}
 
 	*font_string = state;
+	{
+		std::scoped_lock lock(g_string_mutex);
+		g_strings.insert(state);
+	}
 
 	LOGF("\t memory = 0x%016" PRIx64 ", source = 0x%016" PRIx64 ", detail = 0x%016" PRIx64
 	     ", string = 0x%016" PRIx64 ", chars = %zu\n",
@@ -1588,7 +1719,13 @@ int KYTY_SYSV_ABI FontDestroyString(FontString* font_string) {
 	LOGF("\t string_ptr = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(font_string));
 
 	if (font_string != nullptr) {
-		delete static_cast<FontStringState*>(*font_string);
+		auto* state = static_cast<FontStringState*>(*font_string);
+		if (state != nullptr) {
+			std::scoped_lock lock(g_string_mutex);
+			if (g_strings.erase(state) != 0) {
+				delete state;
+			}
+		}
 		*font_string = nullptr;
 	}
 
@@ -1643,18 +1780,25 @@ FontStringRefersRenderCharacters(FontString font_string, FontTextCharacter start
 	if (first == nullptr && state != nullptr && !state->characters.empty()) {
 		first = &state->characters.front();
 	}
+	if (state == nullptr || first == nullptr || first->string != state ||
+	    (last != nullptr && last->string != state)) {
+		if (character_count != nullptr) {
+			*character_count = 0;
+		}
+		return nullptr;
+	}
 
+	const uint32_t count = count_characters_until(first, last);
 	if (character_count != nullptr) {
-		*character_count = count_characters_until(first, last);
+		*character_count = count;
 	}
 
 	LOGF("\t string = 0x%016" PRIx64 ", start = 0x%016" PRIx64 ", last = 0x%016" PRIx64
 	     ", count = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(font_string), reinterpret_cast<uint64_t>(start_character),
-	     reinterpret_cast<uint64_t>(last_character),
-	     character_count != nullptr ? *character_count : count_characters_until(first, last));
+	     reinterpret_cast<uint64_t>(last_character), count);
 
-	return first;
+	return count != 0 ? first : nullptr;
 }
 
 FontTextCharacter KYTY_SYSV_ABI FontCharacterRefersTextNext(FontTextCharacter text_character) {
@@ -1792,7 +1936,7 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
                                   FontRenderCharacter font_character) {
 	PRINT_NAME();
 
-	if (font_writing == nullptr) {
+	if (font_writing == nullptr || font_string == nullptr) {
 		return -1;
 	}
 
@@ -1804,16 +1948,39 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
 
 	auto* state           = new FontWritingState {};
 	state->string         = static_cast<FontStringState*>(font_string);
-	state->character      = get_character(font_character);
 	state->invisible_mask = 0;
-	if (state->character == nullptr && state->string != nullptr &&
-	    !state->string->characters.empty()) {
-		state->character = &state->string->characters.front();
-	}
 
-	fill_writing_step(&state->step, state->character);
-	fill_writing_letter_step(&state->letter_step, state->character);
-	fill_writing_metrics(&state->metrics, state->step.profile.character_count);
+	size_t index = 0;
+	if (font_character != nullptr) {
+		auto* requested = get_character(font_character);
+		if (requested == nullptr || requested->string != state->string) {
+			delete state;
+			return -1;
+		}
+		index = requested->index;
+	}
+	state->next_index    = index;
+	state->current_index = index;
+
+	if (!populate_writing_step(state, index)) {
+		// An empty but registered string is a valid writing with no steps.
+		bool string_is_empty = false;
+		{
+			std::scoped_lock lock(g_string_mutex);
+			string_is_empty = g_strings.count(state->string) != 0 &&
+			                  state->string->characters.empty();
+		}
+		if (!string_is_empty) {
+			delete state;
+			return -1;
+		}
+	}
+	state->pen_x                 = 0.0f;
+	state->pen_y                 = 0.0f;
+	state->metrics               = {};
+	state->has_aggregate_metrics = false;
+	state->has_current_step      = false;
+	state->has_current_character = false;
 	register_writing_state(state);
 
 	font_writing->system_use[0] = state;
@@ -1847,10 +2014,20 @@ const FontWritingStep* KYTY_SYSV_ABI FontWritingRefersRenderStep(FontWriting* fo
 	PRINT_NAME();
 
 	auto* state = get_writing_state(font_writing);
-	auto* step  = state != nullptr ? &state->step : nullptr;
+	if (state == nullptr || !populate_writing_step(state, state->next_index)) {
+		LOGF("\t writing = 0x%016" PRIx64 ", step = 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(font_writing), uint64_t {0});
+		return nullptr;
+	}
+	state->current_index         = state->next_index;
+	state->has_current_step      = true;
+	state->has_current_character = true;
+	accumulate_writing_metrics(state);
+	++state->next_index;
+
 	LOGF("\t writing = 0x%016" PRIx64 ", step = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(step));
-	return step;
+	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(&state->step));
+	return &state->step;
 }
 
 FontTextCharacter KYTY_SYSV_ABI FontWritingRefersRenderStepCharacter(FontWriting* font_writing,
@@ -1858,15 +2035,40 @@ FontTextCharacter KYTY_SYSV_ABI FontWritingRefersRenderStepCharacter(FontWriting
 	PRINT_NAME();
 
 	auto* state = get_writing_state(font_writing);
-	if (letter_step != nullptr) {
-		*letter_step = state != nullptr ? &state->letter_step : nullptr;
+	if (state == nullptr || !state->has_current_step || !state->has_current_character ||
+	    state->string == nullptr) {
+		if (letter_step != nullptr) {
+			*letter_step = nullptr;
+		}
+		return nullptr;
 	}
+	state->has_current_character = false;
+
+	std::scoped_lock string_lock(g_string_mutex);
+	if (g_strings.count(state->string) == 0 ||
+	    state->current_index >= state->string->characters.size()) {
+		if (letter_step != nullptr) {
+			*letter_step = nullptr;
+		}
+		return nullptr;
+	}
+	auto* character = &state->string->characters[state->current_index];
+	if (letter_step != nullptr) {
+		*letter_step = &state->letter_step;
+	}
+	// fill_writing_letter_step() already populated the component fields for
+	// this character; only refresh the pen-dependent values here.
+	state->letter_step.x     = state->step.x;
+	state->letter_step.y     = state->step.y;
+	state->letter_step.advance_x = state->step.advance_x;
+	state->letter_step.advance_y = state->step.advance_y;
+	state->letter_step.components.texts_index = static_cast<uint32_t>(state->current_index);
+
 	LOGF("\t writing = 0x%016" PRIx64 ", character = 0x%016" PRIx64 ", letter_step = 0x%016" PRIx64
 	     "\n",
-	     reinterpret_cast<uint64_t>(font_writing),
-	     reinterpret_cast<uint64_t>(state != nullptr ? state->character : nullptr),
+	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(character),
 	     reinterpret_cast<uint64_t>(letter_step != nullptr ? *letter_step : nullptr));
-	return state != nullptr ? state->character : nullptr;
+	return character;
 }
 
 int KYTY_SYSV_ABI FontWritingGetRenderMetrics(FontWriting*        font_writing,
@@ -1944,7 +2146,13 @@ int KYTY_SYSV_ABI FontWritingLineWritesOrder(FontWritingLine           writing_l
 	if (writing_metrics != nullptr) {
 		order_metrics = *writing_metrics;
 	} else {
-		fill_writing_metrics(&order_metrics, 1);
+		// g_active_font is only a hint; the guest may have closed the font
+		// since it was last touched. Keep the lock while filling metrics so
+		// another thread cannot free it underneath us.
+		std::scoped_lock lock(g_font_mutex);
+		const auto*      font =
+		    g_active_font != nullptr && g_fonts.count(g_active_font) != 0 ? g_active_font : nullptr;
+		fill_writing_metrics(&order_metrics, 1, font);
 	}
 
 	FontWritingLineStep step {};
@@ -2214,6 +2422,7 @@ int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uin
 	if (font_handle == nullptr) {
 		return -1;
 	}
+	g_active_font = font;
 
 	init_image(&font->fallback_image, &font->trans_image, code, font);
 	FontGlyphMetrics local_metrics {};

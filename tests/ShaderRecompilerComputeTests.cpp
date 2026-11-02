@@ -1333,6 +1333,25 @@ void ExpectFatal(const char *name, Function function) {
 }
 #endif
 
+// The submit cadence is off by default and its accessor reads its own field. The CLI test only
+// proves the name is accepted, so this pins the field the accessor returns.
+void CheckSubmitCadenceConfig() {
+  constexpr const char *name = "SubmitCadenceConfig";
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  Config::Load(options);
+  Require(name, "off by default", !Config::GpuSubmitCadenceEnabled(),
+          "the submit cadence must be opt-in");
+  // Only the cadence field differs from the default options above.
+  options.gpu_submit_cadence_enabled = true;
+  Config::Load(options);
+  Require(name, "the flag turns it on", Config::GpuSubmitCadenceEnabled(),
+          "the accessor should return the gpu_submit_cadence_enabled field");
+  options.gpu_submit_cadence_enabled = false;
+  Config::Load(options);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
   const auto first = cache.Insert(1, 1);
@@ -54009,6 +54028,10 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckSubmitCadenceConfig();
+  if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-only") == 0) {
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

@@ -403,6 +403,32 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	return info;
 }
 
+// 8 and 8_8 sRGB decode after filtering where the device has no sRGB view of them. Correctly
+// rounded multiplies keep 0 and 1, so the view's swizzle constants pass through.
+uint32_t DecodeSrgb(EmitterState& state, const IR::MemoryInfo& mem, uint32_t value) {
+	const auto format = state.program.info.images[mem.resource].srgb_decode;
+	if (format == Prospero::BufferFormat::kInvalid ||
+	    (format == Prospero::BufferFormat::k8Srgb ? state.profile.r8_srgb_views
+	                                              : state.profile.r8g8_srgb_views)) {
+		return value;
+	}
+	const auto type     = TypeF32Vector(state, 4);
+	const auto constant = [&](float scalar) {
+		const auto id = ConstantF32Value(state, scalar);
+		return state.builder.Constant(spv::OpConstantComposite, type, id, id, id, id);
+	};
+	const auto curve = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, type, curve, GlslStd450(state), GLSLstd450Pow,
+	    Binary(state, spv::OpFMul, type,
+	           Binary(state, spv::OpFAdd, type, value, constant(0.055f)), constant(1.0f / 1.055f)),
+	    constant(2.4f));
+	const auto low = Binary(state, spv::OpFOrdLessThanEqual, TypeBoolVector(state, 4), value,
+	                        constant(0.04045f));
+	return Select(state, type, low,
+	              Binary(state, spv::OpFMul, type, value, constant(1.0f / 12.92f)), curve);
+}
+
 uint32_t ExtractPackedImageComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                      uint32_t packed, uint32_t type, uint32_t component) {
 	const auto result = state.builder.AllocateId();
@@ -424,7 +450,7 @@ uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem)
 
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
-	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+	if (info.format == Prospero::BufferFormat::kInvalid) return DecodeSrgb(ctx.state, mem, texel);
 
 	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
 	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
@@ -486,7 +512,9 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 
 uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
-	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
+	if (info.format == Prospero::BufferFormat::kInvalid) {
+		return DecodeSrgb(ctx.state, mem, gathered);
+	}
 
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto selector =

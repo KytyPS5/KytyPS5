@@ -130,7 +130,6 @@ std::array<uint32_t, 8> Texture(uint32_t width, uint32_t height,
 class PsmlTest : public testing::Test {
 protected:
   static void SetUpTestSuite() {
-    Libs::LibPsml::InitPsml_1(&g_symbols);
     g_trinity = false;
     ASSERT_EQ(Function<Initialize>("3WVD91e12ZQ")(), ERROR_NOT_TRINITY);
     g_trinity = true;
@@ -152,7 +151,7 @@ protected:
     context_params.shared = shared;
     result.value = nullptr;
     ASSERT_EQ(
-        Function<CreateContext>("gxv3i+MTEzU")(&result.value, &context_params),
+        Function<CreateContext>("fccGInHrj8A")(&result.value, &context_params),
         0);
     ASSERT_TRUE(result.Intact());
     ASSERT_GT(reinterpret_cast<uintptr_t>(result.value), 0x10000u);
@@ -205,6 +204,9 @@ TEST_F(PsmlTest, LegacyContextVariantsUseTheirOwnLayoutsAndOutputResolution) {
   ASSERT_EQ(
       Function<CreateContext>("gxv3i+MTEzU")(&result.value, &context_params),
       ERROR_INVALID_SHARED);
+  ASSERT_EQ(
+      Function<CreateContext>("fccGInHrj8A")(&result.value, &context_params),
+      ERROR_INVALID_SHARED);
   ASSERT_TRUE(result.Intact());
   ASSERT_EQ(result.value, nullptr);
   ASSERT_EQ(
@@ -249,7 +251,7 @@ TEST_F(PsmlTest, DispatchSnapshotsFixedSlotsAndActiveExtent) {
   std::array<uint32_t, 32> command;
   command.fill(0xdeadbeef);
   const CommandSpace space{command.data() + 1, 28};
-  ASSERT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params), 0);
+  ASSERT_EQ(Function<Dispatch>("94iBp3KvIuI")(context, &space, &params), 0);
   EXPECT_EQ(KYTY_PM4_LEN(command[1]), space.dwords);
   EXPECT_EQ(KYTY_PM4_R(command[1]), Pm4::R_PSSR);
   EXPECT_EQ((command[1] >> 8) & 0xffu, Pm4::IT_NOP);
@@ -338,9 +340,231 @@ TEST_F(PsmlTest, DispatchChecksDescriptorContractAndSelectedMip) {
                           [](uint32_t value) { return value == 0xdeadbeef; }));
 }
 
+constexpr int MFSR2_NOT_INITIALIZED = static_cast<int>(0x8a8a0001u);
+constexpr int MFSR2_ALREADY_INITIALIZED = static_cast<int>(0x8a8a0002u);
+constexpr int MFSR2_INVALID_PROFILE = static_cast<int>(0x8a8a0003u);
+constexpr int MFSR2_INVALID_CONTEXT = static_cast<int>(0x8a8a0005u);
+constexpr int MFSR2_NULL_ARGUMENT = static_cast<int>(0x8a8a0009u);
+constexpr int MFSR2_NULL_TEXTURE = static_cast<int>(0x8a8a000au);
+constexpr int MFSR2_INVALID_TEXTURE = static_cast<int>(0x8a8a000bu);
+constexpr int MFSR2_INVALID_PARAMETER = static_cast<int>(0x8a8a000du);
+constexpr int MFSR2_RENDER_SIZE = static_cast<int>(0x8a8a000eu);
+constexpr int MFSR2_NOT_AVAILABLE = static_cast<int>(0x8a8a0012u);
+constexpr int MFSR2_INVALID_SHARED = static_cast<int>(0x8a8a0014u);
+constexpr int MFSR2_TOO_MANY_SHARED = static_cast<int>(0x8a8a0015u);
+
+struct Requirements {
+  uint64_t size = 0;
+  uint64_t alignment = 0;
+  uint64_t count = 0;
+};
+
+struct Mfsr2SharedParameters {
+  uint32_t profile = 0;
+  uint32_t flags = 0;
+  const MemoryBlock *blocks = nullptr;
+  uint64_t block_count = 0;
+  uint16_t max_width = 7680;
+  uint16_t max_height = 4320;
+  uint32_t reserved = 0;
+};
+
+struct Mfsr2ContextParameters {
+  uint32_t profile = 0;
+  uint32_t reserved = 0;
+  const void *shared = nullptr;
+  const MemoryBlock *blocks = nullptr;
+  uint64_t block_count = 0;
+  const char *name = nullptr;
+  uint16_t width = 3840;
+  uint16_t height = 2160;
+  uint32_t color_space = 0;
+};
+static_assert(offsetof(Mfsr2ContextParameters, width) == 0x28);
+
+struct Mfsr2DispatchParameters {
+  const uint32_t *output = nullptr;
+  const uint32_t *color = nullptr;
+  std::array<const uint32_t *, 4> optional{};
+  float pre_exposure = 1.0f;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+static_assert(offsetof(Mfsr2DispatchParameters, x) == 0x34);
+
+using GetRequirements = int(KYTY_SYSV_ABI *)(Requirements *, const void *);
+using Create = int(KYTY_SYSV_ABI *)(void **, const void *);
+
+class PsmlMfsr2Test : public testing::Test {
+protected:
+  static void SetUpTestSuite() {
+    Requirements requirements;
+    const Mfsr2SharedParameters params;
+    ASSERT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+              MFSR2_NOT_INITIALIZED);
+    g_trinity = false;
+    ASSERT_EQ(Function<Initialize>("o+NM86gEwFE")(), MFSR2_NOT_AVAILABLE);
+    g_trinity = true;
+    ASSERT_EQ(Function<Initialize>("o+NM86gEwFE")(), 0);
+    ASSERT_EQ(Function<Initialize>("o+NM86gEwFE")(), MFSR2_ALREADY_INITIALIZED);
+  }
+
+  void *NewContext(uint16_t width, uint16_t height, uint64_t block_count,
+                   int expected = 0) {
+    Mfsr2ContextParameters params;
+    params.shared = &shared_handle;
+    params.blocks = blocks.data();
+    params.block_count = block_count;
+    params.width = width;
+    params.height = height;
+    void *context = nullptr;
+    EXPECT_EQ(Function<Create>("m9JLPc3wOQw")(&context, &params), expected);
+    EXPECT_EQ(context != nullptr, expected == 0);
+    return context;
+  }
+
+  std::array<MemoryBlock, 127> blocks;
+  int shared_handle = 0;
+};
+
+TEST_F(PsmlMfsr2Test, SharedRequirementsCoverMaximumsUpTo8K) {
+  Mfsr2SharedParameters params;
+  Requirements requirements;
+  ASSERT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+            0);
+  EXPECT_EQ(requirements.size, 0x200000u);
+  EXPECT_EQ(requirements.alignment, 0x200000u);
+  EXPECT_EQ(requirements.count, 123u);
+  params.max_width = 959;
+  EXPECT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+            MFSR2_INVALID_PARAMETER);
+  params.max_width = 3840;
+  params.max_height = 4321;
+  EXPECT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+            MFSR2_INVALID_PARAMETER);
+  params.max_height = 2160;
+  params.profile = 1;
+  EXPECT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+            MFSR2_INVALID_PROFILE);
+  EXPECT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(nullptr, &params),
+            MFSR2_NULL_ARGUMENT);
+}
+
+TEST_F(PsmlMfsr2Test, SharedResourcesAreSingleAndTakeTheRequiredBlocks) {
+  Mfsr2SharedParameters params;
+  params.blocks = blocks.data();
+  params.block_count = 122;
+  void *shared = nullptr;
+  EXPECT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params),
+            MFSR2_INVALID_PARAMETER);
+  params.block_count = 123;
+  ASSERT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params), 0);
+  ASSERT_NE(shared, nullptr);
+  EXPECT_EQ(Function<Create>("gMduXCLYrNg")(nullptr, &params),
+            MFSR2_TOO_MANY_SHARED);
+  EXPECT_EQ(Function<Release>("0GAw7SmkwII")(shared), 0);
+  ASSERT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params), 0);
+  EXPECT_EQ(Function<Release>("0GAw7SmkwII")(shared), 0);
+}
+
+TEST_F(PsmlMfsr2Test, ContextRequirementsScaleWithOutputAndFourContextsFit) {
+  Mfsr2ContextParameters params;
+  params.shared = &shared_handle;
+  Requirements requirements;
+  for (const auto [width, height, count] :
+       std::array<std::array<uint16_t, 3>, 5>{{{3840, 2160, 32},
+                                               {1920, 1080, 8},
+                                               {2560, 1440, 15},
+                                               {7680, 4320, 127},
+                                               {1, 1, 1}}}) {
+    params.width = width;
+    params.height = height;
+    ASSERT_EQ(
+        Function<GetRequirements>("5z2gBlqxJ+0")(&requirements, &params), 0);
+    EXPECT_EQ(requirements.count, count) << width << "x" << height;
+  }
+  params.color_space = 2;
+  EXPECT_EQ(Function<GetRequirements>("5z2gBlqxJ+0")(&requirements, &params),
+            MFSR2_INVALID_PARAMETER);
+  params.color_space = 0;
+  params.shared = nullptr;
+  EXPECT_EQ(Function<GetRequirements>("5z2gBlqxJ+0")(&requirements, &params),
+            MFSR2_INVALID_SHARED);
+
+  std::vector<void *> contexts;
+  for (int i = 0; i < 4; ++i) {
+    contexts.push_back(NewContext(1920, 1080, 8));
+  }
+  NewContext(1920, 1080, 1, MFSR2_TOO_MANY_SHARED);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(contexts.back()), 0);
+  NewContext(1920, 1080, 1, MFSR2_INVALID_PARAMETER);
+  contexts.back() = NewContext(1, 1, 1);
+  for (auto *context : contexts) {
+    EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+  }
+}
+
+TEST_F(PsmlMfsr2Test, DispatchFillsTheReservedSpaceWithOnePacket) {
+  void *context = NewContext(3840, 2160, 32);
+  std::array<uint32_t, 2> size{0, 0xdeadbeef};
+  ASSERT_EQ(Function<GetSize>("ZLL31lzzxr4")(context, size.data()), 0);
+  EXPECT_EQ(size[1], 0xdeadbeefu);
+  const uint32_t dwords = size[0];
+  ASSERT_EQ(dwords, 0x800u);
+  auto output = Texture(3840, 2160, 0x10000);
+  auto color = Texture(2944, 1656, 0x20000);
+  Mfsr2DispatchParameters params;
+  params.output = output.data();
+  params.color = color.data();
+  params.width = 2560;
+  params.height = 1440;
+  std::vector<uint32_t> command(dwords + 2, 0xdeadbeef);
+  const CommandSpace space{command.data() + 1, dwords};
+  ASSERT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, &space, &params), 0);
+  EXPECT_EQ(command[1], KYTY_PM4(dwords, Pm4::IT_NOP, Pm4::R_PSSR));
+  Pssr::Request request;
+  std::memcpy(&request, command.data() + 2, sizeof(request));
+  EXPECT_EQ(std::memcmp(request.output, output.data(), sizeof(request.output)),
+            0);
+  EXPECT_EQ(std::memcmp(request.input, color.data(), sizeof(request.input)), 0);
+  EXPECT_EQ(request.width, 2560u);
+  EXPECT_EQ(request.height, 1440u);
+  EXPECT_TRUE(std::all_of(command.begin() + 2 + Pssr::RequestDwords,
+                          command.end() - 1,
+                          [](uint32_t value) { return value == 0; }));
+  EXPECT_EQ(command.front(), 0xdeadbeefu);
+  EXPECT_EQ(command.back(), 0xdeadbeefu);
+
+  const auto expect_nop = [&](const void *dispatch_context, int expected) {
+    command[1] = 0xdeadbeef;
+    EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(dispatch_context, &space,
+                                                &params),
+              expected);
+    EXPECT_EQ(command[1], KYTY_PM4(dwords, Pm4::IT_NOP, Pm4::R_ZERO));
+  };
+  params.x = 385;
+  expect_nop(context, MFSR2_INVALID_TEXTURE);
+  params.x = 0;
+  params.height = 0;
+  expect_nop(context, MFSR2_RENDER_SIZE);
+  params.height = 1440;
+  params.color = nullptr;
+  expect_nop(context, MFSR2_NULL_TEXTURE);
+  params.color = color.data();
+  output = Texture(3840, 2159, 0x10000);
+  expect_nop(context, MFSR2_INVALID_TEXTURE);
+  expect_nop(nullptr, MFSR2_INVALID_CONTEXT);
+  EXPECT_EQ(command.front(), 0xdeadbeefu);
+  EXPECT_EQ(command.back(), 0xdeadbeefu);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   testing::InitGoogleTest(&argc, argv);
+  Libs::LibPsml::InitPsml_1(&g_symbols);
   return RUN_ALL_TESTS();
 }

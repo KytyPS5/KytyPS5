@@ -320,11 +320,6 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason);
 
-uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
-                                  uint32_t variable_id, uint32_t array_index,
-                                  IR::DescriptorBindingKind kind, uint32_t resource,
-                                  const char* variable_name);
-
 uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class);
 
 uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass numeric_class,
@@ -352,8 +347,6 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
-uint32_t ConstantU32(EmitterState& state, uint32_t value);
-
 uint32_t ConstantI32(EmitterState& state, int32_t value);
 
 uint32_t ConstantF32(EmitterState& state, uint32_t bits);
@@ -374,23 +367,10 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
-void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
 
-DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
-                                    uint32_t lane_bits);
-
-DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
-                                        bool left);
-
-DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subid, uint32_t amount);
-
-DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row);
-
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
-
-uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 
@@ -461,14 +441,10 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
 
-uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
-
 inline constexpr auto EmitTBufferSelectF32 =
     EmitNative<spv::OpSelect, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 
 bool IsSignedFormatComponent(Format::ComponentType type);
-
-uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
@@ -523,9 +499,6 @@ inline constexpr auto EmitLogicalOrBool =
 inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
-
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match);
 
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);

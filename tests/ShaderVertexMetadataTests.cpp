@@ -17,15 +17,15 @@ void Check(bool value, const char* text) {
 }
 
 struct Fixture {
-	std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets {};
+	std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1>    offsets {};
 	ShaderUserData                                                             user_data {};
 	ShaderSemantic                                                             semantic {};
 	ShaderMappedData                                                           mapped {};
 
 	Fixture() {
-		offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-		offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)]     = 2;
-		offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 4;
+		offsets.fill(ILLEGAL_DIRECT_OFFSET);
+		offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)]     = 2;
+		offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 4;
 		user_data.direct_resource_offset = offsets.data();
 		user_data.direct_resource_count  = static_cast<uint16_t>(offsets.size());
 		mapped.user_data                 = &user_data;
@@ -51,30 +51,30 @@ void TestValidAndInvalidMetadata() {
 	Fixture              fixture;
 	ShaderVertexMetadata output;
 	Check(ShaderReadVertexMetadata(fixture.mapped, 64, output) == nullptr,
-	      "valid AGC vertex metadata was rejected");
+	      "valid vertex metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == 4 &&
 	          output.input_semantics.size() == 1,
-	      "valid AGC vertex metadata was decoded incorrectly");
+	      "valid vertex metadata was decoded incorrectly");
 
 	Fixture buffer_only;
-	buffer_only.offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] =
-	    AGC_ILLEGAL_DIRECT_OFFSET;
+	buffer_only.offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] =
+	    ILLEGAL_DIRECT_OFFSET;
 	buffer_only.mapped.input_semantics     = nullptr;
 	buffer_only.mapped.num_input_semantics = 0;
 	Check(ShaderReadVertexMetadata(buffer_only.mapped, 64, output) == nullptr,
-	      "vertex-buffer-only AGC metadata was rejected");
+	      "vertex-buffer-only metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == -1 &&
 	          output.input_semantics.empty(),
-	      "vertex-buffer-only AGC metadata was decoded incorrectly");
+	      "vertex-buffer-only metadata was decoded incorrectly");
 
 	Fixture attrib_only;
-	attrib_only.offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] =
-	    AGC_ILLEGAL_DIRECT_OFFSET;
-	CheckRejected(attrib_only.mapped, "vertex-attribute-only AGC metadata was accepted");
+	attrib_only.offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] =
+	    ILLEGAL_DIRECT_OFFSET;
+	CheckRejected(attrib_only.mapped, "vertex-attribute-only metadata was accepted");
 
 	auto missing_header      = fixture.mapped;
 	missing_header.user_data = nullptr;
-	CheckRejected(missing_header, "missing AGC user-data header was accepted");
+	CheckRejected(missing_header, "missing user-data header was accepted");
 
 	Fixture missing_offsets;
 	missing_offsets.user_data.direct_resource_offset = nullptr;
@@ -90,13 +90,12 @@ void TestValidAndInvalidMetadata() {
 	CheckRejected(excessive_semantics.mapped, "excessive vertex semantic count was accepted");
 
 	Fixture excessive_register;
-	excessive_register.offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] =
-	    63;
+	excessive_register.offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 63;
 	CheckRejected(excessive_register.mapped, "out-of-domain vertex table SGPR was accepted");
 
 	Fixture excessive_attrib_register;
 	excessive_attrib_register
-	    .offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 63;
+	    .offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 63;
 	CheckRejected(excessive_attrib_register.mapped,
 	              "out-of-domain vertex attribute table SGPR was accepted");
 

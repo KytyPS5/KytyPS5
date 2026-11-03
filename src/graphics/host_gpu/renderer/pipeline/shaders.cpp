@@ -1,12 +1,9 @@
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
-#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -78,8 +75,9 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+// Creates the descriptor set layout and the pipeline layout that uses it.
+static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                          std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t descriptor_count = 0;
 	uint64_t storage_buffers = 0;
@@ -125,6 +123,19 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	create.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
+	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
+
+	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+
+	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                          &pipeline.pipeline_layout) !=
+	                     vk::Result::eSuccess);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -153,20 +164,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		if (pixel != nullptr) parameters = pixel->rect_parameters;
 		const auto shaders = BuildRectListShaders(parameters, vertex.info.param_export_mask);
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
-		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
-			     static_cast<void*>(tess_control_shader_module));
-		}
-
-		tess_eval_shader_module = CompileSPV(shaders.evaluation, graphics.device);
-		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done module=%p\n",
-			     static_cast<void*>(tess_eval_shader_module));
-		}
+		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}
-
-	EXIT_NOT_IMPLEMENTED(
-	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
@@ -248,7 +247,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		rasterizer.pNext = &provoking_vertex;
 	}
 	rasterizer.polygonMode = static_params.polygon_mode;
-	rasterizer.lineWidth = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
@@ -281,22 +279,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                           : color_blend_attachment[i].colorBlendOp);
 	}
 
-	vk::Bool32 color_write_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t i = 0; i < rendering.color_count; i++) {
-		color_write_enable[i] = VK_TRUE;
-	}
-
-	vk::PipelineColorWriteCreateInfoEXT color_write {};
-	color_write.attachmentCount    = rendering.color_count;
-	color_write.pColorWriteEnables = color_write_enable;
-
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
-	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if !defined(__APPLE__)
-	color_blending.pNext = &color_write;
-#endif
-	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
@@ -313,31 +296,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			pipeline.push_stages |= native_stage;
 		}
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
-
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
-	pipeline_layout_info.pSetLayouts            = set_layouts.data();
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
-		     " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     key.stage_ids[0], key.stage_ids[3], 1u);
-	}
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                   &pipeline.pipeline_layout);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -389,32 +348,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	tessellation_state.patchControlPoints = static_params.patch_control_points;
 	pipeline_info.pTessellationState =
 	    static_params.patch_control_points != 0 ? &tessellation_state : nullptr;
-	pipeline_info.pViewportState          = &viewport_state;
-	pipeline_info.pRasterizationState     = &rasterizer;
-	pipeline_info.pMultisampleState       = &multisampling;
-	pipeline_info.pDepthStencilState      = (with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState        = &color_blending;
-	pipeline_info.pDynamicState           = &dynamic_state;
-	pipeline_info.layout                  = pipeline.pipeline_layout;
-	pipeline_info.basePipelineIndex       = -1;
+	pipeline_info.pViewportState      = &viewport_state;
+	pipeline_info.pRasterizationState = &rasterizer;
+	pipeline_info.pMultisampleState   = &multisampling;
+	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState    = &color_blending;
+	pipeline_info.pDynamicState       = &dynamic_state;
+	pipeline_info.layout              = pipeline.pipeline_layout;
 
-	EXIT_IF(pipeline.pipeline != nullptr);
-
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
-		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
-		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
-		     key.stage_ids[0], key.stage_ids[3],
-		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
-		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
-		     dynamic_state.dynamicStateCount);
-	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	}
+	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
+	                                                            nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -439,36 +382,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap = module.info.info.uses_image_heap;
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	pipeline.push_stages = vk::ShaderStageFlagBits::eCompute;
-	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
-
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
-	pipeline_layout_info.pSetLayouts            = set_layouts.data();
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
+	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
 		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
 	}
-	info.stage             = comp_shader_stage_info;
-	info.layout            = pipeline.pipeline_layout;
-	info.basePipelineIndex = -1;
+	info.stage  = comp_shader_stage_info;
+	info.layout = pipeline.pipeline_layout;
 
-	EXIT_IF(pipeline.pipeline != nullptr);
-
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	const auto result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 

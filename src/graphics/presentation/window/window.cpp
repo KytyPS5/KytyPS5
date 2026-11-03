@@ -136,12 +136,6 @@ std::unique_ptr<WindowContext> g_window;
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 
-static void SetPause(WindowLoopState& game, bool flag) {
-	LOGF("Pause: %s\n", flag ? "true" : "false");
-
-	game.paused.store(flag, std::memory_order_release);
-}
-
 static void GameEventQuit(WindowLoopState& game) {
 	LOGF("Event: quit\n");
 
@@ -336,26 +330,6 @@ static void GameEventLowMemory() {
 	LOGF("Event: low_memory\n");
 }
 
-static void GameEventWillEnterBackground(WindowLoopState& game) {
-	LOGF("Event: will_enter_background\n");
-
-	SetPause(game, true);
-}
-
-static void GameEventDidEnterBackground() {
-	LOGF("Event: did_enter_background\n");
-}
-
-static void GameEventWillEnterForeground() {
-	LOGF("Event: will_enter_foreground\n");
-}
-
-static void GameEventDidEnterForeground(WindowLoopState& game) {
-	LOGF("Event: did_enter_foreground\n");
-
-	SetPause(game, false);
-}
-
 void WindowContext::Resize(int new_width, int new_height) {
 	if (new_width <= 0 || new_height <= 0) {
 		return;
@@ -507,14 +481,6 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_EVENT_TERMINATING: GameEventTerminate(game); break;
 
 		case SDL_EVENT_LOW_MEMORY: GameEventLowMemory(); break;
-
-		case SDL_EVENT_WILL_ENTER_BACKGROUND: GameEventWillEnterBackground(game); break;
-
-		case SDL_EVENT_DID_ENTER_BACKGROUND: GameEventDidEnterBackground(); break;
-
-		case SDL_EVENT_WILL_ENTER_FOREGROUND: GameEventWillEnterForeground(); break;
-
-		case SDL_EVENT_DID_ENTER_FOREGROUND: GameEventDidEnterForeground(game); break;
 
 		case SDL_EVENT_KEY_DOWN:
 		case SDL_EVENT_KEY_UP: {
@@ -740,21 +706,12 @@ void WindowContext::Run() {
 
 	loop.event     = {};
 	loop.need_exit = false;
-	loop.paused.store(false, std::memory_order_release);
 
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
 
 	while (!loop.need_exit) {
-		if (loop.paused.load(std::memory_order_acquire)) {
-			if (!timer.IsPaused()) {
-				timer.Pause();
-			}
-		} else if (timer.IsPaused()) {
-			timer.Resume();
-		}
-
 		// Refresh the title on the main thread without making presentation wait for it.
 		const auto now     = SDL_GetTicks();
 		const auto elapsed = now - title_time;

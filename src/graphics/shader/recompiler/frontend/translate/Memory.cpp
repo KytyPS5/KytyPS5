@@ -11,43 +11,6 @@ namespace {
 
 using IR::ResourceKind;
 
-const Decoder::Operand& DecodedSourceAt(const Decoder::Instruction& decoded, uint32_t index) {
-	switch (index) {
-		case 0: return decoded.src0;
-		case 1: return decoded.src1;
-		case 2: return decoded.src2;
-		default: return decoded.src3;
-	}
-}
-
-Decoder::Operand OffsetDecodedRegister(const Decoder::Operand& operand, uint32_t index) {
-	if (index == 0) {
-		return operand;
-	}
-	auto result               = operand;
-	result.sdwa_sel           = 6;
-	result.sdwa_dst_unused    = 2;
-	result.omod               = 0;
-	result.sdwa_sext          = false;
-	result.op_sel             = false;
-	result.op_sel_hi          = false;
-	result.negate             = false;
-	result.negate_hi          = false;
-	result.absolute           = false;
-	result.dpp_ctrl           = 0;
-	result.dpp8               = false;
-	result.dpp_row_mask       = 0xf;
-	result.dpp_bank_mask      = 0xf;
-	result.explicit_sdwa_dst  = false;
-	result.dpp_fetch_inactive = false;
-	result.dpp_bound_ctrl     = false;
-	result.dpp                = false;
-	if (result.kind == Decoder::OperandKind::Vgpr || result.kind == Decoder::OperandKind::Sgpr) {
-		result.reg += index;
-	}
-	return result;
-}
-
 uint32_t ResourceIndexFromOperand(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: return operand.reg / 4u;
@@ -153,7 +116,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	return memory;
 }
 
-
 bool IsScalarBufferLoad(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
@@ -163,12 +125,6 @@ bool IsScalarBufferLoad(Decoder::Opcode opcode) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return true;
 		default: return false;
 	}
-}
-
-Decoder::Operand MakeM0Operand() {
-	Decoder::Operand operand;
-	operand.kind = Decoder::OperandKind::M0;
-	return operand;
 }
 
 Decoder::Operand MakeImmediate(uint32_t value) {
@@ -193,15 +149,12 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX);
 		uint32_t cursor = 0;
-		if (store_or_atomic) {
-			if (index == cursor++) return decoded.dst;
-		}
-		if (decoded.idxen) {
-			if (index == cursor++) return decoded.src0;
-		}
-		if (decoded.offen) {
-			if (index == cursor++)
-				return decoded.idxen ? OffsetDecodedRegister(decoded.src0, 1u) : decoded.src0;
+		if (store_or_atomic && index == cursor++) return decoded.dst;
+		if (decoded.idxen && index == cursor++) return decoded.src0;
+		if (decoded.offen && index == cursor++) {
+			auto offset = decoded.src0;
+			offset.reg += decoded.idxen ? 1u : 0u;
+			return offset;
 		}
 		if (index == cursor) return decoded.src2;
 		return MakeImmediate(0u);
@@ -214,9 +167,9 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		                   decoded.opcode == Decoder::Opcode::FLAT_STORE_DWORDX3 ||
 		                   decoded.opcode == Decoder::Opcode::FLAT_STORE_DWORDX4;
 		if (store) {
-			return index == 0u ? decoded.dst : DecodedSourceAt(decoded, index - 1u);
+			return index == 0u ? decoded.dst : SourceAt(decoded, index - 1u);
 		}
-		return DecodedSourceAt(decoded, index);
+		return SourceAt(decoded, index);
 	}
 	if (decoded.family == Decoder::Family::MIMG) {
 		const bool store_or_atomic = decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
@@ -234,10 +187,11 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src0 : MakeImmediate(decoded.offset & 0xffffu);
 			case Decoder::Opcode::DS_CONSUME:
 			case Decoder::Opcode::DS_APPEND:
-				return decoded.gds ? MakeM0Operand() : MakeImmediate(0);
-			case Decoder::Opcode::DS_READ_ADDTID_B32: return MakeM0Operand();
+				return decoded.gds ? ConditionOperand(Decoder::OperandKind::M0) : MakeImmediate(0);
+			case Decoder::Opcode::DS_READ_ADDTID_B32:
+				return ConditionOperand(Decoder::OperandKind::M0);
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
-				return index == 0u ? decoded.src1 : MakeM0Operand();
+				return index == 0u ? decoded.src1 : ConditionOperand(Decoder::OperandKind::M0);
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
 			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
@@ -250,11 +204,12 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
-				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
+				if (index == 0u) return decoded.src1;
+				return index == 1u ? decoded.src0 : decoded.src2;
 			default: return decoded.src0;
 		}
 	}
-	return DecodedSourceAt(decoded, index);
+	return SourceAt(decoded, index);
 }
 
 } // namespace
@@ -578,10 +533,16 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	}
 }
 
+// GDS accesses add the M0[31:16] base to their address.
+IR::U32 Translator::DsAddress(const Decoder::Instruction& inst, IR::U32 address) {
+	return inst.gds ? ir.IAdd(address, ir.ShiftRightLogical(ir.GetM0(), IR::U32(IR::Value(16u))))
+	                : address;
+}
+
 void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(inst.src0);
+	const auto address = DsAddress(inst, ReadU32(inst.src0));
 	const auto read = [&](const Decoder::Operand& operand) -> IR::Value {
 		return memory.data_dwords == 2u ? IR::Value(ReadU64(operand)) : IR::Value(ReadU32(operand));
 	};
@@ -793,7 +754,7 @@ void Translator::DS_BVH_STACK(const Decoder::Instruction& inst) {
 
 void Translator::DS_READ(const Decoder::Instruction& inst) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 0));
+	const auto address = DsAddress(inst, ReadU32(MemorySourceAt(inst, 0)));
 	if (memory.data_bits == 32u) {
 		const auto width  = memory.data_dwords;
 		const auto loaded = LoadSharedU32(width, address, memory, inst.pc);
@@ -811,7 +772,7 @@ void Translator::DS_READ(const Decoder::Instruction& inst) {
 void Translator::DS_READ2(const Decoder::Instruction& inst) {
 	const auto memory       = MemoryInfoFromDecoded(inst);
 	const auto width        = memory.data_dwords / 2u;
-	const auto address      = ReadU32(MemorySourceAt(inst, 0));
+	const auto address      = DsAddress(inst, ReadU32(MemorySourceAt(inst, 0)));
 	auto       first        = memory;
 	first.data_dwords       = width;
 	first.component_count   = width;
@@ -837,7 +798,7 @@ void Translator::DS_WRITE(const Decoder::Instruction& inst) {
 	for (uint32_t index = 0; index < width; index++) {
 		values[index] = ReadU32(OffsetOperand(data_operand, index));
 	}
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto address = DsAddress(inst, ReadU32(MemorySourceAt(inst, 1)));
 	if (memory.data_bits == 32u) {
 		WriteSharedU32(width, address, values, memory, inst.pc);
 		return;
@@ -851,7 +812,7 @@ void Translator::DS_WRITE(const Decoder::Instruction& inst) {
 void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 	const auto               memory      = MemoryInfoFromDecoded(inst);
 	const auto               width       = memory.data_dwords / 2u;
-	const auto               address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto               address     = DsAddress(inst, ReadU32(MemorySourceAt(inst, 1)));
 	const auto               first_data  = MemorySourceAt(inst, 0);
 	const auto               second_data = MemorySourceAt(inst, 2);
 	std::array<IR::Value, 4> first_values {};
@@ -1009,7 +970,10 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16:
@@ -1023,6 +987,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:

@@ -1118,6 +1118,8 @@ void CheckUnmappedPaths(const std::filesystem::path &root) {
   fixture.Close();
 
   FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat("/", &stat) == OK && (stat.st_mode & 0170000u) == 0040000u,
+        "the guest root is a directory without a mount");
   Check(FileSystem::GetRealFilename(host_path).empty() &&
             FileSystem::KernelOpen(host_path.c_str(), 0, 0) ==
                 Libs::LibKernel::KERNEL_ERROR_ENOENT &&

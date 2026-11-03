@@ -342,6 +342,19 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
+// sRGB views decode before filtering; a sampler that skips degamma reads through a UNorm view.
+static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::BufferFormat format,
+                                    vk::Format pixel_format, bool skip_degamma) {
+	if (skip_degamma) return SrgbUnormViewFormat(pixel_format);
+	switch (format) {
+		case Prospero::BufferFormat::k8Srgb:
+			return graphics.r8_srgb_views ? vk::Format::eR8Srgb : pixel_format;
+		case Prospero::BufferFormat::k8_8Srgb:
+			return graphics.r8g8_srgb_views ? vk::Format::eR8G8Srgb : pixel_format;
+		default: return pixel_format;
+	}
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -552,7 +565,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 : storage && resource.atomic ? vk::Format::eR32Uint
 	                                 : raw_sint_format != Prospero::BufferFormat::kInvalid
 	                                     ? VulkanFormat(raw_sint_format)
-	                                     : SrgbStorageViewFormat(pixel_format);
+	                                     : SrgbUnormViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
 	                                     : pixel_format;
@@ -626,7 +639,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		// Set after FindImage, whose metadata clears need the attachment-capable format.
+		desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), format, pixel_format,
+		                                          resource.skip_degamma);
+		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};

@@ -753,6 +753,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --video-out-only)
 	add_test(NAME depth_bits
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
+	add_test(NAME srgb_texture
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME pm4_context_state

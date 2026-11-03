@@ -613,6 +613,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.robust_buffer_access_enabled =
 	    supported_robustness2.robustBufferAccess2 &&
 	    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
+	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
 	// The device clock ticks at timestampPeriod nanoseconds.
 	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
 		graphics.device_clock_period_ps = static_cast<uint32_t>(

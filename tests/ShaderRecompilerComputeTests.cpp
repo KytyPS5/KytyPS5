@@ -1360,6 +1360,8 @@ struct BdaMapping {
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
 constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
+constexpr ShaderProfile SrgbViewProfile{
+    .maintenance8 = true, .r8_srgb_views = true, .r8g8_srgb_views = true};
 
 struct TestCase {
   const char *name = "";
@@ -10705,6 +10707,81 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "BGRA16 direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A sampled sRGB texture views as sRGB, or as UNorm when a paired sampler skips degamma; an
+  // 8 sRGB texture views as sRGB only where the device filters R8_SRGB.
+  void CheckSampledSrgbViews() {
+    constexpr const char *name = "SampledSrgbViews";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "sRGB allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "sRGB mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &executor = context.GetRenderExecutor();
+      const auto r8 =
+          context.GetGraphics().r8_srgb_views ? vk::Format::eR8Srgb : vk::Format::eR8Unorm;
+      struct ViewCase {
+        Prospero::BufferFormat format;
+        bool skip_degamma;
+        vk::Format view;
+      };
+      const std::array cases{
+          ViewCase{Prospero::BufferFormat::k8Srgb, false, r8},
+          ViewCase{Prospero::BufferFormat::k8Srgb, true, vk::Format::eR8Unorm},
+          ViewCase{Prospero::BufferFormat::k8_8_8_8Srgb, false, vk::Format::eR8G8B8A8Srgb},
+          ViewCase{Prospero::BufferFormat::k8_8_8_8Srgb, true, vk::Format::eR8G8B8A8Unorm}};
+      for (u32 index = 0; index < cases.size(); index++) {
+        const auto &view = cases[index];
+        const ShaderTextureResource descriptor{{static_cast<u32>((base + index * 0x1000u) >> 8u),
+            (static_cast<u32>(view.format) << 20u) | (1u << 30u), 1u << 14u,
+            DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = true;
+        resource.skip_degamma = view.skip_degamma;
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Require(name, "view format",
+                binding.image_id && binding.desc.view_info.format == view.view &&
+                    context.GetTextureCache().FindTexture(binding.image_id, binding.desc),
+                "a sampled sRGB texture chose the wrong view format");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "sRGB mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "sRGB allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -22403,6 +22480,8 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
+    m_runtime_context.r8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8Srgb);
+    m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
@@ -40683,6 +40762,52 @@ template <bool rg, bool snorm = false> TestCase ImageSamplePacked8() {
   return test;
 }
 
+// 8_8 sRGB samples and gathers, (r, g, 0, 1), decode in the shader where the device has no
+// R8G8_SRGB view; SKIP_DEGAMMA reads the stored values.
+template <u32 mode> TestCase ImageSampleSrgb8_8() {
+  using O = ShaderOpcode;
+  constexpr bool decoded = mode == 0, skip = mode == 1;
+  TestCase test;
+  test.name = std::array{"ImageSampleSrgb8_8", "ImageSampleSrgb8_8SkipDegamma",
+                         "ImageSampleSrgb8_8View"}[mode];
+  AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.25f));
+  AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.25f));
+  test.code.push_back(EncodeMimg0(0x20, 0xf));
+  test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+  test.code.push_back(EncodeMimg0(0x47, 0x1));
+  test.code.push_back(EncodeMimg1(4, 20, 0, 2));
+  test.code.push_back(EncodeMimg0(0x47, 0x8));
+  test.code.push_back(EncodeMimg1(8, 20, 0, 2));
+  for (u32 component = 0; component < 12; ++component) {
+    AppendStoreVgpr(&test.code, component, component);
+  }
+  AppendEnd(&test.code);
+  test.image_width = test.image_height = 2;
+  // R 0x80 takes the curve, G 0x08 the linear segment.
+  test.sampled_image_rgba = {0x08800880u, 0x08800880u};
+  test.sampled_image_format = vk::Format::eR8G8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.expected_float_tolerance = 0.00001f;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8_8Srgb);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  if constexpr (skip) test.user_data[8] = 1u << 31u;
+  test.user_data[50] = 12u * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  if constexpr (mode == 2) test.profile = &SrgbViewProfile;
+  const float r = decoded ? 0.21586050f : 128.0f / 255.0f;
+  const float g = decoded ? 0.00242822f : 8.0f / 255.0f;
+  for (const float value : {r, g, 0.0f, 1.0f, r, r, r, r, 1.0f, 1.0f, 1.0f, 1.0f}) {
+    test.expected.push_back(std::bit_cast<u32>(value));
+  }
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  if constexpr (decoded) test.required_spirv = {"Pow"};
+  else test.forbidden_spirv = {"Pow"};
+  return test;
+}
+
 // A kDepth k16UInt image load returns the stored D16 codes and integer swizzle constants.
 TestCase ImageLoadDepthBits() {
   using O = ShaderOpcode;
@@ -47761,6 +47886,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSamplePacked8<false>);
   AddCase(ImageSamplePacked8<true>);
   AddCase(ImageSamplePacked8<false, true>);
+  AddCase(ImageSampleSrgb8_8<0>);
+  AddCase(ImageSampleSrgb8_8<1>);
+  AddCase(ImageSampleSrgb8_8<2>);
   AddCase(ImageLoadDepthBits);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
@@ -54183,6 +54311,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSamplePacked8<false, true>());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--srgb-texture-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleSrgb8_8<0>());
+    RunCase(&vulkan, ImageSampleSrgb8_8<1>());
+    RunCase(&vulkan, ImageSampleSrgb8_8<2>());
+    vulkan.CheckSampledSrgbViews();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckMsaaStorageClear();
@@ -55156,6 +55292,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
+    vulkan.CheckSampledSrgbViews();
     vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();

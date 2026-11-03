@@ -360,6 +360,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+	// 8 and 8_8 sRGB views of UNorm images only sample.
+	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
+		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +

@@ -146,9 +146,9 @@ public:
 	[[nodiscard]] Result DecodeInput(const Input& input, const FrameBuffer& frame_buffer,
 	                                 Output* output) {
 		std::scoped_lock lock(m_mutex);
-		*output = {};
+		*output           = {};
 		uint32_t produced = 0;
-		auto result = SubmitInput(input, &produced);
+		auto     result   = SubmitInput(input, &produced);
 		if (result == Result::InputFull) {
 			// The combined API supplies an output buffer together with each AU.
 			result = ReceiveOutput(frame_buffer, output);
@@ -162,7 +162,7 @@ public:
 
 	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output) {
 		std::scoped_lock lock(m_mutex);
-		const auto result = ReceiveOutput(frame_buffer, output);
+		const auto       result = ReceiveOutput(frame_buffer, output);
 		return result == Result::NoFrame ? Result::Ok : result;
 	}
 
@@ -181,7 +181,8 @@ private:
 	};
 
 	void ClearFrames() {
-		for (auto& pending: m_frames) av_frame_free(&pending.frame);
+		for (auto& pending: m_frames)
+			av_frame_free(&pending.frame);
 		m_frames.clear();
 	}
 
@@ -210,7 +211,8 @@ private:
 		const auto drained = DrainFrames();
 		if (drained != Result::Ok) return drained;
 		if (m_frames.size() >= m_config.max_pending_frames) return Result::InputFull;
-		if (input.size > static_cast<size_t>(std::numeric_limits<int>::max())) return Result::ApiFail;
+		if (input.size > static_cast<size_t>(std::numeric_limits<int>::max()))
+			return Result::ApiFail;
 		AVPacket* packet = av_packet_alloc();
 		if (packet == nullptr) return Result::ApiFail;
 		int result = av_new_packet(packet, static_cast<int>(input.size));
@@ -219,8 +221,8 @@ private:
 			return Result::ApiFail;
 		}
 		std::memcpy(packet->data, input.data, input.size);
-		packet->pts = ToAvTimestamp(input.pts);
-		packet->dts = ToAvTimestamp(input.dts);
+		packet->pts        = ToAvTimestamp(input.pts);
+		packet->dts        = ToAvTimestamp(input.dts);
 		packet->opaque_ref = av_buffer_alloc(sizeof(PacketMetadata));
 		if (packet->opaque_ref == nullptr) {
 			av_packet_free(&packet);
@@ -232,7 +234,8 @@ private:
 		av_packet_free(&packet);
 		if (result == AVERROR(EAGAIN)) return Result::InputFull; // The AU was not accepted.
 		if (result < 0) {
-			LOGF("Video decoder: submitting an AU failed: %s (%d)\n", AvErrorString(result), result);
+			LOGF("Video decoder: submitting an AU failed: %s (%d)\n", AvErrorString(result),
+			     result);
 			return Result::AccessUnit;
 		}
 		// Once accepted, a full output queue cannot turn this AU into a retry.
@@ -240,12 +243,12 @@ private:
 	}
 
 	[[nodiscard]] Result ReceiveOutput(const FrameBuffer& frame_buffer, Output* output) {
-		*output = {};
+		*output            = {};
 		const auto drained = DrainFrames();
 		if (drained != Result::Ok) return drained;
 		if (m_frames.empty()) return Result::NoFrame;
-		auto& pending = m_frames.front();
-		const auto result = CopyFrame(pending.frame, pending.picture, frame_buffer, output);
+		auto&      pending = m_frames.front();
+		const auto result  = CopyFrame(pending.frame, pending.picture, frame_buffer, output);
 		if (result != Result::Ok) return result;
 		output->last_frame = m_finalized && m_eof && m_frames.size() == 1u;
 		av_frame_free(&pending.frame);
@@ -302,27 +305,57 @@ private:
 			return Result::OversizeDecode;
 		}
 
-		const auto width       = static_cast<uint32_t>(frame->width);
-		const auto height      = static_cast<uint32_t>(frame->height);
-		const auto pitch       = AlignUp(width, 256);
-		const auto chroma_rows = (static_cast<uint64_t>(height) + 1u) / 2u;
-		const auto required =
-		    static_cast<uint64_t>(pitch) * height + static_cast<uint64_t>(pitch) * chroma_rows;
+		const auto width         = static_cast<uint32_t>(frame->width);
+		const auto height        = static_cast<uint32_t>(frame->height);
+		const auto pitch         = AlignUp(width, 256);
+		const auto chroma_rows   = (static_cast<uint64_t>(height) + 1u) / 2u;
+		const auto chroma_width  = AlignUp(width, 2);
+		const auto luma_size     = static_cast<uint64_t>(pitch) * height;
+		const auto chroma_offset = AlignUp(luma_size, 256);
+		const auto chroma_size   = static_cast<uint64_t>(pitch) * chroma_rows;
+		const auto required      = chroma_offset + chroma_size;
 		if (required > frame_buffer.size) {
 			return Result::FrameBufferSize;
 		}
 
 		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
-		std::memset(dst, 0, static_cast<size_t>(required));
+		std::memset(dst, 0, static_cast<size_t>(luma_size));
+		auto* chroma = dst + static_cast<size_t>(chroma_offset);
+		std::memset(chroma, 128, static_cast<size_t>(chroma_size));
+
 		if (frame->format == AV_PIX_FMT_NV12) {
+			const auto copy_luma = std::min(width, static_cast<uint32_t>(frame->linesize[0]));
 			for (uint32_t y = 0; y < height; y++) {
 				std::memcpy(dst + static_cast<size_t>(y) * pitch,
-				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0], width);
+				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0],
+				            copy_luma);
 			}
-			auto* chroma = dst + static_cast<size_t>(pitch) * height;
+			const auto copy_chroma =
+			    std::min(chroma_width, static_cast<uint32_t>(frame->linesize[1]));
 			for (uint32_t y = 0; y < chroma_rows; y++) {
 				std::memcpy(chroma + static_cast<size_t>(y) * pitch,
-				            frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1], width);
+				            frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1],
+				            copy_chroma);
+			}
+		} else if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) {
+			const auto copy_luma = std::min(width, static_cast<uint32_t>(frame->linesize[0]));
+			for (uint32_t y = 0; y < height; y++) {
+				std::memcpy(dst + static_cast<size_t>(y) * pitch,
+				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0],
+				            copy_luma);
+			}
+			const auto uv_width = (width + 1u) / 2u;
+			const auto max_u    = static_cast<uint32_t>(frame->linesize[1]);
+			const auto max_v    = static_cast<uint32_t>(frame->linesize[2]);
+			const auto copy_uv  = std::min({uv_width, max_u, max_v});
+			for (uint32_t y = 0; y < chroma_rows; y++) {
+				const auto* src_u = frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1];
+				const auto* src_v = frame->data[2] + static_cast<ptrdiff_t>(y) * frame->linesize[2];
+				auto*       dst_uv = chroma + static_cast<size_t>(y) * pitch;
+				for (uint32_t x = 0; x < copy_uv; x++) {
+					dst_uv[x * 2]     = src_u[x];
+					dst_uv[x * 2 + 1] = src_v[x];
+				}
 			}
 		} else {
 			m_sws = sws_getCachedContext(m_sws, frame->width, frame->height,
@@ -332,8 +365,7 @@ private:
 			if (m_sws == nullptr) {
 				return Result::ApiFail;
 			}
-			uint8_t* output_planes[4]  = {dst, dst + static_cast<size_t>(pitch) * height, nullptr,
-			                              nullptr};
+			uint8_t* output_planes[4]  = {dst, chroma, nullptr, nullptr};
 			int      output_strides[4] = {static_cast<int>(pitch), static_cast<int>(pitch), 0, 0};
 			if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, output_planes,
 			              output_strides) != frame->height) {
@@ -370,12 +402,12 @@ private:
 		m_picture_buffers.clear();
 	}
 
-	std::deque<PendingFrame>   m_frames;
+	std::deque<PendingFrame>  m_frames;
 	bool                      m_finalized = false;
 	bool                      m_eof       = false;
 	Config                    m_config;
-	AVCodecContext*           m_codec    = nullptr;
-	SwsContext*               m_sws      = nullptr;
+	AVCodecContext*           m_codec = nullptr;
+	SwsContext*               m_sws   = nullptr;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };
@@ -459,8 +491,7 @@ AvcPictureInfo MakeAvcPictureInfo(const PictureInfo& decoded, size_t size) {
 	picture.video_format                   = 5;
 	picture.video_full_range_flag          = decoded.color_range == 2 ? 1 : 0;
 	picture.colour_description_present_flag =
-	    decoded.color_primaries != 0 || decoded.color_trc != 0 || decoded.color_space != 0 ? 1
-	                                                                                       : 0;
+	    decoded.color_primaries != 0 || decoded.color_trc != 0 || decoded.color_space != 0 ? 1 : 0;
 	picture.colour_primaries         = decoded.color_primaries;
 	picture.transfer_characteristics = decoded.color_trc;
 	picture.matrix_coefficients      = decoded.color_space;

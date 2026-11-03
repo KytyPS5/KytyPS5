@@ -319,13 +319,22 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 		return validation_result;
 	}
 
+	const auto pitch =
+	    (static_cast<size_t>(config->max_frame_width > 0 ? config->max_frame_width : 1920) + 255u) &
+	    ~size_t {255};
+	const auto height =
+	    (static_cast<size_t>(config->max_frame_height > 0 ? config->max_frame_height : 1080) +
+	     15u) &
+	    ~size_t {15};
+	const auto calc_frame_size = pitch * height * 3 / 2;
+
 	memory_info->cpu_memory_size        = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_memory             = nullptr;
 	memory_info->gpu_memory_size        = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = std::max(VIDEODEC2_MIN_MEMORY_SIZE, calc_frame_size);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
@@ -351,10 +360,19 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 		return validation_result;
 	}
 
+	const auto pitch =
+	    (static_cast<size_t>(config->max_frame_width > 0 ? config->max_frame_width : 1920) + 255u) &
+	    ~size_t {255};
+	const auto height =
+	    (static_cast<size_t>(config->max_frame_height > 0 ? config->max_frame_height : 1080) +
+	     15u) &
+	    ~size_t {15};
+	const auto required_frame_size = std::max(VIDEODEC2_MIN_MEMORY_SIZE, pitch * height * 3 / 2);
+
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	    memory_info->max_frame_buffer_size < required_frame_size) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 

@@ -1352,6 +1352,21 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+// The flag must be off by default and on when only its field is set.
+void CheckNativeFloatMinMaxConfig() {
+  constexpr const char *name = "NativeFloatMinMaxConfig";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "off by default", !Config::NativeFloatMinMaxEnabled(),
+          "the default options enabled native float min/max");
+  // Only this field differs from the baseline, so nothing else can turn it on.
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .native_float_min_max_enabled = true});
+  Require(name, "on when set", Config::NativeFloatMinMaxEnabled(),
+          "setting the field did not enable native float min/max");
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -54009,6 +54024,10 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckNativeFloatMinMaxConfig();
+  if (argc == 2 && std::strcmp(argv[1], "--native-float-minmax-only") == 0) {
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));

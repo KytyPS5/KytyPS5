@@ -2511,10 +2511,12 @@ void TestNewShaderRecompilerF32CompareFlushSkipsNormalImmediate() {
   struct Variant {
     uint32_t src0;
     size_t flushes;
+    bool has_literal;
   };
-  for (const auto [src0, flushes] :
-       {Variant{240u, 0u}, Variant{128u, 1u}, Variant{256u + 1u, 2u}}) {
-    const uint32_t shader[] = {
+  for (const auto [src0, flushes, has_literal] :
+       {Variant{240u, 0u, false}, Variant{128u, 1u, false},
+        Variant{256u + 1u, 2u, false}, Variant{255u, 1u, true}}) {
+    std::vector<uint32_t> shader = {
         EncodeMubuf0(0x0c, 0, false),
         EncodeMubuf1(0, 12, 0),
         EncodeMubuf0(0x0c, 4, false),
@@ -2525,6 +2527,9 @@ void TestNewShaderRecompilerF32CompareFlushSkipsNormalImmediate() {
         EncodeMubuf1(3, 12, 0),
         EncodeSopp(0x01),
     };
+    if (has_literal) {
+      shader.insert(shader.begin() + 5, 0x00400000u);
+    }
     auto options = MakeCompileOptions(ShaderType::Compute);
     ShaderComputeInputInfo compute{};
     compute.float_mode = 0xc0;

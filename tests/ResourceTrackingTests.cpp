@@ -5521,14 +5521,6 @@ void TestImagesSamplersAndAliases() {
   fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
                {storage, image_address, Value(1u), Value(true)},
                fixture.AddMemory(storage_memory, 16));
-
-  const auto buffer = fixture.Buffer(
-      {image_words[0], image_words[1], image_words[2], image_words[3]}, 20);
-  MemoryInfo buffer_memory;
-  buffer_memory.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::LoadBufferU32,
-               {buffer, Value(0u), Value(0u), Value(0u), Value(true)},
-               fixture.AddMemory(buffer_memory, 20));
   fixture.PlanAndTrack();
 
   Check(fixture.program.info.images.size() == 3 &&
@@ -5546,8 +5538,6 @@ void TestImagesSamplersAndAliases() {
   const auto sampler_source = fixture.program.info.samplers[0].source;
   Check(fixture.program.descriptor_sources[sampler_source].dwords[3].U32() == 0,
         "unused sampler border color was not canonicalized");
-  Check(fixture.program.info.buffers[0].image_alias == 0,
-        "buffer/image descriptor alias was not linked");
 }
 
 void TestIndependentImageSamplerPairs() {

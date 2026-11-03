@@ -681,19 +681,23 @@ bool ValidateVop1Sdwa(Instruction& inst, uint32_t opcode, uint32_t modifier) {
 	return true;
 }
 
+// Source selector byte (SDWA bits [23:16] for SRC0, [31:24] for SRC1): SEL [2:0], SEXT [3],
+// NEG [4], ABS [5]; S [7] = 0 selects a VGPR.
+void DecodeSdwaSource(uint32_t code, uint32_t fields, uint32_t pc, Operand& operand) {
+	DecodeScalarSource(code + ((fields & 0x80u) == 0u ? 256u : 0u), pc, operand);
+	operand.sdwa_sel  = fields & 0x7u;
+	operand.sdwa_sext = (fields & 0x8u) != 0u;
+	operand.negate    = (fields & 0x10u) != 0u;
+	operand.absolute  = (fields & 0x20u) != 0u;
+}
+
 void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vdst, Instruction& inst) {
-	const auto modifier  = code[word_index + 1u];
-	const auto src0      = modifier & 0xffu;
-	const auto dst_sel   = (modifier >> 8u) & 0x7u;
-	const auto dst_u     = (modifier >> 11u) & 0x3u;
-	const auto clamp     = (modifier >> 13u) & 0x1u;
-	const auto omod      = (modifier >> 14u) & 0x3u;
-	const auto src0_sel  = (modifier >> 16u) & 0x7u;
-	const auto src0_sext = (modifier >> 19u) & 0x1u;
-	const auto src0_neg  = (modifier >> 20u) & 0x1u;
-	const auto src0_abs  = (modifier >> 21u) & 0x1u;
-	const auto s0        = (modifier >> 23u) & 0x1u;
+	const auto modifier = code[word_index + 1u];
+	const auto dst_sel  = (modifier >> 8u) & 0x7u;
+	const auto dst_u    = (modifier >> 11u) & 0x3u;
+	const auto clamp    = (modifier >> 13u) & 0x1u;
+	const auto omod     = (modifier >> 14u) & 0x3u;
 
 	SetRawWords(inst, code, word_index, 2);
 	if (!ValidateVop1Sdwa(inst, opcode, modifier)) {
@@ -706,16 +710,12 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	} else {
 		DecodeVectorGpr(vdst, inst.dst);
 	}
-	DecodeScalarSource(src0 + (s0 == 0u ? 256u : 0u), pc, inst.src0);
+	DecodeSdwaSource(modifier & 0xffu, modifier >> 16u, pc, inst.src0);
 	inst.dst.sdwa_sel          = dst_sel;
 	inst.dst.sdwa_dst_unused   = dst_u;
 	inst.dst.explicit_sdwa_dst = true;
 	inst.dst.clamp             = clamp != 0u;
 	inst.dst.omod              = omod;
-	inst.src0.sdwa_sel         = src0_sel;
-	inst.src0.sdwa_sext        = src0_sext != 0u;
-	inst.src0.negate           = src0_neg != 0u;
-	inst.src0.absolute         = src0_abs != 0u;
 	inst.src_count             = 1;
 	ReadLiteralOperands(code, word_index, inst);
 }
@@ -929,40 +929,30 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 }
 
 struct Vop2SdwaFields {
-	uint32_t src0      = 0;
-	uint32_t dst_sel   = 6;
-	uint32_t dst_u     = 0;
-	uint32_t clamp     = 0;
-	uint32_t omod      = 0;
-	uint32_t src0_sel  = 6;
-	uint32_t src0_sext = 0;
-	uint32_t src0_neg  = 0;
-	uint32_t src0_abs  = 0;
-	uint32_t s0        = 0;
-	uint32_t src1_sel  = 6;
-	uint32_t src1_sext = 0;
-	uint32_t src1_neg  = 0;
-	uint32_t src1_abs  = 0;
-	uint32_t s1        = 0;
+	uint32_t dst_sel  = 6;
+	uint32_t dst_u    = 0;
+	uint32_t clamp    = 0;
+	uint32_t omod     = 0;
+	uint32_t src0_sel = 6;
+	uint32_t src0_neg = 0;
+	uint32_t src0_abs = 0;
+	uint32_t src1_sel = 6;
+	uint32_t src1_neg = 0;
+	uint32_t src1_abs = 0;
 };
 
 Vop2SdwaFields DecodeVop2SdwaFields(uint32_t modifier) {
 	Vop2SdwaFields fields;
-	fields.src0      = modifier & 0xffu;
-	fields.dst_sel   = (modifier >> 8u) & 0x7u;
-	fields.dst_u     = (modifier >> 11u) & 0x3u;
-	fields.clamp     = (modifier >> 13u) & 0x1u;
-	fields.omod      = (modifier >> 14u) & 0x3u;
-	fields.src0_sel  = (modifier >> 16u) & 0x7u;
-	fields.src0_sext = (modifier >> 19u) & 0x1u;
-	fields.src0_neg  = (modifier >> 20u) & 0x1u;
-	fields.src0_abs  = (modifier >> 21u) & 0x1u;
-	fields.s0        = (modifier >> 23u) & 0x1u;
-	fields.src1_sel  = (modifier >> 24u) & 0x7u;
-	fields.src1_sext = (modifier >> 27u) & 0x1u;
-	fields.src1_neg  = (modifier >> 28u) & 0x1u;
-	fields.src1_abs  = (modifier >> 29u) & 0x1u;
-	fields.s1        = (modifier >> 31u) & 0x1u;
+	fields.dst_sel  = (modifier >> 8u) & 0x7u;
+	fields.dst_u    = (modifier >> 11u) & 0x3u;
+	fields.clamp    = (modifier >> 13u) & 0x1u;
+	fields.omod     = (modifier >> 14u) & 0x3u;
+	fields.src0_sel = (modifier >> 16u) & 0x7u;
+	fields.src0_neg = (modifier >> 20u) & 0x1u;
+	fields.src0_abs = (modifier >> 21u) & 0x1u;
+	fields.src1_sel = (modifier >> 24u) & 0x7u;
+	fields.src1_neg = (modifier >> 28u) & 0x1u;
+	fields.src1_abs = (modifier >> 29u) & 0x1u;
 	return fields;
 }
 
@@ -1107,21 +1097,13 @@ void DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
-	DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0);
-	DecodeScalarSource(vsrc1 + (fields.s1 == 0u ? 256u : 0u), pc, inst.src1);
+	DecodeSdwaSource(modifier & 0xffu, modifier >> 16u, pc, inst.src0);
+	DecodeSdwaSource(vsrc1, modifier >> 24u, pc, inst.src1);
 	inst.dst.sdwa_sel          = fields.dst_sel;
 	inst.dst.sdwa_dst_unused   = fields.dst_u;
 	inst.dst.explicit_sdwa_dst = true;
 	inst.dst.clamp             = fields.clamp != 0u;
 	inst.dst.omod              = fields.omod;
-	inst.src0.sdwa_sel         = fields.src0_sel;
-	inst.src0.sdwa_sext        = fields.src0_sext != 0u;
-	inst.src0.negate           = fields.src0_neg != 0u;
-	inst.src0.absolute         = fields.src0_abs != 0u;
-	inst.src1.sdwa_sel         = fields.src1_sel;
-	inst.src1.sdwa_sext        = fields.src1_sext != 0u;
-	inst.src1.negate           = fields.src1_neg != 0u;
-	inst.src1.absolute         = fields.src1_abs != 0u;
 	FinalizeVop2Instruction(code, word_index, inst);
 }
 
@@ -1154,40 +1136,6 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	FinalizeVop2Instruction(code, word_index, inst);
 }
 
-struct VopcSdwaFields {
-	uint32_t src0      = 0;
-	uint32_t sdst      = 0;
-	uint32_t sd        = 0;
-	uint32_t src0_sel  = 6;
-	uint32_t src0_sext = 0;
-	uint32_t src0_neg  = 0;
-	uint32_t src0_abs  = 0;
-	uint32_t s0        = 0;
-	uint32_t src1_sel  = 6;
-	uint32_t src1_sext = 0;
-	uint32_t src1_neg  = 0;
-	uint32_t src1_abs  = 0;
-	uint32_t s1        = 0;
-};
-
-VopcSdwaFields DecodeVopcSdwaFields(uint32_t modifier) {
-	VopcSdwaFields fields;
-	fields.src0      = modifier & 0xffu;
-	fields.sdst      = (modifier >> 8u) & 0x7fu;
-	fields.sd        = (modifier >> 15u) & 0x1u;
-	fields.src0_sel  = (modifier >> 16u) & 0x7u;
-	fields.src0_sext = (modifier >> 19u) & 0x1u;
-	fields.src0_neg  = (modifier >> 20u) & 0x1u;
-	fields.src0_abs  = (modifier >> 21u) & 0x1u;
-	fields.s0        = (modifier >> 23u) & 0x1u;
-	fields.src1_sel  = (modifier >> 24u) & 0x7u;
-	fields.src1_sext = (modifier >> 27u) & 0x1u;
-	fields.src1_neg  = (modifier >> 28u) & 0x1u;
-	fields.src1_abs  = (modifier >> 29u) & 0x1u;
-	fields.s1        = (modifier >> 31u) & 0x1u;
-	return fields;
-}
-
 bool SupportsVopcSdwa(Opcode opcode) {
 	// SDWA operand handling is not implemented for 64-bit compares.
 	return opcode != Opcode::UNSUPPORTED &&
@@ -1198,9 +1146,8 @@ bool SupportsVopcSdwa(Opcode opcode) {
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
 	const auto modifier = code[word_index + 1u];
-	const auto fields   = DecodeVopcSdwaFields(modifier);
 	SetRawWords(inst, code, word_index, 2);
-	if (fields.src0_sel > 6u || fields.src1_sel > 6u) {
+	if (((modifier >> 16u) & 0x7u) > 6u || ((modifier >> 24u) & 0x7u) > 6u) {
 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC SDWA selector is invalid");
 		return;
 	}
@@ -1210,24 +1157,16 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 		return;
 	}
 
-	DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0);
-	DecodeScalarSource(vsrc1 + (fields.s1 == 0u ? 256u : 0u), pc, inst.src1);
+	DecodeSdwaSource(modifier & 0xffu, modifier >> 16u, pc, inst.src0);
+	DecodeSdwaSource(vsrc1, modifier >> 24u, pc, inst.src1);
 	if (IsVopcCompareExec(inst.opcode)) {
 		inst.dst.kind = OperandKind::ExecLo;
-	} else if (fields.sd == 0u) {
+	} else if ((modifier & 0x8000u) == 0u) {
 		inst.dst.kind = OperandKind::VccLo;
 	} else {
-		DecodeScalarDestination(fields.sdst, pc, inst.dst);
+		DecodeScalarDestination((modifier >> 8u) & 0x7fu, pc, inst.dst);
 	}
-	inst.src0.sdwa_sel  = fields.src0_sel;
-	inst.src0.sdwa_sext = fields.src0_sext != 0u;
-	inst.src0.negate    = fields.src0_neg != 0u;
-	inst.src0.absolute  = fields.src0_abs != 0u;
-	inst.src1.sdwa_sel  = fields.src1_sel;
-	inst.src1.sdwa_sext = fields.src1_sext != 0u;
-	inst.src1.negate    = fields.src1_neg != 0u;
-	inst.src1.absolute  = fields.src1_abs != 0u;
-	inst.src_count      = 2;
+	inst.src_count = 2;
 	ReadLiteralOperands(code, word_index, inst);
 }
 

@@ -400,7 +400,6 @@ public:
 				Collect(inst);
 			}
 		}
-		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -4337,31 +4336,6 @@ private:
 
 	const DescriptorSource* Source(uint32_t source) const {
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
-	}
-
-	void LinkImageAliases() {
-		for (auto& buffer: m_info.buffers) {
-			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
-				continue;
-			}
-			for (uint32_t image = 0; image < m_info.images.size(); image++) {
-				const auto* image_source = Source(m_info.images[image].source);
-				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_descriptor.has_value()) {
-					continue;
-				}
-				bool alias = true;
-				for (uint32_t dword = 0; dword < 4; dword++) {
-					alias = alias && EquivalentValue(m_program, buffer_source->dwords[dword],
-					                                 image_source->dwords[dword]);
-				}
-				if (alias) {
-					buffer.image_alias = image;
-					break;
-				}
-			}
-		}
 	}
 
 	Program&                                   m_program;

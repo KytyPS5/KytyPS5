@@ -189,9 +189,8 @@ private:
 	void Integer16Mad(const Decoder::Instruction& inst, bool sign);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
-	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void PackedInteger16Mad(const Decoder::Instruction& inst, bool sign);
-	void PackedInteger16MinMax(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode logical_opcode,
 	                IR::ValueOpcode bit_opcode, bool negate_rhs, bool negate_result, bool unary);
 	IR::U1 U64MaskBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool negate_rhs,
@@ -201,15 +200,12 @@ private:
 	void S_ASHR_I64(const Decoder::Instruction& inst);
 	void ComposedIntegerBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                           bool negate_rhs, bool negate_result, bool update_scc);
-	void V_AND_OR_B32(const Decoder::Instruction& inst);
-	void V_OR3_B32(const Decoder::Instruction& inst);
-	void V_XOR3_B32(const Decoder::Instruction& inst);
+	void Integer3(const Decoder::Instruction& inst, IR::ValueOpcode inner, IR::ValueOpcode outer);
 	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb, bool sign);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
-	void V_ADD3_U32(const Decoder::Instruction& inst);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	void S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
@@ -226,10 +222,6 @@ private:
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
-	void    V_LSHL_ADD_U32(const Decoder::Instruction& inst);
-	void    V_ADD_LSHL_U32(const Decoder::Instruction& inst);
-	void    V_XAD_U32(const Decoder::Instruction& inst);
-	void    V_LSHL_OR_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 

@@ -115,7 +115,6 @@ struct ExportInfo {
 };
 
 struct BufferResource {
-	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
@@ -125,7 +124,6 @@ struct BufferResource {
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
-	uint32_t               image_alias        = NoImageAlias;
 	bool                   read               = false;
 	bool                   written            = false;
 	bool                   atomic             = false;

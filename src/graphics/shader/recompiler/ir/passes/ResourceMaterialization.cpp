@@ -2060,11 +2060,6 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			memory.resource = image_remap[memory.resource];
 		}
 	}
-	for (auto& buffer: buffers) {
-		if (buffer.image_alias != BufferResource::NoImageAlias) {
-			buffer.image_alias = image_remap[buffer.image_alias];
-		}
-	}
 	for (auto& pair: sampled_pairs) {
 		pair.image = image_remap[pair.image];
 	}

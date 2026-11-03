@@ -4576,6 +4576,45 @@ public:
       Require(name, "cpu write after a queued publish",
               Backing(race_offset) == cpu_value && Clean(race_offset),
               "a queued publish overwrote a newer CPU write");
+      constexpr uint64_t budget_offset = 0x314000;
+      constexpr uint64_t budget_stride = 0x20000;
+      constexpr uint64_t budget_size = 0x10000;
+      constexpr uint32_t budget_blocks = 17;
+      constexpr uint64_t last_budget_offset =
+          budget_offset + (budget_blocks - 2) * budget_stride;
+      constexpr uint64_t over_budget_offset =
+          budget_offset + (budget_blocks - 1) * budget_stride;
+      constexpr uint32_t budget_first = 0x71572468u;
+      constexpr uint32_t budget_second = 0xace15715u;
+      const auto GpuFill = [&](uint64_t offset, uint64_t size, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, size, true, false);
+        cache.FillBuffer(base + offset, size, value, false);
+      };
+      for (uint32_t block = 0; block != budget_blocks; ++block) {
+        GpuFill(budget_offset + block * budget_stride, budget_size,
+                budget_first);
+        scheduler.Flush();
+        cache.ReadMemory(base + budget_offset + block * budget_stride,
+                         budget_size);
+      }
+      for (uint32_t block = 0; block != budget_blocks; ++block) {
+        GpuFill(budget_offset + block * budget_stride, budget_size,
+                budget_second);
+      }
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "publish budget",
+              Backing(last_budget_offset) == budget_second &&
+                  Clean(last_budget_offset) &&
+                  Backing(over_budget_offset) == budget_first &&
+                  Dirty(over_budget_offset),
+              "PublishReadHot ignored the publish budget");
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "publish budget remainder",
+              Backing(over_budget_offset) == budget_second &&
+                  Clean(over_budget_offset),
+              "unpublished read-hot ranges were dropped");
 
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

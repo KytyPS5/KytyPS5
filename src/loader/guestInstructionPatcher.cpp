@@ -132,7 +132,8 @@ enum class InstructionReplacement {
 	ExtractQ,
 	InsertQ,
 	ReadProcessorId,
-	CacheLineWriteBack
+	CacheLineWriteBack,
+	ReadTimeStampCounter
 };
 
 struct InstructionRewrite {
@@ -149,12 +150,15 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
 		case InstructionReplacement::ExtractQ: return result.extrq;
 		case InstructionReplacement::InsertQ: return result.insertq;
 		case InstructionReplacement::ReadProcessorId: return result.rdpid;
+		case InstructionReplacement::ReadTimeStampCounter: return result.rdtsc;
 		default: return result.clwb;
 	}
 }
 
 bool UsesInstructionTrap(InstructionReplacement replacement, bool trap_replacements) {
+	// RDTSC does not fault, so a trap fallback would keep the host rate.
 	return replacement != InstructionReplacement::None &&
+	       replacement != InstructionReplacement::ReadTimeStampCounter &&
 	       (trap_replacements || replacement == InstructionReplacement::InsertQ ||
 	        replacement == InstructionReplacement::ReadProcessorId);
 }
@@ -950,6 +954,45 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	}
 }
 
+// RDTSC/RDTSCP at the guest rate: EDX:EAX = host TSC * multiplier >> 32 with the upper halves of
+// RAX and RDX zeroed; RDTSCP still sets ECX. The BMI2 sequence keeps RFLAGS and the stack.
+void GenerateReadTimeStampCounter(const DecodedCodeInstruction& decoded, u64 multiplier,
+                                  Xbyak::CodeGenerator& generator) {
+	if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+		generator.rdtscp();
+	} else {
+		generator.rdtsc();
+	}
+	generator.rorx(rdx, rdx, 32);
+	generator.lea(rax, ptr[rax + rdx]);
+	generator.mov(rdx, multiplier);
+	generator.mulx(rdx, rax, rax);
+	generator.rorx(rax, rax, 32);
+	generator.mov(eax, eax);
+	generator.mov(edx, edx);
+}
+
+void CollectTscInstructions(const DecodedFunction&                   function,
+                            std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                            GuestInstructionPatchResult&             result) {
+	for (const auto& [address, decoded]: function.instructions) {
+		const auto mnemonic = decoded.instruction.mnemonic;
+		if (mnemonic == ZYDIS_MNEMONIC_RDTSC || mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+			++result.rdtsc.found;
+			rewrite_sites[address].replacement = InstructionReplacement::ReadTimeStampCounter;
+		}
+	}
+}
+
+// Whether [start, end) holds an RDTSC (0F 31) or RDTSCP (0F 01 F9) encoding: only those functions
+// are decoded when nothing else is patched.
+bool MayReadTimeStampCounter(uintptr_t start, uintptr_t end) {
+	constexpr std::array<u8, 2> Rdtsc {0x0f, 0x31};
+	constexpr std::array<u8, 3> Rdtscp {0x0f, 0x01, 0xf9};
+	const std::span             code(reinterpret_cast<const u8*>(start), end - start);
+	return !std::ranges::search(code, Rdtsc).empty() || !std::ranges::search(code, Rdtscp).empty();
+}
+
 void MarkInstructionTrap(u8* code, const ZydisDecodedInstruction& instruction,
                          InstructionReplacement replacement) {
 	if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
@@ -986,6 +1029,7 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
                                  GuestInstructionPatchResult&                   result) {
 	for (const auto& [address, rewrite]: rewrite_sites) {
 		if (rewrite.replacement == InstructionReplacement::None ||
+		    rewrite.replacement == InstructionReplacement::ReadTimeStampCounter ||
 		    module.patched.contains(reinterpret_cast<u8*>(address))) {
 			continue;
 		}
@@ -1008,7 +1052,7 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 
 void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& function,
                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                               GuestInstructionPatchResult&                   result) {
+                               GuestInstructionPatchResult& result, u64 tsc_multiplier) {
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1054,6 +1098,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 						GenerateReciprocalSquareRoot(*decoded, generator);
 					} else if (replacement == InstructionReplacement::ExtractQ) {
 						GenerateExtractQ(*decoded, generator);
+					} else if (replacement == InstructionReplacement::ReadTimeStampCounter) {
+						GenerateReadTimeStampCounter(*decoded, tsc_multiplier, generator);
 					} else {
 						// CLFLUSH writes back dirty data too; invalidation is a permitted stronger
 						// action.
@@ -1497,9 +1543,11 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
-                                                   GuestInstructionHostFeatures host_features) {
+                                                   GuestInstructionHostFeatures host_features,
+                                                   u64                          tsc_multiplier) {
 	GuestInstructionPatchResult result {};
-	if (!protect_memory && !emulate_amd) {
+	const bool                  tsc_only = !protect_memory && !emulate_amd;
+	if (tsc_only && tsc_multiplier == 0) {
 		return result;
 	}
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
@@ -1529,7 +1577,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		const uintptr_t function_start = starts[function_index];
 		const uintptr_t function_end =
 		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
-		if (function_end <= function_start) {
+		if (function_end <= function_start ||
+		    (tsc_only && !MayReadTimeStampCounter(function_start, function_end))) {
 			continue;
 		}
 
@@ -1552,8 +1601,11 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		if (emulate_amd) {
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
+		if (tsc_multiplier != 0) {
+			CollectTscInstructions(function, rewrite_sites, result);
+		}
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result);
+			RelocateGuestInstructions(module, function, rewrite_sites, result, tsc_multiplier);
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
 		}
 	}

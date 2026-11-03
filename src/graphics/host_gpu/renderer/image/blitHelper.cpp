@@ -44,18 +44,10 @@ BlitHelper::~BlitHelper() {
 	for (const auto& pipeline: m_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline.handle, nullptr);
 	}
-	if (m_fragment_shader != nullptr) {
-		m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
-	}
-	if (m_vertex_shader != nullptr) {
-		m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
-	}
-	if (m_pipeline_layout != nullptr) {
-		m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
-	}
-	if (m_descriptor_layout != nullptr) {
-		m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
-	}
+	m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
+	m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
+	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
 }
 
 vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {

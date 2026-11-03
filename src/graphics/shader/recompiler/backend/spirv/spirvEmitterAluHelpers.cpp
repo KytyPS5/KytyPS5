@@ -22,8 +22,8 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	        EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0)};
 }
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match) {
+static uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
+                                      uint32_t class_match) {
 	const auto selected =
 	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, mask, 1u << bit), 0);
 	return EmitLogicalAndBool(state, selected, class_match);

@@ -7,9 +7,9 @@
 
 namespace Libs::Graphics {
 
-inline constexpr uint16_t AGC_ILLEGAL_DIRECT_OFFSET = 0xffff;
+inline constexpr uint16_t ILLEGAL_DIRECT_OFFSET = 0xffff;
 
-enum class AgcDirectResourceType : uint32_t {
+enum class DirectResourceType : uint32_t {
 	GdsCounterRange          = 0,
 	ShaderResourceTable      = 1,
 	SubPtrFetchShader        = 2,
@@ -22,13 +22,6 @@ enum class AgcDirectResourceType : uint32_t {
 	StereoXOffset            = 9,
 	PtrVertexAttribDescTable = 10,
 	Last                     = PtrVertexAttribDescTable,
-};
-
-enum class ResourceDescriptorType {
-	Texture,
-	Buffer,
-	Sampler,
-	Unused,
 };
 
 struct ShaderBufferResource {
@@ -194,8 +187,6 @@ enum class ShaderStorageUsage {
 	ReadOnly,
 	ReadWrite,
 };
-
-ResourceDescriptorType ShaderClassifyResourceDescriptor(const uint32_t* desc);
 
 } // namespace Libs::Graphics
 

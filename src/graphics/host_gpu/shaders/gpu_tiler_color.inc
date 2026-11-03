@@ -1,4 +1,4 @@
-// ColorTransform values match imageInfo.h. Preserve the floating-point bit fields exactly.
+// ColorTransform values match imageInfo.h. Preserve the component bit fields exactly.
 uvec2 transform_color(uvec2 value, uint transform, bool to_host) {
 	switch (transform) {
 		case 1u:
@@ -15,6 +15,13 @@ uvec2 transform_color(uvec2 value, uint transform, bool to_host) {
 			}
 			break;
 		}
+		case 3u:
+			if (to_host) {
+				value.x = (value.x >> 2u) | (value.x << 30u);
+			} else {
+				value.x = (value.x << 2u) | (value.x >> 30u);
+			}
+			break;
 	}
 	return value;
 }

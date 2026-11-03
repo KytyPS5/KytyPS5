@@ -319,7 +319,7 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   fixture->PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture->program);
   EliminateDeadCode(fixture->program.blocks);
-  ValidateProgram(fixture->program, true);
+  ValidateProgram(fixture->program);
   const auto &source = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
   Check(!source.selector && fixture->program.info.buffers.size() == (nested ? 3u : 2u) &&
             std::ranges::any_of(*fixture->block, [](const Inst &inst) {
@@ -439,6 +439,16 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "noncontiguous descriptor DWORDs entered the table plan");
   Check(!malformed->program.resource_tracking_complete && malformed->program.descriptor_sources.empty(),
         "malformed image table tracking was not transactional");
+  auto aliased = MakeIndirectImageFixture(false, 48u, 0u, 16u, nested);
+  const auto image = std::ranges::find_if(*aliased->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::GetImageResource;
+  });
+  const auto *read = image->Arg(0).Resolve().TryInstruction();
+  aliased->Emit(ValueOpcode::ReferenceU32,
+                {aliased->Emit(ValueOpcode::ReadConstBuffer, {read->Arg(0), read->Arg(1)},
+                               read->Flags<uint64_t>())});
+  CheckFatal([&] { aliased->PlanAndTrack(); }, "not a valid runtime value",
+             "a descriptor read sharing its memory index entered the table plan");
 }
 
 void TestResidentImageHeap() {
@@ -1470,7 +1480,7 @@ void TestGuardedDirectImageTable() {
     Bounded, BoundMissing, BoundUnrelated, BoundBypass, BoundAnyLane,
     BoundDiamond, BoundBranchSpecific, BoundMismatched,
     BoundExec, BoundExecUnguarded, BoundExecMismatched, BoundExecAnd, BoundExecUnprovenActive,
-    BoundExecFactored,
+    BoundExecFactored, BoundExecShared,
     BoundExecBranch, BoundExecBranchUnproven, BoundExecBranchUnguarded, BoundExecBranchMismatched,
     Finite, FiniteZero, FiniteMissing, FiniteWrong, FiniteSigned, FiniteAdd, FiniteXor,
     FiniteShared, FiniteSharedBypass, FiniteLate
@@ -1571,11 +1581,16 @@ void TestGuardedDirectImageTable() {
           auto vcc = fixture.Emit(ValueOpcode::LogicalAnd,
               operand_order & 1u ? std::initializer_list<Value>{stopped_lane, previous}
                                  : std::initializer_list<Value>{previous, stopped_lane});
-          if (guard == Guard::BoundExecFactored) {
+          if (guard == Guard::BoundExecFactored || guard == Guard::BoundExecShared) {
             const auto empty = fixture.Emit(ValueOpcode::IEqual32, {key, Value(UINT32_MAX)});
             const auto sentinel = fixture.Emit(ValueOpcode::LogicalAnd,
                 operand_order & 2u ? std::initializer_list<Value>{empty, previous}
                                    : std::initializer_list<Value>{previous, empty});
+            if (guard == Guard::BoundExecShared) {
+              // Ballots of both arms keep their shared lane predicate from being factored out.
+              fixture.Emit(ValueOpcode::Ballot, {vcc});
+              fixture.Emit(ValueOpcode::Ballot, {sentinel});
+            }
             vcc = fixture.Emit(ValueOpcode::LogicalOr,
                 operand_order & 4u ? std::initializer_list<Value>{sentinel, vcc}
                                    : std::initializer_list<Value>{vcc, sentinel});
@@ -1734,7 +1749,8 @@ void TestGuardedDirectImageTable() {
                    fixture.AddMemory(memory, 0x130));
     }
     if (exec_bound || packed_key) ConstantPropagationPass(fixture.program.blocks);
-    if (guard == Guard::BoundExec || guard == Guard::BoundExecFactored) {
+    if (guard == Guard::BoundExec || guard == Guard::BoundExecFactored ||
+        guard == Guard::BoundExecShared) {
       std::vector<const Inst *> pending{active.ResolveInstruction()};
       uint32_t conjunctions = 0;
       for (size_t index = 0; index < pending.size(); ++index) {
@@ -1749,7 +1765,8 @@ void TestGuardedDirectImageTable() {
             pending.push_back(operand);
         }
       }
-      Check(conjunctions == 1u, "EXEC bound retained repeated active-lane conjunctions");
+      Check(conjunctions == (guard == Guard::BoundExecShared ? 3u : 1u),
+            "EXEC bound has unexpected active-lane conjunctions");
     }
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
@@ -1767,7 +1784,10 @@ void TestGuardedDirectImageTable() {
   auto plan = make_plan(Guard::Nonzero);
   make_plan(Guard::SccNonZero);
   make_plan(Guard::Plain);
-  for (uint32_t order = 0; order < 8u; ++order) make_plan(Guard::BoundExecFactored, order);
+  for (uint32_t order = 0; order < 8u; ++order) {
+    make_plan(Guard::BoundExecFactored, order);
+    make_plan(Guard::BoundExecShared, order);
+  }
   for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
                            Guard::ExecZero, Guard::VccZero, Guard::BoundMissing,
                            Guard::BoundUnrelated, Guard::BoundBypass, Guard::BoundAnyLane,
@@ -1873,7 +1893,7 @@ void TestGuardedDirectImageTable() {
 
   make_plan(Guard::Bounded);
   for (const auto guard : {Guard::BoundDiamond, Guard::BoundExec, Guard::BoundExecFactored,
-                           Guard::BoundExecBranch}) {
+                           Guard::BoundExecShared, Guard::BoundExecBranch}) {
     auto bounded = make_plan(guard);
     Check(bounded.capture_specialization_reads && bounded.info.images[1].written,
           "bounded table with image writes omitted specialization read capture");
@@ -3368,7 +3388,8 @@ void TestUniformizedMaterialImageKeys() {
 
 void TestIndexedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make_program = [](ShaderType stage = ShaderType::Compute, bool shared = false) {
+  const auto make_program = [](ShaderType stage = ShaderType::Compute, bool shared = false,
+                               bool storage = false) {
     Fixture f(stage);
     auto *entry = f.block, *body = f.AddBlock();
     auto *later = shared ? f.AddBlock() : nullptr;
@@ -3444,6 +3465,17 @@ void TestIndexedMaterialImageKeys() {
     f.Emit(ValueOpcode::StoreBufferU32,
         {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
         f.AddMemory(store, 0x300u), done);
+    if (storage) {
+      const auto target = f.Image({Value(0x8000u),
+          Value(static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u),
+          Value(0u), Value((static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u) |
+                          Libs::Graphics::DstSel(4, 5, 6, 7)),
+          Value(0u), Value(0u), Value(0u), Value(0u)}, 0x320u);
+      const auto texel = f.Emit(ValueOpcode::CompositeConstructU32x4,
+          {Value(0u), Value(0u), Value(0u), Value(0u)});
+      f.Emit(ValueOpcode::ImageWrite, {target, address, texel, Value(true)},
+          f.AddMemory({.kind = ResourceKind::Image, .image_dimension = Decoder::ImageDimension::Dim2D}, 0x320u));
+    }
     f.PlanAndTrack();
     if (shared) {
       owner_key.ResolveInstruction()->ReplaceUsesWith(Value(12994u));
@@ -3555,6 +3587,10 @@ void TestIndexedMaterialImageKeys() {
           "unsupported geometry or writable selector lost the original heap domain");
   }
   user_data = original;
+  auto storage_program = make_program(ShaderType::Compute, false, true);
+  auto storage = ExtractResourcePlan(storage_program);
+  Check(MaterializeResources(storage, runtime, snapshot, specialization) && memory.selectors == 0u,
+        "storage-image dispatch narrowed the heap to its material selector");
   auto graphics_program = make_program(ShaderType::Pixel);
   auto graphics = ExtractResourcePlan(graphics_program);
   Check(MaterializeResources(graphics, runtime, snapshot, specialization) && memory.selectors == 0u,
@@ -3605,8 +3641,9 @@ void TestIndexedMaterialImageKeys() {
 
 void TestPointerTableIndexedMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  // A waterfall scalarizes one lane's indexed x3 key; matching lanes sample the
-  // descriptor at the user-data pointer plus key * 32.
+  // A waterfall scalarizes one lane's x3 key from record 2 * lane + 1, clamped at zero;
+  // matching lanes sample the descriptor at the user-data pointer plus key * 32 and write
+  // a storage image.
   Fixture f;
   auto *entry = f.block, *body = f.AddBlock(), *done = f.AddBlock();
   entry->AddBranch(body);
@@ -3619,10 +3656,13 @@ void TestPointerTableIndexedMaterialKeys() {
   MemoryInfo request;
   request.kind = ResourceKind::Buffer;
   request.idxen = true;
+  const auto record = f.Emit(ValueOpcode::IAdd32,
+      {f.Emit(ValueOpcode::ShiftLeftLogical32, {lane, Value(1u)}), Value(1u)});
   const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x3,
-      {material, lane, Value(0u), Value(0u), active}, f.AddMemory(request, 0x28));
+      {material, record, Value(0u), Value(0u), active}, f.AddMemory(request, 0x28));
   const auto selected = f.Emit(ValueOpcode::SelectU32,
-      {active, f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)}), Value(0u)});
+      {active, f.Emit(ValueOpcode::SMax32,
+          {f.Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)}), Value(0u)}), Value(0u)});
   const auto key = f.Emit(ValueOpcode::ReadLane, {selected, f.UserData(6)});
   const auto guard = f.Emit(ValueOpcode::LogicalAnd,
       {active, f.Emit(ValueOpcode::IEqual32, {key, selected})});
@@ -3649,9 +3689,18 @@ void TestPointerTableIndexedMaterialKeys() {
       {f.Image(words, 0x6c), f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
        f.ImageAddress(), guard},
       f.AddMemory(sample, 0x6c));
+  const auto output = f.Image({Value(0x8000u),
+      Value(static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u),
+      Value(0u), Value((static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u) |
+                      Libs::Graphics::DstSel(4, 5, 6, 7)),
+      Value(0u), Value(0u), Value(0u), Value(0u)}, 0x74);
+  const auto texel = f.Emit(ValueOpcode::CompositeConstructU32x4,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  f.Emit(ValueOpcode::ImageWrite, {output, f.ImageAddress(), texel, Value(true)},
+         f.AddMemory(sample, 0x74));
   f.PlanAndTrack();
   const auto plan = ExtractResourcePlan(f.program);
-  Check(plan.info.images.size() == 1u, "pointer-table waterfall image was not tracked");
+  Check(plan.info.images.size() == 2u, "pointer-table waterfall image was not tracked");
   const auto &indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
   Check(indirect.selector && indirect.selector->stride == 0u && indirect.selector->offset == 8u &&
             !indirect.selector->global && !indirect.table_scalar && indirect.table_stride == 32u &&
@@ -3670,8 +3719,9 @@ void TestPointerTableIndexedMaterialKeys() {
     texture[3] = (9u << 28u) | Libs::Graphics::DstSel(4, 5, 6, 7);
   };
   for (const uint32_t key : {0u, 5u, 9u}) put(key);
-  for (uint32_t row = 0; row < records; ++row)
-    memory.words[(row * 12u + 8u) / 4u] = row % 2u == 0u ? 9u : 5u;
+  // Even records hold another field, with no descriptor; a negative field selects key 0.
+  const std::array<uint32_t, records> fields{7u, 9u, 7u, 5u, 7u, UINT32_MAX};
+  for (uint32_t row = 0; row < records; ++row) memory.words[(row * 12u + 8u) / 4u] = fields[row];
   const std::array<uint32_t, 7> user_data{base, 12u << 16u, records, 0x5204u, heap, 0u, 0u};
   const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     auto &m = *static_cast<Memory *>(data);
@@ -3689,9 +3739,9 @@ void TestPointerTableIndexedMaterialKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
-            snapshot.images.size() == 3u,
+            snapshot.images.size() == 4u,
         "pointer-table selector did not read exactly the zero and material-key descriptors");
-  Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 8u, 64u}) !=
+  Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 20u, 52u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
@@ -5408,10 +5458,10 @@ void TestScalarAndVectorBufferAlias() {
         "scalar/vector alias did not share a dense index");
 }
 
-void TestRuntimeUnsignedMinDescriptor() {
+void TestRuntimeClampedDescriptor() {
   Fixture fixture;
-  const auto word3 =
-      fixture.Emit(ValueOpcode::UMin32, {fixture.UserData(0), Value(0x100u)});
+  const auto low = fixture.Emit(ValueOpcode::SMax32, {fixture.UserData(0), Value(0u)});
+  const auto word3 = fixture.Emit(ValueOpcode::UMin32, {low, Value(0x100u)});
   const auto descriptor =
       fixture.Buffer({Value(0u), Value(0u), Value(64u), word3}, 0x330);
   MemoryInfo memory;
@@ -5426,14 +5476,14 @@ void TestRuntimeUnsignedMinDescriptor() {
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue value;
   const auto source = fixture.program.info.buffers[0].source;
-  Check(EvaluateSrtDescriptor(plan, runtime, source, value) &&
-            value.dwords[3] == 0x100u,
+  Check(EvaluateSrtDescriptor(plan, runtime, source, value) && value.dwords[3] == 0u,
+        "runtime descriptor signed maximum did not clamp a negative operand");
+  user_data[0] = 0x200u;
+  Check(EvaluateSrtDescriptor(plan, runtime, source, value) && value.dwords[3] == 0x100u,
         "runtime descriptor unsigned minimum did not clamp its first operand");
   user_data[0] = 0x80u;
-  Check(
-      EvaluateSrtDescriptor(plan, runtime, source, value) &&
-          value.dwords[3] == 0x80u,
-      "runtime descriptor unsigned minimum did not preserve its first operand");
+  Check(EvaluateSrtDescriptor(plan, runtime, source, value) && value.dwords[3] == 0x80u,
+        "runtime descriptor clamp did not preserve an in-range operand");
 }
 
 void TestImagesSamplersAndAliases() {
@@ -5471,14 +5521,6 @@ void TestImagesSamplersAndAliases() {
   fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
                {storage, image_address, Value(1u), Value(true)},
                fixture.AddMemory(storage_memory, 16));
-
-  const auto buffer = fixture.Buffer(
-      {image_words[0], image_words[1], image_words[2], image_words[3]}, 20);
-  MemoryInfo buffer_memory;
-  buffer_memory.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::LoadBufferU32,
-               {buffer, Value(0u), Value(0u), Value(0u), Value(true)},
-               fixture.AddMemory(buffer_memory, 20));
   fixture.PlanAndTrack();
 
   Check(fixture.program.info.images.size() == 3 &&
@@ -5496,8 +5538,6 @@ void TestImagesSamplersAndAliases() {
   const auto sampler_source = fixture.program.info.samplers[0].source;
   Check(fixture.program.descriptor_sources[sampler_source].dwords[3].U32() == 0,
         "unused sampler border color was not canonicalized");
-  Check(fixture.program.info.buffers[0].image_alias == 0,
-        "buffer/image descriptor alias was not linked");
 }
 
 void TestIndependentImageSamplerPairs() {
@@ -7579,7 +7619,7 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
   Check(sampler_words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
         "host descriptor selection changed the GPU Phi");
   EliminateDeadCode(fixture.program.blocks);
-  ValidateProgram(fixture.program, true);
+  ValidateProgram(fixture.program);
   return ExtractResourcePlan(fixture.program);
 }
 
@@ -7845,7 +7885,7 @@ void TestFiniteImageWaterfall() {
     fixture->PlanAndTrack();
     const auto plan = ExtractResourcePlan(fixture->program);
     EliminateDeadCode(fixture->program.blocks);
-    ValidateProgram(fixture->program, true);
+    ValidateProgram(fixture->program);
     const auto& finite = plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
     Check(finite && finite->sources.size() == 3u,
           "waterfall image selection mixed descriptor words or lost a candidate");
@@ -8244,9 +8284,10 @@ void TestBoundedRelativeRegisterWrites() {
     fixture.program.blocks[1]->condition =
         fixture.Emit(ValueOpcode::ConditionRef, {in_range},
                      CFG::BranchCondition::VccNonZero, header);
+    const auto tripled = fixture.Emit(ValueOpcode::IMul32, {Value(&counter), Value(3u)}, 0, body);
     const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                       {Value(&counter), Value(1u)}, 0, body), Value(255u)}, 0, body);
+                       {tripled, Value(1u)}, 0, body), Value(255u)}, 0, body);
     const auto relative_write = [&](Value old_value, uint32_t offset) {
       const auto selected = fixture.Emit(ValueOpcode::IEqual32,
                                            {m0, Value(offset)}, 0, body);
@@ -8256,10 +8297,10 @@ void TestBoundedRelativeRegisterWrites() {
     };
     bound.AddPhiOperand(entry, initial_bound);
     bound.AddPhiOperand(body, relative_write(Value(&bound),
-        variant == Variant::BoundClobber ? 14u : 22u));
+        variant == Variant::BoundClobber ? 42u : 44u));
     records.AddPhiOperand(entry, initial_records);
     records.AddPhiOperand(body, relative_write(Value(&records),
-        variant == Variant::DescriptorClobber ? 14u : 21u));
+        variant == Variant::DescriptorClobber ? 42u : 43u));
     counter.AddPhiOperand(entry, Value(0u));
     counter.AddPhiOperand(body, fixture.Emit(ValueOpcode::IAdd32,
                                              {Value(&counter), Value(1u)}, 0, body));
@@ -9004,7 +9045,7 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
-    Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
+    Run("runtime clamp", TestRuntimeClampedDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

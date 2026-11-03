@@ -248,7 +248,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BITSET0_B64: return S_BITSET_B64(inst, false);
 		case O::S_BITSET1_B64: return S_BITSET_B64(inst, true);
 		case O::S_BITREPLICATE_B64_B32: return S_BITREPLICATE_B64_B32(inst);
-		case O::S_QUADMASK_B64: return S_QUADMASK_B64(inst);
+		case O::S_QUADMASK_B32: return S_QUADMASK(inst, false);
+		case O::S_QUADMASK_B64: return S_QUADMASK(inst, true);
 		case O::S_BFM_B32: return BFM_B32(inst);
 		case O::S_BFM_B64: return S_BFM_B64(inst);
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);
@@ -266,7 +267,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: return;
+		case O::S_WAITCNT_DEPCTR:
+		case O::S_CLAUSE: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;

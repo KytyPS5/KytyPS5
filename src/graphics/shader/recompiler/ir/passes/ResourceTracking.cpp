@@ -16,6 +16,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -138,7 +139,6 @@ const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "vertex";
 		case ShaderType::Pixel: return "pixel";
-		case ShaderType::Fetch: return "fetch";
 		case ShaderType::Compute: return "compute";
 		default: return "unknown";
 	}
@@ -400,7 +400,6 @@ public:
 				Collect(inst);
 			}
 		}
-		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -561,6 +560,11 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+	};
+
+	struct MemoryIndexUse {
+		const Inst* owner = nullptr;
+		uint32_t    count = 0;
 	};
 
 	struct ResolvedHandle {
@@ -829,6 +833,7 @@ private:
 		if (value.IsImmediate()) return;
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+		if (m_srt_visited.contains(inst)) return;
 		const auto cycle = std::ranges::find(m_srt_visiting, inst);
 		if (cycle != m_srt_visiting.end()) {
 			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
@@ -836,7 +841,6 @@ private:
 			})) return;
 			Fail(use_pc, "cyclic typed planning value without a phi");
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
 		m_srt_visiting.push_back(inst);
 		uint32_t memory_index = 0;
 		const auto* memory = ScalarReadMemory(*inst, memory_index);
@@ -858,7 +862,7 @@ private:
 				CollectScalarRead(inst->Arg(arg), use_pc);
 		}
 		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
+		m_srt_visited.insert(inst);
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
@@ -1098,22 +1102,25 @@ private:
 		           : nullptr;
 	}
 
-	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_program.blocks) {
-			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) {
+		if (m_memory_index_uses.empty()) {
+			// Only descriptor planning asks, and it adds no memory instructions.
+			m_memory_index_uses.resize(m_program.memory_info.size());
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					const auto op = inst.GetOpcode();
+					if (BufferAccessOf(op) != BufferAccess::None ||
+					    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+					    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+						auto& use = m_memory_index_uses[inst.Flags<MemoryFlags>().index];
+						use.owner = &inst;
+						use.count++;
+					}
 				}
 			}
 		}
-		return true;
+		const auto& use = m_memory_index_uses[index];
+		return use.count == 0 || (use.count == 1 && use.owner == &owner);
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -1614,6 +1621,13 @@ private:
 			else return nullptr;
 			read = ActiveValue(value, active).TryInstruction();
 		}
+		if (read != nullptr && read->GetOpcode() == ValueOpcode::SMax32) {
+			if (read->Arg(1).Resolve() == Value(0u)) value = read->Arg(0);
+			else if (read->Arg(0).Resolve() == Value(0u)) value = read->Arg(1);
+			else return nullptr;
+			selector.non_negative = true;
+			read = ActiveValue(value, active).TryInstruction();
+		}
 		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitFieldUExtract) {
 			uint32_t width;
 			if (!ImmediateU32(read->Arg(1), selector.bit_offset) ||
@@ -1651,7 +1665,7 @@ private:
 
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
-	                                DescriptorSource& material_source, bool indexed) {
+	                                DescriptorSource& material_source, bool indexed, bool heap = false) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
@@ -1659,17 +1673,25 @@ private:
 		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
 		if (indexed) {
 			read = IndexedMaterialRead(read, active, selector);
-			// Bounded heaps fall back when the material aliases a written buffer; pointer
-			// tables rely on the renderer's specialization-read alias check. Other stages
-			// and unbounded/image writes keep the original domain.
+			// Bounded heaps keep their full domain when the material may alias a write: written
+			// buffers are checked at dispatch, storage images and address writes here. Pointer
+			// tables have no such domain, so a key that a same-dispatch write changes selects
+			// the root descriptor. Other stages keep the original domain.
 			if (read == nullptr || m_program.stage != ShaderType::Compute ||
-			    std::ranges::any_of(m_program.blocks, [](const Block* block) {
+			    (heap && std::ranges::any_of(m_program.blocks, [](const Block* block) {
 				    return std::ranges::any_of(*block, [](const Inst& inst) {
 					    const auto op = inst.GetOpcode();
 					    return ImageOpcodeInfoOf(op).resource_class == ImageResourceClass::Storage ||
 					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
 				    });
-			    }) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			    })) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			// The record index is assumed not to wrap U32; an affine one then reaches only
+			// records offset + k * stride.
+			AffineOffset row;
+			if (MatchAffineOffset(read->Arg(1), active, row) && row.stride != 0u) {
+				selector.first_record = static_cast<uint32_t>(row.offset);
+				selector.record_step = static_cast<uint32_t>(row.stride);
+			}
 			selector.source = InternSource(material_source);
 			indirect.selector = std::move(selector);
 			return true;
@@ -2131,9 +2153,10 @@ private:
 			if (candidate.IsEmpty()) candidate = UnsignedBoundOnEntry(key, access.Parent(), false, active);
 			if (candidate.IsEmpty()) {
 				// A waterfall key inherits the local value's bound only where this same
-				// EXEC predicate proves both their equality and the local range.
+				// EXEC predicate proves both their equality and the local range. Otherwise
+				// the key itself is bounded, with this predicate witnessing its own !(A & Q).
 				const auto local = EqualLocalKey(active, key);
-				if (!local.IsEmpty()) candidate = UnsignedBound(active, local, true, false, active);
+				candidate = UnsignedBound(active, local.IsEmpty() ? key : local, true, false, active);
 			}
 			if (candidate.IsEmpty() ||
 			    !ValidateRuntimeValue(m_program, candidate, RuntimeValueType::Integer)) return {};
@@ -3227,7 +3250,7 @@ private:
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
 		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
-		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true)) {
+		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true, true)) {
 			// Preserve the heap's byte-offset key so runtime geometry can choose the
 			// tighter selector domain without changing the GPU's descriptor reads.
 			indirect.table_scalar = true;
@@ -3750,6 +3773,11 @@ private:
 				if (result <= UINT32_MAX) return static_cast<uint32_t>(result);
 				break;
 			}
+			case ValueOpcode::IMul32: {
+				const auto result = uint64_t {maximum(0)} * maximum(1);
+				if (result <= UINT32_MAX) return static_cast<uint32_t>(result);
+				break;
+			}
 			case ValueOpcode::ShiftRightLogical32:
 			case ValueOpcode::ShiftLeftLogical32: {
 				uint32_t shift;
@@ -4022,10 +4050,10 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
-				Merge(m_info.buffers[i], memory, inst, pc);
+				Merge(m_info.buffers[i], memory, op, pc);
 				return i;
 			}
 		}
@@ -4035,14 +4063,13 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
-		Merge(resource, memory, inst, pc);
+		Merge(resource, memory, op, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
-	static void Merge(BufferResource& resource, const MemoryInfo& memory, const Inst& inst,
+	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
 	                  uint32_t pc) {
-		const auto op            = inst.GetOpcode();
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
@@ -4050,13 +4077,6 @@ private:
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
-		if (write) {
-			// Formatted stores write the whole format; otherwise zero index, VGPR and SGPR offsets
-			// leave only the immediate offset.
-			const bool fixed = !memory.formatted && inst.Arg(1).Resolve() == Value(0u) &&
-			                   inst.Arg(2).Resolve() == Value(0u) && inst.Arg(3).Resolve() == Value(0u);
-			resource.write_extent = std::max(resource.write_extent, fixed ? ByteExtent(memory) : UINT32_MAX);
-		}
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
@@ -4182,7 +4202,7 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect) {
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect) {
 			m_info.uses_dma = true;
 			return;
 		}
@@ -4226,7 +4246,7 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
-			resource = AddBuffer(source, memory, inst, flags.pc);
+			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
 			}
@@ -4254,7 +4274,7 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					Fail(flags.pc, "scratch operation requires a nonzero per-thread scratch size");
 				}
 				return;
 			}
@@ -4318,31 +4338,6 @@ private:
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
 	}
 
-	void LinkImageAliases() {
-		for (auto& buffer: m_info.buffers) {
-			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
-				continue;
-			}
-			for (uint32_t image = 0; image < m_info.images.size(); image++) {
-				const auto* image_source = Source(m_info.images[image].source);
-				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_descriptor.has_value()) {
-					continue;
-				}
-				bool alias = true;
-				for (uint32_t dword = 0; dword < 4; dword++) {
-					alias = alias && EquivalentValue(m_program, buffer_source->dwords[dword],
-					                                 image_source->dwords[dword]);
-				}
-				if (alias) {
-					buffer.image_alias = image;
-					break;
-				}
-			}
-		}
-	}
-
 	Program&                                   m_program;
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
@@ -4350,7 +4345,8 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>            m_srt_visited;
+	std::vector<MemoryIndexUse>                m_memory_index_uses;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

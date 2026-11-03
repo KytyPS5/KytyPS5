@@ -10,8 +10,6 @@ struct ShaderStageRuntime;
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
-vk::MemoryBarrier       MakeShaderAccessDependency();
-vk::MemoryBarrier       MakeShaderWriteHazardDependency();
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);

@@ -68,22 +68,14 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 
 TileManager::~TileManager() {
 	for (auto pipeline: m_pipelines) {
-		if (pipeline != nullptr) {
-			m_graphics.device.destroyPipeline(pipeline, nullptr);
-		}
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
 	                     m_color_clear}) {
-		if (pipeline != nullptr) {
-			m_graphics.device.destroyPipeline(pipeline, nullptr);
-		}
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
-	if (m_pipeline_layout != nullptr) {
-		m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
-	}
-	if (m_descriptor_layout != nullptr) {
-		m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
-	}
+	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
 }
 
 TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,

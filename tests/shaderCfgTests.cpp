@@ -1163,8 +1163,6 @@ void TestNativeShaderResourceDependencies() {
       .shader_hash = program.shader_hash,
       .wave_size = program.wave_size,
       .user_data_base = program.user_data_base,
-      .user_data_count = program.user_data_count,
-      .scratch_dwords = program.scratch_dwords,
       .info = program.info,
       .bindings = program.bindings,
   }};

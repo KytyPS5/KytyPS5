@@ -665,16 +665,14 @@ struct ResourceBlock {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
-	ShaderType                    stage               = ShaderType::Unknown;
-	uint64_t                      shader_hash         = 0;
-	uint32_t                      wave_size           = 64;
-	uint32_t                      user_data_base      = 0;
-	uint32_t                      user_data_count     = 64;
-	uint32_t                      scratch_dwords      = 0;
-	uint32_t                      param_export_mask   = 0;
-	bool                          has_address_writes  = false;
-	ShaderInfo                    info;
-	Bindings                      bindings;
+	ShaderType stage              = ShaderType::Unknown;
+	uint64_t   shader_hash        = 0;
+	uint32_t   wave_size          = 64;
+	uint32_t   user_data_base     = 0;
+	uint32_t   param_export_mask  = 0;
+	bool       has_address_writes = false;
+	ShaderInfo info;
+	Bindings   bindings;
 };
 
 struct UniformFillPlan {

@@ -124,8 +124,6 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
-	// on NVIDIA RTX 5080 Laptop GPU, so they are only emitted when f32 denorms are preserved.
 	const auto flushed_a = FlushF32DenormIfPreserved(state, a);
 	const auto flushed_b = FlushF32DenormIfPreserved(state, b);
 	const auto flushed_c = FlushF32DenormIfPreserved(state, c);

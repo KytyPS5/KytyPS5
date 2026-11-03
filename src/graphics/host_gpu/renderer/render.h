@@ -135,8 +135,20 @@ public:
 	}
 
 	void BeginRendering(const RenderState& state) const;
+	// Ends the rendering instance, then records the barrier of deferred shader writes, if any.
 	void EndRendering() const;
 	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	// A draw whose shaders wrote memory leaves the barrier that orders its writes before later
+	// work pending while draws the guest did not order after it go on in the same rendering
+	// instance (see RenderExecutor::BeginGuestOperation()). EndRendering() records it: every
+	// command other than a draw ends rendering before it records, as does the end of the
+	// command buffer.
+	void DeferShaderWriteBarrier(vk::PipelineStageFlags source_stages) const noexcept {
+		m_pending_shader_writes |= source_stages;
+	}
+	[[nodiscard]] bool HasPendingShaderWrites() const noexcept {
+		return static_cast<bool>(m_pending_shader_writes);
+	}
 
 	[[nodiscard]] CommandRecorder Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -170,6 +182,8 @@ private:
 	bool                m_open   = false;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	// The source stages of the shader writes whose barrier is still to record.
+	mutable vk::PipelineStageFlags m_pending_shader_writes;
 	const HW::Context*    m_registers   = nullptr;
 	const HW::UserConfig* m_user_config = nullptr;
 	const HW::Shader*     m_shaders     = nullptr;
@@ -232,10 +246,10 @@ public:
 	// live registers); operations with the same id see the same context registers.
 	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
 	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
-	// after a direct dispatch is deferred to the next operation, unless that is a direct dispatch
-	// of the same queue the guest did not order after it (see DispatchDirect()).
-	void BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync);
-	// Records the barrier a direct dispatch deferred, if any.
+	// after a dispatch (direct or indirect) is deferred to the next operation, unless that is a
+	// dispatch of the same queue the guest did not order after it (see DispatchDirect()).
+	void BeginGuestOperation(uint32_t queue, bool dispatch, bool draw, bool guest_sync);
+	// Records the barrier a dispatch deferred, if any.
 	void FlushDeferredDispatchBarrier();
 	// Execution thread: an operation other than a draw is about to execute (see
 	// RenderTargetMemo).
@@ -625,6 +639,8 @@ private:
 	std::vector<uint64_t>                              m_bound_image_marks;
 	uint64_t                                           m_bound_image_stamp = 0;
 	// See BeginGuestOperation().
+	uint32_t                                           m_shader_write_queue      = 0;
+	bool                                               m_shader_write_deferred   = false;
 	uint32_t                                           m_guest_queue             = 0;
 	bool                                               m_deferred_barrier        = false;
 	uint32_t                                           m_deferred_barrier_queue  = 0;

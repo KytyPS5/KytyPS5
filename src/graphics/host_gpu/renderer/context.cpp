@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <utility>
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler, CommandStream* stream)
@@ -29,7 +31,7 @@ CommandRecorder CommandBuffer::Handle() const {
 }
 
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
+	EXIT_IF(m_rendering || m_pending_shader_writes || IsInvalid());
 	if (m_stream != nullptr) {
 		// The recording thread begins its Vulkan command buffer when it replays commands.
 		return;
@@ -106,13 +108,15 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 }
 
 void CommandBuffer::EndRendering() const {
-	if (!m_rendering) {
-		return;
+	if (m_rendering) {
+		const auto recorder = Handle();
+		m_context.GetOcclusionQueries().OnEndRendering(recorder);
+		recorder.endRendering();
+		m_rendering = false;
 	}
-	const auto recorder = Handle();
-	m_context.GetOcclusionQueries().OnEndRendering(recorder);
-	recorder.endRendering();
-	m_rendering    = false;
+	if (m_pending_shader_writes) {
+		ShaderWriteBarrier(Handle(), std::exchange(m_pending_shader_writes, {}));
+	}
 }
 
 } // namespace Libs::Graphics

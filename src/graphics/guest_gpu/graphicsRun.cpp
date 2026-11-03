@@ -606,7 +606,11 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	executor.UseContextId(operation.state.context_id);
 	executor.BeginGuestOperation(static_cast<uint32_t>(m_interrupt_event_id),
-	                             operation.kind == GpuOperationKind::DispatchDirect,
+	                             operation.kind == GpuOperationKind::DispatchDirect ||
+	                                 operation.kind == GpuOperationKind::DispatchIndirect,
+	                             operation.kind == GpuOperationKind::DrawIndex ||
+	                                 operation.kind == GpuOperationKind::DrawAuto ||
+	                                 operation.kind == GpuOperationKind::DrawIndirect,
 	                             operation.guest_sync);
 	if (operation.after_wait) {
 		executor.InvalidateRenderTargetMemo();

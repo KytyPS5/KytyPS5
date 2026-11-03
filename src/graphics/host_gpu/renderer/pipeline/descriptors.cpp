@@ -1813,9 +1813,18 @@ void RenderExecutor::FlushDeferredDispatchBarrier() {
 	                    vk::PipelineStageFlagBits::eComputeShader);
 }
 
-void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch_direct, bool guest_sync) {
+void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch, bool draw,
+                                         bool guest_sync) {
 	m_guest_queue = queue;
-	if (m_deferred_barrier && dispatch_direct && !guest_sync && queue == m_deferred_barrier_queue) {
+	m_context.GetOcclusionQueries().DropReadTargets();
+	// On the guest's GPU, draws of one queue overlap unless the guest orders them (a wait or an
+	// ACQUIRE_MEM): the barrier after a draw that wrote memory waits for the next operation that
+	// is not such a draw (see ExecutePreparedDraw()).
+	if (m_shader_write_deferred && (!draw || guest_sync || queue != m_shader_write_queue)) {
+		m_shader_write_deferred = false;
+		m_context.GetCommandScheduler().EndRendering();
+	}
+	if (m_deferred_barrier && dispatch && !guest_sync && queue == m_deferred_barrier_queue) {
 		m_dispatch_chained = true;
 		return;
 	}

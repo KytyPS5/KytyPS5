@@ -1828,8 +1828,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages) {
-		// As for dispatches, buffer writes wait for earlier accesses to the memory.
+	// A draw whose shaders write memory (ASTRO BOT: ~500 a frame, from vertex shaders) waits for
+	// earlier accesses to the memory, as dispatches do, and its writes are ordered before later
+	// work by a barrier. On the guest's GPU nothing orders draws of one queue but the guest's own
+	// sync (a wait, an ACQUIRE_MEM), so draws after it that the guest did not order go on in the
+	// same rendering instance with that barrier pending; the next operation that is not such a
+	// draw records it (BeginGuestOperation()), and so does anything that ends rendering.
+	if (shader_write_stages && !buffer.HasPendingShaderWrites()) {
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
@@ -1872,8 +1877,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {
-		buffer.EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		buffer.DeferShaderWriteBarrier(shader_write_stages);
+		m_shader_write_queue    = m_guest_queue;
+		m_shader_write_deferred = true;
 	}
 }
 

@@ -34,10 +34,8 @@
 
 namespace Libs::Graphics {
 
-static thread_local CommandProcessor* g_current_processor = nullptr;
-static thread_local Pm4Execution*     g_current_execution = nullptr;
-static thread_local bool              g_gpu_thread        = false;
-static thread_local GuestGpu*         g_gpu_state         = nullptr;
+static thread_local Pm4Execution* g_current_execution = nullptr;
+static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -46,7 +44,6 @@ static bool GraphicsRunDebugDumpEnabled() {
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
@@ -92,7 +89,6 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::ProcessCommands() {
-	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -183,8 +179,7 @@ void CommandProcessor::Reset() {
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
-	m_saved_ctx.Reset();
-	m_context_state_pushed             = false;
+	m_saved_ctx.reset();
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
@@ -199,23 +194,19 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;
 		case ContextStateOperation::Push:
-			EXIT_IF(m_context_state_pushed);
-			m_saved_ctx            = m_ctx;
-			m_context_state_pushed = true;
+			EXIT_IF(m_saved_ctx.has_value());
+			m_saved_ctx.emplace(m_ctx);
 			break;
 		case ContextStateOperation::Pop:
-			EXIT_IF(!m_context_state_pushed);
-			m_ctx                  = m_saved_ctx;
-			m_saved_ctx            = {};
-			m_context_state_pushed = false;
+			EXIT_IF(!m_saved_ctx.has_value());
+			m_ctx = *m_saved_ctx;
+			m_saved_ctx.reset();
 			break;
 		case ContextStateOperation::PushClear:
-			EXIT_IF(m_context_state_pushed);
-			m_saved_ctx            = m_ctx;
-			m_context_state_pushed = true;
+			EXIT_IF(m_saved_ctx.has_value());
+			m_saved_ctx.emplace(m_ctx);
 			m_ctx.Reset();
 			break;
-		default: EXIT("unknown context state operation: %u\n", static_cast<uint32_t>(operation));
 	}
 }
 
@@ -386,8 +377,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
-	g_gpu_thread = true;
-	g_gpu_state  = gpu;
+	g_gpu_state = gpu;
 
 	for (;;) {
 		Submission                   submission;
@@ -440,13 +430,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
-			g_gpu_state  = nullptr;
-			g_gpu_thread = false;
+			g_gpu_state = nullptr;
 			return;
 		}
 
 		if (command) {
-			EXIT_IF(g_current_processor != nullptr);
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -539,19 +527,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_made_progress = false;
 
 	struct ExecutionScope {
-		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
-		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
-			g_current_processor = &processor;
-			g_current_execution = &execution;
-		}
-		~ExecutionScope() {
-			g_current_processor = previous_processor;
-			g_current_execution = previous_execution;
-		}
-
-		CommandProcessor* previous_processor;
-		Pm4Execution*     previous_execution;
-	} execution_scope(*this, execution);
+		explicit ExecutionScope(Pm4Execution& execution) { g_current_execution = &execution; }
+		~ExecutionScope() { g_current_execution = nullptr; }
+	} execution_scope(execution);
 
 	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
@@ -576,7 +554,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
-		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
 			continue;
@@ -587,7 +564,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
-		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;
@@ -600,7 +576,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
-			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
@@ -621,7 +597,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto handler = g_cp_op_func[opcode];
 
 		if (handler == nullptr) {
-			const auto offset = total_dw - remaining_dw;
+			const auto offset = cursor.offset_dw;
 			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
 			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
 			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
@@ -632,8 +608,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
-			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
-			     total_dw - remaining_dw, packet_header);
+			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
 		const auto packet_dw =
@@ -1106,15 +1081,6 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
-	if (g_current_processor != nullptr) {
-		EXIT("invalid graphics-thread CPU flip preparation\n");
-	}
-	struct ProcessorScope {
-		explicit ProcessorScope(CommandProcessor& processor) { g_current_processor = &processor; }
-		~ProcessorScope() { g_current_processor = nullptr; }
-	};
-	ProcessorScope processor_scope(*this);
-
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
@@ -1122,7 +1088,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 bool GuestGpu::IsGpuThread() noexcept {
-	return g_gpu_thread;
+	return g_gpu_state != nullptr;
 }
 
 } // namespace Libs::Graphics

@@ -52027,7 +52027,6 @@ void CheckVulkan13FeatureRequirements() {
 }
 
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t untouched = 0x1122334455667788ull;
   constexpr uint64_t ready_bit = 1ull << 63u;
@@ -52070,7 +52069,6 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
 void CheckPm4Predication(RenderContext &renderer) {
   constexpr const char *name = "Pm4Predication";
   constexpr uint64_t ready = 1ull << 63u;
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   processor.BufferInit();
   alignas(16) std::array<uint64_t, 32> query{};
@@ -52172,12 +52170,15 @@ void CheckPm4Predication(RenderContext &renderer) {
 
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
-  constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
-  const auto consumed = HwCtxSetStencilInfo(
-      processor, 0xC0016900u, Pm4::DB_STENCIL_INFO, payload.data(), 1);
+  const std::array<uint32_t, 3> packet{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::DB_STENCIL_INFO,
+      0x00100801u};
+  Pm4Execution execution;
+  const auto result = processor.Process(execution, packet);
   const auto &stencil = processor.GetCtx().GetDepthStencilInfo();
   Require("Pm4StencilInfoValueLane", "standalone register value",
-          consumed == 1 && stencil.format == Prospero::StencilFormat::k8UInt &&
+          result == Pm4ProcessResult::Complete &&
+              stencil.format == Prospero::StencilFormat::k8UInt &&
               stencil.texture_compatibility ==
                   Prospero::TextureCompatibleStencil::kEnable &&
               !stencil.expclear_enabled && !stencil.htile_stencil_disabled,
@@ -52186,7 +52187,6 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
 }
 
 void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor packet(renderer, 0);
   CommandProcessor indirect(renderer, 0);
 
@@ -52262,8 +52262,7 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
         Pm4::CB_COLOR0_FMASK + stride + 1u,
     };
     for (const auto offset : legacy_color_slots) {
-      legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
-                                    g_hw_ctx_indirect_func[offset] == nullptr;
+      legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[offset] == nullptr;
     }
   }
   // These offsets are the removed GCN DB_DEPTH_INFO, DB_DEPTH_SIZE, and
@@ -52272,12 +52271,10 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   constexpr std::array<uint32_t, 3> legacy_depth_slots{0x000fu, 0x0016u,
                                                        0x0017u};
   for (const auto offset : legacy_depth_slots) {
-    legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
-                                  g_hw_ctx_indirect_func[offset] == nullptr;
+    legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[offset] == nullptr;
   }
   // Removed GCN PA_SC_NGG_MODE_CNTL.
-  legacy_slots_are_unhandled &= g_hw_ctx_func[0x0314u] == nullptr &&
-                                g_hw_ctx_indirect_func[0x0314u] == nullptr;
+  legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[0x0314u] == nullptr;
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
@@ -52312,14 +52309,22 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   const bool native_index_size_packet_complete =
       packet.Process(index_size_execution, index_size_packet) ==
           Pm4ProcessResult::Complete &&
-      g_hw_uc_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
       g_hw_uc_indirect_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
-      g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr &&
       g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr;
 
+  // Every value of a register range lands in its own register.
+  std::array<uint32_t, 4> index_range_packet{
+      KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, Pm4::R_ZERO), Pm4::GE_INDX_OFFSET,
+      7u, 0x80000000u};
+  Pm4Execution index_range_execution;
+  Require("Pm4NativeTargetGeometry", "uconfig register range",
+          packet.Process(index_range_execution, index_range_packet) ==
+                  Pm4ProcessResult::Complete &&
+              packet.GetUcfg().GetIndexOffset() == 7u &&
+              packet.GetUcfg().GetPrimitiveResetControl() == 0x80000000u,
+          "a SET_UCONFIG_REG range dropped a register value");
+
   const bool native_ps_address_slots_are_handled =
-      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
-      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr;
   const bool native_pace_slots_are_handled =
@@ -52335,7 +52340,6 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   std::array<uint32_t, 24> registers{
       Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
@@ -52381,7 +52385,6 @@ void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   std::array<uint32_t, 2> registers{
       Pm4::UC_PARAMETER_OVERSUBSCRIPTION, 0x12345678u,
@@ -52406,7 +52409,6 @@ void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t shader_address = 0x0000123456789a00ull;
   std::array<uint32_t, 4> packet{
@@ -52425,7 +52427,6 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
 }
 
 void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
 
@@ -52467,7 +52468,6 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
 }
 
 void CheckPm4IgnoredContextRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   for (const uint32_t offset : {Pm4::CB_DCC_CONTROL,
                                 Pm4::DB_COUNT_CONTROL,
@@ -52523,7 +52523,6 @@ void CheckPm4IgnoredContextRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4IndirectShaderAndUconfigTables(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   bool handled = true;
   for (const uint32_t offset : {Pm4::SPI_SHADER_PGM_RSRC1_HS,
@@ -52554,7 +52553,10 @@ void CheckPm4IndirectShaderAndUconfigTables(RenderContext &renderer) {
        {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL,
         Pm4::IA_MULTI_VGT_PARAM, Pm4::TA_CS_BC_BASE_ADDR,
         Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION,
-        Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS}) {
+        Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS,
+        Pm4::FSR_WINDOW_LEFT + 1u, Pm4::FSR_CONTROL_POINTS_LEFT_X,
+        Pm4::FSR_CONTROL_POINTS_LEFT_Y + 3u, Pm4::FSR_ALPHA_LEFT_X,
+        Pm4::FSR_ALPHA_LEFT_Y + 1u}) {
     handled = handled && g_hw_uc_indirect_func[offset] != nullptr;
   }
   handled = handled &&
@@ -52579,7 +52581,6 @@ void CheckPm4IndirectShaderAndUconfigTables(RenderContext &renderer) {
 }
 
 void CheckPm4LineWidth(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   std::array<uint32_t, 3> command{
       KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::PA_SU_LINE_CNTL,
@@ -52597,7 +52598,6 @@ void CheckPm4LineWidth(RenderContext &renderer) {
 }
 
 void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetBlendColor({1.0f, 2.0f, 3.0f, 4.0f});
 
@@ -52660,7 +52660,6 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
 }
 
 void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   const auto &defaults = processor.GetCtx().GetPolyOffset();
   Require("Pm4PolygonOffset", "format defaults",
@@ -52673,15 +52672,19 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
                                             std::bit_cast<uint32_t>(-3.25f),
                                             std::bit_cast<uint32_t>(32.0f),
                                             std::bit_cast<uint32_t>(4.5f)};
-  const auto consumed = HwCtxSetPolyOffsetRegisters(
-      processor, KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
-      Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, payload.data(), 0);
+  std::array<uint32_t, 2 + payload.size()> packet{
+      KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL};
+  std::copy(payload.begin(), payload.end(), packet.begin() + 2);
+  Pm4Execution execution;
+  const auto result = processor.Process(execution, packet);
   const auto &direct = processor.GetCtx().GetPolyOffset();
   Require("Pm4PolygonOffset", "direct registers",
-          consumed == payload.size() && direct.neg_num_db_bits == -16 &&
-              !direct.db_is_float_fmt && direct.clamp == 2.5f &&
-              direct.front_scale == 16.0f && direct.front_offset == -3.25f &&
-              direct.back_scale == 32.0f && direct.back_offset == 4.5f,
+          result == Pm4ProcessResult::Complete &&
+              direct.neg_num_db_bits == -16 && !direct.db_is_float_fmt &&
+              direct.clamp == 2.5f && direct.front_scale == 16.0f &&
+              direct.front_offset == -3.25f && direct.back_scale == 32.0f &&
+              direct.back_offset == 4.5f,
           "direct polygon offset register packet was decoded incorrectly");
 
   g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL](
@@ -52698,7 +52701,6 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4DepthControlHighBits(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
 
   std::array<uint32_t, 3> direct{
@@ -52747,7 +52749,6 @@ void CheckPm4DepthControlHighBits(RenderContext &renderer) {
 
 void CheckPm4DepthRenderOverride(RenderContext &renderer) {
   constexpr const char *name = "Pm4DepthRenderOverride";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   struct Case {
     uint32_t value;
@@ -52785,6 +52786,37 @@ void CheckPm4DepthRenderOverride(RenderContext &renderer) {
           "DB_RENDER_OVERRIDE lost, exchanged, or retained force flags");
     }
   }
+  // A range through DB_HTILE_DATA_BASE writes every register it covers.
+  const std::array<uint32_t, 5> range_packet{
+      KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::DB_RENDER_OVERRIDE, 0x28000000u, 0u, 0x00001234u};
+  Pm4Execution range_execution;
+  const auto range_result = processor.Process(range_execution, range_packet);
+  const auto &range_override = processor.GetCtx().GetDepthRenderOverride();
+  Require(name, "register range",
+          range_result == Pm4ProcessResult::Complete &&
+              range_override.force_z_valid && range_override.force_z_dirty &&
+              processor.GetCtx().GetDepthRenderTarget().htile_data_base_addr ==
+                  0x123400u,
+          "a SET_CONTEXT_REG range dropped DB_HTILE_DATA_BASE");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckPm4DepthShaderControl(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DepthShaderControl";
+  CommandProcessor processor(renderer, 0);
+  const std::array<uint32_t, 3> packet{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::DB_SHADER_CONTROL,
+      0x00006a61u};
+  Pm4Execution execution;
+  const auto result = processor.Process(execution, packet);
+  const auto &db = processor.GetCtx().GetShaderRegisters().db_shader_control;
+  Require(name, "fields",
+          result == Pm4ProcessResult::Complete && db.shader_z_export_enable &&
+              db.shader_z_behavior == 2 && db.shader_kill_enable &&
+              !db.shader_mask_export_enable && db.shader_dual_export_enable &&
+              !db.shader_execute_on_noop && db.alpha_to_mask_disable,
+          "DB_SHADER_CONTROL fields decoded into the wrong state");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -52934,7 +52966,6 @@ static_assert(offsetof(CommandBufferLayout, reserved_dw) == 0x30);
 
 void CheckPm4AcquireMemPackets(RenderContext &renderer) {
   constexpr const char *name = "Pm4AcquireMemPackets";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   // Byte ranges cover every touched 256-byte block, including partial first and last blocks.
   struct Case {
@@ -52991,7 +53022,6 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
 }
 
 void CheckPm4WaitPackets(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
@@ -53126,7 +53156,6 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
 }
 
 void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
     Pm4Execution execution;
@@ -53318,7 +53347,6 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
 }
 
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr auto primitive_type = static_cast<Prospero::PrimitiveType>(0x35u);
 
@@ -53515,7 +53543,6 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
 
 void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   constexpr const char *name = "Pm4IndirectControlFlow";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   uint32_t selected = 0;
   uint32_t returned = 0;
@@ -53869,7 +53896,6 @@ void CheckPm4Flip() {
           handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
-  GraphicsInitJmpTables();
 
   alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
   constexpr int64_t flip_arg = 0x777;
@@ -54004,7 +54030,6 @@ void CheckPm4Flip() {
 }
 
 void CheckPm4WaitResume(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
 
   uint32_t label = 0;
@@ -54072,7 +54097,6 @@ void CheckPm4WaitResume(RenderContext &renderer) {
 
 void CheckPm4LodStats(RenderContext &renderer) {
   constexpr const char *name = "Pm4LodStats";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
 
   // A 16-dword header, 256 two-dword slots and a guard the CP must leave unwritten.
@@ -54117,7 +54141,6 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
               symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
           "async semaphore import did not resolve to the emitter");
 
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0x20);
   const auto execute = [&](std::span<const uint32_t> commands) {
     Pm4Execution execution;
@@ -54231,7 +54254,6 @@ void CheckPm4RewindResume(RenderContext &renderer) {
               command == invalid,
           "rewind patch accepted or modified a packet with the wrong opcode");
 
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   for (const bool async : {false, true}) {
     for (const uint8_t offload : {0, 1}) {
@@ -55241,6 +55263,7 @@ int main(int argc, char **argv) {
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
+    CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -55562,6 +55585,7 @@ int main(int argc, char **argv) {
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
+  CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
   CheckShaderFusion();
   CheckAgcSystemTable(vulkan.RuntimeRenderer());
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());

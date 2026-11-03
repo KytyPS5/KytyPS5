@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -124,8 +125,7 @@ private:
 
 	RenderContext& m_renderer;
 	HW::Context    m_ctx;
-	HW::Context    m_saved_ctx;
-	bool           m_context_state_pushed = false;
+	std::optional<HW::Context> m_saved_ctx;
 	HW::UserConfig m_ucfg;
 	HW::Shader     m_sh_ctx;
 	uint32_t       m_index_type_and_size              = 0;

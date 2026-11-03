@@ -349,15 +349,13 @@ struct AaSampleControl {
 };
 
 struct DepthShaderControl {
-	uint32_t other_bits                  = 0;
-	uint8_t  conservative_z_export_value = 0;
-	uint8_t  shader_z_behavior           = 0;
-	bool     shader_kill_enable          = false;
-	bool     shader_z_export_enable      = false;
-	bool     shader_mask_export_enable   = false;
-	bool     shader_dual_export_enable   = false;
-	bool     shader_execute_on_noop      = false;
-	bool     alpha_to_mask_disable       = false;
+	uint8_t shader_z_behavior         = 0;
+	bool    shader_kill_enable        = false;
+	bool    shader_z_export_enable    = false;
+	bool    shader_mask_export_enable = false;
+	bool    shader_dual_export_enable = false;
+	bool    shader_execute_on_noop    = false;
+	bool    alpha_to_mask_disable     = false;
 };
 
 struct AaConfig {
@@ -459,9 +457,6 @@ struct PsShaderResource2 {
 
 struct PsStageRegisters {
 	uint64_t          data_addr = 0;
-	uint64_t          user_data_addr = 0;
-	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
-	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
@@ -669,8 +664,7 @@ public:
 		return m_depth_render_target;
 	}
 	void SetDepthZInfo(const DepthZInfo& info) { m_depth_render_target.z_info = info; }
-	[[nodiscard]] const DepthZInfo& GetDepthZInfo() const { return m_depth_render_target.z_info; }
-	void                            SetDepthStencilInfo(const DepthStencilInfo& info) {
+	void SetDepthStencilInfo(const DepthStencilInfo& info) {
 		m_depth_render_target.stencil_info = info;
 	}
 	[[nodiscard]] const DepthStencilInfo& GetDepthStencilInfo() const {
@@ -686,13 +680,7 @@ public:
 	}
 	void SetDepthHTileDataBase(uint64_t addr) { m_depth_render_target.htile_data_base_addr = addr; }
 	void SetDepthDepthView(const DepthDepthView& view) { m_depth_render_target.depth_view = view; }
-	[[nodiscard]] const DepthDepthView& GetDepthDepthView() const {
-		return m_depth_render_target.depth_view;
-	}
 	void SetDepthDepthSizeXY(const DepthDepthSizeXY& size) { m_depth_render_target.size = size; }
-	[[nodiscard]] const DepthDepthSizeXY& GetDepthDepthSizeXY() const {
-		return m_depth_render_target.size;
-	}
 
 	void SetViewportZMin(uint32_t viewport_id, float zmin) {
 		m_screen_viewport.viewports[viewport_id].zmin = zmin;
@@ -914,12 +902,6 @@ private:
 	ShaderRegisters m_sh_regs;
 };
 
-struct FsrView {
-	uint32_t control_points[2][4] {};
-	uint32_t alphas[2][2] {};
-	uint32_t window[2] {};
-};
-
 class UserConfig {
 public:
 	UserConfig()  = default;
@@ -949,17 +931,8 @@ public:
 	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
 	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }
 	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
-	void SetFsrControlPoint(uint32_t axis, uint32_t index, uint32_t value) {
-		m_fsr_view.control_points[axis][index] = value;
-	}
-	void SetFsrAlpha(uint32_t axis, uint32_t index, uint32_t value) {
-		m_fsr_view.alphas[axis][index] = value;
-	}
-	void SetFsrWindow(uint32_t index, uint32_t value) { m_fsr_view.window[index] = value; }
-	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
-	FsrView m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;
@@ -995,12 +968,6 @@ public:
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
-	void SetPsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_ps.ps_regs.user_data_addr, word, value);
-	}
-	void SetPsAuxiliaryTableAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_ps.ps_regs.auxiliary_table_addr, word, value);
-	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
 

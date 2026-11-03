@@ -15,6 +15,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/presentation/frameStepHack.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -1343,6 +1344,21 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
 		}
+	}
+	if (!m_programs.empty()) {
+		const auto* main_program = m_programs.front();
+		std::vector<Libs::VideoOut::FrameStepHack::CodeRange> code;
+		const auto* ehdr = main_program->elf->GetEhdr();
+		const auto* phdr = main_program->elf->GetPhdr();
+		for (Elf64_Half i = 0; ehdr != nullptr && phdr != nullptr && i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X) != 0) {
+				code.push_back({phdr[i].p_vaddr, phdr[i].p_vaddr + phdr[i].p_filesz});
+			}
+		}
+		Libs::VideoOut::FrameStepHack::PatchMainProgram(main_program->base_vaddr,
+		                                                main_program->base_size,
+		                                                main_program->mapped_size, code,
+		                                                !game_patch.empty());
 	}
 	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {

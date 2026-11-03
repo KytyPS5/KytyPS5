@@ -149,7 +149,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:
 		case Prospero::TileMode::kRenderTarget:
-			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
+			tile = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
 			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}

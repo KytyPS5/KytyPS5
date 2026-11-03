@@ -469,10 +469,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
-		const auto& owner = cache.m_slot_images[target.image_id];
-		if ((!owner.registered && !owner.info.data.Empty()) || owner.binding.needs_rebind) {
-			EXIT("color target changed after render-state discovery\n");
-		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
@@ -496,10 +492,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
-		const auto& owner = cache.m_slot_images[depth.image_id];
-		if (!owner.registered || owner.binding.needs_rebind) {
-			EXIT("depth target changed after render-state discovery\n");
-		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
 		const bool meta_clear =
@@ -615,11 +607,10 @@ struct DrawEmitInfo {
 };
 
 struct DrawIndexBufferSource {
-	uint64_t      address   = 0;
-	const void*   host_data = nullptr;
-	uint64_t      size      = 0;
-	vk::IndexType type      = vk::IndexType::eUint16;
-	uint32_t      guest_element_size = 0;
+	uint64_t    address            = 0;
+	const void* host_data          = nullptr;
+	uint64_t    size               = 0;
+	uint32_t    guest_element_size = 0;
 };
 
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
@@ -911,7 +902,8 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	if (source.size == 0) {
 		return prepared;
 	}
-	prepared.type = source.type;
+	prepared.type =
+	    source.guest_element_size == 4 ? vk::IndexType::eUint32 : vk::IndexType::eUint16;
 	if (source.host_data != nullptr) {
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
@@ -1326,17 +1318,9 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	DrawIndexBufferSource index_source {};
 	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
 	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
-		case Prospero::IndexType::kIndex16:
-			index_source.type               = vk::IndexType::eUint16;
-			index_source.guest_element_size = 2;
-			break;
-		case Prospero::IndexType::kIndex32:
-			index_source.type               = vk::IndexType::eUint32;
-			index_source.guest_element_size = 4;
-			break;
-		case Prospero::IndexType::kIndex8:
-			index_source.guest_element_size = 1;
-			break;
+		case Prospero::IndexType::kIndex16: index_source.guest_element_size = 2; break;
+		case Prospero::IndexType::kIndex32: index_source.guest_element_size = 4; break;
+		case Prospero::IndexType::kIndex8: index_source.guest_element_size = 1; break;
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;

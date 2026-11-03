@@ -43,7 +43,6 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eCompute) {
 		result |= vk::PipelineStageFlagBits::eComputeShader;
 	}
-	EXIT_IF(!result);
 	return result;
 }
 
@@ -61,8 +60,6 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
 }
 
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
-	EXIT_IF(buffer == nullptr);
-
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -76,7 +73,6 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 }
 
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
-	EXIT_IF(!runtime);
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
@@ -86,8 +82,7 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		if (!program.info.buffers[i].written) {
 			continue;
 		}
-		const auto& value = resources.buffers[i];
-		EXIT_IF(value.dword_count < 4);
+		const auto&          value = resources.buffers[i];
 		ShaderBufferResource descriptor;
 		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
 		// A zero stride means byte addressing. For either addressing mode a nonzero record
@@ -98,7 +93,6 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const vk::MemoryBarrier barrier {
 	    .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
 	    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
@@ -108,7 +102,6 @@ void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sou
 
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
-	EXIT_IF(vk_buffer == nullptr || !destination_stages);
 	const vk::MemoryBarrier barrier {
 	    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
@@ -117,7 +110,6 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 }
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,
 	                          vk::PipelineStageFlagBits::eComputeShader |

@@ -890,7 +890,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	if (ps_active) {
 		stages[3] = ps_input_info.stage.module;
 	}
-	EXIT_IF(stages[0] == nullptr || (ps_active && stages[3] == nullptr));
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
 	const auto color_count = state.color_count;
 
@@ -1052,9 +1051,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     key.stage_ids[0], static_cast<void*>(stages[0]->module), key.stage_ids[3],
-		     ps_active ? static_cast<void*>(stages[3]->module) : nullptr);
 	}
 
 	{
@@ -1072,7 +1068,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(input_info.stage.module == nullptr);
 	const auto& module = *input_info.stage.module;
 
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);

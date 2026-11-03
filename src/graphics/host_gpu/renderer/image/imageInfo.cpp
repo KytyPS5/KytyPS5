@@ -301,9 +301,8 @@ uint64_t ImageInfo::LinearSize(uint32_t levels) const {
 	for (uint32_t level = 0; level < levels; ++level) {
 		const auto& mip    = mip_layout[level];
 		const auto  slices = MipExtent(level).depth;
-		const auto  stride = linear_slice_stride != 0 ? linear_slice_stride : mip.linear_size;
-		size               = std::max(
-		    size, Add(Add(mip.linear_offset, Multiply(slices - 1u, stride)), mip.linear_size));
+		const auto  last   = Add(mip.linear_offset, Multiply(slices - 1u, linear_slice_stride));
+		size               = std::max(size, Add(last, mip.linear_size));
 	}
 	return size;
 }

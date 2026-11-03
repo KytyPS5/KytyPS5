@@ -582,7 +582,6 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 		}
 		info.metadata.range       = {buffer.metadata_address, dcc_size.size};
 		info.metadata.kind        = Graphics::ImageMetadataKind::Dcc;
-		info.metadata.control     = attribute.dcc_control;
 		info.metadata.compression = compression;
 	}
 	Graphics::ImageOps::Validate(info);

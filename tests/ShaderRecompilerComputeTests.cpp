@@ -7173,6 +7173,33 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
+      // A dynamic-resolution depth target can grow wider at one address while its pitch and
+      // height stay put, so the cache must still replace the narrower native image.
+      constexpr uint64_t depth_widening_offset = 0x27c8000;
+      auto narrow_depth = MakeLinearDesc(
+          base + depth_widening_offset, 16 * 4 * sizeof(float),
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {8, 4, 1}, 1, sizeof(float), 1);
+      narrow_depth.type = BindingType::DepthTarget;
+      narrow_depth.info.pitch = 16;
+      narrow_depth.info.mip_layout[0].pitch = 16;
+      narrow_depth.info.mip_layout[0].linear_pitch = 16;
+      narrow_depth.view_info.format = vk::Format::eD32Sfloat;
+      narrow_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      narrow_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      auto wide_depth = narrow_depth;
+      wide_depth.info.extent = {12, 4, 1};
+      const auto narrow_depth_image = texture_cache.FindImage(narrow_depth);
+      (void)texture_cache.FindDepthTarget(narrow_depth_image, narrow_depth);
+      const auto wide_depth_image = texture_cache.FindImage(wide_depth);
+      (void)texture_cache.FindDepthTarget(wide_depth_image, wide_depth);
+      Require(name, "wider depth target backing",
+              wide_depth_image &&
+                  texture_cache.GetImage(wide_depth_image).backing.extent.width >=
+                      wide_depth.info.extent.width,
+              "a depth target that only grew wider kept its narrower native "
+              "image");
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),

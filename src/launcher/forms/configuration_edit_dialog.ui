@@ -209,7 +209,7 @@
               <property name="text"><string>Compile new pipelines in the background</string></property>
              </widget>
             </item>
-            <item row="13" column="1">
+            <item row="14" column="1">
              <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
               <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
               <property name="text"><string>Relaxed shader float math</string></property>
@@ -217,7 +217,7 @@
             </item>
             <item row="13" column="1">
              <widget class="QCheckBox" name="checkBox_native_rt">
-              <property name="toolTip"><string>Use native RT on the GPU.</string></property>
+              <property name="toolTip"><string>Experimental. Trace the ray tracing passes of supported games (GTA V's shadows and reflections in Fidelity mode, ASTRO BOT) with the GPU's ray tracing hardware instead of emulating the PS5's BVH instructions: much faster where it applies. Needs a GPU with Vulkan ray queries. Visual errors are possible; turn it off if a game looks wrong.</string></property>
               <property name="text"><string>Native ray tracing (experimental)</string></property>
              </widget>
             </item>

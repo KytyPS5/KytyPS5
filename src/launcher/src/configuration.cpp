@@ -105,7 +105,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	// On by default, also in configurations saved before the fork turned it on.
 	occlusion_queries_enabled = s.value("occlusion_queries_enabled", true).toBool();
 	KYTY_CFG_GET(relaxed_shader_float);
-	KYTY_CFG_GET(native_rt);
+	// Configurations saved before upstream's toggle keep the fork's native ray tracing setting.
+	native_rt = s.value("native_rt", s.value("native_ray_tracing_enabled", native_rt)).toBool();
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	// On by default, also in configurations saved before the option existed.
 	async_pipelines_enabled = s.value("async_pipelines_enabled", true).toBool();

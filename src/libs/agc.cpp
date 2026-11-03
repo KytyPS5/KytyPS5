@@ -1635,7 +1635,8 @@ AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes
 
 // Resource registration (the names debugging and capture tools show for guest memory). Libraries
 // register an owner and then each of their resources, typically their shaders by code address;
-// the names are kept for the emulator (ShaderRegisteredName()).
+// with native ray tracing the names are kept for the emulator (ShaderRegisteredName(): it knows
+// the sce::Psr shaders by them). Without it the calls are left unimplemented, as before.
 struct RegisteredResource {
 	uint32_t owner   = 0;
 	uint64_t address = 0;
@@ -1648,6 +1649,10 @@ static std::unordered_map<uint32_t, RegisteredResource> g_registered_resources;
 
 int KYTY_SYSV_ABI AgcDriverRegisterOwner(uint32_t* owner_handle, const char* name) {
 	PRINT_NAME();
+
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
 
 	LOGF("\t name = %s\n", name != nullptr ? name : "(null)");
 
@@ -1667,6 +1672,10 @@ int KYTY_SYSV_ABI AgcDriverRegisterResource(uint32_t* resource_handle, uint32_t 
                                             const void* memory, uint64_t size, const char* name,
                                             uint32_t type, uint64_t user_data) {
 	PRINT_NAME();
+
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
 
 	const auto address = reinterpret_cast<uint64_t>(memory);
 	LOGF("\t owner   = %" PRIu32 "\n"
@@ -1700,6 +1709,10 @@ int KYTY_SYSV_ABI AgcDriverRegisterResource(uint32_t* resource_handle, uint32_t 
 int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
 	PRINT_NAME();
 
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
+
 	LOGF("\t owner = %" PRIu32 "\n", owner_handle);
 
 	std::scoped_lock lock(g_resource_registration_mutex);
@@ -1721,6 +1734,10 @@ int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
 
 int KYTY_SYSV_ABI AgcDriverUnregisterResource(uint32_t resource_handle) {
 	PRINT_NAME();
+
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
 
 	LOGF("\t resource = %" PRIu32 "\n", resource_handle);
 

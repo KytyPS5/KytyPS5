@@ -126,7 +126,10 @@ static void PrintUsage() {
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
-	::printf("  --native-rt                          Use native RT on the GPU.\n");
+	::printf("  --native-rt                          Experimental: trace the ray tracing passes of\n"
+	         "                                       supported games (GTA V, ASTRO BOT) with the host\n"
+	         "                                       GPU's ray tracing hardware. Default: off.\n"
+	         "                                       --native-raytracing is an alias.\n");
 	::printf(
 	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
 	    "                                       draws that need them while they compile.\n");
@@ -274,6 +277,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--native-rt", &ConfigOptions::native_rt},
+    {"--native-raytracing", &ConfigOptions::native_rt}, // alias of --native-rt
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

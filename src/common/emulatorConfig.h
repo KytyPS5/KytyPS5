@@ -208,6 +208,10 @@ bool RelaxedShaderFloatEnabled();
 bool NativeRtEnabled();
 // Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
 bool AsyncPipelinesEnabled();
+// Experimental, --native-rt (alias --native-raytracing), like NativeRtEnabled(): the ray tracing
+// passes the shader recompiler recognizes trace with the host's ray tracing hardware (see
+// NativeRayTracing). Off, the device enables no ray tracing feature and no shader is patched.
+bool NativeRayTracingEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

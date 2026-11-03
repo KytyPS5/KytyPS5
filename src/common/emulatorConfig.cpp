@@ -270,6 +270,10 @@ bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }
 
+bool NativeRayTracingEnabled() {
+	return g_config->native_rt;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

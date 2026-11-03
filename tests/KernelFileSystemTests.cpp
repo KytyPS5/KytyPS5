@@ -2715,6 +2715,96 @@ void CheckSocketWakeup() {
 
 } // namespace
 
+static void TestUnrealScreenPercentage() {
+  namespace FileSystem = Libs::LibKernel::FileSystem;
+  Check(FileSystem::AppendUnrealScreenPercentage(
+            "../../../End/End.uproject -async", 50) ==
+            "../../../End/End.uproject -async "
+            "-ini:Engine:[SystemSettings]:r.ScreenPercentage=50 "
+            "-dpcvars=r.ScreenPercentage=50",
+        "Unreal command line gains r.ScreenPercentage");
+  Check(FileSystem::AppendUnrealScreenPercentage(
+            std::string("-project=a.uproject\r\n\0", 22), 75) ==
+            "-project=a.uproject "
+            "-ini:Engine:[SystemSettings]:r.ScreenPercentage=75 "
+            "-dpcvars=r.ScreenPercentage=75",
+        "Unreal command line drops trailing line ends and NULs");
+  Check(FileSystem::AppendUnrealScreenPercentage("", 10) ==
+            " -ini:Engine:[SystemSettings]:r.ScreenPercentage=10 "
+            "-dpcvars=r.ScreenPercentage=10",
+        "empty Unreal command line");
+  Check(
+      FileSystem::IsUnrealCommandLinePath("/app0/ue4commandline.txt") &&
+          FileSystem::IsUnrealCommandLinePath("/app0/UECommandLine.txt") &&
+          !FileSystem::IsUnrealCommandLinePath("/app0/othercommandline.txt") &&
+          !FileSystem::IsUnrealCommandLinePath(
+              "/app0/data/ue4commandline.txt") &&
+          !FileSystem::IsUnrealCommandLinePath("/savedata0/uecommandline.txt"),
+      "only the two Unreal command line paths match");
+}
+
+static void WriteFixture(const std::filesystem::path &path,
+                         const std::string &text) {
+  Common::File file;
+  Check(file.Create(path), "create fixture file");
+  file.Write(text.data(), static_cast<uint32_t>(text.size()));
+  file.Close();
+}
+
+static std::string ReadGuestFile(const char *path) {
+  const int fd = FileSystem::KernelOpen(path, 0, 0);
+  if (fd < 0) {
+    return "<open failed>";
+  }
+  FileSystem::FileStat stat{};
+  std::string text(4096, '\0');
+  const auto read = FileSystem::KernelRead(fd, text.data(), text.size());
+  Check(FileSystem::KernelFstat(fd, &stat) == OK && read >= 0 &&
+            stat.st_size == read,
+        "fstat reports the size read");
+  Check(FileSystem::KernelClose(fd) == OK, "close command line file");
+  text.resize(read >= 0 ? static_cast<size_t>(read) : 0);
+  return text;
+}
+
+static void CheckUnrealCommandLine(const std::filesystem::path &root) {
+  const auto folder = root / "unreal";
+  Check(std::filesystem::create_directory(folder),
+        "create Unreal fixture directory");
+  const std::string original = "../../../End/End.uproject -async\r\n";
+  WriteFixture(folder / "ue4commandline.txt", original);
+  WriteFixture(folder / "othercommandline.txt", "-other\n");
+  const auto served = FileSystem::AppendUnrealScreenPercentage(original, 50);
+
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  options.unreal_screen_percentage = 50;
+  Config::Load(options);
+  FileSystem::Mount(folder, "/app0");
+  Check(ReadGuestFile("/app0/ue4commandline.txt") == served,
+        "Unreal command line served with r.ScreenPercentage");
+  Check(ReadGuestFile("/app0/UE4CommandLine.txt") == served,
+        "Unreal command line matched in any case");
+  Check(ReadGuestFile("/app0/othercommandline.txt") == "-other\n",
+        "other command line files are served as they are");
+  FileSystem::FileStat stat{};
+  Check(FileSystem::KernelStat("/app0/ue4commandline.txt", &stat) == OK &&
+            stat.st_size == static_cast<int64_t>(served.size()),
+        "stat reports the served command line size");
+  Check(FileSystem::KernelOpen("/app0/uecommandline.txt", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "a missing Unreal command line stays missing");
+  Check(FileSystem::KernelOpen("/app0/ue4commandline.txt", 0x0400, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EACCES,
+        "a read-only truncating open is still refused");
+
+  options.unreal_screen_percentage = 0;
+  Config::Load(options);
+  Check(ReadGuestFile("/app0/ue4commandline.txt") == original,
+        "without the option the command line is left alone");
+  FileSystem::Umount("/app0");
+}
+
 int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
@@ -2735,6 +2825,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  TestUnrealScreenPercentage();
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
@@ -2767,6 +2858,7 @@ int main(int argc, char** argv) {
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
+  CheckUnrealCommandLine(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestFsync();

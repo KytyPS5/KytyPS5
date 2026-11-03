@@ -99,6 +99,7 @@ struct ConfigOptions {
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
+	uint32_t               unreal_screen_percentage        = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -170,6 +171,8 @@ bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
+// The r.ScreenPercentage served to Unreal Engine games, 10 to 200; 0 leaves them alone.
+uint32_t UnrealScreenPercentage();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

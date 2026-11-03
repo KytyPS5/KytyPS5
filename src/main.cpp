@@ -108,6 +108,9 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf(
+	    "  --unreal-screen-percentage <10-200>  Render Unreal Engine games at this share of their\n"
+	    "                                       output (r.ScreenPercentage).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -395,6 +398,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--trophy-duration") {
 			if (!ParseUint32(value, options.config.trophy_duration_seconds)) {
 				::printf("invalid trophy duration: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--unreal-screen-percentage") {
+			auto& percentage = options.config.unreal_screen_percentage;
+			if (!ParseUint32(value, percentage) || percentage < 10 || percentage > 200) {
+				::printf("invalid Unreal screen percentage (10-200): %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--console-language") {

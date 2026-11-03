@@ -18,12 +18,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <random>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -63,6 +65,8 @@ private:
 };
 
 struct File {
+	// What f serves when it is opened in memory; declared first, so that it outlives f.
+	std::string                         memory;
 	Common::File                        f;
 	std::string                         name;
 	std::filesystem::path               real_name;
@@ -415,6 +419,51 @@ bool IsOpenDescriptor(int d) {
 	return file != nullptr && file->opened;
 }
 
+bool IsUnrealCommandLinePath(const std::string& guest_path) {
+	std::string lower(guest_path.size(), '\0');
+	std::ranges::transform(guest_path, lower.begin(),
+	                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return lower == "/app0/ue4commandline.txt" || lower == "/app0/uecommandline.txt";
+}
+
+std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t percentage) {
+	while (!command_line.empty() && (command_line.back() == '\n' || command_line.back() == '\r' ||
+	                                 command_line.back() == '\0')) {
+		command_line.pop_back();
+	}
+	// The engine takes the console variable from either form, depending on its version.
+	const auto option = "r.ScreenPercentage=" + std::to_string(percentage);
+	return command_line + " -ini:Engine:[SystemSettings]:" + option + " -dpcvars=" + option;
+}
+
+// With --unreal-screen-percentage, what an Unreal Engine game reads from its command line file: the
+// file's text with r.ScreenPercentage appended, served from memory, so that the engine renders its
+// scene at that share of its output and upscales it, as its own settings would. Nothing when the
+// option is off, the path is another file, or the file can't be read whole.
+static std::optional<std::string> UnrealCommandLine(const std::string&           guest_path,
+                                                    const std::filesystem::path& real_name) {
+	constexpr uint64_t MaxSize    = 64 * 1024;
+	const auto         percentage = Config::UnrealScreenPercentage();
+	if (percentage == 0 || !IsUnrealCommandLinePath(guest_path)) {
+		return std::nullopt;
+	}
+	Common::File original;
+	if (!original.Open(real_name, Common::File::Mode::Read)) {
+		return std::nullopt;
+	}
+	const auto size = original.Size();
+	if (size > MaxSize) {
+		return std::nullopt;
+	}
+	std::string content(size, '\0');
+	uint32_t    bytes_read = 0;
+	original.Read(content.data(), static_cast<uint32_t>(size), &bytes_read);
+	if (bytes_read != size) {
+		return std::nullopt;
+	}
+	return AppendUnrealScreenPercentage(std::move(content), percentage);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
@@ -542,6 +591,17 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+		} else if (auto served = rw_mode == Common::File::Mode::Read
+		                             ? UnrealCommandLine(file->name, file->real_name)
+		                             : std::nullopt) {
+			file->memory = std::move(*served);
+			result =
+			    file->f.OpenInMem(file->memory.data(), static_cast<uint32_t>(file->memory.size()));
+
+			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red,
+			           "\tOpen: %s, served from memory: %s, %s\n",
+			           Common::PathToString(file->real_name).c_str(), file->memory.c_str(),
+			           result ? "[ok]" : "[fail]");
 		} else {
 			result = file->f.Open(file->real_name, rw_mode);
 
@@ -1155,9 +1215,10 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {
-		stat.st_size    = static_cast<int64_t>(info->size);
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
+		const auto served = UnrealCommandLine(path, real_file_name);
+		stat.st_size      = static_cast<int64_t>(served ? served->size() : info->size);
+		stat.st_blksize   = 512;
+		stat.st_blocks    = (stat.st_size + 511) / 512;
 
 		Common::File::GetLastAccessAndWriteTimeUTC(real_file_name, &at, &wt);
 	}

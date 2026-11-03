@@ -132,7 +132,7 @@ static uint64_t GetHostThreadId() {
 }
 #endif
 
-static uint64_t KernelReadTscNative() {
+static uint64_t KernelHostTsc() {
 #if defined(_M_X64) || defined(__x86_64__)
 	return __rdtsc();
 #else
@@ -140,7 +140,7 @@ static uint64_t KernelReadTscNative() {
 #endif
 }
 
-static uint64_t KernelGetTscFrequencyNative() {
+static uint64_t KernelHostTscFrequency() {
 	static const uint64_t frequency = [] {
 #if defined(_M_X64) || defined(__x86_64__)
 		const auto host_frequency = Common::Timer::QueryPerformanceFrequency();
@@ -148,15 +148,15 @@ static uint64_t KernelGetTscFrequencyNative() {
 			return uint64_t {1000000000};
 		}
 
-		KernelReadTscNative();
+		KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		KernelReadTscNative();
+		KernelHostTsc();
 
 		const auto host_start = Common::Timer::QueryPerformanceCounter();
-		const auto tsc_start  = KernelReadTscNative();
+		const auto tsc_start  = KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		const auto host_end = Common::Timer::QueryPerformanceCounter();
-		const auto tsc_end  = KernelReadTscNative();
+		const auto tsc_end  = KernelHostTsc();
 
 		const auto host_delta = host_end - host_start;
 		const auto tsc_delta  = tsc_end - tsc_start;
@@ -178,6 +178,29 @@ static uint64_t KernelGetTscFrequencyNative() {
 	}();
 
 	return frequency;
+}
+
+// The console counter runs at 1.6 GHz and some games hardcode that rate instead of calling
+// sceKernelGetTscFrequency(); --guest-tsc presents it on every host and the loader rewrites guest
+// RDTSC/RDTSCP to the same product.
+static constexpr uint64_t GUEST_TSC_FREQUENCY = 1600000000;
+
+uint64_t KernelGuestTscMultiplier() {
+	static const uint64_t multiplier =
+	    ((GUEST_TSC_FREQUENCY << 32u) + KernelHostTscFrequency() / 2) / KernelHostTscFrequency();
+	return multiplier;
+}
+
+static uint64_t KernelReadTscNative() {
+	if (!Config::GuestTscEnabled()) {
+		return KernelHostTsc();
+	}
+	return static_cast<uint64_t>(
+	    (static_cast<unsigned __int128>(KernelHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
+}
+
+static uint64_t KernelGetTscFrequencyNative() {
+	return Config::GuestTscEnabled() ? GUEST_TSC_FREQUENCY : KernelHostTscFrequency();
 }
 
 static uint64_t KernelGetInitialTsc() {
@@ -1988,12 +2011,6 @@ int KYTY_SYSV_ABI PthreadAttrGetinheritsched(const PthreadAttr* attr, int* inher
 
 	*inherit_sched = (*attr)->inherit_sched;
 
-	switch (*inherit_sched) {
-		case 0:
-		case 4: break;
-		default: EXIT("unknown inherit_sched: %d\n", *inherit_sched);
-	}
-
 	return OK;
 }
 
@@ -2147,10 +2164,9 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int pinherit_sched = PTHREAD_INHERIT_SCHED;
 	switch (inherit_sched) {
-		case 0: pinherit_sched = PTHREAD_EXPLICIT_SCHED; break;
-		case 4: pinherit_sched = PTHREAD_INHERIT_SCHED; break;
+		case 0:
+		case 4: break;
 		default: EXIT("unknown inherit_sched: %d\n", inherit_sched);
 	}
 
@@ -2158,7 +2174,6 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	// behavior, and some guest attr flows can leave the native attr in a shape that crashes inside
 	// winpthreads.
 	attr_value->inherit_sched = inherit_sched;
-	(void)pinherit_sched;
 
 	return OK;
 }

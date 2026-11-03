@@ -543,6 +543,7 @@ struct Ngs2VoiceInternal {
 		Ngs2WaveformBlock info;
 		size_t            data_cursor    = 0;
 		uint32_t          repeated_count = 0;
+		bool              canceled       = false;
 	};
 	struct Module {
 		std::vector<uint8_t>     param, work, state;
@@ -717,7 +718,7 @@ struct Ngs2VoiceInternal {
 		const bool only_data = (flags & 2u) != 0;
 		const bool join      = only_data && (flags & 0x10u) == 0;
 		// CLEAR reopens a list that the previous addition closed.
-		EXIT_NOT_IMPLEMENTED((!accepts_blocks && !clear) || (flags & ~0x17u) != 0);
+		EXIT_NOT_IMPLEMENTED((!accepts_blocks && !clear) || (flags & ~0x1fu) != 0);
 		const auto retained = clear ? 0 : blocks.size();
 		Block      tail     = retained == 0 ? Block {} : blocks.back();
 		std::vector<Block> pending;
@@ -751,6 +752,12 @@ struct Ngs2VoiceInternal {
 			ClearWaveformBlocks();
 		} else if (retained != 0) {
 			blocks.back().info.data_size = tail.info.data_size;
+		}
+		// CANCEL marks the outstanding blocks; a marked block that has not started decodes as data only.
+		if ((flags & 8u) != 0) {
+			for (auto& block: blocks) {
+				block.canceled = true;
+			}
 		}
 		blocks.insert(blocks.end(), pending.begin(), pending.end());
 		accepts_blocks = (flags & 1u) != 0;
@@ -1586,7 +1593,7 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	                                  block.data,
 	                                  static_cast<uint32_t>(block.info.data_size),
 	                                  block.repeated_count,
-	                                  0,
+	                                  static_cast<uint32_t>(block.canceled),
 	                                  0};
 	if (!repeat) {
 		voice.blocks.pop_front();
@@ -1603,6 +1610,10 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 	frame_samples = 0;
 	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
 		auto& block = voice.blocks.front();
+		if (block.canceled && block.data_cursor == 0 && block.repeated_count == 0) {
+			block.info.num_samples = 0;
+			block.info.num_repeats = 0;
+		}
 		if (block.info.num_samples != 0 && block.data_cursor == 0) {
 			voice.duration_remaining = block.info.num_samples;
 			voice.skip_remaining     = block.info.num_skip_samples;
@@ -1988,8 +1999,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		const auto& output = buffer_info[voice->output_id];
 		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
 		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x18);
-		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering &&
-		                     output.num_channels != voice->channels);
+		// Surround inputs mixed into fewer output channels use their own downmix levels.
+		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering && voice->channels > 2 &&
+		                     output.num_channels < voice->channels);
 		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
 		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
 		                                                                             : sizeof(float)));
@@ -2003,14 +2015,20 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		} else {
 			pcm = static_cast<float*>(output.buffer);
 		}
+		// The stored matrix mixes 2.0ch into 2.0ch; other mastering layouts use the default levels.
+		const bool stored_matrix =
+		    !voice->output_matrix.empty() && voice->channels == 2 && output.num_channels == 2;
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
 			// Output channel 3 is LFE; every other channel is full band.
 			const float gain = dst == 3 ? voice->lfe_level : voice->fbw_level;
 			for (uint32_t src = 0; src < voice->channels; ++src) {
-				const float level =
-				    gain * (voice->output_matrix.empty()
-				                ? static_cast<float>(src == dst)
-				                : voice->output_matrix.at(src * output.num_channels + dst));
+				float level = static_cast<float>(src == dst);
+				if (stored_matrix) {
+					level = voice->output_matrix.at(src * output.num_channels + dst);
+				} else if (voice->rack->type == Ngs2RackType::Mastering) {
+					level = Ngs2DefaultMatrixLevel(voice->channels, src, output.num_channels, dst);
+				}
+				level *= gain;
 				if (level == 0.0f) {
 					continue;
 				}

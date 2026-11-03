@@ -859,6 +859,41 @@ void TestMasteringGain() {
 	      "mastering gain was not clamped or applied per full band and LFE channel");
 }
 
+void TestMasteringDownmix() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 1;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& source = sampler.Voice();
+	auto& mastering = master.Voice();
+	mastering.channels = 2;
+	mastering.state = Ngs2VoicePlayState::Playing;
+	const int16_t frame[2] = {8192, 16384};
+	source.SetupSampler({0x12, 2, 48000});
+	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
+	source.ports[0].dest = &mastering;
+	source.SetEvent(1);
+	// The stored 2.0ch -> 2.0ch matrix applies to neither a mono output nor a mono voice.
+	mastering.output_matrix.assign(4, 0.0f);
+	float pcm = 0.0f;
+	Ngs2RenderBufferInfo output {&pcm, sizeof(pcm), 0x18, 1};
+	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
+	          pcm == 0.75f * std::numbers::sqrt2_v<float> / 2,
+	      "stereo mastering voice did not downmix into a mono output");
+	mastering.channels = 1;
+	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
+	float stereo[2] = {};
+	output = {stereo, sizeof(stereo), 0x18, 2};
+	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
+	          stereo[0] == pcm * (std::numbers::sqrt2_v<float> / 2) && stereo[1] == stereo[0],
+	      "mono mastering voice did not upmix into a stereo output");
+}
+
 void TestReverbDryLevel() {
 	Fixture          f(48000);
 	Ngs2RackInternal reverb_rack {};
@@ -1222,6 +1257,30 @@ void TestClearReopensClosedList() {
 	f.Queue(&second, 1, 4);
 	f.Render(1);
 	Check(f.voice.samples[0] == -0.5f, "CLEAR did not reopen a closed waveform list");
+}
+
+std::vector<uint32_t> g_block_attributes;
+
+void KYTY_SYSV_ABI RecordBlockAttributes(const Ngs2VoiceCallbackInfo* info) {
+	g_block_attributes.push_back(info->attributes);
+}
+
+void TestCancelSkipsBlocksNotStarted() {
+	Fixture f(48000);
+	f.system.option.num_grain_samples = 1;
+	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordBlockAttributes);
+	f.voice.callback_flags = 1;
+	const int16_t pcm[] = {8192, 16384, -8192, -16384};
+	f.Queue(pcm, 2, 1, 1);
+	f.Queue(pcm + 2, 1, 1);
+	f.Render(1);
+	// Cancel during the first pass of the looping block.
+	f.Queue(pcm + 3, 1, 9);
+	f.Render(4);
+	Check(f.voice.samples == std::vector<float> {0.5f, 0.25f, 0.5f, -0.5f},
+	      "CANCEL did not keep the playing block and skip the queued one");
+	Check(g_block_attributes == std::vector<uint32_t> {1, 1, 0},
+	      "block callbacks did not report the canceled blocks");
 }
 
 void TestSetupQuery() {
@@ -1941,6 +2000,7 @@ int main() {
 	TestPcm16RenderOutput();
 	TestPatchToRackHandle();
 	TestMasteringGain();
+	TestMasteringDownmix();
 	TestReverbDryLevel();
 	TestCustomMasteringChannelMixer();
 	TestCustomVoiceStateCapacity();
@@ -1980,6 +2040,7 @@ int main() {
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestClearReopensClosedList();
+	TestCancelSkipsBlocksNotStarted();
 	TestSetupQuery();
 	TestPortInfo();
 	TestPlayStateBeforeRender();

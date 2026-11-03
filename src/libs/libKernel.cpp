@@ -3242,6 +3242,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("8+s5BzZjxSg", LibKernel::PthreadAttrGetaffinity);
 	LIB_FUNC("nsYoNRywwNg", LibKernel::PthreadAttrInit);
 	LIB_FUNC("JaRMy+QcpeU", LibKernel::PthreadAttrGetdetachstate);
+	LIB_FUNC("lpMP8HhkBbg", LibKernel::PthreadAttrGetinheritsched);
 	LIB_FUNC("-quPa4SEJUw", LibKernel::PthreadAttrGetstack);
 	LIB_FUNC("Ru36fiTtJzA", LibKernel::PthreadAttrGetstackaddr);
 	LIB_FUNC("-fA+7ZlGDQs", LibKernel::PthreadAttrGetstacksize);

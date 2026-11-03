@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_GUEST_GPU_PSSR_H_
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_PSSR_H_
 
+#include "graphics/guest_gpu/gpu_defs.h"
+
 #include <cstdint>
 
 namespace Libs::Graphics::Pssr {
@@ -14,6 +16,15 @@ struct Request {
 
 constexpr uint32_t RequestDwords = sizeof(Request) / sizeof(uint32_t);
 static_assert(sizeof(Request) == 72);
+
+inline bool IsColorFormat(Prospero::BufferFormat format) {
+	switch (format) {
+		case Prospero::BufferFormat::k11_11_10Float:
+		case Prospero::BufferFormat::k10_11_11Float:
+		case Prospero::BufferFormat::k16_16_16_16Float: return true;
+		default: return false;
+	}
+}
 
 } // namespace Libs::Graphics::Pssr
 

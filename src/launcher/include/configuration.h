@@ -101,6 +101,7 @@ public:
 	QString     addons_dir;  /* Global setting; not saved per game. */
 	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
 	bool        custom_settings = false;
+	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
 	GameStatus  game_status     = GameStatus::Unknown;
 	QString     game_comment;
 
@@ -144,6 +145,7 @@ public:
 	bool                   renderdoc_enabled           = false;
 	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -189,6 +191,7 @@ public:
 		renderdoc_enabled           = other.renderdoc_enabled;
 		pro_enabled                 = other.pro_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
+		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -203,6 +206,7 @@ public:
 		basedir         = other.basedir;
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
+		pro_supported   = other.pro_supported;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}

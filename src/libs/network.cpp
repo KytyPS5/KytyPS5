@@ -1461,8 +1461,9 @@ int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
-                                       int retry, int flags) {
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      NetResolverInfo* info, int timeout, int retry,
+                                                      int flags) {
 	PRINT_NAME();
 
 	LOGF("\t rid      = %d\n"
@@ -1472,10 +1473,7 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	     "\t flags    = 0x%08x\n",
 	     rid, hostname != nullptr ? hostname : "<null>", timeout, retry, flags);
 
-	(void)timeout;
-	(void)retry;
-
-	if (hostname == nullptr || addr == nullptr || (flags & ~0x00010000) != 0) {
+	if (hostname == nullptr || info == nullptr || (flags & ~0x00010000) != 0) {
 		return NET_ERROR_EINVAL;
 	}
 
@@ -1484,7 +1482,11 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		return NET_ERROR_EBADF;
 	}
 
-	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, addr) == 1) {
+	*info = {};
+	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, &info->addrs[0].addr) == 1) {
+		info->addrs[0].af = 2;
+		info->records     = 1;
+		info->dns4records = 1;
 		return OK;
 	}
 
@@ -1514,15 +1516,35 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
 		    ai->ai_addrlen >= sizeof(sockaddr_in)) {
-			const auto* in = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-			std::memcpy(addr, &in->sin_addr, sizeof(in->sin_addr));
-			freeaddrinfo(result);
-			return OK;
+			if (info->records < static_cast<int>(std::size(info->addrs))) {
+				NetResolverAddr& out = info->addrs[info->records++];
+				const auto*      in  = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+				std::memcpy(&out.addr, &in->sin_addr, sizeof(out.addr));
+				out.af = 2;
+			}
+			info->dns4records++;
 		}
 	}
 
 	freeaddrinfo(result);
-	return NET_ERROR_RESOLVER_ENORECORD;
+	return info->records > 0 ? OK : NET_ERROR_RESOLVER_ENORECORD;
+}
+
+int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
+                                       int retry, int flags) {
+	PRINT_NAME();
+
+	if (addr == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	NetResolverInfo info;
+	const int       ret =
+	    NetResolverStartNtoaMultipleRecords(rid, hostname, &info, timeout, retry, flags);
+	if (ret == OK) {
+		std::memcpy(addr, &info.addrs[0].addr, sizeof(info.addrs[0].addr));
+	}
+	return ret;
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
@@ -4055,6 +4077,7 @@ struct NpCheckPremiumResult {
 
 constexpr int      np_error_invalid_argument            = -2141913085; /* 0x80550003 */
 constexpr int      np_error_signed_out                  = -2141913082; /* 0x80550006 */
+constexpr int      np_error_user_not_found              = -2141913081; /* 0x80550007 */
 constexpr int      np_error_callback_already_registered = -2141913080; /* 0x80550008 */
 constexpr int      np_error_invalid_size                = -2141913071; /* 0x80550011 */
 constexpr int      np_error_aborted                     = -2141913070; /* 0x80550012 */
@@ -4065,6 +4088,7 @@ constexpr int      np_error_network_not_available       = -2141872086; /* 0x8055
 constexpr int      np_request_max                       = 128;
 constexpr uint32_t np_state_signed_out                  = 1;
 constexpr uint32_t np_state_signed_in                   = 2;
+constexpr uint64_t np_account_id                        = 0x00000000feedfaceull;
 
 // A simulated account belongs only to the primary user and survives network loss.
 bool IsSignedIn(int user_id) {
@@ -4298,11 +4322,30 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 	*account_id = 0;
 
 	if (IsSignedIn(user_id)) {
-		*account_id = 0x00000000feedfaceull;
+		*account_id = np_account_id;
 		return OK;
 	}
 
 	return np_error_signed_out;
+}
+
+int KYTY_SYSV_ABI NpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
+	PRINT_NAME();
+
+	LOGF("\t account_id = 0x%016" PRIx64 "\n", account_id);
+
+	if (account_id == 0 || user_id == nullptr) {
+		return np_error_invalid_argument;
+	}
+	if (!Config::PsnEmulationEnabled()) {
+		return np_error_signed_out;
+	}
+	if (account_id != np_account_id) {
+		return np_error_user_not_found;
+	}
+
+	*user_id = Config::GetUserId();
+	return OK;
 }
 
 int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {

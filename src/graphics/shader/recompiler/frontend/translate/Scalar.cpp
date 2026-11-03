@@ -267,7 +267,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: return;
+		case O::S_WAITCNT_DEPCTR:
+		case O::S_CLAUSE: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;

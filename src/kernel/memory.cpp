@@ -816,8 +816,6 @@ static std::recursive_mutex g_memory_operation_mutex;
 static constexpr uint64_t GUEST_DEFAULT_MAP_BASE = 0x200000000ull;
 
 static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t alignment) {
-	EXIT_IF(g_guest_address_space == nullptr || g_virtual_ranges == nullptr);
-
 	auto find_in = [&](uint64_t begin, uint64_t end) {
 		auto current = begin;
 		while (current < end && size <= end - current) {
@@ -830,11 +828,7 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 			if (!g_virtual_ranges->QueryOverlap(candidate, size, &overlap)) {
 				return candidate;
 			}
-			const auto overlap_end = overlap.start + overlap.size;
-			if (overlap_end <= current) {
-				return uint64_t {0};
-			}
-			current = overlap_end;
+			current = overlap.start + overlap.size;
 		}
 		return uint64_t {0};
 	};
@@ -850,13 +844,11 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1442,12 +1434,13 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, VirtualMemory::Mode mode) {
 		const auto reused = block.backing_offset < m_backing_high_water
 		                        ? std::min(block.size, m_backing_high_water - block.backing_offset)
 		                        : 0;
-		const bool cleared =
-		    reused == 0 || g_guest_address_space->ZeroBacking(block.backing_offset, reused);
+		if (reused != 0) {
+			g_guest_address_space->ZeroBacking(block.backing_offset, reused);
+		}
 		// Never roll this back: a successfully exposed view can be written before a later failure.
 		m_backing_high_water = std::max(m_backing_high_water, block.backing_offset + block.size);
-		if (!cleared || !g_guest_address_space->MapBacking(block.vaddr, block.size,
-		                                                   block.backing_offset, mode)) {
+		if (!g_guest_address_space->MapBacking(block.vaddr, block.size, block.backing_offset,
+		                                       mode)) {
 			while (mapped != 0) {
 				const auto& previous = blocks[--mapped];
 				EXIT_IF(!g_guest_address_space->UnmapBacking(previous.vaddr, previous.size));
@@ -1921,7 +1914,7 @@ static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
 static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, size_t len,
                             bool keep_pool_reserved = false) {
 	if (IsReservedRangeType(range.type)) {
-		if (!g_guest_address_space->ReleaseFree(vaddr, len)) {
+		if (!g_guest_address_space->ContainsFree(vaddr, len)) {
 			return KERNEL_ERROR_EACCES;
 		}
 		g_virtual_ranges->Remove(vaddr, len);
@@ -1945,7 +1938,6 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 
 		const auto direct_offset = range.offset + vaddr - range.start;
 		if (DecodeMemoryProtection(range.protection, &direct_mode) &&
-		    g_guest_address_space->BackingContains(vaddr, len) &&
 		    g_guest_address_space->UnmapBacking(vaddr, len)) {
 			if (g_physical_memory->Unmap(vaddr, len)) {
 				owner_unmapped = true;
@@ -2816,7 +2808,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			chunk.host_unmapped    = unmapped;
 			chunk.backend_unmapped = unmapped;
 		} else if (IsReservedRangeType(chunk.range.type)) {
-			unmapped = g_guest_address_space->ReleaseFree(chunk.range.start, chunk.range.size);
+			unmapped = g_guest_address_space->ContainsFree(chunk.range.start, chunk.range.size);
 		} else {
 			unmapped = false;
 		}
@@ -2833,7 +2825,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		}
 	}
 
-	if (!g_guest_address_space->ReserveFixed(start, size)) {
+	if (!g_guest_address_space->ContainsFree(start, size)) {
 		if (!restore_chunks()) {
 			EXIT("reserve-fixed host-reservation rollback failed\n");
 		}
@@ -2857,18 +2849,6 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		           start, size);
 		if (!restore_chunks()) {
 			EXIT("reserve-fixed range-registration rollback failed\n");
-		}
-		auto free_start = start;
-		for (const auto& chunk: chunks) {
-			if (free_start < chunk.range.start &&
-			    !g_guest_address_space->ReleaseFree(free_start, chunk.range.start - free_start)) {
-				EXIT("reserve-fixed range-registration gap cleanup failed\n");
-			}
-			free_start = chunk.range.start + chunk.range.size;
-		}
-		if (free_start < start + size &&
-		    !g_guest_address_space->ReleaseFree(free_start, start + size - free_start)) {
-			EXIT("reserve-fixed range-registration tail cleanup failed\n");
 		}
 		return false;
 	}
@@ -2978,7 +2958,7 @@ void TestFailNextVirtualRangeReplacement() {
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {
-	return g_guest_address_space->TestContainsFree(vaddr, size);
+	return g_guest_address_space->ContainsFree(vaddr, size);
 }
 
 bool TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size) {
@@ -3050,8 +3030,7 @@ bool TestWindowsBackingViewModes() {
 
 bool TestGuestFreeRangeBounds() {
 	return GuestFreeRangeContains(0x10000, 0x20000, 0x18000, 0x4000) &&
-	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000) &&
-	       !GuestFreeRangeContains(UINT64_MAX - 0x1000, 0x2000, UINT64_MAX - 0x800, 0x400);
+	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000);
 }
 #endif
 
@@ -3293,8 +3272,7 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

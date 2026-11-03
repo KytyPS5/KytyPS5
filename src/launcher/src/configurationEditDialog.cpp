@@ -314,6 +314,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_pro->setChecked(info.pro_enabled);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -546,6 +547,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 	info.pro_enabled               = ui.checkBox_pro->isChecked();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif

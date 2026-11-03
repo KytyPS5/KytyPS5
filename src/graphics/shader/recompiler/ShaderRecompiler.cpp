@@ -504,8 +504,11 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code,
-		                                             source.wave_size, crossed_calls);
+		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code,
+		                                                  source.wave_size, crossed_calls);
+		// Several reaching definitions select the value on the GPU, so no SRT walk evaluates it.
+		if (!definition) return Value(&block.AppendNewInst(ValueOpcode::UndefU32));
+		const auto index = *definition;
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
@@ -754,13 +757,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
 				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
 		}
-	}
-	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u\n",
-		     static_cast<unsigned>(options.stage));
 	}
 
 	const auto* stage        = StageName(options.stage);

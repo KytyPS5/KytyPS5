@@ -21,16 +21,6 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	};
 }
 
-const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
-	switch (index) {
-		case 0: return inst.src0;
-		case 1: return inst.src1;
-		case 2: return inst.src2;
-		case 3: return inst.src3;
-		default: EXIT("decoded source operand index is out of range");
-	}
-}
-
 Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst) {
 	auto destination = inst.dst;
 	if (destination.kind != Decoder::OperandKind::Vgpr) {
@@ -1033,8 +1023,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
-	result.cfg_failure_kind    = cfg.failure_kind;
-	result.fallback_reason     = cfg.unsupported_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
@@ -1252,10 +1240,24 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// Instance IDs exclude the start instance, which shaders add from user data.
+			// Instance IDs exclude the start instance, which shaders add from user data. An
+			// indirect record's bases reach only the user SGPRs its packet patches; NGG user
+			// SGPRs start at s8.
+			const bool  indirect = options.input_info.vertex->indirect_draw;
+			const auto& offsets  = options.input_info.vertex->indirect_offsets;
+			for (const auto [slot, parameter]:
+			     {std::pair {offsets.vertex, 1u},
+			      std::pair {offsets.instance, IR::PushData::MeshDrawDwordCount}}) {
+				if (indirect && 8u + slot < options.user_data_count) {
+					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(8u + slot), draw(parameter));
+				}
+			}
+			const auto vertex_index = [&](IR::U32 index) {
+				return indirect ? index : entry_ir.IAdd(draw(1), index);
+			};
 			if (mesh.fast_launch) {
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), vertex_index(group));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
 				                      builtin(IR::StageInputKind::WorkgroupId, 1));
 			} else {
@@ -1305,7 +1307,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
 				     entry_ir.IMul(index_bytes, u32(8))}));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
+				                      vertex_index(entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
 				                      builtin(IR::StageInputKind::WorkgroupId, 1));
 			}

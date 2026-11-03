@@ -51,8 +51,12 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
     {0x20u, Opcode::BUFFER_LOAD_UBYTE_D16, 1, 8},
+    {0x21u, Opcode::BUFFER_LOAD_UBYTE_D16_HI, 1, 8},
+    {0x22u, Opcode::BUFFER_LOAD_SBYTE_D16, 1, 8, true},
+    {0x23u, Opcode::BUFFER_LOAD_SBYTE_D16_HI, 1, 8, true},
     {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
     {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
+    {0x26u, Opcode::BUFFER_LOAD_FORMAT_D16_HI_X, 1, 16, false, false, true},
     {0x27u, Opcode::BUFFER_STORE_FORMAT_D16_HI_X, 1, 16, false, false, true},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
     {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
@@ -335,15 +339,18 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	if (inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
-	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
-	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
-		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ? 5u : 4u;
-	} else if (inst.opcode == Opcode::BUFFER_STORE_BYTE_D16_HI) {
-		inst.dst.sdwa_sel = 2u;
-	} else if (inst.opcode == Opcode::BUFFER_STORE_SHORT_D16_HI ||
-	           inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_HI_X) {
-		inst.dst.sdwa_sel = 5u;
+	switch (inst.opcode) {
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16: inst.dst.sdwa_sel = 4u; break;
+		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
+		case Opcode::BUFFER_STORE_SHORT_D16_HI:
+		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X: inst.dst.sdwa_sel = 5u; break;
+		case Opcode::BUFFER_STORE_BYTE_D16_HI: inst.dst.sdwa_sel = 2u; break;
+		default: break;
 	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);

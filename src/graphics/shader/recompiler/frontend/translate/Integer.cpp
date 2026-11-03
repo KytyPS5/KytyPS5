@@ -50,10 +50,11 @@ void Translator::PackedInteger16Shift(const Decoder::Instruction& inst, IR::Valu
 	             PackU16Lanes(translate_lane(false), translate_lane(true)));
 }
 
-void Translator::PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+void Translator::PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                       bool sign) {
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadU16LaneAsU32(inst.src0, high, false);
-		const auto rhs = ReadU16LaneAsU32(inst.src1, high, false);
+		const auto lhs = ReadU16LaneAsU32(inst.src0, high, sign);
+		const auto rhs = ReadU16LaneAsU32(inst.src1, high, sign);
 		return IR::U32(ir.Emit(opcode, {lhs, rhs}));
 	};
 	WriteOperand(DestinationOperand(inst),
@@ -65,17 +66,6 @@ void Translator::PackedInteger16Mad(const Decoder::Instruction& inst, bool sign)
 		const auto lhs = ReadU16LaneAsU32(inst.src0, high, false);
 		const auto rhs = ReadU16LaneAsU32(inst.src1, high, false);
 		return ir.IAdd(ir.IMul(lhs, rhs), ReadU16LaneAsU32(inst.src2, high, sign));
-	};
-	WriteOperand(DestinationOperand(inst),
-	             PackU16Lanes(translate_lane(false), translate_lane(true)));
-}
-
-void Translator::PackedInteger16MinMax(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
-                                       bool sign) {
-	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadU16LaneAsU32(inst.src0, high, sign);
-		const auto rhs = ReadU16LaneAsU32(inst.src1, high, sign);
-		return IR::U32(ir.Emit(opcode, {lhs, rhs}));
 	};
 	WriteOperand(DestinationOperand(inst),
 	             PackU16Lanes(translate_lane(false), translate_lane(true)));
@@ -206,22 +196,16 @@ void Translator::ComposedIntegerBinary(const Decoder::Instruction& inst, IR::Val
 	}
 }
 
-void Translator::V_AND_OR_B32(const Decoder::Instruction& inst) {
-	const auto result =
-	    ir.BitwiseOr(ir.BitwiseAnd(ReadU32(inst.src0), ReadU32(inst.src1)), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::V_OR3_B32(const Decoder::Instruction& inst) {
-	const auto result =
-	    ir.BitwiseOr(ir.BitwiseOr(ReadU32(inst.src0), ReadU32(inst.src1)), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::V_XOR3_B32(const Decoder::Instruction& inst) {
-	const auto result =
-	    ir.BitwiseXor(ir.BitwiseXor(ReadU32(inst.src0), ReadU32(inst.src1)), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
+void Translator::Integer3(const Decoder::Instruction& inst, IR::ValueOpcode inner,
+                          IR::ValueOpcode outer) {
+	// Shift counts use their low five bits.
+	const auto source = [&](const Decoder::Operand& operand, IR::ValueOpcode opcode) {
+		const auto value = ReadU32(operand);
+		if (opcode != IR::ValueOpcode::ShiftLeftLogical32) return value;
+		return ir.BitwiseAnd(value, IR::U32(IR::Value(31u)));
+	};
+	const auto value = ir.Emit(inner, {ReadU32(inst.src0), source(inst.src1, inner)});
+	WriteOperand(DestinationOperand(inst), ir.Emit(outer, {value, source(inst.src2, outer)}));
 }
 
 void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb,
@@ -309,12 +293,6 @@ void Translator::V_SAD_U32(const Decoder::Instruction& inst) {
 	const auto lo     = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {lhs, rhs}));
 	const auto hi     = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {lhs, rhs}));
 	const auto result = ir.IAdd(ir.ISub(hi, lo), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::V_ADD3_U32(const Decoder::Instruction& inst) {
-	const auto result =
-	    ir.IAdd(ir.IAdd(ReadU32(inst.src0), ReadU32(inst.src1)), ReadU32(inst.src2));
 	WriteOperand(DestinationOperand(inst), result);
 }
 
@@ -512,39 +490,10 @@ void Translator::V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset)
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(lo_part, hi_part));
 }
 
-void Translator::V_LSHL_ADD_U32(const Decoder::Instruction& inst) {
-	const auto shift  = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
-	const auto result = ir.IAdd(ir.ShiftLeftLogical(ReadU32(inst.src0), shift), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::V_ADD_LSHL_U32(const Decoder::Instruction& inst) {
-	const auto shift  = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(31u)));
-	const auto result = ir.ShiftLeftLogical(ir.IAdd(ReadU32(inst.src0), ReadU32(inst.src1)), shift);
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::V_XAD_U32(const Decoder::Instruction& inst) {
-	const auto result =
-	    ir.IAdd(ir.BitwiseXor(ReadU32(inst.src0), ReadU32(inst.src1)), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::V_LSHL_OR_B32(const Decoder::Instruction& inst) {
-	const auto shift = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
-	const auto result =
-	    ir.BitwiseOr(ir.ShiftLeftLogical(ReadU32(inst.src0), shift), ReadU32(inst.src2));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
 void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
-	Decoder::Operand mask_operand;
-	mask_operand.kind = Decoder::OperandKind::VccLo;
-	if (inst.src_count >= 3u) {
-		mask_operand = inst.src2;
-	}
-	const auto condition = ReadMask(mask_operand);
-	IR::Value  result;
+	const auto condition =
+	    ReadMask(inst.src_count >= 3u ? inst.src2 : ConditionOperand(Decoder::OperandKind::VccLo));
+	IR::Value result;
 	if (inst.src0.negate || inst.src0.absolute || inst.src1.negate || inst.src1.absolute) {
 		result =
 		    ir.Emit(IR::ValueOpcode::SelectF32, {condition, ReadOperand(inst.src1, IR::Type::F32),

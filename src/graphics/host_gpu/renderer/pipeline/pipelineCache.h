@@ -123,6 +123,8 @@ struct ShaderModule {
 	std::vector<vk::Format>                      vertex_formats;
 	// Rectangle-list PS: the parameters it reads.
 	std::vector<RectListParameter>               rect_parameters;
+	// Indirect mesh draw: a task shader reads the records and launches the groups.
+	bool                                         mesh_task = false;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -183,6 +185,8 @@ public:
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
+		// The push constant range's stages, which every update names.
+		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
 	};
@@ -262,7 +266,7 @@ private:
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);
-	bool LoadRecord(std::span<const uint8_t>& records, std::vector<GraphicsPipelineKey>& pipelines);
+	bool LoadRecord(std::span<const uint8_t>& records);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);

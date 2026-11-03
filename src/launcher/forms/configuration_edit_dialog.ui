@@ -256,8 +256,8 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable experimental Pro mode for supported titles. PSSR uses linear scaling. Disabled by default.</string></property>
-              <property name="text"><string>Pro mode (experimental)</string></property>
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
              </widget>
             </item>
             <item>
@@ -303,6 +303,12 @@
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
               <property name="text"><string>AMD CPU patch (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_guest_tsc">
+              <property name="toolTip"><string>Run the CPU time stamp counter (TSC) at the PS5's 1.6 GHz instead of the host rate. Fixes games that run too fast.</string></property>
+              <property name="text"><string>PS5 TSC rate (experimental)</string></property>
              </widget>
             </item>
             <item>

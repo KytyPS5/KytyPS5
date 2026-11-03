@@ -364,8 +364,8 @@ IR::F32 Translator::ApplyF32ResultModifiers(const Decoder::Operand& operand, IR:
 			case 2u: multiplier = 4.0f; break;
 			default: break;
 		}
-		value = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(multiplier)}));
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {value, IR::Value::F32(0.0f)}));
+		value = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(multiplier)}));
 	}
 	if (operand.clamp) {
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPSaturate32, {value}));

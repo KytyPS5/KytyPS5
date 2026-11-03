@@ -282,6 +282,18 @@ struct TextureCacheTestAccess {
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
 
+  static void SetGcTick(TextureCache &cache, uint64_t tick) { cache.m_gc_tick = tick; }
+
+  // A freed image may stay allocated until the GPU is done with it, but it is no longer
+  // registered for lookups.
+  static bool IsImageRegistered(const TextureCache &cache, ImageId id) {
+    return cache.m_slot_images.is_allocated(id) && cache.m_slot_images[id].registered;
+  }
+
+  static bool AccessedLongAgo(const TextureCache &cache, const Image &image) {
+    return cache.AccessedLongAgo(image);
+  }
+
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
@@ -6060,11 +6072,18 @@ public:
               ImageHeapTestAccess::ImageOf(heap, filtered.slots[table_size / 4u]) == added,
               "a table grown again after shrinking missed its descriptor");
 
+      // One frame past the last access, so only the release itself can have stamped it. A larger
+      // jump would make the later collector runs treat every image as old.
+      TextureCacheTestAccess::SetGcTick(textures, TextureCacheTestAccess::GcTick(textures) + 1u);
       heap.UnmapMemory(table, table_size);
       Require(name, "unmapped table",
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "unmapping the table kept its images pinned");
+      Require(name, "release stamps the frame",
+              textures.GetImage(resident).gc_tick_accessed_last ==
+                  TextureCacheTestAccess::GcTick(textures),
+              "releasing a heap reference did not record the frame of the use");
       // A smaller table enters once a second draw acquires it and leaves at the suspend point
       // after a frame that did not acquire it. Larger tables stay.
       const IR::ImageHeapRequest small_request{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
@@ -12640,7 +12659,7 @@ public:
   };
 
   // Allocates, maps and registers guest memory with the GPU caches.
-  void MapCadenceMemory(CadenceFixture &fixture, CadenceMemory &memory) {
+  void MapCadenceMemory(RenderContext &context, CadenceMemory &memory) {
     Require(CadenceTestName, "memory allocate",
             LibKernel::Memory::KernelAllocateDirectMemory(
                 0, LibKernel::Memory::KernelGetDirectMemorySize(), memory.size, memory.size, 0,
@@ -12658,13 +12677,13 @@ public:
     Require(CadenceTestName, "memory fill",
             LibKernel::Memory::TryWriteBacking(memory.base, initial.data(), memory.size),
             "cadence memory could not be filled");
-    fixture.context.MapMemory(memory.base, memory.size);
+    context.MapMemory(memory.base, memory.size);
   }
 
   // Drains the GPU before the memory goes away.
-  void UnmapCadenceMemory(CadenceFixture &fixture, const CadenceMemory &memory) {
-    fixture.scheduler.Finish();
-    fixture.context.UnmapMemory(memory.base, memory.size);
+  void UnmapCadenceMemory(RenderContext &context, const CadenceMemory &memory) {
+    context.GetCommandScheduler().Finish();
+    context.UnmapMemory(memory.base, memory.size);
     Require(CadenceTestName, "memory release",
             LibKernel::Memory::KernelCheckedReleaseDirectMemory(memory.physical, memory.size) == 0,
             "cadence memory release failed");
@@ -12747,7 +12766,7 @@ public:
                       {.type = Prospero::ShaderBinaryType::kCs,
                        .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
     CadenceMemory memory{base, CadenceMemorySize};
-    MapCadenceMemory(fixture, memory);
+    MapCadenceMemory(fixture.context, memory);
     SelectCadenceShader(fixture.processor, reinterpret_cast<uint64_t>(code.data()),
                         CadenceDescriptorDwords);
     const auto off = RunCadenceReadModifyWrite(fixture, base, false);
@@ -12763,7 +12782,7 @@ public:
                 " held back=" + std::to_string(on.second.held_back));
     Require(CadenceTestName, "T4 splitting changes no word", on.first == off.first,
             "the words differ between the split and the unsplit run");
-    UnmapCadenceMemory(fixture, memory);
+    UnmapCadenceMemory(fixture.context, memory);
     SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
   }
 
@@ -12917,7 +12936,7 @@ public:
     constexpr std::array<float, 4> second_color{0.0f, 0.0f, 1.0f, 1.0f};
     constexpr uintptr_t base = 0x0000000205000000ull;
     CadenceMemory memory{base, CadenceMemorySize};
-    MapCadenceMemory(fixture, memory);
+    MapCadenceMemory(fixture.context, memory);
     const auto vertex = CadenceTriangleVertexShader();
     static ShaderUserData vertex_user_data{};
     const auto vertex_address = reinterpret_cast<uint64_t>(vertex.data());
@@ -12936,7 +12955,7 @@ public:
         RunCadenceDraws(fixture, base + CadenceSecondRegion, true, pixel_shaders, extent);
     CheckCadenceRenderPassResults(unsplit, split, first_color, second_color, extent,
                                   pixel_shaders.size());
-    UnmapCadenceMemory(fixture, memory);
+    UnmapCadenceMemory(fixture.context, memory);
     SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
   }
 
@@ -12971,6 +12990,159 @@ public:
             "the baseline did not draw both regions");
     Require(CadenceTestName, "T5 a split pass keeps the first draw", split.pixels == unsplit.pixels,
             "the pixels changed when the pass was split");
+  }
+
+  // A small linear float colour target at the address, which the texture cache can create.
+  static RenderColorInfo CadenceAgeTarget(uint64_t address) {
+    constexpr u32 extent = 16;
+    constexpr u32 bytes_per_texel = 16;
+    RenderColorInfo color{};
+    color.desc.type = BindingType::RenderTarget;
+    color.desc.info.data = {address, extent * extent * bytes_per_texel};
+    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent,
+                                     0, color.desc.info.data.size, extent};
+    color.desc.info.tiling.block.bytes_per_element = bytes_per_texel;
+    color.desc.info.linear_slice_stride = color.desc.info.data.size;
+    color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+    color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+    color.desc.info.extent = {extent, extent, 1};
+    color.desc.info.pitch = extent;
+    color.desc.info.bytes_per_block = bytes_per_texel;
+    color.desc.view_info.format = color.desc.info.pixel_format;
+    color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    return color;
+  }
+
+  // Turns the submit cadence on or off for the case, due at once.
+  static void SetCadenceEnabled(CommandScheduler &scheduler, bool enabled) {
+    CommandSchedulerTestAccess::SetCadence(
+        scheduler, SubmitCadence(enabled, SubmitCadence::Clock::duration::zero()));
+  }
+
+  // T7. A cached image may only be replaced after it went unused for a while. Without the submit
+  // cadence that is more than 32 scheduler ticks, as before. With it, the submits are far more
+  // frequent than frames, so the age counts frames instead, and more than 3 of them. The two
+  // thresholds repeat the constants in textureCache.cpp.
+  void CheckCadenceTextureAge() {
+    constexpr const char *name = "GpuSubmitCadenceTextureAge";
+    constexpr uintptr_t base = 0x0000000205100000ull;
+    constexpr uint64_t tick_threshold = 32;
+    constexpr uint64_t frame_threshold = 3;
+    constexpr u32 many_submits = 40;
+    constexpr u32 frames_before_access = 5;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(context, memory);
+    auto &cache = context.GetTextureCache();
+    // Frames pass first, so a stamp that was never written would not match the frame count. Five
+    // collector ticks cannot evict the images made next. The collector's age is min(16, tick),
+    // which is the tick itself here, so its cutoff is tick zero and no image is older than that.
+    for (u32 i = 0; i < frames_before_access; ++i) {
+      cache.RunGarbageCollector();
+    }
+    auto color = CadenceAgeTarget(base);
+    color.image_id = cache.FindImage(color.desc);
+    // Two more images for the replacement case, which frees what it replaces. They are made
+    // alike at the same time, so the two runs of the case differ only in the flag.
+    auto kept = CadenceAgeTarget(base + CadenceSecondRegion);
+    kept.image_id = cache.FindImage(kept.desc);
+    auto freed = CadenceAgeTarget(base + 2 * CadenceSecondRegion);
+    freed.image_id = cache.FindImage(freed.desc);
+    auto &image = cache.GetImage(color.image_id);
+    Require(name, "access stamps both clocks",
+            image.gc_tick_accessed_last == TextureCacheTestAccess::GcTick(cache) &&
+                image.tick_accessed_last == scheduler.CurrentTick(),
+            "an access did not record the frame and the tick");
+    // Many submits, and no frame at all.
+    for (u32 i = 0; i < many_submits; ++i) {
+      scheduler.Flush();
+    }
+    Require(name, "the submits outran the tick threshold",
+            scheduler.CurrentTick() - image.tick_accessed_last > tick_threshold,
+            "the fixture did not submit enough");
+    CheckCadenceTextureSubmits(name, cache, image, scheduler);
+    CheckCadenceTextureReplacement(name, cache, scheduler, kept, freed);
+    CheckCadenceTextureFrames(name, cache, image, scheduler, frame_threshold);
+    CheckCadenceTextureTicks(name, cache, image, scheduler, tick_threshold);
+    UnmapCadenceMemory(context, memory);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Many submits and no frame leave a recently used image alone with the flag on and make it
+  // stale by ticks with the flag off.
+  void CheckCadenceTextureSubmits(const char *name, TextureCache &cache,
+                                  const Libs::Graphics::Image &image, CommandScheduler &scheduler) {
+    SetCadenceEnabled(scheduler, true);
+    const bool on_after_submits = TextureCacheTestAccess::AccessedLongAgo(cache, image);
+    // Only the flag differs from the case above.
+    SetCadenceEnabled(scheduler, false);
+    const bool off_after_submits = TextureCacheTestAccess::AccessedLongAgo(cache, image);
+    Require(name, "flag on ignores submits", !on_after_submits,
+            "an image used this frame was called stale after many submits");
+    Require(name, "flag off still counts ticks", off_after_submits,
+            "the tick age no longer applies with the flag off");
+  }
+
+  // A request at the same address and block size but another mip layout replaces the cached
+  // image only when it counts as unused. With the flag on it was used this frame, so it stays.
+  // With it off, the many submits made it stale, so it is freed.
+  void CheckCadenceTextureReplacement(const char *name, TextureCache &cache,
+                                      CommandScheduler &scheduler, const RenderColorInfo &kept,
+                                      const RenderColorInfo &freed) {
+    const auto replace = [&](const RenderColorInfo &cached, bool enabled) {
+      auto request = CadenceAgeTarget(cached.desc.info.data.address);
+      // Twice the size at the same address is another backing with another mip layout.
+      request.desc.info.data.size *= 2;
+      request.desc.info.mip_layout[0].size = request.desc.info.data.size;
+      request.desc.info.mip_layout[0].linear_size = request.desc.info.data.size;
+      SetCadenceEnabled(scheduler, enabled);
+      (void)cache.FindImage(request.desc);
+      return TextureCacheTestAccess::IsImageRegistered(cache, cached.image_id);
+    };
+    const bool kept_with_flag = replace(kept, true);
+    // Only the flag differs from the request above.
+    const bool kept_without_flag = replace(freed, false);
+    Require(name, "flag on keeps a recently used image", kept_with_flag,
+            "a replacing request freed an image used this frame");
+    Require(name, "flag off frees by ticks", !kept_without_flag,
+            "a replacing request kept an image that the tick age had made stale");
+  }
+
+  // The frame boundary with the flag on. One and two frames, and the threshold itself, are not
+  // stale, and one frame past it is.
+  void CheckCadenceTextureFrames(const char *name, TextureCache &cache,
+                                 const Libs::Graphics::Image &image, CommandScheduler &scheduler,
+                                 uint64_t frame_threshold) {
+    SetCadenceEnabled(scheduler, true);
+    for (uint64_t frame = 1; frame <= frame_threshold + 1; ++frame) {
+      cache.RunGarbageCollector();
+      Require(name, "flag on frame boundary",
+              TextureCacheTestAccess::AccessedLongAgo(cache, image) == (frame > frame_threshold),
+              "the image was stale after " + std::to_string(frame) + " frames");
+    }
+  }
+
+  // The tick boundary with the flag off. The frames are already beyond their threshold, so only
+  // ticks can say not stale here.
+  void CheckCadenceTextureTicks(const char *name, TextureCache &cache,
+                                Libs::Graphics::Image &image, CommandScheduler &scheduler,
+                                uint64_t tick_threshold) {
+    SetCadenceEnabled(scheduler, false);
+    const auto tick = scheduler.CurrentTick();
+    image.tick_accessed_last = tick - tick_threshold;
+    Require(name, "flag off at the tick threshold",
+            !TextureCacheTestAccess::AccessedLongAgo(cache, image),
+            "the tick threshold changed with the flag off");
+    image.tick_accessed_last = tick - tick_threshold - 1;
+    Require(name, "flag off past the tick threshold",
+            TextureCacheTestAccess::AccessedLongAgo(cache, image),
+            "the tick threshold changed with the flag off");
   }
 
   // Creates the timeline semaphore that holds the GPU in the lag case.
@@ -55661,6 +55833,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-gpu-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuSubmitCadence();
+    vulkan.CheckCadenceTextureAge();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
@@ -56361,6 +56534,7 @@ int main(int argc, char **argv) {
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckGpuSubmitCadence();
+  vulkan.CheckCadenceTextureAge();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();
   vulkan.CheckNullTextureDescriptors();

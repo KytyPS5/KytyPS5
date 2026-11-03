@@ -45,6 +45,9 @@ public:
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	/// Tells the submit cadence that a draw or dispatch went into the current command buffer.
 	void NoteRecordedWork() { m_cadence.NoteWork(); }
+	/// Returns whether the submit cadence is on, which makes scheduler ticks much faster than
+	/// frames.
+	[[nodiscard]] bool SubmitCadenceEnabled() const noexcept { return m_cadence.Enabled(); }
 	/// Returns whether the PM4 loop should submit the current command buffer now. The inline gate
 	/// is one branch while nothing is due, so the GPU progress is read only after the time gate
 	/// passed.

@@ -33,7 +33,12 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Scheduler ticks. Each submit is a tick, so this was about two or three frames before the submit
+// cadence began to submit many times per frame.
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// With the submit cadence on, the age counts garbage collector ticks, which come once per frame
+// whatever the submit rate. Three keeps the protection of the 32 scheduler ticks above.
+constexpr uint64_t NumGcTicksBeforeRemoval = 3;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
@@ -741,6 +746,17 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+bool TextureCache::AccessedLongAgo(const Image& image) const {
+	if (m_scheduler.SubmitCadenceEnabled()) {
+		// The cadence submits many times per frame, so scheduler ticks no longer measure frames.
+		const uint64_t gc_tick = m_gc_tick;
+		return gc_tick - std::min(gc_tick, image.gc_tick_accessed_last) > NumGcTicksBeforeRemoval;
+	}
+	const auto current_tick = m_scheduler.CurrentTick();
+	return current_tick - std::min(current_tick, image.tick_accessed_last) >
+	       NumFramesBeforeRemoval;
+}
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -760,10 +776,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
-	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
+	    AccessedLongAgo(cached) && cached.heap_refs.load(std::memory_order_relaxed) == 0u;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1330,7 +1344,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
-		image.tick_accessed_last = m_scheduler.CurrentTick();
+		image.tick_accessed_last    = m_scheduler.CurrentTick();
+		image.gc_tick_accessed_last = m_gc_tick;
 		TouchImage(image);
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);

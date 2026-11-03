@@ -53578,6 +53578,92 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Device creation enables each optional extension the GPU has, and reports the features and
+// limits the GPU gives.
+void CheckDeviceCreation() {
+  constexpr const char *name = "DeviceCreation";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window = SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  const auto &graphics = window.graphic_ctx;
+  const auto extensions = graphics.physical_device.enumerateDeviceExtensionProperties().value;
+  const auto has = [&](std::string_view extension) {
+    return std::ranges::any_of(extensions, [&](const auto &properties) {
+      return extension == properties.extensionName.data();
+    });
+  };
+  const auto features = graphics.physical_device.getFeatures2<
+      vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceMaintenance8FeaturesKHR,
+      vk::PhysicalDeviceProvokingVertexFeaturesEXT,
+      vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
+      vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
+      vk::PhysicalDeviceShaderClockFeaturesKHR, vk::PhysicalDeviceMeshShaderFeaturesEXT,
+      vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
+      vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
+  const auto &mesh = features.get<vk::PhysicalDeviceMeshShaderFeaturesEXT>();
+  const bool feedback =
+      has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+      has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+  const auto properties = graphics.physical_device.getProperties2<
+      vk::PhysicalDeviceProperties2, vk::PhysicalDevicePushDescriptorProperties,
+      vk::PhysicalDeviceMeshShaderPropertiesEXT>();
+  const auto command = [&](const char *function) {
+    return graphics.device.getProcAddr(function) != nullptr;
+  };
+  const auto matches = [&](bool enabled, const char *extension, vk::Bool32 feature) {
+    return enabled == (has(extension) && feature);
+  };
+  Require(name, "extensions",
+          command("vkCmdBeginConditionalRenderingEXT") ==
+                  has(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) &&
+              command("vkCmdDrawMeshTasksEXT") == has(VK_EXT_MESH_SHADER_EXTENSION_NAME) &&
+              command("vkCmdSetAttachmentFeedbackLoopEnableEXT") == feedback &&
+              graphics.memory_budget_ext_enabled == has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME),
+          "an optional extension the GPU has was not enabled");
+  Require(name, "features",
+          matches(graphics.maintenance8_enabled, VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+                  features.get<vk::PhysicalDeviceMaintenance8FeaturesKHR>().maintenance8) &&
+              matches(graphics.provoking_vertex_last_enabled, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+                      features.get<vk::PhysicalDeviceProvokingVertexFeaturesEXT>()
+                          .provokingVertexLast) &&
+              matches(graphics.conditional_rendering_enabled,
+                      VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+                      features.get<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>()
+                          .conditionalRendering) &&
+              matches(graphics.shader_image_int64_atomics_enabled,
+                      VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+                      features.get<vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT>()
+                          .shaderImageInt64Atomics) &&
+              matches(graphics.device_clock_period_ps != 0u, VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
+                      features.get<vk::PhysicalDeviceShaderClockFeaturesKHR>().shaderDeviceClock) &&
+              matches(graphics.mesh_shader_enabled, VK_EXT_MESH_SHADER_EXTENSION_NAME,
+                      mesh.meshShader && mesh.taskShader) &&
+              graphics.attachment_feedback_loop_enabled ==
+                  (feedback &&
+                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
+                       .attachmentFeedbackLoopLayout &&
+                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
+                       .attachmentFeedbackLoopDynamicState),
+          "an enabled feature disagrees with the GPU");
+  Require(name, "limits",
+          graphics.max_push_descriptors ==
+                  properties.get<vk::PhysicalDevicePushDescriptorProperties>().maxPushDescriptors &&
+              graphics.physical_device_properties.deviceID ==
+                  properties.get<vk::PhysicalDeviceProperties2>().properties.deviceID &&
+              graphics.mesh_shader_properties.maxMeshOutputVertices ==
+                  (graphics.mesh_shader_enabled
+                       ? properties.get<vk::PhysicalDeviceMeshShaderPropertiesEXT>()
+                             .maxMeshOutputVertices
+                       : 0u),
+          "device properties were not recorded");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // R_FLIP itself publishes the dumped occlusion counters, then flips.
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
@@ -54718,6 +54804,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {
+    CheckDeviceCreation();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--video-out-only") == 0) {

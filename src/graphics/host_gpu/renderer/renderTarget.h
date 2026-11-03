@@ -13,8 +13,7 @@ static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
 struct RenderAttachment {
 	vk::ImageView           image_view    = nullptr;
 	vk::ImageLayout         image_layout  = vk::ImageLayout::eUndefined;
-	std::array<uint32_t, 4> clear_value   = {};
-	bool                    is_clear      = false;
+	std::array<uint32_t, 2> clear_value   = {};
 	bool                    has_depth     = false;
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;
@@ -48,22 +47,14 @@ struct RenderState {
 	}
 }
 
-enum class TargetViewType : uint8_t { Image2D, Image2DArray, Unsupported };
-
 struct TargetViewInfo {
-	TargetViewType type         = TargetViewType::Unsupported;
-	uint32_t       base_layer   = 0;
-	uint32_t       layer_count  = 0;
-	uint32_t       image_layers = 0;
+	uint32_t base_layer   = 0;
+	uint32_t layer_count  = 0;
+	uint32_t image_layers = 0;
 };
 
-inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint32_t last_layer,
-                                                      uint32_t draw_layer_offset = 0) {
-	if (base_layer > last_layer || draw_layer_offset != 0) {
-		return {};
-	}
-	return {base_layer == last_layer ? TargetViewType::Image2D : TargetViewType::Image2DArray,
-	        base_layer, last_layer - base_layer + 1u, last_layer + 1u};
+inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint32_t last_layer) {
+	return {base_layer, last_layer - base_layer + 1u, last_layer + 1u};
 }
 
 } // namespace Libs::Graphics

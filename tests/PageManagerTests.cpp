@@ -234,7 +234,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
 void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
   g_protection_calls = 0;
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2, PAGE_READWRITE, base);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -250,7 +250,7 @@ void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
 
 void TestSharedWatcherCounts() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -266,7 +266,7 @@ void TestSharedWatcherCounts() {
 
 void TestCrossRegionRange() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   auto *memory = Allocate(region_size * 2);
   const auto base = reinterpret_cast<uint64_t>(memory);
@@ -304,7 +304,7 @@ void TestCrossRegionRange() {
 
 void TestBatchedWatcherRanges() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   constexpr uint64_t allocation_size = region_size * 3;
   auto *memory = Allocate(allocation_size);
@@ -584,7 +584,7 @@ void TestConcurrentSharedWatchers() {
 
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   if (std::strcmp(name, "invalid-range") == 0) {
     manager.UpdatePageWatchers<true>((1ull << 40u) - 1, 2);
   } else if (std::strcmp(name, "unknown-untrack") == 0) {

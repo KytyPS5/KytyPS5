@@ -148,12 +148,18 @@ void EnsureSampler() {
 }
 
 ImU32 FrameTimeColor(double ms) {
-	return ms <= FRAME_TIME_GOOD ? GOOD : ms <= FRAME_TIME_MEDIUM ? MEDIUM : BAD;
+	if (ms <= FRAME_TIME_GOOD) {
+		return GOOD;
+	}
+	return ms <= FRAME_TIME_MEDIUM ? MEDIUM : BAD;
 }
 
 // Green below `warn`, yellow below `bad`, red above.
 ImU32 LevelColor(double value, double warn, double bad) {
-	return value < warn ? GOOD : value < bad ? MEDIUM : BAD;
+	if (value < warn) {
+		return GOOD;
+	}
+	return value < bad ? MEDIUM : BAD;
 }
 
 ImVec4 Color(ImU32 color) {
@@ -459,14 +465,18 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 	}
 }
 
+std::string GpuName(const Common::HostStats& host, const GraphicContext& graphics) {
+	if (host.gpu_model.empty()) {
+		return graphics.GetPhysicalDeviceProperties().deviceName.data();
+	}
+	return host.gpu_cores ? Fmt("%s (%u cores)", host.gpu_model.c_str(), *host.gpu_cores)
+	                      : host.gpu_model;
+}
+
 void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 	const auto& host = shown.host;
 	if (BeginSection("GPU")) {
-		Row("Device", host.gpu_model.empty()
-		                  ? std::string(graphics.GetPhysicalDeviceProperties().deviceName.data())
-		              : host.gpu_cores
-		                  ? Fmt("%s (%u cores)", host.gpu_model.c_str(), *host.gpu_cores)
-		                  : host.gpu_model);
+		Row("Device", GpuName(host, graphics));
 		Row("Utilization", Percent(host.gpu_percent),
 		    host.gpu_percent ? std::optional(LevelColor(*host.gpu_percent, 80, 95)) : std::nullopt);
 		if (host.gpu_renderer_percent || host.gpu_tiler_percent) {

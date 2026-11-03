@@ -129,7 +129,6 @@ template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
 	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
-	// Against a normal, infinite or NaN immediate a denormal compares like a zero.
 	const auto nonzero_immediate = [&](size_t index) {
 		const auto value = inst.Arg(index);
 		return value.IsImmediate() &&
@@ -243,6 +242,7 @@ uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& i
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -345,6 +345,9 @@ inline constexpr auto EmitDataConsume           = EmitAppendConsume;
 uint32_t              EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

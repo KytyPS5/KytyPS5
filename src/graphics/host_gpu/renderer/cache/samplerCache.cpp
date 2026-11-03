@@ -15,8 +15,6 @@ SamplerCache::~SamplerCache() {
 }
 
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
-	Common::LockGuard lock(m_mutex);
-
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;

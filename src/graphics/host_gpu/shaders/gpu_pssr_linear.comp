@@ -1,0 +1,33 @@
+#version 450 core
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform texture2D source;
+layout(binding = 1) writeonly uniform image2D destination;
+layout(push_constant) uniform Parameters {
+	uvec2 input_size;
+	uvec2 output_size;
+	uvec4 output_channels;
+} parameters;
+
+vec4 fetch_color(ivec2 coordinate) {
+	return texelFetch(source, clamp(coordinate, ivec2(0), ivec2(parameters.input_size) - 1), 0);
+}
+
+void main() {
+	uvec2 output_coordinate = gl_GlobalInvocationID.xy;
+	if (any(greaterThanEqual(output_coordinate, parameters.output_size))) return;
+	vec2 input_coordinate = (vec2(output_coordinate) + 0.5) *
+	                        vec2(parameters.input_size) / vec2(parameters.output_size) - 0.5;
+	ivec2 lower = ivec2(floor(input_coordinate));
+	vec2 weight = fract(input_coordinate);
+	vec4 color = mix(mix(fetch_color(lower), fetch_color(lower + ivec2(1, 0)), weight.x),
+	                 mix(fetch_color(lower + ivec2(0, 1)), fetch_color(lower + ivec2(1, 1)), weight.x),
+	                 weight.y);
+	vec4 stored = vec4(0.0);
+	for (uint channel = 0; channel < 3; ++channel) {
+		uint selected = parameters.output_channels[channel];
+		if (selected < 4) stored[channel] = color[selected];
+	}
+	imageStore(destination, ivec2(output_coordinate), stored);
+}

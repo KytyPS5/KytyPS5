@@ -11,7 +11,6 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
                           uint64_t& accessible_size);
 bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t& readable_size);
 bool HostMemoryIsReadable(uint64_t addr);
-bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size);
 
 } // namespace Libs::Graphics
 

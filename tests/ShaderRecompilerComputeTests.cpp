@@ -345,6 +345,12 @@ struct TextureCacheTestAccess {
     return cache.InsertImage(info);
   }
 
+  // Starts write tracking for an image the way a refresh would.
+  static void TrackImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.TrackImage(id);
+  }
+
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
@@ -3138,6 +3144,223 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A cached guest range with an image over it, used by the bulk invalidation checks.
+  struct BulkRange {
+    uint64_t address = 0;
+    ImageId image{};
+  };
+
+  // Results of writing one range with a plain host write and an identical one through the cache.
+  struct BulkRun {
+    BulkRange baseline;
+    BulkRange tested;
+    uint64_t baseline_faults = 0;
+    uint64_t tested_faults = 0;
+  };
+
+  static constexpr uint64_t BulkPages = 8;
+  static constexpr uint64_t BulkSize = BulkPages * TRACKER_PAGE_SIZE;
+
+  // Caches a range clean with a tracked image over all of it. The caller fills it with a
+  // sentinel first, because writing next to cached ranges could invalidate them.
+  BulkRange PrepareBulkRange(RenderContext &resources, auto &gpu, uint64_t address) {
+    auto &texture_cache = resources.GetTextureCache();
+    ImageInfo info{};
+    info.data = {address, BulkSize};
+    info.extent = {1, 1, 1};
+    info.resources = {1, 1};
+    info.samples = 1;
+    BulkRange range{address, TextureCacheTestAccess::InsertImage(texture_cache, info)};
+    TextureCacheTestAccess::TrackImage(texture_cache, range.image);
+    // A new image starts CPU dirty until its first upload. Complete that refresh so the later
+    // CPU dirty state can only come from the write under test.
+    texture_cache.GetImage(range.image).RefreshComplete();
+    gpu.SendCommandSync([&] {
+      (void)resources.GetBufferCache().ObtainBuffer(address, BulkSize, false);
+    });
+    gpu.WaitForIdle();
+    return range;
+  }
+
+  // Must run on the GPU thread. Faults before the write would be hidden by pages that are
+  // already unprotected, so the setup is checked rather than assumed.
+  bool IsBulkRangeClean(RenderContext &resources, const BulkRange &range) {
+    auto &buffer_cache = resources.GetBufferCache();
+    const auto &image = resources.GetTextureCache().GetImage(range.image);
+    return buffer_cache.IsRegionRegistered(range.address, BulkSize) &&
+           !buffer_cache.IsRegionCpuModified(range.address, BulkSize) &&
+           !buffer_cache.IsRegionGpuModified(range.address, BulkSize) &&
+           !buffer_cache.HasGpuDirtyBytes(range.address, BulkSize) &&
+           image.IsTracked() && !image.IsCpuDirty();
+  }
+
+  // Checks the cache state a CPU write must leave behind, whichever way it was made. Words
+  // are first + stride * index. The GPU copy is read back through GDS to prove it was refreshed.
+  void CheckBulkWriteOutcome(const char *operation, RenderContext &resources,
+                             auto &gpu, const BulkRun &run, uint64_t readback,
+                             uint32_t first, uint32_t stride) {
+    const std::string label = std::string("bulk ") + operation + " ";
+    auto &buffer_cache = resources.GetBufferCache();
+    const auto &baseline_image = resources.GetTextureCache().GetImage(run.baseline.image);
+    const auto &tested_image = resources.GetTextureCache().GetImage(run.tested.image);
+    Require("GpuCommandLane", (label + "baseline faults").c_str(),
+            run.baseline_faults == BulkPages,
+            "a plain host write faulted " + std::to_string(run.baseline_faults) +
+                " times, expected " + std::to_string(BulkPages));
+    Require("GpuCommandLane", (label + "tested faults").c_str(), run.tested_faults == 0,
+            "the cache write faulted " + std::to_string(run.tested_faults) + " times");
+    std::vector<uint32_t> expected(BulkSize / sizeof(uint32_t));
+    for (size_t index = 0; index < expected.size(); ++index) {
+      expected[index] = first + stride * static_cast<uint32_t>(index);
+    }
+    Require("GpuCommandLane", (label + "host bytes").c_str(),
+            std::memcmp(reinterpret_cast<const void *>(run.tested.address),
+                        expected.data(), BulkSize) == 0 &&
+                std::memcmp(reinterpret_cast<const void *>(run.baseline.address),
+                            expected.data(), BulkSize) == 0,
+            "the cache write and the plain write left different bytes");
+    Require("GpuCommandLane", (label + "image dirty").c_str(),
+            baseline_image.IsDefinitelyCpuDirty() &&
+                tested_image.IsDefinitelyCpuDirty() && !tested_image.IsTracked(),
+            "the overlapping image was not invalidated like a faulting write");
+    gpu.SendCommandSync([&] {
+      Require("GpuCommandLane", (label + "buffer state").c_str(),
+              buffer_cache.IsRegionCpuModified(run.tested.address, BulkSize) &&
+                  !buffer_cache.IsRegionGpuModified(run.tested.address, BulkSize) &&
+                  !buffer_cache.HasGpuDirtyBytes(run.tested.address, BulkSize),
+              "the cache write did not leave a CPU-modified, GPU-clean range");
+      constexpr uint64_t gds_offset = 0;
+      buffer_cache.CopyBuffer(gds_offset, run.tested.address, BulkSize, true, false);
+      buffer_cache.CopyBuffer(readback, gds_offset, BulkSize, false, true);
+    });
+    Require("GpuCommandLane", (label + "readback fault").c_str(),
+            resources.HandleFault(PageFaultAccess::Read, readback),
+            "the GPU copy readback was not published");
+    Require("GpuCommandLane", (label + "GPU copy").c_str(),
+            std::memcmp(reinterpret_cast<const void *>(readback), expected.data(),
+                        BulkSize) == 0,
+            "the cached GPU copy was not refreshed after the CPU write");
+  }
+
+  // Range slots of the bulk invalidation mapping, each BulkSize bytes.
+  static constexpr uint64_t BulkFillBaselineSlot = 0;
+  static constexpr uint64_t BulkFillTestedSlot = 1;
+  static constexpr uint64_t BulkCopySourceSlot = 2;
+  static constexpr uint64_t BulkCopyBaselineSlot = 3;
+  static constexpr uint64_t BulkCopyTestedSlot = 4;
+  static constexpr uint64_t BulkReadbackSlot = 5;
+  static constexpr uint64_t BulkTotalSize = 6 * BulkSize;
+  // The allocate and map calls also take this value as their alignment, which must be a power of
+  // two, so the mapping is larger than the ranges use.
+  static constexpr uint64_t BulkMapSize = 0x40000;
+  static_assert(BulkTotalSize <= BulkMapSize, "the bulk ranges must fit inside the mapping");
+
+  // Allocates and maps the guest memory for the bulk checks and installs the GPU resources.
+  int64_t MapBulkMemory(RenderContext &resources, uintptr_t base) {
+    int64_t direct_offset = -1;
+    Require("GpuCommandLane", "bulk invalidate direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                BulkMapSize, BulkMapSize, 0, &direct_offset) == 0,
+            "bulk invalidation direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require("GpuCommandLane", "bulk invalidate direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, BulkMapSize, 0x3, 0x10, direct_offset, BulkMapSize) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bulk invalidation fixed direct-memory mapping failed");
+    resources.MapMemory(base, BulkMapSize);
+    // Real write faults need the resources installed. Later checks install them themselves.
+    LibKernel::Memory::InstallGpuResources(&resources);
+    return direct_offset;
+  }
+
+  // Undoes MapBulkMemory and returns the direct memory to the pool.
+  void UnmapBulkMemory(RenderContext &resources, uintptr_t base, int64_t direct_offset) {
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    resources.UnmapMemory(base, BulkMapSize);
+    // Release the pool so later checks that expect the full direct pool still hold.
+    Require("GpuCommandLane", "bulk invalidate unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, BulkMapSize) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, BulkMapSize) == 0,
+            "bulk invalidation memory release failed");
+  }
+
+  // Caches two identical ranges, writes one with a host write and one through the cache, and
+  // checks both leave the same state. Only the cache write is expected to avoid faults.
+  void RunBulkCase(const char *operation, RenderContext &resources, auto &gpu,
+                   uint64_t baseline_address, uint64_t tested_address, uint64_t readback,
+                   uint32_t first, uint32_t stride, auto &&host_write, auto &&cache_write) {
+    const auto fault_count = [] {
+      return Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+    };
+    BulkRun run{PrepareBulkRange(resources, gpu, baseline_address),
+                PrepareBulkRange(resources, gpu, tested_address)};
+    gpu.SendCommandSync([&] {
+      Require("GpuCommandLane", "bulk baseline setup",
+              IsBulkRangeClean(resources, run.baseline),
+              "the baseline range was not clean, cached and tracked");
+    });
+    auto before = fault_count();
+    host_write(run.baseline.address);
+    run.baseline_faults = fault_count() - before;
+    before = fault_count();
+    // The check and the write share one command so nothing can unprotect the pages between.
+    gpu.SendCommandSync([&] {
+      Require("GpuCommandLane", "bulk tested setup",
+              IsBulkRangeClean(resources, run.tested),
+              "the tested range was not clean, cached and tracked");
+      cache_write(run.tested.address);
+    });
+    run.tested_faults = fault_count() - before;
+    CheckBulkWriteOutcome(operation, resources, gpu, run, readback, first, stride);
+    // Images outlive the checks otherwise and would keep their pages watched.
+    for (const auto &range : {run.baseline, run.tested}) {
+      TextureCacheTestAccess::DeleteImage(resources.GetTextureCache(), range.image);
+    }
+  }
+
+  // Compares per-page faulting with bulk invalidation for FillBuffer and CopyBuffer.
+  void CheckBulkInvalidateDma(RenderContext &resources, auto &gpu) {
+    constexpr uintptr_t base = 0x0000000200800000ull;
+    constexpr uint32_t fill_value = 0xcafef00du;
+    constexpr uint32_t sentinel = 0x0badf00du;
+    constexpr uint32_t source_first = 0x5a000000u;
+    constexpr size_t words = BulkSize / sizeof(uint32_t);
+    const auto slot = [](uint64_t index) { return base + index * BulkSize; };
+    const int64_t direct_offset = MapBulkMemory(resources, base);
+    const bool counters_were_enabled = Common::DebugCounters::Enabled();
+    Common::DebugCounters::SetEnabled(true);
+    // Everything is written before any range is cached so setup cannot fault or invalidate.
+    std::fill_n(reinterpret_cast<uint32_t *>(base), BulkTotalSize / sizeof(uint32_t), sentinel);
+    for (uint32_t index = 0; index < words; ++index) {
+      reinterpret_cast<uint32_t *>(slot(BulkCopySourceSlot))[index] = source_first + index;
+    }
+    auto &buffer_cache = resources.GetBufferCache();
+    RunBulkCase("fill", resources, gpu, slot(BulkFillBaselineSlot), slot(BulkFillTestedSlot),
+                slot(BulkReadbackSlot), fill_value, 0,
+                [&](uint64_t address) {
+                  std::fill_n(reinterpret_cast<uint32_t *>(address), words, fill_value);
+                },
+                [&](uint64_t address) {
+                  buffer_cache.FillBuffer(address, BulkSize, fill_value, false);
+                });
+    RunBulkCase("copy", resources, gpu, slot(BulkCopyBaselineSlot), slot(BulkCopyTestedSlot),
+                slot(BulkReadbackSlot), source_first, 1,
+                [&](uint64_t address) {
+                  std::memcpy(reinterpret_cast<void *>(address),
+                              reinterpret_cast<const void *>(slot(BulkCopySourceSlot)),
+                              BulkSize);
+                },
+                [&](uint64_t address) {
+                  buffer_cache.CopyBuffer(address, slot(BulkCopySourceSlot), BulkSize,
+                                          false, false);
+                });
+    Common::DebugCounters::SetEnabled(counters_were_enabled);
+    UnmapBulkMemory(resources, base, direct_offset);
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -3990,6 +4213,8 @@ public:
                                                           clean_copy_words[0],
                                                           clean_copy_words[1]},
             "host-memory fill/copy did not update the clean cached mirror");
+
+    CheckBulkInvalidateDma(resources, gpu);
 
     gpu.SendCommandSync([&] {
       Require("GpuCommandLane", "GPU memory invalidation",
@@ -22470,7 +22695,13 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              const bool handled =
+                  LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              if (handled) {
+                // Mirrors runtimeLinker so tests can count write-tracking faults.
+                Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+              }
+              return handled;
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;

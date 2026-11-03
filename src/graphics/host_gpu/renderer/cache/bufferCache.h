@@ -73,7 +73,12 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	/// Fills GDS or guest memory with a dword. Ranges the GPU has not modified are written on the
+	/// CPU after one bulk invalidation, others are filled on the GPU. GPU thread only.
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	/// Copies between GDS and guest memory. Memory to memory copies run on the CPU after one bulk
+	/// invalidation of the destination when neither range is GPU modified and the source backs no
+	/// cached image. Others are copied on the GPU. GPU thread only.
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

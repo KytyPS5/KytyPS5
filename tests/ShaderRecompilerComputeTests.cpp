@@ -341,7 +341,8 @@ struct TextureCacheTestAccess {
     size_t count = 0;
     for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
       const auto *owners = cache.m_image_page_table.Find(page);
-      count += owners != nullptr && owners->Contains(id) ? 1 : 0;
+      count += owners != nullptr &&
+               std::find(owners->begin(), owners->end(), id) != owners->end();
     }
     return count;
   }
@@ -2095,6 +2096,16 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 }
 
 } // namespace TestSpv
+
+// D16 depth as the D24 and D32 fallback attachments store it.
+constexpr u32 EncodeD16AsD24(uint16_t value) {
+  return static_cast<u32>(
+      (static_cast<uint64_t>(value) * 0x00ffffffu + 0x7fffu) / 0xffffu);
+}
+
+u32 EncodeD16AsD32(uint16_t value) {
+  return std::bit_cast<u32>(static_cast<float>(value) / 65535.0f);
+}
 
 class VulkanHarness {
 public:
@@ -6588,7 +6599,9 @@ public:
       Require(name, "overlap resolution",
               mip == 0 && subresource.SliceOf(chain, mip) == 0 &&
                   ImageRangeOverlaps(chain.data, subresource.data) &&
-                  ImagePageRangesOverlap(chain.data, subresource.data),
+                  ImagePageRangesOverlap(chain.data.address, chain.data.size,
+                                         subresource.data.address,
+                                         subresource.data.size),
               "captured PS5 atlas mip/slice overlap did not resolve");
 
       auto exact_desc = compatible_desc;
@@ -51716,29 +51729,28 @@ void CheckDepthTargetFootprints() {
   struct AttachmentFormatCase {
     const char *name;
     Prospero::DepthFormat depth_format;
-    Prospero::StencilFormat stencil_format;
+    bool has_stencil;
     vk::Format expected;
   };
   constexpr AttachmentFormatCase attachment_cases[] = {
-      {"Z16", Prospero::DepthFormat::kZ16, Prospero::StencilFormat::kInvalid,
-       vk::Format::eD16Unorm},
-      {"Z16S8", Prospero::DepthFormat::kZ16, Prospero::StencilFormat::k8UInt,
-       vk::Format::eD16UnormS8Uint},
-      {"Z32", Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::kInvalid,
-       vk::Format::eD32Sfloat},
-      {"Z32S8", Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::k8UInt,
+      {"Z16", Prospero::DepthFormat::kZ16, false, vk::Format::eD16Unorm},
+      {"Z16S8", Prospero::DepthFormat::kZ16, true, vk::Format::eD16UnormS8Uint},
+      {"Z32", Prospero::DepthFormat::kZ32F, false, vk::Format::eD32Sfloat},
+      {"Z32S8", Prospero::DepthFormat::kZ32F, true,
        vk::Format::eD32SfloatS8Uint},
-      {"invalid depth", static_cast<Prospero::DepthFormat>(2u),
-       Prospero::StencilFormat::k8UInt, vk::Format::eUndefined},
-      {"invalid stencil", Prospero::DepthFormat::kZ16,
-       static_cast<Prospero::StencilFormat>(2u), vk::Format::eUndefined},
   };
   for (const auto &test : attachment_cases) {
+    const auto *policy = FindDepthFormatPolicy(test.depth_format);
     Require("DepthTargetFootprints", test.name,
-            DepthAttachmentFormat(test.depth_format, test.stencil_format) ==
-                test.expected,
+            policy != nullptr &&
+                DepthAttachmentFormat(*policy, test.has_stencil) ==
+                    test.expected,
             "PS5 depth/stencil attachment mapping changed");
   }
+  Require("DepthTargetFootprints", "invalid depth",
+          FindDepthFormatPolicy(static_cast<Prospero::DepthFormat>(2u)) ==
+              nullptr,
+          "PS5 depth/stencil attachment mapping changed");
   Require("DepthTargetFootprints", "1920x1080 Z16S8 without HTile",
           TileGetDepthSize(1920, 1080, Prospero::DepthFormat::kZ16,
                            Prospero::StencilFormat::k8UInt, false, stencil,

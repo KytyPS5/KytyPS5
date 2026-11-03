@@ -60,7 +60,7 @@ public:
 		return bucket == nullptr ? nullptr : &(*bucket)[SecondLevelIndex(page)];
 	}
 
-	[[nodiscard]] Entry& GetOrCreate(size_t page) {
+	[[nodiscard]] Entry& operator[](size_t page) {
 		if (!IsValidPage(page)) {
 			EXIT("MultiLevelPageTable page is outside the guest address space");
 		}
@@ -71,8 +71,6 @@ public:
 		}
 		return (*bucket)[SecondLevelIndex(page)];
 	}
-
-	[[nodiscard]] Entry& operator[](size_t page) { return GetOrCreate(page); }
 
 	[[nodiscard]] static constexpr bool IsValidPage(size_t page) { return page < kPageCount; }
 
@@ -158,16 +156,6 @@ public:
 			std::copy_n(other.m_inline.begin(), m_inline_size, m_inline.begin());
 		}
 	}
-	InlinePageOwnerList& operator=(InlinePageOwnerList&& other) noexcept {
-		if (this != &other) {
-			m_overflow    = std::move(other.m_overflow);
-			m_inline_size = std::exchange(other.m_inline_size, 0);
-			if (m_overflow == nullptr) {
-				std::copy_n(other.m_inline.begin(), m_inline_size, m_inline.begin());
-			}
-		}
-		return *this;
-	}
 
 	[[nodiscard]] const_iterator begin() const noexcept { return {this, 0}; }
 	[[nodiscard]] const_iterator end() const noexcept { return {this, size()}; }
@@ -177,7 +165,6 @@ public:
 		return m_overflow == nullptr ? m_inline_size : m_overflow->size();
 	}
 	[[nodiscard]] OwnerT front() const noexcept { return At(0); }
-	[[nodiscard]] OwnerT operator[](size_type index) const noexcept { return At(index); }
 
 	void push_back(const OwnerT& owner) {
 		const uint64_t packed = Pack(owner);
@@ -195,15 +182,6 @@ public:
 		overflow->assign(m_inline.begin(), m_inline.end());
 		overflow->push_back(packed);
 		m_overflow = std::move(overflow);
-	}
-
-	[[nodiscard]] bool Contains(const OwnerT& owner) const noexcept {
-		const uint64_t packed = Pack(owner);
-		if (m_overflow != nullptr) {
-			return std::find(m_overflow->begin(), m_overflow->end(), packed) != m_overflow->end();
-		}
-		return std::find(m_inline.begin(), m_inline.begin() + static_cast<ptrdiff_t>(m_inline_size),
-		                 packed) != m_inline.begin() + static_cast<ptrdiff_t>(m_inline_size);
 	}
 
 	[[nodiscard]] bool Erase(const OwnerT& owner) noexcept {

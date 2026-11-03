@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -226,19 +225,6 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 	return has_stencil ? policy.stencil_attachment_formats.front() : policy.depth_attachment_format;
 }
 
-[[nodiscard]] inline constexpr vk::Format
-DepthAttachmentFormat(Prospero::DepthFormat   depth_format,
-                      Prospero::StencilFormat stencil_format) noexcept {
-	bool has_stencil = false;
-	switch (stencil_format) {
-		case Prospero::StencilFormat::kInvalid: break;
-		case Prospero::StencilFormat::k8UInt: has_stencil = true; break;
-		default: return vk::Format::eUndefined;
-	}
-	const auto* policy = FindDepthFormatPolicy(depth_format);
-	return policy == nullptr ? vk::Format::eUndefined : DepthAttachmentFormat(*policy, has_stencil);
-}
-
 [[nodiscard]] inline constexpr vk::ImageUsageFlags DepthTargetImageUsage() noexcept {
 	return vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled |
 	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -266,14 +252,6 @@ inline bool ImageInfo::IsDepth() const noexcept {
 		case vk::Format::eD32Sfloat: return 4;
 		default: return 0;
 	}
-}
-
-[[nodiscard]] inline constexpr uint32_t EncodeD16AsD24(uint16_t value) noexcept {
-	return static_cast<uint32_t>((static_cast<uint64_t>(value) * 0x00ffffffu + 0x7fffu) / 0xffffu);
-}
-
-[[nodiscard]] inline uint32_t EncodeD16AsD32(uint16_t value) noexcept {
-	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
 }
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
@@ -580,10 +558,6 @@ inline constexpr std::array<VideoOutFormatPolicy, 10> VIDEO_OUT_FORMAT_POLICIES 
 	const auto right_first = right / TRACKER_PAGE_SIZE;
 	const auto right_last  = (right + right_size - 1) / TRACKER_PAGE_SIZE;
 	return left_first <= right_last && right_first <= left_last;
-}
-
-[[nodiscard]] inline bool ImagePageRangesOverlap(GuestRange left, GuestRange right) {
-	return ImagePageRangesOverlap(left.address, left.size, right.address, right.size);
 }
 
 } // namespace Libs::Graphics

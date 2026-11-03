@@ -11,8 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cmath>
 #include <fmt/format.h>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -42,7 +42,7 @@ static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 	return bound_targets > 1;
 }
 
-uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
+static uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
@@ -88,7 +88,7 @@ void uc_check(const HW::UserConfig& uc) {
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr3 != false);
 }
 
-std::string rt_print(const char* func, const HW::RenderTarget& rt) {
+static std::string rt_print(const char* func, const HW::RenderTarget& rt) {
 	std::string dst;
 	dst.reserve(4096);
 
@@ -186,8 +186,6 @@ static bool RenderIsColorDimension(uint32_t dimension) {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void RtCheck(const HW::RenderTarget& rt) {
 	if (rt.base.addr != 0) {
-		//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
-
 		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
 		if (rt.view.base_array_slice_index != 0x00000000 ||
 		    rt.view.last_array_slice_index != 0x00000000) {
@@ -227,7 +225,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		// EXIT_NOT_IMPLEMENTED(rt.info.blend_clamp != false);
 		if (rt.info.round_mode) {
 			static bool logged = false;
 			if (!logged) {
@@ -235,9 +232,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		//		 EXIT_NOT_IMPLEMENTED(rt.format != 0x0000000a);
-		// EXIT_NOT_IMPLEMENTED(rt.channel_type != 0x00000006);
-		// EXIT_NOT_IMPLEMENTED(rt.channel_order != 0x00000001);
 		if (rt.attrib.force_dest_alpha_to_one) {
 			static bool logged = false;
 			if (!logged) {
@@ -288,11 +282,7 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		}
 		EXIT_NOT_IMPLEMENTED(rt.attrib3.write_vrs_rate_hint_to_cmask);
 
-		// EXIT_NOT_IMPLEMENTED(rt.dcc_max_uncompressed_block_size != 0x00000002);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.max_compressed_block_size != 0x00000000);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
 	}
 }
@@ -420,9 +410,6 @@ static void McPrint(const char* func, const HW::ModeControl& c) {
 }
 
 static void McCheck(const HW::ModeControl& c) {
-	// EXIT_NOT_IMPLEMENTED(c.cull_front != false);
-	// EXIT_NOT_IMPLEMENTED(c.cull_back != false);
-	// EXIT_NOT_IMPLEMENTED(c.face != false);
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {
@@ -661,23 +648,14 @@ static void VpPrint(const char* func, const HW::ScreenViewport& vp,
 }
 
 static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc) {
-
 	if (smc.msaa_enable) {
-
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
 			LOGF("\t warning: unsupported PS5 MSAA raster controls use native Vulkan defaults\n");
 		}
 	}
-	// EXIT_NOT_IMPLEMENTED(smc.vport_scissor_enable);
 	EXIT_NOT_IMPLEMENTED(smc.line_stipple_enable);
 
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xscale != 960.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xoffset != 960.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yscale != -540.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yoffset != 540.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zscale != 0.500000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zoffset != 0.500000);
 	if (vp.transform_control != 1087) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -686,10 +664,6 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 			     vp.transform_control);
 		}
 	}
-	// EXIT_NOT_IMPLEMENTED(vp.hw_offset_x != 60);
-	// EXIT_NOT_IMPLEMENTED(vp.hw_offset_y != 32);
-	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_horz_clip - 33.133327f) > 0.001f);
-	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_vert_clip - 59.629623f) > 0.001f);
 
 	if (vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f) {
 		static std::atomic<uint32_t> log_count {0};
@@ -698,13 +672,6 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 			     vp.guard_band_horz_discard, vp.guard_band_vert_discard);
 		}
 	}
-
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_left != 0);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_top != 0);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_right != 0);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_bottom != 0);
-	// EXIT_NOT_IMPLEMENTED(viewport_scissor &&
-	// vp.viewports[0].viewport_scissor_window_offset_enable != true);
 }
 
 static bool ScissorRectValid(const ScissorRect& r) {
@@ -830,30 +797,13 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& aa      = hw.GetAaSampleControl();
 	const auto& ac      = hw.GetAaConfig();
 
-	auto log_phase = [](const char* phase) {
-		if (graphics_debug_dump_enabled()) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
-				LOGF("HwCheckPhase: %s\n", phase);
-			}
-		}
-	};
-
-	log_phase("rt");
 	RtCheck(rt);
-	log_phase("vp");
 	VpCheck(vp, smc);
-	log_phase("clip");
 	ClipCheck(c);
-	log_phase("mode");
 	McCheck(mc);
-	log_phase("blend");
 	BcCheck(bclr, cc);
-	log_phase("eqaa");
 	EqaaCheck(eqaa, ac);
-	log_phase("aa");
 	AaCheck(aa, ac);
-	log_phase("done");
 
 	if (graphics_debug_dump_enabled() && RenderTargetMaskHasBoundMrt(buffer)) {
 		const auto& sh = hw.GetShaderRegisters();
@@ -893,7 +843,6 @@ void hw_check(const CommandBuffer& buffer) {
 			     hw.GetDepthClearValue());
 		}
 	}
-	// EXIT_NOT_IMPLEMENTED(hw.GetStencilClearValue() != 0);
 }
 
 void hw_print(const CommandBuffer& buffer) {

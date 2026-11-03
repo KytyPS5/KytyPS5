@@ -194,11 +194,11 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	}
 	const auto     guest_format = policy->guest_format;
 	const uint32_t bytes        = policy->bytes_per_element;
-	const auto     pitch        = TileGetDepthPitch(width, bytes, z.z_info.num_samples);
+	const auto     pitch        = TileGetRenderTargetPitch(width, bytes, z.z_info.num_samples);
 	TileSizeAlign depth_size {};
 	TileSizeAlign stencil_size {};
 	TileSizeAlign htile_size {};
-	if (!TileGetDepthSize(width, height, 0, z.z_info.format, z.stencil_info.format, has_htile,
+	if (!TileGetDepthSize(width, height, z.z_info.format, z.stencil_info.format, has_htile,
 	                      stencil_size, htile_size, depth_size, z.z_info.num_samples) ||
 	    depth_size.align != 65536 || depth_size.size == 0 ||
 	    (has_stencil != (stencil_size.align == 65536 && stencil_size.size != 0)) ||

@@ -1126,11 +1126,10 @@ static bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& hti
 	return true;
 }
 
-bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch,
-                      Prospero::DepthFormat z_format, Prospero::StencilFormat stencil_format,
-                      bool htile, TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
+bool TileGetDepthSize(uint32_t width, uint32_t height, Prospero::DepthFormat z_format,
+                      Prospero::StencilFormat stencil_format, bool htile,
+                      TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
                       TileSizeAlign& depth_size, uint32_t num_fragments_log2) {
-	EXIT_IF(pitch != 0);
 	// Prospero derives uncompressed depth/stencil as independent 64 KiB block surfaces.
 	if (width > 0 && width <= 16384 && height > 0 && height <= 16384 &&
 	    (z_format == Prospero::DepthFormat::kZ16 || z_format == Prospero::DepthFormat::kZ32F) &&
@@ -1185,11 +1184,6 @@ uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
 	}
 	const uint64_t pitch = Common::AlignUp(static_cast<uint64_t>(width), block_width);
 	return pitch <= UINT32_MAX ? static_cast<uint32_t>(pitch) : 0;
-}
-
-uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,
-                           uint32_t num_fragments_log2) {
-	return TileGetRenderTargetPitch(width, bytes_per_element, num_fragments_log2);
 }
 
 bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,

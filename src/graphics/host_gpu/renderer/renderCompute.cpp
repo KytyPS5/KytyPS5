@@ -269,9 +269,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		return;
 	}
 
-	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
-	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
-	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
+	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS     = 0x41u;
+	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
 	    DISPATCH_INITIATOR_BASE_BITS | DISPATCH_INITIATOR_MODIFIER_BITS;
 
@@ -291,11 +290,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	input_info.workgroup_counts[0] = thread_group_x;
-	input_info.workgroup_counts[1] = thread_group_y;
-	input_info.workgroup_counts[2] = thread_group_z;
+	input_info.workgroup_counts[0]        = thread_group_x;
+	input_info.workgroup_counts[1]        = thread_group_y;
+	input_info.workgroup_counts[2]        = thread_group_z;
 	if (use_thread_dimensions) {
 		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
 		                                cs_regs.cs_regs.num_thread_z};

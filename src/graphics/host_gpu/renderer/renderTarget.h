@@ -14,7 +14,6 @@ struct RenderAttachment {
 	vk::ImageView           image_view    = nullptr;
 	vk::ImageLayout         image_layout  = vk::ImageLayout::eUndefined;
 	std::array<uint32_t, 4> clear_value   = {};
-	bool                    is_clear      = false;
 	bool                    has_depth     = false;
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;

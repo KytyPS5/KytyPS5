@@ -103,9 +103,7 @@ void ImageInfo::UpdateSize() {
 		                      tile_mode != Prospero::TileMode::kRenderTarget));
 		const auto fragments = std::countr_zero(samples);
 		if (pitch == 0) {
-			pitch = tile_mode == Prospero::TileMode::kDepth
-			            ? TileGetDepthPitch(extent.width, bytes_per_block, fragments)
-			            : TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
+			pitch = TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
 		}
 		EXIT_NOT_IMPLEMENTED(!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
 		if (data.size == 0) {

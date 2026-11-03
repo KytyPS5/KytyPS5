@@ -1258,7 +1258,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		                      depth.stencil_subresources.layer_count};
 		plane.tile_mode    = depth.info.tile_mode;
 		plane.pitch =
-		    plane.IsTiled() ? TileGetDepthPitch(plane.extent.width, 1, 0) : depth.info.pitch;
+		    plane.IsTiled() ? TileGetRenderTargetPitch(plane.extent.width, 1) : depth.info.pitch;
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
 		if (record.depth_id != depth_id) {

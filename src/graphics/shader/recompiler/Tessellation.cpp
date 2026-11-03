@@ -156,11 +156,14 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 					}
 					break;
-				case Opcode::V_AND_B32:
-					if ((lhs.kind == Kind::PackedControlPoint && rhs == constant(0xffu)) ||
-					    (rhs.kind == Kind::PackedControlPoint && lhs == constant(0xffu)))
-						value = constant(0u);
+				case Opcode::V_AND_B32: {
+					const auto mask = lhs.kind == Kind::PackedControlPoint ? rhs
+					                : rhs.kind == Kind::PackedControlPoint ? lhs
+					                                                       : Address {};
+					if (mask == constant(0xffu)) value = constant(0u);
+					if (mask == constant(0x1f00u)) value = {Kind::Affine, 256u, 0u};
 					break;
+				}
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
 				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;

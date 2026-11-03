@@ -68,28 +68,20 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 
 TileManager::~TileManager() {
 	for (auto pipeline: m_pipelines) {
-		if (pipeline != nullptr) {
-			m_graphics.device.destroyPipeline(pipeline, nullptr);
-		}
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
 	                     m_color_clear}) {
-		if (pipeline != nullptr) {
-			m_graphics.device.destroyPipeline(pipeline, nullptr);
-		}
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
-	if (m_pipeline_layout != nullptr) {
-		m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
-	}
-	if (m_descriptor_layout != nullptr) {
-		m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
-	}
+	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
 }
 
 TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
                                          uint64_t linear_capacity, const ImageInfo& info,
-                                         uint32_t levels, uint64_t source_base,
-                                         uint64_t target_base) {
+                                         uint32_t levels, uint64_t source_offset,
+                                         uint64_t target_offset) {
 	levels = levels != 0 ? levels : info.resources.levels;
 	EXIT_IF(levels == 0 || levels > MaxMipLevels || levels > info.resources.levels ||
 	        tiled_capacity == 0 || linear_capacity == 0);
@@ -104,7 +96,8 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	    block.block_depth == 0 || block.block_size == 0 || info.tiling.texel_width == 0 ||
 	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0);
 	EXIT_IF((transform == ColorTransform::SwapBgra16 && block.bytes_per_element != 8u) ||
-	        (transform == ColorTransform::Reverse10_11_11 && block.bytes_per_element != 4u));
+	        ((transform == ColorTransform::Reverse10_11_11 ||
+	          transform == ColorTransform::Rotate2_10_10_10) && block.bytes_per_element != 4u));
 	const auto checked_multiply = [](uint64_t left, uint64_t right, uint64_t& result) {
 		return (left == 0 || right <= UINT64_MAX / left) && (result = left * right, true);
 	};
@@ -114,6 +107,11 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 	const auto valid_range = [](uint64_t offset, uint64_t size, uint64_t capacity) {
 		return size != 0 && offset <= capacity && size <= capacity - offset;
 	};
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_base = source_offset & (descriptor_alignment - 1);
+	const uint64_t target_base = target_offset & (descriptor_alignment - 1);
 
 	// ImageInfo owns the layout. Upload only the header and active mip records.
 	TilingParams params;
@@ -195,8 +193,7 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		params.num_texels += static_cast<uint32_t>(texels);
 	}
 
-	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	const auto  params_size =
+	const auto params_size =
 	    static_cast<uint16_t>(offsetof(TilingParams, mips) + levels * sizeof(Mip));
 	const auto offset = m_stream_buffer.Copy(
 	    &params, params_size,
@@ -336,12 +333,8 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 		           ? source
 		           : TransformColor(source, info.GetColorTransform(), true);
 	}
-	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	const uint64_t descriptor_alignment =
-	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
-	const auto     linear_capacity = info.LinearSize();
-	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
+	const auto linear_capacity = info.LinearSize();
+	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, tiled_offset, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
@@ -350,13 +343,8 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                        const ImageInfo& info, uint32_t levels) {
-	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	const uint64_t descriptor_alignment =
-	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_base = linear_offset & (descriptor_alignment - 1);
-	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
-	const auto     tiling =
-	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
+	const auto tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, info, levels, linear_offset, tiled_offset);
 	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling,
 	       false);
 }
@@ -365,14 +353,10 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                             uint32_t levels) {
 	EXIT_IF(regions.empty());
-	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	const uint64_t descriptor_alignment =
-	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t target_base     = tiled_offset & (descriptor_alignment - 1);
-	const auto     linear_capacity = image.info.LinearSize(levels);
+	const auto linear_capacity = image.info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
 	const auto tiling =
-	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, target_base);
+	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, tiled_offset);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling, false);
@@ -560,7 +544,8 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	uint32_t element_bytes = 0;
 	switch (transform) {
 		case ColorTransform::SwapBgra16: element_bytes = 8; break;
-		case ColorTransform::Reverse10_11_11: element_bytes = 4; break;
+		case ColorTransform::Reverse10_11_11:
+		case ColorTransform::Rotate2_10_10_10: element_bytes = 4; break;
 		default: EXIT("invalid color transform\n");
 	}
 	EXIT_IF(input.size == 0 || input.size % element_bytes != 0 ||
@@ -628,19 +613,20 @@ TileManager::Result TileManager::TransformColor(Result input, ColorTransform tra
 	return result;
 }
 
-vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
-                                        bool expand) {
+vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
+                                        uint32_t keys, bool expand) {
 	struct Check {
 		uint32_t metadata_base;
 		uint32_t words;
+		uint32_t stride;
 		uint32_t keys;
 		uint32_t expand;
 	};
 	static_assert(sizeof(Check) <= sizeof(Conversion));
 	const uint32_t max_slices =
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers;
-	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % (4ull * slices) != 0 ||
-	        metadata.size / 4 > UINT32_MAX);
+	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % 4 != 0 || stride % 4 != 0 ||
+	        metadata.size / 4 > UINT32_MAX || stride * (slices - 1) >= metadata.size);
 	if (m_color_clear == nullptr) {
 		m_color_clear      = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
 		m_clear_predicates = std::make_unique<Buffer>(
@@ -671,8 +657,9 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_clear);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const Check push {source.base, static_cast<uint32_t>(metadata.size / 4 / slices), keys,
-	                  expand};
+	const Check push {source.base,
+	                  static_cast<uint32_t>((metadata.size - stride * (slices - 1)) / 4),
+	                  static_cast<uint32_t>(stride / 4), keys, expand};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch(slices, 1, 1);

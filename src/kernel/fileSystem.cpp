@@ -1127,6 +1127,12 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	LOGF("\t KernelStat: %s\n", path);
 
+	// The guest root holds only mount points and has no host directory.
+	if (std::strcmp(path, "/") == 0) {
+		*sb = {.st_mode = 0040777u};
+		return OK;
+	}
+
 	auto real_file_name = g_mount_points->ResolvePath(path);
 
 	const auto info = Common::File::GetInfo(real_file_name);

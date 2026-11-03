@@ -1,6 +1,5 @@
 #include "common/timer.h"
 
-#include "common/assert.h"
 #include "common/platform/sysTimer.h"
 
 namespace Common {
@@ -11,29 +10,6 @@ Timer::Timer() noexcept {
 
 void Timer::Start() {
 	SysQueryPerformanceCounter(&m_StartTime);
-	m_is_paused = false;
-}
-
-void Timer::Pause() {
-	EXIT_IF(m_is_paused);
-
-	SysQueryPerformanceCounter(&m_PauseTime);
-	m_is_paused = true;
-}
-
-void Timer::Resume() {
-	EXIT_IF(!m_is_paused);
-
-	uint64_t current_time = 0;
-	SysQueryPerformanceCounter(&current_time);
-
-	m_StartTime += current_time - m_PauseTime;
-
-	m_is_paused = false;
-}
-
-bool Timer::IsPaused() const {
-	return m_is_paused;
 }
 
 // return time in milliseconds
@@ -43,10 +19,6 @@ double Timer::GetTimeMs() const {
 
 // return time in seconds
 double Timer::GetTimeS() const {
-	if (m_is_paused) {
-		return (static_cast<double>(m_PauseTime - m_StartTime)) / static_cast<double>(m_Frequency);
-	}
-
 	uint64_t current_time = 0;
 	SysQueryPerformanceCounter(&current_time);
 

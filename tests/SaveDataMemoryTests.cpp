@@ -396,6 +396,26 @@ void TestClassicSavePaths() {
 	CHECK(Search(1) == names);
 }
 
+void TestBusyMountPreservesResult() {
+	Reset("BUSYMOUNT");
+	const auto name = DirName("slot");
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = 4;
+	mount.blocks     = 48;
+	SaveDataMountResult result {};
+	CHECK(SaveDataMount3(&mount, &result) == OK);
+	const std::string first_mount_point = result.mount_point.data;
+	CHECK(first_mount_point == "/savedata0");
+
+	mount.mount_mode = 32;
+	CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_BUSY);
+	CHECK(result.mount_point.data == first_mount_point);
+	CHECK(g_test_mounts.contains(first_mount_point));
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+}
+
 void TestConvert() {
 	Reset("CONVERT");
 	const auto             source = DirName("save");
@@ -743,6 +763,7 @@ int main(int argc, char** argv) {
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
+	TestBusyMountPreservesResult();
 	TestConvert();
 	TestGuestSaveIsolation();
 	TestSaveAllocations();

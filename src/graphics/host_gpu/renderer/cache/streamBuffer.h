@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -48,24 +49,23 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
+		EXIT_IF(m_device_address == 0);
+		return m_device_address;
+	}
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
-	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
+	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
+		return address >= m_cpu_address && size <= Size() &&
+		       address - m_cpu_address <= Size() - size;
+	}
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-	              uint64_t destination_offset, uint64_t size,
-	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
+	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.

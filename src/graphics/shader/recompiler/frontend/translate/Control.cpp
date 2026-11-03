@@ -14,12 +14,6 @@ bool IsExecOrVcc(const Decoder::Operand& operand) {
 	}
 }
 
-Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
-	Decoder::Operand operand;
-	operand.kind = kind;
-	return operand;
-}
-
 } // namespace
 
 void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) {

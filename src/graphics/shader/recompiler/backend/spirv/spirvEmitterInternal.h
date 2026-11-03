@@ -118,8 +118,11 @@ struct EmitterState {
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
-	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
+	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
+	uint32_t                                         bvh8_result_type       = 0;
+	uint32_t                                         bvh8_intersect_function = 0;
+	uint32_t                                         bvh_stack_function      = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -141,6 +144,7 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_payload                          = 0;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -169,6 +173,7 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
+uint32_t TypeBvh8Result(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
@@ -269,8 +274,6 @@ struct ValueEmitContext {
 	uint32_t                                                           half       = 0;
 };
 
-enum class VertexInputScalarKind { Float, Sint, Uint };
-
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 
 struct DppTargetLane {
@@ -300,12 +303,11 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
-VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location);
+Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
 uint32_t VertexParameterComponentCount(const InputBinding& input);
 
-uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
-
+uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 uint32_t MrtOutputType(EmitterState& state, uint32_t index);
@@ -317,11 +319,6 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason);
-
-uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
-                                  uint32_t variable_id, uint32_t array_index,
-                                  IR::DescriptorBindingKind kind, uint32_t resource,
-                                  const char* variable_name);
 
 uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class);
 
@@ -350,8 +347,6 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
-uint32_t ConstantU32(EmitterState& state, uint32_t value);
-
 uint32_t ConstantI32(EmitterState& state, int32_t value);
 
 uint32_t ConstantF32(EmitterState& state, uint32_t bits);
@@ -372,23 +367,10 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
-void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
 
-DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
-                                    uint32_t lane_bits);
-
-DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
-                                        bool left);
-
-DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subid, uint32_t amount);
-
-DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row);
-
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
-
-uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 
@@ -448,6 +430,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+// EmitMemoryElementInBounds, or true for storage buffers the device bounds-checks; only
+// loads and plain stores may use it.
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -455,14 +441,10 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
 
-uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
-
 inline constexpr auto EmitTBufferSelectF32 =
     EmitNative<spv::OpSelect, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 
 bool IsSignedFormatComponent(Format::ComponentType type);
-
-uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
@@ -518,9 +500,6 @@ inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Typ
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match);
-
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
@@ -540,9 +519,13 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
-void DefineIndirectBufferFormats(ValueEmitContext& ctx);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
+void DefineTrinityBvhIntersect(EmitterState& state);
+uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32_t, 3>, 3>& positions,
+                         std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
+                         uint32_t remap, uint32_t triangle_id, uint32_t bary);
+void DefineTrinityFunctions(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.

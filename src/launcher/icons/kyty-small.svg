@@ -1,15 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs>
-<linearGradient id="body" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#e3e9f2"/></linearGradient>
+<linearGradient id="tile" x2="0" y2="1"><stop stop-color="#3d7fe6"/><stop offset="1" stop-color="#1c47b0"/></linearGradient>
+<linearGradient id="body" x2="0" y2="1"><stop stop-color="#fff"/><stop offset="1" stop-color="#e3e9f2"/></linearGradient>
+<linearGradient id="gloss" x2="0" y2="1"><stop stop-color="#fff" stop-opacity="0.28"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
 </defs>
-<g transform="translate(256 268) scale(1.16) translate(-256 -268)" stroke-linejoin="round" stroke-linecap="round">
-<path d="M100 196 L120 104 Q124 92 134 99 L214 160 Z" fill="url(#body)"/><path d="M412 196 L392 104 Q388 92 378 99 L298 160 Z" fill="url(#body)"/>
+<rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tile)"/>
+<path d="M16 128 A112 112 0 0 1 128 16 L384 16 A112 112 0 0 1 496 128 L496 200 Q256 150 16 236 Z" fill="url(#gloss)"/>
+<g transform="translate(256 268) scale(0.92) translate(-256 -268)" stroke-linejoin="round" stroke-linecap="round">
+<g transform="translate(0 12)" fill-opacity="0.22" stroke="#000" stroke-opacity="0.22" stroke-width="20"><path d="M100 196 L120 104 Q124 92 134 99 L214 160 Z"/><path d="M412 196 L392 104 Q388 92 378 99 L298 160 Z"/><path d="M256 154 C330 154 380 160 406 178 C432 196 447 244 459 302 C471 358 466 398 430 408 C400 416 380 398 360 368 L326 318 C316 304 306 300 290 300 L222 300 C206 300 196 304 186 318 L152 368 C132 398 112 416 82 408 C46 398 41 358 53 302 C65 244 80 196 106 178 C132 160 182 154 256 154 Z"/></g>
+<g fill="url(#body)" stroke="#0b0d12" stroke-width="20"><path d="M100 196 L120 104 Q124 92 134 99 L214 160 Z"/><path d="M412 196 L392 104 Q388 92 378 99 L298 160 Z"/></g>
 <path d="M116 181 L137 121 L190 157 Z" fill="#0b0d12"/><path d="M396 181 L375 121 L322 157 Z" fill="#0b0d12"/>
-<g fill="none" stroke="#0b0d12" stroke-width="20"><path d="M100 196 L120 104 Q124 92 134 99 L214 160 Z"/><path d="M412 196 L392 104 Q388 92 378 99 L298 160 Z"/></g>
-<path d="M256 154 C330 154 380 160 406 178 C432 196 447 244 459 302 C471 358 466 398 430 408 C400 416 380 398 360 368 L326 318 C316 304 306 300 290 300 L222 300 C206 300 196 304 186 318 L152 368 C132 398 112 416 82 408 C46 398 41 358 53 302 C65 244 80 196 106 178 C132 160 182 154 256 154 Z" fill="url(#body)"/>
-<path d="M256 154 C330 154 380 160 406 178 C432 196 447 244 459 302 C471 358 466 398 430 408 C400 416 380 398 360 368 L326 318 C316 304 306 300 290 300 L222 300 C206 300 196 304 186 318 L152 368 C132 398 112 416 82 408 C46 398 41 358 53 302 C65 244 80 196 106 178 C132 160 182 154 256 154 Z" fill="none" stroke="#0b0d12" stroke-width="20"/>
-<g fill="none" stroke="#0b0d12" stroke-width="14"><path d="M82 260 C100 274 118 288 128 304 C134 316 121 350 108 388"/><path d="M430 260 C412 274 394 288 384 304 C378 316 391 350 404 388"/></g>
-<path d="M72 316 L92 336 M70 336 L86 352 M440 316 L420 336 M442 336 L426 352" fill="none" stroke="#0b0d12" stroke-width="10"/>
-<path d="M179 230 Q194 210 209 230" fill="none" stroke="#0b0d12" stroke-width="16"/>
+<path d="M256 154 C330 154 380 160 406 178 C432 196 447 244 459 302 C471 358 466 398 430 408 C400 416 380 398 360 368 L326 318 C316 304 306 300 290 300 L222 300 C206 300 196 304 186 318 L152 368 C132 398 112 416 82 408 C46 398 41 358 53 302 C65 244 80 196 106 178 C132 160 182 154 256 154 Z" fill="url(#body)" stroke="#0b0d12" stroke-width="20"/>
+<g fill="none" stroke="#0b0d12"><g stroke-width="14"><path d="M82 260 C100 274 118 288 128 304 C134 316 121 350 108 388"/><path d="M430 260 C412 274 394 288 384 304 C378 316 391 350 404 388"/></g>
+<path d="M72 316 L92 336 M70 336 L86 352 M440 316 L420 336 M442 336 L426 352" stroke-width="10"/>
+<path d="M179 230 Q194 210 209 230" stroke-width="16"/></g>
 <circle cx="318" cy="222" r="21" fill="#0b0d12"/>
 <path d="M240 256 L272 256 L256 278 Z" fill="#0b0d12" stroke="#0b0d12" stroke-width="8"/>
 </g></svg>

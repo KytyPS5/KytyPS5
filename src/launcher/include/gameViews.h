@@ -73,6 +73,24 @@ private:
 	QPixmap m_scaled;
 };
 
+// Marks a title that supports PS5 Pro mode with a pill in the top-right corner of its cover.
+inline void PaintProBadge(QPainter* painter, const QRect& cover, QFont font, const QString& text) {
+	font.setBold(true);
+	const QFontMetrics metrics(font);
+	const int          inset = metrics.height() / 3;
+	QRect              badge(0, 0, metrics.horizontalAdvance(text) + 2 * inset, metrics.height());
+	badge.moveTopRight(cover.topRight() + QPoint(-inset, inset));
+	painter->save();
+	painter->setRenderHint(QPainter::Antialiasing);
+	painter->setPen(Qt::NoPen);
+	painter->setBrush(QColor(0x534ab7));
+	painter->drawRoundedRect(badge, 4, 4);
+	painter->setFont(font);
+	painter->setPen(QColor(0xeeedfe));
+	painter->drawText(badge, Qt::AlignCenter, text);
+	painter->restore();
+}
+
 // A card on a translucent panel, so the text keeps its contrast over the game background.
 class GameGridDelegate: public QStyledItemDelegate {
 public:
@@ -100,6 +118,9 @@ public:
 		const QRect cover(option.rect.topLeft() + QPoint(CARD_PADDING, CARD_PADDING),
 		                  option.decorationSize);
 		index.data(Qt::DecorationRole).value<QIcon>().paint(painter, cover);
+		if (index.data(Qt::UserRole).toBool()) {
+			PaintProBadge(painter, cover, option.font, QStringLiteral("PS5 PRO"));
+		}
 
 		QRect line(cover.left(), cover.bottom() + 1 + CARD_PADDING, cover.width(),
 		           option.fontMetrics.lineSpacing());
@@ -128,6 +149,28 @@ public:
 
 private:
 	static constexpr int CARD_PADDING = 8;
+};
+
+// The list's name cell, with the PS5 Pro badge over its icon.
+class GameListNameDelegate: public QStyledItemDelegate {
+public:
+	using QStyledItemDelegate::QStyledItemDelegate;
+
+	void paint(QPainter* painter, const QStyleOptionViewItem& option,
+	           const QModelIndex& index) const override {
+		QStyledItemDelegate::paint(painter, option, index);
+		if (!index.data(Qt::UserRole).toBool()) {
+			return;
+		}
+		QStyleOptionViewItem opt(option);
+		initStyleOption(&opt, index);
+		const auto icon = opt.widget->style()->subElementRect(QStyle::SE_ItemViewItemDecoration,
+		                                                      &opt, opt.widget);
+		// The list's small icon takes a smaller badge than the grid's covers.
+		auto font = opt.font;
+		font.setPixelSize(icon.height() / 5);
+		PaintProBadge(painter, icon, font, QStringLiteral("PRO"));
+	}
 };
 
 // Shows the list's games as cards in the grid: both views share the items and the current game.

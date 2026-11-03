@@ -255,6 +255,12 @@
            <property name="title"><string>General</string></property>
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
+             <widget class="QCheckBox" name="checkBox_pro">
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
               <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
               <property name="text"><string>Run in fullscreen</string></property>
@@ -297,6 +303,12 @@
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
               <property name="text"><string>AMD CPU patch (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_guest_tsc">
+              <property name="toolTip"><string>Run the CPU time stamp counter (TSC) at the PS5's 1.6 GHz instead of the host rate. Fixes games that run too fast.</string></property>
+              <property name="text"><string>PS5 TSC rate (experimental)</string></property>
              </widget>
             </item>
             <item>
@@ -404,6 +416,11 @@
         <widget class="QCheckBox" name="checkBox_network_connected">
          <property name="toolTip"><string>Let games use your computer's local network connection.</string></property>
          <property name="text"><string>Enable network connection</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="checkBox_psn_emulation">
+         <property name="text"><string>Emulate PSN (compatibility)</string></property>
         </widget>
        </item>
        <item>

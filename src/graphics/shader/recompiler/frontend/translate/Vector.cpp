@@ -375,9 +375,14 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_SUB_NC_U16:
 		case O::V_SUB_NC_I16: return Integer16Binary(inst, IR::ValueOpcode::ISub32, false);
 		case O::V_MUL_LO_U16: return Integer16Binary(inst, IR::ValueOpcode::IMul32, false);
-		case O::V_MAD_I16: return V_MAD_I16(inst);
+		case O::V_MAD_I16: return Integer16Mad(inst, true);
+		case O::V_MAD_U16: return Integer16Mad(inst, false);
 		case O::V_MED3_I16: return Integer16Ternary(inst, IR::ValueOpcode::SMedTri32, true);
 		case O::V_MIN3_U16: return Integer16Ternary(inst, IR::ValueOpcode::UMinTri32, false);
+		case O::V_MIN3_I16: return Integer16Ternary(inst, IR::ValueOpcode::SMinTri32, true);
+		case O::V_MAX3_I16: return Integer16Ternary(inst, IR::ValueOpcode::SMaxTri32, true);
+		case O::V_MAX3_U16: return Integer16Ternary(inst, IR::ValueOpcode::UMaxTri32, false);
+		case O::V_MED3_U16: return Integer16Ternary(inst, IR::ValueOpcode::UMedTri32, false);
 		case O::V_MIN_I16: return Integer16Binary(inst, IR::ValueOpcode::SMin32, true);
 		case O::V_MAX_I16: return Integer16Binary(inst, IR::ValueOpcode::SMax32, true);
 		case O::V_MIN_U16: return Integer16Binary(inst, IR::ValueOpcode::UMin32, false);
@@ -391,15 +396,15 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			return PackedInteger16Shift(inst, IR::ValueOpcode::ShiftRightArithmetic32, true);
 		case O::V_PK_MAD_I16: return PackedInteger16Mad(inst, true);
 		case O::V_PK_MAD_U16: return PackedInteger16Mad(inst, false);
-		case O::V_PK_MUL_LO_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::IMul32);
+		case O::V_PK_MUL_LO_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::IMul32, false);
 		case O::V_PK_ADD_I16:
-		case O::V_PK_ADD_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::IAdd32);
+		case O::V_PK_ADD_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::IAdd32, false);
 		case O::V_PK_SUB_I16:
-		case O::V_PK_SUB_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::ISub32);
-		case O::V_PK_MAX_I16: return PackedInteger16MinMax(inst, IR::ValueOpcode::SMax32, true);
-		case O::V_PK_MIN_I16: return PackedInteger16MinMax(inst, IR::ValueOpcode::SMin32, true);
-		case O::V_PK_MAX_U16: return PackedInteger16MinMax(inst, IR::ValueOpcode::UMax32, false);
-		case O::V_PK_MIN_U16: return PackedInteger16MinMax(inst, IR::ValueOpcode::UMin32, false);
+		case O::V_PK_SUB_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::ISub32, false);
+		case O::V_PK_MAX_I16: return PackedInteger16Binary(inst, IR::ValueOpcode::SMax32, true);
+		case O::V_PK_MIN_I16: return PackedInteger16Binary(inst, IR::ValueOpcode::SMin32, true);
+		case O::V_PK_MAX_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::UMax32, false);
+		case O::V_PK_MIN_U16: return PackedInteger16Binary(inst, IR::ValueOpcode::UMin32, false);
 
 		case O::V_PK_ADD_F16: return PackedFloat16(inst, IR::ValueOpcode::FPAdd32, false, false);
 		case O::V_PK_MUL_F16: return PackedFloat16(inst, IR::ValueOpcode::FPMul32, false, false);
@@ -565,12 +570,18 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_LSHRREV_B64:
 			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightLogical64, IR::Type::U64, true,
 			                     false, false);
+		case O::V_ASHRREV_I64:
+			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightArithmetic64, IR::Type::U64, true,
+			                     false, false);
 
 		case O::V_XNOR_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseXor32, false, true, false);
-		case O::V_AND_OR_B32: return V_AND_OR_B32(inst);
-		case O::V_OR3_B32: return V_OR3_B32(inst);
-		case O::V_XOR3_B32: return V_XOR3_B32(inst);
+		case O::V_AND_OR_B32:
+			return Integer3(inst, IR::ValueOpcode::BitwiseAnd32, IR::ValueOpcode::BitwiseOr32);
+		case O::V_OR3_B32:
+			return Integer3(inst, IR::ValueOpcode::BitwiseOr32, IR::ValueOpcode::BitwiseOr32);
+		case O::V_XOR3_B32:
+			return Integer3(inst, IR::ValueOpcode::BitwiseXor32, IR::ValueOpcode::BitwiseXor32);
 		case O::V_FFBH_U32: return V_FFBH_32(inst, false);
 		case O::V_FFBH_I32: return V_FFBH_32(inst, true);
 
@@ -578,9 +589,11 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MAD_U32_U24: return Integer24(inst, false, true);
 		case O::V_MUL_I32_I24: return Integer24(inst, true, false);
 		case O::V_MUL_U32_U24: return Integer24(inst, false, false);
+		case O::V_MUL_HI_I32_I24: return Integer24(inst, true, false, true);
+		case O::V_MUL_HI_U32_U24: return Integer24(inst, false, false, true);
 		case O::V_MAD_U64_U32: return V_MAD_U64_U32(inst);
 		case O::V_SAD_U32: return V_SAD_U32(inst);
-		case O::V_ADD3_U32: return V_ADD3_U32(inst);
+		case O::V_ADD3_U32: return Integer3(inst, IR::ValueOpcode::IAdd32, IR::ValueOpcode::IAdd32);
 		case O::V_BCNT_U32_B32: return V_BCNT_U32_B32(inst);
 		case O::V_MBCNT_LO_U32_B32: return V_MBCNT_U32_B32(inst, true);
 		case O::V_MBCNT_HI_U32_B32: return V_MBCNT_U32_B32(inst, false);
@@ -590,10 +603,15 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_BFI_B32: return V_BFI_B32(inst);
 		case O::V_ALIGNBIT_B32: return V_ALIGN_B32(inst, false);
 		case O::V_ALIGNBYTE_B32: return V_ALIGN_B32(inst, true);
-		case O::V_LSHL_ADD_U32: return V_LSHL_ADD_U32(inst);
-		case O::V_ADD_LSHL_U32: return V_ADD_LSHL_U32(inst);
-		case O::V_XAD_U32: return V_XAD_U32(inst);
-		case O::V_LSHL_OR_B32: return V_LSHL_OR_B32(inst);
+		case O::V_LSHL_ADD_U32:
+			return Integer3(inst, IR::ValueOpcode::ShiftLeftLogical32, IR::ValueOpcode::IAdd32);
+		case O::V_ADD_LSHL_U32:
+			return Integer3(inst, IR::ValueOpcode::IAdd32, IR::ValueOpcode::ShiftLeftLogical32);
+		case O::V_XAD_U32:
+			return Integer3(inst, IR::ValueOpcode::BitwiseXor32, IR::ValueOpcode::IAdd32);
+		case O::V_LSHL_OR_B32:
+			return Integer3(inst, IR::ValueOpcode::ShiftLeftLogical32,
+			                IR::ValueOpcode::BitwiseOr32);
 		case O::V_CNDMASK_B32: return V_CNDMASK_B32(inst);
 		default: return FailMissingTranslation(inst);
 	}

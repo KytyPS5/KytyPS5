@@ -357,25 +357,13 @@ KYTY_HW_SH_PARSER(HwShSetCsRegisters) {
 	return reg_num;
 }
 
-static uint32_t UserSgprWriteNum(uint32_t slot, uint32_t reg_num, uint32_t capacity,
-                                 const char* stage) {
-	EXIT_IF(stage == nullptr);
-	EXIT_NOT_IMPLEMENTED(capacity > HW::UserSgprInfo::SGPRS_MAX || slot >= capacity ||
-	                     reg_num > capacity - slot);
-
-	return reg_num;
-}
-
 KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(
-	    !(cmd_offset >= Pm4::COMPUTE_USER_DATA_0 && cmd_offset <= Pm4::COMPUTE_USER_DATA_15));
+	uint32_t slot = cmd_offset - Pm4::COMPUTE_USER_DATA_0;
 
-	uint32_t slot = (cmd_offset - Pm4::COMPUTE_USER_DATA_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 16u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i]);
 	}
 
@@ -383,15 +371,12 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 }
 
 KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_DATA_PS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_DATA_PS_31));
+	uint32_t slot = cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
 
-	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 32u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i]);
 	}
 
@@ -399,15 +384,12 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 }
 
 KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_DATA_GS_31));
+	uint32_t slot = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
 
-	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 32u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
 	}
 
@@ -415,15 +397,12 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 }
 
 KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_DATA_HS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_DATA_HS_31));
+	uint32_t slot = cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
 
-	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 32u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i]);
 	}
 
@@ -621,12 +600,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
-	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
-	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
-	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
-
-	if (take_then) {
+	if (TestWaitRegMemValue(*compare_addr, reference, mask, function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
@@ -968,12 +942,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	const uint32_t control = buffer[2];
-
-	const uint32_t control_flags = control & 0x0fe00000u;
-	if (control_flags != 0x0f200000u) {
-		LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
-		     control_flags);
-	}
 
 	auto* indirect_buffer =
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
@@ -2421,20 +2389,11 @@ static constexpr auto MakeUconfigIndirectTable() {
 	for (const auto cmd_offset:
 	     {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL, Pm4::IA_MULTI_VGT_PARAM,
 	      Pm4::TA_CS_BC_BASE_ADDR, Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION,
-	      Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS}) {
+	      Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS, Pm4::GE_STEREO_CNTL}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
 
 	table[Pm4::GE_INDX_OFFSET] = [](KYTY_HW_REG_ARGS) { cp.GetUcfg().SetIndexOffset(value); };
-
-	table[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_REG_ARGS) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("warning: ignoring indirect uc reg GE_STEREO_CNTL at 0x%" PRIx32
-			     ", value = 0x%08" PRIx32 "\n",
-			     cmd_offset, value);
-		}
-	};
 
 	return table;
 }

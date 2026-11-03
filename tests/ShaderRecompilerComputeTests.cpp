@@ -52434,6 +52434,25 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
               processor.GetShCtx().GetVs().es_regs.data_addr == shader_address,
           "direct SET_SH_REG did not route its ES base pair through the "
           "register handlers");
+  std::array<uint32_t, 8> user_data{
+      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+      Pm4::SPI_SHADER_USER_DATA_PS_0 + 30,
+      1u,
+      2u,
+      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+      Pm4::COMPUTE_USER_DATA_0 + 14,
+      3u,
+      4u,
+  };
+  Pm4Execution user_data_execution;
+  const auto &ps_sgpr = processor.GetShCtx().GetPs().ps_user_sgpr.value;
+  const auto &cs_sgpr = processor.GetShCtx().GetCs().cs_user_sgpr.value;
+  Require("Pm4DirectShaderRegisterFallback", "last user-data slots",
+          processor.Process(user_data_execution, user_data) ==
+                  Pm4ProcessResult::Complete &&
+              ps_sgpr[30] == 1u && ps_sgpr[31] == 2u && cs_sgpr[14] == 3u &&
+              cs_sgpr[15] == 4u,
+          "direct SET_SH_REG user data missed the last slots of a stage");
   std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
 }
 
@@ -52567,7 +52586,7 @@ void CheckPm4IndirectShaderAndUconfigTables(RenderContext &renderer) {
         Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS,
         Pm4::FSR_WINDOW_LEFT + 1u, Pm4::FSR_CONTROL_POINTS_LEFT_X,
         Pm4::FSR_CONTROL_POINTS_LEFT_Y + 3u, Pm4::FSR_ALPHA_LEFT_X,
-        Pm4::FSR_ALPHA_LEFT_Y + 1u}) {
+        Pm4::FSR_ALPHA_LEFT_Y + 1u, Pm4::GE_STEREO_CNTL}) {
     handled = handled && g_hw_uc_indirect_func[offset] != nullptr;
   }
   handled = handled &&
@@ -55289,6 +55308,7 @@ int main(int argc, char **argv) {
     CheckPm4IndirectShaderAndUconfigTables(vulkan.RuntimeRenderer());
     CheckPm4LineWidth(vulkan.RuntimeRenderer());
     CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
+    CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
     CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());

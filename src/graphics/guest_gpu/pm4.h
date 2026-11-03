@@ -679,7 +679,6 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_PS_SHARED_VGPR_CNT_SHIFT        = 28;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_PS_SHARED_VGPR_CNT_MASK         = 0xF;
 
 constexpr uint32_t SPI_SHADER_USER_DATA_PS_0  = 0xC;
-constexpr uint32_t SPI_SHADER_USER_DATA_PS_31 = 0x2B;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_PS_0 = 0x32;
 
 constexpr uint32_t SPI_SHADER_PACE_ID_GS = 0x80;
@@ -734,7 +733,6 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_GS_SHARED_VGPR_CNT_SHIFT  = 28;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_GS_SHARED_VGPR_CNT_MASK   = 0xF;
 
 constexpr uint32_t SPI_SHADER_USER_DATA_GS_0    = 0x8C;
-constexpr uint32_t SPI_SHADER_USER_DATA_GS_31   = 0xAB;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0 = 0xB2;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES         = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES         = 0xC9;
@@ -779,7 +777,6 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_HS_USER_SGPR_MSB_MASK     = 0x1;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_HS_SHARED_VGPR_CNT_SHIFT  = 28;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_HS_SHARED_VGPR_CNT_MASK   = 0xF;
 constexpr uint32_t SPI_SHADER_USER_DATA_HS_0                      = 0x10C;
-constexpr uint32_t SPI_SHADER_USER_DATA_HS_31                     = 0x12B;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_0                   = 0x132;
 constexpr uint32_t SPI_SHADER_PGM_LO_LS                           = 0x148;
 constexpr uint32_t SPI_SHADER_PGM_HI_LS                           = 0x149;
@@ -849,7 +846,6 @@ constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT = 0;
 constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK  = 0xF;
 constexpr uint32_t COMPUTE_PACE_ID                      = 0x22A;
 constexpr uint32_t COMPUTE_USER_DATA_0                  = 0x240;
-constexpr uint32_t COMPUTE_USER_DATA_15                 = 0x24F;
 
 constexpr uint32_t SH_NOP = 0x280;
 

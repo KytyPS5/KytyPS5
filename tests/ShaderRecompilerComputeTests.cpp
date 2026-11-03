@@ -11568,6 +11568,224 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The color and metadata planes slice differently. A color slice is a volume depth slice and
+  // a metadata slice is the 4 KiB block whose first byte is that slice's clear code.
+  static constexpr uint64_t ColorClearMetadataSliceSize = 0x1000;
+  static constexpr uint32_t ColorClearSliceCount = 32;
+  static constexpr uint8_t ColorClearConsumedCode = 0xff;
+  static constexpr uint8_t ColorClearRegisterCode = 0x20;
+  // A clear word that no fixed DCC code produces, so only the register clear can explain it.
+  static constexpr uint32_t ColorClearRegisterWord = 0x2a5a96a5u;
+  // Slices whose code is one bit off a real clear code, or a real code with one stray byte.
+  static constexpr uint32_t ColorClearNearMiss21Slice = 5;
+  static constexpr uint32_t ColorClearNearMiss41Slice = 9;
+  static constexpr uint32_t ColorClearStrayByteSlice = 13;
+  static constexpr uint64_t ColorClearStrayByteOffset = 77;
+  // The texels that the fixed DCC codes and the register word clear a 10_10_10_2 target to.
+  static constexpr u32 ColorClearTexel00 = 0;
+  static constexpr u32 ColorClearTexel40 = 0xc0000000u;
+  static constexpr u32 ColorClearTexel80 = 0x3fffffffu;
+  static constexpr u32 ColorClearTexelC0 = 0xffffffffu;
+  static constexpr u32 ColorClearTexelRegister = ColorClearRegisterWord;
+
+  // One slice of a color clear script. A slice that clears ends up as this texel and 0xff
+  // metadata, and any other listed slice keeps the painted texel and its written metadata.
+  struct ColorClearSlice {
+    uint32_t slice;
+    uint8_t code;
+    bool clears;
+    u32 texel;
+    bool stray_byte;
+  };
+
+  // A view over metadata slices first to last. Slices outside the view and slices missing from
+  // the list hold other_code and must be left alone.
+  struct ColorClearCase {
+    const char *label;
+    uint32_t first;
+    uint32_t last;
+    uint8_t other_code;
+    std::vector<ColorClearSlice> slices;
+  };
+
+  // What a color clear pass leaves behind, one texel per volume slice plus all metadata.
+  struct ColorClearScriptResult {
+    std::vector<u32> texels;
+    std::vector<uint8_t> metadata;
+  };
+
+  // The metadata the case writes before the pass.
+  static std::vector<uint8_t> BuildColorClearMetadata(const ColorClearCase &item) {
+    std::vector<uint8_t> metadata(ColorClearSliceCount * ColorClearMetadataSliceSize,
+                                  item.other_code);
+    for (const auto &entry : item.slices) {
+      const auto begin = metadata.begin() + entry.slice * ColorClearMetadataSliceSize;
+      std::fill(begin, begin + ColorClearMetadataSliceSize, entry.code);
+      if (entry.stray_byte) {
+        // One stray byte in an otherwise valid slice means the slice was not cleared.
+        begin[ColorClearStrayByteOffset] = 0x00;
+      }
+    }
+    return metadata;
+  }
+
+  // Invalidates the cached metadata buffer and writes the case's codes to guest backing, so the
+  // pass reads them as a CPU write rather than stale buffer contents.
+  static void WriteColorClearCodes(RenderContext &context, uint64_t dcc_address,
+                                   const std::vector<uint8_t> &metadata) {
+    Require("ColorClearCodeReads", "guest write range",
+            context.InvalidateMemory(dcc_address, metadata.size()),
+            "metadata write is outside the mapped allocation");
+    LibKernel::Memory::WriteBacking(dcc_address, metadata.data(), metadata.size());
+  }
+
+  // Checks every slice against the case's table, so a reader that never clears, clears the wrong
+  // slice or clears the right slice to the wrong colour all fail.
+  static void CheckColorClearCase(const char *name, const ColorClearCase &item,
+                                  u32 painted_texel,
+                                  const ColorClearScriptResult &result) {
+    auto expected_metadata = BuildColorClearMetadata(item);
+    std::vector<u32> expected_texels(ColorClearSliceCount, painted_texel);
+    for (const auto &entry : item.slices) {
+      if (entry.clears && entry.slice >= item.first && entry.slice <= item.last) {
+        expected_texels[entry.slice] = entry.texel;
+        const auto begin = expected_metadata.begin() + entry.slice * ColorClearMetadataSliceSize;
+        std::fill(begin, begin + ColorClearMetadataSliceSize, ColorClearConsumedCode);
+      }
+    }
+    for (uint32_t slice = 0; slice < ColorClearSliceCount; slice++) {
+      char detail[96];
+      std::snprintf(detail, sizeof(detail),
+                    "slice %u has the wrong texel after the color clear pass", slice);
+      Require(name, item.label, result.texels[slice] == expected_texels[slice], detail);
+    }
+    Require(name, item.label, result.metadata == expected_metadata,
+            "the color clear pass left unexpected metadata bytes");
+  }
+
+  // Runs distinct clear codes, near misses and consumed codes through one strided code read and
+  // checks every slice's texel and metadata against an explicit table.
+  void CheckColorClearCodeReads() {
+    constexpr const char *name = "ColorClearCodeReads";
+    constexpr uintptr_t base = 0x0000000203e00000ull;
+    constexpr uint64_t slice_size = 0x10000;
+    constexpr uint64_t color_size = 0x200000;
+    constexpr uint64_t metadata_size = ColorClearSliceCount * ColorClearMetadataSliceSize;
+    constexpr uint64_t allocation_size = 56 * slice_size;
+    constexpr uint64_t dcc_address = base + color_size;
+    const std::vector<ColorClearCase> cases = {
+        {"full view",
+         0,
+         ColorClearSliceCount - 1,
+         ColorClearConsumedCode,
+         {{3, 0x00, true, ColorClearTexel00, false},
+          {11, 0x40, true, ColorClearTexel40, false},
+          {17, 0x80, true, ColorClearTexel80, false},
+          {23, 0xc0, true, ColorClearTexelC0, false},
+          {19, ColorClearRegisterCode, true, ColorClearTexelRegister, false},
+          {ColorClearNearMiss21Slice, 0x21, false, 0, false},
+          {ColorClearNearMiss41Slice, 0x41, false, 0, false},
+          {ColorClearStrayByteSlice, 0x40, false, 0, true}}},
+        {"view from slice 4",
+         4,
+         7,
+         0xc0,
+         {{4, 0x80, true, ColorClearTexel80, false},
+          {5, ColorClearConsumedCode, false, 0, false},
+          {6, 0x40, true, ColorClearTexel40, false},
+          {7, 0x21, false, 0, false}}}};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, slice_size, 0, &direct_offset) == 0,
+            "color-clear direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, slice_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "color-clear fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.dcc_compression_enable = true,
+              .format = Prospero::ChannelLayout::k10_10_10_2,
+              .channel_type = Prospero::ChannelType::kUNorm,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 31, .width = 31});
+      registers.SetColorAttrib3(0, {.depth = 31,
+                                    .tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 2,
+                                    .metadata_pipe_aligned = true});
+      registers.SetColorDccAddr(0, {.addr = dcc_address});
+      registers.SetColorClearWord0(0, {.word0 = ColorClearRegisterWord});
+      registers.SetColorClearWord1(0, {.word1 = 0});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      WriteMetadata(context, dcc_address, metadata_size, UINT32_MAX);
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         color, 0);
+      (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
+      vk::ClearValue painted{};
+      painted.color.float32 = std::array{0.5f, 0.25f, 0.75f, 0.33f};
+      for (const auto &item : cases) {
+        for (uint32_t slice = 0; slice < ColorClearSliceCount; slice++) {
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, slice, 1}, painted);
+        }
+        const u32 painted_texel = ReadCachedTexel(name, context, color.image_id, {0, 0, 1})[0];
+        WriteColorClearCodes(context, dcc_address, BuildColorClearMetadata(item));
+        RenderExecutorTestAccess::ResetBindings(executor);
+        registers.SetColorView(0, {.base_array_slice_index = item.first,
+                                   .last_array_slice_index = item.last});
+        RenderColorInfo view{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           view, 0);
+        (void)texture_cache.FindRenderTarget(view.image_id, view.desc);
+        ColorClearScriptResult result;
+        for (uint32_t slice = 0; slice < ColorClearSliceCount; slice++) {
+          result.texels.push_back(ReadCachedTexel(name, context, color.image_id,
+                                                  {0, 0, static_cast<int32_t>(slice)})[0]);
+        }
+        result.metadata.resize(metadata_size);
+        context.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+        Require(name, "metadata readback",
+                LibKernel::Memory::TryReadBacking(dcc_address, result.metadata.data(),
+                                                  result.metadata.size()),
+                "the metadata backing could not be read");
+        CheckColorClearCase(name, item, painted_texel, result);
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "color-clear direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "color-clear direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   static void WriteMetadata(RenderContext &context, uint64_t address,
                             uint64_t size, uint32_t value) {
     Require("DccMetadata", "guest write range", size % sizeof(value) == 0 &&
@@ -55043,6 +55261,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckColorClearCodeReads();
     vulkan.CheckRenderExecutorColorMetadataClear();
     return 0;
   }
@@ -55363,6 +55582,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckColorResolvePlacedTarget();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckColorClearCodeReads();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();

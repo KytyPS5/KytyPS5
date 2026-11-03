@@ -36,6 +36,38 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+// Every clear code DecodeColorClear accepts (DCC 0x00, 0x20, 0x40, 0x80 and 0xc0, CMask 0x00)
+// has these bits clear. The steady state code 0xff does not, so it skips the decode.
+constexpr uint8_t ColorClearCodeLowBits = 0x1f;
+// Slice counts up to this read their codes into the stack. Larger views fall back to the heap.
+constexpr uint32_t ColorClearCodesOnStack = 128;
+
+// Reads the first byte of each of count metadata slices in one locked pass, so a clear applied
+// later cannot change a code that is still to be read. Slice counts up to
+// ColorClearCodesOnStack stay on the stack so the common case allocates nothing, and larger
+// views fall back to the heap. It exits on an unreadable slice.
+class ColorClearCodes {
+public:
+	ColorClearCodes(uint64_t first, uint64_t stride, uint32_t count) {
+		m_codes = m_stack.data();
+		if (count > m_stack.size()) {
+			m_heap.resize(count);
+			m_codes = m_heap.data();
+		}
+		if (!LibKernel::Memory::TryReadBackingStrided(first, stride, count, m_codes)) {
+			EXIT("TextureCache: failed to read color metadata backing\n");
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(ColorClearCodes);
+
+	[[nodiscard]] uint8_t operator[](uint32_t slice) const { return m_codes[slice]; }
+
+private:
+	std::array<uint8_t, ColorClearCodesOnStack> m_stack;
+	std::vector<uint8_t>                        m_heap;
+	uint8_t*                                    m_codes = nullptr;
+};
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -1119,11 +1151,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
+	const ColorClearCodes codes(run(0), slice_size, count);
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
-		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+		const auto code    = codes[slice];
+		if ((code & ColorClearCodeLowBits) != 0) {
+			continue;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {

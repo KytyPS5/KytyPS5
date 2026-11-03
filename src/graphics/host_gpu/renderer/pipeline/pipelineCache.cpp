@@ -32,6 +32,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -232,13 +233,70 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 	return formats;
 }
 
+constexpr uint32_t AmdVendorId   = 0x1002u;
+constexpr uint32_t AppleVendorId = 0x106Bu;
+
+// Why the opt-in does or does not reach the shaders.
+enum class HostFloatMinMaxVerdict { FlagOff, Enabled, AmdNative, Apple, MissingFloat32Property };
+
+// Decides whether the opt-in reaches the shaders on this device.
+HostFloatMinMaxVerdict HostFloatMinMaxVerdictFor(const GraphicContext& graphics, bool flag_on) {
+	if (!flag_on) {
+		return HostFloatMinMaxVerdict::FlagOff;
+	}
+	const auto vendor = graphics.physical_device_properties.vendorID;
+	if (vendor == AmdVendorId) {
+		return HostFloatMinMaxVerdict::AmdNative;
+	}
+	// MoltenVK may report the vendor of the GPU underneath, so its driver id counts as well.
+	if (vendor == AppleVendorId || graphics.moltenvk_driver) {
+		return HostFloatMinMaxVerdict::Apple;
+	}
+	// The SignedZeroInfNanPreserve mode the shaders request is only honoured with the property.
+	if (!graphics.float32_signed_zero_inf_nan_preserve) {
+		return HostFloatMinMaxVerdict::MissingFloat32Property;
+	}
+	return HostFloatMinMaxVerdict::Enabled;
+}
+
+// Tells once per process whether the opt-in took effect, so a run can be checked from its log.
+void LogHostFloatMinMaxVerdict(HostFloatMinMaxVerdict verdict) {
+	// Returning before the once-flag keeps a flag-off call from using up the one log line.
+	if (verdict == HostFloatMinMaxVerdict::FlagOff) {
+		return;
+	}
+	static std::once_flag logged;
+	std::call_once(logged, [verdict] {
+		switch (verdict) {
+			case HostFloatMinMaxVerdict::Enabled:
+				LOGF("Native float min/max: host min/max enabled\n");
+				break;
+			case HostFloatMinMaxVerdict::AmdNative:
+				LOGF("Native float min/max: host min/max not needed, AMD already uses it\n");
+				break;
+			case HostFloatMinMaxVerdict::Apple:
+				LOGF("Native float min/max: host min/max disabled, Apple/MoltenVK is not supported\n");
+				break;
+			case HostFloatMinMaxVerdict::MissingFloat32Property:
+				LOGF("Native float min/max: host min/max disabled, the device lacks "
+				     "shaderSignedZeroInfNanPreserveFloat32\n");
+				break;
+			case HostFloatMinMaxVerdict::FlagOff: break; // Handled above.
+		}
+	});
+}
+
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
-	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
-	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	const bool flag_on = Config::NativeFloatMinMaxEnabled();
+	const auto verdict = HostFloatMinMaxVerdictFor(graphics, flag_on);
+	LogHostFloatMinMaxVerdict(verdict);
+	// AMD GPUs run NMin/NMax as v_min/v_max, which give the guest's NaN and signed-zero
+	// results. GLSL.std.450 alone does not order -0 below +0.
 	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .native_float_min_max   = graphics.physical_device_properties.vendorID == AmdVendorId,
+	        .host_float_min_max     = verdict == HostFloatMinMaxVerdict::Enabled,
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,

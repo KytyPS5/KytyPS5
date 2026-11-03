@@ -47,6 +47,10 @@ struct GraphicContext {
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
+	// The device keeps the sign of zero, infinities and NaNs in 32-bit shader math.
+	bool                               float32_signed_zero_inf_nan_preserve  = false;
+	// MoltenVK can report the vendor of the GPU underneath, so the driver id marks it.
+	bool                               moltenvk_driver                       = false;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);

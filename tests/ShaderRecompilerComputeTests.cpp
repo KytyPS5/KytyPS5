@@ -34,6 +34,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1364,6 +1365,64 @@ void CheckNativeFloatMinMaxConfig() {
   Require(name, "on when set", Config::NativeFloatMinMaxEnabled(),
           "setting the field did not enable native float min/max");
   Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+constexpr uint32_t AmdVendorIdForTests = 0x1002u;
+constexpr uint32_t AppleVendorIdForTests = 0x106bu;
+
+// One fake device for the host min/max gate.
+struct HostMinMaxDevice {
+  const char *label;
+  uint32_t vendor;
+  bool float32_property;
+  bool moltenvk_driver;
+  bool expect_host; // With the flag on.
+};
+
+// Serialized profile bytes, as the shader store header writes them.
+std::vector<uint8_t> ProfileBytes(const ShaderRecompiler::Spirv::Profile &profile) {
+  ShaderRecompiler::IR::Writer writer;
+  ShaderRecompiler::IR::IoAll(writer, ShaderRecompiler::Spirv::Profile(profile));
+  return writer.bytes;
+}
+
+// The opt-in reaches the profile only on a non-AMD, non-Apple device with the Float32 property.
+void CheckSpirvProfileNativeFloatMinMax() {
+  constexpr const char *name = "SpirvProfileNativeFloatMinMax";
+  constexpr uint32_t amd = AmdVendorIdForTests, nvidia = 0x10deu, intel = 0x8086u,
+                     apple = AppleVendorIdForTests;
+  const HostMinMaxDevice devices[] = {
+      {"nvidia", nvidia, true, false, true},
+      {"intel", intel, true, false, true},
+      {"nvidia without property", nvidia, false, false, false},
+      {"apple vendor", apple, true, false, false},
+      {"moltenvk on nvidia id", nvidia, true, true, false},
+      {"amd", amd, true, false, false},
+      {"amd without property", amd, false, false, false},
+  };
+  for (const auto &device : devices) {
+    GraphicContext graphics;
+    graphics.physical_device_properties.vendorID = device.vendor;
+    graphics.float32_signed_zero_inf_nan_preserve = device.float32_property;
+    graphics.moltenvk_driver = device.moltenvk_driver;
+    graphics.maintenance8_enabled = true;
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    const auto off = SpirvProfile(graphics);
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .native_float_min_max_enabled = true});
+    const auto on = SpirvProfile(graphics);
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    const bool is_amd = device.vendor == amd;
+    Require(name, device.label,
+            !off.host_float_min_max && on.host_float_min_max == device.expect_host &&
+                off.native_float_min_max == is_amd && on.native_float_min_max == is_amd,
+            "the host min/max gate disagreed with the device, or the flag changed native_float_min_max");
+    const bool bytes_differ = ProfileBytes(off) != ProfileBytes(on);
+    Require(name, device.label,
+            bytes_differ == device.expect_host,
+            "the serialized profile did not change exactly when host min/max turned on");
+  }
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -22507,6 +22566,17 @@ private:
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
+    // The production device query fills these, and the profile gate reads them.
+    vk::PhysicalDeviceDriverProperties driver_properties{};
+    vk::PhysicalDeviceFloatControlsProperties float_controls{};
+    float_controls.pNext = &driver_properties;
+    vk::PhysicalDeviceProperties2 float_controls_query{};
+    float_controls_query.pNext = &float_controls;
+    m_physical_device.getProperties2(&float_controls_query);
+    m_runtime_context.float32_signed_zero_inf_nan_preserve =
+        float_controls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
+    m_runtime_context.moltenvk_driver =
+        driver_properties.driverID == vk::DriverId::eMoltenvk;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -48250,6 +48320,28 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   warm.compiled = {};
   Require(name, "warm restart", run() == warm && std::filesystem::file_size(store) == size,
           "a restart compiled a module, created a pipeline late or rewrote the store");
+  // The opt-in is in the header only where it changes the SPIR-V, so toggling it starts the store
+  // over there. Elsewhere it must leave the store warm. A baseline run without the flag is the
+  // warm restart above, so only the flag can explain the difference.
+  {
+    const auto &device = vulkan.RuntimeContext();
+    const bool host_min_max =
+        device.physical_device_properties.vendorID != AmdVendorIdForTests &&
+        device.physical_device_properties.vendorID != AppleVendorIdForTests && !device.moltenvk_driver &&
+        device.float32_signed_zero_inf_nan_preserve;
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .native_float_min_max_enabled = true});
+    const auto with_flag = run();
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    Require(name, "native min/max header",
+            with_flag == (host_min_max ? cold : warm) &&
+                std::filesystem::file_size(store) == size,
+            host_min_max ? "turning the opt-in on reused a store built without it"
+                         : "the opt-in invalidated the store on a host where it changes nothing");
+    // Turning it off again must not reuse the store written with it.
+    Require(name, "native min/max header off", run() == (host_min_max ? cold : warm),
+            "turning the opt-in off reused a store built with it");
+  }
   std::filesystem::resize_file(store, size + 3);
   Require(name, "torn tail", run() == warm && std::filesystem::file_size(store) == size,
           "a torn last record was kept");
@@ -54025,6 +54117,7 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckNativeFloatMinMaxConfig();
+  CheckSpirvProfileNativeFloatMinMax();
   if (argc == 2 && std::strcmp(argv[1], "--native-float-minmax-only") == 0) {
     return 0;
   }

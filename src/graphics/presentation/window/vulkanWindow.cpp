@@ -469,12 +469,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 
 	vk::StructureChain<
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
-	    vk::PhysicalDeviceRobustness2PropertiesEXT, vk::PhysicalDeviceVulkan11Properties,
-	    vk::PhysicalDeviceSubgroupSizeControlProperties, vk::PhysicalDevicePushDescriptorProperties,
-	    vk::PhysicalDeviceMeshShaderPropertiesEXT>
+	    vk::PhysicalDeviceDriverProperties, vk::PhysicalDeviceRobustness2PropertiesEXT,
+	    vk::PhysicalDeviceVulkan11Properties, vk::PhysicalDeviceSubgroupSizeControlProperties,
+	    vk::PhysicalDevicePushDescriptorProperties, vk::PhysicalDeviceMeshShaderPropertiesEXT>
 	    properties;
-	auto& [properties2, float_controls, robustness2_props, properties11, subgroup_control,
-	       push_descriptor, mesh_properties] = properties;
+	auto& [properties2, float_controls, driver_properties, robustness2_props, properties11,
+	       subgroup_control, push_descriptor, mesh_properties] = properties;
 	if (!graphics.mesh_shader_enabled) {
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
@@ -485,6 +485,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
 
+	graphics.float32_signed_zero_inf_nan_preserve =
+	    float_controls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
+	graphics.moltenvk_driver   = driver_properties.driverID == vk::DriverId::eMoltenvk;
 	const auto subgroup_stages = subgroup_control.requiredSubgroupSizeStages;
 	graphics.subgroup_size     = properties11.subgroupSize;
 	graphics.min_subgroup_size = subgroup_control.minSubgroupSize;

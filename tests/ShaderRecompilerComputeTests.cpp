@@ -235,6 +235,11 @@ struct CommandSchedulerTestAccess {
   }
 };
 
+struct CommandBufferTestAccess {
+  // Whether a render pass is open in the command buffer.
+  static bool Rendering(const CommandBuffer &command) { return command.m_rendering; }
+};
+
 struct ImageTestAccess {
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
@@ -12337,13 +12342,28 @@ public:
     CommandScheduler &scheduler;
     CommandProcessor &processor;
     vk::Semaphore gate = nullptr;
+    uint64_t empty_shader = 0;
     std::once_flag gate_released;
   };
 
   static constexpr const char *CadenceTestName = "GpuSubmitCadence";
   static constexpr u32 CadenceDispatches = 8;
+  static constexpr uint64_t CadenceMinimumSplits = 2;
   static constexpr u32 CadenceNopOnlyPackets = 17;
   static constexpr u32 CadenceWaveSize = 64;
+  static constexpr u32 CadenceInitialWord = 100;
+  // Out of bounds select 3 turns off the range checks, which would zero loads from a raw buffer.
+  static constexpr u32 CadenceRawBoundsMode = 3;
+  // The kernel mapping arguments: read and write access at a fixed address.
+  static constexpr int CadenceProtectReadWrite = 0x3;
+  static constexpr int CadenceMapFixed = 0x10;
+  static constexpr uint64_t CadenceMemorySize = 0x10000;
+  // Where the second buffer or target of a case lives, so both runs have their own memory.
+  static constexpr uint64_t CadenceSecondRegion = 0x4000;
+  // A raw buffer descriptor is four dwords, which are the user registers the shader receives.
+  static constexpr u32 CadenceDescriptorDwords = 4;
+  static constexpr u32 CadenceFormatShift = 12;
+  static constexpr u32 CadenceBoundsShift = 28;
   static constexpr u32 CadenceNopPacketDw = 3;
   static constexpr u32 CadenceDispatchPacketDw = 5;
   static constexpr u32 CadenceIndirectPacketDw = 4;
@@ -12612,6 +12632,347 @@ public:
             "the due submit was held back by a lag that no longer exists");
   }
 
+  // Guest memory a case reads or writes, mapped for the GPU for as long as the case runs.
+  struct CadenceMemory {
+    uintptr_t base;
+    uint64_t size;
+    int64_t physical = -1;
+  };
+
+  // Allocates, maps and registers guest memory with the GPU caches.
+  void MapCadenceMemory(CadenceFixture &fixture, CadenceMemory &memory) {
+    Require(CadenceTestName, "memory allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), memory.size, memory.size, 0,
+                &memory.physical) == 0,
+            "cadence memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(memory.base);
+    Require(CadenceTestName, "memory map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, memory.size, CadenceProtectReadWrite,
+                                                     CadenceMapFixed,
+                                                     memory.physical, memory.size) == 0 &&
+                mapped == reinterpret_cast<void *>(memory.base),
+            "cadence memory mapping failed");
+    // Filled before the GPU tracks the pages, so the first upload carries this word.
+    const std::vector<u32> initial(memory.size / sizeof(u32), CadenceInitialWord);
+    Require(CadenceTestName, "memory fill",
+            LibKernel::Memory::TryWriteBacking(memory.base, initial.data(), memory.size),
+            "cadence memory could not be filled");
+    fixture.context.MapMemory(memory.base, memory.size);
+  }
+
+  // Drains the GPU before the memory goes away.
+  void UnmapCadenceMemory(CadenceFixture &fixture, const CadenceMemory &memory) {
+    fixture.scheduler.Finish();
+    fixture.context.UnmapMemory(memory.base, memory.size);
+    Require(CadenceTestName, "memory release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(memory.physical, memory.size) == 0,
+            "cadence memory release failed");
+  }
+
+  // Makes a compute shader current, with the user registers the cases fill in afterwards.
+  static void SelectCadenceShader(CommandProcessor &processor, uint64_t address,
+                                  uint8_t user_sgpr) {
+    processor.GetShCtx().SetCsShader({.data_addr = address, .num_thread_x = CadenceWaveSize,
+                                      .num_thread_y = 1, .num_thread_z = 1,
+                                      .wave_size = CadenceWaveSize, .user_sgpr = user_sgpr});
+  }
+
+  // out[lane] += 1 on the buffer in the first four user registers. Each lane owns one dword, so
+  // the result only comes out right if every dispatch sees the stores of the earlier ones.
+  static std::vector<u32> CadenceReadModifyWriteShader() {
+    constexpr u32 lshlrev_opcode = 0x1a;
+    constexpr u32 add_opcode = 0x25;
+    constexpr u32 load_dword_opcode = 0x0c;
+    constexpr u32 store_dword_opcode = 0x1c;
+    constexpr u32 waitcnt_opcode = 0x0c;
+    constexpr u32 dword_shift = 2;
+    constexpr u32 lane_vgpr = 0;
+    constexpr u32 address_vgpr = 2;
+    constexpr u32 data_vgpr = 1;
+    constexpr u32 buffer_descriptor = 0;
+    constexpr u32 wait_for_everything = 0;
+    constexpr u32 increment = 1;
+    std::vector<u32> code{
+        EncodeVop2(lshlrev_opcode, address_vgpr, InlineU32(dword_shift), lane_vgpr),
+        EncodeMubuf0(load_dword_opcode), EncodeMubuf1(data_vgpr, buffer_descriptor, address_vgpr),
+        EncodeSopp(waitcnt_opcode, wait_for_everything),
+        EncodeVop2(add_opcode, data_vgpr, InlineU32(increment), data_vgpr),
+        EncodeMubuf0(store_dword_opcode), EncodeMubuf1(data_vgpr, buffer_descriptor, address_vgpr)};
+    AppendEnd(&code);
+    return code;
+  }
+
+  // Points the compute shader at a raw buffer of one dword per lane.
+  static void BindCadenceBuffer(CommandProcessor &processor, uint64_t address) {
+    ShaderBufferResource descriptor{};
+    descriptor.UpdateAddress48(address);
+    descriptor.fields[2] = CadenceWaveSize * sizeof(u32);
+    // DstSel(4, 5, 6, 7) is the identity channel select, x y z w.
+    descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+                           (static_cast<u32>(Prospero::BufferFormat::k32UInt) << CadenceFormatShift) |
+                           (CadenceRawBoundsMode << CadenceBoundsShift);
+    for (u32 i = 0; i < CadenceDescriptorDwords; ++i) {
+      processor.GetShCtx().SetCsUserSgpr(i, descriptor.fields[i]);
+    }
+  }
+
+  // Runs N read-modify-write dispatches in one stream over a buffer of the initial word, drains
+  // the GPU and returns the buffer and what the stream did to the counters.
+  std::pair<std::vector<u32>, CadenceCounts> RunCadenceReadModifyWrite(
+      CadenceFixture &fixture, uint64_t address, bool enabled) {
+    constexpr u32 byte_size = CadenceWaveSize * sizeof(u32);
+    BindCadenceBuffer(fixture.processor, address);
+    const auto counts = RunCadence(fixture, enabled, CadenceImmediately,
+                                   CadenceDispatchStream(CadenceDispatches));
+    fixture.scheduler.Finish();
+    fixture.context.GetBufferCache().ReadMemory(address, byte_size);
+    std::vector<u32> words(CadenceWaveSize);
+    Require(CadenceTestName, "buffer read",
+            LibKernel::Memory::TryReadBacking(address, words.data(), byte_size),
+            "the buffer could not be read back");
+    return {words, counts};
+  }
+
+  // T4. The same dispatches over the same buffer give the same words with the cadence on and off.
+  // One stream is used, rather than one stream per dispatch with a Finish between, because a
+  // Finish would hide a lost barrier or lost work at a split. In one stream the lag guard may
+  // hold some submits back, but the first dispatch always finds the GPU caught up, so at least
+  // one split lies between dependent dispatches. The second dispatch finds at most one submit
+  // still running, which is below the lag limit, so two splits are certain.
+  void CheckCadenceBuffers(CadenceFixture &fixture) {
+    constexpr uintptr_t base = 0x0000000204f00000ull;
+    const auto code = CadenceReadModifyWriteShader();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture, memory);
+    SelectCadenceShader(fixture.processor, reinterpret_cast<uint64_t>(code.data()),
+                        CadenceDescriptorDwords);
+    const auto off = RunCadenceReadModifyWrite(fixture, base, false);
+    // Only the flag differs from the case above.
+    const auto on = RunCadenceReadModifyWrite(fixture, base + CadenceSecondRegion, true);
+    const std::vector<u32> expected(CadenceWaveSize, CadenceInitialWord + CadenceDispatches);
+    Require(CadenceTestName, "T4 flag off counts every dispatch", off.first == expected,
+            "the unsplit run did not add once per dispatch");
+    Require(CadenceTestName, "T4 the split run is split",
+            on.second.cadence_submits >= CadenceMinimumSplits &&
+                on.second.cadence_submits + on.second.held_back == CadenceDispatches,
+            "submits=" + std::to_string(on.second.cadence_submits) +
+                " held back=" + std::to_string(on.second.held_back));
+    Require(CadenceTestName, "T4 splitting changes no word", on.first == off.first,
+            "the words differ between the split and the unsplit run");
+    UnmapCadenceMemory(fixture, memory);
+    SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
+  }
+
+  // A triangle covering the whole viewport, built from the vertex id in v5. Vertex 0 is (-1, -1),
+  // vertex 1 is (3, -1) and vertex 2 is (-1, 3). That is the usual big triangle, whose visible
+  // part is the whole clip square. The position goes out as x y 0 1.
+  static std::vector<u32> CadenceTriangleVertexShader() {
+    constexpr u32 minus_one_bits = 0xbf800000u;
+    constexpr u32 three_bits = 0x40400000u;
+    constexpr u32 one_bits = 0x3f800000u;
+    constexpr u32 compare_eq_opcode = 0xc2;
+    constexpr u32 cndmask_opcode = 0x01;
+    constexpr u32 vertex_id_vgpr = 5;
+    constexpr u32 low_vgpr = 1;
+    constexpr u32 high_vgpr = 2;
+    constexpr u32 x_vgpr = 3;
+    constexpr u32 y_vgpr = 4;
+    constexpr u32 zero_vgpr = 0;
+    constexpr u32 one_vgpr = 6;
+    constexpr u32 position_target = 0x0c;
+    constexpr u32 all_components = 0xf;
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, low_vgpr, minus_one_bits);
+    AppendVMovLiteral(&code, high_vgpr, three_bits);
+    // Each coordinate takes 3 for its own vertex id and -1 otherwise.
+    code.push_back(EncodeVopc(compare_eq_opcode, InlineU32(1), vertex_id_vgpr));
+    code.push_back(EncodeVop2(cndmask_opcode, x_vgpr, Vgpr(low_vgpr), high_vgpr));
+    code.push_back(EncodeVopc(compare_eq_opcode, InlineU32(2), vertex_id_vgpr));
+    code.push_back(EncodeVop2(cndmask_opcode, y_vgpr, Vgpr(low_vgpr), high_vgpr));
+    AppendVMovU32(&code, zero_vgpr, 0);
+    AppendVMovLiteral(&code, one_vgpr, one_bits);
+    code.push_back(EncodeExp0(position_target, all_components));
+    code.push_back(EncodeExp1(x_vgpr, y_vgpr, zero_vgpr, one_vgpr));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // A pixel shader exporting one constant colour to target 0.
+  static std::vector<u32> CadenceColorPixelShader(const std::array<float, 4> &color) {
+    std::vector<u32> code;
+    for (u32 component = 0; component < color.size(); ++component) {
+      AppendVMovLiteral(&code, component, std::bit_cast<u32>(color[component]));
+    }
+    code.push_back(EncodeExp0(0, 0xf));
+    code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // Registers one float colour target in linear memory, with the viewport covering all of it.
+  static void SetupCadenceColorTarget(HW::Context &registers, uint64_t address, u32 extent) {
+    constexpr u32 viewport_transform = 0x300;
+    constexpr u32 pixel_input_control = 0x8000;
+    constexpr u32 color_export_mode = 4;
+    constexpr u32 first_slot_mask = 0xf;
+    registers.Reset();
+    registers.SetViewportTransformControl(viewport_transform);
+    registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+    registers.SetViewportZMax(0, 1);
+    registers.SetRenderTargetMask(first_slot_mask);
+    registers.SetShaderMask(first_slot_mask);
+    registers.SetPsInControl(pixel_input_control);
+    registers.SetColorBase(0, {.addr = address});
+    registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                               .channel_type = Prospero::ChannelType::kFloat,
+                               .channel_order = Prospero::ChannelOrder::kStandard});
+    registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+    registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    registers.SetTargetOutputMode(0, color_export_mode);
+  }
+
+  // Limits the next draw to the columns [left, right) of the target.
+  static void SetCadenceDrawColumns(HW::Context &registers, u32 left, u32 right, u32 extent) {
+    registers.SetScreenScissor(left, 0, right, extent);
+    registers.SetWindowScissor(left, 0, right, extent, false);
+    registers.SetGenericScissor(left, 0, right, extent, false);
+    registers.SetViewportScissorTL(0, left, 0, false);
+    registers.SetViewportScissorBR(0, right, extent);
+  }
+
+  // Maps a pixel shader and makes it the current one.
+  static void SelectCadencePixelShader(CommandProcessor &processor, const std::vector<u32> &code) {
+    const auto address = reinterpret_cast<uint64_t>(code.data());
+    ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kPs,
+                                .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    processor.GetShCtx().SetPsShaderBase(address);
+  }
+
+  // One draw of the vertex shader's triangle as a PM4 packet, so the cadence hook sees it.
+  static std::vector<u32> CadenceDrawStream() {
+    constexpr u32 draw_packet_dw = 3;
+    constexpr u32 vertex_count = 3;
+    constexpr u32 auto_index_initiator = 2;
+    return {KYTY_PM4(draw_packet_dw, Pm4::IT_DRAW_INDEX_AUTO, 0u), vertex_count,
+            auto_index_initiator};
+  }
+
+  // What one run of the two draws produced.
+  struct CadenceDraws {
+    std::vector<u32> pixels;
+    bool pass_open_after_a;
+    uint64_t cadence_submits;
+  };
+
+  // Draws A into the left columns and B into the right ones of the target at the given address,
+  // as two streams so that a split falls between them. Each run has its own target, so pixels left
+  // by an earlier run can never stand in for work a run lost. Returns the target, whether A's
+  // pass was still open when its stream ended, and the cadence submits the two streams made.
+  CadenceDraws RunCadenceDraws(CadenceFixture &fixture, uint64_t target_address, bool enabled,
+                               const std::array<std::vector<u32>, 2> &pixel_shaders, u32 extent) {
+    auto &registers = fixture.processor.GetCtx();
+    fixture.scheduler.Finish();
+    registers.SetColorBase(0, {.addr = target_address});
+    RenderColorInfo color{};
+    RenderExecutorTestAccess::ResolveRenderColorTarget(
+        fixture.context.GetRenderExecutor(), fixture.scheduler.Current(), color, 0);
+    const auto image = color.image_id;
+    // A known start, so a region nobody drew into is comparable between the runs.
+    TextureCacheTestAccess::ClearImage(fixture.context.GetTextureCache(),
+                                       fixture.scheduler.Current(), image,
+                                       {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler,
+                                           SubmitCadence(enabled, CadenceImmediately));
+    CadenceDraws result{};
+    for (u32 draw = 0; draw < pixel_shaders.size(); ++draw) {
+      SetCadenceDrawColumns(registers, draw * extent / 2, (draw + 1) * extent / 2, extent);
+      SelectCadencePixelShader(fixture.processor, pixel_shaders[draw]);
+      result.cadence_submits +=
+          RunCadenceStream(fixture.processor, CadenceDrawStream()).cadence_submits;
+      if (draw == 0) {
+        result.pass_open_after_a = CommandBufferTestAccess::Rendering(fixture.scheduler.Current());
+      }
+    }
+    fixture.scheduler.Finish();
+    result.pixels = ReadCachedTexel(CadenceTestName, fixture.context, image, {},
+                                    {extent, extent, 1});
+    return result;
+  }
+
+  // T5. A render pass split by a cadence submit between two draws keeps the first draw's pixels.
+  // The draws cover disjoint columns in different colours, so a pass that reopened with a clear
+  // would wipe the first colour from the left half. The draws are separate streams, so a hook
+  // that fired only at the end of a stream would pass too. T1 to T3 cover where the hook sits in
+  // the packet loop. The depth case needs no split test. The HTILE meta clear is consumed per
+  // draw in AcquireRenderTargets through TouchMeta, before any pass begins, and BeginRendering
+  // only clears depth when depth_clear is set. A split therefore changes neither whether the
+  // clear is consumed nor when.
+  void CheckCadenceRenderPass(CadenceFixture &fixture) {
+    constexpr u32 extent = 16;
+    constexpr std::array<float, 4> first_color{1.0f, 0.0f, 0.0f, 1.0f};
+    constexpr std::array<float, 4> second_color{0.0f, 0.0f, 1.0f, 1.0f};
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture, memory);
+    const auto vertex = CadenceTriangleVertexShader();
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex.data());
+    ShaderMapUserData(vertex_address, {.type = Prospero::ShaderBinaryType::kGs,
+                                       .user_data = &vertex_user_data,
+                                       .code_size_bytes = static_cast<u32>(vertex.size() * sizeof(u32))});
+    auto &registers = fixture.processor.GetCtx();
+    SetupCadenceColorTarget(registers, base, extent);
+    fixture.processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    fixture.processor.GetShCtx().SetEsShaderBase(vertex_address);
+    const std::array pixel_shaders{CadenceColorPixelShader(first_color),
+                                   CadenceColorPixelShader(second_color)};
+    const auto unsplit = RunCadenceDraws(fixture, base, false, pixel_shaders, extent);
+    // Only the flag and the target differ from the case above.
+    const auto split =
+        RunCadenceDraws(fixture, base + CadenceSecondRegion, true, pixel_shaders, extent);
+    CheckCadenceRenderPassResults(unsplit, split, first_color, second_color, extent,
+                                  pixel_shaders.size());
+    UnmapCadenceMemory(fixture, memory);
+    SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
+  }
+
+  // The checks of T5, separate to keep each function short.
+  void CheckCadenceRenderPassResults(const CadenceDraws &unsplit, const CadenceDraws &split,
+                                     const std::array<float, 4> &first_color,
+                                     const std::array<float, 4> &second_color, u32 extent,
+                                     size_t draw_count) {
+    const auto region_is = [&](const CadenceDraws &draws, u32 left, u32 right,
+                               const std::array<float, 4> &color) {
+      for (u32 y = 0; y < extent; ++y) {
+        for (u32 x = left; x < right; ++x) {
+          for (u32 c = 0; c < color.size(); ++c) {
+            if (draws.pixels[(y * extent + x) * color.size() + c] !=
+                std::bit_cast<u32>(color[c])) {
+              return false;
+            }
+          }
+        }
+      }
+      return true;
+    };
+    Require(CadenceTestName, "T5 the unsplit pass is open between the draws",
+            unsplit.pass_open_after_a && unsplit.cadence_submits == 0,
+            "the baseline closed its pass or made a cadence submit");
+    Require(CadenceTestName, "T5 the cadence closed the pass between the draws",
+            !split.pass_open_after_a && split.cadence_submits == draw_count,
+            "cadence submits were " + std::to_string(split.cadence_submits));
+    Require(CadenceTestName, "T5 the unsplit draws land",
+            region_is(unsplit, 0, extent / 2, first_color) &&
+                region_is(unsplit, extent / 2, extent, second_color),
+            "the baseline did not draw both regions");
+    Require(CadenceTestName, "T5 a split pass keeps the first draw", split.pixels == unsplit.pixels,
+            "the pixels changed when the pass was split");
+  }
+
   // Creates the timeline semaphore that holds the GPU in the lag case.
   vk::Semaphore CreateCadenceGate() {
     vk::SemaphoreTypeCreateInfo timeline_type{};
@@ -12655,6 +13016,9 @@ public:
       CadenceFixture fixture{context, context.GetCommandScheduler(), processor, gate};
       // The first dispatch compiles its pipeline, which is not part of any case below.
       (void)RunCadence(fixture, false, CadenceImmediately, CadenceDispatchStream(1));
+      fixture.empty_shader = reinterpret_cast<uint64_t>(code.data());
+      CheckCadenceBuffers(fixture);
+      CheckCadenceRenderPass(fixture);
       CheckCadenceDispatches(fixture);
       CheckCadenceIdle(fixture);
       CheckCadenceIndirect(fixture);
@@ -54260,6 +54624,118 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// What the occlusion cadence case saw around one stream.
+struct CadenceOcclusionRun {
+  bool pending = false;
+  bool published_by_flush = false;
+  uint64_t cadence_submits = 0;
+  uint64_t gpu_waits = 0;
+};
+
+constexpr uint32_t CadenceDumpPacketDw = 4;
+constexpr uint32_t CadenceNopDw = 3;
+constexpr uint32_t CadenceDispatchPacketDw = 5;
+// The dump, a NOP, the dispatch and a NOP.
+constexpr size_t CadenceOcclusionStreamDw =
+    CadenceDumpPacketDw + CadenceNopDw + CadenceDispatchPacketDw + CadenceNopDw;
+
+// A dump to the results, then a dispatch between NOPs. Only the dispatch makes a submit due.
+std::array<uint32_t, CadenceOcclusionStreamDw> CadenceOcclusionStream(uint64_t results_address) {
+  constexpr uint32_t dump_packet_dw = CadenceDumpPacketDw;
+  constexpr uint32_t dump_event_word = 0x139u;
+  constexpr uint32_t nop_packet_dw = CadenceNopDw;
+  constexpr uint32_t dispatch_packet_dw = CadenceDispatchPacketDw;
+  constexpr uint32_t dispatch_mode = 0x41u;
+  const auto nop = KYTY_PM4(nop_packet_dw, Pm4::IT_NOP, Pm4::R_ZERO);
+  return {KYTY_PM4(dump_packet_dw, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO), dump_event_word,
+          static_cast<uint32_t>(results_address), static_cast<uint32_t>(results_address >> 32u),
+          nop, 0, 0,
+          KYTY_PM4(dispatch_packet_dw, Pm4::IT_DISPATCH_DIRECT, 0u), 1, 1, 1, dispatch_mode,
+          nop, 0, 0};
+}
+
+// Runs the stream with a cadence that is due at once, then publishes the dumps by hand to show
+// that they were still there to publish.
+CadenceOcclusionRun RunCadenceOcclusionStream(
+    RenderContext &renderer, const std::vector<uint32_t> &shader,
+    std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> &results, uint64_t untouched) {
+  constexpr uint32_t wave_size = 64;
+  namespace Counters = Common::DebugCounters;
+  CadenceOcclusionRun run;
+  auto &scheduler = renderer.GetCommandScheduler();
+  const auto stream = CadenceOcclusionStream(reinterpret_cast<uint64_t>(results.data()));
+  renderer.GetGpu().SendCommandSync([&] {
+    CommandProcessor processor(renderer, 0);
+    processor.BufferInit();
+    processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader.data()),
+                                      .num_thread_x = wave_size, .num_thread_y = 1,
+                                      .num_thread_z = 1, .wave_size = wave_size, .user_sgpr = 0});
+    scheduler.Finish();
+    CommandSchedulerTestAccess::SetCadence(
+        scheduler, SubmitCadence(true, SubmitCadence::Clock::duration::zero()));
+    const auto submits_before = Counters::Get(Counters::Counter::CadenceSubmits);
+    const auto waits_before = Counters::Get(Counters::Counter::GpuWaits);
+    Pm4Execution execution;
+    Require("GpuSubmitCadenceOcclusion", "stream completes",
+            processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+            "the PM4 stream did not run to its end");
+    run.cadence_submits = Counters::Get(Counters::Counter::CadenceSubmits) - submits_before;
+    run.gpu_waits = Counters::Get(Counters::Counter::GpuWaits) - waits_before;
+    run.pending = std::ranges::all_of(results, [&](uint64_t word) { return word == untouched; });
+    processor.BufferFlush();
+    run.published_by_flush = (results[0] & OCCLUSION_QUERY_READY) != 0;
+    scheduler.Finish();
+  });
+  return run;
+}
+
+// T6. Runs a dump, then a dispatch, then lets the cadence submit. The dump is still pending
+// afterwards, because only BufferFlush and the fences publish occlusion counters.
+void CheckGpuSubmitCadenceOcclusion() {
+  constexpr const char *name = "GpuSubmitCadenceOcclusion";
+  constexpr uint32_t window_extent = 64;
+  constexpr uint32_t end_program = 0xbf810000u;
+  constexpr uint64_t untouched = 0x1122334455667788ull;
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .occlusion_queries_enabled = true,
+                .gpu_submit_cadence_enabled = true});
+  Common::DebugCounters::SetEnabled(true);
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = window_extent;
+  window.graphic_ctx.screen_height = window_extent;
+  window.window = SDL_CreateWindow(name, window_extent, window_extent,
+                                   SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(nullptr);
+  Require(name, "occlusion queries", renderer.GetOcclusionQueries().Enabled(),
+          "the device has no host occlusion queries");
+  Require(name, "cadence built from the flag",
+          CommandSchedulerTestAccess::CadenceEnabled(renderer.GetCommandScheduler()),
+          "the render scheduler ignored the flag");
+  const std::vector<uint32_t> shader{end_program};
+  ShaderMapUserData(reinterpret_cast<uint64_t>(shader.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<uint32_t>(shader.size() * sizeof(uint32_t))});
+  alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results;
+  results.fill(untouched);
+  const auto run = RunCadenceOcclusionStream(renderer, shader, results, untouched);
+  Require(name, "the cadence submitted", run.cadence_submits == 1,
+          "cadence submits were " + std::to_string(run.cadence_submits));
+  Require(name, "the dump is still pending", run.pending,
+          "a cadence submit published the occlusion counters");
+  Require(name, "the cadence waited on nothing", run.gpu_waits == 0,
+          "the cadence blocked on the GPU " + std::to_string(run.gpu_waits) + " times");
+  Require(name, "a buffer flush publishes the dump", run.published_by_flush,
+          "the dump could not be published, so the pending check proves nothing");
+  renderer.ShutdownGpu();
+  Common::DebugCounters::SetEnabled(false);
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
 
@@ -55316,6 +55792,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-occlusion-only") == 0) {
+    CheckGpuSubmitCadenceOcclusion();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {

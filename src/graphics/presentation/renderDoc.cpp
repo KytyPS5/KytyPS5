@@ -158,7 +158,7 @@ static void StartCapture() {
 
 void RenderDocOnGuestFlip(RenderContext& renderer) {
 	const auto state = g_state.load(std::memory_order_acquire);
-	if (g_api == nullptr || state == RenderDocState::Idle) {
+	if (state == RenderDocState::Idle) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {

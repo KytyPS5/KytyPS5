@@ -202,6 +202,7 @@ void ConfigurationItem::Update(bool reload_icon) {
 	const auto path         = GetPathText(*m_info);
 
 	setText(NameColumn, m_info->name);
+	setData(NameColumn, Qt::UserRole, m_info->pro_supported);
 	setText(SerialColumn, m_info->title_id);
 	setText(GameVersionColumn,
 	        m_info->gameVersion.isEmpty() ? QStringLiteral("\u2014") : m_info->gameVersion);

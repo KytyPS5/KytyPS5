@@ -111,9 +111,6 @@ bool IsImmediateSigned(const Decoder::Operand& operand, int32_t& value) {
 
 bool OtherScalarSource(const Instruction& inst, uint32_t known_code,
                        const Decoder::Operand** other) {
-	if (other == nullptr) {
-		return false;
-	}
 	if (IsScalarCode(inst.src0, known_code)) {
 		*other = &inst.src1;
 		return true;
@@ -143,9 +140,7 @@ bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, u
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
 		if (candidate.opcode == Opcode::S_GETPC_B64 && IsScalarCode(candidate.dst, dst_code)) {
-			if (index != nullptr) {
-				*index = candidate_index;
-			}
+			*index = candidate_index;
 			return true;
 		}
 		if (InstructionWritesScalarCode(candidate, dst_code)) {
@@ -157,9 +152,6 @@ bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, u
 
 bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_index,
                            uint32_t base_code, uint32_t* pc) {
-	if (pc == nullptr) {
-		return false;
-	}
 	for (uint32_t i = before_index; i > 0; i--) {
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
@@ -227,7 +219,7 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 
 bool AddSignedByteOffset(uint32_t base, uint32_t encoded_offset, uint32_t* address) {
 	const auto value = static_cast<int64_t>(base) + static_cast<int32_t>(encoded_offset);
-	if (address == nullptr || value < 0 || value > UINT32_MAX) {
+	if (value < 0 || value > UINT32_MAX) {
 		return false;
 	}
 	*address = static_cast<uint32_t>(value);
@@ -241,9 +233,7 @@ bool FindPreviousScalarLoad(const Decoder::Program& program, uint32_t before_ind
 		const auto&    candidate       = program.instructions[candidate_index];
 		if (InstructionWritesScalarCode(candidate, dst_code)) {
 			if (candidate.opcode == opcode && IsScalarCode(candidate.dst, dst_code)) {
-				if (index != nullptr) {
-					*index = candidate_index;
-				}
+				*index = candidate_index;
 				return true;
 			}
 			return false;
@@ -255,9 +245,6 @@ bool FindPreviousScalarLoad(const Decoder::Program& program, uint32_t before_ind
 bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before_index,
                                 const Decoder::Operand& byte_offset_operand, uint32_t stride_shift,
                                 uint32_t* entry_count) {
-	if (entry_count == nullptr) {
-		return false;
-	}
 	uint32_t byte_offset_code = 0;
 	if (!ScalarOperandCode(byte_offset_operand, byte_offset_code)) {
 		return false;
@@ -550,7 +537,6 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
                          SetpcTargetInfo& info) {
-	info = {};
 	if (ResolveSetpcDwordJumpTable(program, setpc_index, info)) {
 		return true;
 	}
@@ -608,18 +594,12 @@ void RemapIds(std::vector<uint32_t>& values, const std::vector<uint32_t>& id_map
 
 void RebuildPredecessors(Graph& graph) {
 	for (auto& block: graph.blocks) {
-		block.predecessors.clear();
 		SortUnique(block.successors);
-	}
-	for (const auto& block: graph.blocks) {
 		for (auto succ: block.successors) {
 			if (succ < graph.blocks.size()) {
-				AddUnique(graph.blocks[succ].predecessors, block.id);
+				graph.blocks[succ].predecessors.push_back(block.id);
 			}
 		}
-	}
-	for (auto& block: graph.blocks) {
-		SortUnique(block.predecessors);
 	}
 }
 
@@ -662,8 +642,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 	for (auto& block: graph.blocks) {
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.successors, id_map);
-		block.predecessors.clear();
-		block.dominators.clear();
 		auto& terminator          = block.terminator;
 		terminator.true_block     = RemapId(terminator.true_block, id_map);
 		terminator.false_block    = RemapId(terminator.false_block, id_map);
@@ -676,10 +654,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 			target = RemapId(target, id_map);
 		}
 	}
-	graph.back_edges.clear();
-	graph.natural_loops.clear();
-	graph.components.clear();
-	RebuildPredecessors(graph);
 }
 
 void ComputeDominators(Graph& graph) {
@@ -717,7 +691,6 @@ void ComputeDominators(Graph& graph) {
 }
 
 void ComputeBackEdges(Graph& graph) {
-	graph.back_edges.clear();
 	for (const auto& block: graph.blocks) {
 		for (auto succ: block.successors) {
 			if (graph.Dominates(succ, block.id)) {
@@ -738,10 +711,6 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 	if (latch != header) {
 		stack.push_back(latch);
 	}
-	if (natural != nullptr) {
-		*natural = true;
-	}
-
 	while (!stack.empty()) {
 		const auto block_id = stack.back();
 		stack.pop_back();
@@ -750,7 +719,7 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 			continue;
 		}
 		for (auto pred: block->predecessors) {
-			if (!graph.Dominates(header, pred) && natural != nullptr) {
+			if (!graph.Dominates(header, pred)) {
 				*natural = false;
 			}
 			if (!Contains(body, pred)) {
@@ -766,7 +735,6 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 }
 
 void ComputeNaturalLoops(Graph& graph) {
-	graph.natural_loops.clear();
 	for (auto& edge: graph.back_edges) {
 		bool natural = true;
 		auto body    = NaturalLoopBody(graph, edge.to, edge.from, &natural);
@@ -859,8 +827,7 @@ void ComputeComponents(Graph& graph) {
 		}
 	}
 
-	graph.components  = std::move(state.components);
-	graph.irreducible = false;
+	graph.components = std::move(state.components);
 	for (const auto& component: graph.components) {
 		if (component.irreducible) {
 			graph.irreducible   = true;
@@ -892,7 +859,6 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.predecessors, id_map);
 		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
@@ -953,7 +919,7 @@ namespace {
 
 // Eliminate gotos by moving them through a structured statement tree. Every Code node
 // retains exactly one guest block; only Boolean route values cross construct boundaries.
-// This follows the outward/inward/lifting transformations used by shadPS4's GotoPass.
+// It applies the outward-movement, inward-movement and lifting transformations.
 class GotoStructurizer {
 	using ExprOp = ConditionExpression::Op;
 	enum class Kind { Root, Code, Label, Goto, If, Loop, Break, Return, Set };
@@ -1539,7 +1505,6 @@ Graph BuildGraph(const Decoder::Program& program) {
 	};
 
 	for (auto& block: graph.blocks) {
-		block.terminator = {};
 		if (block.inst_begin == block.inst_end) {
 			block.terminator.kind = TerminatorKind::Return;
 			continue;
@@ -1621,17 +1586,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 		}
 	}
 
-	for (auto& block: graph.blocks) {
-		SortUnique(block.successors);
-		for (auto succ: block.successors) {
-			AddUnique(graph.blocks[succ].predecessors, block.id);
-		}
-	}
-	for (auto& block: graph.blocks) {
-		SortUnique(block.predecessors);
-	}
 	PruneUnreachableBlocks(graph);
-	graph.code_table_load_pcs.clear();
+	RebuildPredecessors(graph);
 	bool indirect_setpc = false;
 	for (const auto& block: graph.blocks) {
 		if (block.terminator.kind != TerminatorKind::IndirectBranch) {

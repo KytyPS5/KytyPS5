@@ -284,7 +284,7 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index);
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
+                             uint32_t address, uint32_t index, uint32_t bits);
 
 template <typename Fn>
 auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
@@ -392,16 +392,14 @@ uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 }
 
 uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-                             const MemoryResourceAccess& resource, uint32_t bits,
-                             bool sign_extend) {
+                             const MemoryResourceAccess& resource, uint32_t bits) {
 	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
+	    [&]() { return LoadSubwordInBounds(ctx, resource, address, index, bits); });
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -414,7 +412,7 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 }
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
+                             uint32_t address, uint32_t index, uint32_t bits) {
 	uint32_t value;
 	if (resource.element_bits < 32u) {
 		const auto loaded = ctx.state.builder.AllocateId();
@@ -433,18 +431,14 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 		               Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), word, shift),
 		               ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu));
 	}
-	if (!sign_extend) return value;
-	const auto left = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state), value,
-	                         ConstantU32(ctx.state, 32u - bits));
-	return Binary(ctx.state, spv::OpShiftRightArithmetic, TypeU32(ctx.state), left,
-	              ConstantU32(ctx.state, 32u - bits));
+	return value;
 }
 
-uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
-                     bool sign_extend) {
+uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
+                     uint32_t bits) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
+		return LoadSubwordPrepared(ctx, inst, mem, resource, bits);
 	});
 }
 
@@ -743,7 +737,7 @@ uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	    },
 	    [&](uint32_t component, uint32_t bits) {
 		    const auto [address, index] = FormattedComponentAddress(ctx.state, plan, component);
-		    return LoadSubwordInBounds(ctx, plan.resource, address, index, bits, false);
+		    return LoadSubwordInBounds(ctx, plan.resource, address, index, bits);
 	    });
 }
 
@@ -1655,9 +1649,9 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
 		                address_info.data_bits, mem.coherent);
 	else if (inst.GetType() == IR::Type::U8)
-		value = LoadSubword(ctx, inst, mem, 8, false);
+		value = LoadSubword(ctx, inst, mem, 8);
 	else if (inst.GetType() == IR::Type::U16)
-		value = LoadSubword(ctx, inst, mem, 16, false);
+		value = LoadSubword(ctx, inst, mem, 16);
 	else
 		value = LoadWord(ctx, inst, mem);
 	ctx.Define(inst, value);

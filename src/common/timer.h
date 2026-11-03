@@ -12,12 +12,6 @@ public:
 
 	void Start();
 
-	void Pause();
-
-	void Resume();
-
-	[[nodiscard]] bool IsPaused() const;
-
 	// return time in milliseconds
 	[[nodiscard]] double GetTimeMs() const;
 
@@ -30,10 +24,8 @@ public:
 	[[nodiscard]] static uint64_t QueryPerformanceCounter();
 
 private:
-	bool     m_is_paused = true;
 	uint64_t m_Frequency = 0;
 	uint64_t m_StartTime = 0;
-	uint64_t m_PauseTime = 0;
 };
 
 } // namespace Common

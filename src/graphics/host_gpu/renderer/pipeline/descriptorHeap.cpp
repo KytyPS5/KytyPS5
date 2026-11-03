@@ -33,8 +33,6 @@ DescriptorHeap::~DescriptorHeap() {
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(layout == nullptr);
-
 	auto& batch = m_sets[layout];
 	if (batch.size != 0) {
 		return batch.sets[--batch.size];

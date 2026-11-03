@@ -5,7 +5,6 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -103,19 +102,16 @@ struct MemoryInfo {
 enum class ExportTargetKind { Unknown, Null, Position, Primitive, Parameter, Mrt, MrtZ };
 
 struct ExportInfo {
-	ExportTargetKind kind   = ExportTargetKind::Unknown;
-	uint32_t         target = 0;
-	uint32_t         index  = 0;
-	uint32_t         en     = 0;
-	bool             done   = false;
-	bool             compr  = false;
-	bool             vm     = false;
+	ExportTargetKind kind  = ExportTargetKind::Unknown;
+	uint32_t         index = 0;
+	uint32_t         en    = 0;
+	bool             compr = false;
+	bool             vm    = false;
 
 	bool operator==(const ExportInfo& other) const = default;
 };
 
 struct BufferResource {
-	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
@@ -125,7 +121,6 @@ struct BufferResource {
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
-	uint32_t               image_alias        = NoImageAlias;
 	bool                   read               = false;
 	bool                   written            = false;
 	bool                   atomic             = false;
@@ -157,12 +152,14 @@ struct ImageResource {
 	uint32_t                      mip_count         = 1;
 	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
+	Prospero::BufferFormat        srgb_decode       = Prospero::BufferFormat::kInvalid;
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
 	bool                          depth_compare     = false;
+	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
@@ -663,16 +660,14 @@ struct ResourceBlock {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
-	ShaderType                    stage               = ShaderType::Unknown;
-	uint64_t                      shader_hash         = 0;
-	uint32_t                      wave_size           = 64;
-	uint32_t                      user_data_base      = 0;
-	uint32_t                      user_data_count     = 64;
-	uint32_t                      scratch_dwords      = 0;
-	uint32_t                      param_export_mask   = 0;
-	bool                          has_address_writes  = false;
-	ShaderInfo                    info;
-	Bindings                      bindings;
+	ShaderType stage              = ShaderType::Unknown;
+	uint64_t   shader_hash        = 0;
+	uint32_t   wave_size          = 64;
+	uint32_t   user_data_base     = 0;
+	uint32_t   param_export_mask  = 0;
+	bool       has_address_writes = false;
+	ShaderInfo info;
+	Bindings   bindings;
 };
 
 struct UniformFillPlan {
@@ -740,8 +735,6 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
-	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.

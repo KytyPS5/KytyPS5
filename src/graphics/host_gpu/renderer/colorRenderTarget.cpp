@@ -41,7 +41,6 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
-                                              uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
@@ -62,10 +61,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
 			if (log_id < 128) {
 				LOGF("RenderColorTarget: no color output slot=%" PRIu32 " base=0x%010" PRIx64
-				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32
-				     " rt_slice_offset=%" PRIu32 "\n",
-				     rt_slot, rt.base.addr, mask, hw.GetRenderTargetMask(),
-				     render_target_slice_offset);
+				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32 "\n",
+				     rt_slot, rt.base.addr, mask, hw.GetRenderTargetMask());
 			}
 		}
 
@@ -114,16 +111,11 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	                                ? std::min(rt.view.last_array_slice_index,
 	                                           std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
 	                                : rt.view.last_array_slice_index;
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, last_layer, render_target_slice_offset);
-	switch (view.type) {
-		case TargetViewType::Image2D:
-		case TargetViewType::Image2DArray: break;
-		case TargetViewType::Unsupported:
-			EXIT("invalid render-target view: base=%u last=%u draw_offset=%u\n",
-			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
-			     render_target_slice_offset);
+	if (rt.view.base_array_slice_index > last_layer) {
+		EXIT("invalid render-target view: base=%u last=%u\n", rt.view.base_array_slice_index,
+		     last_layer);
 	}
+	const auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index, last_layer);
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic_uint log_count = 0;
 		const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
@@ -157,7 +149,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:
 		case Prospero::TileMode::kRenderTarget:
-			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
+			tile = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
 			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}

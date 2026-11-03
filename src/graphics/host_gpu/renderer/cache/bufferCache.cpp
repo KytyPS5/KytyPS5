@@ -117,9 +117,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	const auto size_pages = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
-		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
-		(void)it;
-		EXIT_IF(!inserted);
+		m_buffers.emplace(buffer.CpuAddress(), id);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -131,10 +129,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
-		const auto found = m_buffers.find(buffer.CpuAddress());
-		EXIT_IF(found == m_buffers.end() || found->second != id);
-		m_buffers.erase(found);
-		EXIT_IF(buffer.Size() > m_total_used_memory);
+		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
@@ -144,15 +139,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
-	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
-	}
+	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
-	if (IsBufferInvalid(id)) {
-		return;
-	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -172,7 +162,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Keep packed ranges on separate cache lines, as in shadPS4.
+			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
@@ -292,13 +282,9 @@ BufferCache::~BufferCache() {
 			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
 		}
 	}
-	m_buffers.clear();
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
-	if (!GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: invalid memory-invalidation range\n");
-	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
@@ -413,7 +399,6 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -501,10 +486,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: buffer request requires a recording command buffer\n");
-	}
+	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
@@ -535,9 +517,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
-	if (!GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: invalid image source\n");
-	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
@@ -686,7 +665,6 @@ void BufferCache::RunGarbageCollector() {
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
-		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -697,7 +675,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
-			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
@@ -714,11 +692,7 @@ void BufferCache::RunGarbageCollector() {
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
-		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
-			EXIT("BufferCache: garbage collection retained GPU ownership\n");
-		}
-		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}

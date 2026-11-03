@@ -973,6 +973,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
 		        Prospero::TileMode::kDepth;
 		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
+		// SKIP_DEGAMMA (S# bit 31) reads sRGB texels as stored.
+		image.skip_degamma = Prospero::IsSrgbFormat(format) &&
+		    std::ranges::any_of(program.info.sampled_pairs, [&](const auto& pair) {
+			    return pair.image == base_index && pair.sampler < snapshot.samplers.size() &&
+			           (snapshot.samplers[pair.sampler].dwords[0] >> 31u) != 0u;
+		    });
+		// The shader decodes direct 8 and 8_8 sRGB textures where the device has no sRGB view.
+		if (!storage && !base.depth_compare && !image.skip_degamma &&
+		    image.indirect_root == ImageResource::NoIndirectImage &&
+		    (format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb)) {
+			image.srgb_decode = format;
+		}
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
@@ -1859,10 +1871,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.mip_count                  = source.mip_count;
 		image.conversion_format          = source.conversion_format;
 		image.shader_swizzle             = source.shader_swizzle;
+		image.srgb_decode                = source.srgb_decode;
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
 		image.indirect_resources.clear();
 	}
@@ -2044,11 +2058,6 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	for (auto& memory: memory_info) {
 		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
 			memory.resource = image_remap[memory.resource];
-		}
-	}
-	for (auto& buffer: buffers) {
-		if (buffer.image_alias != BufferResource::NoImageAlias) {
-			buffer.image_alias = image_remap[buffer.image_alias];
 		}
 	}
 	for (auto& pair: sampled_pairs) {

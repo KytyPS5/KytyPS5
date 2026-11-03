@@ -244,9 +244,6 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
-			if (module.module == nullptr) {
-				return false;
-			}
 			program->second.modules.push_back(std::move(module));
 			break;
 		}

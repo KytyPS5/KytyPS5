@@ -118,8 +118,8 @@ private:
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
-	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
-	                             uint64_t target_base);
+	                             const ImageInfo& info, uint32_t levels, uint64_t source_offset,
+	                             uint64_t target_offset);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);

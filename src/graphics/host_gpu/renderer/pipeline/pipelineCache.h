@@ -437,6 +437,9 @@ private:
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
+	// GetProgram() looks up and compiles compute programs without the native ray tracing patch
+	// (for a dispatch without a TLAS, see GetComputeProgram()).
+	bool                                   m_guest_traversal = false;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	// Guards the driver cache state below, which the timer thread also reads.

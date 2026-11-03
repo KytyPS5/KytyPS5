@@ -94,11 +94,22 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 
 // Compute programs compiled with the native ray tracing patching on (see RayTracingPatch.h: the
 // compiler patches the ones whose traversal loops it recognizes) differ from the stored software
-// ones: they get their own program keys.
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key) {
-	if (stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
+// ones: they get their own program keys. `native`: false for the program of a dispatch without
+// a TLAS (see PipelineCache::GetComputeProgram()).
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true) {
+	if (native && stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
 		key.push_back(0x52545041u);
 	}
+}
+
+// Whether the dispatch of a patched program reads a null TLAS header address from its flattened
+// SRT (ShaderInfo::ray_query_header_slots): it has nothing to trace with the host structures.
+bool ReadsNullTlas(const ShaderModule& module, const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	const auto& info  = module.info.info;
+	const auto& slots = info.ray_query_header_slots;
+	const auto& flat  = resources.flattened_srt;
+	return info.ray_query && slots[0] < flat.size() && slots[1] < flat.size() && flat[slots[0]] == 0 &&
+	       flat[slots[1]] == 0;
 }
 
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
@@ -967,7 +978,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state);
+	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state, !m_guest_traversal);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -1012,7 +1023,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = NativeRayTracing::PatchShaders();
+	options.native_ray_tracing = NativeRayTracing::PatchShaders() && !m_guest_traversal;
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -1687,6 +1698,14 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.Fail();
 		return nullptr;
 	}
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		// The program without the patch serves a dispatch without a TLAS: the execution thread
+		// resolves it (see GetComputeProgram()).
+		if (ReadsNullTlas(*module, resources)) {
+			ahead.reads.Fail();
+			return nullptr;
+		}
+	}
 	last = static_cast<size_t>(module - modules.begin());
 	input_info.stage = {.module = &*module, .resources = &resources};
 	module->info.bindings.AdvancePushData(push_data_cursor);
@@ -2000,7 +2019,18 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
-	return GetProgram(params, input_info, push_data_cursor);
+	const auto             cursor = push_data_cursor;
+	const auto*            module = GetProgram(params, input_info, push_data_cursor);
+	// A dispatch without a TLAS runs the program without the native ray tracing patch. The
+	// patched one would take its guest traversal, but much slower: Astro Bot dispatches most of
+	// its ray tracing passes so, and the patched cs 45f8ddf6 took 3.6 ms instead of 0.7.
+	if (module != nullptr && ReadsNullTlas(*module, *input_info.stage.resources)) {
+		push_data_cursor  = cursor;
+		m_guest_traversal = true;
+		module            = GetProgram(params, input_info, push_data_cursor);
+		m_guest_traversal = false;
+	}
+	return module;
 }
 
 const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,

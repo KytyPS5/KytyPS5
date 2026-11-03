@@ -39,6 +39,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/submitCadence.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
@@ -1350,6 +1351,129 @@ void CheckSubmitCadenceConfig() {
   options.gpu_submit_cadence_enabled = false;
   Config::Load(options);
   std::printf("[host]    %-32s ok\n", name);
+}
+
+// The submit cadence tests drive this clock, so elapsed time is exact and the tests never sleep.
+SubmitCadence::Clock::time_point g_cadence_now {};
+
+SubmitCadence::Clock::time_point CadenceTestNow() {
+  return g_cadence_now;
+}
+
+// A cadence policy on the fake clock, with the clock reset to its epoch.
+SubmitCadence MakeTestCadence(bool enabled, SubmitCadence::Clock::duration interval) {
+  g_cadence_now = {};
+  return SubmitCadence(enabled, interval, &CadenceTestNow);
+}
+
+// T0a. With the flag on and no interval, one piece of work makes a submit due, and with the flag
+// off the same work never does.
+void CheckSubmitCadenceFlag() {
+  constexpr const char *name = "SubmitCadence";
+  auto on = MakeTestCadence(true, SubmitCadence::Clock::duration::zero());
+  on.NoteWork();
+  Require(name, "flag on makes work due", on.Due() && on.ShouldSubmit(0),
+          "one draw with no interval should make a submit due");
+  // Only the flag differs from the case above.
+  auto off = MakeTestCadence(false, SubmitCadence::Clock::duration::zero());
+  off.NoteWork();
+  Require(name, "flag off never submits", !off.Due() && !off.ShouldSubmit(0),
+          "the cadence must do nothing with the flag off");
+}
+
+// T0b. A submit becomes due exactly when the interval has passed since the first work.
+void CheckSubmitCadenceInterval() {
+  constexpr const char *name = "SubmitCadence";
+  constexpr auto just_short = SubmitCadenceInterval - std::chrono::microseconds {1};
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  g_cadence_now += just_short;
+  cadence.NoteWork();
+  Require(name, "work inside the interval is not due", !cadence.Due(),
+          "a submit came due before the interval passed");
+  // One more microsecond reaches the interval, which is the only difference from the check above.
+  g_cadence_now += std::chrono::microseconds {1};
+  cadence.NoteWork();
+  Require(name, "work at the interval is due", cadence.Due(),
+          "a submit should come due once the interval has passed");
+}
+
+// T0e. Idle time before the first work does not count toward the interval, so a GPU thread that
+// waited for its next submission does not submit after one draw.
+void CheckSubmitCadenceIdleStart() {
+  constexpr const char *name = "SubmitCadence";
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.Reset();
+  g_cadence_now += 5 * SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "idle time before the first work is not counted", !cadence.Due(),
+          "the interval should start at the first draw, not when the buffer began");
+  // A policy that ignored work would also pass the check above, so the interval must still run.
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "the interval runs from the first work", cadence.Due(),
+          "a submit should come due an interval after the first draw");
+}
+
+// T0c. Reset starts a new command buffer with no work and nothing due.
+void CheckSubmitCadenceReset() {
+  constexpr const char *name = "SubmitCadence";
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "the setup makes a submit due", cadence.Due(),
+          "the submit was never due, so the reset check below proves nothing");
+  cadence.Reset();
+  Require(name, "reset clears due", !cadence.Due() && !cadence.ShouldSubmit(0),
+          "a new command buffer should start with nothing due");
+  // The clock is already an interval past the first note, so a kept start time would be due here.
+  cadence.NoteWork();
+  Require(name, "reset restarts the interval", !cadence.Due(),
+          "the interval should restart with the new command buffer");
+  // A reset that left the policy dead would pass the checks above, so it must still come due.
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "the policy works after a reset", cadence.Due(),
+          "a submit should come due an interval after the first draw of the new buffer");
+}
+
+// T0d. A due submit is held back while the GPU has enough submits queued. The hold clears due but
+// keeps the start time, so the next draw re-arms it, and it goes through once the GPU catches up.
+void CheckSubmitCadenceGpuLag() {
+  constexpr const char *name = "SubmitCadence";
+  auto idle = MakeTestCadence(true, SubmitCadenceInterval);
+  Require(name, "lag with nothing due counts nothing",
+          !idle.ShouldSubmit(SubmitCadenceMaxGpuLag) && idle.TakeHeldBack() == 0,
+          "only a due submit can be held back");
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "a lag below the limit submits", cadence.ShouldSubmit(SubmitCadenceMaxGpuLag - 1),
+          "a GPU just under the lag limit should still take a submit");
+  // Only the lag differs from the check above.
+  Require(name, "a lag at the limit holds the submit back",
+          !cadence.ShouldSubmit(SubmitCadenceMaxGpuLag) && !cadence.Due() &&
+              cadence.TakeHeldBack() == 1 && cadence.TakeHeldBack() == 0,
+          "a GPU with enough work queued should not get another submit, counted once");
+  Require(name, "a hold with no new work counts nothing more",
+          !cadence.ShouldSubmit(SubmitCadenceMaxGpuLag) && cadence.TakeHeldBack() == 0,
+          "packet boundaries without new work should not recheck the lag");
+  // No time passes here, so only a kept start time makes the next draw due again.
+  cadence.NoteWork();
+  Require(name, "the next draw re-arms a held submit", cadence.Due() && cadence.ShouldSubmit(0),
+          "a held submit should come due at the next draw and go through once the GPU catches up");
+}
+
+// Covers the pure submit cadence policy, which needs no GPU.
+void CheckSubmitCadenceLogic() {
+  CheckSubmitCadenceFlag();
+  CheckSubmitCadenceInterval();
+  CheckSubmitCadenceIdleStart();
+  CheckSubmitCadenceReset();
+  CheckSubmitCadenceGpuLag();
+  std::printf("[host]    %-32s ok\n", "SubmitCadence");
 }
 
 void CheckLeastRecentlyUsedCacheOrdering() {
@@ -54029,6 +54153,7 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckSubmitCadenceConfig();
+  CheckSubmitCadenceLogic();
   if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-only") == 0) {
     return 0;
   }

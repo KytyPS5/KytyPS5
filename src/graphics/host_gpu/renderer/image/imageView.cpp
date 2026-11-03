@@ -8,19 +8,6 @@ namespace Libs::Graphics {
 
 namespace {
 
-[[nodiscard]] bool IsComponentSwizzle(vk::ComponentSwizzle swizzle) {
-	switch (swizzle) {
-		case vk::ComponentSwizzle::eIdentity:
-		case vk::ComponentSwizzle::eZero:
-		case vk::ComponentSwizzle::eOne:
-		case vk::ComponentSwizzle::eR:
-		case vk::ComponentSwizzle::eG:
-		case vk::ComponentSwizzle::eB:
-		case vk::ComponentSwizzle::eA: return true;
-		default: return false;
-	}
-}
-
 [[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
 	switch (format) {
 		case vk::Format::eS8Uint:
@@ -41,27 +28,13 @@ namespace {
 			switch (info.type) {
 				case vk::ImageViewType::e2D: return info.layer_count == 1;
 				case vk::ImageViewType::e2DArray: return true;
-				case vk::ImageViewType::eCube:
-					return static_cast<bool>(image.flags &
-					                         vk::ImageCreateFlagBits::eCubeCompatible) &&
-					       info.base_layer % 6 == 0 && info.layer_count == 6;
-				case vk::ImageViewType::eCubeArray:
-					return static_cast<bool>(image.flags &
-					                         vk::ImageCreateFlagBits::eCubeCompatible) &&
-					       info.base_layer % 6 == 0 && info.layer_count % 6 == 0;
 				default: return false;
 			}
 		case vk::ImageType::e3D:
 			switch (info.type) {
 				case vk::ImageViewType::e3D: return info.base_layer == 0 && info.layer_count == 1;
-				case vk::ImageViewType::e2D:
-					return static_cast<bool>(image.flags &
-					                         vk::ImageCreateFlagBits::e2DArrayCompatible) &&
-					       info.level_count == 1 && info.layer_count == 1;
-				case vk::ImageViewType::e2DArray:
-					return static_cast<bool>(image.flags &
-					                         vk::ImageCreateFlagBits::e2DArrayCompatible) &&
-					       info.level_count == 1;
+				case vk::ImageViewType::e2D: return info.level_count == 1 && info.layer_count == 1;
+				case vk::ImageViewType::e2DArray: return info.level_count == 1;
 				default: return false;
 			}
 		default: return false;
@@ -342,11 +315,8 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const bool ranges_valid = levels_valid && normalized.layer_count != 0 &&
 	                          normalized.base_layer < view_layers &&
 	                          normalized.layer_count <= view_layers - normalized.base_layer;
-	const bool mapping_valid =
-	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
-	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
-	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
-	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
+	if (!format_compatible || !ranges_valid || !IsValidViewType(image, normalized) ||
+	    !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
 		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),

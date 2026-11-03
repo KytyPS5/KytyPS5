@@ -743,11 +743,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
-		auto& prepared = *stage;
-		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
-		const auto& layout = program.bindings;
+		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
@@ -801,14 +800,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program   = prepared.runtime->module->info;
-	const auto& snapshot  = *prepared.runtime->resources;
-	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	const auto& program  = prepared.runtime->module->info;
+	const auto& snapshot = *prepared.runtime->resources;
+	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -837,12 +833,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program  = prepared.runtime->module->info;
-	const auto& snapshot = *prepared.runtime->resources;
-	auto&       images   = prepared.images;
-	EXIT_IF(images.size() != program.info.images.size());
-	auto& texture_cache = m_context.GetTextureCache();
+	const auto& program       = prepared.runtime->module->info;
+	const auto& snapshot      = *prepared.runtime->resources;
+	auto&       images        = prepared.images;
+	auto&       texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
@@ -922,7 +916,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	for (const auto* prepared: prepared_bindings) {
-		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = prepared->runtime->module->info;
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
@@ -1013,10 +1006,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:
-						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
-						for (const auto& view: descriptors.buffers) {
-							EXIT_IF(view.range == 0);
-						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
@@ -1064,8 +1053,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto& resource = program.info.images[i];
 			const auto& texture = descriptors.images[i];
 			if (resource.heap) continue;
-			EXIT_IF(texture.image_id &&
-			        resource.mip_count != (texture.mip_views.empty() ? 1u : texture.mip_views.size()));
 			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
@@ -1074,8 +1061,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
-		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);

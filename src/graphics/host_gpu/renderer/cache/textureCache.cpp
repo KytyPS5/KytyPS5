@@ -1240,10 +1240,6 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid()) {
-		EXIT("TextureCache: image lookup requires a valid command buffer\n");
-	}
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;

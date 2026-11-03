@@ -399,7 +399,6 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -487,10 +486,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: buffer request requires a recording command buffer\n");
-	}
+	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&

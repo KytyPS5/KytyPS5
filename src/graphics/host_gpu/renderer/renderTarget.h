@@ -13,7 +13,7 @@ static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
 struct RenderAttachment {
 	vk::ImageView           image_view    = nullptr;
 	vk::ImageLayout         image_layout  = vk::ImageLayout::eUndefined;
-	std::array<uint32_t, 4> clear_value   = {};
+	std::array<uint32_t, 2> clear_value   = {};
 	bool                    has_depth     = false;
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;

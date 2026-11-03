@@ -440,11 +440,9 @@ struct RenderExecutorTestAccess {
                                       bool pixel_active) {
     RenderExecutor::GraphicsBindings result;
     executor.PrepareBindings(vertex, result.vertex[0]);
-    std::array<PreparedBindings *, 2> stages{&result.vertex[0], nullptr};
+    std::array<PreparedBindings *, 2> stages{&result.vertex[0], &result.pixel};
     if (pixel_active) {
-      result.pixel.emplace();
-      executor.PrepareBindings(pixel, *result.pixel);
-      stages[1] = &*result.pixel;
+      executor.PrepareBindings(pixel, result.pixel);
     }
     executor.PrepareGraphicsBindings(
         std::span{stages.data(), pixel_active ? 2u : 1u}, {});
@@ -16298,8 +16296,7 @@ public:
                                                  &ordered_snapshot};
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
-      const auto ordered_sampled_id =
-          ordered_bindings.pixel->images[0].image_id;
+      const auto ordered_sampled_id = ordered_bindings.pixel.images[0].image_id;
       Require(
           name, "VS-before-PS retained-owner order",
           ordered_bindings.vertex[0].images[0].image_id == storage_id &&
@@ -16315,8 +16312,7 @@ public:
               executor, storage_runtime, sampled_runtime, true);
       const auto &storage_binding =
           graphics_bindings.vertex[0].images[0];
-      const auto &sampled_binding =
-          graphics_bindings.pixel->images[0];
+      const auto &sampled_binding = graphics_bindings.pixel.images[0];
       Require(name, "storage final acquisition",
               storage_binding.image_view != nullptr &&
                   texture_cache.GetImage(storage_id).IsGpuModified() &&
@@ -16334,7 +16330,7 @@ public:
               "storage acquisition before pixel sampling");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), graphics_bindings.vertex[0],
-          *graphics_bindings.pixel));
+          graphics_bindings.pixel));
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
                   (vk::AccessFlagBits2::eShaderRead |
@@ -16376,16 +16372,16 @@ public:
               "storage alias bound the same backing");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), writable_alias_bindings.vertex[0],
-          *writable_alias_bindings.pixel));
+          writable_alias_bindings.pixel));
       Require(
           name, "forced-general descriptor capture",
           writable_alias_bindings.vertex[0].images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              writable_alias_bindings.pixel->images[0].layout ==
+              writable_alias_bindings.pixel.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
               MakeImageInfo(writable_alias_bindings.vertex[0].images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
-              MakeImageInfo(writable_alias_bindings.pixel->images[0])
+              MakeImageInfo(writable_alias_bindings.pixel.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
               texture_cache.GetImage(storage_id).backing.state.layout ==
                   vk::ImageLayout::eGeneral &&
@@ -16944,15 +16940,16 @@ public:
         auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, bounds_vertex, bounds_pixel, true);
         std::array<PreparedBindings *, 2> bounds_stages{
-            &bounds_bindings.vertex[0], &*bounds_bindings.pixel};
+            &bounds_bindings.vertex[0], &bounds_bindings.pixel};
         vk::ImageAspectFlags bounds_feedback;
         const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &no_color, 0, bounds_depth,
             bounds_stages, &bounds_feedback);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-            executor, scheduler.Current(), bounds_bindings.vertex[0], *bounds_bindings.pixel));
+            executor, scheduler.Current(), bounds_bindings.vertex[0],
+            bounds_bindings.pixel));
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
-        const auto &pixel_depth = bounds_bindings.pixel->images[0];
+        const auto &pixel_depth = bounds_bindings.pixel.images[0];
         const auto expected_layout = pass == 0
             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
             : vk::ImageLayout::eDepthReadOnlyOptimal;
@@ -17359,11 +17356,11 @@ public:
         stencil_view_info.aspect = vk::ImageAspectFlagBits::eStencil;
         stencil_view_info.usage = vk::ImageUsageFlagBits::eSampled;
         const auto stencil_view = shared_image.FindView(stencil_view_info);
-        auto& pixel_image = shared_bindings.pixel->images[0];
+        auto &pixel_image = shared_bindings.pixel.images[0];
         pixel_image.image_view = stencil_view;
         pixel_image.desc.view_info = stencil_view_info;
         std::array<PreparedBindings *, 2> shared_stages{
-            &shared_bindings.vertex[0], &*shared_bindings.pixel};
+            &shared_bindings.vertex[0], &shared_bindings.pixel};
         vk::ImageAspectFlags shared_feedback;
         const auto shared_rendering =
             RenderExecutorTestAccess::AcquireRenderTargets(
@@ -17371,7 +17368,7 @@ public:
                 shared_stages, &shared_feedback);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), shared_bindings.vertex[0],
-            *shared_bindings.pixel));
+            shared_bindings.pixel));
         const auto expected_layout =
             stencil_write
                 ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
@@ -19426,12 +19423,13 @@ public:
       auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, vertex.stage, pixel.stage, true);
       Require(name, "sampled attachment identity",
-              !depth_feedback || bindings.pixel->images[0].image_id == depth.image_id,
+              !depth_feedback ||
+                  bindings.pixel.images[0].image_id == depth.image_id,
               "the fragment must sample the depth attachment's native image");
       auto &command = scheduler.Current();
       vk::ImageAspectFlags feedback_aspects;
-      std::array<PreparedBindings *, 2> stages{
-          &bindings.vertex[0], &*bindings.pixel};
+      std::array<PreparedBindings *, 2> stages{&bindings.vertex[0],
+                                               &bindings.pixel};
       auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, command, &color, 1, depth, stages, &feedback_aspects);
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
@@ -19443,7 +19441,7 @@ public:
                                           : vk::ImageAspectFlags{}),
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
-          executor, command, selected, bindings.vertex[0], *bindings.pixel);
+          executor, command, selected, bindings.vertex[0], bindings.pixel);
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);

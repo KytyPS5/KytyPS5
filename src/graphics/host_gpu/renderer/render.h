@@ -10,7 +10,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -164,7 +163,7 @@ private:
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
-		std::optional<PreparedBindings> pixel;
+		PreparedBindings                pixel;
 	};
 
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,

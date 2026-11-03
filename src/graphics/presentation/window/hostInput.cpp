@@ -146,17 +146,6 @@ MouseJoystickState g_mouse;
 SDL_Window*        g_mouse_window   = nullptr;
 uint64_t           g_cursor_hide_at = 0;
 
-struct MouseTouchPadState {
-	bool     enabled        = false;
-	bool     cursor_visible = true;
-	bool     drawing        = false;
-	bool     position_valid = false;
-	float    x              = 0.5f;
-	float    y              = 0.5f;
-	uint64_t revision       = 0;
-	uint64_t gesture        = 0;
-};
-
 struct GamepadTouchPadState {
 	bool     enabled   = false;
 	bool     drawing   = false;
@@ -173,9 +162,9 @@ constexpr int   GAMEPAD_TOUCHPAD_POLL_MS = 8;
 constexpr int   GAMEPAD_TOUCHPAD_DEADZONE = 18;
 constexpr float GAMEPAD_TOUCHPAD_SPEED    = 0.8f;
 
-MouseTouchPadState   g_mouse_touchpad;
-GamepadTouchPadState g_gamepad_touchpad;
-std::mutex           g_touchpad_mutex;
+HostInputTouchPadVisualState                 g_mouse_touchpad;
+GamepadTouchPadState                         g_gamepad_touchpad;
+std::mutex                                   g_touchpad_mutex;
 std::unordered_map<int, std::array<bool, 2>> g_pad_trigger_pressed;
 
 std::size_t ControlFromName(std::string_view name) {
@@ -842,7 +831,6 @@ void HostInputSetTouchPadMode(bool enabled) {
 	{
 		std::scoped_lock lock(g_touchpad_mutex);
 		g_mouse_touchpad.enabled        = enabled;
-		g_mouse_touchpad.cursor_visible = true;
 		g_mouse_touchpad.drawing        = false;
 		g_mouse_touchpad.position_valid = false;
 		g_mouse_touchpad.gesture++;
@@ -976,27 +964,15 @@ void HostInputDisconnectGamepadTouchPad(int id) {
 }
 
 HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
-	std::scoped_lock             lock(g_touchpad_mutex);
-	HostInputTouchPadVisualState state {};
+	std::scoped_lock lock(g_touchpad_mutex);
+	auto             state = g_mouse_touchpad;
 	if (g_gamepad_touchpad.enabled) {
 		state.enabled        = true;
-		state.cursor_visible = true;
 		state.drawing        = g_gamepad_touchpad.drawing;
 		state.x              = g_gamepad_touchpad.x;
 		state.y              = g_gamepad_touchpad.y;
-		state.revision       = g_mouse_touchpad.revision;
-		state.gesture        = g_mouse_touchpad.gesture;
 		state.position_valid = true;
-		return state;
 	}
-	state.enabled        = g_mouse_touchpad.enabled;
-	state.cursor_visible = g_mouse_touchpad.cursor_visible;
-	state.drawing        = g_mouse_touchpad.drawing;
-	state.x              = g_mouse_touchpad.x;
-	state.y              = g_mouse_touchpad.y;
-	state.revision       = g_mouse_touchpad.revision;
-	state.gesture        = g_mouse_touchpad.gesture;
-	state.position_valid = g_mouse_touchpad.position_valid;
 	return state;
 }
 

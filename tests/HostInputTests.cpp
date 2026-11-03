@@ -126,6 +126,27 @@ void TestKeyboardSwitchesFromGamepadTouchPad() {
 	Check(!GetHostInputTouchPadVisualState().enabled, "F6 failed to disable mouse touchpad mode");
 }
 
+void TestTouchPadVisualState() {
+	Inputs inputs;
+	HostInputSetTouchPadMode(true);
+	HostInputMouseMotion(0.0f, 0.0f);
+	const auto mouse = GetHostInputTouchPadVisualState();
+	Check(mouse.enabled && mouse.position_valid && !mouse.drawing && mouse.x == 0.5f &&
+	          mouse.y == 0.5f,
+	      "mouse touchpad state was not reported");
+	physical_stick = {SDL_JOYSTICK_AXIS_MAX, SDL_JOYSTICK_AXIS_MIN};
+	HostInputToggleGamepadTouchPad(1);
+	PollGamepadTouchPad(1008);
+	const auto pad = GetHostInputTouchPadVisualState();
+	Check(pad.enabled && pad.position_valid && pad.x > 0.5f && pad.y < 0.5f &&
+	          pad.revision > mouse.revision && pad.gesture > mouse.gesture,
+	      "gamepad touchpad state did not replace the mouse position");
+	HostInputToggleGamepadTouchPad(1);
+	const auto off = GetHostInputTouchPadVisualState();
+	Check(!off.enabled && !off.position_valid && off.revision > pad.revision,
+	      "leaving gamepad touchpad mode kept a visible cursor");
+}
+
 void TestIndependentTriggerEdges() {
 	Inputs inputs;
 	HostInputPadTrigger(2, true, 255);
@@ -197,6 +218,7 @@ int main() {
 	Config::Load(options);
 	TestTouchPadStickHandoff();
 	TestKeyboardSwitchesFromGamepadTouchPad();
+	TestTouchPadVisualState();
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
 	TestDisabledMappingTabs();

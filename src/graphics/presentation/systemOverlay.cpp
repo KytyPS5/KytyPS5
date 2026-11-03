@@ -710,7 +710,7 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            (cursor.enabled && cursor.cursor_visible),
+	            cursor.enabled,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
 	            PerformanceOverlayRevision()};
@@ -1612,8 +1612,7 @@ struct SystemOverlay::Impl {
 		}
 		auto* draw = ImGui::GetForegroundDrawList();
 		DrawTouchParticles(draw, now);
-		if (!state.enabled || !state.cursor_visible ||
-		    !state.position_valid || !cursor_initialized) {
+		if (!state.enabled || !state.position_valid || !cursor_initialized) {
 			return;
 		}
 

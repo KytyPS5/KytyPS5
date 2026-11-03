@@ -53742,8 +53742,86 @@ void CheckPm4Flip() {
           "R_FLIP did not publish the occlusion counters or flip");
 
   gpu.WaitForIdle();
+  // Each pre-vblank event carries the port's pre-vblank count.
+  EventQueue::KernelEqueue vblanks = EventQueue::KERNEL_EQUEUE_INVALID;
+  Require(name, "pre-vblank events",
+          EventQueue::KernelCreateEqueue(&vblanks, "vblanks") == 0 &&
+              VideoOut::VideoOutAddPreVblankStartEvent(vblanks, handle,
+                                                       &udata) == 0,
+          "pre-vblank event registration failed");
+  std::array<int64_t, 2> pre_vblanks{};
+  for (auto &pre_vblank : pre_vblanks) {
+    timeout = 2'000'000;
+    Require(name, "pre-vblank",
+            EventQueue::KernelWaitEqueue(vblanks, &event, 1, &count,
+                                         &timeout) == 0 &&
+                count == 1 &&
+                VideoOut::VideoOutGetEventData(&event, &pre_vblank) == 0,
+            "no pre-vblank event");
+  }
+  Require(name, "pre-vblank count",
+          pre_vblanks[0] > 0 && pre_vblanks[1] == pre_vblanks[0] + 1,
+          "pre-vblank events did not count vblanks");
+  // Handle checks of an open port, a closed one and the same port reopened.
+  alignas(4) std::array<uint8_t, 16> color{};
+  const auto *settings =
+      reinterpret_cast<const VideoOut::VideoOutColorSettings *>(color.data());
+  constexpr int invalid = VideoOut::VIDEO_OUT_ERROR_INVALID_HANDLE;
+  Require(name, "open port",
+          VideoOut::VideoOutAdjustColor(handle, settings) == 0 &&
+              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(handle) ==
+                  0 &&
+              VideoOut::VideoOutSetFlipMaster(handle, handle) ==
+                  VideoOut::VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION &&
+              VideoOut::VideoOutSetFlipMaster(handle, handle + 1) == invalid &&
+              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(0) ==
+                  invalid &&
+              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(5) ==
+                  invalid,
+          "open-port handle checks failed");
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
           "video-out close failed");
+  Require(name, "closed port",
+          VideoOut::VideoOutClose(handle) == invalid &&
+              VideoOut::VideoOutAdjustColor(handle, settings) == invalid &&
+              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(handle) ==
+                  invalid &&
+              VideoOut::VideoOutSetFlipMaster(handle, handle) == invalid &&
+              VideoOut::VideoOutAddVblankEvent(flips, handle, &udata) ==
+                  invalid &&
+              VideoOut::VideoOutSubmitFlip(handle, -1, 1, 0) == invalid,
+          "a closed port accepted its handle");
+  // Events registered on the reopened port fire.
+  timeout = 2'000'000;
+  Require(name, "reopen",
+          VideoOut::VideoOutOpen(255, 0, 0, nullptr) == handle &&
+              VideoOut::VideoOutAddVblankEvent(flips, handle, &udata) == 0 &&
+              EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                           &timeout) == 0 &&
+              count == 1 &&
+              VideoOut::VideoOutGetEventId(&event) == 1 /* vblank */,
+          "the reopened port rejected its handle or its events");
+  // A CPU flip of the blank buffer is presented at a vblank.
+  constexpr int64_t cpu_flip_arg = 0x55;
+  timeout = 2'000'000;
+  Require(name, "cpu flip",
+          VideoOut::VideoOutAddFlipEvent(vblanks, handle, &udata) == 0 &&
+              VideoOut::VideoOutSubmitFlip(handle, -1, 1, cpu_flip_arg) == 0 &&
+              EventQueue::KernelWaitEqueue(vblanks, &event, 1, &count,
+                                           &timeout) == 0 &&
+              count == 1 &&
+              VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
+              flipped_arg == cpu_flip_arg &&
+              VideoOut::VideoOutClose(handle) == 0,
+          "the CPU flip was not presented");
+  // Waits measure their timeout with the host timer.
+  timeout = 2'000;
+  Require(name, "timeout",
+          EventQueue::KernelWaitEqueue(vblanks, &event, 1, &count, &timeout) ==
+                  LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+              count == 0,
+          "an empty event queue did not time out");
+  EventQueue::KernelDeleteEqueue(vblanks);
   EventQueue::KernelDeleteEqueue(flips);
   renderer.ShutdownGpu();
   VideoOut::VideoOutShutdown();

@@ -1031,10 +1031,6 @@ bool Presenter::PresentLastFrame() {
 	return true;
 }
 
-bool Presenter::IsGuestPaused() const noexcept {
-	return m_impl->window.loop.paused.load(std::memory_order_acquire);
-}
-
 bool Presenter::IsHdrSupported() const noexcept {
 	return m_impl->swapchain.IsHdrSupported();
 }

@@ -904,9 +904,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			key.stage_ids[i] = stages[i]->id;
 		}
 	}
-	auto& static_params         = key.static_params;
-	auto& rendering             = key.rendering;
-	rendering.color_count       = 0;
+	auto&    static_params      = key.static_params;
+	auto&    rendering          = key.rendering;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;

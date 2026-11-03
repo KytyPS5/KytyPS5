@@ -398,6 +398,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			const auto& image = program.info.images[i];
 			const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			const auto  max_mip = image.r128 ? r.LastLevel() : r.MaxMip();
 			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
 			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
 			     i, image.source, image.written ? "read-write" : "read-only",
@@ -410,7 +411,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
 			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
 			         ? 1u
-			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
+			         : static_cast<uint32_t>(max_mip) + 1u,
 			     static_cast<uint32_t>(r.TileMode()));
 		}
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {

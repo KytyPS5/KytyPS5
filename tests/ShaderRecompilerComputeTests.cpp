@@ -50805,6 +50805,18 @@ void CheckStorageTextureDepthTileUploadLayout() {
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == pitch,
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
+  auto stencil_layout = layout;
+  stencil_layout.pixel_format = vk::Format::eS8Uint;
+  auto depth_layout = layout;
+  depth_layout.pixel_format = vk::Format::eD16Unorm;
+  Require("StorageTextureDepthTileUpload", "copy aspects",
+          regions[0].imageSubresource.aspectMask ==
+                  vk::ImageAspectFlagBits::eColor &&
+              stencil_layout.BufferCopies()[0].imageSubresource.aspectMask ==
+                  vk::ImageAspectFlagBits::eStencil &&
+              depth_layout.BufferCopies()[0].imageSubresource.aspectMask ==
+                  vk::ImageAspectFlagBits::eDepth,
+          "depth-plane copies lost their color, stencil or depth aspect");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
 

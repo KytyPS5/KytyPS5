@@ -354,6 +354,16 @@ static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::Bu
 	}
 }
 
+// Atomics and raw signed stores use unsigned integer views; sRGB images store through UNorm.
+static vk::Format StorageViewFormat(const ShaderRecompiler::IR::ImageResource& resource,
+                                    Prospero::BufferFormat format, vk::Format pixel_format) {
+	if (resource.atomic64) return vk::Format::eR64Uint;
+	if (resource.atomic) return vk::Format::eR32Uint;
+	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
+	if (raw_sint_format != Prospero::BufferFormat::kInvalid) return VulkanFormat(raw_sint_format);
+	return SrgbUnormViewFormat(pixel_format);
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -559,16 +569,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
-	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
-	                                 : storage && resource.atomic ? vk::Format::eR32Uint
-	                                 : raw_sint_format != Prospero::BufferFormat::kInvalid
-	                                     ? VulkanFormat(raw_sint_format)
-	                                     : SrgbUnormViewFormat(pixel_format);
-	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
-	                                     ? storage_view_format
-	                                     : pixel_format;
-	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	const auto view_format =
+	    storage ? StorageViewFormat(resource, format, pixel_format) : pixel_format;
+	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;

@@ -96,12 +96,12 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
 
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
+	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }

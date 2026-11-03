@@ -1073,7 +1073,6 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
-	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();

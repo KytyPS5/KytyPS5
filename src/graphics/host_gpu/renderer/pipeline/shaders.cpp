@@ -78,8 +78,9 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+// Creates the descriptor set layout and the pipeline layout that uses it.
+static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                          std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t descriptor_count = 0;
 	uint64_t storage_buffers = 0;
@@ -125,6 +126,20 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	create.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
+	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
+
+	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+
+	EXIT_IF(pipeline.pipeline_layout != nullptr);
+	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                          &pipeline.pipeline_layout) !=
+	                     vk::Result::eSuccess);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -294,31 +309,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			pipeline.push_stages |= native_stage;
 		}
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
-
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
-	pipeline_layout_info.pSetLayouts            = set_layouts.data();
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
 		     " set_layouts=1 push_constants=%" PRIu32 "\n",
 		     key.stage_ids[0], key.stage_ids[3], 1u);
 	}
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                   &pipeline.pipeline_layout);
+	CreateLayouts(graphics, pipeline, descriptor_bindings);
 	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+		LOGF("PipelineTrace: vkCreatePipelineLayout done layout=%p\n",
+		     static_cast<void*>(pipeline.pipeline_layout));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -389,8 +389,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
+	                                                            nullptr, &pipeline.pipeline);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -419,23 +419,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap = module.info.info.uses_image_heap;
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	pipeline.push_stages = vk::ShaderStageFlagBits::eCompute;
-	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
-
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
-	pipeline_layout_info.pSetLayouts            = set_layouts.data();
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
+	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
@@ -446,8 +431,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	const auto result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 

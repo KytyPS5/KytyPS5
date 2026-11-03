@@ -351,12 +351,13 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = source.backing.image_type == backing.image_type
-	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
-	                            : backing.image_type == vk::ImageType::e3D
-	                                ? backing.extent.depth
-	                                : source.backing.extent.depth;
-	const auto     source_aspect =
+	uint32_t       base_depth = source.backing.extent.depth;
+	if (source.backing.image_type == backing.image_type) {
+		base_depth = std::min(base_depth, backing.extent.depth);
+	} else if (backing.image_type == vk::ImageType::e3D) {
+		base_depth = backing.extent.depth;
+	}
+	const auto source_aspect =
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
 	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
@@ -494,9 +495,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
 	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.buffer              = buffer.Handle();

@@ -111,15 +111,6 @@ Buffer::~Buffer() {
 	}
 }
 
-vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
-	EXIT_IF(m_device_address == 0);
-	return m_device_address;
-}
-
-bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
-	return address >= m_cpu_address && size <= Size() && address - m_cpu_address <= Size() - size;
-}
-
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {

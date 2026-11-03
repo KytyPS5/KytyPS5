@@ -238,6 +238,34 @@ bool File::Unlink() {
 	return SysFileUnlink(*m_p->f, m_file_name);
 }
 
+bool File::Chmod(uint32_t mode) {
+	EXIT_IF(IsInvalid());
+
+	if (m_p->archive != nullptr) {
+		return false;
+	}
+
+	if (m_p->f == nullptr) {
+		return false;
+	}
+
+	return SysFileChmod(*m_p->f, mode, m_file_name);
+}
+
+bool File::GetPermissions(uint16_t* perms) const {
+	EXIT_IF(IsInvalid());
+
+	if (m_p->archive != nullptr) {
+		return false;
+	}
+
+	if (m_p->f == nullptr) {
+		return false;
+	}
+
+	return SysFileGetPermissions(*m_p->f, perms);
+}
+
 uint64_t File::Tell() const {
 	EXIT_IF(IsInvalid());
 
@@ -305,16 +333,13 @@ void File::Printf(const char* format, ...) {
 	Write(s.data(), static_cast<uint32_t>(s.size()));
 }
 
-static std::filesystem::path WithoutTrailingSeparator(
-	const std::filesystem::path& path) {
-		if (!path.empty() && !path.has_filename() &&
-			path != path.root_path()) {
-			return path.parent_path();
-		}
+static std::filesystem::path WithoutTrailingSeparator(const std::filesystem::path& path) {
+	if (!path.empty() && !path.has_filename() && path != path.root_path()) {
+		return path.parent_path();
+	}
 
-		return path;
+	return path;
 }
-
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
@@ -336,67 +361,60 @@ bool File::CreateDirectory(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    return SysFileCreateDirectory(
-        WithoutTrailingSeparator(path));
+	return SysFileCreateDirectory(WithoutTrailingSeparator(path));
 }
 
 bool File::DeleteDirectory(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    return SysFileDeleteDirectory(
-        WithoutTrailingSeparator(path));
+	return SysFileDeleteDirectory(WithoutTrailingSeparator(path));
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    const auto normalized_path =
-        WithoutTrailingSeparator(path);
+	const auto normalized_path = WithoutTrailingSeparator(path);
 
-    auto current_path = normalized_path.root_path();
+	auto current_path = normalized_path.root_path();
 
-    for (const auto& component:
-         normalized_path.relative_path()) {
-        current_path /= component;
+	for (const auto& component: normalized_path.relative_path()) {
+		current_path /= component;
 
-        if (IsDirectoryExisting(current_path)) {
-            continue;
-        }
+		if (IsDirectoryExisting(current_path)) {
+			continue;
+		}
 
-        if (!CreateDirectory(current_path)) {
-            return false;
-        }
-    }
+		if (!CreateDirectory(current_path)) {
+			return false;
+		}
+	}
 
-    return true;
+	return true;
 }
 
 bool File::DeleteDirectories(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    const auto normalized_path =
-        WithoutTrailingSeparator(path);
+	const auto normalized_path = WithoutTrailingSeparator(path);
 
-    std::vector<std::filesystem::path> directories;
-    auto current_path = normalized_path.root_path();
+	std::vector<std::filesystem::path> directories;
+	auto                               current_path = normalized_path.root_path();
 
-    for (const auto& component:
-         normalized_path.relative_path()) {
-        current_path /= component;
-        directories.push_back(current_path);
-    }
+	for (const auto& component: normalized_path.relative_path()) {
+		current_path /= component;
+		directories.push_back(current_path);
+	}
 
-    for (auto it = directories.rbegin();
-         it != directories.rend(); ++it) {
-        if (!DeleteDirectory(*it)) {
-            return false;
-        }
-    }
+	for (auto it = directories.rbegin(); it != directories.rend(); ++it) {
+		if (!DeleteDirectory(*it)) {
+			return false;
+		}
+	}
 
-    return true;
+	return true;
 }
 
 bool File::DeleteFile(
@@ -426,7 +444,7 @@ std::vector<std::byte> File::ReadWholeBuffer() {
 
 	EXIT_IF((s >> 32u) != 0);
 
-	const auto            read_size = static_cast<uint32_t>(s);
+	const auto             read_size = static_cast<uint32_t>(s);
 	std::vector<std::byte> buf(read_size);
 
 	Read(buf.data(), read_size);

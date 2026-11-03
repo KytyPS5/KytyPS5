@@ -52,12 +52,12 @@ struct Lifecycle {
 	static constexpr auto emergency_shutdown = Libs::LibKernel::FileSystem::EmergencyShutdown;
 };
 
-void                  Mount(const std::filesystem::path& folder, const std::string& point);
-void                  Umount(const std::string& folder_or_point);
+void Mount(const std::filesystem::path& folder, const std::string& point);
+void Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 // Returns whether d is an open file, directory or device descriptor.
-bool                  IsOpenDescriptor(int d);
+bool IsOpenDescriptor(int d);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);
@@ -82,6 +82,8 @@ int KYTY_SYSV_ABI     KernelGetdents(int fd, char* buf, int nbytes);
 int KYTY_SYSV_ABI     KernelMkdir(const char* path, uint16_t mode);
 int KYTY_SYSV_ABI     KernelRmdir(const char* path);
 int KYTY_SYSV_ABI     KernelCheckReachability(const char* path);
+int KYTY_SYSV_ABI     KernelChmod(const char* path, uint32_t mode);
+int KYTY_SYSV_ABI     KernelFchmod(int fd, uint32_t mode);
 
 } // namespace Libs::LibKernel::FileSystem
 

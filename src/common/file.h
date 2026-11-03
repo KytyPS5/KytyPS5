@@ -62,6 +62,8 @@ public:
 
 	bool Truncate(uint64_t size);
 	bool Unlink();
+	bool Chmod(uint32_t mode);
+	bool GetPermissions(uint16_t* perms) const;
 
 	[[nodiscard]] bool IsInvalid() const;
 
@@ -76,7 +78,7 @@ public:
 
 	std::vector<std::byte> ReadWholeBuffer();
 
-	static uint64_t Size(const std::filesystem::path& name);
+	static uint64_t            Size(const std::filesystem::path& name);
 	static std::optional<Info> GetInfo(const std::filesystem::path& name);
 
 	static bool IsDirectoryExisting(const std::filesystem::path& path);

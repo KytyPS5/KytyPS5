@@ -11,7 +11,6 @@
 #include <memory>
 #include <mutex>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -26,15 +25,11 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
-	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
-	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
-		CheckNotInUploadCallback();
-
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
@@ -65,7 +60,6 @@ public:
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
-		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			const auto       address = manager->GetCpuAddr() + offset;
@@ -81,8 +75,6 @@ public:
 	                        UploadFunc&& upload_func) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
-		CheckNotInUploadCallback();
-		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
@@ -100,18 +92,10 @@ public:
 				               manager->lock.unlock();
 			               });
 		}
-		s_upload_owner = previous_upload_owner;
 	}
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
-	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
-
-	void CheckNotInUploadCallback() const noexcept {
-		if (s_upload_owner == this) {
-			EXIT("memory tracker re-entered from upload callback\n");
-		}
-	}
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {

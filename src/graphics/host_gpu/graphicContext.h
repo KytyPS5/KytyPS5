@@ -56,11 +56,6 @@ struct GraphicContext {
 		return physical_device_properties;
 	}
 
-	[[nodiscard]] const vk::PhysicalDeviceMemoryProperties&
-	GetPhysicalDeviceMemoryProperties() const {
-		return physical_device_memory_properties;
-	}
-
 	[[nodiscard]] vk::FormatProperties GetFormatProperties(vk::Format format) const {
 		std::scoped_lock lock(m_format_properties_mutex);
 		auto [it, inserted] = m_format_properties.try_emplace(format);

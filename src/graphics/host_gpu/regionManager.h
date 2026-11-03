@@ -81,9 +81,6 @@ class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
-		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
-			EXIT("invalid region tracking manager construction\n");
-		}
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
@@ -104,11 +101,6 @@ public:
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
-			}
-		}
-		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
-				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
 		auto& bits = GetBits<source>();
@@ -179,10 +171,6 @@ private:
 	}
 
 	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
-		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
-		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
-			EXIT("range lies outside its tracking region\n");
-		}
 		const auto offset = vaddr - m_cpu_addr;
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};

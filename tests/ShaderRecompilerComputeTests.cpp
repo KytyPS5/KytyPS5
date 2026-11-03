@@ -6143,8 +6143,10 @@ public:
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
         cache, 0, std::numeric_limits<uint64_t>::max());
     cache.RunGarbageCollector();
-    Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
-            "garbage collection kept the clean buffer");
+    Require(name, "clean eviction",
+            !cache.IsRegionRegistered(base, 3 * page) &&
+                cache.IsRegionCpuModified(base + 2 * page, page),
+            "garbage collection kept the clean buffer or its protection");
     (void)cache.FindBuffer(base, 3 * page);
     context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
@@ -51412,7 +51414,8 @@ void CheckStorageTextureGpuOwnedRebindState() {
               !tracker.IsRegionCpuModified(base, size) &&
               HostMemoryQueryReadable(base, size, readable) && readable == size,
           "clean storage readback did not publish readable coherent backing");
-  tracker.MarkRegionAsGpuModified(base, size);
+  tracker.ForEachUploadRange(
+      base, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
   readable = 0;
   Require(
       "StorageTextureGpuOwnedRebind", "clean reclaim",
@@ -51439,7 +51442,7 @@ void CheckStorageTextureGpuOwnedRebindState() {
       "ownership");
 
   tracker.UnmarkRegionAsGpuModified(base, size);
-  tracker.UntrackMemory(base, size);
+  tracker.MarkRegionAsCpuModified(base, size);
   Require("StorageTextureGpuOwnedRebind", "free",
           Libs::LibKernel::Memory::FreeGuestMemory(base, size),
           "guest-owner free failed");

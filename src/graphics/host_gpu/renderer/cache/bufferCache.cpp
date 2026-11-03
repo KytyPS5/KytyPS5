@@ -139,15 +139,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
-	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
-	}
+	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
-	if (IsBufferInvalid(id)) {
-		return;
-	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -287,13 +282,9 @@ BufferCache::~BufferCache() {
 			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
 		}
 	}
-	m_buffers.clear();
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
-	if (!GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: invalid memory-invalidation range\n");
-	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
@@ -691,7 +682,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
-			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
@@ -708,7 +699,7 @@ void BufferCache::RunGarbageCollector() {
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
-		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}

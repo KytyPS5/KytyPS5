@@ -919,7 +919,7 @@ namespace {
 
 // Eliminate gotos by moving them through a structured statement tree. Every Code node
 // retains exactly one guest block; only Boolean route values cross construct boundaries.
-// This follows the outward/inward/lifting transformations used by shadPS4's GotoPass.
+// It applies the outward-movement, inward-movement and lifting transformations.
 class GotoStructurizer {
 	using ExprOp = ConditionExpression::Op;
 	enum class Kind { Root, Code, Label, Goto, If, Loop, Break, Return, Set };

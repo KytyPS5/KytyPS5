@@ -56,7 +56,7 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
-	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
+	// PA_SU_SC_MODE_CNTL.POLY_MODE disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
 		return vk::PolygonMode::eFill;
 	}
@@ -694,7 +694,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		vertex_info[0].indirect_draw    = state.indirect_draw;
 	}
 	if (object_primitive_id) {
-		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID.
 		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
 		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
 		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);

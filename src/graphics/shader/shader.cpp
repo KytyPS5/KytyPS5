@@ -214,7 +214,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
-			// AGC vertex formats encode the buffer format above the two channel-count bits.
+			// Vertex attribute formats encode the buffer format above the two channel-count bits.
 			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
 			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
 			              (buffer_format << 12u) |
@@ -299,12 +299,12 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	info.scratch_size_dwords = data.scratch_size_dwords;
 
 	if (data.user_data == nullptr) {
-		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
+		LOGF("ShaderGetVertexInputInfo(): no user data for shader=0x%016" PRIx64
 		     " user_sgpr_num=%u\n",
 		     shader_addr, user_sgpr_num);
 	}
 	if (data.vertex_error != nullptr) {
-		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+		LOGF("ShaderGetVertexInputInfo(): invalid vertex metadata shader=0x%016" PRIx64 ": %s\n",
 		     shader_addr, data.vertex_error);
 		return false;
 	}

@@ -20416,11 +20416,11 @@ public:
                       native_vertex.end());
           return code;
         }();
-        static std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+        static std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1>
             fetch_offsets;
-        fetch_offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+        fetch_offsets.fill(ILLEGAL_DIRECT_OFFSET);
+        fetch_offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 0;
+        fetch_offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 2;
         static ShaderUserData fetch_user_data{
             .direct_resource_offset = fetch_offsets.data(),
             .direct_resource_count = static_cast<uint16_t>(fetch_offsets.size())};

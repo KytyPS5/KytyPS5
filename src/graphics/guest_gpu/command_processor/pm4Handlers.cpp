@@ -979,7 +979,7 @@ KYTY_CP_OP_PARSER(CpOpSetBase) {
 
 	auto base_index = buffer[0] & 0xfu;
 	auto base_addr  = (buffer[1] & ~0x7ull) | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u);
-	// libSceAgc::setBaseIndirectArgs encodes Gnmp::ShaderType in PM4 header bit 1.
+	// The PM4 header encodes the shader type from bit 1.
 	auto shader_type = (cmd_id >> 1u) & 0x3u;
 
 	EXIT_NOT_IMPLEMENTED(base_index != 1u);

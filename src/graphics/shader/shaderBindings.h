@@ -7,9 +7,9 @@
 
 namespace Libs::Graphics {
 
-inline constexpr uint16_t AGC_ILLEGAL_DIRECT_OFFSET = 0xffff;
+inline constexpr uint16_t ILLEGAL_DIRECT_OFFSET = 0xffff;
 
-enum class AgcDirectResourceType : uint32_t {
+enum class DirectResourceType : uint32_t {
 	GdsCounterRange          = 0,
 	ShaderResourceTable      = 1,
 	SubPtrFetchShader        = 2,

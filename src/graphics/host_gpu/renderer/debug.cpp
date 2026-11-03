@@ -162,7 +162,7 @@ static std::string rt_print(const char* func, const HW::RenderTarget& rt) {
 }
 
 static bool RenderIsColorTileMode(Prospero::TileMode tile_mode) {
-	// AGC CxRenderTarget::TileMode shifted by CB_COLOR*_ATTRIB3.COLOR_SW_MODE.
+	// Swizzle modes CB_COLOR*_ATTRIB3.COLOR_SW_MODE can select.
 	switch (tile_mode) {
 		case Prospero::TileMode::kLinear:
 		case Prospero::TileMode::kStandard256B:

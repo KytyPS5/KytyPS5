@@ -4274,7 +4274,7 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					Fail(flags.pc, "scratch operation requires a nonzero per-thread scratch size");
 				}
 				return;
 			}

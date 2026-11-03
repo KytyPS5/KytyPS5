@@ -773,7 +773,7 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_VS_SHARED_VGPR_CNT_SHIFT = 28;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_VS_SHARED_VGPR_CNT_MASK  = 0xF;
 
 constexpr uint32_t SPI_SHADER_PACE_ID_GS           = 0x80;
-// AGC compiler records use this numeric tag as opaque metadata. It is not a shader checksum
+// Shader binaries record this numeric tag as opaque metadata. It is not a shader checksum
 // register and intentionally has no checksum-state consumer in HardwareContext.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_GS        = SPI_SHADER_PACE_ID_GS;
 constexpr uint32_t SPI_SHADER_PGM_RSRC4_GS         = 0x81;
@@ -830,7 +830,7 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0                   = 0xB2;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_3                   = 0xB5;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES                           = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES                           = 0xC9;
-// Private AGC registers used by shader binaries submitted through SET_SH_REG_INDIRECT.
+// Private registers used by shader binaries submitted through SET_SH_REG_INDIRECT.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_HS                       = 0x100;
 constexpr uint32_t SPI_SHADER_PGM_RSRC4_HS                        = 0x101;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_HS                = 0x102;

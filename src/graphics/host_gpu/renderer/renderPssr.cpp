@@ -31,7 +31,6 @@ RenderExecutor::~RenderExecutor() {
 }
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
-	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};

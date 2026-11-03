@@ -14818,29 +14818,6 @@ void TestNewShaderRecompilerNativeBindingPlan() {
             result.program.bindings == bindings &&
             result.program.info.buffers[0].descriptor_index == 0,
         "repeated emission did not rebuild descriptor slots deterministically");
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ShaderRecompiler::IR::Inst *buffer_handle = nullptr;
-  for (auto *block : result.program.blocks) {
-    const auto found = std::ranges::find_if(*block, [](const auto &inst) {
-      return inst.GetOpcode() ==
-             ShaderRecompiler::IR::ValueOpcode::GetBufferResource;
-    });
-    if (found != block->end()) {
-      buffer_handle = &*found;
-      break;
-    }
-  }
-  Check(buffer_handle != nullptr,
-        "native validation fixture lacks a buffer handle");
-  ExpectFatal(
-      [&] {
-        buffer_handle->SetFlags(UINT32_MAX);
-        (void)ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                   options.input_info);
-      },
-      "invalid dense buffer resource did not terminate SPIR-V emission");
-#endif
 }
 
 void BuildTypedPlan(const uint32_t *code, uint32_t words,

@@ -139,7 +139,6 @@ const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "vertex";
 		case ShaderType::Pixel: return "pixel";
-		case ShaderType::Fetch: return "fetch";
 		case ShaderType::Compute: return "compute";
 		default: return "unknown";
 	}

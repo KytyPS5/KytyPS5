@@ -243,10 +243,19 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
+                             const PreparedBindings&       bindings) {
+	const auto& images = input_info.stage.module->info.info.images;
+	return bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||
+	       std::ranges::any_of(images, [](const auto& image) {
+		       return image.written &&
+			          image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+	       });
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
-	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -324,22 +333,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	if (use_thread_dimensions) {
-		const uint32_t old_x = thread_group_x;
-		const uint32_t old_y = thread_group_y;
-		const uint32_t old_z = thread_group_z;
-		thread_group_x       = input_info.workgroup_counts[0];
-		thread_group_y       = input_info.workgroup_counts[1];
-		thread_group_z       = input_info.workgroup_counts[2];
-
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: use-thread-dimensions %ux%ux%u / %ux%ux%u -> "
-			     "groups %ux%ux%u\n",
-			     old_x, old_y, old_z, std::max(cs_regs.cs_regs.num_thread_x, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_y, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
-			     thread_group_z);
-		}
+		thread_group_x = input_info.workgroup_counts[0];
+		thread_group_y = input_info.workgroup_counts[1];
+		thread_group_z = input_info.workgroup_counts[2];
 	}
 
 	buffer.EndRendering();
@@ -362,20 +358,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
+	const auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage);
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
-	if (has_storage_writes) {
+	if (HasStorageWrites(input_info, bindings)) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -472,7 +458,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
                                       bool async_compute) {
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
+	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
@@ -514,13 +500,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
-	    });
-	if (has_storage_writes) {
+	if (HasStorageWrites(input_info, bindings)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};

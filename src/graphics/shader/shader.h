@@ -26,7 +26,6 @@ enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
-	Fetch,
 	Compute,
 	Mesh,
 	Local,

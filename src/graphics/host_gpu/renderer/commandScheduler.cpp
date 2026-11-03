@@ -136,16 +136,6 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	}
 }
 
-void CommandScheduler::BeginRendering(const RenderState& state) {
-	Current().BeginRendering(state);
-}
-
-void CommandScheduler::EndRendering() {
-	if (Active() && !m_command.IsInvalid()) {
-		Current().EndRendering();
-	}
-}
-
 void CommandScheduler::Flush() {
 	SubmitInfo submit;
 	Flush(submit);
@@ -153,12 +143,6 @@ void CommandScheduler::Flush() {
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
-	BeginNext();
-}
-
-void CommandScheduler::FlushAndWait() {
-	const auto tick = Submit();
-	m_master.Wait(tick);
 	BeginNext();
 }
 
@@ -321,8 +305,6 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;

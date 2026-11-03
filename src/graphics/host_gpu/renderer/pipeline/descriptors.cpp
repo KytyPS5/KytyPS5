@@ -665,8 +665,6 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto& command_buffer = context.GetCommandScheduler().Current();
-	EXIT_IF(command_buffer.IsInvalid());
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
@@ -916,15 +914,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
-	size_t image_descriptor_count = 0;
-	size_t write_count      = 0;
+	auto                           vk_buffer              = buffer.Handle();
+	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = prepared->runtime->module->info;
-		write_count += std::popcount(program.bindings.descriptor_mask);
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
 			const auto count = program.bindings.descriptor_counts[index];
@@ -940,18 +936,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
-	m_descriptor_writes.reserve(write_count);
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
 	for (auto* prepared: prepared_bindings) {
-		const auto& program       = prepared->runtime->module->info;
-		auto&       descriptors   = *prepared;
-		const auto  shader_stage  = NativeShaderStage(program.stage);
-		const auto  shader_stages = ShaderPipelineStages(shader_stage);
+		const auto& program     = prepared->runtime->module->info;
+		auto&       descriptors = *prepared;
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
-			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
+			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
+			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
 			vk_buffer.pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |

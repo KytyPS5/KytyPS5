@@ -225,13 +225,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		if (rt.info.round_mode) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 color round mode\n");
-				logged = true;
-			}
-		}
 		if (rt.attrib.force_dest_alpha_to_one) {
 			static bool logged = false;
 			if (!logged) {
@@ -445,15 +438,7 @@ static void BcPrint(const char* func, const HW::BlendControl& c, const HW::Blend
 	     color.red, color.green, color.blue, color.alpha, cc.mode, cc.op);
 }
 
-static void BcCheck(const HW::BlendColor& color, const HW::ColorControl& cc) {
-	if (color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f || color.alpha != 0.0f) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("BlendControl: temporary: accepting nonzero blend constants (%f, %f, %f, %f)\n",
-			     color.red, color.green, color.blue, color.alpha);
-			logged = true;
-		}
-	}
+static void BcCheck(const HW::ColorControl& cc) {
 	if (cc.mode != 1 && cc.mode != 0 && cc.mode != 2 && cc.mode != 3 && cc.mode != 5 &&
 	    cc.mode != 6) {
 		static bool logged = false;
@@ -569,15 +554,6 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 			LOGF("\t warning: unsupported PS5 sample locations use native Vulkan locations: "
 			     "samples=%" PRIu8 ", exposed=%" PRIu8 ", max_dist=%" PRIu8 "\n",
 			     cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
-		}
-	}
-}
-
-void LogDrawPhase(const char* draw_name, const char* phase) {
-	if (graphics_debug_dump_enabled()) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
-			LOGF("DrawPhase: %s %s\n", draw_name, phase);
 		}
 	}
 }
@@ -786,10 +762,8 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
 	const auto& c       = hw.GetClipControl();
-	const auto& rc      = hw.GetRenderControl();
 	const auto& mc      = hw.GetModeControl();
 	const auto& eqaa    = hw.GetEqaaControl();
 	const auto& cc      = hw.GetColorControl();
@@ -801,7 +775,7 @@ void hw_check(const CommandBuffer& buffer) {
 	VpCheck(vp, smc);
 	ClipCheck(c);
 	McCheck(mc);
-	BcCheck(bclr, cc);
+	BcCheck(cc);
 	EqaaCheck(eqaa, ac);
 	AaCheck(aa, ac);
 
@@ -833,14 +807,6 @@ void hw_check(const CommandBuffer& buffer) {
 			     static_cast<uint32_t>(mrt.info.cmask_fast_clear_enable), mrt.cmask.addr,
 			     static_cast<uint32_t>(mrt.dcc.dcc_clear_key_enable), mrt.clear_word0.word0,
 			     mrt.clear_word1.word1);
-		}
-	}
-	if (rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&
-	    hw.GetDepthClearValue() != 1.0f) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t temporary: accepting non-default depth clear value %f\n",
-			     hw.GetDepthClearValue());
 		}
 	}
 }

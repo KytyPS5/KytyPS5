@@ -22,11 +22,9 @@ public:
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
-	void           BeginRendering(const RenderState& state);
-	void           EndRendering();
+	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
-	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});

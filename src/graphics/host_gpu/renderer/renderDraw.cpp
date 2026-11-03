@@ -450,7 +450,6 @@ struct DrawCallInfo {
 	bool     indexed        = true;
 	uint32_t index_count    = 0;
 	uint32_t instance_count = 0;
-	uint32_t first_instance = 0;
 
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
@@ -858,17 +857,11 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
-	if (draw.indexed) {
-		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
-	}
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
-	}
-	if (draw.indexed) {
-		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
@@ -877,9 +870,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				state.color_count++;
 			}
 		}
-	}
-	if (draw.indexed) {
-		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
@@ -1034,7 +1024,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
 	if (depth.load_clear_aspects) {
-		m_context.GetCommandScheduler().BeginRendering(rendering);
+		buffer.BeginRendering(rendering);
 	}
 	auto& cache = m_context.GetTextureCache();
 	auto& source = cache.GetImage(depth.image_id);
@@ -1052,7 +1042,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		     color.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
 		    {static_cast<uint32_t>(rect.right - rect.left),
 		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
-		m_context.GetCommandScheduler().EndRendering();
+		buffer.EndRendering();
 		const auto command = buffer.Handle();
 		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 		               {}, command);
@@ -1117,7 +1107,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
-	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1135,7 +1124,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
-		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
@@ -1146,9 +1134,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                                : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
-	}
-	if (draw.indexed) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
@@ -1228,11 +1213,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
-		m_context.GetCommandScheduler().EndRendering();
+		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
-	LogDrawPhase(draw.Name(), "BeginRendering");
-	m_context.GetCommandScheduler().BeginRendering(rendering);
+	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
@@ -1254,10 +1238,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {
-		m_context.GetCommandScheduler().EndRendering();
+		buffer.EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
-	LogDrawPhase(draw.Name(), "DrawComplete");
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
@@ -1297,7 +1280,6 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
@@ -1377,7 +1359,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {true, args.index_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {true, args.index_count, args.instance_count};
 	if (!PrepareDrawRenderState(buffer, draw, state)) {
 		ResetBindings();
 		return true;
@@ -1398,7 +1380,6 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
@@ -1436,7 +1417,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {false, args.vertex_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
 	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
 	                       .indirect_draw    = args.indirect.address != 0};

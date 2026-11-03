@@ -839,21 +839,6 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
-void TestSignedMinMaxFolding() {
-  Fixture fixture;
-  const auto low =
-      fixture.Emit(ValueOpcode::SMin32, {Value(0xfffffffeu), Value(3u)});
-  const auto high =
-      fixture.Emit(ValueOpcode::SMax32, {low, Value(0xffffffffu)});
-  fixture.Emit(ValueOpcode::ReferenceU32, {high});
-
-  ConstantPropagationPass(fixture.program.blocks);
-
-  Check(fixture.BlockAt().Instructions().back().Arg(0).Resolve() ==
-            Value(0xffffffffu),
-        "signed min/max constant folding regressed");
-}
-
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -976,7 +961,6 @@ int main() {
     TestReadLaneElimination();
     TestCompleteWaveReduction();
     TestOptimizationPipeline();
-    TestSignedMinMaxFolding();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();

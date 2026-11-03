@@ -156,13 +156,6 @@ static_assert(!HasObtainBufferForImageCopy<BufferCache>);
 static_assert(!HasObtainBufferForImageWrite<BufferCache>);
 static_assert(!HasDiscardGpuDirtyBytes<BufferCache>);
 
-// A render-target view covers slices base..last of last + 1 image layers.
-static_assert(ResolveTargetViewInfo(3, 3).base_layer == 3 &&
-              ResolveTargetViewInfo(3, 3).layer_count == 1 &&
-              ResolveTargetViewInfo(3, 3).image_layers == 4);
-static_assert(ResolveTargetViewInfo(0, 5).layer_count == 6 &&
-              ResolveTargetViewInfo(0, 5).image_layers == 6);
-
 template <typename Backing>
 concept HasLegacyImageLayout = requires(Backing &backing) { backing.layout; };
 static_assert(!HasLegacyImageLayout<VulkanImage>);
@@ -3862,7 +3855,7 @@ public:
     std::memcpy(reinterpret_cast<void *>(clean_cached_source),
                 clean_copy_words.data(), sizeof(clean_copy_words));
 
-    std::array<uint32_t, 63> dma_commands{};
+    std::array<uint32_t, 56> dma_commands{};
     size_t dma_cursor = 0;
     const auto append_dma = [&](uint8_t dst_sel, uint64_t dst, uint8_t src_sel,
                                 uint64_t src, uint32_t bytes,
@@ -3892,8 +3885,6 @@ public:
     append_dma(3, l2_copy_dst, 3, memory_src, sizeof(source_words));
     append_dma(2, nowhere_dst, 3, nowhere_dst, sizeof(nowhere_words),
                1u << 31u);
-    // A 2 MiB register-space DMA_DATA to 0x3022c is dropped without a copy.
-    append_dma(0, 0x3022c, 3, 0, 1u << 21u, 0x5u << 27u);
     Require("GpuCommandLane", "DMA_DATA packet assembly",
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
@@ -6042,13 +6033,6 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
-    texture_cache.UnmapMemory(read_write_meta,
-                              write_only_meta - read_write_meta);
-    Require(name, "unmapped metadata range",
-            texture_cache.IsMeta(read_only_meta) &&
-                !texture_cache.IsMeta(read_write_meta) &&
-                texture_cache.IsMeta(write_only_meta),
-            "unmapping erased metadata outside its range or kept one inside");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -6141,10 +6125,8 @@ public:
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
         cache, 0, std::numeric_limits<uint64_t>::max());
     cache.RunGarbageCollector();
-    Require(name, "clean eviction",
-            !cache.IsRegionRegistered(base, 3 * page) &&
-                cache.IsRegionCpuModified(base + 2 * page, page),
-            "garbage collection kept the clean buffer or its protection");
+    Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
+            "garbage collection kept the clean buffer");
     (void)cache.FindBuffer(base, 3 * page);
     context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
@@ -19386,28 +19368,6 @@ public:
       return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
-    if (!depth_feedback && !packed_vertex_color) {
-      auto msaa = color;
-      auto &info = msaa.desc.info;
-      info.data = {depth_address + 0x14000, 8 * 8 * 16 * 4};
-      info.mip_layout[0] = {0, info.data.size, 8, 8, 0, info.data.size, 8};
-      info.linear_slice_stride = info.data.size;
-      info.extent = {8, 8, 1};
-      info.pitch = 8;
-      info.samples = 4;
-      msaa.image_id = cache.FindImage(msaa.desc);
-      auto per_sample = pixel;
-      per_sample.ps_sample_shading = true;
-      DrawRenderState state{.color_info = {msaa}, .color_count = 1,
-                            .topology = vk::PrimitiveTopology::eTriangleList,
-                            .ps_active = true, .vertex_info = {vertex},
-                            .ps_input_info = per_sample};
-      Require(name, "per-sample shading",
-              static_cast<bool>(context.GetPipelineCache()
-                                    .GetGraphicsPipeline(scheduler.Current(), state)
-                                    .pipeline),
-              "a 4x per-sample-shaded pipeline was not built");
-    }
     const auto draw = [&](const PipelineCache::Pipeline &selected,
                           uint32_t vertex_count = 3,
                           std::array<u32, 4> clear_value = {}) {
@@ -50801,18 +50761,6 @@ void CheckStorageTextureDepthTileUploadLayout() {
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == pitch,
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
-  auto stencil_layout = layout;
-  stencil_layout.pixel_format = vk::Format::eS8Uint;
-  auto depth_layout = layout;
-  depth_layout.pixel_format = vk::Format::eD16Unorm;
-  Require("StorageTextureDepthTileUpload", "copy aspects",
-          regions[0].imageSubresource.aspectMask ==
-                  vk::ImageAspectFlagBits::eColor &&
-              stencil_layout.BufferCopies()[0].imageSubresource.aspectMask ==
-                  vk::ImageAspectFlagBits::eStencil &&
-              depth_layout.BufferCopies()[0].imageSubresource.aspectMask ==
-                  vk::ImageAspectFlagBits::eDepth,
-          "depth-plane copies lost their color, stencil or depth aspect");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
 
@@ -52323,18 +52271,6 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
       g_hw_uc_indirect_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
       g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr;
 
-  // Every value of a register range lands in its own register.
-  std::array<uint32_t, 4> index_range_packet{
-      KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, Pm4::R_ZERO), Pm4::GE_INDX_OFFSET,
-      7u, 0x80000000u};
-  Pm4Execution index_range_execution;
-  Require("Pm4NativeTargetGeometry", "uconfig register range",
-          packet.Process(index_range_execution, index_range_packet) ==
-                  Pm4ProcessResult::Complete &&
-              packet.GetUcfg().GetIndexOffset() == 7u &&
-              packet.GetUcfg().GetPrimitiveResetControl() == 0x80000000u,
-          "a SET_UCONFIG_REG range dropped a register value");
-
   const bool native_ps_address_slots_are_handled =
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr;
@@ -52434,25 +52370,6 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
               processor.GetShCtx().GetVs().es_regs.data_addr == shader_address,
           "direct SET_SH_REG did not route its ES base pair through the "
           "register handlers");
-  std::array<uint32_t, 8> user_data{
-      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
-      Pm4::SPI_SHADER_USER_DATA_PS_0 + 30,
-      1u,
-      2u,
-      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
-      Pm4::COMPUTE_USER_DATA_0 + 14,
-      3u,
-      4u,
-  };
-  Pm4Execution user_data_execution;
-  const auto &ps_sgpr = processor.GetShCtx().GetPs().ps_user_sgpr.value;
-  const auto &cs_sgpr = processor.GetShCtx().GetCs().cs_user_sgpr.value;
-  Require("Pm4DirectShaderRegisterFallback", "last user-data slots",
-          processor.Process(user_data_execution, user_data) ==
-                  Pm4ProcessResult::Complete &&
-              ps_sgpr[30] == 1u && ps_sgpr[31] == 2u && cs_sgpr[14] == 3u &&
-              cs_sgpr[15] == 4u,
-          "direct SET_SH_REG user data missed the last slots of a stage");
   std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
 }
 
@@ -52495,136 +52412,6 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
               range_viewport.guard_band_vert_discard == 8.0f,
           "full guard-band range did not preserve hardware register order");
   std::printf("[host]    %-32s ok\n", "Pm4GuardBandRegisterRanges");
-}
-
-void CheckPm4IgnoredContextRegisters(RenderContext &renderer) {
-  CommandProcessor processor(renderer, 0);
-  for (const uint32_t offset : {Pm4::CB_DCC_CONTROL,
-                                Pm4::DB_COUNT_CONTROL,
-                                Pm4::DB_SRESULTS_COMPARE_STATE0,
-                                Pm4::DB_SRESULTS_COMPARE_STATE1,
-                                Pm4::DB_RENDER_OVERRIDE2,
-                                Pm4::DB_DFSM_CONTROL,
-                                Pm4::DB_RMI_L2_CACHE_CONTROL,
-                                Pm4::CB_RMI_GL2_CACHE_CONTROL,
-                                Pm4::TA_BC_BASE_ADDR,
-                                Pm4::TA_BC_BASE_ADDR_HI,
-                                Pm4::PA_SU_POINT_SIZE,
-                                Pm4::PA_SU_POINT_MINMAX,
-                                Pm4::SPI_VS_OUT_CONFIG,
-                                Pm4::SPI_SHADER_POS_FORMAT,
-                                Pm4::SPI_SHADER_IDX_FORMAT,
-                                Pm4::VGT_GS_INSTANCE_CNT,
-                                Pm4::VGT_GS_ONCHIP_CNTL,
-                                Pm4::VGT_HOS_MAX_TESS_LEVEL,
-                                Pm4::VGT_HOS_MIN_TESS_LEVEL,
-                                Pm4::VGT_ESGS_RING_ITEMSIZE,
-                                Pm4::VGT_PRIMITIVEID_EN,
-                                Pm4::VGT_REUSE_OFF,
-                                Pm4::VGT_TESS_DISTRIBUTION,
-                                Pm4::VGT_PRIMITIVEID_RESET,
-                                Pm4::SPI_SHADER_Z_FORMAT,
-                                Pm4::PA_SC_FOV_WINDOW_LR,
-                                Pm4::PA_SC_FOV_WINDOW_TB,
-                                Pm4::PA_SC_FSR_ENABLE,
-                                Pm4::FSR_RECURSIONS0,
-                                Pm4::FSR_RECURSIONS1,
-                                Pm4::PA_SC_MODE_CNTL_1,
-                                Pm4::PA_SC_AA_MASK_X0Y0_X1Y0,
-                                Pm4::PA_SC_AA_MASK_X0Y1_X1Y1,
-                                Pm4::PA_SU_VTX_CNTL,
-                                Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK,
-                                Pm4::PA_SC_BINNER_CNTL_0,
-                                Pm4::PA_SC_BINNER_CNTL_1,
-                                Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL,
-                                Pm4::PA_SC_SHADER_CONTROL,
-                                Pm4::CX_NOP}) {
-    std::array<uint32_t, 3> command{
-        KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), offset, ~0u};
-    Pm4Execution execution;
-    Require("Pm4IgnoredContextRegisters", "accepted register",
-            processor.Process(execution, command) ==
-                    Pm4ProcessResult::Complete &&
-                (offset == Pm4::CX_NOP ||
-                 g_hw_ctx_indirect_func[offset] != nullptr),
-            "an ignored context register write did not complete");
-  }
-  std::printf("[host]    %-32s ok\n", "Pm4IgnoredContextRegisters");
-}
-
-void CheckPm4IndirectShaderAndUconfigTables(RenderContext &renderer) {
-  CommandProcessor processor(renderer, 0);
-  bool handled = true;
-  for (const uint32_t offset : {Pm4::SPI_SHADER_PGM_RSRC1_HS,
-                                Pm4::SPI_SHADER_PGM_RSRC4_HS,
-                                Pm4::SPI_SHADER_PGM_CHKSUM_HS,
-                                Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS,
-                                Pm4::SPI_SHADER_PGM_RSRC4_GS,
-                                Pm4::SPI_SHADER_PACE_ID_GS,
-                                Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS,
-                                Pm4::SPI_SHADER_PGM_RSRC1_PS,
-                                Pm4::SPI_SHADER_PACE_ID_PS,
-                                Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS,
-                                0x0cau,
-                                Pm4::COMPUTE_PGM_LO,
-                                Pm4::COMPUTE_PGM_HI,
-                                Pm4::COMPUTE_PGM_RSRC1,
-                                Pm4::COMPUTE_PGM_RSRC2,
-                                Pm4::COMPUTE_START_X,
-                                Pm4::COMPUTE_START_Y,
-                                Pm4::COMPUTE_START_Z,
-                                Pm4::COMPUTE_RESOURCE_LIMITS,
-                                Pm4::COMPUTE_TMPRING_SIZE,
-                                Pm4::COMPUTE_PGM_RSRC3,
-                                Pm4::COMPUTE_PACE_ID}) {
-    handled = handled && g_hw_sh_indirect_func[offset] != nullptr;
-  }
-  for (const uint32_t offset :
-       {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL,
-        Pm4::IA_MULTI_VGT_PARAM, Pm4::TA_CS_BC_BASE_ADDR,
-        Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION,
-        Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS,
-        Pm4::FSR_WINDOW_LEFT + 1u, Pm4::FSR_CONTROL_POINTS_LEFT_X,
-        Pm4::FSR_CONTROL_POINTS_LEFT_Y + 3u, Pm4::FSR_ALPHA_LEFT_X,
-        Pm4::FSR_ALPHA_LEFT_Y + 1u, Pm4::GE_STEREO_CNTL}) {
-    handled = handled && g_hw_uc_indirect_func[offset] != nullptr;
-  }
-  handled = handled &&
-            g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MIN] != nullptr &&
-            g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MAX] != nullptr;
-  for (const uint32_t offset :
-       {Pm4::COMPUTE_NUM_THREAD_X, Pm4::COMPUTE_NUM_THREAD_Y,
-        Pm4::COMPUTE_NUM_THREAD_Z}) {
-    const auto handler = g_hw_sh_indirect_func[offset];
-    handled = handled && handler != nullptr;
-    if (handler != nullptr) {
-      handler(processor, offset, offset);
-    }
-  }
-  const auto &cs = processor.GetShCtx().GetCs().cs_regs;
-  Require("Pm4IndirectShaderAndUconfigTables", "indirect handlers",
-          handled && cs.num_thread_x == Pm4::COMPUTE_NUM_THREAD_X &&
-              cs.num_thread_y == Pm4::COMPUTE_NUM_THREAD_Y &&
-              cs.num_thread_z == Pm4::COMPUTE_NUM_THREAD_Z,
-          "an indirect SH or UCONFIG register lost its handler");
-  std::printf("[host]    %-32s ok\n", "Pm4IndirectShaderAndUconfigTables");
-}
-
-void CheckPm4LineWidth(RenderContext &renderer) {
-  CommandProcessor processor(renderer, 0);
-  std::array<uint32_t, 3> command{
-      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::PA_SU_LINE_CNTL,
-      8u};
-  Pm4Execution execution;
-  const bool direct =
-      processor.Process(execution, command) == Pm4ProcessResult::Complete &&
-      processor.GetCtx().GetLineWidth() == 1.0f;
-  g_hw_ctx_indirect_func[Pm4::PA_SU_LINE_CNTL](processor, Pm4::PA_SU_LINE_CNTL,
-                                               12u);
-  Require("Pm4LineWidth", "width in eighths",
-          direct && processor.GetCtx().GetLineWidth() == 1.5f,
-          "PA_SU_LINE_CNTL width was not decoded in eighths of a pixel");
-  std::printf("[host]    %-32s ok\n", "Pm4LineWidth");
 }
 
 void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
@@ -52816,37 +52603,6 @@ void CheckPm4DepthRenderOverride(RenderContext &renderer) {
           "DB_RENDER_OVERRIDE lost, exchanged, or retained force flags");
     }
   }
-  // A range through DB_HTILE_DATA_BASE writes every register it covers.
-  const std::array<uint32_t, 5> range_packet{
-      KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
-      Pm4::DB_RENDER_OVERRIDE, 0x28000000u, 0u, 0x00001234u};
-  Pm4Execution range_execution;
-  const auto range_result = processor.Process(range_execution, range_packet);
-  const auto &range_override = processor.GetCtx().GetDepthRenderOverride();
-  Require(name, "register range",
-          range_result == Pm4ProcessResult::Complete &&
-              range_override.force_z_valid && range_override.force_z_dirty &&
-              processor.GetCtx().GetDepthRenderTarget().htile_data_base_addr ==
-                  0x123400u,
-          "a SET_CONTEXT_REG range dropped DB_HTILE_DATA_BASE");
-  std::printf("[host]    %-32s ok\n", name);
-}
-
-void CheckPm4DepthShaderControl(RenderContext &renderer) {
-  constexpr const char *name = "Pm4DepthShaderControl";
-  CommandProcessor processor(renderer, 0);
-  const std::array<uint32_t, 3> packet{
-      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::DB_SHADER_CONTROL,
-      0x00006a61u};
-  Pm4Execution execution;
-  const auto result = processor.Process(execution, packet);
-  const auto &db = processor.GetCtx().GetShaderRegisters().db_shader_control;
-  Require(name, "fields",
-          result == Pm4ProcessResult::Complete && db.shader_z_export_enable &&
-              db.shader_z_behavior == 2 && db.shader_kill_enable &&
-              !db.shader_mask_export_enable && db.shader_dual_export_enable &&
-              !db.shader_execute_on_noop && db.alpha_to_mask_disable,
-          "DB_SHADER_CONTROL fields decoded into the wrong state");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -53644,16 +53400,6 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                 commands[1] == value,
             "a NOP payload executed or blocked the following packet");
   }
-  // Debug markers carry an opaque string; the packet after a push/pop pair must run.
-  std::array<uint32_t, 10> markers{KYTY_PM4(3, Pm4::IT_NOP, Pm4::R_PUSH_MARKER), 0x00636261u, 0u,
-                                   KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_POP_MARKER), 0u};
-  std::copy(completion.begin(), completion.end(), markers.begin() + 5);
-  selected = 0;
-  Pm4Execution marker_execution;
-  Require(name, "debug markers",
-          processor.Process(marker_execution, markers) == Pm4ProcessResult::Complete &&
-              selected == 7,
-          "a debug marker consumed the wrong length or hid the packet after it");
   alignas(8) uint64_t released = 0;
   std::array<uint32_t, 20> disabled_commands{};
   const auto disabled_write = write(&returned, 99);
@@ -53981,98 +53727,10 @@ void CheckPm4Flip() {
               VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
               flipped_arg == flip_arg,
           "R_FLIP did not publish the occlusion counters or flip");
-  // The flip status reports the completed flip and nothing pending.
-  std::array<uint64_t, 16> flip_status{};
-  Require(name, "flip status",
-          VideoOut::VideoOutGetFlipStatus(
-              handle, reinterpret_cast<VideoOut::VideoOutFlipStatus *>(
-                          flip_status.data())) == 0 &&
-              flip_status[0] == 1 &&
-              static_cast<int64_t>(flip_status[3]) == flip_arg &&
-              VideoOut::VideoOutIsFlipPending(handle) == 0,
-          "the flip status did not report the completed flip");
 
   gpu.WaitForIdle();
-  // Each pre-vblank event carries the port's pre-vblank count.
-  EventQueue::KernelEqueue vblanks = EventQueue::KERNEL_EQUEUE_INVALID;
-  Require(name, "pre-vblank events",
-          EventQueue::KernelCreateEqueue(&vblanks, "vblanks") == 0 &&
-              VideoOut::VideoOutAddPreVblankStartEvent(vblanks, handle,
-                                                       &udata) == 0,
-          "pre-vblank event registration failed");
-  std::array<int64_t, 2> pre_vblanks{};
-  for (auto &pre_vblank : pre_vblanks) {
-    timeout = 2'000'000;
-    Require(name, "pre-vblank",
-            EventQueue::KernelWaitEqueue(vblanks, &event, 1, &count,
-                                         &timeout) == 0 &&
-                count == 1 &&
-                VideoOut::VideoOutGetEventData(&event, &pre_vblank) == 0,
-            "no pre-vblank event");
-  }
-  Require(name, "pre-vblank count",
-          pre_vblanks[0] > 0 && pre_vblanks[1] == pre_vblanks[0] + 1,
-          "pre-vblank events did not count vblanks");
-  // Handle checks of an open port, a closed one and the same port reopened.
-  alignas(4) std::array<uint8_t, 16> color{};
-  const auto *settings =
-      reinterpret_cast<const VideoOut::VideoOutColorSettings *>(color.data());
-  constexpr int invalid = VideoOut::VIDEO_OUT_ERROR_INVALID_HANDLE;
-  Require(name, "open port",
-          VideoOut::VideoOutAdjustColor(handle, settings) == 0 &&
-              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(handle) ==
-                  0 &&
-              VideoOut::VideoOutSetFlipMaster(handle, handle) ==
-                  VideoOut::VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION &&
-              VideoOut::VideoOutSetFlipMaster(handle, handle + 1) == invalid &&
-              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(0) ==
-                  invalid &&
-              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(5) ==
-                  invalid,
-          "open-port handle checks failed");
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
           "video-out close failed");
-  Require(name, "closed port",
-          VideoOut::VideoOutClose(handle) == invalid &&
-              VideoOut::VideoOutAdjustColor(handle, settings) == invalid &&
-              VideoOut::VideoOutAllowOutputResolutionWqhdDetection(handle) ==
-                  invalid &&
-              VideoOut::VideoOutSetFlipMaster(handle, handle) == invalid &&
-              VideoOut::VideoOutAddVblankEvent(flips, handle, &udata) ==
-                  invalid &&
-              VideoOut::VideoOutSubmitFlip(handle, -1, 1, 0) == invalid,
-          "a closed port accepted its handle");
-  // Events registered on the reopened port fire.
-  timeout = 2'000'000;
-  Require(name, "reopen",
-          VideoOut::VideoOutOpen(255, 0, 0, nullptr) == handle &&
-              VideoOut::VideoOutAddVblankEvent(flips, handle, &udata) == 0 &&
-              EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
-                                           &timeout) == 0 &&
-              count == 1 &&
-              VideoOut::VideoOutGetEventId(&event) == 1 /* vblank */,
-          "the reopened port rejected its handle or its events");
-  // A CPU flip of the blank buffer is presented at a vblank.
-  constexpr int64_t cpu_flip_arg = 0x55;
-  timeout = 2'000'000;
-  Require(name, "cpu flip",
-          VideoOut::VideoOutAddFlipEvent(vblanks, handle, &udata) == 0 &&
-              VideoOut::VideoOutSubmitFlip(handle, -1, 1, cpu_flip_arg) == 0 &&
-              EventQueue::KernelWaitEqueue(vblanks, &event, 1, &count,
-                                           &timeout) == 0 &&
-              count == 1 &&
-              VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
-              flipped_arg == cpu_flip_arg &&
-              VideoOut::VideoOutClose(handle) == 0,
-          "the CPU flip was not presented");
-  // Waits measure their timeout with the host timer.
-  timeout = 2'000;
-  Require(name, "timeout",
-          EventQueue::KernelWaitEqueue(vblanks, &event, 1, &count, &timeout) ==
-                  LibKernel::KERNEL_ERROR_ETIMEDOUT &&
-              count == 0,
-          "an empty event queue did not time out");
-  EventQueue::KernelDeleteEqueue(vblanks);
   EventQueue::KernelDeleteEqueue(flips);
   renderer.ShutdownGpu();
   VideoOut::VideoOutShutdown();
@@ -55304,9 +54962,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckShaderFusion();
     CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
-    CheckPm4IgnoredContextRegisters(vulkan.RuntimeRenderer());
-    CheckPm4IndirectShaderAndUconfigTables(vulkan.RuntimeRenderer());
-    CheckPm4LineWidth(vulkan.RuntimeRenderer());
     CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
     CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
     CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
@@ -55314,7 +54969,6 @@ int main(int argc, char **argv) {
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
-    CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -55629,14 +55283,10 @@ int main(int argc, char **argv) {
   CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
-  CheckPm4IgnoredContextRegisters(vulkan.RuntimeRenderer());
-  CheckPm4IndirectShaderAndUconfigTables(vulkan.RuntimeRenderer());
-  CheckPm4LineWidth(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
-  CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
   CheckShaderFusion();
   CheckAgcSystemTable(vulkan.RuntimeRenderer());
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());

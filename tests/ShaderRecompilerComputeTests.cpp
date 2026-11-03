@@ -30990,6 +30990,128 @@ TestCase VectorMinMaxF32RelaxedCornerCases(u32 wave) {
   return test;
 }
 
+constexpr u32 LoopBoundInputsPerRow = 5;
+constexpr u32 LoopBoundMaxSaturated = 0xffffffffu;
+constexpr float LoopBoundTwoPow32 = 4294967296.0f;
+constexpr size_t LoopBoundMinSwapSensitiveRows = 6;
+
+// Raw bits of a float, for the emulated min and max oracle.
+u32 LoopBoundFloatBits(float value) { return std::bit_cast<u32>(value); }
+
+// One engine style float to integer row. a and b are the integer bounds, x and y feed the
+// inner max and k scales the difference.
+struct LoopBoundRow {
+  u32 a, b;
+  float x, y, k;
+};
+
+// V_MUL_F32 with clamp maps NaN to zero and the rest into 0..1.
+float ClampZeroToOne(float value) {
+  if (std::isnan(value)) return 0.0f;
+  return std::min(std::max(value, 0.0f), 1.0f);
+}
+
+// V_CVT_U32_F32 saturates and maps NaN and negatives to zero.
+u32 SaturatingFloatToU32(float value) {
+  if (std::isnan(value) || value <= 0.0f) return 0u;
+  if (value >= LoopBoundTwoPow32) return LoopBoundMaxSaturated;
+  return static_cast<u32>(value);
+}
+
+// cvt_u32(max(float(a), clamp01(k * (max(x, y) - y)) * float(b))) under the emulated rules.
+// With swapped set both maxes become mins, which shows which rows can tell the two apart.
+u32 LoopBoundReference(const LoopBoundRow &row, bool swapped) {
+  u32 (*pick)(u32, u32) = swapped ? EmulatedMin : EmulatedMax;
+  const float inner =
+      std::bit_cast<float>(pick(LoopBoundFloatBits(row.x), LoopBoundFloatBits(row.y)));
+  const float unit = ClampZeroToOne(row.k * (inner - row.y));
+  const float scaled = unit * static_cast<float>(row.b);
+  const float outer = std::bit_cast<float>(
+      pick(LoopBoundFloatBits(static_cast<float>(row.a)), LoopBoundFloatBits(scaled)));
+  return SaturatingFloatToU32(outer);
+}
+
+// Rows covering normal values, NaN, infinity, mixed zeros, overflow and negatives, with
+// enough rows that change their integer when the maxes become mins.
+std::vector<LoopBoundRow> LoopBoundRows() {
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  const float quiet_nan = std::bit_cast<float>(QuietNanBits);
+  const float signaling_nan = std::bit_cast<float>(SignalingNanBits);
+  const float negative_zero = std::bit_cast<float>(NegativeZeroBits);
+  constexpr float huge = 3.0e38f;
+  return {
+      {3, 10, 5.0f, 2.0f, 0.5f},          // Both maxes pick the larger input.
+      {3, 10, 2.5f, 2.0f, 1.0f},          // A partial fraction.
+      {100, 7, 5.0f, 2.0f, 1.0f},         // The bound a wins the outer max.
+      {0, 0xffffffffu, 5.0f, 2.0f, 1.0f}, // The product saturates the conversion.
+      {0xffffffffu, 0xffffffffu, 5.0f, 2.0f, 1.0f},
+      {3, 10, quiet_nan, 2.0f, 1.0f},     // A NaN leaves the other operand.
+      {3, 10, 5.0f, quiet_nan, 1.0f},
+      {3, 10, signaling_nan, 2.0f, 1.0f},
+      {3, 10, quiet_nan, quiet_nan, 1.0f},
+      {3, 10, inf, 2.0f, 1.0f},
+      {3, 10, -inf, 2.0f, 1.0f},
+      {3, 10, inf, inf, 1.0f},            // inf - inf is NaN and the clamp maps it to zero.
+      {3, 10, negative_zero, 0.0f, 1.0f}, // Mixed-sign zeros vanish through the clamp.
+      {3, 10, 0.0f, negative_zero, 1.0f},
+      {3, 10, 8.0f, 2.0f, huge},          // The scaled difference overflows to infinity.
+      {3, 10, 2.0f, 2.0f, inf},           // inf * 0 is NaN.
+      {3, 10, 5.0f, 2.0f, -1.0f},         // A negative scale clamps to zero.
+      {3, 10, -5.0f, -7.0f, 1.0f},
+      {3, 10, -7.0f, -5.0f, 1.0f},
+      {5, 0, 5.0f, 2.0f, 1.0f},
+  };
+}
+
+// The pattern engines use to turn a float into a loop count or index, on the real guest ops. The
+// host min/max may only differ in a zero sign or a NaN payload, and the clamp and the conversion
+// remove both, so the integers must equal the reference exactly in the emulated and host runs.
+// Honest limit, a mutant that breaks only the NaN handling of the inner max is not caught here,
+// because the clamp maps the NaN result to zero either way.
+TestCase VectorMinMaxF32RelaxedLoopBound(u32 wave) {
+  using O = ShaderOpcode;
+  const auto rows = LoopBoundRows();
+  size_t swap_sensitive = 0;
+  TestCase test;
+  test.name = "VectorMinMaxF32RelaxedLoopBound";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  for (const auto &row : rows) {
+    test.initial.insert(test.initial.end(),
+                        {row.a, row.b, LoopBoundFloatBits(row.x), LoopBoundFloatBits(row.y),
+                         LoopBoundFloatBits(row.k)});
+    swap_sensitive += LoopBoundReference(row, false) != LoopBoundReference(row, true);
+  }
+  Require(test.name, "swap sensitive rows", swap_sensitive >= LoopBoundMinSwapSensitiveRows,
+          "too few rows change their integer when the max becomes a min");
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < rows.size(); ++index) {
+    for (u32 operand = 0; operand < LoopBoundInputsPerRow; ++operand) {
+      AppendVMovU32(&code, 30, (index * LoopBoundInputsPerRow + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    code.push_back(EncodeVop1(0x06, 5, Vgpr(0)));        // float(a)
+    code.push_back(EncodeVop1(0x06, 6, Vgpr(1)));        // float(b)
+    code.push_back(EncodeVop2(0x10, 7, Vgpr(2), 3));     // max(x, y)
+    code.push_back(EncodeVop2(0x04, 8, Vgpr(7), 3));     // max(x, y) - y
+    AppendVop3(&code, 0x108, 9, Vgpr(4), Vgpr(8), 0, 0, 0, true); // clamp01(k * difference)
+    code.push_back(EncodeVop2(0x08, 10, Vgpr(9), 6));    // * float(b)
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(5), 10));   // max(float(a), product)
+    code.push_back(EncodeVop1(0x07, 12, Vgpr(11)));      // cvt_u32
+    AppendStoreVgpr(&code, 12, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(LoopBoundReference(rows[index], false));
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_F32_U32, O::V_MAX_F32, O::V_SUB_F32,
+                  O::V_MUL_F32, O::V_CVT_U32_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 // True when the production profile would use host min/max on this device with the flag on, so
 // the cases only execute on hosts that can actually enable it. Elsewhere they compile only.
 bool HostMinMaxRunsOn(VulkanHarness &vulkan) {
@@ -54441,6 +54563,19 @@ int main(int argc, char **argv) {
         test.compile_only = !host_runs;
         RunCase(&vulkan, test);
       }
+      // Without NMin or NMax both maxes took the emulated lowering. The conversion emits the
+      // emulation markers too, so requiring them here would prove nothing about the max.
+      auto loop_emulated = VectorMinMaxF32RelaxedLoopBound(wave);
+      loop_emulated.forbidden_spirv = {" NMin ", " NMax "};
+      RunCase(&vulkan, loop_emulated);
+      auto loop_host = VectorMinMaxF32RelaxedLoopBound(wave);
+      loop_host.profile = &host_profile;
+      loop_host.required_spirv = {" NMax "};
+      // The clamp and the conversion also emit OpIsNan and compares, so no emulation marker is
+      // unique to the max here. NMin is forbidden because the pattern has no min.
+      loop_host.forbidden_spirv = {" NMin "};
+      loop_host.compile_only = !host_runs;
+      RunCase(&vulkan, loop_host);
       // MED3 stays emulated under the opt-in. The native profile is the baseline that shows the
       // check can see NMax in the same shader.
       auto med3_native = VectorMed3F32NanUsesMin3Path(wave);

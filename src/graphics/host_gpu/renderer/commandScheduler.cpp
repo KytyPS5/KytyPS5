@@ -74,10 +74,12 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool submit_cadence)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_cadence(submit_cadence) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -299,7 +301,25 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	// Any submit starts a new command buffer, so the cadence counts again from its first draw.
+	m_cadence.Reset();
 	return m_command;
+}
+
+uint64_t CommandScheduler::GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) noexcept {
+	// The next tick to be issued is current_tick, so the last submitted one is current_tick - 1.
+	return current_tick > known_gpu_tick + 1 ? current_tick - 1 - known_gpu_tick : 0;
+}
+
+bool CommandScheduler::TakeDueCadenceSubmit() {
+	// The known GPU tick only advances on a refresh, so a stale one would report a lag that is gone.
+	m_master.Refresh();
+	const bool submit = m_cadence.ShouldSubmit(GpuLag(CurrentTick(), m_master.KnownGpuTick()));
+	// ShouldSubmit is the only place a hold is counted, so the count is complete here.
+	if (const auto held_back = m_cadence.TakeHeldBack(); held_back != 0) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::CadenceHeldBack, held_back);
+	}
+	return submit;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {

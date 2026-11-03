@@ -219,6 +219,22 @@ struct StreamBufferTestAccess {
   }
 };
 
+struct CommandSchedulerTestAccess {
+  // Replaces the policy so a test picks the flag, interval and clock. It runs on the GPU thread
+  // between streams, so nothing else reads the policy meanwhile.
+  static void SetCadence(CommandScheduler &scheduler, const SubmitCadence &cadence) {
+    scheduler.m_cadence = cadence;
+  }
+
+  static bool CadenceEnabled(const CommandScheduler &scheduler) {
+    return scheduler.m_cadence.Enabled();
+  }
+
+  static uint64_t GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) {
+    return CommandScheduler::GpuLag(current_tick, known_gpu_tick);
+  }
+};
+
 struct ImageTestAccess {
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
@@ -1366,6 +1382,23 @@ SubmitCadence MakeTestCadence(bool enabled, SubmitCadence::Clock::duration inter
   return SubmitCadence(enabled, interval, &CadenceTestNow);
 }
 
+// The lag is the submitted but unfinished ticks, and it saturates instead of wrapping.
+void CheckSubmitCadenceLagMath() {
+  constexpr const char *name = "SubmitCadence";
+  using Access = CommandSchedulerTestAccess;
+  // The first tick is 1, so a fresh timeline has nothing submitted.
+  Require(name, "nothing submitted", Access::GpuLag(1, 0) == 0,
+          "a fresh timeline should have no lag");
+  Require(name, "three submitted, one finished", Access::GpuLag(4, 1) == 2,
+          "ticks 2 and 3 are submitted but not finished");
+  Require(name, "all finished", Access::GpuLag(4, 3) == 0,
+          "a GPU that caught up has no lag");
+  // The GPU tick can be read after the current tick was, so it may pass it.
+  Require(name, "stale current tick saturates",
+          Access::GpuLag(3, 5) == 0 && Access::GpuLag(0, 0) == 0,
+          "the lag must not wrap around to a huge value");
+}
+
 // T0a. With the flag on and no interval, one piece of work makes a submit due, and with the flag
 // off the same work never does.
 void CheckSubmitCadenceFlag() {
@@ -1473,6 +1506,7 @@ void CheckSubmitCadenceLogic() {
   CheckSubmitCadenceIdleStart();
   CheckSubmitCadenceReset();
   CheckSubmitCadenceGpuLag();
+  CheckSubmitCadenceLagMath();
   std::printf("[host]    %-32s ok\n", "SubmitCadence");
 }
 
@@ -2662,7 +2696,7 @@ public:
 
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context, false);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -2792,7 +2826,7 @@ public:
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
 
-    CommandScheduler draining(Renderer(), m_runtime_context);
+    CommandScheduler draining(Renderer(), m_runtime_context, false);
     HW::Context drain_registers{};
     HW::UserConfig drain_user_config{};
     HW::Shader drain_shaders{};
@@ -4360,7 +4394,7 @@ public:
   void CheckUnifiedImageViewCache() {
     EnsureRuntimeContext();
     constexpr const char *name = "UnifiedImageViewCache";
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context, false);
 
     ImageInfo color_info{};
     color_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -12288,6 +12322,352 @@ public:
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(
         physical, size) == 0, "buffer binding release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Counter changes over one PM4 stream.
+  struct CadenceCounts {
+    uint64_t cadence_submits = 0;
+    uint64_t queue_submits = 0;
+    uint64_t held_back = 0;
+  };
+
+  // What the cadence cases share, so each case stays a short function.
+  struct CadenceFixture {
+    RenderContext &context;
+    CommandScheduler &scheduler;
+    CommandProcessor &processor;
+    vk::Semaphore gate = nullptr;
+    std::once_flag gate_released;
+  };
+
+  static constexpr const char *CadenceTestName = "GpuSubmitCadence";
+  static constexpr u32 CadenceDispatches = 8;
+  static constexpr u32 CadenceNopOnlyPackets = 17;
+  static constexpr u32 CadenceWaveSize = 64;
+  static constexpr u32 CadenceNopPacketDw = 3;
+  static constexpr u32 CadenceDispatchPacketDw = 5;
+  static constexpr u32 CadenceIndirectPacketDw = 4;
+  static constexpr u32 CadenceDispatchMode = 0x41u;
+  static constexpr auto CadenceNever = std::chrono::hours {1};
+  static constexpr auto CadenceImmediately = SubmitCadence::Clock::duration::zero();
+  // A gated GPU that stays blocked this long means the case hung, so the watchdog frees it.
+  static constexpr auto CadenceWatchdog = std::chrono::seconds {2};
+
+  // A NOP packet, which records no draw or dispatch.
+  static void AppendCadenceNop(std::vector<u32> *stream) {
+    stream->insert(stream->end(),
+                   {KYTY_PM4(CadenceNopPacketDw, Pm4::IT_NOP, Pm4::R_ZERO), 0u, 0u});
+  }
+
+  // A stream with a NOP before and after every dispatch, so each dispatch ends at a packet
+  // boundary that has other packets around it.
+  static std::vector<u32> CadenceDispatchStream(u32 dispatches) {
+    std::vector<u32> stream;
+    AppendCadenceNop(&stream);
+    for (u32 i = 0; i < dispatches; ++i) {
+      stream.insert(stream.end(),
+                    {KYTY_PM4(CadenceDispatchPacketDw, Pm4::IT_DISPATCH_DIRECT, 0u), 1u, 1u, 1u,
+                     CadenceDispatchMode});
+      AppendCadenceNop(&stream);
+    }
+    return stream;
+  }
+
+  // One indirect dispatch between two NOPs, reading its group counts from the given address.
+  static std::vector<u32> CadenceIndirectStream(uint64_t args_address) {
+    std::vector<u32> stream;
+    AppendCadenceNop(&stream);
+    stream.insert(stream.end(),
+                  {KYTY_PM4(CadenceIndirectPacketDw, Pm4::IT_DISPATCH_INDIRECT, 0u),
+                   static_cast<u32>(args_address), static_cast<u32>(args_address >> 32u),
+                   CadenceDispatchMode});
+    AppendCadenceNop(&stream);
+    return stream;
+  }
+
+  // Runs a stream on the GPU thread and returns how far the counters moved.
+  static CadenceCounts RunCadenceStream(CommandProcessor &processor,
+                                        std::span<const u32> stream) {
+    namespace Counters = Common::DebugCounters;
+    const auto read = [] {
+      return CadenceCounts{Counters::Get(Counters::Counter::CadenceSubmits),
+                           Counters::Get(Counters::Counter::QueueSubmits),
+                           Counters::Get(Counters::Counter::CadenceHeldBack)};
+    };
+    const auto before = read();
+    Pm4Execution execution;
+    Require(CadenceTestName, "stream completes",
+            processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+            "the PM4 stream did not run to its end");
+    const auto after = read();
+    return {after.cadence_submits - before.cadence_submits,
+            after.queue_submits - before.queue_submits, after.held_back - before.held_back};
+  }
+
+  // Starts from a caught up GPU, so the lag guard has nothing to hold back, then runs a stream
+  // with the given policy.
+  static CadenceCounts RunCadence(CadenceFixture &fixture, bool enabled,
+                                  SubmitCadence::Clock::duration interval,
+                                  std::span<const u32> stream) {
+    fixture.scheduler.Finish();
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler, SubmitCadence(enabled, interval));
+    return RunCadenceStream(fixture.processor, stream);
+  }
+
+  // One dispatch per stream, so the GPU is caught up for each and the counts add up.
+  static CadenceCounts RunCadenceEach(CadenceFixture &fixture, bool enabled,
+                                      SubmitCadence::Clock::duration interval) {
+    CadenceCounts total;
+    const auto single_stream = CadenceDispatchStream(1);
+    for (u32 i = 0; i < CadenceDispatches; ++i) {
+      const auto counts = RunCadence(fixture, enabled, interval, single_stream);
+      total.cadence_submits += counts.cadence_submits;
+      total.queue_submits += counts.queue_submits;
+      total.held_back += counts.held_back;
+    }
+    return total;
+  }
+
+  // The schedulers are built from the flag, and a false argument keeps one off.
+  void CheckGpuSubmitCadenceWiring() {
+    EnsureRuntimeContext();
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    Config::Load(options);
+    {
+      RenderContext off_context(m_runtime_context);
+      Require(CadenceTestName, "flag off leaves the render scheduler off",
+              !CommandSchedulerTestAccess::CadenceEnabled(off_context.GetCommandScheduler()),
+              "the render scheduler enabled the cadence without the flag");
+    }
+    options.gpu_submit_cadence_enabled = true;
+    Config::Load(options);
+    {
+      RenderContext on_context(m_runtime_context);
+      Require(CadenceTestName, "flag on turns the render scheduler on",
+              CommandSchedulerTestAccess::CadenceEnabled(on_context.GetCommandScheduler()),
+              "the render scheduler ignored the flag");
+    }
+    // The flag is still on, so only the argument can keep this scheduler off.
+    CommandScheduler declined(Renderer(), m_runtime_context, false);
+    Require(CadenceTestName, "a false argument keeps it off",
+            !CommandSchedulerTestAccess::CadenceEnabled(declined),
+            "the constructor argument was ignored");
+    CommandScheduler asked(Renderer(), m_runtime_context, true);
+    Require(CadenceTestName, "a true argument turns it on",
+            CommandSchedulerTestAccess::CadenceEnabled(asked),
+            "the baseline scheduler built with the cadence is not enabled");
+  }
+
+  // T1. Each dispatch makes a submit due and the next packet boundary submits it.
+  void CheckCadenceDispatches(CadenceFixture &fixture) {
+    const auto on = RunCadenceEach(fixture, true, CadenceImmediately);
+    // Only the flag differs from the case above.
+    const auto off = RunCadenceEach(fixture, false, CadenceImmediately);
+    Require(CadenceTestName, "T1 one cadence submit per dispatch",
+            on.cadence_submits == CadenceDispatches,
+            "cadence submits were " + std::to_string(on.cadence_submits));
+    Require(CadenceTestName, "T1 the cadence reaches the queue",
+            on.queue_submits >= off.queue_submits + CadenceDispatches,
+            "queue submits on=" + std::to_string(on.queue_submits) +
+                " off=" + std::to_string(off.queue_submits));
+    Require(CadenceTestName, "T1 flag off makes none", off.cadence_submits == 0,
+            "cadence submits with the flag off were " + std::to_string(off.cadence_submits));
+    // In one stream the GPU may still run earlier work, so each due submit is either made or
+    // held back, and the first one finds the GPU caught up.
+    const auto streamed = RunCadence(fixture, true, CadenceImmediately,
+                                     CadenceDispatchStream(CadenceDispatches));
+    Require(CadenceTestName, "T1 a long stream submits or holds every dispatch",
+            streamed.cadence_submits >= 1 &&
+                streamed.cadence_submits + streamed.held_back == CadenceDispatches,
+            "submits=" + std::to_string(streamed.cadence_submits) +
+                " held back=" + std::to_string(streamed.held_back));
+  }
+
+  // T2 and T3. Packets without work never submit, and an unelapsed interval never submits.
+  void CheckCadenceIdle(CadenceFixture &fixture) {
+    std::vector<u32> nops;
+    for (u32 i = 0; i < CadenceNopOnlyPackets; ++i) {
+      AppendCadenceNop(&nops);
+    }
+    const auto idle = RunCadence(fixture, true, CadenceImmediately, nops);
+    // Only one dispatch differs from the case above.
+    const auto single = RunCadence(fixture, true, CadenceImmediately, CadenceDispatchStream(1));
+    Require(CadenceTestName, "T2 NOPs alone never submit", idle.cadence_submits == 0,
+            "cadence submits for NOPs were " + std::to_string(idle.cadence_submits));
+    Require(CadenceTestName, "T2 one dispatch submits once", single.cadence_submits == 1,
+            "cadence submits for one dispatch were " + std::to_string(single.cadence_submits));
+    // T1 shows the same dispatches submit with no interval.
+    const auto slow = RunCadenceEach(fixture, true, CadenceNever);
+    Require(CadenceTestName, "T3 an unelapsed interval never submits", slow.cadence_submits == 0,
+            "cadence submits within the interval were " + std::to_string(slow.cadence_submits));
+  }
+
+  // An indirect dispatch notes its work too. Its group counts come from guest memory.
+  void CheckCadenceIndirect(CadenceFixture &fixture) {
+    constexpr uintptr_t base = 0x0000000204e00000ull;
+    constexpr uint64_t size = 0x10000;
+    int64_t physical = -1;
+    Require(CadenceTestName, "indirect allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+            "indirect argument allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(CadenceTestName, "indirect map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, physical, size) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "indirect argument mapping failed");
+    fixture.context.MapMemory(base, size);
+    const std::array<u32, 3> groups{1, 1, 1};
+    Require(CadenceTestName, "indirect arguments",
+            LibKernel::Memory::TryWriteBacking(base, groups.data(), sizeof(groups)),
+            "indirect arguments could not be written");
+    const auto stream = CadenceIndirectStream(base);
+    const auto on = RunCadence(fixture, true, CadenceImmediately, stream);
+    // Only the flag differs from the case above.
+    const auto off = RunCadence(fixture, false, CadenceImmediately, stream);
+    Require(CadenceTestName, "indirect dispatch submits once", on.cadence_submits == 1,
+            "cadence submits were " + std::to_string(on.cadence_submits));
+    Require(CadenceTestName, "indirect dispatch with the flag off makes none",
+            off.cadence_submits == 0,
+            "cadence submits with the flag off were " + std::to_string(off.cadence_submits));
+    fixture.scheduler.Finish();
+    fixture.context.UnmapMemory(base, size);
+    Require(CadenceTestName, "indirect release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "indirect argument release failed");
+  }
+
+  // Signals the gate once, from the case or from the watchdog, whichever comes first.
+  void ReleaseCadenceGate(CadenceFixture &fixture) {
+    std::call_once(fixture.gate_released, [&] {
+      vk::SemaphoreSignalInfo release{};
+      release.sType = vk::StructureType::eSemaphoreSignalInfo;
+      release.semaphore = fixture.gate;
+      release.value = 1;
+      Require(CadenceTestName, "gate release",
+              m_runtime_context.device.signalSemaphore(&release) == vk::Result::eSuccess,
+              "failed to release the gated GPU work");
+    });
+  }
+
+  // Waits on the host for the scheduler's timeline without telling the scheduler about it, so
+  // its known GPU tick stays stale until the scheduler refreshes it.
+  void WaitForTimelineOnHost(CadenceFixture &fixture, uint64_t tick) {
+    auto semaphore = fixture.scheduler.GetMasterSemaphore().Handle();
+    vk::SemaphoreWaitInfo wait{};
+    wait.sType = vk::StructureType::eSemaphoreWaitInfo;
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &semaphore;
+    wait.pValues = &tick;
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(CadenceWatchdog);
+    Require(CadenceTestName, "host wait",
+            m_runtime_context.device.waitSemaphores(&wait, timeout.count()) ==
+                vk::Result::eSuccess,
+            "the released GPU work did not finish");
+  }
+
+  // T-lag and the refresh. Two submits waiting on the gate leave the GPU behind, so a due submit
+  // is held back. Once the GPU finished, the next due submit must see that without anything else
+  // having refreshed the scheduler.
+  void CheckCadenceLag(CadenceFixture &fixture) {
+    const auto one_dispatch = CadenceDispatchStream(1);
+    std::binary_semaphore finished{0};
+    std::atomic<bool> timed_out{false};
+    std::jthread watchdog([&] {
+      if (!finished.try_acquire_for(CadenceWatchdog)) {
+        timed_out = true;
+        ReleaseCadenceGate(fixture);
+      }
+    });
+    for (uint64_t i = 0; i < SubmitCadenceMaxGpuLag; ++i) {
+      SubmitInfo blocked;
+      blocked.AddWait(fixture.gate, 1);
+      fixture.scheduler.Flush(blocked);
+    }
+    // No Finish here, because the GPU is held on purpose.
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler,
+                                           SubmitCadence(true, CadenceImmediately));
+    const auto lagging = RunCadenceStream(fixture.processor, one_dispatch);
+    const auto last_blocked_tick = fixture.scheduler.CurrentTick() - 1;
+    ReleaseCadenceGate(fixture);
+    WaitForTimelineOnHost(fixture, last_blocked_tick);
+    // Only the GPU having finished differs from the case above. A recorded dispatch would
+    // refresh the scheduler itself before the hook, so the work is noted and the hook asked
+    // directly. Then only the cadence check can bring the known GPU tick up to date.
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler,
+                                           SubmitCadence(true, CadenceImmediately));
+    fixture.scheduler.NoteRecordedWork();
+    const bool submits_after_finish = fixture.scheduler.TakeCadenceSubmit();
+    finished.release();
+    watchdog.join();
+    Require(CadenceTestName, "T-lag no hang", !timed_out, "the gated GPU work never ended");
+    Require(CadenceTestName, "T-lag a due submit is held back while the GPU lags",
+            lagging.cadence_submits == 0 && lagging.held_back >= 1,
+            "submits=" + std::to_string(lagging.cadence_submits) +
+                " held back=" + std::to_string(lagging.held_back));
+    Require(CadenceTestName, "T-lag the scheduler sees the GPU finished",
+            submits_after_finish,
+            "the due submit was held back by a lag that no longer exists");
+  }
+
+  // Creates the timeline semaphore that holds the GPU in the lag case.
+  vk::Semaphore CreateCadenceGate() {
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    Require(CadenceTestName, "gate create",
+            m_runtime_context.device.createSemaphore(&timeline_create, nullptr, &gate) ==
+                vk::Result::eSuccess,
+            "failed to create the GPU gate");
+    return gate;
+  }
+
+  // T1 to T3, the indirect dispatch and the lag cases. Dispatches in a PM4 stream make a submit
+  // due, and the hook submits it at the next packet boundary.
+  void CheckGpuSubmitCadence() {
+    CheckGpuSubmitCadenceWiring();
+    std::vector<u32> code;
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.gpu_submit_cadence_enabled = true;
+    Config::Load(options);
+    Common::DebugCounters::SetEnabled(true);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    const auto gate = CreateCadenceGate();
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      processor.GetShCtx().SetCsShader(
+          {.data_addr = reinterpret_cast<uint64_t>(code.data()), .num_thread_x = CadenceWaveSize,
+           .num_thread_y = 1, .num_thread_z = 1, .wave_size = CadenceWaveSize, .user_sgpr = 0});
+      CadenceFixture fixture{context, context.GetCommandScheduler(), processor, gate};
+      // The first dispatch compiles its pipeline, which is not part of any case below.
+      (void)RunCadence(fixture, false, CadenceImmediately, CadenceDispatchStream(1));
+      CheckCadenceDispatches(fixture);
+      CheckCadenceIdle(fixture);
+      CheckCadenceIndirect(fixture);
+      CheckCadenceLag(fixture);
+      fixture.scheduler.Finish();
+    });
+    m_runtime_context.device.destroySemaphore(gate, nullptr);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Common::DebugCounters::SetEnabled(false);
+    options.gpu_submit_cadence_enabled = false;
+    Config::Load(options);
+    std::printf("[gpu]     %-32s ok\n", CadenceTestName);
   }
 
   void CheckOrderedDispatch() {
@@ -21304,7 +21684,7 @@ public:
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
 
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context, false);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -49382,7 +49762,7 @@ void CheckRenderTargetFormatContract() {
              std::strcmp(kind, "volume-slice-range") == 0) {
     VulkanHarness vulkan;
     auto &graphics = vulkan.RuntimeContext();
-    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics);
+    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics, false);
     ImageInfo volume_info{};
     volume_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
     volume_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
@@ -49729,7 +50109,7 @@ void CheckSampledDepthResource() {
 void CheckImageTransitionState(RenderContext &renderer) {
   constexpr const char *name = "ImageTransitionState";
   auto &context = renderer.GetGraphics();
-  CommandScheduler scheduler(renderer, context);
+  CommandScheduler scheduler(renderer, context, false);
   const auto MakeInfo = [](vk::Format format, uint32_t levels,
                            uint32_t layers) {
     ImageInfo info{};
@@ -54802,6 +55182,11 @@ int main(int argc, char **argv) {
     CheckReferenceClockScale();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuSubmitCadence();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
@@ -55495,6 +55880,7 @@ int main(int argc, char **argv) {
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
+  vulkan.CheckGpuSubmitCadence();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();
   vulkan.CheckNullTextureDescriptors();

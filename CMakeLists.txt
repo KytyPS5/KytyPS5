@@ -713,6 +713,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
+	add_test(NAME shader_recompiler_submit_cadence_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-gpu-only)
+	set_tests_properties(shader_recompiler_submit_cadence_gpu PROPERTIES TIMEOUT 60)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max

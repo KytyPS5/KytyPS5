@@ -290,7 +290,9 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      // The presenter submits whole frames itself, so the submit cadence must not split them.
+	      present_scheduler(renderer, owner.graphic_ctx, false),
+	      frames(owner, present_scheduler) {
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}

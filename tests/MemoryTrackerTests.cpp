@@ -407,6 +407,75 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// A repeated ForEachUploadRange is skipped only while its regions are
+// unchanged: a CPU write, a GPU unmark or a download in between makes the next
+// identical call run again, and a new tracker does not take an old one's skip.
+void TestRepeatedUploadSkip() {
+  uint8_t *memory = nullptr;
+  uint64_t address = 0;
+  uint64_t page_size = 0;
+  uint32_t ranges = 0;
+  uint32_t uploads = 0;
+  const auto upload = [&](MemoryTracker &tracker, bool written) {
+    ranges = 0;
+    tracker.ForEachUploadRange(
+        address, page_size, written,
+        [&](uint64_t, uint64_t) noexcept { ranges++; },
+        [&]() noexcept { uploads++; });
+  };
+  {
+    TrackerHarness harness;
+    auto &tracker = harness.tracker;
+    page_size = harness.page_manager.GetPageSize();
+    memory = Allocate(harness.page_manager, 2);
+    address = reinterpret_cast<uint64_t>(memory);
+
+    upload(tracker, false);
+    Check(ranges == 1 && uploads == 1, "first upload did not copy the page");
+    upload(tracker, false);
+    Check(ranges == 0 && uploads == 2 && Protection(memory) == PAGE_READONLY,
+          "repeated upload copied or skipped its upload callback");
+    tracker.InvalidateRegion(address + 8, 8, [] {});
+    upload(tracker, false);
+    Check(ranges == 1, "upload after a CPU write was skipped");
+    upload(tracker, false);
+    Check(ranges == 0 && !tracker.IsRegionCpuModified(address, page_size),
+          "upload after a CPU write left the page dirty");
+
+    upload(tracker, true);
+    Check(tracker.IsRegionGpuModified(address, page_size) &&
+              Protection(memory) == PAGE_NOACCESS,
+          "written upload did not mark the page GPU-dirty");
+    tracker.UnmarkRegionAsGpuModified(address, page_size);
+    upload(tracker, true);
+    Check(tracker.IsRegionGpuModified(address, page_size) &&
+              Protection(memory) == PAGE_NOACCESS,
+          "written upload after an unmark was skipped");
+    tracker.ForEachDownloadRange<true>(address, page_size,
+                                       [](uint64_t, uint64_t) noexcept {});
+    Check(!tracker.IsRegionGpuModified(address, page_size),
+          "download did not clear the GPU-dirty page");
+    upload(tracker, true);
+    Check(tracker.IsRegionGpuModified(address, page_size) &&
+              Protection(memory) == PAGE_NOACCESS,
+          "written upload after a download was skipped");
+    upload(tracker, true);
+    Check(ranges == 0 && tracker.IsRegionGpuModified(address, page_size) &&
+              uploads == 8,
+          "repeated written upload changed the page's state");
+
+    tracker.UnmarkRegionAsGpuModified(address, page_size * 2);
+    tracker.UntrackMemory(address, page_size * 2);
+  }
+  {
+    TrackerHarness harness;
+    upload(harness.tracker, false);
+    Check(ranges == 1, "a new tracker skipped its first upload");
+    harness.tracker.UntrackMemory(address, page_size * 2);
+  }
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1202,6 +1271,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestRepeatedUploadSkip();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

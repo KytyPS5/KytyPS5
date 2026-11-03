@@ -10433,10 +10433,8 @@ void TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   auto result = RecompileForTest(shader, options);
-  Check(result.program.dispatcher_fallback &&
-            result.program.cfg_failure_kind == failed.failure_kind &&
-            result.program.fallback_reason == failed.unsupported_reason,
-        "compiler did not consume CFG failure diagnostics directly");
+  Check(result.program.dispatcher_fallback,
+        "failed structurization did not fall back to the dispatcher");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

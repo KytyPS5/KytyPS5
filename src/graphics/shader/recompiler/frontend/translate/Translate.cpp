@@ -1023,8 +1023,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
-	result.cfg_failure_kind    = cfg.failure_kind;
-	result.fallback_reason     = cfg.unsupported_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;

@@ -5,7 +5,6 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -103,13 +102,11 @@ struct MemoryInfo {
 enum class ExportTargetKind { Unknown, Null, Position, Primitive, Parameter, Mrt, MrtZ };
 
 struct ExportInfo {
-	ExportTargetKind kind   = ExportTargetKind::Unknown;
-	uint32_t         target = 0;
-	uint32_t         index  = 0;
-	uint32_t         en     = 0;
-	bool             done   = false;
-	bool             compr  = false;
-	bool             vm     = false;
+	ExportTargetKind kind  = ExportTargetKind::Unknown;
+	uint32_t         index = 0;
+	uint32_t         en    = 0;
+	bool             compr = false;
+	bool             vm    = false;
 
 	bool operator==(const ExportInfo& other) const = default;
 };
@@ -738,8 +735,6 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
-	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.

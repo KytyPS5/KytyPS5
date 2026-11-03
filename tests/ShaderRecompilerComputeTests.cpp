@@ -28956,6 +28956,7 @@ TestCase Vop3OutputModifierFlushesNegativeZero() {
   AppendVMovLiteral(&code, 1, 0x3f800000u);
   AppendVMovLiteral(&code, 2, 0xbf000000u);
   AppendVMovLiteral(&code, 3, 0x80800000u);
+  AppendVMovLiteral(&code, 4, 0x40000000u);
   AppendVop3(&code, 0x108, 10, Vgpr(0), Vgpr(1), 0, 0, 0, false, 1);
   AppendVop3(&code, 0x103, 11, Vgpr(0), Vgpr(0), 0, 0, 0, false, 3);
   AppendVop3(&code, 0x108, 12, Vgpr(2), Vgpr(1), 0, 0, 0, false, 2);
@@ -28964,7 +28965,8 @@ TestCase Vop3OutputModifierFlushesNegativeZero() {
   code.push_back(EncodeVop2Sdwa(0, 6, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1));
   AppendVop3(&code, 0x108, 15, Vgpr(3), Vgpr(1), 0, 0, 0, false, 3);
   code.insert(code.end(), {EncodeVop2(0x1b, 15, 255, 15), 0x80000000u});
-  for (u32 dst = 10; dst <= 15; dst++) {
+  AppendVop3(&code, 0x108, 16, Vgpr(4), Vgpr(1), 0, 0, 0, true, 3);
+  for (u32 dst = 10; dst <= 16; dst++) {
     AppendStoreVgpr(&code, dst, dst - 10);
   }
   AppendEnd(&code);
@@ -28972,7 +28974,8 @@ TestCase Vop3OutputModifierFlushesNegativeZero() {
   return {"Vop3OutputModifierFlushesNegativeZero",
           code,
           {},
-          {0x00000000u, 0x00000000u, 0xc0000000u, 0x80000000u, 0x00000000u, 0x80000000u},
+          {0x00000000u, 0x00000000u, 0xc0000000u, 0x80000000u, 0x00000000u, 0x80000000u,
+           0x3f800000u},
           {O::V_MOV_B32, O::V_MUL_F32, O::V_ADD_F32, O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 

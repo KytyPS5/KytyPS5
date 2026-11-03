@@ -695,7 +695,7 @@ void TestCompleteWaveReduction() {
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
-    Endpoint, EndpointSource, CrossBlock, WrongOperation, Or
+    Endpoint, EndpointSource, CrossBlock, WrongOperation, Or, Add
   };
   for (const auto test : {Case::Masked, Case::ScalarExec, Case::Wave32,
        Case::Wave32Rows, Case::Wave32Maximum, Case::RowMask, Case::BankMask,
@@ -704,7 +704,7 @@ void TestCompleteWaveReduction() {
        Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
        Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
-       Case::CrossBlock, Case::WrongOperation, Case::Or}) {
+       Case::CrossBlock, Case::WrongOperation, Case::Or, Case::Add}) {
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
     const auto source = fixture.Emit(ValueOpcode::LaneId);
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
@@ -723,7 +723,8 @@ void TestCompleteWaveReduction() {
     // UMax and OR scans seed lanes outside EXEC with zero.
     const bool maximum = test == Case::Wave32Maximum;
     const bool bitwise_or = test == Case::Or;
-    const uint32_t neutral = maximum || bitwise_or ? 0u : UINT32_MAX;
+    const bool add = test == Case::Add;
+    const uint32_t neutral = maximum || bitwise_or || add ? 0u : UINT32_MAX;
     const auto seed = fixture.Emit(ValueOpcode::SelectU32, {mask, source, Value(neutral)});
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
@@ -732,6 +733,10 @@ void TestCompleteWaveReduction() {
     if (bitwise_or) {
       operation = ValueOpcode::BitwiseOr32;
       reduction_opcode = ValueOpcode::SubgroupOrU32;
+    }
+    if (add) {
+      operation = ValueOpcode::IAdd32;
+      reduction_opcode = ValueOpcode::SubgroupIAddU32;
     }
     if (test == Case::WrongOperation) operation = ValueOpcode::BitwiseXor32;
     for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
@@ -793,7 +798,7 @@ void TestCompleteWaveReduction() {
     const uint32_t wave_size = test == Case::Wave32 || rows ? 32u : 64u;
     ConstantPropagationPass(fixture.program.blocks, wave_size);
     const auto stats = EliminateReadLane(fixture.program, wave_size);
-    const bool matches = test == Case::Masked || rows || bitwise_or;
+    const bool matches = test == Case::Masked || rows || bitwise_or || add;
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
           ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
     if (matches) {

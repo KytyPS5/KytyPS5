@@ -347,15 +347,13 @@ const InputMap& GetInputMap() {
 	return map;
 }
 
-void SetButton(uint32_t button, bool down) {
+void SetButton(uint32_t button, bool down, int id = Controller::HOST_INPUT_CONTROLLER_ID) {
 	if (button == Controller::PAD_BUTTON_L2) {
-		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerLeft,
-		                    down ? 255 : 0);
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
 	} else if (button == Controller::PAD_BUTTON_R2) {
-		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerRight,
-		                    down ? 255 : 0);
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
 	} else if (button != 0) {
-		Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, button, down);
+		Controller::SetButton(id, button, down);
 	}
 }
 
@@ -634,12 +632,8 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
 		}
 		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
-	} else if (info.button == Controller::PAD_BUTTON_L2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
-	} else if (info.button == Controller::PAD_BUTTON_R2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
 	} else if (info.button != 0) {
-		Controller::SetButton(id, info.button, down);
+		SetButton(info.button, down, id);
 	} else if (info.axis == Controller::Axis::AxisMax) {
 		CycleSettingOnPress(info.setting, down);
 	}

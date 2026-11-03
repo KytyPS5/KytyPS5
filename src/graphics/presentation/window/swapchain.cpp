@@ -60,13 +60,7 @@ public:
 	KYTY_CLASS_NO_COPY(FramePool);
 
 	void Initialize(uint32_t count, vk::Format format) {
-		if (count == 0 || format == vk::Format::eUndefined) {
-			EXIT("prepared-frame pool requires at least one frame\n");
-		}
 		Common::LockGuard lock(m_mutex);
-		if (!m_frames.empty()) {
-			EXIT("prepared-frame pool was initialized twice\n");
-		}
 		m_format = format;
 		m_frames.reserve(count);
 		m_free.reserve(count);
@@ -78,26 +72,17 @@ public:
 	}
 
 	void SetFormat(vk::Format format) {
-		if (format == vk::Format::eUndefined) {
-			EXIT("prepared-frame pool requires a presentation format\n");
-		}
 		Common::LockGuard lock(m_mutex);
 		m_format = format;
 	}
 
 	vk::Format GetFormat() {
 		Common::LockGuard lock(m_mutex);
-		if (m_format == vk::Format::eUndefined) {
-			EXIT("prepared-frame pool has no presentation format\n");
-		}
 		return m_format;
 	}
 
 	Presenter::Frame* Acquire(vk::Extent2D extent, vk::Format format) {
 		m_mutex.Lock();
-		if (m_frames.empty()) {
-			EXIT("prepared-frame pool was used before swapchain initialization\n");
-		}
 		// A synchronized flip may need more frames than the swapchain has images.
 		// Queue capacity bounds growth; waiting here can prevent its master from recording.
 		if (m_free.empty()) {
@@ -114,9 +99,6 @@ public:
 			*compatible = m_free.back();
 		}
 		m_free.pop_back();
-		if (frame->busy) {
-			EXIT("prepared-frame pool returned an invalid frame\n");
-		}
 		frame->busy = true;
 		m_mutex.Unlock();
 
@@ -124,17 +106,7 @@ public:
 		return frame;
 	}
 
-	void ValidateForPresent(Presenter::Frame* frame) {
-		Common::LockGuard lock(m_mutex);
-		if (frame == nullptr || !frame->busy) {
-			EXIT("prepared frame has invalid presentation ownership\n");
-		}
-	}
-
 	void Release(Presenter::Frame* frame) {
-		if (frame == nullptr) {
-			EXIT("cannot release a null prepared frame\n");
-		}
 		Common::LockGuard lock(m_mutex);
 		if (!frame->busy) {
 			EXIT("prepared frame was released twice\n");
@@ -231,7 +203,6 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 	dependency.pImageMemoryBarriers    = &barrier;
 	command.pipelineBarrier2(dependency);
 	image.state = {stage, access, layout};
-	image.subresource_states.clear();
 }
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
@@ -1054,7 +1025,6 @@ void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
-		m_impl->frames.ValidateForPresent(layer.frame);
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {
 			m_impl->frames.Release(previous.frame);

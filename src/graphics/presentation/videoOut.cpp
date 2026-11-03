@@ -671,7 +671,6 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status               = VideoOutFlipStatus();
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
-	config.flip_status.count         = 0;
 	config.pre_vblanks               = 0;
 	config.vblank_status             = VideoOutVblankStatus();
 
@@ -709,13 +708,6 @@ bool VideoOutDriver::Impl::Close(int handle) {
 		master             = config.master;
 		config.master      = nullptr;
 
-		for (const auto& buffer: config.buffers) {
-			if (buffer.Occupied() &&
-			    (buffer.group_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
-			     buffer.data_address == 0 || !config.groups[buffer.group_index].occupied)) {
-				EXIT("inconsistent registered video-out buffer state\n");
-			}
-		}
 		for (auto& buffer: config.buffers) {
 			buffer = VideoOutBuffer {};
 		}
@@ -1571,8 +1563,9 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
 
+	auto&     driver     = DriverState();
 	uint64_t  request_id = 0;
-	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
+	const int result     = ReserveFlipRequest(driver, handle, index, flip_mode, flip_arg,
 	                                          FlipRequestSource::Cpu, request_id);
 	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
 		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
@@ -1580,7 +1573,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	if (result != OK) {
 		return result;
 	}
-	g_video_out_driver->SubmitFlipPreparation(request_id);
+	driver.Renderer().GetGpu().SubmitFlipPreparation(request_id);
 
 	return OK;
 }
@@ -1597,10 +1590,6 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 
 	return OK;
-}
-
-void VideoOutDriver::SubmitFlipPreparation(uint64_t request_id) {
-	m_impl->Renderer().GetGpu().SubmitFlipPreparation(request_id);
 }
 
 void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer) {

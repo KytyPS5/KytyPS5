@@ -758,13 +758,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
 		}
 	}
-	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u\n",
-		     static_cast<unsigned>(options.stage));
-	}
 
 	const auto* stage        = StageName(options.stage);
 	const auto compile_begin = std::chrono::steady_clock::now();

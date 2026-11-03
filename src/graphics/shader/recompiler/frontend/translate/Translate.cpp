@@ -21,16 +21,6 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	};
 }
 
-const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
-	switch (index) {
-		case 0: return inst.src0;
-		case 1: return inst.src1;
-		case 2: return inst.src2;
-		case 3: return inst.src3;
-		default: EXIT("decoded source operand index is out of range");
-	}
-}
-
 Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst) {
 	auto destination = inst.dst;
 	if (destination.kind != Decoder::OperandKind::Vgpr) {
@@ -1033,8 +1023,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
-	result.cfg_failure_kind    = cfg.failure_kind;
-	result.fallback_reason     = cfg.unsupported_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;

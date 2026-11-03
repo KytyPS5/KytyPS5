@@ -1,8 +1,6 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 
-#include "common/assert.h"
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -17,7 +15,7 @@
 namespace Libs::Graphics {
 
 // Sparse two-level lookup for texture-cache page ownership.
-// Entries are selected by guest page number; queries never allocate L1 buckets.
+// Entries are selected by guest page number below kPageCount; queries never allocate L1 buckets.
 template <typename EntryT, size_t PageBits = 20, size_t AddressSpaceBits = 40,
           size_t FirstLevelBits = 10>
 class MultiLevelPageTable final {
@@ -45,36 +43,22 @@ public:
 	MultiLevelPageTable(): m_first_level(kFirstLevelEntries) {}
 
 	[[nodiscard]] Entry* Find(size_t page) {
-		if (!IsValidPage(page)) {
-			return nullptr;
-		}
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		return bucket == nullptr ? nullptr : &(*bucket)[SecondLevelIndex(page)];
 	}
 
 	[[nodiscard]] const Entry* Find(size_t page) const {
-		if (!IsValidPage(page)) {
-			return nullptr;
-		}
 		const auto& bucket = m_first_level[FirstLevelIndex(page)];
 		return bucket == nullptr ? nullptr : &(*bucket)[SecondLevelIndex(page)];
 	}
 
-	[[nodiscard]] Entry& GetOrCreate(size_t page) {
-		if (!IsValidPage(page)) {
-			EXIT("MultiLevelPageTable page is outside the guest address space");
-		}
+	[[nodiscard]] Entry& operator[](size_t page) {
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		if (bucket == nullptr) {
 			bucket = std::make_unique<Bucket>();
-			++m_allocated_buckets;
 		}
 		return (*bucket)[SecondLevelIndex(page)];
 	}
-
-	[[nodiscard]] Entry& operator[](size_t page) { return GetOrCreate(page); }
-
-	[[nodiscard]] static constexpr bool IsValidPage(size_t page) { return page < kPageCount; }
 
 	// Returns the half-open page interval touched by a non-empty byte range.
 	// An end exactly at 2^AddressSpaceBits is valid; wrapping or crossing it is not.
@@ -89,8 +73,6 @@ public:
 		return true;
 	}
 
-	[[nodiscard]] size_t AllocatedBucketCount() const { return m_allocated_buckets; }
-
 private:
 	using Bucket = std::array<Entry, kBucketEntries>;
 
@@ -102,7 +84,6 @@ private:
 	}
 
 	std::vector<std::unique_ptr<Bucket>> m_first_level;
-	size_t                               m_allocated_buckets = 0;
 };
 
 // Inline owner storage for page-table entries. Texture pages normally have only a
@@ -158,16 +139,6 @@ public:
 			std::copy_n(other.m_inline.begin(), m_inline_size, m_inline.begin());
 		}
 	}
-	InlinePageOwnerList& operator=(InlinePageOwnerList&& other) noexcept {
-		if (this != &other) {
-			m_overflow    = std::move(other.m_overflow);
-			m_inline_size = std::exchange(other.m_inline_size, 0);
-			if (m_overflow == nullptr) {
-				std::copy_n(other.m_inline.begin(), m_inline_size, m_inline.begin());
-			}
-		}
-		return *this;
-	}
 
 	[[nodiscard]] const_iterator begin() const noexcept { return {this, 0}; }
 	[[nodiscard]] const_iterator end() const noexcept { return {this, size()}; }
@@ -177,7 +148,6 @@ public:
 		return m_overflow == nullptr ? m_inline_size : m_overflow->size();
 	}
 	[[nodiscard]] OwnerT front() const noexcept { return At(0); }
-	[[nodiscard]] OwnerT operator[](size_type index) const noexcept { return At(index); }
 
 	void push_back(const OwnerT& owner) {
 		const uint64_t packed = Pack(owner);
@@ -195,15 +165,6 @@ public:
 		overflow->assign(m_inline.begin(), m_inline.end());
 		overflow->push_back(packed);
 		m_overflow = std::move(overflow);
-	}
-
-	[[nodiscard]] bool Contains(const OwnerT& owner) const noexcept {
-		const uint64_t packed = Pack(owner);
-		if (m_overflow != nullptr) {
-			return std::find(m_overflow->begin(), m_overflow->end(), packed) != m_overflow->end();
-		}
-		return std::find(m_inline.begin(), m_inline.begin() + static_cast<ptrdiff_t>(m_inline_size),
-		                 packed) != m_inline.begin() + static_cast<ptrdiff_t>(m_inline_size);
 	}
 
 	[[nodiscard]] bool Erase(const OwnerT& owner) noexcept {

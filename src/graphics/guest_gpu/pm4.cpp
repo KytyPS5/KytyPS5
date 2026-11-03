@@ -18,14 +18,11 @@ constexpr auto MakeRegisterNames() {
 	}
 
 	names[R_ZERO]           = "R_ZERO";
-	names[R_DRAW_RESET]     = "R_DRAW_RESET";
 	names[R_WAIT_FLIP_DONE] = "R_WAIT_FLIP_DONE";
 	names[R_DISPATCH_RESET] = "R_DISPATCH_RESET";
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
-	names[R_WRITE_DATA]     = "R_WRITE_DATA";
 	names[R_FLIP]           = "R_FLIP";
-	names[R_DMA_DATA]       = "R_DMA_DATA";
 	names[R_CONTEXT_STATE]  = "R_CONTEXT_STATE";
 	return names;
 }
@@ -91,8 +88,6 @@ constexpr auto g_opcode_names   = MakeOpcodeNames();
 
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw) {
-	// db_dump();
-
 	file->Printf("----- Buffer --- dwords: 0x%05" PRIx32 ", offset : %u, addr: %016" PRIx64
 	             " ----- \n",
 	             num_dw, start_dw, reinterpret_cast<uint64_t>(cmd_buffer));

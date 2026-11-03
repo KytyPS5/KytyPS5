@@ -72,8 +72,7 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k32_32_32_32UInt, vk::Format::eR32G32B32A32Uint},
     {Prospero::BufferFormat::k32_32_32_32SInt, vk::Format::eR32G32B32A32Sint},
     {Prospero::BufferFormat::k32_32_32_32Float, vk::Format::eR32G32B32A32Sfloat},
-    // Narrow-channel sRGB formats are optional in Vulkan. Keep a same-width fallback until
-    // sampler-aware sRGB emulation is available.
+    // 8 and 8_8 sRGB views are optional in Vulkan, so these images store UNorm.
     {Prospero::BufferFormat::k8Srgb, vk::Format::eR8Unorm},
     {Prospero::BufferFormat::k8_8Srgb, vk::Format::eR8G8Unorm},
     {Prospero::BufferFormat::k8_8_8_8Srgb, vk::Format::eR8G8B8A8Srgb},

@@ -30,7 +30,6 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
-	bool storage       = false;
 	bool render_target = false;
 	bool video_out     = false;
 };
@@ -85,19 +84,12 @@ public:
 			HeapChanged();
 		}
 	}
-	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
-		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
-			EXIT("image cannot resolve maybe-dirty hash\n");
-		}
+	void ResolveMaybeCpuHash(uint64_t hash) {
 		m_maybe_cpu_dirty = false;
-		m_cpu_dirty |= hash != m_maybe_cpu_hash;
-		return m_cpu_dirty;
+		m_cpu_dirty       = hash != m_maybe_cpu_hash;
 	}
 
 	void RefreshComplete() {
-		if (!IsCpuDirty()) {
-			EXIT("clean image cannot complete a refresh\n");
-		}
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 	}
@@ -113,10 +105,8 @@ public:
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
-	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
-	                            bool pages = false) const noexcept {
-		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
-		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
+	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const noexcept {
+		return info.data.address < address + size && address < info.data.End();
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();

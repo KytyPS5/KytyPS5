@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/refreshRegions.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -43,6 +44,7 @@
 #include <deque>
 #include <initializer_list>
 #include <iterator>
+#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -1299,6 +1301,245 @@ void TestNormalizedImageContracts() {
             ImageViewOps::FormatsCompatible(vk::Format::eBc3UnormBlock,
                                             vk::Format::eR32G32B32A32Uint),
         "Vulkan image-view compatibility classes diverged from production");
+}
+
+ImageInfo MakeRefreshInfo(Prospero::BufferFormat guest, vk::Format pixel, Prospero::TileMode tile,
+                          uint32_t width, uint32_t height, uint32_t levels, uint32_t layers) {
+  ImageInfo info{};
+  info.data.address = 0x10000000;
+  info.pixel_format = pixel;
+  info.guest_format = guest;
+  info.extent = {width, height, 1};
+  info.resources = {levels, layers};
+  info.tile_mode = tile;
+  info.UpdateSize();
+  return info;
+}
+
+// Reference address of one element, built from the tile tables the way the tiler shader does.
+// The plane and column formulas mirror TileManager::Prepare (tiler.cpp:155-189) and
+// gpu_tiler_common.inc, so this is not independent of them. The GPU test in a later commit is.
+uint64_t RefreshTiledAddress(const ImageInfo &info, uint32_t level, uint32_t layer,
+                             uint32_t x, uint32_t y) {
+  const auto &block = info.tiling.block;
+  const auto &mip = info.mip_layout[level];
+  const bool tail = level >= info.first_tail_level;
+  const uint64_t columns = (mip.pitch + block.block_width - 1u) / block.block_width;
+  const uint32_t bx = tail ? 0 : x / block.block_width;
+  const uint32_t by = tail ? 0 : y / block.block_height;
+  const uint32_t lx = tail ? x + mip.tail_x : x % block.block_width;
+  const uint32_t ly = tail ? y + mip.tail_y : y % block.block_height;
+  uint32_t local = 0, block_xor = 0;
+  Check(TileGetBlockOffset(block, lx, ly, 0, local) &&
+            TileGetBlockXor(block, bx, by, mip.surface_z + layer, block_xor),
+        "refresh region reference address lookup failed");
+  return mip.offset + uint64_t{layer} * info.tiled_slice_stride +
+         (by * columns + bx) * block.block_size + (local ^ block_xor);
+}
+
+bool RefreshRegionsCover(const std::vector<RefreshRegion> &regions, uint32_t level,
+                         uint32_t layer, uint32_t x, uint32_t y) {
+  return std::ranges::any_of(regions, [&](const RefreshRegion &r) {
+    return r.level == level && r.layer == layer && x >= r.x0 && x < r.x0 + r.width &&
+           y >= r.y0 && y < r.y0 + r.height;
+  });
+}
+
+// Checks every element whose tiled address is inside the rounded range. Each must lie in a
+// region (completeness) and the regions may not be larger than the blocks those elements touch
+// (tightness). Tightness is skipped for tail levels, which are taken whole.
+void CheckTiledRefreshRange(const ImageInfo &info, uint64_t lo, uint64_t hi, const char *what) {
+  const auto regions = TiledRefreshRegions(info, lo, hi);
+  const auto range = RoundRefreshRange(info, lo, hi);
+  const auto &block = info.tiling.block;
+  std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> touched;
+  for (uint32_t level = 0; level < info.resources.levels; ++level) {
+    const auto extent = info.MipExtent(level);
+    for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+      for (uint32_t y = 0; y < extent.height; ++y) {
+        for (uint32_t x = 0; x < extent.width; ++x) {
+          const auto address = RefreshTiledAddress(info, level, layer, x, y);
+          if (address < range.lo || address >= range.hi) continue;
+          Check(RefreshRegionsCover(regions, level, layer, x, y), what);
+          if (level < info.first_tail_level)
+            touched.insert({level, layer, x / block.block_width, y / block.block_height});
+        }
+      }
+    }
+  }
+  // Exact membership. Every block a region covers must hold a byte of the range, which a
+  // clipped or oversized rectangle would break, and regions may not overlap.
+  for (const auto &r : regions) {
+    if (r.level >= info.first_tail_level) continue;
+    for (uint32_t by = r.y0 / block.block_height; by <= (r.y0 + r.height - 1) / block.block_height;
+         ++by)
+      for (uint32_t bx = r.x0 / block.block_width;
+           bx <= (r.x0 + r.width - 1) / block.block_width; ++bx)
+        Check(touched.contains({r.level, r.layer, bx, by}), what);
+  }
+  for (size_t first = 0; first < regions.size(); ++first)
+    for (size_t second = first + 1; second < regions.size(); ++second) {
+      const auto &a = regions[first];
+      const auto &b = regions[second];
+      Check(a.level != b.level || a.layer != b.layer || a.x0 + a.width <= b.x0 ||
+                b.x0 + b.width <= a.x0 || a.y0 + a.height <= b.y0 || b.y0 + b.height <= a.y0,
+            what);
+    }
+}
+
+void TestRefreshRegionsTiled() {
+  const auto target = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                      Prospero::TileMode::kRenderTarget, 256, 256, 1, 1);
+  const uint32_t block_bytes = target.tiling.block.block_size;
+  Check(target.tiling.block.block_width == 128 && target.tiling.block.block_height == 128 &&
+            block_bytes == 0x10000 && target.first_tail_level >= 1,
+        "256x256 R32 RenderTarget64KB is not 2x2 blocks of 128x128");
+  const RefreshRegion block0{0, 0, 0, 0, 128, 128};
+  const RefreshRegion block1{0, 0, 128, 0, 128, 128};
+  const RefreshRegion block2{0, 0, 0, 128, 128, 128};
+  Check(TiledRefreshRegions(target, 0, 4) == std::vector{block0},
+        "a write at the image base did not refresh exactly block 0");
+  Check(TiledRefreshRegions(target, block_bytes, block_bytes + 4) == std::vector{block1},
+        "a write at the second block did not refresh block 1 (x0 = 128)");
+  Check(TiledRefreshRegions(target, 0, block_bytes) == std::vector{block0},
+        "a range ending on a block boundary touched the next block");
+  const auto spanning = TiledRefreshRegions(target, block_bytes, 2 * block_bytes + 4);
+  Check(spanning == std::vector({block1, block2}),
+        "a range crossing a block row did not give the two touched blocks");
+  CheckTiledRefreshRange(target, block_bytes, 2 * block_bytes + 4, "row-spanning cover");
+  for (const auto &range : {std::pair<uint64_t, uint64_t>{0, 4}, {block_bytes - 4, block_bytes + 4},
+                            {100000, 200000}, {0, target.data.size}})
+    CheckTiledRefreshRange(target, range.first, range.second, "256x256 R32 cover");
+  Check(TiledRefreshRegions(target, 0, 0).empty() &&
+            TiledRefreshRegions(target, target.data.size, target.data.size + 8).empty(),
+        "an empty or out of image range returned regions");
+}
+
+void TestRefreshRegionsRoundingAndVolume() {
+  auto target = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                Prospero::TileMode::kRenderTarget, 256, 256, 1, 1);
+  const RefreshByteRange rounded = RoundRefreshRange(target, 1, 2);
+  Check(rounded.lo == 0 && rounded.hi == 4, "a one byte range was not widened to its element");
+  Check(RoundRefreshRange(target, 0x10000 - 1, 0x10000 + 1) == RefreshByteRange{0xfffc, 0x10004},
+        "a range across a block boundary was not widened on both sides");
+  Check(RoundRefreshRange(target, 0, target.data.size + 64).hi == target.data.size,
+        "a range past the image was not clamped");
+  Check(TiledRefreshRegions(target, 1, 2) == std::vector{RefreshRegion{0, 0, 0, 0, 128, 128}},
+        "a sub-element write did not refresh the block holding its element");
+  target.type = Prospero::ImageType::kColor3D;
+  Check(TiledRefreshRegions(target, 0, 4).empty() && LinearRefreshRegions(target, 0, 4).empty(),
+        "a volume returned partial refresh regions");
+}
+
+void TestRefreshRegionsFullHdAndMips() {
+  const auto hd = MakeRefreshInfo(Prospero::BufferFormat::k8_8_8_8UNorm,
+                                  vk::Format::eR8G8B8A8Unorm, Prospero::TileMode::kRenderTarget,
+                                  1920, 1080, 1, 1);
+  for (const auto &range : {std::pair<uint64_t, uint64_t>{0, 4}, {0x1ff00, 0x40100}})
+    CheckTiledRefreshRange(hd, range.first, range.second, "1920x1080 RGBA8 cover");
+  // 200 is not a multiple of the 128 element block width, so the second column hangs over.
+  const auto narrow = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                      Prospero::TileMode::kRenderTarget, 200, 200, 1, 1);
+  Check(TiledRefreshRegions(narrow, narrow.tiling.block.block_size,
+                            narrow.tiling.block.block_size + 4) ==
+            std::vector{RefreshRegion{0, 0, 128, 0, 72, 128}},
+        "a block hanging over the right edge was not clipped to the image width");
+  const auto edge = TiledRefreshRegions(hd, hd.data.size - 4, hd.data.size);
+  Check(!edge.empty() && edge.back().x0 + edge.back().width <= 1920 &&
+            edge.back().y0 + edge.back().height <= 1080,
+        "the last block was not clipped to the image");
+
+  const auto mipped = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                      Prospero::TileMode::kStandard64KB, 256, 256, 5, 1);
+  Check(mipped.first_tail_level < 5 && mipped.mip_layout[0].offset != 0,
+        "mipped Standard64KB fixture lost its backwards mip chain");
+  const auto head = TiledRefreshRegions(mipped, 0, 4);
+  Check(!head.empty() && std::ranges::all_of(head, [&](const RefreshRegion &r) {
+          return r.level >= mipped.first_tail_level &&
+                 r.width == std::max(256u >> r.level, 1u);
+        }),
+        "a write at the base of a mipped texture did not give only whole tail levels");
+  for (const auto &range : {std::pair<uint64_t, uint64_t>{0, 4},
+                            {mipped.mip_layout[0].offset, mipped.mip_layout[0].offset + 4},
+                            {0, mipped.data.size}})
+    CheckTiledRefreshRange(mipped, range.first, range.second, "mipped Standard64KB cover");
+}
+
+void TestRefreshRegionsArray() {
+  const auto array = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                     Prospero::TileMode::kStandard64KB, 128, 128, 1, 2);
+  Check(array.tiled_slice_stride != 0 && array.first_tail_level >= 1,
+        "array fixture has no layer stride");
+  const auto layer1 =
+      TiledRefreshRegions(array, array.tiled_slice_stride, array.tiled_slice_stride + 4);
+  Check(layer1.size() == 1 && layer1[0].layer == 1 && layer1[0].level == 0 &&
+            layer1[0].x0 == 0 && layer1[0].y0 == 0,
+        "a write at the second layer did not give a layer 1 region");
+  const auto layer0 = TiledRefreshRegions(array, 0, 4);
+  Check(layer0.size() == 1 && layer0[0].layer == 0, "a write at the base gave a layer 1 region");
+  CheckTiledRefreshRange(array, array.tiled_slice_stride - 4, array.tiled_slice_stride + 4,
+                         "array layer boundary cover");
+}
+
+void TestRefreshRegionsLinearAndCopies() {
+  const auto linear = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                      Prospero::TileMode::kLinear, 64, 4, 1, 1);
+  const uint32_t row_bytes = linear.mip_layout[0].linear_pitch * 4;
+  Check(linear.mip_layout[0].linear_pitch == 64, "linear fixture is padded");
+  Check(LinearRefreshRegions(linear, 4, 12) == std::vector{RefreshRegion{0, 0, 1, 0, 2, 1}},
+        "a two element write in row 0 was not x 1..2 of row 0");
+  const auto three = LinearRefreshRegions(linear, 4, 3 * row_bytes + 8);
+  Check(three == std::vector({RefreshRegion{0, 0, 1, 0, 63, 1}, RefreshRegion{0, 0, 0, 1, 64, 2},
+                              RefreshRegion{0, 0, 0, 3, 2, 1}}),
+        "a range over several rows was not a partial row, full rows and a partial row");
+  const auto layered = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                       Prospero::TileMode::kLinear, 64, 4, 1, 2);
+  const uint64_t layer_stride = layered.linear_slice_stride != 0
+                                    ? layered.linear_slice_stride
+                                    : layered.mip_layout[0].linear_size;
+  Check(LinearRefreshRegions(layered, layer_stride + 4, layer_stride + 12) ==
+            std::vector{RefreshRegion{0, 1, 1, 0, 2, 1}},
+        "a linear write in the second slice did not give a layer 1 region");
+  // Width 60 laid out at pitch 64 leaves 16 bytes of padding after each 240 byte row.
+  const auto padded = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                      Prospero::TileMode::kLinear, 60, 4, 1, 1);
+  const uint32_t padded_row = padded.mip_layout[0].linear_pitch * 4;
+  Check(padded.mip_layout[0].linear_pitch > 60 && padded_row - 60 * 4 >= 8,
+        "padded linear fixture lost its row padding");
+  Check(LinearRefreshRegions(padded, 60 * 4 + 4, 60 * 4 + 12).empty(),
+        "a write wholly in row padding returned regions");
+  Check(LinearRefreshRegions(padded, 60 * 4 + 4, padded_row + 8) ==
+            std::vector{RefreshRegion{0, 0, 0, 1, 2, 1}},
+        "a write from row padding into the next row did not start at the next row");
+  Check(LinearRefreshRegions(padded, padded_row + 232, padded_row + 252) ==
+            std::vector{RefreshRegion{0, 0, 58, 1, 2, 1}},
+        "a write ending in row padding was not clipped to the row width");
+  Check(LinearRefreshRegions(padded, padded_row + 40, 3 * padded_row + 60 * 4 + 4) ==
+            std::vector({RefreshRegion{0, 0, 10, 1, 50, 1}, RefreshRegion{0, 0, 0, 2, 60, 2}}),
+        "a range ending in padding of its last row did not join the full rows");
+  // Ending in the padding of a row that is not the last one must still merge with full rows.
+  Check(LinearRefreshRegions(padded, 40, 2 * padded_row + 248) ==
+            std::vector({RefreshRegion{0, 0, 10, 0, 50, 1}, RefreshRegion{0, 0, 0, 1, 60, 2}}),
+        "a range ending in padding of a middle row did not join the full rows");
+  const uint64_t base = 1024;
+  const auto row1 = LinearRefreshRegions(linear, row_bytes + 12, row_bytes + 20);
+  const auto copies = RegionCopies(linear, row1, base);
+  Check(row1 == std::vector{RefreshRegion{0, 0, 3, 1, 2, 1}} && copies.size() == 1 &&
+            copies[0].bufferOffset == base + row_bytes + 12 && copies[0].imageOffset.x == 3 &&
+            copies[0].imageOffset.y == 1 && copies[0].imageExtent.width == 2 &&
+            copies[0].imageExtent.height == 1 && copies[0].bufferRowLength == 64,
+        "a region copy did not address its own origin in the buffer");
+
+  const auto array = MakeRefreshInfo(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                     Prospero::TileMode::kStandard64KB, 128, 128, 1, 2);
+  const auto layer_copies = RegionCopies(array, std::vector{RefreshRegion{0, 1, 0, 0, 128, 128}},
+                                         base);
+  const auto &mip = array.mip_layout[0];
+  const uint64_t stride =
+      array.linear_slice_stride != 0 ? array.linear_slice_stride : mip.linear_size;
+  Check(layer_copies.size() == 1 && layer_copies[0].imageSubresource.baseArrayLayer == 1 &&
+            layer_copies[0].bufferOffset == base + mip.linear_offset + stride,
+        "a layer 1 region copy did not include the layer stride");
 }
 
 void TestRebasedTextureMipViews() {
@@ -17316,6 +17557,11 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestRefreshRegionsTiled();
+  TestRefreshRegionsRoundingAndVolume();
+  TestRefreshRegionsFullHdAndMips();
+  TestRefreshRegionsArray();
+  TestRefreshRegionsLinearAndCopies();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();

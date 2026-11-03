@@ -673,6 +673,8 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_user_name_too_long
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 12345678901234567)
 	set_tests_properties(emulator_user_name_too_long PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_partial_buffer_refresh_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --partial-buffer-refresh)
 	add_test(NAME emulator_present_mode_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Immediate)
 	add_test(NAME emulator_present_mode_invalid

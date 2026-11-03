@@ -213,6 +213,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool PartialBufferRefreshEnabled() {
+	return g_config->partial_buffer_refresh_enabled;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

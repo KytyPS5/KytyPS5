@@ -226,6 +226,32 @@ struct ImageTestAccess {
 };
 
 struct TileManagerTestAccess {
+  struct RegionRecordSummary {
+    uint32_t total = 0;
+    uint32_t window_start = 0;
+    uint32_t window_len = 0;
+    std::vector<uint32_t> texels;
+    std::vector<std::array<uint32_t, 3>> origins;
+  };
+  static RegionRecordSummary RegionRecords(const ImageInfo &info,
+                                           std::span<const RefreshRegion> regions,
+                                           uint64_t lo, uint64_t hi,
+                                           uint64_t source_base) {
+    const TileManager::RegionSource source{nullptr, source_base, lo, hi};
+    const auto params = TileManager::BuildRegionParams(
+        info, regions, source, source_base, 0, info.LinearSize());
+    RegionRecordSummary summary;
+    summary.total = params.num_texels;
+    summary.window_start = params.window_start;
+    summary.window_len = params.window_len;
+    for (size_t index = 0; index < regions.size(); ++index) {
+      summary.texels.push_back(params.mips[index].num_texels);
+      summary.origins.push_back(
+          {params.mips[index].x0, params.mips[index].y0, params.mips[index].z0});
+    }
+    return summary;
+  }
+
   static uint32_t ConversionRows(uint64_t offset, uint64_t row_stride,
                                  uint64_t active, uint32_t remaining,
                                  uint64_t alignment, uint64_t max_range,
@@ -372,6 +398,14 @@ struct TextureCacheTestAccess {
     cache.m_readback_linear_images = enabled;
   }
 
+  static void SetTiledReadback(TextureCache &cache, bool enabled) {
+    cache.m_readback_tiled_images = enabled;
+  }
+
+  static void SetPartialBufferRefresh(TextureCache &cache, bool enabled) {
+    cache.m_partial_buffer_refresh = enabled;
+  }
+
   static std::pair<uint8_t *, uint64_t>
   MapDownload(TextureCache &cache, uint64_t size, uint64_t alignment) {
     auto &download =
@@ -381,6 +415,16 @@ struct TextureCacheTestAccess {
       download.Commit();
     }
     return mapping;
+  }
+
+  static bool TryPartialRefresh(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.TryPartialRefresh(cache.m_slot_images[id]);
+  }
+
+  static bool IsDownloadPending(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.m_download_images.contains(id);
   }
 
   static bool TryDownload(TextureCache &cache, ImageId id) {
@@ -6328,7 +6372,7 @@ public:
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x3000000;
+    constexpr uint64_t allocation_size = 0x3800000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -8110,6 +8154,625 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
+      // With --partial-buffer-refresh a small base write records only its byte range and keeps
+      // gpu_mod, while a big write or an ineligible image takes the whole mark as before. The
+      // upload is still a full one in this step, so texels must match the flag-off result.
+      constexpr uint64_t partial_refresh_base_offset = 0x2f00000;
+      constexpr uint64_t partial_refresh_stride = 0x10000;
+      constexpr uint32_t partial_refresh_texels = 4;
+      constexpr uint32_t partial_refresh_small_write = sizeof(uint32_t);
+      constexpr uint32_t partial_refresh_big_write = 3 * sizeof(uint32_t);
+      constexpr uint32_t partial_refresh_half_write = 2 * sizeof(uint32_t);
+      struct PartialRefreshResult {
+        std::optional<GuestRange> range;
+        bool whole = false;
+        bool painted_gpu_modified = false;
+        bool gpu_modified_after_write = false;
+        bool gpu_modified_after_bind = false;
+        std::vector<u32> texels;
+      };
+      uint32_t partial_refresh_slot = 0;
+      const auto run_partial_refresh = [&](bool flag, uint32_t write_size) {
+        TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, flag);
+        const uint64_t offset =
+            partial_refresh_base_offset + partial_refresh_slot++ * partial_refresh_stride;
+        std::memset(memory + offset, 0, partial_refresh_texels * sizeof(uint32_t));
+        auto desc = MakeLinearDesc(
+            base + offset, partial_refresh_texels * sizeof(uint32_t), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {partial_refresh_texels, 1, 1}, 1, 4, 1);
+        const auto image_id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        PartialRefreshResult result;
+        result.painted_gpu_modified = texture_cache.GetImage(image_id).IsGpuModified();
+        auto writable = resources.GetBufferCache().ObtainBuffer(desc.info.data.address,
+                                                                write_size, true, false);
+        Require(name, "partial refresh buffer allocation", writable.first != nullptr,
+                "failed to allocate the partial refresh write buffer");
+        writable.first->Fill(writable.second, write_size, buffer_alias_write_value);
+        texture_cache.InvalidateBufferWrite(desc.info.data.address, write_size);
+        const auto &marked = texture_cache.GetImage(image_id);
+        result.range = marked.BufferModifiedRange();
+        result.whole = marked.IsBufferModified() && !result.range;
+        result.gpu_modified_after_write = marked.IsGpuModified();
+        (void)texture_cache.FindTexture(image_id, desc);
+        result.gpu_modified_after_bind = texture_cache.GetImage(image_id).IsGpuModified();
+        result.texels = ReadCachedTexel(name, context, image_id, {},
+                                        {partial_refresh_texels, 1, 1});
+        return result;
+      };
+      const auto partial_off = run_partial_refresh(false, partial_refresh_small_write);
+      const auto partial_on = run_partial_refresh(true, partial_refresh_small_write);
+      const auto partial_big = run_partial_refresh(true, partial_refresh_big_write);
+      Require(name, "partial refresh fixture",
+              partial_off.painted_gpu_modified && partial_on.painted_gpu_modified,
+              "the painted image was not GPU-modified, so keeping gpu_mod proves nothing");
+      Require(name, "partial refresh flag off baseline",
+              !partial_off.range && partial_off.whole && !partial_off.gpu_modified_after_write,
+              "with the flag off a buffer write must be a whole mark that clears gpu_mod");
+      Require(name, "partial refresh records the written range",
+              partial_on.range && partial_on.range->address ==
+                                      base + partial_refresh_base_offset + partial_refresh_stride &&
+                  partial_on.range->size == partial_refresh_small_write && !partial_on.whole &&
+                  partial_on.gpu_modified_after_write,
+              "with the flag on a small base write must record (base, size) and keep gpu_mod");
+      Require(name, "partial refresh binds the written texel",
+              partial_on.texels.front() == buffer_alias_write_value &&
+                  partial_off.texels.front() == buffer_alias_write_value &&
+                  partial_on.gpu_modified_after_bind && !partial_off.gpu_modified_after_bind,
+              "a range mark must refresh the written texel and keep gpu_mod, which the whole mark "
+              "baseline clears");
+      Require(name, "partial refresh threshold",
+              !partial_big.range && partial_big.whole && !partial_big.gpu_modified_after_write,
+              "a write over half the image must take the whole mark even with the flag on");
+      // Exactly half the image still gets a range, so the limit is inclusive.
+      const auto partial_half = run_partial_refresh(true, partial_refresh_half_write);
+      Require(name, "partial refresh threshold boundary",
+              partial_half.range && partial_half.range->size == partial_refresh_half_write &&
+                  !partial_half.whole && partial_half.gpu_modified_after_write,
+              "a write of exactly half the image must record a range");
+
+      // A depth image shares its contents with stencil and HTILE handling, so it stays whole.
+      constexpr uint64_t partial_depth_offset = partial_refresh_base_offset + 8 * partial_refresh_stride;
+      auto partial_depth_desc = MakeLinearDesc(
+          base + partial_depth_offset, partial_refresh_texels * sizeof(float),
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {partial_refresh_texels, 1, 1}, 1, sizeof(float), 1);
+      partial_depth_desc.type = BindingType::DepthTarget;
+      partial_depth_desc.view_info.format = vk::Format::eD32Sfloat;
+      partial_depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      partial_depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, true);
+      const auto partial_depth_image = texture_cache.FindImage(partial_depth_desc);
+      (void)texture_cache.FindDepthTarget(partial_depth_image, partial_depth_desc);
+      texture_cache.MarkGpuWritten(partial_depth_image);
+      texture_cache.InvalidateBufferWrite(partial_depth_desc.info.data.address,
+                                          partial_refresh_small_write);
+      const auto &partial_depth_marked = texture_cache.GetImage(partial_depth_image);
+      Require(name, "partial refresh skips depth images",
+              partial_depth_marked.IsBufferModified() &&
+                  !partial_depth_marked.BufferModifiedRange() &&
+                  !partial_depth_marked.IsGpuModified(),
+              "a small write over a depth image must take the whole mark even with the flag on");
+      // Each excluded trait is applied in place to a painted colour image whose baseline gets a
+      // range, then restored. The write goes through InvalidateBufferWrite, so a trait that the
+      // eligibility check forgets shows up as a range instead of a whole mark.
+      struct PartialTraitCase {
+        const char *label;
+        void (*apply)(Libs::Graphics::Image &);
+        bool expect_range;
+      };
+      const std::array partial_trait_cases{
+          PartialTraitCase{"linear colour baseline", [](Libs::Graphics::Image &) {}, true},
+          PartialTraitCase{"tiled colour baseline",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.tile_mode = Prospero::TileMode::kStandard4KB;
+                           },
+                           true},
+          PartialTraitCase{"volume",
+                           [](Libs::Graphics::Image &image) { image.info.type = Prospero::ImageType::kColor3D; },
+                           false},
+          PartialTraitCase{"info samples", [](Libs::Graphics::Image &image) { image.info.samples = 2; }, false},
+          PartialTraitCase{"backing samples",
+                           [](Libs::Graphics::Image &image) { image.backing.samples = 2; }, false},
+          PartialTraitCase{"block compressed",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.guest_format = Prospero::BufferFormat::kBc1UNorm;
+                           },
+                           false},
+          PartialTraitCase{"metadata kind",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Htile;
+                           },
+                           false},
+          PartialTraitCase{"Dcc kind",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Dcc;
+                           },
+                           true},
+          PartialTraitCase{"Cmask kind",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Cmask;
+                           },
+                           true},
+          PartialTraitCase{"Dcc kind with video out",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Dcc;
+                             image.usage.video_out = true;
+                           },
+                           false},
+          PartialTraitCase{"Cmask kind with kDepth tile mode",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.kind = ImageMetadataKind::Cmask;
+                             image.info.tile_mode = Prospero::TileMode::kDepth;
+                           },
+                           false},
+          PartialTraitCase{"metadata compression",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
+                           },
+                           false},
+          PartialTraitCase{"video out", [](Libs::Graphics::Image &image) { image.usage.video_out = true; },
+                           false},
+          PartialTraitCase{"colour transform", [](Libs::Graphics::Image &image) { image.info.bgra16 = true; },
+                           false},
+          PartialTraitCase{"kDepth tile mode",
+                           [](Libs::Graphics::Image &image) { image.info.tile_mode = Prospero::TileMode::kDepth; },
+                           false},
+          PartialTraitCase{"Fmask format",
+                           [](Libs::Graphics::Image &image) {
+                             image.info.tile_mode = Prospero::TileMode::kStandard4KB;
+                             image.info.guest_format = Prospero::BufferFormat::kFmask8_S2_F1;
+                           },
+                           false},
+      };
+      constexpr uint64_t partial_trait_offset = partial_refresh_base_offset + 0x90000;
+      constexpr uint64_t partial_trait_stride = 0x1000;
+      uint32_t partial_trait_slot = 0;
+      for (const auto &trait : partial_trait_cases) {
+        const uint64_t offset = partial_trait_offset + partial_trait_slot++ * partial_trait_stride;
+        std::memset(memory + offset, 0, partial_refresh_texels * sizeof(uint32_t));
+        auto desc = MakeLinearDesc(
+            base + offset, partial_refresh_texels * sizeof(uint32_t), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {partial_refresh_texels, 1, 1}, 1, 4, 1);
+        const auto trait_id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), trait_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        auto &trait_image = texture_cache.GetImage(trait_id);
+        Require(name, trait.label, trait_image.IsGpuModified(),
+                "the painted trait image was not GPU-modified");
+        const auto saved_info = trait_image.info;
+        const auto saved_usage = trait_image.usage;
+        const auto saved_samples = trait_image.backing.samples;
+        trait.apply(trait_image);
+        texture_cache.InvalidateBufferWrite(desc.info.data.address, partial_refresh_small_write);
+        const bool has_range = trait_image.BufferModifiedRange().has_value();
+        const bool whole = trait_image.IsBufferModified() && !has_range;
+        const bool kept_gpu_modified = trait_image.IsGpuModified();
+        trait_image.info = saved_info;
+        trait_image.usage = saved_usage;
+        trait_image.backing.samples = saved_samples;
+        Require(name, trait.label,
+                trait.expect_range ? (has_range && kept_gpu_modified)
+                                   : (whole && !kept_gpu_modified),
+                trait.expect_range
+                    ? "an eligible image did not record a range"
+                    : "an excluded trait must take the whole mark and clear gpu_mod");
+      }
+      // Linear partial refresh. A small buffer write over a linear image uploads only its own
+      // rectangles and leaves every other texel as the GPU painted it.
+      constexpr uint64_t linear_refresh_base = 0x2fa0000;
+      constexpr uint64_t linear_refresh_stride = 0x4000;
+      constexpr uint32_t linear_refresh_guest = 0x5000u;
+      constexpr uint32_t linear_refresh_pitch_padding = 4;
+      using DebugCounter = Common::DebugCounters::Counter;
+      struct LinearRefreshCase {
+        bool flag = true;
+        uint32_t width = 64;
+        uint32_t height = 4;
+        uint32_t pitch = 64;
+        uint64_t mark_offset = 0;
+        uint64_t mark_size = sizeof(uint32_t);
+        bool direct_mark = false;
+        bool track_download = false;
+        // Leave the guest bytes in the buffer, so every element is different and a copy with
+        // the wrong row length or origin shows up.
+        bool fill = true;
+        // Gives the image a stencil association for the bind, which makes it ineligible while
+        // every other gate still passes.
+        bool ineligible = false;
+        // Marks the guest bytes as changed by the CPU before the bind.
+        bool cpu_dirty = false;
+        // The tile mode of the image. Tiled images use the big fixture addresses.
+        Prospero::TileMode tile = Prospero::TileMode::kLinear;
+        uint32_t levels = 1;
+        // The colour metadata kind the image wears, applied in place after it is created.
+        ImageMetadataKind metadata = ImageMetadataKind::None;
+        // Turns the metadata into video-out DCC between the mark and the refresh.
+        bool flip_compression = false;
+      };
+      struct LinearRefreshResult {
+        std::vector<u32> texels;
+        std::vector<u32> backing;
+        ImageInfo info;
+        bool refused = false;
+        std::vector<std::vector<u32>> mips;
+        bool gpu_modified_after_bind = false;
+        bool downloaded = false;
+        bool pending_after_process = false;
+        uint64_t data_size = 0;
+        uint64_t upload_bytes = 0;
+        uint64_t partial_bytes = 0;
+        uint64_t refreshes = 0;
+        uint64_t fallbacks = 0;
+      };
+      constexpr uint64_t tiled_refresh_base = 0x3000000;
+      constexpr uint64_t tiled_refresh_stride = 0x80000;
+      uint32_t linear_refresh_slot = 0;
+      uint32_t tiled_refresh_slot = 0;
+      const auto run_linear_refresh = [&](const LinearRefreshCase &c) {
+        TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, c.flag);
+        const bool tiled = c.tile != Prospero::TileMode::kLinear;
+        const uint64_t offset = tiled ? tiled_refresh_base + tiled_refresh_slot++ * tiled_refresh_stride
+                                      : linear_refresh_base + linear_refresh_slot++ * linear_refresh_stride;
+        const uint64_t provisional = uint64_t{c.pitch} * c.height * sizeof(uint32_t);
+        auto desc = MakeLinearDesc(base + offset, provisional, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {c.width, c.height, 1}, 1, 4, 1);
+        desc.info.pitch = c.pitch;
+        desc.info.resources.levels = c.levels;
+        desc.view_info.level_count = c.levels;
+        if (tiled) {
+          desc.info.tile_mode = c.tile;
+          desc.info.data.size = 0;
+          desc.info.pitch = 0;
+        }
+        desc.info.UpdateSize();
+        const uint64_t bytes = desc.info.data.size;
+        Require(name, "linear refresh fixture",
+                bytes <= tiled_refresh_stride &&
+                    (tiled ? desc.info.IsTiled() && (c.levels > 1 || bytes == provisional)
+                           : (c.pitch == c.width ||
+                              desc.info.mip_layout[0].linear_pitch >=
+                                  c.width + linear_refresh_pitch_padding) &&
+                                 desc.info.mip_layout[0].linear_pitch == c.pitch),
+                "the padded linear fixture lost its row padding or the tiled one its size");
+        // Distinct guest words, so a copy from the wrong place cannot hide behind uniform data.
+        std::vector<u32> guest(bytes / sizeof(u32));
+        for (uint32_t index = 0; index < guest.size(); ++index)
+          guest[index] = linear_refresh_guest + index;
+        std::memcpy(memory + offset, guest.data(), bytes);
+        Libs::LibKernel::Memory::WriteBacking(base + offset, guest.data(), bytes);
+        const auto image_id = texture_cache.FindImage(desc);
+        texture_cache.GetImage(image_id).info.metadata.kind = c.metadata;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, c.levels, 0, 1}, painted);
+        if (c.track_download) {
+          TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+          TextureCacheTestAccess::SetTiledReadback(texture_cache, true);
+          TextureCacheTestAccess::TrackDownload(texture_cache, image_id);
+        }
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            desc.info.data.address + c.mark_offset, c.mark_size, true, false);
+        Require(name, "linear refresh buffer allocation", writable.first != nullptr,
+                "failed to allocate the linear refresh write buffer");
+        if (c.fill)
+          writable.first->Fill(writable.second, c.mark_size, buffer_alias_write_value);
+        if (c.direct_mark)
+          texture_cache.GetImage(image_id).MarkBufferModifiedRange(c.mark_offset, c.mark_size);
+        else
+          texture_cache.InvalidateBufferWrite(desc.info.data.address, c.mark_size);
+        LinearRefreshResult result;
+        result.info = desc.info;
+        result.data_size = desc.info.data.size;
+        if (c.track_download) {
+          texture_cache.ProcessDownloadImages();
+          result.pending_after_process =
+              TextureCacheTestAccess::IsDownloadPending(texture_cache, image_id);
+        }
+        Common::DebugCounters::SetEnabled(true);
+        const auto counter = [](DebugCounter which) { return Common::DebugCounters::Get(which); };
+        const auto upload_before = counter(DebugCounter::TextureUploadBytes);
+        const auto partial_before = counter(DebugCounter::TexturePartialUploadBytes);
+        const auto refresh_before = counter(DebugCounter::TexturePartialRefreshes);
+        const auto fallback_before = counter(DebugCounter::TexturePartialFallbacks);
+        if (c.flip_compression) {
+          auto &flipped = texture_cache.GetImage(image_id);
+          flipped.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
+          result.refused = !TextureCacheTestAccess::TryPartialRefresh(texture_cache, image_id);
+          result.refreshes = counter(DebugCounter::TexturePartialRefreshes) - refresh_before;
+          result.fallbacks = counter(DebugCounter::TexturePartialFallbacks) - fallback_before;
+          flipped.info.metadata.compression = VideoOutCompression::Uncompressed;
+          Common::DebugCounters::SetEnabled(false);
+          return result;
+        }
+        if (c.cpu_dirty)
+          texture_cache.GetImage(image_id).MarkCpuDirty();
+        if (c.ineligible)
+          texture_cache.GetImage(image_id).stencil_ids.push_back(image_id);
+        (void)texture_cache.FindTexture(image_id, desc);
+        if (c.ineligible)
+          texture_cache.GetImage(image_id).stencil_ids.clear();
+        result.upload_bytes = counter(DebugCounter::TextureUploadBytes) - upload_before;
+        result.partial_bytes = counter(DebugCounter::TexturePartialUploadBytes) - partial_before;
+        result.refreshes = counter(DebugCounter::TexturePartialRefreshes) - refresh_before;
+        result.fallbacks = counter(DebugCounter::TexturePartialFallbacks) - fallback_before;
+        Common::DebugCounters::SetEnabled(false);
+        result.gpu_modified_after_bind = texture_cache.GetImage(image_id).IsGpuModified();
+        result.texels = ReadCachedTexel(name, context, image_id, {}, {c.width, c.height, 1});
+        for (uint32_t level = 1; level < c.levels; ++level)
+          result.mips.push_back(ReadCachedTexel(
+              name, context, image_id, {},
+              {std::max(c.width >> level, 1u), std::max(c.height >> level, 1u), 1}, 0, level));
+        if (c.track_download)
+          texture_cache.ProcessDownloadImages();
+        else
+          result.downloaded = TextureCacheTestAccess::TryDownload(texture_cache, image_id);
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        result.backing.resize(guest.size());
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, result.backing.data(), bytes);
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+        TextureCacheTestAccess::SetTiledReadback(texture_cache, false);
+        return result;
+      };
+      // The painted value everywhere, except the given element range which holds the write.
+      const auto painted_but = [&](uint32_t count, uint32_t first, uint32_t last) {
+        std::vector<u32> expected(count, buffer_alias_image_value);
+        std::fill(expected.begin() + first, expected.begin() + last, buffer_alias_write_value);
+        return expected;
+      };
+      const auto linear_on = run_linear_refresh({});
+      const auto linear_off = run_linear_refresh({.flag = false});
+      Require(name, "linear partial refresh keeps the image's own texels",
+              linear_on.texels == painted_but(256, 0, 1) && linear_off.texels.front() ==
+                  buffer_alias_write_value && linear_off.texels[1] != buffer_alias_image_value,
+              "a one texel write must change only that texel with the flag on, while the flag off "
+              "baseline re-uploads the rest from the buffer or guest bytes");
+      Require(name, "linear partial refresh uploads the written range",
+              linear_on.refreshes == 1 && linear_on.fallbacks == 0 &&
+                  linear_on.texels.front() == buffer_alias_write_value,
+              "the written texel was not refreshed through the partial path");
+      Require(name, "linear partial refresh upload bytes",
+              linear_on.upload_bytes == sizeof(uint32_t) &&
+                  linear_on.partial_bytes == sizeof(uint32_t) &&
+                  linear_off.upload_bytes == linear_off.data_size && linear_off.partial_bytes == 0,
+              "the partial path must copy only the region bytes while the full path copies the image");
+      Require(name, "linear partial refresh download consistency",
+              linear_on.gpu_modified_after_bind && linear_on.downloaded &&
+                  linear_on.backing == painted_but(256, 0, 1) && !linear_off.gpu_modified_after_bind,
+              "the image must stay GPU-modified and download as the written texel plus its own "
+              "texels");
+      // Marks are normally exact-base, so a hull above the limit is built on the image directly.
+      const auto linear_big = run_linear_refresh(
+          {.mark_size = 600, .direct_mark = true});
+      Require(name, "linear partial refresh threshold fallback",
+              linear_big.fallbacks == 1 && linear_big.refreshes == 0 &&
+                  linear_big.upload_bytes == linear_big.data_size &&
+                  linear_big.texels[5] != buffer_alias_image_value &&
+                  !linear_big.gpu_modified_after_bind,
+              "a range over half the image must take the full upload and count a fallback");
+      // Width 60 at pitch 64 puts 16 bytes of padding after each row. The write covers three
+      // rows, the padding between them and ten texels of a fourth.
+      constexpr uint32_t padded_write_bytes = 3 * 64 * sizeof(uint32_t) + 10 * sizeof(uint32_t);
+      const auto linear_padded = run_linear_refresh(
+          {.width = 60, .height = 8, .pitch = 64, .mark_size = padded_write_bytes, .fill = false});
+      std::vector<u32> padded_expected(60 * 8, buffer_alias_image_value);
+      for (uint32_t row = 0; row < 4; ++row)
+        for (uint32_t column = 0; column < (row < 3 ? 60u : 10u); ++column)
+          padded_expected[row * 60 + column] = linear_refresh_guest + row * 64 + column;
+      Require(name, "linear partial refresh padded rows",
+              linear_padded.texels == padded_expected &&
+                  linear_padded.upload_bytes == (3 * 60 + 10) * sizeof(uint32_t),
+              "a write reaching into row padding must refresh only the real texels of its rows");
+      // A range from texel 10 of row 0 to texel 42 of row 2 splits into three rectangles.
+      constexpr uint32_t multi_first = 10;
+      constexpr uint32_t multi_last = 2 * 64 + 43;
+      std::vector<u32> multi_expected(64 * 8, buffer_alias_image_value);
+      for (uint32_t index = multi_first; index < multi_last; ++index)
+        multi_expected[index] = linear_refresh_guest + index;
+      const auto linear_multi = run_linear_refresh(
+          {.height = 8, .mark_offset = multi_first * sizeof(uint32_t),
+           .mark_size = (multi_last - multi_first) * sizeof(uint32_t), .direct_mark = true,
+           .fill = false});
+      Require(name, "linear partial refresh multi-row split",
+              linear_multi.texels == multi_expected &&
+                  linear_multi.upload_bytes == (multi_last - multi_first) * sizeof(uint32_t),
+              "a range over several rows must refresh a partial row, the full rows and a partial "
+              "row with the right texels");
+      // The same direct mark on an image that fails one eligibility trait must not refresh in
+      // parts, with the eligible image of the same shape as the baseline.
+      const auto direct_small = run_linear_refresh({.direct_mark = true});
+      const auto direct_ineligible = run_linear_refresh({.direct_mark = true, .ineligible = true});
+      Require(name, "linear partial refresh skips ineligible images",
+              direct_small.refreshes == 1 && direct_small.fallbacks == 0 &&
+                  direct_ineligible.refreshes == 0 && direct_ineligible.fallbacks == 1 &&
+                  direct_ineligible.upload_bytes == direct_ineligible.data_size &&
+                  !direct_ineligible.gpu_modified_after_bind,
+              "a range mark on an ineligible image must count a fallback, upload the whole image "
+              "and clear gpu_mod");
+      // A CPU write since the range mark makes the rest of the image stale too, so the bind must
+      // upload all of it. The mark without a CPU write is the baseline above.
+      const auto direct_dirty = run_linear_refresh({.direct_mark = true, .cpu_dirty = true});
+      Require(name, "linear partial refresh skips CPU-dirty images",
+              direct_dirty.refreshes == 0 && direct_dirty.fallbacks == 1 &&
+                  direct_dirty.upload_bytes == direct_dirty.data_size &&
+                  direct_dirty.texels.front() == buffer_alias_write_value &&
+                  direct_dirty.texels[1] == linear_refresh_guest + 1 &&
+                  !direct_dirty.gpu_modified_after_bind,
+              "a CPU-dirty range-marked image must fall back and show the guest bytes outside "
+              "the range");
+      // A tiled image refreshes the blocks the write touched and merges them with its own texels.
+      const auto tiled_small = run_linear_refresh({.width = 32, .height = 32, .pitch = 32,
+                                                   .tile = Prospero::TileMode::kStandard4KB});
+      Require(name, "tiled partial refresh of a one block image",
+              tiled_small.refreshes == 1 && tiled_small.fallbacks == 0 &&
+                  tiled_small.partial_bytes == tiled_small.data_size &&
+                  tiled_small.texels == painted_but(32 * 32, 0, 1) &&
+                  tiled_small.gpu_modified_after_bind,
+              "a tiled range-marked image must refresh its touched block, keep its other texels "
+              "and keep gpu_mod");
+      // A 256x256 R32 RenderTarget image takes a 32 KB write at its base. Its first block holds
+      // tiled bytes 0 to 64K, so the write covers half of block 0 and nothing else.
+      constexpr uint32_t tiled_write_bytes = 32 * 1024;
+      const LinearRefreshCase rt_case{.width = 256, .height = 256, .pitch = 256,
+                                      .mark_size = tiled_write_bytes,
+                                      .tile = Prospero::TileMode::kRenderTarget};
+      auto rt_off_case = rt_case;
+      rt_off_case.flag = false;
+      const auto rt_on = run_linear_refresh(rt_case);
+      const auto rt_off = run_linear_refresh(rt_off_case);
+      // The texels by their tiled address: below the write they hold W, above it I or the guest.
+      std::vector<u32> rt_expected_on(256 * 256), rt_expected_off(256 * 256);
+      for (uint32_t y = 0; y < 256; ++y)
+        for (uint32_t x = 0; x < 256; ++x) {
+          const auto address = RegionTexelAddress(rt_on.info, 0, x, y);
+          const bool written = address < tiled_write_bytes;
+          rt_expected_on[y * 256 + x] = written ? buffer_alias_write_value : buffer_alias_image_value;
+          rt_expected_off[y * 256 + x] =
+              written ? buffer_alias_write_value : linear_refresh_guest + address / 4;
+        }
+      Require(name, "tiled partial refresh keeps the image's own texels",
+              rt_on.texels == rt_expected_on && rt_off.texels == rt_expected_off,
+              "texels outside the written bytes, in block 0 and in the other blocks, must keep "
+              "the painted value with the flag on, and take the guest bytes with it off");
+      Require(name, "tiled partial refresh bytes",
+              rt_on.refreshes == 1 && rt_on.fallbacks == 0 && rt_on.partial_bytes == 64 * 1024 &&
+                  rt_on.upload_bytes == 64 * 1024 && rt_off.upload_bytes == rt_off.data_size &&
+                  rt_off.data_size == 256 * 1024,
+              "the write must upload the one block it touches, and the flag off baseline the image");
+      Require(name, "tiled partial refresh download consistency",
+              rt_on.gpu_modified_after_bind && rt_on.downloaded &&
+                  rt_on.backing == painted_but(256 * 256, 0, tiled_write_bytes / 4) &&
+                  !rt_off.gpu_modified_after_bind,
+              "the image must stay GPU-modified and download as the merged contents");
+      // The same write with the guest words left in the buffer, so every written texel is
+      // different and a copy from the wrong place cannot hide behind the uniform value.
+      const auto window_expected = [&](const ImageInfo &info, uint64_t first, uint64_t last) {
+        std::vector<u32> expected(256 * 256, buffer_alias_image_value);
+        for (uint32_t y = 0; y < 256; ++y)
+          for (uint32_t x = 0; x < 256; ++x) {
+            const auto address = RegionTexelAddress(info, 0, x, y);
+            if (address >= first && address < last)
+              expected[y * 256 + x] = linear_refresh_guest + address / 4;
+          }
+        return expected;
+      };
+      const auto rt_words = run_linear_refresh({.width = 256, .height = 256, .pitch = 256,
+                                                .mark_size = tiled_write_bytes, .fill = false,
+                                                .tile = Prospero::TileMode::kRenderTarget});
+      Require(name, "tiled partial refresh with distinct words",
+              rt_words.texels == window_expected(rt_words.info, 0, tiled_write_bytes) &&
+                  rt_words.partial_bytes == 64 * 1024,
+              "each written texel must take its own guest word and every other texel the painted "
+              "value");
+      // A range that starts inside the image, so the window source must start at that offset.
+      constexpr uint64_t offset_window_start = 64 * 1024 + 0x100;
+      constexpr uint32_t offset_window_bytes = 0x4000;
+      const auto rt_offset = run_linear_refresh({.width = 256, .height = 256, .pitch = 256,
+                                                 .mark_offset = offset_window_start,
+                                                 .mark_size = offset_window_bytes,
+                                                 .direct_mark = true, .fill = false,
+                                                 .tile = Prospero::TileMode::kRenderTarget});
+      Require(name, "tiled partial refresh of a range inside the image",
+              rt_offset.texels == window_expected(rt_offset.info, offset_window_start,
+                                                  offset_window_start + offset_window_bytes) &&
+                  rt_offset.refreshes == 1 && rt_offset.fallbacks == 0,
+              "only the texels of the written window may change, with their own guest words");
+      // A pending readback of a range-marked tiled image survives until the refresh lands.
+      const auto tiled_pending = run_linear_refresh({.width = 32, .height = 32, .pitch = 32,
+                                                     .track_download = true,
+                                                     .tile = Prospero::TileMode::kStandard4KB});
+      const auto tiled_pending_off = run_linear_refresh(
+          {.flag = false, .width = 32, .height = 32, .pitch = 32, .track_download = true,
+           .tile = Prospero::TileMode::kStandard4KB});
+      Require(name, "range-marked tiled image keeps its pending readback",
+              tiled_pending.pending_after_process && !tiled_pending_off.pending_after_process &&
+                  tiled_pending.backing == painted_but(32 * 32, 0, 1),
+              "a range-marked tiled image lost its queued download before the refresh");
+      // Colour metadata kinds on the 256x256 image, each with a 4 byte write at the base. DCC and
+      // CMASK take the partial path. HTILE is depth only, so a colour image with it stays whole.
+      const LinearRefreshCase metadata_case{.width = 256, .height = 256, .pitch = 256, .fill = false,
+                                            .tile = Prospero::TileMode::kRenderTarget};
+      auto with_metadata = [&](ImageMetadataKind kind) {
+        auto c = metadata_case;
+        c.metadata = kind;
+        return run_linear_refresh(c);
+      };
+      const auto dcc_small = with_metadata(ImageMetadataKind::Dcc);
+      const auto cmask_small = with_metadata(ImageMetadataKind::Cmask);
+      const auto htile_small = with_metadata(ImageMetadataKind::Htile);
+      Require(name, "DCC tiled image takes the partial path",
+              dcc_small.refreshes == 1 && dcc_small.fallbacks == 0 &&
+                  dcc_small.partial_bytes == 64 * 1024 && dcc_small.partial_bytes < dcc_small.data_size &&
+                  dcc_small.texels == window_expected(dcc_small.info, 0, 4) &&
+                  dcc_small.gpu_modified_after_bind,
+              "a 4 byte base write on a DCC tile mode 27 image must upload only its block");
+      Require(name, "CMASK image takes the partial path",
+              cmask_small.refreshes == 1 && cmask_small.fallbacks == 0 &&
+                  cmask_small.texels == window_expected(cmask_small.info, 0, 4),
+              "a CMASK image must refresh only the written texels");
+      Require(name, "HTILE on a colour image stays whole",
+              htile_small.refreshes == 0 && htile_small.upload_bytes == htile_small.data_size &&
+                  !htile_small.gpu_modified_after_bind,
+              "a colour image with HTILE must take the whole mark and the full upload");
+      // A flip to video-out DCC between the mark and the refresh makes the image ineligible.
+      auto flip_case = metadata_case;
+      flip_case.metadata = ImageMetadataKind::Dcc;
+      flip_case.flip_compression = true;
+      const auto flipped = run_linear_refresh(flip_case);
+      Require(name, "compression flip refuses the partial path",
+              flipped.refused && flipped.refreshes == 0 && flipped.fallbacks == 1,
+              "an image that became compressed must not be refreshed in parts");
+      // Standard64KB with mips. The guest chain runs backwards, so a write at the base lands in
+      // the shared tail block. The first bytes of that block belong to no texel, because the tail
+      // mips sit at offsets inside it, so the write is long enough to reach the first of them.
+      constexpr uint32_t mipped_write_bytes = 0x2800;
+      const auto mipped = run_linear_refresh({.width = 256, .height = 256, .pitch = 256,
+                                              .mark_size = mipped_write_bytes,
+                                              .tile = Prospero::TileMode::kStandard64KB,
+                                              .levels = 5});
+      std::vector<std::vector<u32>> mip_expected;
+      uint32_t changed_texels = 0, changed_tail_texels = 0;
+      for (uint32_t level = 0; level < 5; ++level) {
+        const uint32_t size = std::max(256u >> level, 1u);
+        mip_expected.emplace_back(size * size, buffer_alias_image_value);
+        for (uint32_t y = 0; y < size; ++y)
+          for (uint32_t x = 0; x < size; ++x)
+            if (RegionTexelAddress(mipped.info, 0, x, y, level) < mipped_write_bytes) {
+              mip_expected[level][y * size + x] = buffer_alias_write_value;
+              ++changed_texels;
+              changed_tail_texels += level >= mipped.info.first_tail_level;
+            }
+      }
+      Require(name, "tiled partial refresh of a mipped texture",
+              changed_texels > 0 && changed_texels == changed_tail_texels &&
+                  mipped.texels == mip_expected[0] &&
+                  std::equal(mipped.mips.begin(), mipped.mips.end(), mip_expected.begin() + 1) &&
+                  mipped.refreshes == 1 && mipped.fallbacks == 0,
+              "a base write must change only the tail level texels it covers and leave every other "
+              "texel of every mip alone");
+      // A pending readback of a range-marked image must survive until the refresh lands.
+      const auto pending_on = run_linear_refresh({.track_download = true});
+      const auto pending_off = run_linear_refresh({.flag = false, .track_download = true});
+      Require(name, "range-marked image keeps its pending readback",
+              pending_on.pending_after_process && !pending_off.pending_after_process &&
+                  pending_on.backing == painted_but(256, 0, 1),
+              "a range-marked image lost its queued download before the refresh, or the baseline "
+              "no longer drops a whole-marked one");
+      TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, false);
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
@@ -8195,6 +8858,87 @@ public:
               texture_cache.FindImage(clear_read_desc) == clear_image,
               "cleared image could not be read or written after ownership "
               "transfer");
+
+      // Buffer-written byte range tracking on an image large enough to hold distinct ranges.
+      constexpr uint64_t range_size = 0x8000;
+      auto range_desc = MakeLinearDesc(
+          base + 0x800000, range_size, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {128, 64, 1}, 1, 4, 1);
+      auto &range_image = texture_cache.GetImage(texture_cache.FindImage(range_desc));
+      const auto range_address = range_image.info.data.address;
+      const auto RangeIs = [&](uint64_t offset, uint64_t size) {
+        const auto range = range_image.BufferModifiedRange();
+        return range && range->address == range_address + offset && range->size == size;
+      };
+      range_image.ClearBufferModified();
+      const bool clean_before_whole =
+          !range_image.IsBufferModified() && !range_image.BufferModifiedRange();
+      range_image.MarkBufferModified();
+      Require(name, "buffer range baseline whole mark",
+              clean_before_whole && range_image.IsBufferModified() &&
+                  !range_image.BufferModifiedRange(),
+              "a whole mark reported a range or did not mark the image");
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(0, range_size);
+      range_image.MarkBufferModifiedRange(0, 4);
+      Require(name, "buffer range hull keeps the larger range",
+              range_image.IsBufferModified() && RangeIs(0, range_size),
+              "a later small range replaced the earlier large range");
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(64, 16);
+      range_image.MarkBufferModifiedRange(0, 8);
+      Require(name, "buffer range hull of disjoint ranges", RangeIs(0, 80),
+              "disjoint ranges did not merge into their hull");
+      // The higher range second, so a hull that took the newest start would lose offset 0.
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(0, 8);
+      range_image.MarkBufferModifiedRange(64, 16);
+      Require(name, "buffer range hull keeps the lowest start", RangeIs(0, 80),
+              "a later higher range moved the start of the hull");
+      range_image.MarkBufferModified();
+      range_image.MarkBufferModifiedRange(0, 4);
+      Require(name, "buffer range cannot downgrade a whole mark",
+              range_image.IsBufferModified() && !range_image.BufferModifiedRange(),
+              "a range mark downgraded a whole mark");
+      range_image.ClearBufferModified();
+      Require(name, "buffer range clear",
+              !range_image.IsBufferModified() && !range_image.BufferModifiedRange(),
+              "clear left a mark or a range behind");
+      range_image.MarkBufferModifiedRange(range_size - 8, 0x100);
+      Require(name, "buffer range clamp", RangeIs(range_size - 8, 8),
+              "a range past the image was not clamped");
+      // Past the end, an unsigned wrap would otherwise widen the hull.
+      range_image.MarkBufferModifiedRange(range_size + 0x100, 4);
+      range_image.MarkBufferModifiedRange(range_size, 4);
+      range_image.MarkBufferModifiedRange(0, 0);
+      Require(name, "buffer range empty marks ignored", RangeIs(range_size - 8, 8),
+              "an empty or out-of-image range changed the mark");
+      range_image.ClearBufferModified();
+      range_image.MarkBufferModifiedRange(range_size + 0x100, 4);
+      range_image.MarkBufferModifiedRange(0, 0);
+      Require(name, "buffer range ignored marks leave a clean image clean",
+              !range_image.IsBufferModified() && !range_image.BufferModifiedRange(),
+              "an ignored range mark marked a clean image");
+
+      // Resident image heaps must be told when a range mark changes the image.
+      range_image.heap_refs.store(1u);
+      const auto epoch_before = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModifiedRange(0, 0);
+      range_image.MarkBufferModifiedRange(range_size + 0x100, 4);
+      const auto epoch_ignored = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModifiedRange(0, 16);
+      const auto epoch_marked = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModified();
+      const auto epoch_whole = Libs::Graphics::Image::heap_epoch.load();
+      range_image.MarkBufferModifiedRange(0, 16);
+      const auto epoch_after_whole = Libs::Graphics::Image::heap_epoch.load();
+      range_image.heap_refs.store(0u);
+      Require(name, "buffer range notifies image heaps",
+              epoch_ignored == epoch_before && epoch_marked > epoch_ignored &&
+                  epoch_whole > epoch_marked && epoch_after_whole == epoch_whole,
+              "a range mark did not bump the heap epoch or an ignored mark did");
+      range_image.ClearBufferModified();
 
       auto stencil_clear_desc = MakeLinearDesc(
           base + 0x27e0000, 0x1000, vk::Format::eD32SfloatS8Uint,
@@ -13025,6 +13769,10 @@ public:
       uint32_t samples_log2 = 0;
       bool goat = false;
       bool dcc_mips = false;
+      // A small buffer write marks the image before the CMASK clear binds it, and `partial`
+      // turns --partial-buffer-refresh on for the case.
+      bool range_mark = false;
+      bool partial = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
@@ -13033,6 +13781,12 @@ public:
         FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
                  .layout = Prospero::ChannelLayout::k8_8_8_8,
                  .type = Prospero::ChannelType::kUNorm, .goat = true},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .range_mark = true, .partial = true},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .range_mark = true},
         FillCase{.fill = 0, .texel = {0, 0}, .cmask = true,
                  .eliminate_fast_clear = true},
         FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
@@ -13188,7 +13942,8 @@ public:
         resources.MapMemory(base, allocation_size);
         ImageId preexisting_id{};
         RenderColorInfo color{};
-        if (fill_case.reuse_unorm || fill_case.reuse_mips || fill_case.eliminate_fast_clear) {
+        if (fill_case.reuse_unorm || fill_case.reuse_mips || fill_case.eliminate_fast_clear ||
+            fill_case.range_mark) {
           const auto float_info = registers.GetRenderTarget(0).info;
           const auto single_mip = registers.GetRenderTarget(0).attrib2;
           auto initial_info = float_info;
@@ -13207,6 +13962,19 @@ public:
           preexisting_id = preexisting.image_id;
           color = preexisting;
           (void)texture_cache.FindRenderTarget(preexisting_id, preexisting.desc);
+          if (fill_case.range_mark) {
+            // The image is GPU-written, then a 4 byte buffer write at its base marks it.
+            vk::ClearValue gpu_paint{};
+            gpu_paint.color.float32 = std::array{0.25f, 0.5f, 0.75f, 1.0f};
+            TextureCacheTestAccess::ClearImage(
+                texture_cache, scheduler.Current(), preexisting_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2}, gpu_paint);
+            TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, fill_case.partial);
+            auto writable = resources.GetBufferCache().ObtainBuffer(base, sizeof(uint32_t), true,
+                                                                    false);
+            writable.first->Fill(writable.second, sizeof(uint32_t), 0x12345678u);
+            texture_cache.InvalidateBufferWrite(base, sizeof(uint32_t));
+          }
           if (fill_case.reuse_mips) {
             Require(name, "mip chain excludes metadata",
                     preexisting.desc.info.data.address + preexisting.desc.info.data.size <=
@@ -13331,11 +14099,20 @@ public:
           scheduler.Finish();
           return;
         }
+        using ClearCounter = Common::DebugCounters::Counter;
+        Common::DebugCounters::SetEnabled(fill_case.range_mark);
+        const auto refreshes_before = Common::DebugCounters::Get(ClearCounter::TexturePartialRefreshes);
+        const auto fallbacks_before = Common::DebugCounters::Get(ClearCounter::TexturePartialFallbacks);
         RenderExecutorTestAccess::ResolveRenderColorTarget(
             executor, scheduler.Current(), color, 0);
         RenderDepthInfo no_depth{};
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &color, 1, no_depth);
+        const auto partial_refreshes =
+            Common::DebugCounters::Get(ClearCounter::TexturePartialRefreshes) - refreshes_before;
+        const auto partial_fallbacks =
+            Common::DebugCounters::Get(ClearCounter::TexturePartialFallbacks) - fallbacks_before;
+        Common::DebugCounters::SetEnabled(false);
         if (fill_case.reuse_unorm) {
           Require(name, "FLOAT clear reuses UNORM image",
                   color.image_id == preexisting_id &&
@@ -13361,6 +14138,17 @@ public:
                                     {static_cast<int32_t>(512 - probe_width), 255, 0},
                                     {probe_width, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
+        if (fill_case.range_mark) {
+          // The register clear wins at both corners with or without the partial refresh.
+          Require(name, "CMASK range mark refresh",
+                  partial_refreshes == (fill_case.partial ? 1u : 0u) && partial_fallbacks == 0,
+                  "a marked CMASK target must take exactly one partial refresh with the flag on "
+                  "and none with it off");
+          TextureCacheTestAccess::SetPartialBufferRefresh(texture_cache, false);
+          resources.UnmapMemory(base, allocation_size);
+          scheduler.Finish();
+          return;
+        }
         if (fill_case.reuse_mips) {
           const auto &image = texture_cache.GetImage(color.image_id);
           Require(name, "single-mip clear reuses mip chain",
@@ -13852,6 +14640,168 @@ public:
     Require(name, "release",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "MSAA allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A colour DCC image with a base write. A pending fast clear must still win over the refreshed
+  // texels, and an applied and checked clear must survive a later base write.
+  struct ColorMetadataRefreshResult {
+    std::vector<u32> pending_texels;
+    std::vector<u32> later_texels;
+    uint64_t pending_refreshes = 0;
+    uint64_t later_refreshes = 0;
+    uint64_t later_fallbacks = 0;
+    uint64_t later_checks = 0;
+    uint64_t third_checks = 0;
+    std::vector<u32> third_texels;
+  };
+
+  ColorMetadataRefreshResult RunColorMetadataRefresh(bool flag, bool gpu_metadata) {
+    constexpr const char *name = "PartialRefreshColorMetadata";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t dcc_address = base + 0x10000;
+    constexpr uint64_t dcc_bytes = 0x1000;
+    constexpr uint64_t color_bytes = 0x4000;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint32_t guest_base = 0x6000u;
+    constexpr uint32_t first_write = std::bit_cast<uint32_t>(0.5f);
+    constexpr uint32_t later_write = std::bit_cast<uint32_t>(1.0f);
+    using DebugCounter = Common::DebugCounters::Counter;
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x10000, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    // Distinct guest words, so a texel from a full refresh cannot pass for the clear or the paint.
+    std::vector<u32> guest(color_bytes / sizeof(u32));
+    for (uint32_t index = 0; index < guest.size(); ++index) guest[index] = guest_base + index;
+    std::memcpy(mapped, guest.data(), color_bytes);
+    std::memset(reinterpret_cast<void *>(dcc_address), 0xff, dcc_bytes);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    auto &cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    TextureCacheTestAccess::SetPartialBufferRefresh(cache, flag);
+    const ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+        0xc1600000u, 0x000fc00fu, 0x91b00204u, 0, 0x00700000u,
+        0x002b0000u | (static_cast<uint32_t>(dcc_address >> 8u) << 24u),
+        static_cast<uint32_t>(dcc_address >> 16u)}};
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy_n(descriptor.fields, 8, value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.written = true;
+    const auto bind = [&] {
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      return binding;
+    };
+    const auto corners = [&](ImageId id) {
+      auto texels = ReadCachedTexel(name, context, id, {0, 0, 0});
+      const auto last = ReadCachedTexel(name, context, id, {63, 63, 0});
+      texels.insert(texels.end(), last.begin(), last.end());
+      return texels;
+    };
+    const auto write_base = [&](uint32_t bits) {
+      auto writable = context.GetBufferCache().ObtainBuffer(base, sizeof(uint32_t), true, false);
+      writable.first->Fill(writable.second, sizeof(uint32_t), bits);
+      cache.InvalidateBufferWrite(base, sizeof(uint32_t));
+    };
+    const auto counter = [](DebugCounter which) { return Common::DebugCounters::Get(which); };
+    const auto first = bind();
+    Require(name, "DCC fixture", cache.GetImage(first.image_id).info.metadata.kind ==
+                                     ImageMetadataKind::Dcc,
+            "the fixture lost its DCC metadata");
+    vk::ClearValue paint{};
+    paint.color.float32 = std::array{0.375f, 0.f, 0.f, 0.f};
+    TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), first.image_id,
+                                       {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, paint);
+    ColorMetadataRefreshResult result;
+    Common::DebugCounters::SetEnabled(true);
+    // A write at the base, then a fast clear to code 0 that is pending when the image is bound.
+    write_base(first_write);
+    if (gpu_metadata) {
+      // A GPU write of the clear key, which sends the bind down the conditional rendering path.
+      auto keys = context.GetBufferCache().ObtainBuffer(dcc_address, dcc_bytes, true, false);
+      keys.first->Fill(keys.second, dcc_bytes, 0u);
+    } else {
+      WriteMetadata(context, dcc_address, dcc_bytes, 0u);
+    }
+    auto refreshes = counter(DebugCounter::TexturePartialRefreshes);
+    const auto pending = bind();
+    result.pending_refreshes = counter(DebugCounter::TexturePartialRefreshes) - refreshes;
+    result.pending_texels = corners(pending.image_id);
+    // The clear is now applied and checked. A later base write then binds again.
+    write_base(later_write);
+    refreshes = counter(DebugCounter::TexturePartialRefreshes);
+    const auto fallbacks = counter(DebugCounter::TexturePartialFallbacks);
+    const auto checks = counter(DebugCounter::ColorMetadataChecks);
+    const auto later = bind();
+    result.later_refreshes = counter(DebugCounter::TexturePartialRefreshes) - refreshes;
+    result.later_fallbacks = counter(DebugCounter::TexturePartialFallbacks) - fallbacks;
+    result.later_checks = counter(DebugCounter::ColorMetadataChecks) - checks;
+    result.later_texels = corners(later.image_id);
+    // The refresh must not have forgotten the checked clear, so a third bind neither checks nor
+    // clears again.
+    const auto third_before = counter(DebugCounter::ColorMetadataChecks);
+    const auto third = bind();
+    result.third_checks = counter(DebugCounter::ColorMetadataChecks) - third_before;
+    Common::DebugCounters::SetEnabled(false);
+    result.third_texels = corners(third.image_id);
+    TextureCacheTestAccess::SetPartialBufferRefresh(cache, false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0, "release failed");
+    return result;
+  }
+
+  void CheckPartialRefreshColorMetadata() {
+    constexpr const char *name = "PartialRefreshColorMetadata";
+    const auto on = RunColorMetadataRefresh(true, true);
+    const auto off = RunColorMetadataRefresh(false, true);
+    const auto cpu_on = RunColorMetadataRefresh(true, false);
+    constexpr u32 later_write = std::bit_cast<uint32_t>(1.0f);
+    // A pending clear wins over the refreshed write, as it does after a full refresh.
+    Require(name, "pending clear wins over the refresh",
+            on.pending_texels == std::vector<u32>{0u, 0u} &&
+                off.pending_texels == std::vector<u32>{0u, 0u} && on.pending_refreshes == 1,
+            "the DCC clear must cover the viewed mip, and the refresh must run before it");
+    Require(name, "clear kept outside the written range",
+            on.later_texels == std::vector<u32>{later_write, 0u} && on.later_refreshes == 1 &&
+                on.later_fallbacks == 0 && off.later_texels[0] == later_write &&
+                off.later_texels[1] != 0u,
+            "a base write after an applied clear must change only its own texel, while the whole "
+            "refresh baseline loses the clear");
+    Require(name, "checked state kept",
+            on.later_checks == 0 && on.third_checks == 0 &&
+                on.third_texels == std::vector<u32>{later_write, 0u},
+            "a data write must not make the clear check run again or clear the refreshed texel");
+    Require(name, "pending clear through the readback path",
+            cpu_on.pending_texels == std::vector<u32>{0u, 0u} &&
+                cpu_on.later_texels == std::vector<u32>{later_write, 0u},
+            "the CPU readback clear must give the same results");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -21075,6 +22025,360 @@ public:
     return pixel;
   }
 
+  // Region detile checks. A fixture is an image whose tiled bytes hold a hash of their own
+  // address, so the reference result of any region and window follows from the tile tables alone.
+  static constexpr uint8_t kRegionSentinel = 0xcd;
+  static constexpr const char *kRegionName = "GpuTilerRegions";
+
+  struct RegionRig {
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    CommandScheduler scheduler;
+    StreamBuffer parameters;
+    TileManager tiler;
+    explicit RegionRig(VulkanHarness &harness)
+        : scheduler(harness.Renderer(), harness.m_runtime_context),
+          parameters(harness.m_runtime_context, scheduler, MemoryUsage::Stream, 1u << 20),
+          tiler(harness.m_runtime_context, scheduler, parameters) {
+      scheduler.Begin(registers, user_config, shaders);
+    }
+  };
+
+  struct RegionFixture {
+    ImageInfo info;
+    std::vector<uint8_t> pattern;
+  };
+
+  static uint8_t RegionPatternByte(uint64_t address) {
+    const auto value = static_cast<uint8_t>(address * 131u + (address >> 8) * 7u + 17u);
+    return value == kRegionSentinel ? static_cast<uint8_t>(value + 1) : value;
+  }
+
+  // A single level, tiled image of the given format, with its pattern.
+  static RegionFixture MakeRegionFixture(Prospero::BufferFormat guest, vk::Format pixel,
+                                         Prospero::TileMode tile, uint32_t width, uint32_t height,
+                                         uint32_t layers) {
+    RegionFixture fixture;
+    auto &info = fixture.info;
+    info.data.address = 0x10000000;
+    info.pixel_format = pixel;
+    info.guest_format = guest;
+    info.extent = {width, height, 1};
+    info.resources = {1, layers};
+    info.tile_mode = tile;
+    info.UpdateSize();
+    fixture.pattern.resize(info.data.size);
+    for (uint64_t address = 0; address < info.data.size; ++address)
+      fixture.pattern[address] = RegionPatternByte(address);
+    return fixture;
+  }
+
+  // Tile table reference for level 0, the way the tiler shader addresses a texel.
+  uint64_t RegionTexelAddress(const ImageInfo &info, uint32_t layer, uint32_t x, uint32_t y,
+                              uint32_t level = 0) {
+    const auto &block = info.tiling.block;
+    const auto &mip = info.mip_layout[level];
+    const bool tail = level >= info.first_tail_level;
+    const uint64_t columns = (mip.pitch + block.block_width - 1u) / block.block_width;
+    const uint32_t bx = tail ? 0 : x / block.block_width;
+    const uint32_t by = tail ? 0 : y / block.block_height;
+    uint32_t local = 0, block_xor = 0;
+    Require(kRegionName, "reference address",
+            TileGetBlockOffset(block, tail ? x + mip.tail_x : x % block.block_width,
+                               tail ? y + mip.tail_y : y % block.block_height, 0, local) &&
+                TileGetBlockXor(block, bx, by, mip.surface_z + layer, block_xor),
+            "tile table lookup failed");
+    return mip.offset + uint64_t{layer} * info.tiled_slice_stride +
+           (by * columns + bx) * block.block_size + (local ^ block_xor);
+  }
+
+  static uint64_t RegionLinearOffset(const ImageInfo &info, uint32_t layer, uint32_t x,
+                                     uint32_t y) {
+    const auto &mip = info.mip_layout[0];
+    const uint64_t slice = info.linear_slice_stride != 0 ? info.linear_slice_stride : mip.linear_size;
+    return mip.linear_offset + layer * slice +
+           (uint64_t{y} * mip.linear_pitch + x) * info.tiling.block.bytes_per_element;
+  }
+
+  // The linear bytes a region detile must produce: the pattern for texels whose tiled bytes lie in
+  // [lo, hi), and the sentinel everywhere else. With a null region list every texel is expected.
+  std::vector<uint8_t> ExpectedRegionBytes(const RegionFixture &fixture,
+                                           const std::vector<RefreshRegion> &regions, uint64_t lo,
+                                           uint64_t hi) {
+    const auto &info = fixture.info;
+    const uint32_t element = info.tiling.block.bytes_per_element;
+    std::vector<uint8_t> bytes(info.LinearSize(), kRegionSentinel);
+    for (const auto &r : regions)
+      for (uint32_t y = r.y0; y < r.y0 + r.height; ++y)
+        for (uint32_t x = r.x0; x < r.x0 + r.width; ++x) {
+          const auto address = RegionTexelAddress(info, r.layer, x, y);
+          if (address < lo || address >= hi) continue;
+          for (uint32_t i = 0; i < element; ++i)
+            bytes[RegionLinearOffset(info, r.layer, x, y) + i] = fixture.pattern[address + i];
+        }
+    return bytes;
+  }
+
+  static std::vector<u32> RegionWords(const std::vector<uint8_t> &bytes, uint8_t fill) {
+    std::vector<u32> words((bytes.size() + 3) / 4, fill * 0x01010101u);
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    return words;
+  }
+
+  std::vector<uint8_t> ReadRegionBytes(const Buffer &buffer, uint64_t size) {
+    const auto words = ReadBuffer(kRegionName, buffer, (size + 3) / 4);
+    std::vector<uint8_t> bytes(size);
+    std::memcpy(bytes.data(), words.data(), size);
+    return bytes;
+  }
+
+  void RegionHostBarrier(RegionRig &rig, vk::Buffer buffer, uint64_t size) {
+    vk::BufferMemoryBarrier barrier{};
+    barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = buffer;
+    barrier.size = size;
+    rig.scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+  }
+
+  // Runs DetileRegions over a sentinel filled target. The window buffer holds the image bytes from
+  // lo on, starting source_offset bytes in, so bytes past hi are real data that only the mask
+  // keeps out of the result.
+  std::vector<uint8_t> RunRegionDetile(RegionRig &rig, const RegionFixture &fixture,
+                                       const std::vector<RefreshRegion> &regions, uint64_t lo,
+                                       uint64_t hi, uint64_t source_offset) {
+    const auto &info = fixture.info;
+    std::vector<uint8_t> source(source_offset, 0x7b);
+    source.insert(source.end(), fixture.pattern.begin() + lo, fixture.pattern.end());
+    auto input = CreateHostBuffer(kRegionName, source.size(), AllFlags, RegionWords(source, 0x7b));
+    const uint64_t size = Common::AlignUp<uint64_t>(info.LinearSize(), 4);
+    auto output = CreateHostBuffer(kRegionName, size, AllFlags,
+                                   RegionWords(std::vector<uint8_t>(size, kRegionSentinel), 0));
+    rig.tiler.DetileRegions({input.buffer, source_offset, lo, hi}, info, regions,
+                            {output.buffer, 0, size});
+    RegionHostBarrier(rig, output.buffer, size);
+    rig.scheduler.Finish();
+    auto result = ReadRegionBytes(output, info.LinearSize());
+    DestroyBuffer(&output);
+    DestroyBuffer(&input);
+    return result;
+  }
+
+  // Runs one region case and returns how many bytes of the target were written.
+  size_t ExpectRegionScratch(RegionRig &rig, const char *label, const RegionFixture &fixture,
+                             const std::vector<RefreshRegion> &regions, uint64_t lo, uint64_t hi,
+                             uint64_t source_offset) {
+    const auto scratch = RunRegionDetile(rig, fixture, regions, lo, hi, source_offset);
+    const auto expected = ExpectedRegionBytes(fixture, regions, lo, hi);
+    Require(kRegionName, label, scratch == expected,
+            "texels outside the regions or the window must keep the sentinel and the rest must "
+            "match the tile tables");
+    return std::count_if(expected.begin(), expected.end(),
+                         [](uint8_t byte) { return byte != kRegionSentinel; });
+  }
+
+  // The legacy full detile, checked on texel bytes only because padding is not defined.
+  void CheckFullDetileAndTile(RegionRig &rig, const char *label, const RegionFixture &fixture) {
+    const auto &info = fixture.info;
+    const RefreshRegion whole{0, 0, 0, 0, info.extent.width, info.extent.height};
+    const auto expected = ExpectedRegionBytes(fixture, {whole}, 0, info.data.size);
+    const uint64_t linear_size = Common::AlignUp<uint64_t>(info.LinearSize(), 4);
+    auto input = CreateHostBuffer(kRegionName, fixture.pattern.size(), AllFlags,
+                                  RegionWords(fixture.pattern, 0));
+    auto output = CreateHostBuffer(kRegionName, linear_size, AllFlags,
+                                   RegionWords(std::vector<uint8_t>(linear_size, 0), 0));
+    const auto detiled = rig.tiler.Detile(input.buffer, 0, info);
+    const vk::BufferCopy copy{detiled.offset, 0, linear_size};
+    rig.scheduler.Current().Handle().copyBuffer(detiled.buffer, output.buffer, 1, &copy);
+    RegionHostBarrier(rig, output.buffer, linear_size);
+    rig.scheduler.Finish();
+    const auto actual = ReadRegionBytes(output, info.LinearSize());
+    bool equal = true;
+    for (size_t i = 0; i < expected.size(); ++i) equal &= expected[i] == kRegionSentinel || expected[i] == actual[i];
+    Require(kRegionName, label, equal, "the legacy full detile differs from the tile tables");
+    DestroyBuffer(&output);
+    DestroyBuffer(&input);
+    CheckLegacyTile(rig, label, fixture, expected);
+  }
+
+  // The legacy tile direction: linear texels in, tiled bytes out, checked at the texel addresses.
+  void CheckLegacyTile(RegionRig &rig, const char *label, const RegionFixture &fixture,
+                       const std::vector<uint8_t> &linear) {
+    const auto &info = fixture.info;
+    const uint64_t linear_size = Common::AlignUp<uint64_t>(info.LinearSize(), 4);
+    const uint64_t tiled_size = Common::AlignUp<uint64_t>(info.data.size, 4);
+    auto input = CreateHostBuffer(kRegionName, linear_size, AllFlags, RegionWords(linear, 0));
+    auto output = CreateHostBuffer(kRegionName, tiled_size, AllFlags,
+                                   RegionWords(std::vector<uint8_t>(tiled_size, kRegionSentinel), 0));
+    rig.tiler.Tile(input.buffer, 0, linear_size, output.buffer, 0, tiled_size, info);
+    RegionHostBarrier(rig, output.buffer, tiled_size);
+    rig.scheduler.Finish();
+    const auto tiled = ReadRegionBytes(output, info.data.size);
+    const uint32_t element = info.tiling.block.bytes_per_element;
+    bool equal = true;
+    for (uint32_t y = 0; y < info.extent.height; ++y)
+      for (uint32_t x = 0; x < info.extent.width; ++x) {
+        const auto address = RegionTexelAddress(info, 0, x, y);
+        for (uint32_t i = 0; i < element; ++i)
+          equal &= tiled[address + i] == fixture.pattern[address + i];
+      }
+    Require(kRegionName, label, equal, "the legacy tile differs from the tile tables");
+    DestroyBuffer(&output);
+    DestroyBuffer(&input);
+  }
+
+  // Block 0 of a 256x256 R32 RenderTarget64KB image with a window that ends half way through it.
+  void CheckRegionMaskInBlock(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    CheckFullDetileAndTile(rig, "full detile baseline", fixture);
+    const auto written = ExpectRegionScratch(rig, "window mask inside a block", fixture,
+                                             {{0, 0, 0, 0, 128, 128}}, 0, 32 * 1024, 0);
+    Require(kRegionName, "window mask inside a block count", written == 32 * 1024,
+            "half of the block must have been written");
+  }
+
+  // A rect over the whole mip with a window narrower than it, which only writes the window.
+  void CheckRegionNarrowWindow(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    const auto written = ExpectRegionScratch(rig, "whole mip rect with a narrow window", fixture,
+                                             {{0, 0, 0, 0, 256, 256}}, 64 * 1024, 96 * 1024, 52);
+    Require(kRegionName, "narrow window count", written == 32 * 1024,
+            "only the window may have been written");
+  }
+
+  void CheckRegionOrigins(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    constexpr uint64_t block = 64 * 1024;
+    (void)ExpectRegionScratch(rig, "block at x0 = 128", fixture, {{0, 0, 128, 0, 128, 128}},
+                              block, 2 * block, 20);
+    (void)ExpectRegionScratch(rig, "block at y0 = 128", fixture, {{0, 0, 0, 128, 128, 128}},
+                              2 * block, 3 * block, 36);
+  }
+
+  // Four regions in one dispatch, then 32 strips that need two chunks.
+  void CheckRegionChunks(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kRenderTarget, 256, 256, 1);
+    const std::vector<RefreshRegion> blocks{{0, 0, 0, 0, 128, 128},     {0, 0, 128, 0, 128, 128},
+                                            {0, 0, 0, 128, 128, 128}, {0, 0, 128, 128, 128, 128}};
+    (void)ExpectRegionScratch(rig, "four regions in one dispatch", fixture, blocks, 0,
+                              fixture.info.data.size, 0);
+    std::vector<RefreshRegion> strips;
+    for (uint32_t row = 0; row < 256; row += 8) strips.push_back({0, 0, 0, row, 256, 8});
+    Require(kRegionName, "strip count", strips.size() > 16, "the case needs more than one chunk");
+    (void)ExpectRegionScratch(rig, "more than one chunk of regions", fixture, strips, 0,
+                              fixture.info.data.size, 0);
+  }
+
+  void CheckRegionLayers(RegionRig &rig) {
+    const auto fixture = MakeRegionFixture(Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint,
+                                           Prospero::TileMode::kStandard64KB, 128, 128, 2);
+    (void)ExpectRegionScratch(rig, "layer region", fixture, {{0, 1, 0, 0, 128, 128}},
+                              fixture.info.tiled_slice_stride, fixture.info.data.size, 0);
+  }
+
+  // Every family and element size a partial refresh can reach, with the legacy directions too.
+  // A pair is unsupported when the tile tables have no layout for it.
+  void CheckRegionSweep(RegionRig &rig) {
+    struct Format {
+      Prospero::BufferFormat guest;
+      vk::Format pixel;
+    };
+    const std::array formats{Format{Prospero::BufferFormat::k8UNorm, vk::Format::eR8Unorm},
+                             Format{Prospero::BufferFormat::k16UInt, vk::Format::eR16Uint},
+                             Format{Prospero::BufferFormat::k32UInt, vk::Format::eR32Uint},
+                             Format{Prospero::BufferFormat::k32_32UInt, vk::Format::eR32G32Uint},
+                             Format{Prospero::BufferFormat::k32_32_32_32UInt,
+                                    vk::Format::eR32G32B32A32Uint}};
+    const std::array tiles{Prospero::TileMode::kStandard256B, Prospero::TileMode::kStandard4KB,
+                           Prospero::TileMode::kStandard64KB, Prospero::TileMode::kPrt,
+                           Prospero::TileMode::kRenderTarget};
+    uint32_t covered = 0, unsupported = 0;
+    for (const auto tile : tiles)
+      for (const auto &format : formats) {
+        TileSurfaceLayout surface{};
+        if (!TileGetTiledTextureLayout({format.guest, tile, TileSurfaceDimension::Dim2D, 200, 150,
+                                        1, 1, 1}, surface)) {
+          ++unsupported;
+          continue;
+        }
+        CheckRegionPair(rig, MakeRegionFixture(format.guest, format.pixel, tile, 200, 150, 1));
+        ++covered;
+      }
+    // Every family a partial refresh can reach must build and run at every element size.
+    Require(kRegionName, "sweep coverage", covered == tiles.size() * formats.size(),
+            "a family and element size pair was skipped");
+    std::printf("[gpu]     %-32s %u pairs, %u unsupported\n", "GpuTilerRegionSweep", covered,
+                unsupported);
+  }
+
+  // A full region equals the legacy detile, and one partial region with a partial window matches
+  // the reference inside the window and the sentinel outside.
+  void CheckRegionPair(RegionRig &rig, const RegionFixture &fixture) {
+    const auto &info = fixture.info;
+    const std::string label = std::to_string(static_cast<uint32_t>(info.tile_mode)) + "/" +
+                              std::to_string(info.tiling.block.bytes_per_element);
+    CheckFullDetileAndTile(rig, ("legacy " + label).c_str(), fixture);
+    (void)ExpectRegionScratch(rig, ("full region " + label).c_str(), fixture,
+                              {{0, 0, 0, 0, info.extent.width, info.extent.height}}, 0,
+                              info.data.size, 0);
+    const uint64_t lo = Common::AlignDown<uint64_t>(info.data.size / 4, 16);
+    const uint64_t hi = Common::AlignDown<uint64_t>(info.data.size / 4 * 3, 16);
+    const RefreshRegion partial{0, 0, 3, 5, info.extent.width - 3, info.extent.height - 5};
+    const auto written = ExpectRegionScratch(rig, ("partial region " + label).c_str(), fixture,
+                                             {partial}, lo, hi, 20);
+    const uint64_t texel_bytes = uint64_t{partial.width} * partial.height *
+                                 info.tiling.block.bytes_per_element;
+    Require(kRegionName, ("partial window " + label).c_str(), written > 0 && written < texel_bytes,
+            "the window must cut the region without missing it");
+  }
+
+  void CheckGpuTilerRegions() {
+    EnsureRuntimeContext();
+    RegionRig rig(*this);
+    CheckRegionMaskInBlock(rig);
+    CheckRegionNarrowWindow(rig);
+    CheckRegionOrigins(rig);
+    CheckRegionChunks(rig);
+    CheckRegionLayers(rig);
+    CheckRegionSweep(rig);
+    std::printf("[gpu]     %-32s ok\n", kRegionName);
+  }
+
+  // The window texel counts BuildMip puts in the records, for regions of several sizes.
+  void CheckTilerRegionRecords() {
+    constexpr const char *name = "TilerRegionRecords";
+    ImageInfo info{};
+    info.data.address = 0x10000000;
+    info.pixel_format = vk::Format::eR32Uint;
+    info.guest_format = Prospero::BufferFormat::k32UInt;
+    info.extent = {256, 256, 1};
+    info.resources = {1, 1};
+    info.tile_mode = Prospero::TileMode::kRenderTarget;
+    info.UpdateSize();
+    const std::vector<RefreshRegion> regions{
+        {0, 0, 0, 0, 128, 128}, {0, 0, 128, 0, 100, 50}, {0, 0, 0, 128, 10, 10}};
+    const auto records = TileManagerTestAccess::RegionRecords(info, regions, 4096, 8192, 64);
+    Require(name, "window texel totals",
+            records.total == 128 * 128 + 100 * 50 + 10 * 10 &&
+                records.texels == std::vector<uint32_t>{128 * 128, 100 * 50, 10 * 10},
+            "region records must count the texels of their windows, not of their mips");
+    Require(name, "window header", records.window_start == 64 && records.window_len == 4096 &&
+                records.origins == std::vector<std::array<uint32_t, 3>>{{0, 0, 0}, {128, 0, 0},
+                                                                         {0, 128, 0}},
+            "region records lost their window or their origin");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckGpuTilerCpuParity() {
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
@@ -21585,8 +22889,9 @@ public:
           std::max<uint64_t>(m_runtime_context.GetPhysicalDeviceProperties()
                                  .limits.nonCoherentAtomSize,
                              1);
+      // 16-byte header + N x 64-byte Mip.
       for (const auto [mips, bytes] :
-           std::array{std::pair{1u, 64u}, std::pair{2u, 112u}}) {
+           std::array{std::pair{1u, 80u}, std::pair{2u, 144u}}) {
         StreamBuffer compact_parameters(m_runtime_context, scheduler,
                                         MemoryUsage::Stream,
                                         Common::AlignUp<uint64_t>(bytes, atom));
@@ -54516,6 +55821,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    vulkan.CheckGpuTilerRegions();
+    vulkan.CheckTilerRegionRecords();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
@@ -54746,6 +56053,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckPartialRefreshColorMetadata();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -54788,6 +56096,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckPartialRefreshColorMetadata();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -55075,6 +56384,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
+  vulkan.CheckGpuTilerRegions();
+  vulkan.CheckTilerRegionRecords();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);
@@ -55098,6 +56409,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckPartialRefreshColorMetadata();
     vulkan.CheckDepthBitsCopy();
     vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();

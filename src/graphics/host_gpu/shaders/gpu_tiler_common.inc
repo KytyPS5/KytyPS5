@@ -23,11 +23,19 @@ struct Mip {
 	uint tail_x;
 	uint tail_y;
 	uint num_texels;
+	// Region records only. The window starts at (x0, y0) of layer z0 of the mip.
+	uint x0;
+	uint y0;
+	uint z0;
+	uint spare;
 };
 
 layout(set = 0, binding = 2, std140) uniform TilingInfo {
 	uint num_texels;
 	uint color_transform;
+	// Region detiles only. The valid source bytes are [window_start, window_start + window_len).
+	uint window_start;
+	uint window_len;
 	Mip mips[16];
 } info;
 
@@ -71,6 +79,8 @@ void main() {
 	uint row = texel / params.width;
 	uint z = row / params.height;
 	uvec3 p = uvec3(texel - row * params.width, row - z * params.height, z);
+	// Without REGION the origin folds to zero when the pipeline is specialized.
+	p += REGION != 0u ? uvec3(params.x0, params.y0, params.z0) : uvec3(0u);
 
 	uvec3 extent = block_extent();
 	uvec3 block = p / extent;
@@ -81,6 +91,13 @@ void main() {
 	             block_offset(swizzle);
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
+	// A region detile only reads the window. Its src_base is biased by the window start in
+	// wrapping 32 bit arithmetic, so src - window_start is the offset inside the window when the
+	// texel lies in it and wraps to a huge value when it does not. One unsigned compare therefore
+	// rejects both ends, and the texel keeps whatever the target already holds.
+	if (REGION != 0u && (params.src_base + tiled - info.window_start) >= info.window_len) {
+		return;
+	}
 	if (TILE == 0) {
 		copy_element(params.src_base + tiled, params.dst_base + linear);
 	} else {

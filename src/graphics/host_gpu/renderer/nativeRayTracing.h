@@ -71,13 +71,18 @@ public:
 
 	// The guest TLAS of a known tracing shader: its header's address is the 64-bit value at
 	// user data pointer (user SGPR pair `user_sgpr`) + `header_offset`; `root` its root node,
-	// `layout` how the shader reads its instance records (Decoder::RayTracingLayout::Pack()).
+	// `layout` how the shader reads its instance records (Decoder::RayTracingLayout::Pack());
+	// `header_slots` the flattened SRT dwords the shader reads the header's address from, when it
+	// loads it from its user data (ShaderInfo::ray_query_header_slots); `header_vsharp` (not
+	// NoRayQuerySlot) the offset from the user data pointer of a V# whose base takes the place of
+	// the pointer (ShaderInfo::ray_query_header_vsharp, see UserPointer()).
 	struct TlasSource {
 		uint32_t                user_sgpr     = 0;
 		uint32_t                header_offset = 0;
 		uint32_t                root          = 0;
 		std::array<uint32_t, 4> layout {};
 		uint32_t                header_vsharp = 0xffffffffu;
+		std::array<uint32_t, 2> header_slots {};
 	};
 	// The pointer the header address is at `header_offset` from: the user data pointer, or the
 	// base of the V# at it + `header_vsharp` (read with `read`, false when unreadable: 0).
@@ -88,10 +93,11 @@ public:
 	                                         TlasSource& source) noexcept;
 
 	// Records, before the dispatch, the walk of the guest TLAS whose header the 64-bit value at
-	// `user_pointer + source.header_offset` points to, the builds of pending BLASes and the TLAS
-	// build. Outside a render pass.
+	// `user_pointer + source.header_offset` points to (the dwords at `source.header_slots` of
+	// `flattened_srt`, the dispatch's flattened SRT, when it has them), the builds of pending
+	// BLASes and the TLAS build. Outside a render pass.
 	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
-	             uint64_t frame);
+	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame);
 
 	// The TLAS formats of the generations of sce::Psr (see hle_tlas.comp): the header and the
 	// instance records of GTA V 01.010/01.011 (Base460) and of 01.005 (Base252).

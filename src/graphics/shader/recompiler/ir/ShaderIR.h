@@ -602,6 +602,7 @@ struct Bindings {
 };
 
 struct ShaderInfo {
+	static constexpr uint32_t NoRayQuerySlot  = 0xffffffffu;
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	// Programs with inlined call targets (ray tracing hit groups) gather the images and samplers
 	// of every target: Wolverine's cs 1a04c58a9fbc2052 has more than 64 sampler roots.
@@ -675,6 +676,9 @@ struct ShaderInfo {
 	uint32_t                        ray_query_root                = 0;
 	// How its instance records are laid out (IR::RayTracingLayout::Pack()).
 	std::array<uint32_t, 4>         ray_query_layout {};
+	// The flattened SRT dwords (ReadConst slots) its sites read that header address from, low and
+	// high, when it loads it from its user data (NoRayQuerySlot otherwise).
+	std::array<uint32_t, 2>         ray_query_header_slots {NoRayQuerySlot, NoRayQuerySlot};
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

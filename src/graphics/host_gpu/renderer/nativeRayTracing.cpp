@@ -134,6 +134,10 @@ constexpr uint64_t ReadbackChanged = ReadbackJobs + uint64_t {MaxJobs} * JobStri
 constexpr uint64_t ReadbackUsed    = ReadbackChanged + uint64_t {ChangedCapacity} * 4;
 constexpr uint64_t ReadbackSize    = ReadbackUsed + uint64_t {SlotCapacity} * 4;
 
+// TlasPush::header_offset when the walk finds the header address in its state (kHeaderInState in
+// rt_tlas_walk.comp).
+constexpr uint32_t HeaderInState = 0xffffffffu;
+
 struct TlasPush {
 	uint64_t user_ptr_va;
 	uint64_t state;
@@ -361,7 +365,8 @@ bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& in
 	if (!info.ray_query || !PatchShaders()) {
 		return false;
 	}
-	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout};
+	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
+	          info.ray_query_header_slots, info.ray_query_header_vsharp};
 	return true;
 }
 
@@ -1199,7 +1204,8 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 }
 
 void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
-                               const TlasSource& source, uint64_t frame) {
+                               const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
+                               uint64_t frame) {
 	if (!m_enabled) {
 		return;
 	}
@@ -1376,6 +1382,30 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
 	                  vk::AccessFlagBits2::eTransferWrite);
+	// The header address as the guest's own load reads it, from the flattened SRT (its user data,
+	// read on the CPU, with the dwords the GPU wrote copied in), into the state the walk starts
+	// from. Through the BDA page table the walk would read a cache buffer over that memory,
+	// synchronized only when something binds it, or no buffer at all (zero, Astro Bot).
+	const auto in_srt = [&](uint32_t slot) {
+		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot &&
+		       (uint64_t {slot} + 1) * sizeof(uint32_t) <= flattened_srt.range;
+	};
+	const bool header_in_state = flattened_srt.buffer && in_srt(source.header_slots[0]) &&
+	                             in_srt(source.header_slots[1]);
+	if (header_in_state) {
+		const std::array<vk::BufferCopy, 2> words {{
+		    {flattened_srt.offset + uint64_t {source.header_slots[0]} * sizeof(uint32_t),
+		     offsetof(RtState, header_va), sizeof(uint32_t)},
+		    {flattened_srt.offset + uint64_t {source.header_slots[1]} * sizeof(uint32_t),
+		     offsetof(RtState, header_va) + sizeof(uint32_t), sizeof(uint32_t)},
+		}};
+		command.copyBuffer(flattened_srt.buffer, m_state->Handle(), static_cast<uint32_t>(words.size()),
+		                   words.data());
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+		                  vk::AccessFlagBits2::eTransferWrite);
+	}
 
 	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
 	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
@@ -1395,6 +1425,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_tlas_layout, 0, 1, &write);
+
 	const TlasPush tlas_push {
 	    .user_ptr_va       = user_pointer,
 	    .state             = m_state->BufferDeviceAddress(),
@@ -1407,7 +1438,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	    .context           = m_context_address,
 	    .tlas_address      = m_tlas_address,
 	    .verify_list       = m_verify_list->BufferDeviceAddress(),
-	    .header_offset     = source.header_offset,
+	    .header_offset     = header_in_state ? HeaderInState : source.header_offset,
 	    .root              = source.root,
 	    .instance_capacity = tlas_count,
 	    .table_mask        = TableEntries - 1,

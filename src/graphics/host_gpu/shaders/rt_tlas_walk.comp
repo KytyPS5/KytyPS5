@@ -59,6 +59,13 @@ layout(push_constant, std430) uniform Push {
 // QueueCapacity and MissingCapacity in nativeRayTracing.cpp.
 const uint kQueueCapacity   = 1u << 16;
 const uint kMissingCapacity = 256;
+// RtState::overflow: part of the TLAS (a box node or an instance record) is in memory the host has
+// not cached. The context stays invalid, so the guest traverses the TLAS itself this time, and its
+// own reads of that memory get it cached.
+const uint kUnmapped = 4u;
+// Push::header_offset when the host copied the header address into the state (from the dwords
+// the tracing shader reads it from; HeaderInState in nativeRayTracing.cpp).
+const uint kHeaderInState = 0xffffffffu;
 
 shared uint s_head;
 shared uint s_tail;
@@ -180,7 +187,9 @@ void main() {
 	const uint lid   = gl_LocalInvocationID.x;
 	RtState    state = RtState(pc.state);
 	if (lid == 0) {
-		const uint64_t header = LoadGuestU64(pc.user_ptr_va + pc.header_offset);
+		const uint64_t header = pc.header_offset == kHeaderInState
+		                            ? state.header_va
+		                            : LoadGuestU64(pc.user_ptr_va + pc.header_offset);
 		s_header              = header;
 		s_valid               = header != 0 && (header & 255) == 0 && HostAddress(header) != 0 ? 1u : 0u;
 		state.header_va       = header;
@@ -217,7 +226,12 @@ void main() {
 		for (uint i = head + lid; i < tail; i += gl_WorkGroupSize.x) {
 			const uint node = U32Ref(pc.queue + uint64_t(i) * 4).v;
 			const uint64_t address = NodeAddress(header, node);
-			const uvec4 children = LoadGuestU32x4(address);
+			const uint64_t host    = HostAddress(address);
+			if (host == 0) {
+				atomicOr(state.overflow, kUnmapped);
+				continue;
+			}
+			const uvec4 children = U32x4Ref(host).v;
 			for (uint c = 0; c < 4; c++) {
 				const uint child = children[c];
 				if (child == kInvalidNode) {
@@ -260,6 +274,9 @@ void main() {
 	for (uint i = lid; i < count; i += gl_WorkGroupSize.x) {
 		const uint     node   = U32Ref(pc.instance_nodes + uint64_t(i) * 4).v;
 		const uint64_t      record = InstanceRecord(header, instance_base, node, pc.instance_layout);
+		if (HostAddress(record) == 0) {
+			atomicOr(state.overflow, kUnmapped);
+		}
 		const GuestInstance guest  = LoadGuestInstance(record, pc.instance_layout);
 		const uint64_t      blas   = guest.blas;
 		const uint          root   = LayoutInline(pc.instance_layout, node)
@@ -357,7 +374,7 @@ void main() {
 			context.slots          = pc.slots;
 			context.instance_count = count;
 			context.instance_base  = instance_base;
-			context.valid          = pc.tlas_address != 0 ? 1u : 0u;
+			context.valid          = pc.tlas_address != 0 && (state.overflow & kUnmapped) == 0 ? 1u : 0u;
 		}
 	}
 }

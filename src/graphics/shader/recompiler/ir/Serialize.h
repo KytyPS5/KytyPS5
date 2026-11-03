@@ -159,7 +159,7 @@ KYTY_IO_FIELDS(StageOutput, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo::DmaWindow, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z)
+               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,

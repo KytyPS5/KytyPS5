@@ -56,15 +56,22 @@ enum class AjmSampleEncoding : uint32_t {
 	Float = 2,
 };
 
+struct AjmSidebandResampleInfo {
+	float    ratio       = 1.0f;
+	int32_t  num_samples = 0;
+	uint32_t reserved[8] {};
+};
+
 struct AjmDecodeResult {
-	int32_t           result                = OK;
-	int32_t           internal_result       = OK;
-	size_t            input_consumed        = 0;
-	size_t            output_written        = 0;
-	uint64_t          total_decoded_samples = 0;
-	uint32_t          frames                = 0;
-	uint32_t          frames_per_packet     = 0;
-	AjmSidebandFormat format {};
+	int32_t                 result                = OK;
+	int32_t                 internal_result       = OK;
+	size_t                  input_consumed        = 0;
+	size_t                  output_written        = 0;
+	uint64_t                total_decoded_samples = 0;
+	uint32_t                frames                = 0;
+	uint32_t                frames_per_packet     = 0;
+	AjmSidebandFormat       format {};
+	AjmSidebandResampleInfo resample_info {};
 };
 
 constexpr int32_t AJM_RESULT_NOT_INITIALIZED    = 0x00000001;

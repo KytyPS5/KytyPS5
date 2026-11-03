@@ -105,7 +105,17 @@ PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
 	auto* local_buttons = new QDialogButtonBox(local);
 	auto* reload        = local_buttons->addButton(tr("Reload"), QDialogButtonBox::ActionRole);
 	m_apply = local_buttons->addButton(tr("Apply selection"), QDialogButtonBox::ActionRole);
+	auto* enable_all    = local_buttons->addButton(tr("Enable all"), QDialogButtonBox::ActionRole);
+	auto* disable_all   = local_buttons->addButton(tr("Disable all"), QDialogButtonBox::ActionRole);
 	local_layout->addWidget(local_buttons);
+	auto set_all = [this](Qt::CheckState state) {
+		for (int i = 0; i < m_patches->count(); ++i)
+		{
+			m_patches->item(i)->setCheckState(state);
+		}
+	};
+	connect(enable_all, &QPushButton::clicked, this, [set_all] { set_all(Qt::Checked); });
+	connect(disable_all, &QPushButton::clicked, this, [set_all] { set_all(Qt::Unchecked); });
 	auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
 	layout->addWidget(buttons);
 	connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);

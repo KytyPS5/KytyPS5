@@ -125,6 +125,14 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 			}
 		}
 	}
+	if (dirty_state.cull_mode) {
+		dirty_state.cull_mode = false;
+		cmdbuf.setCullMode(cull_mode);
+	}
+	if (dirty_state.front_face) {
+		dirty_state.front_face = false;
+		cmdbuf.setFrontFace(front_face);
+	}
 	if (dirty_state.blend_constants) {
 		dirty_state.blend_constants = false;
 		cmdbuf.setBlendConstants(blend_constants.data());

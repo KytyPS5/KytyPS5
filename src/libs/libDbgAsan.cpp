@@ -38,8 +38,8 @@ struct Global {
 };
 
 struct Shadow {
-	uintptr_t start = 0;
-	int       count = 0;
+	uintptr_t start         = 0;
+	uint64_t  covered_bytes = 0;
 };
 
 struct AsanContext {
@@ -49,6 +49,14 @@ struct AsanContext {
 
 static uint32_t     g_fake_stack = 0;
 static AsanContext* g_ctx        = nullptr;
+
+// Allocation and release callbacks can partition the same guest range differently.
+static uint64_t ShadowCoverage(uintptr_t page, uintptr_t min_addr, uintptr_t max_addr) {
+	const auto guest_start = (page - 0x10000000000ull) << 3u;
+	const auto guest_end   = guest_start + 0x80000ull - 1;
+	return std::min<uintptr_t>(max_addr, guest_end) - std::max<uintptr_t>(min_addr, guest_start) +
+	       1;
+}
 
 static void AllocShadow(uintptr_t min_addr, uintptr_t max_addr) {
 	EXIT_IF(g_ctx == nullptr);
@@ -67,10 +75,11 @@ static void AllocShadow(uintptr_t min_addr, uintptr_t max_addr) {
 	     static_cast<uint64_t>(min_shadow), static_cast<uint64_t>(size));
 
 	for (uintptr_t page = min_shadow; page <= max_shadow; page += page_size) {
-		const auto it = std::find_if(g_ctx->shadows.begin(), g_ctx->shadows.end(),
-		                             [page](const Shadow& s) { return s.start == page; });
+		const auto bytes = ShadowCoverage(page, min_addr, max_addr);
+		const auto it    = std::find_if(g_ctx->shadows.begin(), g_ctx->shadows.end(),
+		                                [page](const Shadow& s) { return s.start == page; });
 		if (it != g_ctx->shadows.end()) {
-			it->count++;
+			it->covered_bytes += bytes;
 		} else {
 			if (!Common::VirtualMemory::AllocFixed(page, page_size,
 			                                       Common::VirtualMemory::Mode::ReadWrite)) {
@@ -78,8 +87,8 @@ static void AllocShadow(uintptr_t min_addr, uintptr_t max_addr) {
 			}
 
 			Shadow s;
-			s.start = page;
-			s.count = 1;
+			s.start         = page;
+			s.covered_bytes = bytes;
 			g_ctx->shadows.push_back(s);
 		}
 	}
@@ -105,14 +114,15 @@ static void FreeShadow(uintptr_t min_addr, uintptr_t max_addr) {
 		const auto it = std::find_if(g_ctx->shadows.begin(), g_ctx->shadows.end(),
 		                             [page](const Shadow& s) { return s.start == page; });
 		if (it != g_ctx->shadows.end()) {
-			it->count--;
-
-			if (it->count <= 0) {
+			const auto bytes = ShadowCoverage(page, min_addr, max_addr);
+			if (bytes >= it->covered_bytes) {
 				if (!Common::VirtualMemory::Free(page)) {
 					EXIT("can't free shadow memory\n");
 				}
 
 				g_ctx->shadows.erase(it);
+			} else {
+				it->covered_bytes -= bytes;
 			}
 		}
 	}
@@ -125,6 +135,14 @@ static void KernelAlloc(uintptr_t addr, size_t size) {
 static void KernelFree(uintptr_t addr, size_t size) {
 	FreeShadow(addr, addr + size - 1);
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+void TestRegisterMemoryCallbacks() {
+	EXIT_IF(g_ctx != nullptr);
+	g_ctx = new AsanContext;
+	LibKernel::Memory::RegisterCallbacks(KernelAlloc, KernelFree);
+}
+#endif
 
 static void KYTY_SYSV_ABI asan_init() {
 	PRINT_NAME();

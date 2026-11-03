@@ -167,6 +167,16 @@ bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
 	return false;
 }
 
+// Whether one operand is the other's negation.
+bool IsComplementPair(const Inst& inst, ValueOpcode negation) {
+	for (uint32_t arg = 0; arg < 2u; ++arg) {
+		const auto* negate = Arg(inst, arg).TryInstruction();
+		if (negate != nullptr && negate->GetOpcode() == negation &&
+		    Arg(*negate, 0) == Arg(inst, arg ^ 1u)) return true;
+	}
+	return false;
+}
+
 bool FoldSelect(Inst& inst) {
 	const auto condition   = Arg(inst, 0);
 	const auto true_value  = Arg(inst, 1);
@@ -243,17 +253,6 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	if (producer != nullptr && producer->GetOpcode() == construct) {
 		Replace(inst, producer->Arg(component));
 		return true;
-	}
-	if (component < 2u && producer != nullptr &&
-	    producer->GetOpcode() == ValueOpcode::IAddCarry32) {
-		const auto lhs = producer->Arg(0).Resolve();
-		const auto rhs = producer->Arg(1).Resolve();
-		if (IsImmediate(lhs, Type::U32) && IsImmediate(rhs, Type::U32)) {
-			const auto sum = static_cast<uint64_t>(lhs.U32()) + rhs.U32();
-			Replace(inst, Value(component == 0u ? static_cast<uint32_t>(sum)
-			                                    : static_cast<uint32_t>(sum >> 32u)));
-			return true;
-		}
 	}
 	return false;
 }
@@ -511,11 +510,6 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				ReplaceBinaryIdentity(inst, Type::U32, 1u);
 			}
 			return;
-		case ValueOpcode::IMul64:
-			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a * b; })) {
-				ReplaceBinaryIdentity(inst, Type::U64, 1u);
-			}
-			return;
 		case ValueOpcode::WqmU64: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U64)) {
@@ -642,8 +636,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitwiseXor32:
 			if (!FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
-			    })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0u);
+			    }) && !ReplaceBinaryIdentity(inst, Type::U32, 0u) &&
+			    IsComplementPair(inst, ValueOpcode::BitwiseNot32)) {
+				Replace(inst, Value(UINT32_MAX));
 			}
 			return;
 		case ValueOpcode::BitwiseNot32: {
@@ -667,17 +662,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		}
-		case ValueOpcode::BitCount32: {
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindILsb32: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U32)) {
-				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U32()))));
-			}
-			return;
-		}
-		case ValueOpcode::BitCount64: {
-			const auto value = Arg(inst, 0);
-			if (IsImmediate(value, Type::U64)) {
-				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U64()))));
+				const auto bits = value.U32();
+				Replace(inst, Value(static_cast<uint32_t>(
+				    inst.GetOpcode() == ValueOpcode::BitCount32 ? std::popcount(bits)
+				    : bits == 0u                                ? -1
+				                                                : std::countr_zero(bits))));
 			}
 			return;
 		}
@@ -690,7 +683,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::UMin32:
-			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); });
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); })) {
+				ReplaceBinaryIdentity(inst, Type::U32, ~0u);
+			}
 			return;
 		case ValueOpcode::UMax32:
 			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
@@ -818,6 +813,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 					Replace(inst, lhs.U1() ? lhs : rhs);
 				} else if (IsImmediate(rhs, Type::U1)) {
 					Replace(inst, rhs.U1() ? rhs : lhs);
+				} else if (IsComplementPair(inst, ValueOpcode::LogicalNot)) {
+					Replace(inst, Value(true));
 				} else {
 					const auto* left = lhs.TryInstruction();
 					const auto* right = rhs.TryInstruction();
@@ -908,8 +905,10 @@ private:
 		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 		    !Immediate(Arg(inst, 1), 0u)) return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
-		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
-		           ? Arg(*source, 0) : Value {};
+		if (source == nullptr) return {};
+		// Helper lanes keep the per-lane EXEC, so the live mask projects to true.
+		if (source->GetOpcode() == ValueOpcode::LiveMask) return Value(true);
+		return source->GetOpcode() == ValueOpcode::Ballot ? Arg(*source, 0) : Value {};
 	}
 
 	bool CanProject(Value value) {
@@ -1029,6 +1028,19 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		}
 		drain();
 	} while (normalized);
+	// Repeated register reads share a bitcast only within the same SSA block.
+	std::unordered_map<const Inst*, Inst*> bitcasts;
+	for (auto* block: blocks) {
+		bitcasts.clear();
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::BitCastF32U32 &&
+			    inst.GetOpcode() != ValueOpcode::BitCastU32F32) continue;
+			const auto* source = Arg(inst, 0).TryInstruction();
+			if (source == nullptr) continue;
+			const auto [entry, inserted] = bitcasts.try_emplace(source, &inst);
+			if (!inserted) Replace(inst, Value(entry->second));
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

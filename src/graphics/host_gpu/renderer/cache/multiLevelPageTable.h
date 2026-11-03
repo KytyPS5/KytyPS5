@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -118,6 +119,13 @@ public:
 
 	class const_iterator final {
 	public:
+		// libstdc++'s algorithms need these. Input, not forward, because operator* returns a copy.
+		using iterator_category = std::input_iterator_tag;
+		using value_type        = OwnerT;
+		using difference_type   = std::ptrdiff_t;
+		using pointer           = void;
+		using reference         = OwnerT;
+
 		[[nodiscard]] OwnerT operator*() const noexcept { return m_owners->At(m_index); }
 		const_iterator&      operator++() noexcept {
 			++m_index;

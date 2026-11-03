@@ -51,53 +51,51 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
-	if (!write_64) {
-		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
-		const auto old = ir.GetExecLo();
-		const auto src = ReadU32(inst.src0);
+	const auto combine = [&](IR::U32 old, IR::U32 src) {
 		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		IR::U32 result;
-		switch (operation) {
-			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
-			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
-			default: EXIT("unsupported SAVEEXEC operation");
-		}
+		return operation == IR::ValueOpcode::LogicalAnd ? ir.BitwiseAnd(lhs, rhs)
+		                                                : ir.BitwiseOr(lhs, rhs);
+	};
+	if (!write_64) {
+		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
+		const auto old    = ir.GetExecLo();
+		const auto result = combine(old, ReadU32(inst.src0));
 		WriteRawU32(inst.dst, old);
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo), result);
 		ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 		return;
 	}
-	const auto old    = ir.GetExec();
-	const auto src    = ReadMask(inst.src0);
-	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
-	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
-	WriteMask(inst.dst, old, true);
-	const auto mask = BallotMask(result);
-	ir.SetExec(result);
-	ir.SetExecLo(mask[0]);
-	ir.SetExecHi(mask[1]);
+	// EXEC words combine bitwise; the per-lane EXEC combines the per-lane masks, so helper lanes
+	// stay enabled.
+	const auto old      = ir.GetExec();
+	const auto src      = ReadMask(inst.src0);
+	const auto lhs      = negate_exec ? ir.LogicalNot(old) : old;
+	const auto rhs      = negate_source ? ir.LogicalNot(src) : src;
+	const auto src_mask = ReadU32Pair(inst.src0);
+	const std::array old_mask {ir.GetExecLo(), ir.GetExecHi()};
+	const std::array mask {combine(old_mask[0], src_mask[0]), combine(old_mask[1], src_mask[1])};
+	WriteMask(inst.dst, old, old_mask, true);
+	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), IR::U1(ir.Emit(operation, {lhs, rhs})),
+	          mask);
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 }
 
 void Translator::ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in) {
-	const auto zero     = IR::U32(IR::Value(0u));
-	const auto lhs      = ReadU32(inst.src0);
-	const auto rhs      = ReadU32(inst.src1);
-	const auto carry_in = !use_carry_in ? zero
-	                      : vector      ? ConditionBit(inst.src2)
-	                                    : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc));
-	const auto add0     = ir.Emit(IR::ValueOpcode::IAddCarry32, {lhs, rhs});
-	const auto partial  = ir.CompositeExtract(add0, 0);
-	const auto carry0   = ir.CompositeExtract(add0, 1);
-	const auto add1     = ir.Emit(IR::ValueOpcode::IAddCarry32, {partial, carry_in});
-	const auto result   = ir.CompositeExtract(add1, 0);
-	const auto carry1   = ir.CompositeExtract(add1, 1);
-	const auto carry    = ir.INotEqual(ir.BitwiseOr(carry0, carry1), zero);
+	const auto lhs     = ReadU32(inst.src0);
+	const auto rhs     = ReadU32(inst.src1);
+	const auto partial = ir.IAdd(lhs, rhs);
+	auto       result  = partial;
+	auto       carry   = ir.ULessThan(partial, lhs);
+	if (use_carry_in) {
+		// The carry-in is 0 or 1, so the second add carries out only when it wraps to zero.
+		result = ir.IAdd(partial, vector ? ConditionBit(inst.src2)
+		                                 : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc)));
+		carry  = ir.LogicalOr(carry, ir.ULessThan(result, partial));
+	}
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
+		WriteVectorMask(inst.dst2, carry);
 	} else {
 		ir.SetScc(carry);
 	}
@@ -110,7 +108,7 @@ void Translator::SUB_U32(const Decoder::Instruction& inst, bool vector, bool rev
 	const auto borrow = ir.UGreaterThan(rhs, lhs);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
+		WriteVectorMask(inst.dst2, borrow);
 	} else {
 		ir.SetScc(borrow);
 	}
@@ -128,7 +126,7 @@ void Translator::SUBB_U32(const Decoder::Instruction& inst, bool vector, bool re
 	const auto borrow    = ir.LogicalOr(borrow0, borrow1);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
+		WriteVectorMask(inst.dst2, borrow);
 	} else {
 		ir.SetScc(borrow);
 	}
@@ -142,29 +140,25 @@ void Translator::S_ABSDIFF_I32(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_ADD_SUB_I32(const Decoder::Instruction& inst, bool subtract) {
-	const auto lhs      = ReadU32(inst.src0);
-	const auto rhs      = ReadU32(inst.src1);
-	const auto result   = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
-	const auto shift    = IR::U32(IR::Value(31u));
-	const auto lhs_sign = ir.ShiftRightLogical(lhs, shift);
-	const auto rhs_sign = ir.ShiftRightLogical(rhs, shift);
-	const auto out_sign = ir.ShiftRightLogical(result, shift);
-	const auto inputs = subtract ? ir.INotEqual(lhs_sign, rhs_sign) : ir.IEqual(lhs_sign, rhs_sign);
-	const auto changed = ir.INotEqual(lhs_sign, out_sign);
+	const auto lhs    = ReadU32(inst.src0);
+	const auto rhs    = ReadU32(inst.src1);
+	const auto result = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
+	// Signed overflow moves the result past lhs the wrong way for the sign of rhs.
+	const auto ge = [&](IR::Value a, IR::Value b) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::SGreaterThanEqual32, {a, b}));
+	};
+	const auto moved = subtract ? ge(lhs, result) : ge(result, lhs);
 	WriteOperand(DestinationOperand(inst), result);
-	ir.SetScc(ir.LogicalAnd(inputs, changed));
+	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {moved, ge(rhs, IR::Value(0u))})));
 }
 
 void Translator::S_LSHL_ADD_U32(const Decoder::Instruction& inst, uint32_t shift_amount) {
-	const auto lhs           = ReadU32(inst.src0);
-	const auto shift         = IR::U32(IR::Value(shift_amount));
-	const auto rhs           = ReadU32(inst.src1);
-	const auto shifted       = ir.ShiftLeftLogical(lhs, shift);
-	const auto result        = ir.IAdd(shifted, rhs);
-	const auto add_carry     = ir.ULessThan(result, shifted);
-	const auto inverse_shift = ir.ISub(IR::U32(IR::Value(32u)), shift);
-	const auto shifted_out   = ir.ShiftRightLogical(lhs, inverse_shift);
-	const auto shift_carry   = ir.INotEqual(shifted_out, IR::U32(IR::Value(0u)));
+	const auto lhs         = ReadU32(inst.src0);
+	const auto rhs         = ReadU32(inst.src1);
+	const auto shifted     = ir.ShiftLeftLogical(lhs, IR::U32(IR::Value(shift_amount)));
+	const auto result      = ir.IAdd(shifted, rhs);
+	const auto add_carry   = ir.ULessThan(result, shifted);
+	const auto shift_carry = ir.UGreaterThan(lhs, IR::U32(IR::Value(~0u >> shift_amount)));
 	WriteOperand(DestinationOperand(inst), result);
 	ir.SetScc(ir.LogicalOr(add_carry, shift_carry));
 }
@@ -471,9 +465,13 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
-	const auto result =
-	    ir.Emit(IR::ValueOpcode::Permlane16U32,
-	            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec()}, flags);
+	// An EXEC-disabled source lane without FI disables the write unless BOUND_CTRL reads zero.
+	const auto inactive = flags.fetch_inactive || flags.bound_control
+	                          ? IR::U32(IR::Value(0u))
+	                          : ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
+	const auto result   = ir.Emit(
+	    IR::ValueOpcode::Permlane16U32,
+	    {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec(), inactive}, flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

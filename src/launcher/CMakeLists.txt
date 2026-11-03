@@ -1,5 +1,5 @@
 
-find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
@@ -36,6 +36,16 @@ target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+
+add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
+	src/gameContent.cpp
+	src/launcherTheme.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
+target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
@@ -102,19 +112,11 @@ install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
 
-if(NOT APPLE)
-	# Older releases require the previous executable name when validating updates.
-	install(CODE "
-		file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
-			TYPE PROGRAM RENAME \"launcher${CMAKE_EXECUTABLE_SUFFIX}\"
-			FILES \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}${CMAKE_EXECUTABLE_SUFFIX}\")
-	")
-endif()
-
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
+	install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION "KytyPS5.app/Contents/Resources/assets/fonts")
 	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
@@ -191,9 +193,12 @@ elseif(LINUX)
 				RESOLVED_DEPENDENCIES_VAR kyty_resolved
 				POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
 				POST_EXCLUDE_REGEXES \".*\")
+			# Install each library once, as a regular file under the name the binaries load.
 			foreach(kyty_dep \${kyty_resolved})
+				get_filename_component(kyty_dep_file \"\${kyty_dep}\" REALPATH)
+				get_filename_component(kyty_dep_name \"\${kyty_dep}\" NAME)
 				file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\"
-					TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES \"\${kyty_dep}\")
+					RENAME \"\${kyty_dep_name}\" FILES \"\${kyty_dep_file}\")
 			endforeach()
 		")
 		install(CODE "

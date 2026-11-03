@@ -1,32 +1,24 @@
+/* The views get their transparent background from their own styleSheet in
+   configuration_list_widget.ui: Breeze paints black behind the scrollbars of views without one. */
+QTreeWidget#cfgs_list,
 QListView#cfgs_grid {
-    background: palette(base);
-    border: 1px solid palette(mid);
-    color: palette(text);
-}
-
-QListView#cfgs_grid::item {
-    padding: 8px;
-}
-
-GameListTreeWidget#cfgs_list {
-    background: transparent;
     border: 1px solid palette(mid);
     color: palette(text);
     outline: 0;
 }
 
-GameListTreeWidget#cfgs_list::item {
+QTreeWidget#cfgs_list::item {
     background: transparent;
     border-bottom: 1px solid palette(mid);
     padding: 4px;
 }
 
-GameListTreeWidget#cfgs_list::item:selected {
+QTreeWidget#cfgs_list::item:selected {
     background: palette(highlight);
     color: palette(highlighted-text);
 }
 
-GameListTreeWidget#cfgs_list QHeaderView::section {
+QTreeWidget#cfgs_list QHeaderView::section {
     background: palette(button);
     color: palette(button-text);
     border: 0;

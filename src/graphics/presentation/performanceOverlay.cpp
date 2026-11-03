@@ -310,6 +310,10 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("CPU waiting on GPU",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
 	        Rate(shown, Counter::GpuWaits)));
+	Row("DCC/CMASK readbacks",
+	    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
+	        Rate(shown, Counter::ColorMetadataReadbacks)));
+	Row("DCC/CMASK GPU checks", Fmt("%.0f/s", Rate(shown, Counter::ColorMetadataChecks)));
 }
 
 void CompilationRows(const Snapshot& shown) {
@@ -529,16 +533,16 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		    Bytes(guest.pooled_allocated) + " (" + Bytes(guest.pool_committed) + " committed)");
 		Row("Flexible", Bytes(guest.flexible_used) + " / " + Bytes(guest.flexible_total));
 		Row("Extended", Bytes(guest.automatic_allocated));
-		// Past the pool size the guest sees no page-table entries available.
-		const auto entries = std::max(guest.cpu_page_entries, guest.gpu_page_entries);
+		// Past its total a side sees no page-table entries available.
+		const auto percent = std::max(guest.cpu_page_entries * 100 / guest.cpu_page_entries_total,
+		                              guest.gpu_page_entries * 100 / guest.gpu_page_entries_total);
 		Row("Page table (2 MB)",
-		    Fmt("CPU %llu  GPU %llu  / %llu",
+		    Fmt("CPU %llu / %llu  GPU %llu / %llu",
 		        static_cast<unsigned long long>(guest.cpu_page_entries),
+		        static_cast<unsigned long long>(guest.cpu_page_entries_total),
 		        static_cast<unsigned long long>(guest.gpu_page_entries),
-		        static_cast<unsigned long long>(guest.page_entries_total)),
-		    entries > guest.page_entries_total            ? BAD
-		    : entries * 10 > guest.page_entries_total * 9 ? MEDIUM
-		                                                  : GOOD);
+		        static_cast<unsigned long long>(guest.gpu_page_entries_total)),
+		    LevelColor(static_cast<double>(percent), 90, 100));
 		ImGui::EndTable();
 	}
 	if (BeginSection("Emulator process")) {

@@ -2,10 +2,12 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/stringUtils.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -675,19 +677,6 @@ static bool font_is_italic(const FontState* font) {
 	       font->render_effect_slant != 0.0f;
 }
 
-static const char* fallback_font_file_name(bool bold, bool italic) {
-	if (bold && italic) {
-		return "Roboto-BoldItalic.ttf";
-	}
-	if (bold) {
-		return "Roboto-Bold.ttf";
-	}
-	if (italic) {
-		return "Roboto-Italic.ttf";
-	}
-	return "Roboto-Regular.ttf";
-}
-
 static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file) {
@@ -709,49 +698,34 @@ static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
 	return data;
 }
 
-static std::vector<std::filesystem::path> fallback_font_candidates(const char* file_name) {
-	const auto rel =
-	    std::filesystem::path("3rdparty") / "tracy" / "profiler" / "src" / "font" / file_name;
-	std::vector<std::filesystem::path> paths;
-
-	auto source_root = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
-	paths.push_back(source_root / rel);
-
-	std::error_code ec;
-	auto            cwd = std::filesystem::current_path(ec);
-	if (!ec) {
-		paths.push_back(cwd / rel);
-		paths.push_back(cwd / ".." / rel);
-		paths.push_back(cwd / ".." / ".." / rel);
+static std::vector<uint8_t> load_fallback_font_data(const char* file_name) {
+	const char* base_path = SDL_GetBasePath();
+	if (base_path == nullptr) {
+		LOGF("Font: SDL_GetBasePath failed: %s\n", SDL_GetError());
+		return {};
 	}
-
-	return paths;
-}
-
-static std::vector<uint8_t> load_fallback_font_data(bool bold, bool italic) {
-	for (const auto& path: fallback_font_candidates(fallback_font_file_name(bold, italic))) {
-		auto data = read_file_bytes(path);
-		if (!data.empty()) {
-			return data;
-		}
+	// SDL returns UTF-8; path(const char*) would read it in the Windows ANSI code page.
+	const auto path = Common::PathFromUtf8(base_path) / "assets" / "fonts" / file_name;
+	auto       data = read_file_bytes(path);
+	if (data.empty()) {
+		LOGF("Font: fallback font not found: %s\n", Common::PathToString(path).c_str());
 	}
-
-	return {};
+	return data;
 }
 
 static const std::vector<uint8_t>& fallback_font_data(bool bold, bool italic) {
-	static const auto regular     = load_fallback_font_data(false, false);
-	static const auto bold_data   = load_fallback_font_data(true, false);
-	static const auto italic_data = load_fallback_font_data(false, true);
-	static const auto bold_italic = load_fallback_font_data(true, true);
+	static const auto regular     = load_fallback_font_data("NotoSans-Regular.ttf");
+	static const auto bold_data   = load_fallback_font_data("NotoSans-Bold.ttf");
+	static const auto italic_data = load_fallback_font_data("NotoSans-Italic.ttf");
+	static const auto bold_italic = load_fallback_font_data("NotoSans-BoldItalic.ttf");
 
-	if (bold && italic && !bold_italic.empty()) {
+	if (bold && italic) {
 		return bold_italic;
 	}
-	if (bold && !bold_data.empty()) {
+	if (bold) {
 		return bold_data;
 	}
-	if (italic && !italic_data.empty()) {
+	if (italic) {
 		return italic_data;
 	}
 	return regular;

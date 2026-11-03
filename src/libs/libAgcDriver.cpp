@@ -18,7 +18,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("2JtWUUiYBXs", Gen5::AgcGetRegisterDefaults2);
 	LIB_FUNC("wRbq6ZjNop4", Gen5::AgcGetRegisterDefaults2Internal);
 	LIB_FUNC("f3dg2CSgRKY", Gen5::AgcCreateShader);
-	LIB_FUNC("dolOmWH+huQ", Gen5::AgcUnknownGetFusedShaderSize);
+	LIB_FUNC("dolOmWH+huQ", Gen5::AgcGetFusedShaderSize);
 	LIB_FUNC("fd5Bp5tGTgo", Gen5::AgcFuseShaderHalves_0200);
 	LIB_FUNC("nApJjpKNBl4", Gen5::AgcFuseShaderHalves);
 	LIB_FUNC("vcmNN+AAXnY", Gen5::AgcSetCxRegIndirectPatchSetAddress);
@@ -78,6 +78,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("b-oySn+G2tE", Gen5::AgcAcbJumpGetSize);
 	LIB_FUNC("DwICrVxerkY", Gen5::AgcAcbRewind);
 	LIB_FUNC("htn36gPnBk4", Gen5::AgcAcbWaitRegMem);
+	LIB_FUNC("q4VuU-QsLOE", Gen5::AgcAcbMemSemaphore);
 	LIB_FUNC("idlaArvdXEs", Gen5::AgcAcbWaitOnAddressGetSize);
 	LIB_FUNC("-RnpfpxIhec", Gen5::AgcAcbDmaData);
 	LIB_FUNC("qzMN2XKGA4k", Gen5::AgcAcbCopyData);

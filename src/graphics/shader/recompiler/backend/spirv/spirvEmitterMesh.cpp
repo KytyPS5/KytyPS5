@@ -187,7 +187,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
-				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+				    ConstantU32(state, component * 10u), ConstantU32(state, 9));
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,

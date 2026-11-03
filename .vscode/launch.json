@@ -27,7 +27,7 @@
             "args": [
                 "--game", "D:/gamesps5/PPSA07429",
                 "--printf-direction", "File",
-                "--graphics-debug-dump", "True"
+                "--graphics-debug-dump"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}\\_Build\\vscode-clang",

@@ -304,8 +304,11 @@
         </layout>
        </item>
        <item>
-        <widget class="QStackedWidget" name="game_views">
-         <widget class="GameListTreeWidget" name="cfgs_list">
+        <widget class="GameViews" name="game_views">
+         <widget class="QTreeWidget" name="cfgs_list">
+          <property name="styleSheet">
+           <string notr="true">#cfgs_list { background: transparent; }</string>
+          </property>
           <property name="rootIsDecorated">
            <bool>false</bool>
           </property>
@@ -350,7 +353,11 @@
            </property>
           </column>
          </widget>
-         <widget class="QListView" name="cfgs_grid"/>
+         <widget class="QListView" name="cfgs_grid">
+          <property name="styleSheet">
+           <string notr="true">#cfgs_grid { background: transparent; }</string>
+          </property>
+         </widget>
         </widget>
        </item>
       </layout>
@@ -369,9 +376,10 @@
  </widget>
  <customwidgets>
   <customwidget>
-   <class>GameListTreeWidget</class>
-   <extends>QTreeWidget</extends>
-   <header>gameListTreeWidget.h</header>
+   <class>GameViews</class>
+   <extends>QStackedWidget</extends>
+   <header>gameViews.h</header>
+   <container>1</container>
   </customwidget>
  </customwidgets>
  <resources/>

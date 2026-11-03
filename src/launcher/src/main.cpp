@@ -22,7 +22,10 @@ QString TranslationDirectory() {
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
 	QTranslator translator;
-	if (translator.load(QLocale(), "kytyps5", "_", TranslationDirectory())) {
+	const QStringList ui_languages = QLocale().uiLanguages();
+	const bool english_first =
+		!ui_languages.isEmpty() && QLocale(ui_languages.first()).language() == QLocale::English;
+	if (!english_first && translator.load(QLocale(), "kytyps5", "_", TranslationDirectory())) {
 		a.installTranslator(&translator);
 	}
 	// Title bars and taskbars get the bolder small-size artwork.

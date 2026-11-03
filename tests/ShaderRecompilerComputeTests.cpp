@@ -28963,6 +28963,7 @@ TestCase Vop3OutputModifierFlushesNegativeZero() {
   code.push_back(EncodeVop2(0x08, 14, 249, 1));
   code.push_back(EncodeVop2Sdwa(0, 6, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1));
   AppendVop3(&code, 0x108, 15, Vgpr(3), Vgpr(1), 0, 0, 0, false, 3);
+  code.insert(code.end(), {EncodeVop2(0x1b, 15, 255, 15), 0x80000000u});
   for (u32 dst = 10; dst <= 15; dst++) {
     AppendStoreVgpr(&code, dst, dst - 10);
   }
@@ -28972,7 +28973,7 @@ TestCase Vop3OutputModifierFlushesNegativeZero() {
           code,
           {},
           {0x00000000u, 0x00000000u, 0xc0000000u, 0x80000000u, 0x00000000u, 0x80000000u},
-          {O::V_MOV_B32, O::V_MUL_F32, O::V_ADD_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_MUL_F32, O::V_ADD_F32, O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase CvtPkrtzF16F32SdwaAndOutputModifiers() {

@@ -283,7 +283,7 @@ private:
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
-	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
+	uint32_t                       m_image_index         = 0;
 	uint32_t                       m_frame_index         = 0;
 };
 
@@ -291,7 +291,6 @@ struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
-		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
@@ -488,8 +487,6 @@ void Swapchain::Create() {
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
 	}
-	m_image_index = static_cast<uint32_t>(-1);
-	m_frame_index = 0;
 }
 
 Swapchain::~Swapchain() {
@@ -542,7 +539,6 @@ void Swapchain::Destroy() {
 	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
 	m_window_extent = {};
-	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
 	m_images.clear();
 	m_image_views.clear();
@@ -574,11 +570,9 @@ bool Swapchain::NeedsResize() const {
 }
 
 Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
 	// Wait for the submission that consumed this slot before signaling it again.
 	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
-	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
@@ -598,7 +592,6 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 			return Status::SurfaceLost;
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
-	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
 }
 
@@ -760,7 +753,6 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
-	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
 	const bool blit_source     = source != nullptr && !convert_source;
@@ -895,7 +887,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
-	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
@@ -905,7 +896,6 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 }
 
 Swapchain::Status Swapchain::Present() {
-	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;

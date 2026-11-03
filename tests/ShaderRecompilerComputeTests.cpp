@@ -53956,6 +53956,16 @@ void CheckPm4Flip() {
               VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
               flipped_arg == flip_arg,
           "R_FLIP did not publish the occlusion counters or flip");
+  // The flip status reports the completed flip and nothing pending.
+  std::array<uint64_t, 16> flip_status{};
+  Require(name, "flip status",
+          VideoOut::VideoOutGetFlipStatus(
+              handle, reinterpret_cast<VideoOut::VideoOutFlipStatus *>(
+                          flip_status.data())) == 0 &&
+              flip_status[0] == 1 &&
+              static_cast<int64_t>(flip_status[3]) == flip_arg &&
+              VideoOut::VideoOutIsFlipPending(handle) == 0,
+          "the flip status did not report the completed flip");
 
   gpu.WaitForIdle();
   // Each pre-vblank event carries the port's pre-vblank count.

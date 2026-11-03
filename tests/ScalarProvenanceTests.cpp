@@ -720,7 +720,7 @@ void TestCompleteWaveReduction() {
       enabled = fixture.Emit(ValueOpcode::INotEqual32,
           {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
     }
-    // UMax and OR scans seed lanes outside EXEC with zero.
+    // UMax, OR, and IAdd scans seed lanes outside EXEC with zero.
     const bool maximum = test == Case::Wave32Maximum;
     const bool bitwise_or = test == Case::Or;
     const bool add = test == Case::Add;

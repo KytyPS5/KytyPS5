@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -52,11 +51,6 @@ static uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	}
 
 	return 0;
-}
-
-bool graphics_debug_dump_enabled() {
-	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
 void uc_print(const char* func, const HW::UserConfig& uc) {

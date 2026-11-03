@@ -210,27 +210,6 @@ struct DepthRenderOverride {
 	bool force_stencil_dirty = false;
 };
 
-struct GdsOaCounter {
-	uint32_t counter = 0;
-	uint32_t address = 0;
-
-	[[nodiscard]] uint32_t GetSpaceAvailable() const { return counter; }
-	[[nodiscard]] uint32_t GetAddressBytes() const { return address & 0x0000ffffu; }
-	[[nodiscard]] uint32_t GetCrawlerType() const { return (address >> 16u) & 0x3u; }
-	[[nodiscard]] uint32_t GetCrawlerId() const { return (address >> 20u) & 0xfu; }
-	[[nodiscard]] bool     IsCounterEnabled() const { return (address & 0x80000000u) != 0; }
-	[[nodiscard]] bool IsAllocationCrawlerDisabled() const { return (address & 0x40000000u) != 0; }
-};
-
-struct GdsOaState {
-	static constexpr uint32_t COUNTERS_NUM = 8;
-
-	uint32_t     cntl = 0;
-	GdsOaCounter counters[COUNTERS_NUM];
-
-	[[nodiscard]] uint32_t GetIndex() const { return cntl & (COUNTERS_NUM - 1u); }
-};
-
 struct ClipControl {
 	uint8_t user_clip_planes                    = 0;
 	uint8_t user_clip_plane_mode                = 0;
@@ -924,13 +903,6 @@ public:
 	void                           SetGeControl(const GeControl& control) { m_ge_cntl = control; }
 	[[nodiscard]] const GeUserVgprEn& GetGeUserVgprEn() const { return m_ge_user_vgpr_en; }
 	void SetGeUserVgprEn(const GeUserVgprEn& en) { m_ge_user_vgpr_en = en; }
-	[[nodiscard]] const GdsOaState&   GetGdsOaState() const { return m_gds_oa; }
-	[[nodiscard]] const GdsOaCounter& GetGdsOaCounter(uint32_t index) const {
-		return m_gds_oa.counters[index & 0x0fu];
-	}
-	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
-	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }
-	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
 
 private:
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
@@ -940,7 +912,6 @@ private:
 
 	GeControl    m_ge_cntl;
 	GeUserVgprEn m_ge_user_vgpr_en;
-	GdsOaState   m_gds_oa;
 };
 
 class Shader {

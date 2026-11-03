@@ -454,29 +454,6 @@ KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
 	return reg_num;
 }
 
-static void HwUcSetGdsOaRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
-	auto& ucfg = cp.GetUcfg();
-
-	switch (cmd_offset) {
-		case Pm4::GDS_OA_CNTL: ucfg.SetGdsOaCntl(value); break;
-		case Pm4::GDS_OA_COUNTER: ucfg.SetGdsOaCounter(value); break;
-		case Pm4::GDS_OA_ADDRESS: ucfg.SetGdsOaAddress(value); break;
-	}
-
-	const auto                   index = ucfg.GetGdsOaState().GetIndex();
-	const auto&                  oa    = ucfg.GetGdsOaCounter(index);
-	static std::atomic<uint32_t> log_count {0};
-	if (oa.IsCounterEnabled() && log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
-		LOGF("GDS_OA: index=%u address_bytes=0x%04" PRIx32 " space=0x%08" PRIx32
-		     " crawler=%u crawler_id=%u "
-		     "alloc_crawler=%s raw_cntl=0x%08" PRIx32 " raw_counter=0x%08" PRIx32
-		     " raw_address=0x%08" PRIx32 "\n",
-		     index, oa.GetAddressBytes(), oa.GetSpaceAvailable(), oa.GetCrawlerType(),
-		     oa.GetCrawlerId(), oa.IsAllocationCrawlerDisabled() ? "disabled" : "enabled",
-		     ucfg.GetGdsOaState().cntl, oa.counter, oa.address);
-	}
-}
-
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2477,16 +2454,14 @@ static constexpr auto MakeUconfigIndirectTable() {
 		cp.GetUcfg().SetPrimitiveResetControl(value);
 	};
 	// The host does not read these registers.
-	for (const auto cmd_offset: {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL,
-	                             Pm4::IA_MULTI_VGT_PARAM, Pm4::TA_CS_BC_BASE_ADDR,
-	                             Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION}) {
+	for (const auto cmd_offset:
+	     {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL, Pm4::IA_MULTI_VGT_PARAM,
+	      Pm4::TA_CS_BC_BASE_ADDR, Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION,
+	      Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
 
 	table[Pm4::GE_INDX_OFFSET] = [](KYTY_HW_REG_ARGS) { cp.GetUcfg().SetIndexOffset(value); };
-	table[Pm4::GDS_OA_CNTL]    = HwUcSetGdsOaRegister;
-	table[Pm4::GDS_OA_COUNTER] = HwUcSetGdsOaRegister;
-	table[Pm4::GDS_OA_ADDRESS] = HwUcSetGdsOaRegister;
 
 	table[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_REG_ARGS) {
 		static std::atomic<uint32_t> log_count {0};

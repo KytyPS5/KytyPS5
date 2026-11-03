@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUG_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUG_H_
 
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
@@ -22,8 +23,12 @@ struct ScissorRect {
 	int bottom = 0;
 };
 
+inline bool graphics_debug_dump_enabled() {
+	return Config::GraphicsDebugDumpEnabled() &&
+	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
+}
+
 uint32_t    render_target_mask_slot(uint32_t mask, uint32_t slot);
-bool        graphics_debug_dump_enabled();
 void        uc_print(const char* func, const HW::UserConfig& uc);
 void        uc_check(const HW::UserConfig& uc);
 bool        RenderIsColorTileModeLinear(Prospero::TileMode tile_mode);

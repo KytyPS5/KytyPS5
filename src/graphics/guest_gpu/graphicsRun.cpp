@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
-#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -11,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -18,7 +18,6 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
-#include "libs/agc.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -37,15 +36,9 @@ namespace Libs::Graphics {
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
-static bool GraphicsRunDebugDumpEnabled() {
-	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
-}
-
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
-	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -121,7 +114,7 @@ void GuestGpu::Submit(std::span<const uint32_t> commands) {
 		return;
 	}
 	Submission submission;
-	submission.type     = SubmissionType::Graphics;
+	submission.type     = SubmissionType::Commands;
 	submission.queue_id = 0;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
@@ -134,7 +127,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 
 	const auto compute_queue = queue - ComputeQueueBase;
 	Submission submission;
-	submission.type     = SubmissionType::Compute;
+	submission.type     = SubmissionType::Commands;
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
@@ -468,31 +461,13 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
-	const bool first_slice = !submission.started;
-	auto&      cp          = GetProcessor(submission.queue_id);
-
-	submission.started = true;
+	auto& cp = GetProcessor(submission.queue_id);
 
 	cp.BufferInit();
 	bool complete = true;
 
 	switch (submission.type) {
-		case SubmissionType::Compute:
-			if (first_slice) {
-				const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
-				const auto*     buffer = submission.commands.data();
-				static uint32_t compute_batch_log_count = 0;
-				if (num_dw <= 128 && compute_batch_log_count++ < 32) {
-					LOGF("compute direct batch: data=0x%016" PRIx64 ", num_dw=%" PRIu32 "\n",
-					     reinterpret_cast<uint64_t>(buffer), num_dw);
-					for (uint32_t i = 0; i < std::min<uint32_t>(num_dw, 16); i++) {
-						LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIx32 "\n", i, buffer[i]);
-					}
-				}
-				GraphicsDbgDumpDcb("cc", num_dw, buffer);
-			}
-			[[fallthrough]];
-		case SubmissionType::Graphics:
+		case SubmissionType::Commands:
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
@@ -549,6 +524,7 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	const bool debug_dump = graphics_debug_dump_enabled();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -573,7 +549,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
-		if (GraphicsRunDebugDumpEnabled()) {
+		if (debug_dump) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
 			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
@@ -863,21 +839,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 	{
 		frame_num = m_renderer.GetGpu().GetFrameNum();
-		if (GraphicsRunDebugDumpEnabled()) {
+		if (graphics_debug_dump_enabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
 				const auto& cs = m_sh_ctx.GetCs().cs_regs;
-				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
 				LOGF("QueuePoint DispatchDirect: frame=%u groups=%ux%ux%u local=%ux%ux%u "
-				     "mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
-				     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32
-				     "\n",
+				     "mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64 "\n",
 				     frame_num, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
 				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
-				     cs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
-				     oa.IsCounterEnabled() ? "true" : "false", oa.GetAddressBytes(),
-				     oa.GetSpaceAvailable());
+				     cs.data_addr);
 			}
 		}
 
@@ -920,7 +891,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id) {
-	if (GraphicsRunDebugDumpEnabled()) {
+	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
 		     "\t interrupt_selector = %" PRIu32 "\n"
@@ -989,7 +960,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
-	if (GraphicsRunDebugDumpEnabled()) {
+	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
 		     "\t event_index = 0x%08" PRIx32 "\n"
@@ -1066,7 +1037,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
-	if (GraphicsRunDebugDumpEnabled()) {
+	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();

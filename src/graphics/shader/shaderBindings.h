@@ -24,13 +24,6 @@ enum class AgcDirectResourceType : uint32_t {
 	Last                     = PtrVertexAttribDescTable,
 };
 
-enum class ResourceDescriptorType {
-	Texture,
-	Buffer,
-	Sampler,
-	Unused,
-};
-
 struct ShaderBufferResource {
 	uint32_t fields[4] = {0};
 
@@ -194,8 +187,6 @@ enum class ShaderStorageUsage {
 	ReadOnly,
 	ReadWrite,
 };
-
-ResourceDescriptorType ShaderClassifyResourceDescriptor(const uint32_t* desc);
 
 } // namespace Libs::Graphics
 

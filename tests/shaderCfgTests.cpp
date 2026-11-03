@@ -1043,39 +1043,6 @@ void EnsureConfigInitialized() {
   }
 }
 
-void TestResourceDescriptorClassification() {
-  uint32_t raw_texture[8] = {};
-  raw_texture[3] = 9u << 28u;
-  raw_texture[5] = 2u << 27u;
-  Check(ShaderClassifyResourceDescriptor(raw_texture) ==
-            ResourceDescriptorType::Texture,
-        "raw texture descriptor must not be classified by ResourceDescriptor "
-        "byte 23 fields");
-
-  uint32_t tagged_buffer[8] = {};
-  tagged_buffer[5] = 1u << 27u;
-  Check(ShaderClassifyResourceDescriptor(tagged_buffer) ==
-            ResourceDescriptorType::Buffer,
-        "tagged ResourceDescriptor buffer was not recognized");
-
-  uint32_t tagged_sampler[8] = {};
-  tagged_sampler[5] = 2u << 27u;
-  Check(ShaderClassifyResourceDescriptor(tagged_sampler) ==
-            ResourceDescriptorType::Sampler,
-        "tagged ResourceDescriptor sampler was not recognized");
-
-  uint32_t tagged_unused[8] = {};
-  tagged_unused[5] = 3u << 27u;
-  Check(ShaderClassifyResourceDescriptor(tagged_unused) ==
-            ResourceDescriptorType::Unused,
-        "tagged ResourceDescriptor unused slot was not recognized");
-
-  uint32_t raw_buffer[8] = {};
-  Check(ShaderClassifyResourceDescriptor(raw_buffer) ==
-            ResourceDescriptorType::Buffer,
-        "raw buffer descriptor fallback was not preserved");
-}
-
 constexpr uint32_t EncodeSMovB32(uint32_t dst, uint32_t src) {
   return 0x80000000u | (0x7du << 23u) | ((dst & 0x7fu) << 16u) | (0x03u << 8u) |
          (src & 0xffu);
@@ -17291,7 +17258,6 @@ int main() {
   EnsureConfigInitialized();
   TestVop3FloatConversionDecode();
   TestRayTracingInstructions();
-  TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();

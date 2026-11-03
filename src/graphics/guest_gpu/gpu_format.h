@@ -16,11 +16,6 @@ struct RenderTargetFormatEncoding {
 	uint8_t             components    = 0;
 	ChannelOrderSupport order_support = ChannelOrderSupport::kNone;
 
-	[[nodiscard]] constexpr bool IsValid() const {
-		return buffer_format != BufferFormat::kInvalid && components >= 1u && components <= 4u &&
-		       order_support != ChannelOrderSupport::kNone;
-	}
-
 	[[nodiscard]] constexpr bool SupportsOrder(ChannelOrder order) const {
 		switch (order_support) {
 			case ChannelOrderSupport::kStandardOnly: return order == ChannelOrder::kStandard;

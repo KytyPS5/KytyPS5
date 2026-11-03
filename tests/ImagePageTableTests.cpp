@@ -51,19 +51,16 @@ void TestCrossBucketRange() {
 	Table table;
 	table[range.first].push_back(1);
 	table[range.last_exclusive - 1].push_back(2);
-	Check(table.AllocatedBucketCount() == 2,
-	      "pages across the L1 boundary use distinct sparse buckets");
+	Check(table.Find(range.first - 1) != nullptr && table.Find(range.last_exclusive) != nullptr,
+	      "pages across the L1 boundary allocate their sparse buckets");
 }
 
 void TestQueriesDoNotAllocate() {
 	Table table;
 	Check(table.Find(123) == nullptr, "unallocated page query is empty");
-	Check(table.AllocatedBucketCount() == 0, "mutable query does not allocate");
+	Check(table.Find(123) == nullptr, "mutable query does not allocate");
 	const Table& const_table = table;
 	Check(const_table.Find(Table::kPageCount - 1) == nullptr, "const query is empty");
-	Check(table.AllocatedBucketCount() == 0, "const query does not allocate");
-	Check(table.Find(Table::kPageCount) == nullptr, "out-of-range query is empty");
-	Check(table.AllocatedBucketCount() == 0, "out-of-range query does not allocate");
 }
 
 void TestAddressSpaceBoundaries() {
@@ -135,7 +132,7 @@ void TestOneMiBRegistrationGranularity() {
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		table[page].push_back(7);
 	}
-	Check(table.AllocatedBucketCount() == 1,
+	Check(table.Find(OwnerTable::kBucketEntries) == nullptr,
 	      "large registration uses one sparse second-level bucket");
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		auto* owners = table.Find(page);

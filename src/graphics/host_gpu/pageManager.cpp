@@ -171,8 +171,7 @@ struct PageManager::Impl {
 	}
 
 	Region* FindRegion(uint64_t vaddr) const noexcept {
-		return vaddr < ADDRESS_SIZE ? regions[vaddr / REGION_SIZE].load(std::memory_order_acquire)
-		                            : nullptr;
+		return regions[vaddr / REGION_SIZE].load(std::memory_order_acquire);
 	}
 
 	Region* GetOrCreateRegion(uint64_t vaddr) {
@@ -215,13 +214,14 @@ struct PageManager::Impl {
 			}
 		};
 
+		constexpr int delta = track ? 1 : -1;
 		for (size_t page_index = first; page_index < last; page_index++) {
 			auto&      page    = region.pages[page_index];
 			const auto address = base_addr + page_index * PAGE_SIZE;
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
+			const auto new_count = update ? page.AddDelta<delta, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
 

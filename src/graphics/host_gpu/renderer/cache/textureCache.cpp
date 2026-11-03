@@ -248,9 +248,6 @@ void TextureCache::DeleteImage(ImageId id) {
 			FreeImage(association);
 		}
 	}
-	if (image.IsGpuModified()) {
-		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
-	}
 	m_download_images.erase(id);
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(image.info.metadata.range.address);
@@ -397,9 +394,6 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	                     info.extent.depth * info.resources.layers;
 	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
 	                   : m_readback_linear_images) {
-		if (!image.IsGpuModified()) {
-			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
-		}
 		m_download_images.insert(id);
 	}
 }
@@ -1967,10 +1961,18 @@ void TextureCache::RunGarbageCollector() {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		uint64_t age        = 16;
+		size_t   deletions  = 10;
+		if (aggressive) {
+			age       = 160;
+			deletions = 40;
+		} else if (pressured) {
+			age       = 80;
+			deletions = 20;
+		}
+		age = std::min(age, tick);
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal

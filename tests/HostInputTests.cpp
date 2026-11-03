@@ -14,8 +14,9 @@ void Check(bool condition, const char* message) {
 
 std::array<Sint16, 2> physical_stick {};
 std::array<int, 2>    guest_stick {128, 128};
-uint32_t             guest_buttons = 0;
-bool                 guest_touch   = false;
+uint32_t              guest_buttons = 0;
+bool                  guest_touch   = false;
+float                 guest_click_x = 0.0f;
 } // namespace
 
 namespace Fake {
@@ -57,18 +58,22 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 
 namespace Libs::Controller {
 void SetButton(int id, uint32_t button, bool down) {
-	if (id == 1) {
+	if (id == 1 || id == HOST_INPUT_CONTROLLER_ID) {
 		guest_buttons = down ? guest_buttons | button : guest_buttons & ~button;
 	}
 }
 void SetAxis(int id, Axis axis, int value) {
-	if (id == 1 && (axis == Axis::LeftX || axis == Axis::LeftY)) {
+	if ((id == 1 || id == HOST_INPUT_CONTROLLER_ID) &&
+	    (axis == Axis::LeftX || axis == Axis::LeftY)) {
 		guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
 	}
 }
-void SetTouchPad(int id, int finger, bool down, float, float) {
+void SetTouchPad(int id, int finger, bool down, float x, float) {
 	if (id == 1 && finger == 1) {
 		guest_touch = down;
+	}
+	if (id == 1 && finger == 0) {
+		guest_click_x = down ? x : 0.0f;
 	}
 }
 void SetRightStick(int, int, int) {}
@@ -86,6 +91,7 @@ struct Inputs {
 		guest_stick    = {128, 128};
 		guest_buttons  = 0;
 		guest_touch    = false;
+		guest_click_x  = 0.0f;
 		HostInputInit(nullptr);
 	}
 	~Inputs() { HostInputShutdown(); }
@@ -177,6 +183,35 @@ void TestTriggerLifecycleReset() {
 	Check(guest_buttons == PAD_BUTTON_CROSS, "shutdown retained a previous trigger press");
 }
 
+void TestDefaultKeyboardControls() {
+	Inputs inputs;
+	HostInputKey(SDLK_J, true);
+	HostInputKey(SDLK_A, true);
+	HostInputKey(SDLK_S, true);
+	Check(guest_buttons == PAD_BUTTON_CROSS && guest_stick == std::array {0, 255},
+	      "default keys did not press Cross and move the left stick");
+	HostInputKey(SDLK_D, true);
+	HostInputKey(SDLK_W, true);
+	Check(guest_stick == std::array {128, 128}, "opposite default stick keys did not cancel");
+	HostInputKey(SDLK_J, false);
+	HostInputKey(SDLK_A, false);
+	HostInputKey(SDLK_S, false);
+	HostInputKey(SDLK_D, false);
+	HostInputKey(SDLK_W, false);
+	Check(guest_buttons == 0 && guest_stick == std::array {128, 128},
+	      "released default keys left the guest pad pressed");
+}
+
+void TestPadTouchPadClick() {
+	Inputs inputs;
+	HostInputPadButton(1, SDL_GAMEPAD_BUTTON_SOUTH, true);
+	Check(guest_click_x == 0.75f && guest_buttons == PAD_BUTTON_TOUCH_PAD,
+	      "a pad button mapped to TouchPadRight did not click the right touchpad half");
+	HostInputPadButton(1, SDL_GAMEPAD_BUTTON_SOUTH, false);
+	Check(guest_click_x == 0.0f && guest_buttons == 0,
+	      "the mapped touchpad click was not released");
+}
+
 void TestDisabledMappingTabs() {
 	Config::ConfigOptions options;
 	const auto south = InputMap::SourceFromButton(SDL_GAMEPAD_BUTTON_SOUTH);
@@ -214,13 +249,16 @@ void TestDisabledMappingTabs() {
 int main() {
 	Config::Initialize();
 	Config::ConfigOptions options;
-	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger"};
+	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger",
+	                  "Pad:TouchPadRight=South"};
 	Config::Load(options);
 	TestTouchPadStickHandoff();
 	TestKeyboardSwitchesFromGamepadTouchPad();
 	TestTouchPadVisualState();
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
+	TestDefaultKeyboardControls();
+	TestPadTouchPadClick();
 	TestDisabledMappingTabs();
 	Config::Shutdown();
 	return 0;

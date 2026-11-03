@@ -394,40 +394,25 @@ bool TouchPadModeActive() {
 	return g_mouse_touchpad.enabled || g_gamepad_touchpad.enabled;
 }
 
-uint32_t DefaultKeyboardButton(int key_code) {
-	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
-		case SDLK_UP: return Controller::PAD_BUTTON_UP;
-		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
-		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
-		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
-		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
-		case SDLK_L: return Controller::PAD_BUTTON_CIRCLE;
-		case SDLK_Q: return Controller::PAD_BUTTON_L1;
-		case SDLK_E: return Controller::PAD_BUTTON_R1;
-		case SDLK_Z: return Controller::PAD_BUTTON_L2;
-		case SDLK_C: return Controller::PAD_BUTTON_R2;
-		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
-		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
-		case SDLK_RETURN:
-		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
-		default: return 0;
-	}
-}
-
-struct StickKeys {
-	bool left  = false;
-	bool right = false;
-	bool up    = false;
-	bool down  = false;
+struct AxisKeys {
+	bool negative = false;
+	bool positive = false;
 };
 
-void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
+// Held stick keys of the LeftX, LeftY, RightX and RightY axes.
+std::array<AxisKeys, 4> g_axis_keys;
+
+void SetStickKey(Controller::Axis axis, bool positive, bool down) {
+	auto& keys = g_axis_keys[static_cast<std::size_t>(axis)];
+	if (positive) {
+		keys.positive = down;
+	} else {
+		keys.negative = down;
+	}
 	int value = 128;
-	if (negative && !positive) {
+	if (keys.negative && !keys.positive) {
 		value = 0;
-	} else if (positive && !negative) {
+	} else if (keys.positive && !keys.negative) {
 		value = 255;
 	}
 	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
@@ -469,27 +454,10 @@ void SetControl(std::size_t control, bool down) {
 		CycleSettingOnPress(info.setting, down);
 		return;
 	}
-
-	struct AxisKeys {
-		bool negative = false;
-		bool positive = false;
-	};
-	static std::array<AxisKeys, 4> axes;
-
-	const auto axis = static_cast<std::size_t>(info.axis);
-	EXIT_IF(axis >= axes.size());
-	if (info.positive) {
-		axes[axis].positive = down;
-	} else {
-		axes[axis].negative = down;
-	}
-	SetStickAxis(info.axis, axes[axis].negative, axes[axis].positive);
+	SetStickKey(info.axis, info.positive, down);
 }
 
 void DefaultKeyboardInput(int key_code, bool down) {
-	static StickKeys left;
-	static StickKeys right;
-
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_F6:
@@ -501,39 +469,31 @@ void DefaultKeyboardInput(int key_code, bool down) {
 		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
-		case SDLK_A:
-			left.left = down;
-			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
-			return;
-		case SDLK_D:
-			left.right = down;
-			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
-			return;
-		case SDLK_W:
-			left.up = down;
-			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
-			return;
-		case SDLK_S:
-			left.down = down;
-			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
-			return;
-		case SDLK_F:
-			right.left = down;
-			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
-			return;
-		case SDLK_H:
-			right.right = down;
-			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
-			return;
-		case SDLK_T:
-			right.up = down;
-			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
-			return;
-		case SDLK_G:
-			right.down = down;
-			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
-			return;
-		default: SetButton(DefaultKeyboardButton(key_code), down); return;
+		case SDLK_A: SetStickKey(Controller::Axis::LeftX, false, down); return;
+		case SDLK_D: SetStickKey(Controller::Axis::LeftX, true, down); return;
+		case SDLK_W: SetStickKey(Controller::Axis::LeftY, false, down); return;
+		case SDLK_S: SetStickKey(Controller::Axis::LeftY, true, down); return;
+		case SDLK_F: SetStickKey(Controller::Axis::RightX, false, down); return;
+		case SDLK_H: SetStickKey(Controller::Axis::RightX, true, down); return;
+		case SDLK_T: SetStickKey(Controller::Axis::RightY, false, down); return;
+		case SDLK_G: SetStickKey(Controller::Axis::RightY, true, down); return;
+		case SDLK_UP: SetButton(Controller::PAD_BUTTON_UP, down); return;
+		case SDLK_LEFT: SetButton(Controller::PAD_BUTTON_LEFT, down); return;
+		case SDLK_DOWN: SetButton(Controller::PAD_BUTTON_DOWN, down); return;
+		case SDLK_RIGHT: SetButton(Controller::PAD_BUTTON_RIGHT, down); return;
+		case SDLK_J: SetButton(Controller::PAD_BUTTON_CROSS, down); return;
+		case SDLK_I: SetButton(Controller::PAD_BUTTON_TRIANGLE, down); return;
+		case SDLK_K: SetButton(Controller::PAD_BUTTON_SQUARE, down); return;
+		case SDLK_L: SetButton(Controller::PAD_BUTTON_CIRCLE, down); return;
+		case SDLK_Q: SetButton(Controller::PAD_BUTTON_L1, down); return;
+		case SDLK_E: SetButton(Controller::PAD_BUTTON_R1, down); return;
+		case SDLK_Z: SetButton(Controller::PAD_BUTTON_L2, down); return;
+		case SDLK_C: SetButton(Controller::PAD_BUTTON_R2, down); return;
+		case SDLK_LSHIFT: SetButton(Controller::PAD_BUTTON_L3, down); return;
+		case SDLK_LCTRL: SetButton(Controller::PAD_BUTTON_R3, down); return;
+		case SDLK_RETURN:
+		case SDLK_RETURN2: SetButton(Controller::PAD_BUTTON_OPTIONS, down); return;
+		default: return;
 	}
 }
 
@@ -628,8 +588,8 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 		return;
 	} else if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
 		// Real touchpads report their own finger position; other inputs emulate a click.
-		if (source != PAD_SOURCES.size() && PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
+		if (PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+			Controller::SetTouchPad(id, 0, down, info.touch_x, 0.5f);
 		}
 		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
 	} else if (info.button != 0) {

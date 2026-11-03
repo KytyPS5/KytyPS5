@@ -142,7 +142,6 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
                                      const std::vector<const char*>& device_extensions,
-                                     SurfaceCapabilities&            out_capabilities,
                                      vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
                                      std::string& out_rejections) {
 	EXIT_IF(instance == nullptr);
@@ -165,9 +164,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		devices = {headset}; // The headset runtime renders on this GPU.
 	}
 
-	vk::PhysicalDevice  best_device       = nullptr;
-	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
-	SurfaceCapabilities best_capabilities;
+	vk::PhysicalDevice best_device       = nullptr;
+	uint32_t           best_queue_family = static_cast<uint32_t>(-1);
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
@@ -370,15 +368,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
 			best_device       = device;
 			best_queue_family = queue_family;
-			best_capabilities = std::move(candidate_capabilities);
 		}
 	}
 
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
-	if (best_device != nullptr) {
-		out_capabilities = std::move(best_capabilities);
-	}
 }
 
 static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
@@ -933,7 +927,7 @@ void WindowContext::CreateVulkan() {
 	}
 
 	std::string rejected_devices;
-	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
+	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions,
 	                         graphic_ctx.physical_device, graphic_ctx.queue_family,
 	                         rejected_devices);
 

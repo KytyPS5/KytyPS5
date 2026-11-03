@@ -21,16 +21,6 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	};
 }
 
-const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
-	switch (index) {
-		case 0: return inst.src0;
-		case 1: return inst.src1;
-		case 2: return inst.src2;
-		case 3: return inst.src3;
-		default: EXIT("decoded source operand index is out of range");
-	}
-}
-
 Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst) {
 	auto destination = inst.dst;
 	if (destination.kind != Decoder::OperandKind::Vgpr) {

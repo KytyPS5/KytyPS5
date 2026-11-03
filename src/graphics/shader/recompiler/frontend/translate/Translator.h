@@ -1,11 +1,28 @@
 #pragma once
 
+#include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+inline const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index) {
+	switch (index) {
+		case 0: return inst.src0;
+		case 1: return inst.src1;
+		case 2: return inst.src2;
+		case 3: return inst.src3;
+		default: EXIT("decoded source operand index is out of range");
+	}
+}
+
+inline Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
+	Decoder::Operand operand;
+	operand.kind = kind;
+	return operand;
+}
 
 class Translator {
 public:
@@ -21,7 +38,6 @@ public:
 	                        IR::Block& info);
 
 private:
-	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);
 	Decoder::Operand ScalarDestinationOperand(const Decoder::Operand& operand, uint32_t offset);

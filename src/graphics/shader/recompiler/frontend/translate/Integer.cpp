@@ -538,13 +538,9 @@ void Translator::V_LSHL_OR_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
-	Decoder::Operand mask_operand;
-	mask_operand.kind = Decoder::OperandKind::VccLo;
-	if (inst.src_count >= 3u) {
-		mask_operand = inst.src2;
-	}
-	const auto condition = ReadMask(mask_operand);
-	IR::Value  result;
+	const auto condition =
+	    ReadMask(inst.src_count >= 3u ? inst.src2 : ConditionOperand(Decoder::OperandKind::VccLo));
+	IR::Value result;
 	if (inst.src0.negate || inst.src0.absolute || inst.src1.negate || inst.src1.absolute) {
 		result =
 		    ir.Emit(IR::ValueOpcode::SelectF32, {condition, ReadOperand(inst.src1, IR::Type::F32),

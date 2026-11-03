@@ -1814,6 +1814,11 @@ void TestNewShaderRecompilerSMovB32() {
         "new decoder did not decode literal S_MOV_B32 operand");
   Check((result.decoded_dump.find("S_MOV_B32 s2, s1") != std::string::npos),
         "new decoder did not decode register S_MOV_B32 operand");
+  const uint32_t abs_code[] = {EncodeSop1(0x34, 4, 2)}; // s_abs_i32 s4, s2
+  ShaderRecompiler::Decoder::Instruction inst;
+  ShaderRecompiler::Decoder::DecodeInstruction(abs_code, 0, inst);
+  Check(ShaderRecompiler::Decoder::InstructionToString(inst) == "0x00000000: S_ABS_I32 s4, s2",
+        "scalar unary dump did not print its destination and source");
   Check((result.ir_dump.find("StoreBufferU32") != std::string::npos) &&
             (result.ir_dump.find("0x00000001") != std::string::npos) &&
             (result.ir_dump.find("0x12345678") != std::string::npos),

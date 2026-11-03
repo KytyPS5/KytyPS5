@@ -150,74 +150,6 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
 
 constexpr auto VOP1_OPS = Detail::MakeOpcodeTable<0x100>(VOP1_OPCODE_LIST);
 
-constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
-    {0x00u, Opcode::V_NOP},
-    {0x01u, Opcode::V_MOV_B32},
-    {0x02u, Opcode::V_READFIRSTLANE_B32},
-    {0x04u, Opcode::V_CVT_F64_I32},
-    {0x0fu, Opcode::V_CVT_F32_F64},
-    {0x10u, Opcode::V_CVT_F64_F32},
-    {0x11u, Opcode::V_CVT_F32_UBYTE0},
-    {0x12u, Opcode::V_CVT_F32_UBYTE1},
-    {0x13u, Opcode::V_CVT_F32_UBYTE2},
-    {0x14u, Opcode::V_CVT_F32_UBYTE3},
-    {0x16u, Opcode::V_CVT_F64_U32},
-    {0x17u, Opcode::V_TRUNC_F64},
-    {0x18u, Opcode::V_CEIL_F64},
-    {0x1au, Opcode::V_FLOOR_F64},
-    {0x2fu, Opcode::V_RCP_F64},
-    {0x05u, Opcode::V_CVT_F32_I32},
-    {0x06u, Opcode::V_CVT_F32_U32},
-    {0x07u, Opcode::V_CVT_U32_F32},
-    {0x08u, Opcode::V_CVT_I32_F32},
-    {0x0au, Opcode::V_CVT_F16_F32},
-    {0x0bu, Opcode::V_CVT_F32_F16},
-    {0x0cu, Opcode::V_CVT_RPI_I32_F32},
-    {0x0du, Opcode::V_CVT_FLR_I32_F32},
-    {0x0eu, Opcode::V_CVT_OFF_F32_I4},
-    {0x2au, Opcode::V_RCP_F32},
-    {0x20u, Opcode::V_FRACT_F32},
-    {0x21u, Opcode::V_TRUNC_F32},
-    {0x22u, Opcode::V_CEIL_F32},
-    {0x23u, Opcode::V_RNDNE_F32},
-    {0x24u, Opcode::V_FLOOR_F32},
-    {0x25u, Opcode::V_EXP_F32},
-    {0x27u, Opcode::V_LOG_F32},
-    {0x2bu, Opcode::V_RCP_IFLAG_F32},
-    {0x2eu, Opcode::V_RSQ_F32},
-    {0x33u, Opcode::V_SQRT_F32},
-    {0x35u, Opcode::V_SIN_F32},
-    {0x36u, Opcode::V_COS_F32},
-    {0x37u, Opcode::V_NOT_B32},
-    {0x38u, Opcode::V_BFREV_B32},
-    {0x39u, Opcode::V_FFBH_U32},
-    {0x3au, Opcode::V_FFBL_B32},
-    {0x3bu, Opcode::V_FFBH_I32},
-    {0x3eu, Opcode::V_FRACT_F64},
-    {0x3fu, Opcode::V_FREXP_EXP_I32_F32},
-    {0x40u, Opcode::V_FREXP_MANT_F32},
-    {0x42u, Opcode::V_MOVRELD_B32},
-    {0x43u, Opcode::V_MOVRELS_B32},
-    {0x50u, Opcode::V_CVT_F16_U16},
-    {0x51u, Opcode::V_CVT_F16_I16},
-    {0x52u, Opcode::V_CVT_U16_F16},
-    {0x53u, Opcode::V_CVT_I16_F16},
-    {0x54u, Opcode::V_RCP_F16},
-    {0x55u, Opcode::V_SQRT_F16},
-    {0x56u, Opcode::V_RSQ_F16},
-    {0x57u, Opcode::V_LOG_F16},
-    {0x58u, Opcode::V_EXP_F16},
-    {0x5bu, Opcode::V_FLOOR_F16},
-    {0x5cu, Opcode::V_CEIL_F16},
-    {0x5du, Opcode::V_TRUNC_F16},
-    {0x5eu, Opcode::V_RNDNE_F16},
-    {0x5fu, Opcode::V_FRACT_F16},
-    {0x60u, Opcode::V_SIN_F16},
-    {0x61u, Opcode::V_COS_F16},
-};
-
-constexpr auto VOP3_ENCODED_VOP1_OPS = Detail::MakeOpcodeTable<0x80>(VOP3_ENCODED_VOP1_OPCODE_LIST);
-
 struct VopcOpcodeInfo {
 	uint32_t encoding     = 0;
 	Opcode   decoded      = Opcode::UNKNOWN;
@@ -435,26 +367,6 @@ bool IsUnsupportedVop3EncodedVop2Alias(uint32_t opcode) {
 	       opcode == 0x3au;
 }
 
-Opcode LookupVop3Opcode(uint32_t opcode) {
-	const auto direct = Detail::LookupOpcode(VOP3_OPS, opcode);
-	if (direct != Opcode::UNSUPPORTED) {
-		return direct;
-	}
-	if (opcode <= 0xffu) {
-		return Detail::LookupOpcode(VOPC_OPS, opcode);
-	}
-	if (opcode >= 0x100u && opcode <= 0x13fu) {
-		if (IsUnsupportedVop3EncodedVop2Alias(opcode - 0x100u)) {
-			return Opcode::UNSUPPORTED;
-		}
-		return Detail::LookupOpcode(VOP2_OPS, opcode - 0x100u);
-	}
-	if (opcode >= 0x180u && opcode <= 0x1ffu) {
-		return Detail::LookupOpcode(VOP3_ENCODED_VOP1_OPS, opcode - 0x180u);
-	}
-	return Opcode::UNSUPPORTED;
-}
-
 bool IsVop3EncodedVopc(uint32_t opcode) {
 	return opcode <= 0xffu;
 }
@@ -465,6 +377,26 @@ bool IsVop3EncodedVop2(uint32_t opcode) {
 
 bool IsVop3EncodedVop1(uint32_t opcode) {
 	return opcode >= 0x180u && opcode <= 0x1ffu;
+}
+
+Opcode LookupVop3Opcode(uint32_t opcode) {
+	const auto direct = Detail::LookupOpcode(VOP3_OPS, opcode);
+	if (direct != Opcode::UNSUPPORTED) {
+		return direct;
+	}
+	if (IsVop3EncodedVopc(opcode)) {
+		return Detail::LookupOpcode(VOPC_OPS, opcode);
+	}
+	if (IsVop3EncodedVop2(opcode)) {
+		if (IsUnsupportedVop3EncodedVop2Alias(opcode - 0x100u)) {
+			return Opcode::UNSUPPORTED;
+		}
+		return Detail::LookupOpcode(VOP2_OPS, opcode - 0x100u);
+	}
+	if (IsVop3EncodedVop1(opcode)) {
+		return Detail::LookupOpcode(VOP1_OPS, opcode - 0x180u);
+	}
+	return Opcode::UNSUPPORTED;
 }
 
 Opcode LookupVintrpOpcode(uint32_t opcode) {

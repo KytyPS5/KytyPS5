@@ -258,13 +258,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreVtxControl([[maybe_unused]] uint32_t value) {}
-
 static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
 	auto& ctx    = cp.GetCtx();
 	auto  fvalue = *reinterpret_cast<const float*>(&value);
@@ -288,24 +281,6 @@ static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_off
 	}
 }
 
-static void HwCtxIgnoreFovWindow([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreFsrRegister([[maybe_unused]] uint32_t cmd_offset,
-                                   [[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreScanModeControl1([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnorePaScExtendedControl([[maybe_unused]] uint32_t cmd_offset,
-                                           [[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreCbDccControl([[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnorePointState([[maybe_unused]] uint32_t cmd_offset,
-                                  [[maybe_unused]] uint32_t value) {}
-
-static void HwCtxIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset,
-                                            [[maybe_unused]] uint32_t value) {}
-
 static void HwCtxIgnoreSpiTmpringSize(uint32_t value) {
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
@@ -321,28 +296,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetSpiTmpringSize) {
 	HwCtxIgnoreSpiTmpringSize(buffer[0]);
 
 	return 1;
-}
-
-static bool HwCtxIsFakeRegister(uint32_t cmd_offset) {
-	switch (cmd_offset) {
-		case Pm4::CX_NOP: return true;
-		default: return false;
-	}
-}
-
-static void HwCtxIgnoreFakeRegister([[maybe_unused]] uint32_t cmd_offset,
-                                    [[maybe_unused]] uint32_t value) {}
-
-static bool HwCtxTrySetFakeRegister(uint32_t cmd_offset, uint32_t value) {
-	if (!HwCtxIsFakeRegister(cmd_offset)) {
-		return false;
-	}
-
-	if (cmd_offset != Pm4::CX_NOP) {
-		HwCtxIgnoreFakeRegister(cmd_offset, value);
-	}
-
-	return true;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDepthBounds) {
@@ -365,44 +318,10 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthMetadataRegisters) {
 	return num_values;
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetBorderColorTableAddr) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreBorderColorTableAddr(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetPaScExtendedControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePaScExtendedControl(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetCbDccControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreCbDccControl(buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetPointState) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePointState(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
+// Accept registers the host does not read.
+static void IgnoreRegister(CommandProcessor&, uint32_t, uint32_t) {}
+KYTY_HW_CTX_PARSER(IgnoreRegisters) {
+	return KYTY_PM4_LEN(cmd_id) - 2u;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDrawPayloadControl) {
@@ -413,56 +332,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetDrawPayloadControl) {
 KYTY_HW_CTX_PARSER(HwCtxSetObjprimIdControl) {
 	cp.GetCtx().SetObjprimIdControl(buffer[0]);
 	return KYTY_PM4_LEN(cmd_id) - 2u;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetPrimitiveIdReset) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePrimitiveIdReset(buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetVtxControl) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreVtxControl(buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetFovWindow) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreFovWindow(buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetScanModeControl1) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreScanModeControl1(buffer[i]);
-	}
-
-	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset + i, buffer[i]);
-	}
-
-	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetBlendControl) {
@@ -659,9 +528,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetHardwareScreenOffset) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SU_HARDWARE_SCREEN_OFFSET);
 
-	// uint32_t x = static_cast<uint16_t>(buffer[0] & 0xffffu);
-	// uint32_t y = static_cast<uint16_t>((buffer[0] >> 16u) & 0xffffu);
-
 	uint32_t x = KYTY_PM4_GET(buffer[0], PA_SU_HARDWARE_SCREEN_OFFSET, HW_SCREEN_OFFSET_X);
 	uint32_t y = KYTY_PM4_GET(buffer[0], PA_SU_HARDWARE_SCREEN_OFFSET, HW_SCREEN_OFFSET_Y);
 
@@ -703,11 +569,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetLineControl) {
 
 	auto line_width = KYTY_PM4_GET(buffer[0], PA_SU_LINE_CNTL, WIDTH);
 
-	if (line_width == 8) {
-		cp.GetCtx().SetLineWidth(1.0f);
-	} else {
-		cp.GetCtx().SetLineWidth(static_cast<float>(line_width) / 8.0f);
-	}
+	cp.GetCtx().SetLineWidth(static_cast<float>(line_width) / 8.0f);
 
 	return 1;
 }
@@ -925,11 +787,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetViewportZ) {
 	return reg_num;
 }
 
-static void HwShIgnoreComputeRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
-static void HwShIgnoreShaderRegister([[maybe_unused]] uint32_t cmd_offset,
-                                     [[maybe_unused]] uint32_t value) {}
-
 KYTY_HW_SH_PARSER(HwShSetRegisters) {
 	const auto reg_num = (cmd_id >> 16u) & 0x3fffu;
 	EXIT_NOT_IMPLEMENTED(reg_num == 0);
@@ -1007,7 +864,7 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_START_Z:
 		case Pm4::COMPUTE_RESOURCE_LIMITS:
 		case Pm4::COMPUTE_TMPRING_SIZE:
-		case Pm4::COMPUTE_PACE_ID: HwShIgnoreComputeRegister(cmd_offset, value); break;
+		case Pm4::COMPUTE_PACE_ID: break;
 		default:
 			EXIT("unsupported compute SH register 0x%08" PRIx32 " = 0x%08" PRIx32 "\n", cmd_offset,
 			     value);
@@ -1104,8 +961,7 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 	return first >= base && first - base < 4u && count <= 4u - (first - base);
 }
 
-static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
-                                               uint32_t value) {
+static void HwShIgnoreUserAccumulatorRegister(CommandProcessor&, uint32_t, uint32_t value) {
 	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
 }
 
@@ -1119,7 +975,7 @@ KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
 	EXIT_NOT_IMPLEMENTED(reg_num == 0 || !valid_range);
 
 	for (uint32_t i = 0; i < reg_num; i++) {
-		HwShIgnoreUserAccumulatorRegister(cmd_offset + i, buffer[i]);
+		HwShIgnoreUserAccumulatorRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return reg_num;
@@ -1151,29 +1007,10 @@ KYTY_HW_UC_PARSER(HwUcSetObjectId) {
 	return 1;
 }
 
-static void HwUcIgnoreTextureGradientFactors([[maybe_unused]] uint32_t value) {}
-
 KYTY_HW_UC_PARSER(HwUcSetTextureGradientFactors) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 	EXIT_NOT_IMPLEMENTED(num_values == 0 || cmd_offset < Pm4::TEXTURE_GRADIENT_FACTORS ||
 	                     cmd_offset + num_values - 1u > Pm4::TEXTURE_GRADIENT_CONTROL);
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwUcIgnoreTextureGradientFactors(buffer[i]);
-	}
-
-	return num_values;
-}
-
-static void HwUcIgnoreIaMultiVgtParam([[maybe_unused]] uint32_t value) {}
-
-KYTY_HW_UC_PARSER(HwUcSetIaMultiVgtParam) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwUcIgnoreIaMultiVgtParam(buffer[i]);
-	}
-
 	return num_values;
 }
 
@@ -1183,18 +1020,10 @@ KYTY_HW_UC_PARSER(HwUcSetMultiPrimIbReset) {
 	return 1;
 }
 
-static void HwUcIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset,
-                                           [[maybe_unused]] uint32_t value) {}
-
 KYTY_HW_UC_PARSER(HwUcSetBorderColorTableAddr) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 	EXIT_NOT_IMPLEMENTED(num_values == 0 || cmd_offset < Pm4::TA_CS_BC_BASE_ADDR ||
 	                     cmd_offset + num_values - 1u > Pm4::TA_CS_BC_BASE_ADDR_HI);
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwUcIgnoreBorderColorTableAddr(cmd_offset + i, buffer[i]);
-	}
-
 	return num_values;
 }
 
@@ -1353,13 +1182,12 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 		    (buffer[0] & 0xfffffff0u) | (static_cast<uint64_t>(buffer[1] & 0xffu) << 32u);
 	}
 
-	auto  condition       = (flags >> 8u) & 0x1u;
-	auto  wait_op         = (flags >> 12u) & 0x1u;
-	auto  op              = (flags >> 16u) & 0x7u;
-	auto* address         = reinterpret_cast<const volatile void*>(address_value);
-	auto  count_in_dwords = 0u;
+	auto  condition = (flags >> 8u) & 0x1u;
+	auto  wait_op   = (flags >> 12u) & 0x1u;
+	auto  op        = (flags >> 16u) & 0x7u;
+	auto* address   = reinterpret_cast<const volatile void*>(address_value);
 
-	cp.SetPredication(condition, op, wait_op, address, count_in_dwords);
+	cp.SetPredication(condition, op, wait_op, address);
 
 	return payload_dw;
 }
@@ -1434,11 +1262,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 static uint8_t CopyDataDstToDma(uint32_t dst) {
 	switch (dst) {
 		case 2:
-		case 4:
-		case 5: return 3;
-		case 3:
-		case 6:
-		case 7: return 1;
+		case 4: return 3;
+		case 6: return 1;
 		default: break;
 	}
 
@@ -1469,9 +1294,6 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 	const uint32_t control             = buffer[0];
 	const uint32_t src_sel             = ((control & 0xfu) << 1u) | ((control >> 30u) & 0x1u);
 	const uint32_t dst_sel             = ((control >> 8u) & 0xfu) << 1u;
-	const uint8_t  src_cache           = static_cast<uint8_t>((control >> 13u) & 0x3u);
-	const uint8_t  dst_cache           = static_cast<uint8_t>((control >> 25u) & 0x3u);
-	const uint8_t  write_confirm       = static_cast<uint8_t>((control >> 20u) & 0x1u);
 	const uint32_t num_bytes           = ((control >> 16u) & 0x1u) != 0 ? 8u : 4u;
 	const uint64_t src                 = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
 	const uint64_t dst                 = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
@@ -1495,8 +1317,7 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 		EXIT("unsupported 64-bit immediate copyData\n");
 	}
 
-	cp.DmaData(0, CopyDataDstToDma(dst_sel), dst_cache, dst, dma_src, src_cache, src, num_bytes, 1,
-	           write_confirm, 1);
+	cp.DmaData(CopyDataDstToDma(dst_sel), dst, dma_src, src, num_bytes);
 
 	return 5;
 }
@@ -1506,29 +1327,18 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(7, Pm4::IT_DMA_DATA, 0u));
 
-	const uint32_t control  = buffer[0];
-	const uint32_t control2 = buffer[5];
-	const uint64_t src      = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
-	const uint64_t dst      = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	const uint32_t control   = buffer[0];
+	const uint32_t control2  = buffer[5];
+	const uint64_t src       = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	const uint64_t dst       = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	const uint32_t num_bytes = control2 & 0x03ffffffu;
 
-	if (control == 0x60000000 && dst == 0x0003022c && (control2 >> 21u) == 0x141u) {
-		return 6;
-	}
-
-	const uint8_t engine           = static_cast<uint8_t>(control & 0x1u);
-	const uint8_t src_cache_policy = static_cast<uint8_t>((control >> 13u) & 0x3u);
-	const uint8_t dst_sel          = static_cast<uint8_t>(
+	const uint8_t dst_sel = static_cast<uint8_t>(
 	    ((control >> 20u) & 0x3u) | ((control2 >> 25u) & 0x4u) | ((control2 >> 26u) & 0x8u));
-	const uint8_t dst_cache_policy = static_cast<uint8_t>((control >> 25u) & 0x3u);
-	const uint8_t src_sel          = static_cast<uint8_t>(
+	const uint8_t src_sel = static_cast<uint8_t>(
 	    ((control >> 29u) & 0x3u) | ((control2 >> 24u) & 0x4u) | ((control2 >> 25u) & 0x8u));
-	const uint8_t  block_engine  = static_cast<uint8_t>((control >> 31u) & 0x1u);
-	const uint8_t  wait_previous = static_cast<uint8_t>((control2 >> 30u) & 0x1u);
-	const uint8_t  write_confirm = static_cast<uint8_t>((control2 >> 31u) & 0x1u);
-	const uint32_t num_bytes     = control2 & 0x03ffffffu;
 
-	cp.DmaData(engine, dst_sel, dst_cache_policy, dst, src_sel, src_cache_policy, src, num_bytes,
-	           wait_previous, write_confirm, block_engine);
+	cp.DmaData(dst_sel, dst, src_sel, src, num_bytes);
 
 	return 6;
 }
@@ -1838,7 +1648,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
-		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
+		if (cmd_offset == Pm4::CX_NOP) {
 			continue;
 		}
 
@@ -1908,15 +1718,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
-		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
-
-		// Not sure if this is correct
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
 		}
@@ -1969,13 +1770,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
-		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
@@ -2094,7 +1888,7 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 
 	auto cmd_offset = NormalizeRegisterOffset(buffer[0]);
 
-	if (HwCtxTrySetFakeRegister(cmd_offset, buffer[1])) {
+	if (cmd_offset == Pm4::CX_NOP) {
 		return 2;
 	}
 
@@ -2186,12 +1980,6 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		cmd_offset = raw_cmd_offset & 0x0fffffffu;
 	}
 
-	// if (raw_cmd_offset != cmd_offset) {
-	// 	LOGF_COLOR(Log::Color::Red,
-	// 	           "\t temporary: normalized UC register offset 0x%08" PRIx32 " -> 0x%08" PRIx32
-	// 	           "\n",
-	// 	           raw_cmd_offset, cmd_offset);
-	// }
 	if (cmd_offset == Pm4::UC_NOP) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
@@ -2284,11 +2072,10 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
 	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
 	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 3u + value_dw);
-	auto  poll = buffer[3u + value_dw * 2u];
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 
-	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
+	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, CpOpWaitRegMemWaitOp<T>(ctrl));
 
 	return payload_dw;
 }
@@ -2692,56 +2479,50 @@ void GraphicsInitJmpTablesCxIndirect() {
 			cp.GetCtx().SetBlendColor(color);
 		};
 	}
-	g_hw_ctx_indirect_func[Pm4::CB_DCC_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreCbDccControl(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::DB_COUNT_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-	};
-	for (auto cmd_offset = Pm4::DB_SRESULTS_COMPARE_STATE0;
-	     cmd_offset <= Pm4::DB_SRESULTS_COMPARE_STATE1; cmd_offset++) {
-		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-		};
+	g_hw_ctx_indirect_func[Pm4::DB_RENDER_OVERRIDE] = HwCtxSetDepthMetadataRegister;
+
+	// The host does not read these registers.
+	for (const auto cmd_offset: {Pm4::CB_DCC_CONTROL,
+	                             Pm4::DB_COUNT_CONTROL,
+	                             Pm4::DB_SRESULTS_COMPARE_STATE0,
+	                             Pm4::DB_SRESULTS_COMPARE_STATE1,
+	                             Pm4::DB_RENDER_OVERRIDE2,
+	                             Pm4::DB_DFSM_CONTROL,
+	                             Pm4::DB_RMI_L2_CACHE_CONTROL,
+	                             Pm4::CB_RMI_GL2_CACHE_CONTROL,
+	                             Pm4::TA_BC_BASE_ADDR,
+	                             Pm4::TA_BC_BASE_ADDR_HI,
+	                             Pm4::PA_SU_POINT_SIZE,
+	                             Pm4::PA_SU_POINT_MINMAX,
+	                             Pm4::SPI_VS_OUT_CONFIG,
+	                             Pm4::SPI_SHADER_POS_FORMAT,
+	                             Pm4::SPI_SHADER_IDX_FORMAT,
+	                             Pm4::VGT_GS_INSTANCE_CNT,
+	                             Pm4::VGT_GS_ONCHIP_CNTL,
+	                             Pm4::VGT_HOS_MAX_TESS_LEVEL,
+	                             Pm4::VGT_HOS_MIN_TESS_LEVEL,
+	                             Pm4::VGT_ESGS_RING_ITEMSIZE,
+	                             Pm4::VGT_PRIMITIVEID_EN,
+	                             Pm4::VGT_REUSE_OFF,
+	                             Pm4::VGT_TESS_DISTRIBUTION,
+	                             Pm4::VGT_PRIMITIVEID_RESET,
+	                             Pm4::SPI_SHADER_Z_FORMAT,
+	                             Pm4::PA_SC_FOV_WINDOW_LR,
+	                             Pm4::PA_SC_FOV_WINDOW_TB,
+	                             Pm4::PA_SC_FSR_ENABLE,
+	                             Pm4::FSR_RECURSIONS0,
+	                             Pm4::FSR_RECURSIONS1,
+	                             Pm4::PA_SC_MODE_CNTL_1,
+	                             Pm4::PA_SC_AA_MASK_X0Y0_X1Y0,
+	                             Pm4::PA_SC_AA_MASK_X0Y1_X1Y1,
+	                             Pm4::PA_SU_VTX_CNTL,
+	                             Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK,
+	                             Pm4::PA_SC_BINNER_CNTL_0,
+	                             Pm4::PA_SC_BINNER_CNTL_1,
+	                             Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL,
+	                             Pm4::PA_SC_SHADER_CONTROL}) {
+		g_hw_ctx_indirect_func[cmd_offset] = IgnoreRegister;
 	}
-	g_hw_ctx_indirect_func[Pm4::DB_RENDER_OVERRIDE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::DB_RENDER_OVERRIDE2] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::DB_DFSM_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::DB_RMI_L2_CACHE_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::CB_RMI_GL2_CACHE_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthMetadataRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::TA_BC_BASE_ADDR] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreBorderColorTableAddr(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::TA_BC_BASE_ADDR_HI] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreBorderColorTableAddr(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POINT_SIZE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePointState(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POINT_MINMAX] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePointState(cmd_offset, value);
-	};
-
-	g_hw_ctx_indirect_func[Pm4::SPI_VS_OUT_CONFIG] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetVsOutConfig(value);
-	};
-
-	g_hw_ctx_indirect_func[Pm4::SPI_SHADER_POS_FORMAT] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetShaderPosFormat(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::SPI_SHADER_IDX_FORMAT] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetShaderIdxFormat(value);
-	};
 	g_hw_ctx_indirect_func[Pm4::SPI_TMPRING_SIZE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreSpiTmpringSize(value);
 	};
@@ -2751,40 +2532,14 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::GE_NGG_SUBGRP_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetNggSubgrpCntl(value);
 	};
-	g_hw_ctx_indirect_func[Pm4::VGT_GS_INSTANCE_CNT] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetGsInstanceCnt(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::VGT_GS_ONCHIP_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetGsOnchipCntl(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::VGT_HOS_MAX_TESS_LEVEL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetHosMaxTessLevel(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::VGT_HOS_MIN_TESS_LEVEL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetHosMinTessLevel(value);
-	};
-
 	g_hw_ctx_indirect_func[Pm4::GE_MAX_OUTPUT_PER_SUBGROUP] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetMaxOutputPerSubgroup(value);
-	};
-
-	g_hw_ctx_indirect_func[Pm4::VGT_ESGS_RING_ITEMSIZE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetEsgsRingItemsize(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_GS_MAX_VERT_OUT] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetGsMaxVertOut(value);
 	};
-	g_hw_ctx_indirect_func[Pm4::VGT_PRIMITIVEID_EN] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetPrimitiveIdEn(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::VGT_REUSE_OFF] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetReuseOff(value);
-	};
 	g_hw_ctx_indirect_func[Pm4::VGT_MULTI_PRIM_IB_RESET_INDX] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetPrimitiveResetIndex(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::VGT_TESS_DISTRIBUTION] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetTessDistribution(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_SHADER_STAGES_EN] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetShaderStages(value);
@@ -2800,12 +2555,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetDrawPayloadControl(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::VGT_PRIMITIVEID_RESET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePrimitiveIdReset(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::SPI_SHADER_Z_FORMAT] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetShaderZFormat(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_CL_OBJPRIM_ID_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetObjprimIdControl(value);
@@ -2860,9 +2609,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	g_hw_ctx_indirect_func[Pm4::CB_SHADER_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetShaderMask(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_SHADER_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetScShaderControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::CB_TARGET_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetRenderTargetMask(value);
@@ -2956,35 +2702,19 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetModeControl(DecodeModeControl(value));
 	};
 
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_CLAMP] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_BACK_SCALE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
-	};
+	for (const auto cmd_offset:
+	     {Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, Pm4::PA_SU_POLY_OFFSET_CLAMP,
+	      Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE, Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET,
+	      Pm4::PA_SU_POLY_OFFSET_BACK_SCALE, Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET}) {
+		g_hw_ctx_indirect_func[cmd_offset] = HwCtxSetPolyOffsetRegister;
+	}
 
 	g_hw_ctx_indirect_func[Pm4::DB_Z_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetDepthZInfo(HW::DepthZInfo::Decode(value));
 	};
 
-	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MIN] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthBoundsRegister(cp, cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MAX] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthBoundsRegister(cp, cmd_offset, value);
-	};
+	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MIN] = HwCtxSetDepthBoundsRegister;
+	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MAX] = HwCtxSetDepthBoundsRegister;
 
 	g_hw_ctx_indirect_func[Pm4::DB_STENCIL_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetDepthStencilInfo(HW::DepthStencilInfo::Decode(value));
@@ -3122,22 +2852,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	g_hw_ctx_indirect_func[Pm4::PA_SU_LINE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		auto line_width = KYTY_PM4_GET(value, PA_SU_LINE_CNTL, WIDTH);
-		cp.GetCtx().SetLineWidth(line_width == 8 ? 1.0f : static_cast<float>(line_width) / 8.0f);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_FOV_WINDOW_LR] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreFovWindow(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_FOV_WINDOW_TB] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreFovWindow(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_FSR_ENABLE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreFsrRegister(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::FSR_RECURSIONS0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreFsrRegister(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::FSR_RECURSIONS1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreFsrRegister(cmd_offset, value);
+		cp.GetCtx().SetLineWidth(static_cast<float>(line_width) / 8.0f);
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_CL_VTE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3146,9 +2861,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_MODE_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetScanModeControl(DecodeScanModeControl(value));
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_MODE_CNTL_1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreScanModeControl1(value);
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_CONFIG] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3177,26 +2889,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetAaSampleControl(r);
 	};
 
-	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SU_VTX_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreVtxControl(value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_BINNER_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePaScExtendedControl(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_BINNER_CNTL_1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePaScExtendedControl(cmd_offset, value);
-	};
-	g_hw_ctx_indirect_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] =
-	    [](KYTY_HW_CTX_INDIRECT_ARGS) { HwCtxIgnorePaScExtendedControl(cmd_offset, value); };
 	g_hw_ctx_indirect_func[Pm4::DB_ALPHA_TO_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetAlphaToMaskEnable(
 		    KYTY_PM4_GET(value, DB_ALPHA_TO_MASK, ALPHA_TO_MASK_ENABLE) != 0);
@@ -3219,57 +2911,28 @@ void GraphicsInitJmpTablesShIndirect() {
 		func = nullptr;
 	}
 
-	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_LO] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_HI] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_RSRC1] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_RSRC2] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_START_X] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_START_Y] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_START_Z] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_NUM_THREAD_X] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_NUM_THREAD_Y] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_NUM_THREAD_Z] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_RESOURCE_LIMITS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_TMPRING_SIZE] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_RSRC3] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
+	for (const auto cmd_offset:
+	     {Pm4::COMPUTE_PGM_LO, Pm4::COMPUTE_PGM_HI, Pm4::COMPUTE_PGM_RSRC1, Pm4::COMPUTE_PGM_RSRC2,
+	      Pm4::COMPUTE_START_X, Pm4::COMPUTE_START_Y, Pm4::COMPUTE_START_Z,
+	      Pm4::COMPUTE_NUM_THREAD_X, Pm4::COMPUTE_NUM_THREAD_Y, Pm4::COMPUTE_NUM_THREAD_Z,
+	      Pm4::COMPUTE_RESOURCE_LIMITS, Pm4::COMPUTE_TMPRING_SIZE, Pm4::COMPUTE_PGM_RSRC3,
+	      Pm4::COMPUTE_PACE_ID}) {
+		g_hw_sh_indirect_func[cmd_offset] = HwShSetCsRegister;
+	}
+
+	// The host does not read these registers.
+	for (const auto cmd_offset: {Pm4::SPI_SHADER_PGM_RSRC4_HS, Pm4::SPI_SHADER_PGM_CHKSUM_HS,
+	                             Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS, Pm4::SPI_SHADER_PGM_RSRC4_GS,
+	                             Pm4::SPI_SHADER_PACE_ID_GS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS,
+	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS}) {
+		g_hw_sh_indirect_func[cmd_offset] = IgnoreRegister;
+	}
+	// GS-front allocation metadata; the native GS resource registers already carry it.
+	g_hw_sh_indirect_func[0x0ca] = IgnoreRegister;
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 			cp.GetShCtx().SetCsUserSgpr(cmd_offset - Pm4::COMPUTE_USER_DATA_0, value);
-		};
-	}
-	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_ACCUM_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		};
 	}
 	for (uint32_t slot = 0; slot < 32; slot++) {
@@ -3286,26 +2949,12 @@ void GraphicsInitJmpTablesShIndirect() {
 			    cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
 		    };
 	}
-	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
-		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
-		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
+	                       Pm4::SPI_SHADER_USER_ACCUM_LSHS_0, Pm4::COMPUTE_USER_ACCUM_0}) {
+		for (uint32_t slot = 0; slot < 4; slot++) {
+			g_hw_sh_indirect_func[base + slot] = HwShIgnoreUserAccumulatorRegister;
+		}
 	}
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3318,20 +2967,6 @@ void GraphicsInitJmpTablesShIndirect() {
 			cp.GetShCtx().SetPsAuxiliaryTableAddress(cmd_offset - 4, value);
 		};
 	}
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	// Toolkit state restoration emits the compiler's GS-front allocation
-	// metadata here. Native GS resource registers already carry that allocation.
-	g_hw_sh_indirect_func[0x0ca] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3339,15 +2974,6 @@ void GraphicsInitJmpTablesShIndirect() {
 			                                   value);
 		};
 	}
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3539,11 +3165,6 @@ void GraphicsInitJmpTablesUcIndirect() {
 		r.vertex_group_size    = KYTY_PM4_GET(value, GE_CNTL, VERT_GRP_SIZE);
 		cp.GetUcfg().SetGeControl(r);
 	};
-	g_hw_uc_indirect_func[Pm4::UC_PARAMETER_OVERSUBSCRIPTION] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		(void)cp;
-		(void)cmd_offset;
-		(void)value;
-	};
 	g_hw_uc_indirect_func[Pm4::GE_USER_VGPR_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeUserVgprEn r;
 		r.vgpr1 = KYTY_PM4_GET(value, GE_USER_VGPR_EN, EN_USER_VGPR1) != 0;
@@ -3562,37 +3183,22 @@ void GraphicsInitJmpTablesUcIndirect() {
 	g_hw_uc_indirect_func[Pm4::VGT_OBJECT_ID] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		cp.GetUcfg().SetObjectId(value);
 	};
-	g_hw_uc_indirect_func[Pm4::TEXTURE_GRADIENT_FACTORS] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcIgnoreTextureGradientFactors(value);
-	};
-	g_hw_uc_indirect_func[Pm4::TEXTURE_GRADIENT_CONTROL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcIgnoreTextureGradientFactors(value);
-	};
-	g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcIgnoreIaMultiVgtParam(value);
-	};
 	g_hw_uc_indirect_func[Pm4::GE_MULTI_PRIM_IB_RESET_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		cp.GetUcfg().SetPrimitiveResetControl(value);
 	};
-	g_hw_uc_indirect_func[Pm4::TA_CS_BC_BASE_ADDR] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcIgnoreBorderColorTableAddr(cmd_offset, value);
-	};
-	g_hw_uc_indirect_func[Pm4::TA_CS_BC_BASE_ADDR_HI] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcIgnoreBorderColorTableAddr(cmd_offset, value);
-	};
+	// The host does not read these registers.
+	for (const auto cmd_offset: {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL,
+	                             Pm4::IA_MULTI_VGT_PARAM, Pm4::TA_CS_BC_BASE_ADDR,
+	                             Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION}) {
+		g_hw_uc_indirect_func[cmd_offset] = IgnoreRegister;
+	}
 
 	g_hw_uc_indirect_func[Pm4::GE_INDX_OFFSET] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		cp.GetUcfg().SetIndexOffset(value);
 	};
-	g_hw_uc_indirect_func[Pm4::GDS_OA_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcSetGdsOaRegister(cp, cmd_offset, value);
-	};
-	g_hw_uc_indirect_func[Pm4::GDS_OA_COUNTER] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcSetGdsOaRegister(cp, cmd_offset, value);
-	};
-	g_hw_uc_indirect_func[Pm4::GDS_OA_ADDRESS] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwUcSetGdsOaRegister(cp, cmd_offset, value);
-	};
+	g_hw_uc_indirect_func[Pm4::GDS_OA_CNTL]    = HwUcSetGdsOaRegister;
+	g_hw_uc_indirect_func[Pm4::GDS_OA_COUNTER] = HwUcSetGdsOaRegister;
+	g_hw_uc_indirect_func[Pm4::GDS_OA_ADDRESS] = HwUcSetGdsOaRegister;
 
 	g_hw_uc_indirect_func[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		static std::atomic<uint32_t> log_count {0};

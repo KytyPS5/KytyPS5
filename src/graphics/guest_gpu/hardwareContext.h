@@ -20,8 +20,7 @@ struct ColorView {
 };
 
 struct ColorInfo {
-	bool fmask_compression_enable = false;
-	// uint32_t fmask_compression_mode   = 0;
+	bool                    fmask_compression_enable       = false;
 	bool                    fmask_data_compression_disable = false;
 	bool                    fmask_one_frag_mode            = false;
 	bool                    cmask_fast_clear_enable        = false;
@@ -540,32 +539,19 @@ struct GsStageRegisters {
 };
 
 struct ShaderRegisters {
-	uint32_t m_spiVsOutConfig     = 0;
-	uint32_t m_spiShaderPosFormat = 0;
-	uint32_t m_paClVsOutCntl      = 0;
+	uint32_t m_paClVsOutCntl = 0;
 
 	uint32_t ps_interpolator_settings[32] = {0};
-	// uint32_t ps_input_num                 = 0;
 
-	uint32_t m_spiShaderIdxFormat     = 0;
 	uint32_t m_geNggSubgrpCntl        = 0;
-	uint32_t m_vgtGsInstanceCnt       = 0;
-	uint32_t m_vgtGsOnchipCntl        = 0;
-	uint32_t m_vgtHosMaxTessLevel     = 0;
-	uint32_t m_vgtHosMinTessLevel     = 0;
 	uint32_t m_geMaxOutputPerSubgroup = 0;
-	uint32_t m_vgtEsgsRingItemsize    = 0;
 	uint32_t m_vgtGsMaxVertOut        = 0;
 	uint32_t m_vgtGsOutPrimType       = 0;
-	uint32_t m_vgtPrimitiveIdEn       = 0;
 	uint32_t m_vgtDrawPayloadCntl     = 0;
 	uint32_t m_paClObjprimIdCntl      = 0;
-	uint32_t m_vgtReuseOff            = 0;
-	uint32_t m_vgtTessDistribution    = 0;
 	uint32_t m_vgtLsHsConfig          = 0;
 	uint32_t m_vgtTfParam             = 0;
 
-	uint32_t shader_z_format       = 0;
 	uint8_t  target_output_mode[8] = {};
 	uint32_t ps_input_ena          = 0;
 	uint32_t ps_input_addr         = 0;
@@ -573,27 +559,12 @@ struct ShaderRegisters {
 	uint32_t baryc_cntl            = 0;
 	uint32_t m_cbShaderMask        = 0;
 
-	uint32_t m_paScShaderControl = 0;
-
 	DepthShaderControl db_shader_control;
 	bool               alpha_to_mask_enable = false;
 
 	// DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE overrides DB_ALPHA_TO_MASK per shader.
 	[[nodiscard]] bool AlphaToMask() const {
 		return alpha_to_mask_enable && !db_shader_control.alpha_to_mask_disable;
-	}
-
-	[[nodiscard]] uint32_t GetExportCount() const {
-		return 1u + ((m_spiVsOutConfig >> 1u) & 0x1Fu);
-	}
-	[[nodiscard]] uint32_t GetEsVertsPerSubgrp() const {
-		return (m_vgtGsOnchipCntl >> 0u) & 0x7FFu;
-	}
-	[[nodiscard]] uint32_t GetGsPrimsPerSubgrp() const {
-		return (m_vgtGsOnchipCntl >> 11u) & 0x7FFu;
-	}
-	[[nodiscard]] uint32_t GetGsInstPrimsInSubgrp() const {
-		return (m_vgtGsOnchipCntl >> 22u) & 0x3FFu;
 	}
 };
 
@@ -878,34 +849,20 @@ public:
 
 	[[nodiscard]] const ShaderRegisters& GetShaderRegisters() const { return m_sh_regs; }
 
-	void SetVsOutConfig(uint32_t value) { m_sh_regs.m_spiVsOutConfig = value; }
-	void SetShaderPosFormat(uint32_t value) { m_sh_regs.m_spiShaderPosFormat = value; }
 	void SetClVsOutCntl(uint32_t value) { m_sh_regs.m_paClVsOutCntl = value; }
-	void SetShaderIdxFormat(uint32_t value) { m_sh_regs.m_spiShaderIdxFormat = value; }
 	void SetNggSubgrpCntl(uint32_t value) { m_sh_regs.m_geNggSubgrpCntl = value; }
-	void SetGsInstanceCnt(uint32_t value) { m_sh_regs.m_vgtGsInstanceCnt = value; }
-	void SetGsOnchipCntl(uint32_t value) { m_sh_regs.m_vgtGsOnchipCntl = value; }
-	void SetHosMaxTessLevel(uint32_t value) { m_sh_regs.m_vgtHosMaxTessLevel = value; }
-	void SetHosMinTessLevel(uint32_t value) { m_sh_regs.m_vgtHosMinTessLevel = value; }
 	void SetMaxOutputPerSubgroup(uint32_t value) { m_sh_regs.m_geMaxOutputPerSubgroup = value; }
-	void SetEsgsRingItemsize(uint32_t value) { m_sh_regs.m_vgtEsgsRingItemsize = value; }
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
-	void SetPrimitiveIdEn(uint32_t value) { m_sh_regs.m_vgtPrimitiveIdEn = value; }
 	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
 	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
-	void SetReuseOff(uint32_t value) { m_sh_regs.m_vgtReuseOff = value; }
-	void SetTessDistribution(uint32_t value) { m_sh_regs.m_vgtTessDistribution = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }
 	void SetTfParam(uint32_t value) { m_sh_regs.m_vgtTfParam = value; }
 
 	void SetPsInputSettings(uint32_t id, uint32_t value) {
 		m_sh_regs.ps_interpolator_settings[id] = value;
-		// m_sh_regs.ps_input_num                 = ((id + 1) > m_sh_regs.ps_input_num ? (id + 1) :
-		// m_sh_regs.ps_input_num);
 	}
 
-	void SetShaderZFormat(uint32_t value) { m_sh_regs.shader_z_format = value; }
 	void SetTargetOutputMode(uint32_t slot, uint8_t value) {
 		m_sh_regs.target_output_mode[slot] = value;
 	}
@@ -918,8 +875,6 @@ public:
 		m_sh_regs.db_shader_control = value;
 	}
 	void SetAlphaToMaskEnable(bool value) { m_sh_regs.alpha_to_mask_enable = value; }
-
-	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
 
 private:
 	float    m_line_width            = 1.0f;

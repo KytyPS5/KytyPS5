@@ -39,8 +39,7 @@ void GraphicsInitJmpTablesUcIndirect();
 uint32_t HwCtxSetRenderControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetDepthMetadataRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                         uint32_t);
-uint32_t HwCtxSetBorderColorTableAddr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
-                                      uint32_t);
+uint32_t IgnoreRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetStencilClear(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetDepthClear(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetScreenScissor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
@@ -52,7 +51,6 @@ uint32_t HwCtxSetWindowScissor(CommandProcessor&, uint32_t, uint32_t, const uint
 uint32_t HwCtxSetClipRect(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetRenderTargetMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetGenericScissor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetCbDccControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetStencilControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetStencilMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetPsInput(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
@@ -61,7 +59,6 @@ uint32_t HwCtxSetDepthControl(CommandProcessor&, uint32_t, uint32_t, const uint3
 uint32_t HwCtxSetEqaaControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetColorControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetDepthBounds(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetPointState(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetClipControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetModeControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetPolyOffsetRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
@@ -69,19 +66,12 @@ uint32_t HwCtxSetPolyOffsetRegisters(CommandProcessor&, uint32_t, uint32_t, cons
 uint32_t HwCtxSetViewportTransformControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                           uint32_t);
 uint32_t HwCtxSetLineControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetFovWindow(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetScanModeControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetScanModeControl1(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetAaConfig(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetAaSampleControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetCentroidPriority(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetAaMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetVtxControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetPaScExtendedControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
-                                     uint32_t);
 uint32_t HwCtxSetDrawPayloadControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                     uint32_t);
-uint32_t HwCtxSetPrimitiveIdReset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetObjprimIdControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetShaderStages(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetColorInfo(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
@@ -103,7 +93,6 @@ uint32_t HwUcSetIndexType(CommandProcessor&, uint32_t, uint32_t, const uint32_t*
 uint32_t HwUcSetObjectId(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetTextureGradientFactors(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                        uint32_t);
-uint32_t HwUcSetIaMultiVgtParam(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetMultiPrimIbReset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetBorderColorTableAddr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                      uint32_t);

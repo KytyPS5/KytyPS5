@@ -14,12 +14,12 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::DB_RENDER_CONTROL]            = HwCtxSetRenderControl;
 	g_hw_ctx_func[Pm4::DB_COUNT_CONTROL]             = HwCtxSetDepthMetadataRegisters;
 	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE]           = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE2]          = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_DFSM_CONTROL]              = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RMI_L2_CACHE_CONTROL]      = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::CB_RMI_GL2_CACHE_CONTROL]     = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR]              = HwCtxSetBorderColorTableAddr;
-	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR_HI]           = HwCtxSetBorderColorTableAddr;
+	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE2]          = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::DB_DFSM_CONTROL]              = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::DB_RMI_L2_CACHE_CONTROL]      = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::CB_RMI_GL2_CACHE_CONTROL]     = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR]              = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR_HI]           = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::DB_STENCIL_CLEAR]             = HwCtxSetStencilClear;
 	g_hw_ctx_func[Pm4::DB_DEPTH_CLEAR]               = HwCtxSetDepthClear;
 	g_hw_ctx_func[Pm4::PA_SC_SCREEN_SCISSOR_TL]      = HwCtxSetScreenScissor;
@@ -33,7 +33,7 @@ constexpr auto MakeContextDispatchTable() {
 	}
 	g_hw_ctx_func[Pm4::CB_TARGET_MASK]                 = HwCtxSetRenderTargetMask;
 	g_hw_ctx_func[Pm4::PA_SC_GENERIC_SCISSOR_TL]       = HwCtxSetGenericScissor;
-	g_hw_ctx_func[Pm4::CB_DCC_CONTROL]                 = HwCtxSetCbDccControl;
+	g_hw_ctx_func[Pm4::CB_DCC_CONTROL]                 = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::DB_STENCIL_CONTROL]             = HwCtxSetStencilControl;
 	g_hw_ctx_func[Pm4::DB_STENCILREFMASK]              = HwCtxSetStencilMask;
 	g_hw_ctx_func[Pm4::SPI_PS_INPUT_CNTL_0]            = HwCtxSetPsInput;
@@ -43,8 +43,8 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::CB_COLOR_CONTROL]               = HwCtxSetColorControl;
 	g_hw_ctx_func[Pm4::DB_DEPTH_BOUNDS_MIN]            = HwCtxSetDepthBounds;
 	g_hw_ctx_func[Pm4::DB_DEPTH_BOUNDS_MAX]            = HwCtxSetDepthBounds;
-	g_hw_ctx_func[Pm4::PA_SU_POINT_SIZE]               = HwCtxSetPointState;
-	g_hw_ctx_func[Pm4::PA_SU_POINT_MINMAX]             = HwCtxSetPointState;
+	g_hw_ctx_func[Pm4::PA_SU_POINT_SIZE]               = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SU_POINT_MINMAX]             = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::PA_CL_CLIP_CNTL]                = HwCtxSetClipControl;
 	g_hw_ctx_func[Pm4::PA_SU_SC_MODE_CNTL]             = HwCtxSetModeControl;
 	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL]  = HwCtxSetPolyOffsetRegisters;
@@ -55,10 +55,10 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET]  = HwCtxSetPolyOffsetRegisters;
 	g_hw_ctx_func[Pm4::PA_CL_VTE_CNTL]                 = HwCtxSetViewportTransformControl;
 	g_hw_ctx_func[Pm4::PA_SU_LINE_CNTL]                = HwCtxSetLineControl;
-	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_LR]            = HwCtxSetFovWindow;
-	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_TB]            = HwCtxSetFovWindow;
+	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_LR]            = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_TB]            = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_0]              = HwCtxSetScanModeControl;
-	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_1]              = HwCtxSetScanModeControl1;
+	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_1]              = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::PA_SC_AA_CONFIG]                = HwCtxSetAaConfig;
 	for (auto cmd_offset = Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0;
 	     cmd_offset < Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + 16; cmd_offset++) {
@@ -66,15 +66,15 @@ constexpr auto MakeContextDispatchTable() {
 	}
 	g_hw_ctx_func[Pm4::PA_SC_CENTROID_PRIORITY_0]             = HwCtxSetCentroidPriority;
 	g_hw_ctx_func[Pm4::PA_SC_CENTROID_PRIORITY_1]             = HwCtxSetCentroidPriority;
-	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0]               = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1]               = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SU_VTX_CNTL]                        = HwCtxSetVtxControl;
-	g_hw_ctx_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK]       = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = HwCtxSetPaScExtendedControl;
+	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0]               = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1]               = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SU_VTX_CNTL]                        = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK]       = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = IgnoreRegisters;
+	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::VGT_DRAW_PAYLOAD_CNTL]                 = HwCtxSetDrawPayloadControl;
-	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
+	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = IgnoreRegisters;
 	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;
 	g_hw_ctx_func[Pm4::VGT_SHADER_STAGES_EN]                  = HwCtxSetShaderStages;
 
@@ -159,7 +159,7 @@ constexpr auto MakeUconfigDispatchTable() {
 	g_hw_uc_func[Pm4::VGT_OBJECT_ID]             = HwUcSetObjectId;
 	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_FACTORS]  = HwUcSetTextureGradientFactors;
 	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_CONTROL]  = HwUcSetTextureGradientFactors;
-	g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM]        = HwUcSetIaMultiVgtParam;
+	g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM]        = IgnoreRegisters;
 	g_hw_uc_func[Pm4::GE_MULTI_PRIM_IB_RESET_EN] = HwUcSetMultiPrimIbReset;
 	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR]        = HwUcSetBorderColorTableAddr;
 	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR_HI]     = HwUcSetBorderColorTableAddr;

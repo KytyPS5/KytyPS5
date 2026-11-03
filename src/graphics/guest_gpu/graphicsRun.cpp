@@ -256,23 +256,21 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 }
 
 template <typename T>
-void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
-                                  uint32_t wait_op) {
+void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
 	if ((wait_op & ~1u) != 0) {
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
-                                                     uint32_t, uint32_t);
+                                                     uint32_t);
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
-                                                     uint32_t, uint32_t);
+                                                     uint32_t);
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
 	if (signal) {
@@ -325,22 +323,9 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
-void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
-                               uint64_t dst_address_or_offset, uint8_t src_sel,
-                               uint8_t  src_cache_policy,
-                               uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
-                               uint8_t wait_for_previous, uint8_t write_confirm,
-                               uint8_t block_engine) {
-	EXIT_NOT_IMPLEMENTED(engine > 1);
-	if (num_bytes == 0) {
-		return;
-	}
-	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
-	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
-	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
-	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
-	EXIT_NOT_IMPLEMENTED(block_engine > 1);
-	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
+                               uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
+	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
@@ -498,10 +483,7 @@ bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
-	if (first_slice) {
-		submission.started = true;
-		cp.SetSubmitId(++m_submit_id);
-	}
+	submission.started = true;
 
 	cp.BufferInit();
 	bool complete = true;
@@ -713,8 +695,7 @@ uint32_t CommandProcessor::NumInstances() {
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
-                                      const volatile void* address, uint32_t count_in_dwords) {
-	(void)count_in_dwords;
+                                      const volatile void* address) {
 	uint64_t value = 0;
 
 	switch (op) {
@@ -769,7 +750,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	m_renderer.GetRenderExecutor().DrawIndex(CurrentBuffer(), args);
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -859,14 +840,17 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
 	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
-	if (IndirectDrawOffsets(registers, records.offsets) && (!indexed || m_index_buffer_size != 0) &&
-	    (indexed ? executor.DrawIndex(m_submit_id, CurrentBuffer(),
-	                                  {.index_count         = m_index_buffer_size,
-	                                   .index_addr          = IndexAddress(0),
-	                                   .index_type_and_size = m_index_type_and_size,
-	                                   .indirect            = records})
-	             : executor.DrawAuto(m_submit_id, CurrentBuffer(), {.indirect = records}))) {
-		return;
+	if (IndirectDrawOffsets(registers, records.offsets)) {
+		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
+			return;
+		}
+		if (indexed && m_index_buffer_size != 0 &&
+		    executor.DrawIndex(CurrentBuffer(), {.index_count         = m_index_buffer_size,
+		                                         .index_addr          = IndexAddress(0),
+		                                         .index_type_and_size = m_index_type_and_size,
+		                                         .indirect            = records})) {
+			return;
+		}
 	}
 
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
@@ -875,26 +859,24 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (!indexed) {
 			const auto& args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
 			PatchIndirectDrawOffsets(*this, registers, args.firstVertex, args.firstInstance, 0, i);
-			executor.DrawAuto(m_submit_id, CurrentBuffer(),
-			                  {.vertex_count   = args.vertexCount,
-			                   .instance_count = args.instanceCount,
-			                   .first_vertex   = args.firstVertex,
-			                   .first_instance = args.firstInstance,
-			                   .offset_source  = DrawOffsetSource::IndirectArgs});
+			executor.DrawAuto(CurrentBuffer(), {.vertex_count   = args.vertexCount,
+			                                    .instance_count = args.instanceCount,
+			                                    .first_vertex   = args.firstVertex,
+			                                    .first_instance = args.firstInstance,
+			                                    .offset_source  = DrawOffsetSource::IndirectArgs});
 			continue;
 		}
 
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex, i);
-		executor.DrawIndex(m_submit_id, CurrentBuffer(),
-		                   {.index_count         = std::min(args.indexCount, max_indices),
-		                    .index_addr          = IndexAddress(args.firstIndex),
-		                    .instance_count      = args.instanceCount,
-		                    .index_type_and_size = m_index_type_and_size,
-		                    .base_vertex         = args.vertexOffset,
-		                    .first_instance      = args.firstInstance,
-		                    .offset_source       = DrawOffsetSource::IndirectArgs});
+		executor.DrawIndex(CurrentBuffer(), {.index_count = std::min(args.indexCount, max_indices),
+		                                     .index_addr  = IndexAddress(args.firstIndex),
+		                                     .instance_count      = args.instanceCount,
+		                                     .index_type_and_size = m_index_type_and_size,
+		                                     .base_vertex         = args.vertexOffset,
+		                                     .first_instance      = args.firstInstance,
+		                                     .offset_source = DrawOffsetSource::IndirectArgs});
 	}
 }
 
@@ -911,11 +893,11 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
 				const auto& cs = m_sh_ctx.GetCs().cs_regs;
 				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
-				LOGF("QueuePoint DispatchDirect: frame=%u submit=%" PRIu64
-				     " groups=%ux%ux%u local=%ux%ux%u mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
+				LOGF("QueuePoint DispatchDirect: frame=%u groups=%ux%ux%u local=%ux%ux%u "
+				     "mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
 				     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32
 				     "\n",
-				     frame_num, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
+				     frame_num, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
 				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
 				     cs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
@@ -924,8 +906,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
+		m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x,
+		                                              thread_group_y, thread_group_z, mode,
+		                                              IsAsyncComputeQueue());
 	}
 }
 
@@ -942,7 +925,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
+	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }
 
@@ -950,7 +933,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

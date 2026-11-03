@@ -149,14 +149,11 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (samples == 0) {
 		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
 	}
-	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
-	switch (view.type) {
-		case TargetViewType::Image2D:
-		case TargetViewType::Image2DArray: break;
-		case TargetViewType::Unsupported:
-			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
-			           z.depth_view.slice_max);
+	if (z.depth_view.slice_start > z.depth_view.slice_max) {
+		DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
+		           z.depth_view.slice_max);
 	}
+	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
 	if (z.z_info.max_mip_level != 0 || unsupported_shading_rate_encoding || depth_address == 0 ||
 	    (depth_address & 0xffffu) != 0) {

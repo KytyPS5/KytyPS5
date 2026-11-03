@@ -49,17 +49,6 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
-                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
-	m_debug_op        = op;
-	m_debug_submit_id = submit_id;
-	m_debug_arg0      = arg0;
-	m_debug_arg1      = arg1;
-	m_debug_arg2      = arg2;
-	m_debug_arg3      = arg3;
-	m_debug_arg4      = arg4;
-}
-
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;

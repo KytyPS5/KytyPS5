@@ -91,8 +91,6 @@ constexpr auto g_opcode_names   = MakeOpcodeNames();
 
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw) {
-	// db_dump();
-
 	file->Printf("----- Buffer --- dwords: 0x%05" PRIx32 ", offset : %u, addr: %016" PRIx64
 	             " ----- \n",
 	             num_dw, start_dw, reinterpret_cast<uint64_t>(cmd_buffer));

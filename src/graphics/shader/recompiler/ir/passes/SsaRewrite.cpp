@@ -348,14 +348,20 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 } // namespace
 
 void RewriteToSsa(const BlockList& blocks) {
-	Pass pass;
+	Pass                               pass;
+	std::unordered_map<Block*, size_t> filled_predecessors;
 	for (auto* block: blocks) {
+		if (block->ImmPredecessors().empty()) {
+			pass.Seal(block);
+		}
 		for (auto& inst: *block) {
 			VisitInstruction(pass, block, inst);
 		}
-	}
-	for (auto* block: blocks) {
-		pass.Seal(block);
+		for (auto* successor: block->ImmSuccessors()) {
+			if (++filled_predecessors[successor] == successor->ImmPredecessors().size()) {
+				pass.Seal(successor);
+			}
+		}
 	}
 }
 

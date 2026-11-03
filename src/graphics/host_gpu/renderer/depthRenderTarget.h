@@ -11,18 +11,11 @@
 
 namespace Libs::Graphics {
 
-// Without a stencil plane, Hi-Stencil fields are inactive. An active plane is compatible when
-// Hi-Stencil is disabled or HTile backing is present.
-inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
-                                                                  bool htile_stencil_disabled) {
-	return !has_stencil || htile_stencil_disabled || has_htile;
-}
-
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;
 	bool                        depth_clear_enable       = false;
-	bool                        depth_load_clear_enable  = false;
+	vk::ImageAspectFlags        load_clear_aspects;
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
 	// Effective draw writes; discovery applies test, target-write and clear controls.

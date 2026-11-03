@@ -73,12 +73,17 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 	}
 }
 
-void Translator::V_INTERP_P1_F32() {}
-
 void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {
 	const auto value = ir.Emit(IR::ValueOpcode::GetAttribute,
 	                           {IR::Value(inst.src1.value), IR::Value(inst.src2.value)});
 	WriteOperand(inst.dst, value);
+}
+
+void Translator::V_INTERP_P2_F16(const Decoder::Instruction& inst) {
+	const auto value = ir.Emit(IR::ValueOpcode::GetAttributeF16,
+	                           {IR::Value(inst.src1.value), IR::Value(inst.src2.value),
+	                            IR::Value(uint32_t {inst.src1.op_sel})});
+	WriteF16(inst.dst, IR::F32(value));
 }
 
 void Translator::V_INTERP_MOV_F32(const Decoder::Instruction& inst) {
@@ -108,8 +113,11 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 
 void Translator::EmitInterpolation(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::V_INTERP_P1_F32: V_INTERP_P1_F32(); return;
+		// P2 interpolates the whole attribute, so the P1 halves have nothing to compute.
+		case Decoder::Opcode::V_INTERP_P1_F32:
+		case Decoder::Opcode::V_INTERP_P1LL_F16: return;
 		case Decoder::Opcode::V_INTERP_P2_F32: V_INTERP_P2_F32(inst); return;
+		case Decoder::Opcode::V_INTERP_P2_F16: V_INTERP_P2_F16(inst); return;
 		case Decoder::Opcode::V_INTERP_MOV_F32: V_INTERP_MOV_F32(inst); return;
 		default: return FailMissingTranslation(inst);
 	}

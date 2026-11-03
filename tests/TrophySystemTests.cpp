@@ -1,4 +1,5 @@
 #include "common/file.h"
+#include "common/localization.h"
 #include "common/trophies.h"
 
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -18,6 +20,65 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "TrophySystemTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+void TestLocalization() {
+  struct Translation {
+    std::string_view locale;
+    std::string_view earned;
+  };
+  static constexpr Translation translations[] = {
+      {"ja-JP", "トロフィーを獲得しました！"},
+      {"en-US", "Trophy earned!"},
+      {"fr-FR", "Trophée obtenu !"},
+      {"es-ES", "¡Ganaste un trofeo!"},
+      {"de-DE", "Trophäe erhalten!"},
+      {"it-IT", "Trofeo ottenuto!"},
+      {"nl-NL", "Trofee behaald!"},
+      {"pt-PT", "Troféu conquistado!"},
+      {"ru-RU", "Трофей получен!"},
+      {"ko-KR", "트로피를 획득했습니다!"},
+      {"zh-Hant", "已獲得獎盃！"},
+      {"zh-Hans", "已获得奖杯！"},
+      {"fi-FI", "Pokaali ansaittu!"},
+      {"sv-SE", "Trofé intjänad!"},
+      {"da-DK", "Trofæ optjent!"},
+      {"no-NO", "Trofé opptjent!"},
+      {"pl-PL", "Zdobyto trofeum!"},
+      {"pt-BR", "Troféu conquistado!"},
+      {"en-GB", "Trophy earned!"},
+      {"tr-TR", "Kupa kazanıldı!"},
+      {"es-419", "¡Ganaste un trofeo!"},
+      {"ar-AE", "تم كسب الكأس!"},
+      {"fr-CA", "Trophée obtenu !"},
+      {"cs-CZ", "Trofej získána!"},
+      {"hu-HU", "Trófea megszerezve!"},
+      {"el-GR", "Κερδίσατε ένα τρόπαιο!"},
+      {"ro-RO", "Trofeu câștigat!"},
+      {"th-TH", "ได้รับถ้วยรางวัลแล้ว!"},
+      {"vi-VN", "Đã nhận cúp!"},
+      {"id-ID", "Trofi diperoleh!"},
+  };
+  constexpr std::string_view key = "trophy.toast.earned";
+  const auto japanese = Common::Localization::Get(0, key);
+  int language = 0;
+  for (const auto &translation : translations) {
+    Check(Common::Localization::LocaleName(language) == translation.locale,
+          "console language selects its locale");
+    Check(Common::Localization::Get(language, key) == translation.earned,
+          "embedded notification preserves translated UTF-8 bytes");
+    ++language;
+  }
+  Check(japanese == translations[0].earned,
+        "translation view survives other locale lookups");
+  for (const int invalid : {-1, 30, 1000}) {
+    Check(Common::Localization::LocaleName(invalid) == "en-US" &&
+              Common::Localization::Get(invalid, key) == "Trophy earned!",
+          "invalid console language falls back to English");
+  }
+  Check(Common::Localization::Get(0, "missing.translation") ==
+            "missing.translation",
+        "unknown translation returns its key");
 }
 
 class TempDirectory {
@@ -252,6 +313,7 @@ void TestUnlockPersistence(const std::filesystem::path &directory) {
 } // namespace
 
 int main() {
+  TestLocalization();
   TempDirectory directory;
   TestEventExtraction(directory.Path());
   TestProgress(directory.Path());

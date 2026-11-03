@@ -40,9 +40,7 @@ void CheckRejected(const ShaderMappedData& data, const char* text) {
 	output.vertex_buffer_reg = 37;
 	output.vertex_attrib_reg = 41;
 	output.input_semantics   = prior_semantics;
-	std::string error;
-	Check(!ShaderReadVertexMetadata(data, 64, output, &error), text);
-	Check(!error.empty(), "metadata rejection omitted its diagnostic");
+	Check(ShaderReadVertexMetadata(data, 64, output) != nullptr, text);
 	Check(output.vertex_buffer_reg == 37 && output.vertex_attrib_reg == 41 &&
 	          output.input_semantics.data() == prior_semantics.data() &&
 	          output.input_semantics.size() == prior_semantics.size(),
@@ -52,8 +50,7 @@ void CheckRejected(const ShaderMappedData& data, const char* text) {
 void TestValidAndInvalidMetadata() {
 	Fixture              fixture;
 	ShaderVertexMetadata output;
-	std::string          error;
-	Check(ShaderReadVertexMetadata(fixture.mapped, 64, output, &error),
+	Check(ShaderReadVertexMetadata(fixture.mapped, 64, output) == nullptr,
 	      "valid AGC vertex metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == 4 &&
 	          output.input_semantics.size() == 1,
@@ -64,7 +61,7 @@ void TestValidAndInvalidMetadata() {
 	    AGC_ILLEGAL_DIRECT_OFFSET;
 	buffer_only.mapped.input_semantics     = nullptr;
 	buffer_only.mapped.num_input_semantics = 0;
-	Check(ShaderReadVertexMetadata(buffer_only.mapped, 64, output, &error),
+	Check(ShaderReadVertexMetadata(buffer_only.mapped, 64, output) == nullptr,
 	      "vertex-buffer-only AGC metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == -1 &&
 	          output.input_semantics.empty(),

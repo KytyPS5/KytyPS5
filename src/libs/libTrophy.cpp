@@ -105,6 +105,8 @@ struct TrophyState {
 	const Trophies::Package* package = nullptr;
 	Trophies::UnlockData     unlocks;
 	std::filesystem::path    path;
+	// Guests (players 2+) have no profile: nothing is loaded, saved or announced.
+	bool guest = false;
 };
 
 struct TrophyContext {
@@ -153,9 +155,12 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 			     package.event_rules.size(), uds_filename.c_str());
 		}
 	}
-	auto path    = Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto unlocks = Trophies::LoadUnlockData(path);
-	return &g_states.emplace(key, TrophyState {&package, std::move(unlocks), std::move(path)})
+	const bool guest = Config::IsGuestUserId(key.first);
+	auto       path  = guest ? std::filesystem::path {}
+	                         : Trophies::UnlocksPath({}, title_id, key.first, key.second);
+	auto unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
+	return &g_states
+	            .emplace(key, TrophyState {&package, std::move(unlocks), std::move(path), guest})
 	            .first->second;
 }
 
@@ -240,6 +245,10 @@ static void FillGroupInfo(const TrophyState& state, int group_id, const std::str
 }
 
 static void RecordTrophyUnlock(TrophyState& state, int trophy_id, bool from_stat = false) {
+	if (state.guest) {
+		LOGF("[Trophy] guest users cannot earn trophies (trophy %d)\n", trophy_id);
+		return;
+	}
 	const auto found = state.package->trophies.find(trophy_id);
 	if (found == state.package->trophies.end()) {
 		LOGF("[Trophy] ignored unknown trophy ID %d\n", trophy_id);

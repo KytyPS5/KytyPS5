@@ -18,45 +18,9 @@ using ShaderRecompiler::Spirv::Builder;
 
 constexpr uint32_t SpirvVersion15 = 0x00010500u;
 
-struct Parameter {
-	uint32_t input_location  = 0;
-	uint32_t output_location = 0;
-	bool     flat            = false;
-};
-
-std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
-                                     const ShaderPixelInputInfo*  pixel_info) {
-	if (pixel_info == nullptr) {
-		return {};
-	}
-	EXIT_IF(pixel_info->input_num > ShaderVertexInputInfo::RES_MAX);
-	EXIT_IF(pixel_info->stage.program == nullptr);
-
-	std::vector<uint32_t> active_inputs;
-	for (const auto& input: pixel_info->stage.program->info.inputs) {
-		if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
-			active_inputs.push_back(input.location);
-		}
-	}
-
-	std::vector<Parameter> parameters;
-	std::array<bool, 32> output_locations {};
-	for (const auto input: active_inputs) {
-		const auto input_location = ShaderPixelParameterMappedLocation(*pixel_info, input);
-		const auto output_location = ShaderPixelParameterLocation(*pixel_info, active_inputs, input);
-		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0 &&
-		    !output_locations[output_location]) {
-			parameters.push_back({input_location, output_location,
-			                      ShaderPixelParameterIsFlat(*pixel_info, input)});
-			output_locations[output_location] = true;
-		}
-	}
-	return parameters;
-}
-
 class RectListEmitter {
 public:
-	RectListEmitter(const std::vector<Parameter>& parameters_, spv::ExecutionModel model)
+	RectListEmitter(const std::vector<RectListParameter>& parameters_, spv::ExecutionModel model)
 	    : parameters(parameters_) {
 		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
@@ -315,42 +279,68 @@ private:
 		              Result(spv::OpFAdd, vec4_float_type, p1, p2));
 	}
 
-	Builder                       builder {SpirvVersion15};
-	const std::vector<Parameter>& parameters;
-	std::vector<uint32_t>         interfaces;
-	std::vector<uint32_t>         inputs;
-	std::vector<uint32_t>         outputs;
-	uint32_t                      main                  = 0;
-	uint32_t                      void_type             = 0;
-	uint32_t                      bool_type             = 0;
-	uint32_t                      uint_type             = 0;
-	uint32_t                      int_type              = 0;
-	uint32_t                      float_type            = 0;
-	uint32_t                      vec2_bool_type        = 0;
-	uint32_t                      vec2_float_type       = 0;
-	uint32_t                      vec3_float_type       = 0;
-	uint32_t                      vec4_float_type       = 0;
-	uint32_t                      function_type         = 0;
-	uint32_t                      per_vertex_type       = 0;
-	uint32_t                      ptr_input_float       = 0;
-	uint32_t                      ptr_input_vec4_float  = 0;
-	uint32_t                      ptr_output_float      = 0;
-	uint32_t                      ptr_output_vec4_float = 0;
-	uint32_t                      gl_in                 = 0;
-	uint32_t                      gl_out                = 0;
-	uint32_t                      tess_inner            = 0;
-	uint32_t                      tess_outer            = 0;
-	uint32_t                      tess_coord            = 0;
-	uint32_t                      invocation_id         = 0;
+	Builder                               builder {SpirvVersion15};
+	const std::vector<RectListParameter>& parameters;
+	std::vector<uint32_t>                 interfaces;
+	std::vector<uint32_t>                 inputs;
+	std::vector<uint32_t>                 outputs;
+	uint32_t                              main                  = 0;
+	uint32_t                              void_type             = 0;
+	uint32_t                              bool_type             = 0;
+	uint32_t                              uint_type             = 0;
+	uint32_t                              int_type              = 0;
+	uint32_t                              float_type            = 0;
+	uint32_t                              vec2_bool_type        = 0;
+	uint32_t                              vec2_float_type       = 0;
+	uint32_t                              vec3_float_type       = 0;
+	uint32_t                              vec4_float_type       = 0;
+	uint32_t                              function_type         = 0;
+	uint32_t                              per_vertex_type       = 0;
+	uint32_t                              ptr_input_float       = 0;
+	uint32_t                              ptr_input_vec4_float  = 0;
+	uint32_t                              ptr_output_float      = 0;
+	uint32_t                              ptr_output_vec4_float = 0;
+	uint32_t                              gl_in                 = 0;
+	uint32_t                              gl_out                = 0;
+	uint32_t                              tess_inner            = 0;
+	uint32_t                              tess_outer            = 0;
+	uint32_t                              tess_coord            = 0;
+	uint32_t                              invocation_id         = 0;
 };
 
 } // namespace
 
-RectListShaders BuildRectListShaders(const ShaderVertexInputInfo& vertex_info,
-                                     const ShaderPixelInputInfo*  pixel_info) {
-	const auto      parameters = GetParameters(vertex_info, pixel_info);
-	RectListEmitter control(parameters, spv::ExecutionModelTessellationControl);
-	RectListEmitter evaluation(parameters, spv::ExecutionModelTessellationEvaluation);
+std::vector<RectListParameter> RectListParameters(
+    const ShaderPixelInputInfo& pixel_info, const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	EXIT_IF(pixel_info.input_num > ShaderVertexInputInfo::RES_MAX);
+	std::vector<uint32_t> active_inputs;
+	for (const auto& input: program.info.inputs) {
+		if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
+			active_inputs.push_back(input.location);
+		}
+	}
+	std::vector<RectListParameter> parameters;
+	for (const auto input: active_inputs) {
+		parameters.push_back({ShaderPixelParameterMappedLocation(pixel_info, input),
+		                      ShaderPixelParameterLocation(pixel_info, active_inputs, input),
+		                      ShaderPixelParameterIsFlat(pixel_info, input)});
+	}
+	return parameters;
+}
+
+RectListShaders BuildRectListShaders(std::span<const RectListParameter> parameters,
+                                     uint32_t                           param_export_mask) {
+	std::vector<RectListParameter> exported;
+	std::array<bool, 32>           output_locations {};
+	for (const auto& parameter: parameters) {
+		if ((param_export_mask & (1u << parameter.input_location)) != 0 &&
+		    !output_locations[parameter.output_location]) {
+			exported.push_back(parameter);
+			output_locations[parameter.output_location] = true;
+		}
+	}
+	RectListEmitter control(exported, spv::ExecutionModelTessellationControl);
+	RectListEmitter evaluation(exported, spv::ExecutionModelTessellationEvaluation);
 	return {control.EmitControl(), evaluation.EmitEvaluation()};
 }
 

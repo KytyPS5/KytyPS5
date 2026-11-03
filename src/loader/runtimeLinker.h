@@ -21,6 +21,7 @@ struct EntryParams {
 };
 
 class Elf64;
+struct Elf64_Phdr;
 struct Elf64_Sym;
 struct Elf64_Rela;
 class RuntimeLinker;
@@ -128,6 +129,7 @@ struct Program {
 	uint64_t                     base_size         = 0;
 	uint64_t                     base_size_aligned = 0;
 	uint64_t                     mapped_size       = 0;
+	uint64_t                     flexible_size     = 0;
 	uint64_t instruction_trampoline_size = 0;
 	std::unique_ptr<SymbolDatabase> export_symbols;
 	std::unique_ptr<SymbolDatabase> import_symbols;
@@ -202,6 +204,8 @@ private:
 	application_heap_free_func_t           m_application_heap_free           = nullptr;
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
+
+uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, uint16_t phnum);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();

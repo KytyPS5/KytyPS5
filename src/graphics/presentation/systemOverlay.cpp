@@ -1,19 +1,19 @@
 #include "graphics/presentation/systemOverlay.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/localization.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
-#include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
+#include "imgui_internal.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
@@ -21,6 +21,7 @@
 #include "loader/systemContent.h"
 #include "stb_image.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -280,6 +282,61 @@ std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_
 	}
 }
 
+// ImGui's built-in font covers Latin only. Merge installed fonts for the selected console language.
+void AddSystemFontFallbacks(ImGuiIO& io) {
+	io.Fonts->AddFontDefault();
+	const auto add = [&](std::initializer_list<const char*> paths) {
+		for (const char* path: paths) {
+			std::error_code error;
+			if (std::filesystem::is_regular_file(path, error)) {
+				ImFontConfig config;
+				config.MergeMode = true;
+				config.Flags = ImFontFlags_NoLoadError;
+				if (io.Fonts->AddFontFromFileTTF(path, 0.0f, &config) != nullptr) {
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	bool found =
+	    add({"C:/Windows/Fonts/segoeui.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+	         "/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	         "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf"});
+	const auto  locale     = Common::Localization::LocaleName(Config::GetConsoleLanguage());
+	const char* noto_cjk[] = {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"};
+	if (locale == "ja-JP") {
+		found = add({"C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc",
+		             "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", noto_cjk[0], noto_cjk[1],
+		             noto_cjk[2]});
+	} else if (locale == "ko-KR") {
+		found = add({"C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+		             noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "zh-Hans" || locale == "zh-Hant") {
+		found =
+		    add({locale == "zh-Hans" ? "C:/Windows/Fonts/msyh.ttc" : "C:/Windows/Fonts/msjh.ttc",
+		         "/System/Library/Fonts/PingFang.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "th-TH") {
+		found = add({"C:/Windows/Fonts/leelawui.ttf", "C:/Windows/Fonts/tahoma.ttf",
+		             "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+		             "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+		             "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+		             "/usr/share/fonts/noto/NotoSansThai-Regular.ttf"});
+	} else if (locale == "ar-AE") {
+		found = add({"C:/Windows/Fonts/tahoma.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf",
+		             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		             "/usr/share/fonts/TTF/DejaVuSans.ttf",
+		             "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+		             "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf"});
+	}
+	if (!found) {
+		LOGF("[Trophy] no installed fallback font for %.*s\n", static_cast<int>(locale.size()),
+		     locale.data());
+	}
+}
+
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
 	g_input_events.clear();
@@ -441,6 +498,63 @@ std::u16string Utf8ToUtf16(std::string_view text) {
 	return result;
 }
 
+// The Arabic notification is a single RTL run. Use presentation forms because ImGui does not
+// shape Arabic. This intentionally applies only to the catalog subtitle, never game-provided names.
+std::string PrepareTrophySubtitle(int language) {
+	const auto text = Common::Localization::Get(language, "trophy.toast.earned");
+	if (Common::Localization::LocaleName(language) != "ar-AE") {
+		return std::string(text);
+	}
+	struct ArabicForm {
+		char16_t letter;
+		char16_t isolated;
+		bool     joins_next;
+	};
+	static constexpr ArabicForm FORMS[] = {
+	    {0x0621, 0xfe80, false}, {0x0622, 0xfe81, false}, {0x0623, 0xfe83, false},
+	    {0x0624, 0xfe85, false}, {0x0625, 0xfe87, false}, {0x0626, 0xfe89, true},
+	    {0x0627, 0xfe8d, false}, {0x0628, 0xfe8f, true},  {0x0629, 0xfe93, false},
+	    {0x062a, 0xfe95, true},  {0x062b, 0xfe99, true},  {0x062c, 0xfe9d, true},
+	    {0x062d, 0xfea1, true},  {0x062e, 0xfea5, true},  {0x062f, 0xfea9, false},
+	    {0x0630, 0xfeab, false}, {0x0631, 0xfead, false}, {0x0632, 0xfeaf, false},
+	    {0x0633, 0xfeb1, true},  {0x0634, 0xfeb5, true},  {0x0635, 0xfeb9, true},
+	    {0x0636, 0xfebd, true},  {0x0637, 0xfec1, true},  {0x0638, 0xfec5, true},
+	    {0x0639, 0xfec9, true},  {0x063a, 0xfecd, true},  {0x0641, 0xfed1, true},
+	    {0x0642, 0xfed5, true},  {0x0643, 0xfed9, true},  {0x0644, 0xfedd, true},
+	    {0x0645, 0xfee1, true},  {0x0646, 0xfee5, true},  {0x0647, 0xfee9, true},
+	    {0x0648, 0xfeed, false}, {0x0649, 0xfeef, false}, {0x064a, 0xfef1, true},
+	};
+	const auto form = [](char16_t c) -> const ArabicForm* {
+		for (const auto& value: FORMS) {
+			if (value.letter == c) {
+				return &value;
+			}
+		}
+		return nullptr;
+	};
+	const auto logical = Utf8ToUtf16(text);
+	if (std::none_of(logical.begin(), logical.end(),
+	                 [](char16_t c) { return c >= 0x0600 && c <= 0x06ff; })) {
+		return std::string(text);
+	}
+	auto visual = logical;
+	for (size_t i = 0; i < logical.size(); ++i) {
+		const auto* current = form(logical[i]);
+		if (current == nullptr) {
+			continue;
+		}
+		const auto* previous = i > 0 ? form(logical[i - 1]) : nullptr;
+		const auto* next     = i + 1 < logical.size() ? form(logical[i + 1]) : nullptr;
+		const bool  joins_previous =
+		    previous != nullptr && previous->joins_next && current->letter != 0x0621;
+		const bool joins_next = current->joins_next && next != nullptr && next->letter != 0x0621;
+		visual[i]             = static_cast<char16_t>(current->isolated + (joins_next ? 2 : 0) +
+		                                              (joins_previous ? 1 : 0));
+	}
+	std::reverse(visual.begin(), visual.end());
+	return Common::Utf16ToUtf8(visual);
+}
+
 std::string VisibleText(const Ime::HostSnapshot& snapshot, size_t max_units) {
 	const size_t cursor        = std::min<size_t>(snapshot.cursor, snapshot.text.size());
 	const size_t payload_units = max_units > 4 ? max_units - 4 : 1;
@@ -598,7 +712,8 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
 	            (cursor.enabled && cursor.cursor_visible),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision)};
+	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
+	            PerformanceOverlayRevision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -794,6 +909,7 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		AddSystemFontFallbacks(io);
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -1547,8 +1663,7 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-
-	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now) {
+	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
 				return false;
@@ -1578,8 +1693,9 @@ struct SystemOverlay::Impl {
 				trophy_notification = std::move(g_trophy_notifications.front());
 				g_trophy_notifications.pop_front();
 			}
-			trophy_notification_born  = now;
-			trophy_notification_image = LoadTrophyIcon(trophy_notification->icon_png);
+			trophy_notification_subtitle = PrepareTrophySubtitle(Config::GetConsoleLanguage());
+			trophy_notification_born     = now;
+			trophy_notification_image    = LoadTrophyIcon(trophy_notification->icon_png);
 			PlayTrophySound();
 		}
 		const float age = std::chrono::duration<float>(now - trophy_notification_born).count();
@@ -1615,7 +1731,7 @@ struct SystemOverlay::Impl {
 		const float  alpha    = std::min(fade_in, fade_out);
 		const float  slide    = (1.0f - fade_in) * (width + 24.0f);
 		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 32.0f - width + slide,
-		                       32.0f};
+		                       std::max(32.0f, min_top + 12.0f)};
 		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
 		auto*        draw = ImGui::GetForegroundDrawList();
 		const auto   fade = [alpha](int r, int g, int b, int a) {
@@ -1663,8 +1779,17 @@ struct SystemOverlay::Impl {
 			              line.data(), line.data() + line.size());
 			line_y += line_height;
 		}
-		draw->AddText(nullptr, 20.0f * screen_scale, {text_left, line_y + 8.0f * screen_scale},
-		              fade(176, 180, 192, 255), "Trophy earned!");
+		const float subtitle_size = 20.0f * screen_scale;
+		const float subtitle_width =
+		    ImGui::GetFont()
+		        ->CalcTextSizeA(subtitle_size, std::numeric_limits<float>::max(), 0.0f,
+		                        trophy_notification_subtitle.c_str())
+		        .x;
+		const float available_width = std::max(1.0f, width - text_offset - text_padding);
+		const float fitted_size = std::max(
+		    1.0f, subtitle_size * std::min(1.0f, available_width / std::max(1.0f, subtitle_width)));
+		draw->AddText(nullptr, fitted_size, {text_left, line_y + 8.0f * screen_scale},
+		              fade(176, 180, 192, 255), trophy_notification_subtitle.c_str());
 		draw->PopClipRect();
 	}
 
@@ -1674,7 +1799,7 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled) {
+		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1705,6 +1830,7 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		DrawSplash(frame_extent);
+		const float performance_bottom = DrawPerformanceOverlay(graphics, frame_extent);
 		GetOverlaySnapshot(&snapshot);
 		if (has_overlay && snapshot.session == prepared_session) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {
@@ -1713,7 +1839,7 @@ struct SystemOverlay::Impl {
 				DrawIme(snapshot.ime, frame_extent);
 			}
 		}
-		DrawTrophyNotification(frame_extent, now);
+		DrawTrophyNotification(frame_extent, now, performance_bottom);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;
@@ -1782,6 +1908,7 @@ struct SystemOverlay::Impl {
 	static constexpr std::size_t                MAX_TOUCH_PARTICLES      = 64;
 	static constexpr std::size_t                MAX_TOUCH_TRAIL_SEGMENTS = 128;
 	std::optional<TrophyNotification>           trophy_notification;
+	std::string                                 trophy_notification_subtitle;
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
 	std::array<std::unique_ptr<DdsImage>, 2>      splash_dds;

@@ -15,6 +15,24 @@ namespace Libs::LibKernel::Memory {
 void Initialize();
 void Shutdown();
 
+// Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
+// waits on the GPU; call it only while the memory subsystem is initialized.
+struct DebugStats {
+	uint64_t direct_total        = 0;
+	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated    = 0; // Memory pool expansions.
+	uint64_t automatic_allocated = 0; // Extended memory.
+	uint64_t direct_mapped       = 0;
+	uint64_t flexible_total      = 0;
+	uint64_t flexible_used       = 0;
+	uint64_t pool_committed      = 0;
+	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries       = 0;
+	uint64_t cpu_page_entries_total = 0;
+	uint64_t gpu_page_entries_total = 0;
+};
+[[nodiscard]] DebugStats GetDebugStats();
+
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
 	static constexpr auto        initialize = Libs::LibKernel::Memory::Initialize;
@@ -108,7 +126,6 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
@@ -180,6 +197,9 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
+// Loaded modules' segments use flexible memory without taking its backing.
+void ChargeFlexibleMemory(uint64_t size);
+void ReleaseFlexibleMemory(uint64_t size);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
@@ -205,6 +225,11 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
+uint64_t TestFlexibleBackingHighWater();
+uint64_t TestGuestFreeRangeVisits();
+uint64_t TestDirectMappingCount();
+uint64_t TestFlexibleMappingCount();
+uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
 #endif
 

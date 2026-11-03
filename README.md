@@ -23,11 +23,8 @@ can change significantly between builds.
 
 ## Current Status
 
-KytyPS5 can boot 2D and 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
-planned.
-
 Development is currently focused on expanding game compatibility and improving boot reliability.
+External low-level emulation modules are neither required nor planned.
 
 Windows and Linux are the primary target platforms and receive the most testing.
 
@@ -46,6 +43,16 @@ or graphical glitches, so please include the version you tested when reporting a
 ## Screenshots
 
 <table align="center">
+  <tr>
+    <td align="center">
+      <strong>Cyberpunk 2077</strong><br>
+      <img src="docs/screenshots/ps5-07.png" width="300" alt="Cyberpunk 2077 running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>MLB The Show 23</strong><br>
+      <img src="docs/screenshots/ps5-08.png" width="300" alt="MLB The Show 23 running in KytyPS5">
+    </td>
+  </tr>
   <tr>
     <td align="center">
       <strong>Astro Bot</strong><br>
@@ -79,6 +86,13 @@ or graphical glitches, so please include the version you tested when reporting a
 </table>
 
 <p align="center"><em>And many more...</em></p>
+
+## Notable Forks
+
+These community forks bring KytyPS5 to other platforms.
+
+- [Cosmo/KytyPS5](https://github.com/Cosmo/KytyPS5) — Xbox Series X: Direct3D 12 renderer, sleek
+  controller-first interface, and local multiplayer for up to four players.
 
 ## Contributing
 
@@ -275,11 +289,11 @@ From the repository root, follow the launcher configure, build and install steps
 [Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
 Fedora's packaged Qt 6 automatically.
 
-Run `./_Build/linux/install/launcher` on regular Fedora or inside the container. To launch a
+Run `./_Build/linux/install/kyty_launcher` on regular Fedora or inside the container. To launch a
 container build from the host, leave the container with `exit`, then run from the repository root:
 
 ```bash
-distrobox enter kyty-build -- ./_Build/linux/install/launcher
+distrobox enter kyty-build -- ./_Build/linux/install/kyty_launcher
 ```
 
 Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
@@ -345,7 +359,7 @@ Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
 Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
+`kyty_launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
 compiler per platform, so on Linux configure from the command line as shown above.
 
 Before using it:
@@ -365,11 +379,11 @@ Update your graphics driver before reporting rendering problems.
 To use the graphical launcher:
 
 ```powershell
-.\_Build\windows\install\launcher.exe
+.\_Build\windows\install\kyty_launcher.exe
 ```
 
 ```bash
-./_Build/linux/install/launcher
+./_Build/linux/install/kyty_launcher
 ```
 
 ```bash

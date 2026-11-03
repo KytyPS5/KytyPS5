@@ -97,6 +97,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto count = physical_device_memory_properties.memoryHeapCount;
+	for (uint32_t heap = 0; heap < count; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		heaps[heap] = {.usage        = budgets[heap].usage,
+		               .budget       = budgets[heap].budget,
+		               .allocations  = budgets[heap].statistics.allocationCount,
+		               .device_local = static_cast<bool>(properties.flags &
+		                                                 vk::MemoryHeapFlagBits::eDeviceLocal)};
+	}
+	return count;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;
@@ -133,7 +151,8 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(

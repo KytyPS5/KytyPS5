@@ -101,6 +101,7 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&

@@ -123,9 +123,11 @@ uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,
 bool     TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
                                  uint32_t bytes_per_element, TileSizeAlign& total_size,
                                  uint32_t num_fragments_log2 = 0);
+// mips, when given, receives the size and offset within a slice of each level that has metadata.
 bool     TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
                         uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
-                        TileSizeAlign& total_size, uint32_t num_fragments_log2 = 0);
+                        TileSizeAlign& total_size, uint32_t num_fragments_log2 = 0,
+                        TileSizeOffset* mips = nullptr);
 bool     TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t levels,
                           TileSizeAlign& total_size);
 void     TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,

@@ -65,6 +65,8 @@ else()
 	SET(CMAKE_NINJA_FORCE_RESPONSE_FILE 1 CACHE INTERNAL "")
 endif()
 
+# Guest code runs natively and needs x86-64-v3 (AVX2, BMI2, FMA), so every host has it.
+# No FMA contraction: a * b + c keeps both roundings.
 if(KYTY_CLANG_CL)
 	if(CMAKE_CXX_FLAGS MATCHES "/W[0-4]")
 		string(REGEX REPLACE "/W[0-4]" "/W3" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
@@ -79,7 +81,7 @@ if(KYTY_CLANG_CL)
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 			
-	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /wd4244 /wd4305 /wd4800 /wd4345")
+	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /clang:-march=x86-64-v3 /clang:-ffp-contract=off /wd4244 /wd4305 /wd4800 /wd4345")
   
 	if(KYTY_WARNINGS_ARE_ERRORS)
 		#set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /WX")
@@ -103,6 +105,7 @@ elseif(CLANG OR GCC)
 	else()
 		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -fno-exceptions -fdiagnostics-color=always -finput-charset=UTF-8 -fexec-charset=UTF-8 -static-libgcc -static-libstdc++ -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -Wno-unused-value -fmessage-length=0")
 	endif()
+	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -march=x86-64-v3 -ffp-contract=off")
 	
     if(KYTY_WARNINGS_ARE_ERRORS)
         #set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -Werror")

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -13,6 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -190,6 +192,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -652,6 +655,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -666,6 +670,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			return true;
+		}
+		if (const auto length =
+		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
 	}
@@ -1626,6 +1636,8 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	}
 }
 
+constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	uint64_t base_size = 0;
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -1637,6 +1649,20 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 		}
 	}
 	return base_size;
+}
+
+// A module's E, R and RW LOAD segments use flexible memory in 16 KiB pages; GNU_RELRO adds none
+// since it lies inside an RW LOAD.
+uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
+	uint64_t size = 0;
+	for (Elf64_Half i = 0; i < phnum; i++) {
+		const auto flags = phdr[i].p_flags;
+		if (phdr[i].p_type == PT_LOAD &&
+		    (flags == PF_X || flags == PF_R || flags == (PF_R | PF_W))) {
+			size += AlignUp(phdr[i].p_memsz, GUEST_PAGE_SIZE);
+		}
+	}
+	return size;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1658,8 +1684,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(phdr == nullptr || ehdr == nullptr);
 
-	program->base_size                 = CalcBaseSize(ehdr, phdr);
-	constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+	program->base_size = CalcBaseSize(ehdr, phdr);
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
@@ -1672,7 +1697,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const uint64_t tsc_multiplier =
+	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1684,6 +1712,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
+	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
@@ -1788,20 +1818,21 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
-			                module_name));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
+			    module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result = PatchGuestInstructions(
+			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+			    GetGuestInstructionHostFeatures(), tsc_multiplier);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
+			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -1814,6 +1845,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (totals.rdtsc.found != 0) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
+			                totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};
@@ -1869,6 +1905,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		}
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
+		Libs::LibKernel::Memory::ReleaseFlexibleMemory(program->flexible_size);
 	}
 }
 

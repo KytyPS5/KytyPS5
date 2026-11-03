@@ -157,7 +157,6 @@ int GuestGpu::GetFrameNum() const {
 }
 
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
-	EXIT_IF(queue_id >= QueueCount);
 	if (queue_id == 0) {
 		return *m_gfx_cp;
 	}
@@ -350,7 +349,6 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 }
 
 void GuestGpu::Enqueue(Submission submission) {
-	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -375,8 +373,7 @@ void GuestGpu::ThreadRun(void* data) {
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
-		bool                         has_submission = false;
-		bool                         should_stop    = false;
+		bool                         should_stop = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
@@ -418,7 +415,6 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
-				has_submission    = true;
 			}
 		}
 		if (should_stop) {
@@ -438,7 +434,6 @@ void GuestGpu::ThreadRun(void* data) {
 			continue;
 		}
 
-		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
@@ -557,14 +552,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
-			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
-			static std::atomic<uint32_t> skip_log_count {0};
-			if (skip_log_count.fetch_add(1) < 2048) {
-				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
-				     ", packet=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32 "\n",
-				     opcode, KYTY_PM4_R(packet_header), packet_dw,
-				     reinterpret_cast<uint64_t>(packet), packet_header);
-			}
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
@@ -684,15 +672,6 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
-	}
-	if (op == 0x03) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 128) {
-			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
-			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(address), value, condition,
-			     m_predicate_skip ? 1u : 0u, wait_op);
-		}
 	}
 }
 
@@ -834,28 +813,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-
-	uint32_t frame_num = 0;
-
-	{
-		frame_num = m_renderer.GetGpu().GetFrameNum();
-		if (graphics_debug_dump_enabled()) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
-				const auto& cs = m_sh_ctx.GetCs().cs_regs;
-				LOGF("QueuePoint DispatchDirect: frame=%u groups=%ux%ux%u local=%ux%ux%u "
-				     "mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64 "\n",
-				     frame_num, thread_group_x, thread_group_y, thread_group_z,
-				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
-				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
-				     cs.data_addr);
-			}
-		}
-
-		m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode,
-		                                              IsAsyncComputeQueue());
-	}
+	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
+	                                              thread_group_z, mode, IsAsyncComputeQueue());
 }
 
 void CommandProcessor::ProcessPssr(const Pssr::Request& request) {

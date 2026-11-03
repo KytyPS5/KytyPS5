@@ -464,7 +464,6 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	uint32_t thread_group_x = buffer[0];
@@ -550,8 +549,6 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_PREDICATION);
-
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 
 	EXIT_NOT_IMPLEMENTED(payload_dw < 2);
@@ -581,8 +578,6 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 KYTY_CP_OP_PARSER(CpOpCondExec) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_COND_EXEC);
-
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 
 	EXIT_NOT_IMPLEMENTED(payload_dw < 4);
@@ -606,11 +601,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 KYTY_CP_OP_PARSER(CpOpBranch) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
-
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
-
-	EXIT_NOT_IMPLEMENTED(payload_dw != 13);
 
 	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
 	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
@@ -866,7 +857,6 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_R(cmd_id) != Pm4::R_CONTEXT_STATE);
 	EXIT_NOT_IMPLEMENTED(packet_size_dw != 3u && packet_size_dw != 5u);
 	EXIT_NOT_IMPLEMENTED(buffer[0] > static_cast<uint32_t>(ContextStateOperation::PushClear));
 
@@ -877,8 +867,6 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
 	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
 	uint32_t   event_index    = (buffer[0] >> 8u) & 0x7u;
@@ -951,7 +939,6 @@ KYTY_CP_OP_PARSER(CpOpIndexBase) {
 KYTY_CP_OP_PARSER(CpOpSetBase) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_BASE);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	auto base_index = buffer[0] & 0xfu;
@@ -973,8 +960,6 @@ KYTY_CP_OP_PARSER(CpOpSetBase) {
 
 KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
 
 	if (KYTY_PM4_LEN(cmd_id) == 14u) {
 		return CpOpBranch(cp, cmd_id, buffer, dw, num_dw);
@@ -1013,7 +998,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
@@ -1083,7 +1067,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
@@ -1137,7 +1120,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
@@ -1216,11 +1198,6 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
-	static std::atomic<uint32_t> pop_marker_log_count {0};
-	if (pop_marker_log_count.fetch_add(1) < 64) {
-		LOGF("Pop marker\n");
-	}
-
 	return dw_num + 1;
 }
 
@@ -1228,13 +1205,6 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
-
-	const char* str = reinterpret_cast<const char*>(buffer);
-
-	static std::atomic<uint32_t> push_marker_log_count {0};
-	if (push_marker_log_count.fetch_add(1) < 128) {
-		LOGF("Push marker: %s\n", str);
-	}
 
 	return dw_num + 1;
 }
@@ -1382,10 +1352,8 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
 	constexpr auto payload_dw = 4u + value_dw * 2u;
 	constexpr auto packet_dw  = payload_dw + 1u;
-	constexpr auto opcode =
-	    (sizeof(T) == sizeof(uint32_t) ? Pm4::IT_WAIT_REG_MEM : Pm4::IT_WAIT_REG_MEM_64);
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != opcode || KYTY_PM4_R(cmd_id) != 0u);
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_R(cmd_id) != 0u);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
 
 	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
@@ -1416,10 +1384,6 @@ KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {
 	KYTY_PROFILER_FUNCTION();
-
-	auto op = (cmd_id >> 8u) & 0xffu;
-
-	EXIT_NOT_IMPLEMENTED(op != Pm4::IT_WRITE_DATA);
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 

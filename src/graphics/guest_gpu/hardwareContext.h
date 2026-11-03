@@ -646,9 +646,6 @@ public:
 	void SetDepthStencilInfo(const DepthStencilInfo& info) {
 		m_depth_render_target.stencil_info = info;
 	}
-	[[nodiscard]] const DepthStencilInfo& GetDepthStencilInfo() const {
-		return m_depth_render_target.stencil_info;
-	}
 	void SetDepthZReadBase(uint64_t addr) { m_depth_render_target.z_read_base_addr = addr; }
 	void SetDepthStencilReadBase(uint64_t addr) {
 		m_depth_render_target.stencil_read_base_addr = addr;
@@ -693,15 +690,6 @@ public:
 	}
 	void SetViewportZOffset(uint32_t viewport_id, float zoffset) {
 		m_screen_viewport.viewports[viewport_id].zoffset = zoffset;
-	}
-	void SetViewportScissor(uint32_t viewport_id, int left, int top, int right, int bottom,
-	                        bool window_offset_enable) {
-		m_screen_viewport.viewports[viewport_id].viewport_scissor_left   = left;
-		m_screen_viewport.viewports[viewport_id].viewport_scissor_top    = top;
-		m_screen_viewport.viewports[viewport_id].viewport_scissor_right  = right;
-		m_screen_viewport.viewports[viewport_id].viewport_scissor_bottom = bottom;
-		m_screen_viewport.viewports[viewport_id].viewport_scissor_window_offset_enable =
-		    window_offset_enable;
 	}
 	void SetViewportScissorTL(uint32_t viewport_id, int left, int top, bool window_offset_enable) {
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_left = left;

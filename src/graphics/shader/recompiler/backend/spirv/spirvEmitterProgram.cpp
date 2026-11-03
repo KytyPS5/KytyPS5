@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <optional>
@@ -48,9 +49,20 @@ struct DeferredPhiPatch {
 	uint32_t        half        = 0;
 };
 
+// An incoming edge of a bool phi from a block emitted at or after the phi's own block (a loop's
+// back edge); see CollectLateBoolPhiEdges.
+struct LateBoolPhiEdge {
+	const IR::Inst* phi   = nullptr;
+	size_t          index = 0;
+};
+
 struct StructuredFunctionState {
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
+	// The late bool phi edges by predecessor, and the copy each phi takes on them (by phi, then
+	// incoming index and half; 0 for the other edges).
+	std::unordered_map<const IR::Block*, std::vector<LateBoolPhiEdge>>        late_bool_phi_edges;
+	std::unordered_map<const IR::Inst*, std::vector<std::array<uint32_t, 2>>> late_bool_phi_copies;
 };
 
 struct DispatcherFunctionState {
@@ -318,17 +330,71 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	}
 }
 
+// NVIDIA's SPIR-V compiler (driver 580.178) dereferences a null terminator on a bool OpPhi whose
+// incoming values are all defined before it when one predecessor is emitted later, as a loop
+// header's back edge is. Such an edge instead takes a copy made at the end of that predecessor,
+// which the phi has not seen yet, so the phi stays a plain bool. Astro's Playroom hits this in its
+// ray-traced lighting kernels and closed as soon as the game left its menu.
+void CollectLateBoolPhiEdges(const IR::Program& program, StructuredFunctionState& structured) {
+	std::unordered_map<const IR::Block*, size_t> order;
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		order.emplace(program.blocks[index], index);
+	}
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		for (const auto& inst: *program.blocks[index]) {
+			if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
+				break;
+			}
+			if (inst.GetType() != IR::Type::U1) {
+				continue;
+			}
+			for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+				const auto found = order.find(inst.PhiBlock(arg));
+				if (found != order.end() && found->second >= index) {
+					structured.late_bool_phi_edges[found->first].push_back({&inst, arg});
+				}
+			}
+		}
+	}
+}
+
+// At the end of `block`, before its terminator: the copies its late bool phi edges carry.
+void EmitLateBoolPhiCopies(ValueEmitContext& ctx, StructuredFunctionState& structured,
+                           const IR::Block* block) {
+	const auto edges = structured.late_bool_phi_edges.find(block);
+	if (edges == structured.late_bool_phi_edges.end()) {
+		return;
+	}
+	for (const auto& edge: edges->second) {
+		auto& copies = structured.late_bool_phi_copies[edge.phi];
+		copies.resize(edge.phi->NumArgs());
+		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
+			auto&      lane = half == 0 ? ctx : *ctx.other_half;
+			const auto copy = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpCopyObject, TypeBool(ctx.state), copy,
+			                              lane.Def(edge.phi->Arg(edge.index)));
+			copies[edge.index][half] = copy;
+		}
+	}
+}
+
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
 	for (const auto& deferred: structured.deferred_phis) {
-		auto& lane = deferred.half == 0 ? ctx : *ctx.other_half;
+		auto&      lane   = deferred.half == 0 ? ctx : *ctx.other_half;
+		const auto copies = structured.late_bool_phi_copies.find(deferred.instruction);
 		for (size_t index = 0; index < deferred.instruction->NumArgs(); index++) {
 			const auto* predecessor = deferred.instruction->PhiBlock(index);
 			const auto  found       = structured.block_exit_labels.find(predecessor);
 			if (found == structured.block_exit_labels.end()) {
 				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
-			ctx.state.builder.PatchDeferredPhi(
-			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), found->second);
+			auto value = copies != structured.late_bool_phi_copies.end()
+			                 ? copies->second[index][deferred.half]
+			                 : 0u;
+			if (value == 0) {
+				value = lane.Def(deferred.instruction->Arg(index));
+			}
+			ctx.state.builder.PatchDeferredPhi(deferred.phi, index, value, found->second);
 		}
 	}
 }
@@ -336,6 +402,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	CollectLateBoolPhiEdges(program, structured);
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -343,6 +410,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
+		EmitLateBoolPhiCopies(ctx, structured, block);
 		EmitStructuredTerminator(ctx, block);
 	}
 	PatchStructuredPhis(ctx, structured);

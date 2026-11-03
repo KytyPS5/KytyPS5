@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -48,25 +49,8 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	std::_Exit(322);
 }
 
-class SpinGuard final {
-public:
-	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
-		}
-	}
-	~SpinGuard() { m_lock.clear(std::memory_order_release); }
-	KYTY_CLASS_NO_COPY(SpinGuard);
-
-private:
-	std::atomic_flag& m_lock;
-};
+// The page tracking's lock: waiters sleep instead of spinning on a preempted holder.
+using SpinGuard = std::lock_guard<TrackingSpinLock>;
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
@@ -128,7 +112,7 @@ struct PageManager::Impl {
 	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
-		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
+		TrackingSpinLock                    lock;
 		std::array<PageState, REGION_PAGES> pages;
 	};
 

@@ -20,6 +20,8 @@ constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 // threads (0 while none are reserved), and the next ideal processor to hand out among them.
 static std::atomic<uint64_t> g_unreserved_processors {0};
 static std::atomic<uint32_t> g_next_ideal_processor {0};
+// Set by Thread::PinCurrent() on a processor of a reserved core.
+static thread_local bool t_reserved_core = false;
 
 // A default CPU set alone does not keep a thread off the reserved cores: Windows still gives the
 // thread an ideal processor there, and a thread made ready while every allowed processor is busy
@@ -133,9 +135,19 @@ void Thread::PinCurrent(int logical_cpu) {
 		const auto mask = DWORD_PTR {1} << static_cast<uint32_t>(logical_cpu);
 		::SetThreadAffinityMask(::GetCurrentThread(), mask);
 		::SetThreadIdealProcessor(::GetCurrentThread(), static_cast<DWORD>(logical_cpu));
+		const auto unreserved = g_unreserved_processors.load(std::memory_order_acquire);
+		t_reserved_core = unreserved != 0 && (unreserved & mask) == 0;
 	}
 #else
 	(void)logical_cpu;
+#endif
+}
+
+bool Thread::HasReservedCore() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return t_reserved_core;
+#else
+	return false;
 #endif
 }
 

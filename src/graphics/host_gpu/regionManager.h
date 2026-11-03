@@ -2,11 +2,13 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -17,6 +19,9 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
+#pragma comment(lib, "Synchronization.lib")
+#undef min
+#undef max
 #undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
@@ -27,14 +32,49 @@
 
 namespace Libs::Graphics {
 
+// The lock of the short critical sections of the page tracking, which the GPU threads and the
+// guest's threads (in their page-fault handlers) share. Uncontended it costs what a spin lock
+// costs. A waiter spins for some tens of microseconds and then sleeps until the holder releases
+// the lock: holders change page protections inside it, and a holder the scheduler preempted there
+// otherwise waited for a processor behind its spinning waiters. ASTRO BOT froze for 2-6 s while a
+// dozen game threads and the execution thread spun on one region's lock and its holder, ready,
+// did not get to run. The GPU stage threads that have a reserved core keep spinning.
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		if (m_state.exchange(1, std::memory_order_acquire) != 0) [[unlikely]] {
+			LockSlow(thread);
+		}
+		m_owner.store(thread, std::memory_order_relaxed);
+	}
+	void unlock() noexcept {
+		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
+		m_owner.store(0, std::memory_order_relaxed);
+		// Sequentially consistent, so the release is visible before the check for sleepers: a
+		// waiter registers as a sleeper before it looks at the lock word for the last time.
+		m_state.store(0, std::memory_order_seq_cst);
+		if (m_sleepers.load(std::memory_order_seq_cst) != 0) [[unlikely]] {
+			WakeSleeper();
+		}
+	}
+
+private:
+	// About 50 us of pauses before a waiter sleeps.
+	static constexpr uint32_t SpinRounds = 4096;
+
+#if defined(_MSC_VER) && !defined(__clang__)
+	__declspec(noinline)
+#else
+	[[gnu::noinline]]
+#endif
+	void LockSlow(uint32_t thread) noexcept {
+		// A GPU stage thread alone on its reserved core takes no processor from anyone by spinning,
+		// and as the critical path it does not pay for a wake-up: it keeps spinning.
+		const bool own_core = Common::Thread::HasReservedCore();
+		for (uint32_t round = 0;; round++) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			// Wait on reads, so the holder's cache line is not written until the lock is free.
-			while (m_lock.test(std::memory_order_relaxed)) {
+			if (round < SpinRounds || own_core) {
 #if defined(__x86_64__) || defined(_M_X64)
 				_mm_pause();
 #elif defined(_M_ARM64)
@@ -42,17 +82,34 @@ public:
 #elif defined(__aarch64__)
 				asm volatile("yield");
 #endif
+			} else {
+				m_sleepers.fetch_add(1, std::memory_order_seq_cst);
+				SleepWhileHeld();
+				m_sleepers.fetch_sub(1, std::memory_order_relaxed);
+			}
+			if (m_state.load(std::memory_order_relaxed) == 0 &&
+			    m_state.exchange(1, std::memory_order_acquire) == 0) {
+				return;
 			}
 		}
-		m_owner.store(thread, std::memory_order_relaxed);
-	}
-	void unlock() noexcept {
-		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
-		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
 	}
 
-private:
+	void SleepWhileHeld() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// At most a millisecond: a release that missed this sleeper does not keep it waiting.
+		uint32_t held = 1;
+		(void)::WaitOnAddress(&m_state, &held, sizeof(held), 1);
+#else
+		std::this_thread::yield();
+#endif
+	}
+
+	void WakeSleeper() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		::WakeByAddressSingle(&m_state);
+#endif
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Cached: the lock is taken for most dirty-page queries of the GPU threads.
@@ -71,8 +128,9 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
+	std::atomic_uint32_t m_state {0};
 	std::atomic_uint32_t m_owner {0};
+	std::atomic_uint32_t m_sleepers {0};
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);

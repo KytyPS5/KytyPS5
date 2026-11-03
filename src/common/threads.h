@@ -37,6 +37,9 @@ void PinCurrent(int logical_cpu);
 // other physical cores remain: those running now and those that start later get a hard
 // affinity to the other processors.
 void ReserveCores(std::span<const int> logical_cpus);
+// Whether the calling thread pinned itself (PinCurrent) to a processor of the cores
+// ReserveCores() keeps the other threads off: it runs alone there.
+bool HasReservedCore();
 
 } // namespace Thread
 

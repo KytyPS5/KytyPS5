@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -446,6 +447,27 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
+// PPSA03541
+// The texture cache matches images by pitch. With dynamic resolution, a narrower cached depth
+// surface with the same pitch (e.g. 3832 for a 3840-wide target) is returned for the same address.
+// A render area larger than an attachment loses the device, so clamp it to the host mip extent.
+static void ClampRenderAreaToHostImage(RenderState& state, const Image& image, uint32_t level,
+                                       const char* kind, uint64_t address) {
+	const uint32_t width  = std::max(image.backing.extent.width >> level, 1u);
+	const uint32_t height = std::max(image.backing.extent.height >> level, 1u);
+	if (width >= state.width && height >= state.height) {
+		return;
+	}
+	static std::atomic<uint32_t> log_count = 0;
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("%s target at 0x%016" PRIx64 " is smaller than the render area: host=%ux%u "
+		            "(mip %u) render_area=%ux%u, clamping\n",
+		            kind, address, width, height, level, state.width, state.height);
+	}
+	state.width  = std::min(state.width, width);
+	state.height = std::min(state.height, height);
+}
+
 struct DrawCallInfo {
 	bool     indexed        = true;
 	uint32_t index_count    = 0;
@@ -485,6 +507,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
+		ClampRenderAreaToHostImage(state, image, view.base_level, "color",
+		                           target.desc.info.data.address);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
@@ -547,6 +571,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              buffer.Handle());
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		ClampRenderAreaToHostImage(state, image, view.base_level, "depth",
+		                           depth.desc.info.data.address);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;

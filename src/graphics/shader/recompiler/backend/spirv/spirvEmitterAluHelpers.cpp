@@ -112,8 +112,17 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 	              numeric);
 }
 
-uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (state.profile.native_float_min_max) {
+// True when V_MIN/V_MAX use the host's NMin/NMax. AMD is exact for the guest, and other GPUs
+// only after the user opted in and accepted the zero-sign and two-NaN differences.
+static bool UseHostFloatMinMax(const Profile& profile) {
+	return profile.native_float_min_max || profile.host_float_min_max;
+}
+
+// Emits V_MIN/V_MAX with the host's NMin/NMax when use_host is set and the emulated rules
+// otherwise. MED3 passes its own decision so it can stay emulated while MIN and MAX switch.
+static uint32_t EmitMinMaxF32Choice(EmitterState& state, uint32_t lhs, uint32_t rhs,
+                                    bool max_value, bool use_host) {
+	if (use_host) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
@@ -121,6 +130,11 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	}
 	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
+}
+
+// Emits V_MIN/V_MAX_F32 (and the F16 and MIN3/MAX3 forms built on it) for the profile.
+uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	return EmitMinMaxF32Choice(state, lhs, rhs, max_value, UseHostFloatMinMax(state.profile));
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -141,7 +155,10 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
 	const auto y =
 	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
-	const auto median = EmitMinMaxF32Value(state, x, y, true);
+	// Only AMD takes the host max here. The opt-in does not cover MED3, whose tie handling needs
+	// the exact zero ordering.
+	const auto median =
+	    EmitMinMaxF32Choice(state, x, y, true, state.profile.native_float_min_max);
 	const auto is_nan = [&](uint32_t value) {
 		return Unary(state, spv::OpIsNan, TypeBool(state), value);
 	};

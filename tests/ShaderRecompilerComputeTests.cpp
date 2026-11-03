@@ -80,6 +80,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -1492,6 +1493,8 @@ struct TestCase {
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
   size_t max_spirv_words = 0;
+  // Replaces the exact readback comparison. Returns an error message, or empty when it accepts.
+  std::function<std::string(const std::vector<u32> &)> readback_check;
 };
 
 struct GraphicsCase {
@@ -23438,7 +23441,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyImage(&storage_image_uint);
   vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
-  CompareWords(test, "readback", test.expected, actual);
+  if (test.readback_check) {
+    const auto problem = test.readback_check(actual);
+    if (!problem.empty()) Fail(test.name, "readback", problem);
+  } else {
+    CompareWords(test, "readback", test.expected, actual);
+  }
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
@@ -30753,6 +30761,243 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_MIN_F32,         O::V_MAX_F32,
                   O::V_MIN3_F32, O::V_MAX3_F32,        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
+}
+
+constexpr u32 PositiveInfinityBits = 0x7f800000u;
+constexpr u32 NegativeInfinityBits = 0xff800000u;
+constexpr u32 QuietNanBits = 0x7fc00000u;
+constexpr u32 SignalingNanBits = 0x7fa00001u;
+constexpr u32 NegativeNanBits = 0xffc05678u;
+constexpr u32 HostCanonicalNanBits = 0x7fffffffu;
+constexpr u32 NegativeZeroBits = 0x80000000u;
+constexpr u32 AbsoluteValueMask = 0x7fffffffu;
+constexpr u32 MinMaxInputsPerRow = 3;
+
+// The emulated min/max rules, kept here so the opted-in cases do not depend on other tests.
+bool IsNanBits(u32 bits) { return (bits & AbsoluteValueMask) > PositiveInfinityBits; }
+bool IsZeroBits(u32 bits) { return (bits & AbsoluteValueMask) == 0u; }
+
+u32 EmulatedMin(u32 a, u32 b) {
+  if (IsNanBits(b)) return a;
+  if (IsNanBits(a)) return b;
+  if (IsZeroBits(a) && IsZeroBits(b)) return a | b;
+  return std::bit_cast<float>(a) < std::bit_cast<float>(b) ? a : b;
+}
+
+u32 EmulatedMax(u32 a, u32 b) {
+  if (IsNanBits(b)) return a;
+  if (IsNanBits(a)) return b;
+  if (IsZeroBits(a) && IsZeroBits(b)) return a & b;
+  return std::bit_cast<float>(a) >= std::bit_cast<float>(b) ? a : b;
+}
+
+// A step the host may answer differently, mixed-sign zeros and two NaNs.
+bool HostMayDiffer(u32 a, u32 b) {
+  return (IsNanBits(a) && IsNanBits(b)) || (IsZeroBits(a) && IsZeroBits(b) && a != b);
+}
+
+// What a host may return for the first step of MIN3 or MAX3.
+std::vector<u32> HostInnerResults(u32 (*op)(u32, u32), u32 a, u32 b) {
+  if (!HostMayDiffer(a, b)) return {op(a, b)};
+  if (IsZeroBits(a)) return {0u, NegativeZeroBits};
+  return {a, b, HostCanonicalNanBits};
+}
+
+// The emulated result of one output word and whether the host may legitimately differ in it.
+struct MinMaxExpectation {
+  u32 expected = 0;
+  bool relaxed = false;
+};
+
+MinMaxExpectation TwoOperandExpectation(u32 (*op)(u32, u32), u32 a, u32 b) {
+  return {op(a, b), HostMayDiffer(a, b)};
+}
+
+// A MIN3 or MAX3 stays exact when every host answer to the first step leads to the same result,
+// for example two NaNs followed by a finite third operand.
+MinMaxExpectation ThreeOperandExpectation(u32 (*op)(u32, u32), u32 a, u32 b, u32 c) {
+  MinMaxExpectation result{op(op(a, b), c), false};
+  std::set<u32> outcomes;
+  for (const u32 inner : HostInnerResults(op, a, b)) {
+    result.relaxed = result.relaxed || HostMayDiffer(inner, c);
+    outcomes.insert(op(inner, c));
+  }
+  result.relaxed = result.relaxed || outcomes.size() > 1u;
+  return result;
+}
+
+// Checks a readback word by word. A relaxed word only has to be a zero when the emulated result
+// is a zero, or a NaN when it is a NaN. Every other word must match the emulated bits.
+std::function<std::string(const std::vector<u32> &)>
+RelaxedReadbackCheck(std::vector<u32> expected, std::vector<bool> relaxed, size_t first_result) {
+  return [expected = std::move(expected), relaxed = std::move(relaxed),
+          first_result](const std::vector<u32> &actual) -> std::string {
+    for (size_t index = 0; index < relaxed.size(); ++index) {
+      const u32 want = expected[first_result + index];
+      const u32 got = actual[first_result + index];
+      bool ok = got == want;
+      if (relaxed[index] && IsZeroBits(want)) ok = IsZeroBits(got);
+      if (relaxed[index] && IsNanBits(want)) ok = IsNanBits(got);
+      if (!ok)
+        return "result " + std::to_string(index) + " gave " + Hex(got) + " for " + Hex(want);
+    }
+    return {};
+  };
+}
+
+// Instructions that only the emulated lowering produces. The host path must not contain any, so
+// a MIN3 or MAX3 step that stayed emulated cannot hide behind an NMin elsewhere in the shader.
+const std::vector<std::string> &EmulatedMinMaxMarkers() {
+  static const std::vector<std::string> markers = {"OpIsNan", "OpFOrdLessThan",
+                                                   "OpFOrdGreaterThanEqual"};
+  return markers;
+}
+
+// Shared by the opted-in min/max cases, so both use the same shader shape. Each input row holds
+// two operands and a third that only the three-operand form reads. The results follow the inputs
+// and the caller fills their expected words.
+TestCase HostMinMaxCase(const char *name, u32 wave, const std::vector<std::array<u32, 3>> &inputs,
+                        bool three_operand) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = name;
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : inputs)
+    test.initial.insert(test.initial.end(), values.begin(), values.end());
+  const auto input_dwords = static_cast<u32>(test.initial.size());
+  const u32 results = three_operand ? 4u : 2u;
+  auto &code = test.code;
+  for (u32 index = 0; index < inputs.size(); ++index) {
+    for (u32 operand = 0; operand < MinMaxInputsPerRow; ++operand) {
+      AppendVMovU32(&code, 30, (index * MinMaxInputsPerRow + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+    if (three_operand) {
+      AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+      AppendVop3(&code, 0x154, 13, Vgpr(0), Vgpr(1), Vgpr(2));
+    }
+    for (u32 result = 0; result < results; ++result)
+      AppendStoreVgpr(&code, 10 + result, input_dwords + index * results + result);
+  }
+  AppendEnd(&code);
+  test.initial.resize(input_dwords + static_cast<u32>(inputs.size()) * results);
+  // The inputs stay in the buffer and the results are filled in by the caller.
+  test.expected = test.initial;
+  test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_MIN_F32,         O::V_MAX_F32,
+                  O::V_MIN3_F32, O::V_MAX3_F32,        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // Opcode checks, so a result that happens to match cannot hide the wrong instruction.
+  test.required_spirv = {" NMin ", " NMax "};
+  test.forbidden_spirv = {" FMin ", " FMax "};
+  test.forbidden_spirv.insert(test.forbidden_spirv.end(), EmulatedMinMaxMarkers().begin(),
+                              EmulatedMinMaxMarkers().end());
+  return test;
+}
+
+// The same shader under the emulated profile. It proves the emulation-only markers exist, so the
+// forbidden check in the opted-in cases can see a step that stayed emulated.
+TestCase HostMinMaxEmulatedBaseline(u32 wave) {
+  const std::vector<std::array<u32, 3>> inputs = {{0x40000000u, 0x40400000u, 0x3f800000u}};
+  auto test = HostMinMaxCase("VectorMinMaxF32EmulatedBaseline", wave, inputs, true);
+  test.required_spirv = EmulatedMinMaxMarkers();
+  test.forbidden_spirv = {" NMin ", " NMax "};
+  test.compile_only = true;
+  return test;
+}
+
+// With host_float_min_max the results agree with the emulated rules, except where the host may
+// answer a mixed-sign zero pair or a NaN pair differently. Those words only have to be a zero or
+// a NaN, and a MIN3 or MAX3 whose result does not depend on such a step stays bit-exact.
+// Denormal operands are left out, because hosts may flush them and the emulated result for them
+// is not pinned down here. MED3 is not switched and has its own case.
+TestCase VectorMinMaxF32RelaxedAgrees(u32 wave) {
+  constexpr u32 pool[] = {0x40000000u, 0xc0400000u, 0x3f800000u, PositiveInfinityBits,
+                          NegativeInfinityBits, QuietNanBits, 0x00000000u, NegativeZeroBits};
+  std::vector<std::array<u32, 3>> inputs;
+  std::vector<u32> results;
+  std::vector<bool> relaxed;
+  const auto add = [&](const MinMaxExpectation &word) {
+    results.push_back(word.expected);
+    relaxed.push_back(word.relaxed);
+  };
+  for (const u32 a : pool)
+    for (const u32 b : pool)
+      for (const u32 c : pool) {
+        inputs.push_back({a, b, c});
+        add(TwoOperandExpectation(EmulatedMin, a, b));
+        add(TwoOperandExpectation(EmulatedMax, a, b));
+        add(ThreeOperandExpectation(EmulatedMin, a, b, c));
+        add(ThreeOperandExpectation(EmulatedMax, a, b, c));
+      }
+  auto test = HostMinMaxCase("VectorMinMaxF32RelaxedAgrees", wave, inputs, true);
+  const size_t first_result = test.initial.size() - results.size();
+  std::copy(results.begin(), results.end(), test.expected.begin() + first_result);
+  test.readback_check = RelaxedReadbackCheck(test.expected, relaxed, first_result);
+  return test;
+}
+
+// The rows where the host may differ. A mixed-sign zero pair accepts a zero of either sign and a
+// NaN pair accepts any NaN. Every other row stays bit-exact, including same-sign zeros,
+// infinities and a single NaN. A result that is not a zero or not a NaN fails those rows.
+TestCase VectorMinMaxF32RelaxedCornerCases(u32 wave) {
+  struct Row {
+    u32 a, b;
+    u32 min_expected, max_expected;
+    bool relaxed;
+  };
+  constexpr u32 two = 0x40000000u, three = 0x40400000u;
+  const std::vector<Row> rows = {
+      {NegativeZeroBits, 0u, 0u, 0u, true},
+      {0u, NegativeZeroBits, 0u, 0u, true},
+      {0x7fc01234u, NegativeNanBits, QuietNanBits, QuietNanBits, true},
+      {NegativeNanBits, 0x7fc01234u, QuietNanBits, QuietNanBits, true},
+      {SignalingNanBits, NegativeNanBits, QuietNanBits, QuietNanBits, true},
+      {0u, 0u, 0u, 0u, false},
+      {NegativeZeroBits, NegativeZeroBits, NegativeZeroBits, NegativeZeroBits, false},
+      {NegativeInfinityBits, PositiveInfinityBits, NegativeInfinityBits, PositiveInfinityBits,
+       false},
+      {two, three, two, three, false},
+      {0x7fc01234u, two, two, two, false},
+      {two, NegativeNanBits, two, two, false},
+      {SignalingNanBits, three, three, three, false},
+  };
+  std::vector<std::array<u32, 3>> inputs;
+  std::vector<bool> relaxed;
+  for (const auto &row : rows) {
+    inputs.push_back({row.a, row.b, 0u});
+    relaxed.insert(relaxed.end(), 2u, row.relaxed);
+  }
+  auto test = HostMinMaxCase("VectorMinMaxF32RelaxedCornerCases", wave, inputs, false);
+  const size_t first_result = test.initial.size() - rows.size() * 2u;
+  for (size_t index = 0; index < rows.size(); ++index) {
+    test.expected[first_result + index * 2u] = rows[index].min_expected;
+    test.expected[first_result + index * 2u + 1u] = rows[index].max_expected;
+  }
+  const auto check = RelaxedReadbackCheck(test.expected, relaxed, first_result);
+  // The bits are printed as evidence of what this host does, for the pull request description.
+  test.readback_check = [check, first_result, wave](const std::vector<u32> &actual) {
+    const auto at = [&](size_t row, size_t which) { return actual[first_result + row * 2u + which]; };
+    std::printf("[gpu] host min/max bits (wave %u): min(-0,+0)=0x%08x max(-0,+0)=0x%08x "
+                "min(+0,-0)=0x%08x max(+0,-0)=0x%08x min(NaN,NaN)=0x%08x max(NaN,NaN)=0x%08x\n",
+                wave, at(0, 0), at(0, 1), at(1, 0), at(1, 1), at(2, 0), at(2, 1));
+    return check(actual);
+  };
+  return test;
+}
+
+// True when the production profile would use host min/max on this device with the flag on, so
+// the cases only execute on hosts that can actually enable it. Elsewhere they compile only.
+bool HostMinMaxRunsOn(VulkanHarness &vulkan) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .native_float_min_max_enabled = true});
+  const bool enabled = SpirvProfile(vulkan.RuntimeContext()).host_float_min_max;
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  return enabled;
 }
 
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
@@ -54185,6 +54430,34 @@ int main(int argc, char **argv) {
         test.compile_only = native && !supported;
         RunCase(&vulkan, test);
       }
+    }
+    // The opt-in must reach the shader on any GPU, so the profile is set directly.
+    static constexpr ShaderProfile host_profile{.maintenance8 = true, .host_float_min_max = true};
+    const bool host_runs = HostMinMaxRunsOn(vulkan);
+    for (u32 wave : {32u, 64u}) {
+      RunCase(&vulkan, HostMinMaxEmulatedBaseline(wave));
+      for (auto test : {VectorMinMaxF32RelaxedAgrees(wave), VectorMinMaxF32RelaxedCornerCases(wave)}) {
+        test.profile = &host_profile;
+        test.compile_only = !host_runs;
+        RunCase(&vulkan, test);
+      }
+      // MED3 stays emulated under the opt-in. The native profile is the baseline that shows the
+      // check can see NMax in the same shader.
+      auto med3_native = VectorMed3F32NanUsesMin3Path(wave);
+      med3_native.profile = &native_profile;
+      med3_native.required_spirv = {" NMax "};
+      med3_native.compile_only = !supported;
+      RunCase(&vulkan, med3_native);
+      auto med3_host = VectorMed3F32NanUsesMin3Path(wave);
+      med3_host.profile = &host_profile;
+      med3_host.forbidden_spirv = {" NMin ", " NMax "};
+      RunCase(&vulkan, med3_host);
+      // F16 min and max lower to the same F32 operations, so the opt-in covers them.
+      auto f16_host = VectorMinMaxF16Ops();
+      f16_host.profile = &host_profile;
+      f16_host.required_spirv = {" NMin ", " NMax "};
+      f16_host.compile_only = !host_runs;
+      RunCase(&vulkan, f16_host);
     }
     return 0;
   }

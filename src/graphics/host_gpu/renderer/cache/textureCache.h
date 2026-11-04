@@ -172,6 +172,8 @@ private:
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	// Advances once per frame, in RunGarbageCollector at each suspend point. The LRU cache and
+	// Image::frame_accessed_last age images in these ticks.
 	uint64_t         m_gc_tick                = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;

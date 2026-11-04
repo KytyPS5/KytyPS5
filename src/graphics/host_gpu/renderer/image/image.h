@@ -147,8 +147,9 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	// TextureCache garbage-collector tick, one per frame, of the last access.
+	uint64_t frame_accessed_last = 0;
+	size_t   lru_id              = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

@@ -282,14 +282,14 @@ struct TextureCacheTestAccess {
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
-        image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.frame_accessed_last = tick;
         live.push_back(id);
       }
     });
     for (const auto id : oldest) {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
-        owner->tick_accessed_last = 0;
+        owner->frame_accessed_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
       }
     }

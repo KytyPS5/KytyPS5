@@ -768,6 +768,7 @@ void TestSubmixerSetupAndRouting() {
 	submixer.ports.resize(1);
 	submixer.matrices.resize(1);
 	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1274,7 +1275,9 @@ void TestGeomRolloffAndFlags() {
 	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK && attrib.a3d_attrib.volume == 0.0f,
 	      "enabled source cone did not attenuate a listener behind the source");
 	source.cone.outer_angle = 360.0f;
-	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK && attrib.a3d_attrib.volume == 0.0f,
+	// acos and the conversion to degrees can round just below the outer cone boundary.
+	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK &&
+	          std::abs(attrib.a3d_attrib.volume) < 1e-6f,
 	      "360-degree outer cone bypassed source directionality");
 	source.cone      = {2.0f, 360.0f, 2.0f, 360.0f};
 	source.max_level = 0.75f;
@@ -1557,6 +1560,7 @@ void TestMonoRateAndRouting() {
 	std::vector<int16_t> pcm(441, 16384);
 	f.Queue(pcm.data(), 441, 0);
 	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1610,6 +1614,7 @@ void TestDefaultMatrix() {
 void TestMatrixOutputChannels() {
 	Fixture f(48000, 2);
 	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1642,6 +1647,7 @@ void TestSamplerReuseResetsRouting() {
 	for (auto type: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
 		Fixture          f(48000, 1, type);
 		Ngs2RackInternal mastering_rack {};
+		mastering_rack.ngs  = &f.system;
 		mastering_rack.type = Ngs2RackType::Mastering;
 		Ngs2VoiceInternal mastering;
 		mastering.rack     = &mastering_rack;

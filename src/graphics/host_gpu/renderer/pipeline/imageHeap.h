@@ -61,15 +61,30 @@ private:
 		DescriptorValue value;
 		TextureBinding  binding;
 		uint32_t        kind   = 0;
-		uint32_t        refs   = 0; // Slots of the owning view that select it.
+		uint32_t        refs   = 0;
 		bool            stale  = false;
 		uint64_t        serial = 0; // Image::serial of binding.image_id.
 	};
 
 	struct Memory;
 
+	struct Pool {
+		ShaderRecompiler::IR::ImageResource                           profile;
+		std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> elements;
+		std::vector<uint32_t> pending;  // Not yet resolved.
+		std::vector<uint32_t> released; // No slot selects them after the next upload.
+		std::vector<uint32_t> away;     // Not yet moved to the read layout.
+		std::vector<uint32_t> dcc;      // Color metadata clears apply on each discovery.
+		std::vector<uint32_t> held;     // Another extent holds their address.
+		uint64_t              resolve_epoch = 0;
+		uint64_t              layout_epoch  = 0;
+		uint64_t              held_serial   = 0; // Image::serials when held was last retried.
+		uint64_t              renewals      = 0;
+	};
+
 	struct View {
 		Memory&                             memory;
+		Pool&                               pool;
 		uint64_t                            step  = 0;
 		uint64_t                            first = 0;
 		uint64_t                            count = 0;
@@ -78,20 +93,12 @@ private:
 		std::vector<uint32_t>               slots; // Plus a trailing null slot.
 		std::vector<uint32_t>               kind_keys;
 		std::vector<DescriptorValue>        kinds; // One representative per kind_keys entry.
-		std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> elements;
-		std::vector<uint32_t>   pending;  // Not yet resolved.
-		std::vector<uint32_t>   released; // No slot selects them after the next upload.
-		std::vector<uint32_t>   away;     // Not yet moved to the read layout.
-		std::vector<uint32_t>   dcc;      // Color metadata clears apply on each discovery.
-		std::vector<uint32_t>   held;     // Another extent holds their address.
 		std::unique_ptr<Buffer> buffer;
 		size_t                  dirty_begin   = 0; // Slots to upload.
 		size_t                  dirty_end     = 0;
 		size_t                  changed_begin = 0; // Table bytes changed since it was probed.
 		size_t                  changed_end   = 0;
-		uint64_t                resolve_epoch = 0;
-		uint64_t                layout_epoch  = 0;
-		uint64_t                held_serial   = 0; // Image::serials when held was last retried.
+		uint64_t                renewals      = 0;
 	};
 
 	struct Memory {
@@ -119,7 +126,8 @@ private:
 	void     Unreference(Element& element);
 	Image*   ImageOf(const Element& element) const;
 	uint32_t Allocate();
-	void     Retire(View& view);
+	void     Retire(Pool& pool);
+	void     CollectPools();
 	void     Resize(Memory& memory, uint64_t size);
 	void     WriteDescriptors();
 
@@ -128,6 +136,9 @@ private:
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
+	std::vector<std::unique_ptr<Pool>>   m_pools;
+	std::vector<Pool*>                   m_active_pools;
+	std::vector<uint8_t>                 m_buried;
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
 	std::vector<Element>                 m_elements;

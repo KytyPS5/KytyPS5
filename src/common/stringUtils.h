@@ -11,35 +11,22 @@
 #include <locale>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
 namespace Common {
 
 inline std::string PathToString(const std::filesystem::path& path) {
-#if defined(__cpp_char8_t)
 	auto u8 = path.u8string();
 	return {u8.begin(), u8.end()};
-#else
-	return path.u8string();
-#endif
 }
 
 inline std::string PathToGenericString(const std::filesystem::path& path) {
-#if defined(__cpp_char8_t)
 	auto u8 = path.generic_u8string();
 	return {u8.begin(), u8.end()};
-#else
-	return path.generic_u8string();
-#endif
 }
 
 inline std::filesystem::path PathFromUtf8(std::string_view text) {
-#if defined(__cpp_char8_t)
 	return std::filesystem::path(std::u8string(text.begin(), text.end()));
-#else
-	return std::filesystem::u8path(text.begin(), text.end());
-#endif
 }
 
 inline bool EqualNoCase(std::string_view lhs, std::string_view rhs) {
@@ -68,13 +55,6 @@ inline std::string Mid(std::string_view text, size_t first, size_t count = std::
 		return {};
 	}
 	return std::string(text.substr(first, count));
-}
-
-inline std::string RemoveLast(std::string_view text, size_t count) {
-	if (count >= text.size()) {
-		return {};
-	}
-	return std::string(text.substr(0, text.size() - count));
 }
 
 inline std::string RemoveFirst(std::string_view text, size_t count) {

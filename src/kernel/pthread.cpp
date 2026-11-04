@@ -32,9 +32,6 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #if defined(_M_X64) || defined(__x86_64__)
 #include <intrin.h>
 #endif

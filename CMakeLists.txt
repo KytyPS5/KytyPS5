@@ -80,17 +80,8 @@ endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
-include(TestBigEndian)
-
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 	message(FATAL_ERROR "only 64-bit builds are supported")
-endif()
-
-test_big_endian(BIG_ENDIAN)
-if(BIG_ENDIAN)
-	set(KYTY_ENDIAN KYTY_ENDIAN_BIG)
-else()
-	set(KYTY_ENDIAN KYTY_ENDIAN_LITTLE)
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)

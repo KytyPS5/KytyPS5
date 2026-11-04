@@ -151,18 +151,6 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
-            <!--
-            <item row="3" column="0">
-             <widget class="QLabel" name="label_shader_optimization">
-              <property name="text"><string>Shader optimization:</string></property>
-             </widget>
-            </item>
-            <item row="3" column="1">
-             <widget class="QComboBox" name="comboBox_shader_optimization_type">
-              <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
-             </widget>
-            </item>
-            -->
             <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>

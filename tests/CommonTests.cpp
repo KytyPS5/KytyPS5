@@ -1,9 +1,11 @@
 #include "FileTimeTestUtil.h"
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
+#include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -181,6 +184,12 @@ TEST(Log, FileGetsPlainTextAndTheConsoleGetsEachLineOnce) {
 		    std::_Exit(file_ok && console_ok && silent_ok ? 0 : 1);
 	    },
 	    testing::ExitedWithCode(0), "");
+}
+
+TEST(StringUtils, PathRoundTripsUtf8) {
+	constexpr std::string_view Utf8 = "dir/\xc3\xa9-\xe6\x97\xa5.bin";
+	EXPECT_EQ(Common::PathToString(Common::PathFromUtf8(Utf8)), Utf8);
+	EXPECT_EQ(Common::PathToGenericString(Common::PathFromUtf8(Utf8)), Utf8);
 }
 
 TEST(Thread, MutexIsRecursiveAndCondVarTimesOutOrWakes) {

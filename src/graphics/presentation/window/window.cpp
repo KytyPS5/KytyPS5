@@ -918,13 +918,7 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
 
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	static constexpr auto build_type = "Debug";
-#elif KYTY_BUILD == KYTY_BUILD_RELEASE
-	static constexpr auto build_type = "Release";
-#else
-	static constexpr auto build_type = "Unknown";
-#endif
+	static constexpr auto build_type = KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release";
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(

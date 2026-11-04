@@ -1,7 +1,6 @@
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/dateTime.h"
-#include "common/debug.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -14,34 +13,15 @@
 #include <filesystem>
 #include <string_view>
 #include <vector>
-#include <fmt/format.h>
 #include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;
 
-static std::string GetBuildString() {
-	Date date = Date::FromMacros(std::string(__DATE__));
-
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	std::string type = "Debug";
-#elif KYTY_BUILD == KYTY_BUILD_RELEASE
-	std::string type = "Release";
-#else
-	std::string type = "????";
-#endif
-
-	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
-
-	std::string str =
-	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
-	                KYTY_VERSION, KYTY_GIT_VERSION, date.ToString().c_str());
-
-	return str;
-}
-
 static void PrintUsage() {
-	::printf("%s\n", GetBuildString().c_str());
+	::printf("%s, %s, ver = %s, git = %s, date = %s\n",
+	         KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release", KYTY_TOOLCHAIN, KYTY_VERSION,
+	         KYTY_GIT_VERSION, __DATE__);
 	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
@@ -88,7 +68,6 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
-	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -399,11 +378,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
-				return false;
-			}
-		} else if (arg == "--shader-optimization-type") {
-			if (!ParseEnum(value, options.config.shader_optimization_type)) {
-				::printf("invalid shader optimization type: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-log-direction") {

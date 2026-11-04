@@ -8,9 +8,6 @@
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h> // IWYU pragma: keep
 // clang-format off
 #include <psapi.h>

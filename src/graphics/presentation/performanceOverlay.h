@@ -19,6 +19,11 @@ void TogglePerformanceOverlayDetails() noexcept;
 
 // Changes when the panel needs a repaint without a guest flip (toggled, or the guest stalled).
 [[nodiscard]] uint64_t PerformanceOverlayRevision() noexcept;
+// Asks for a repaint without a guest flip, e.g. after mouse input on the panel.
+void RequestPerformanceOverlayRepaint() noexcept;
+
+// Whether the shown panel covers (x, y), in window pixels. Safe to call from any thread.
+[[nodiscard]] bool PerformanceOverlayContains(float x, float y) noexcept;
 
 // Must run between ImGui::NewFrame() and ImGui::Render(), on the present thread while the
 // graphics subsystem is alive. Draws in the top-right corner and returns the panel's bottom

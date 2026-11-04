@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "imgui.h"
 #include "kernel/memory.h"
 
@@ -11,13 +12,18 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -54,7 +60,12 @@ struct FrameWindow {
 	uint32_t                         guest_height = 0;
 	Clock::time_point                last_flip    = {};
 	Clock::time_point                window_start = {};
+	bool                             recording    = false;
+	std::vector<float>               recorded_ms;
 };
+
+constexpr size_t MAX_RECORDED_FRAMES  = size_t {1} << 20;
+constexpr size_t MAX_RECORDED_SAMPLES = 3600; // One hour of refreshes.
 
 // Shown values, recomputed once per refresh interval.
 struct Snapshot {
@@ -91,6 +102,60 @@ Common::HostStats           g_host_stats;
 uint64_t                    g_host_generation = 0;
 std::condition_variable_any g_sampler_wait;
 std::jthread                g_sampler;
+
+// Panel bounds, written by the present thread and hit-tested by the event thread.
+std::mutex g_panel_mutex;
+ImVec2     g_panel_min;
+ImVec2     g_panel_max;
+
+constexpr ImU32 SELECTION       = IM_COL32(70, 130, 230, 110);
+constexpr auto  STATUS_DURATION = std::chrono::seconds(2);
+
+// A line of the panel that can be selected and copied as text.
+struct TextLine {
+	std::string text;
+	ImVec2      min;
+	ImVec2      max;
+	std::string field; // "Section / Label" of a row that can be recorded alone, else empty.
+	std::string value;
+};
+
+// Lines are selected by index, from the anchor (where the press began) to the current line.
+struct Selection {
+	int  anchor   = -1;
+	int  current  = -1;
+	bool dragging = false;
+};
+
+// Present thread only.
+std::vector<TextLine> g_lines;
+std::string           g_section; // Title of the section being drawn.
+Selection             g_selection;
+std::string           g_status;
+Clock::time_point     g_status_time {};
+// Set while the sections are written to JSON instead of drawn.
+nlohmann::ordered_json* g_export         = nullptr;
+nlohmann::ordered_json* g_export_section = nullptr;
+
+bool LineSelected(size_t index) {
+	if (g_selection.anchor < 0) {
+		return false;
+	}
+	const auto first = static_cast<size_t>(std::min(g_selection.anchor, g_selection.current));
+	const auto last  = static_cast<size_t>(std::max(g_selection.anchor, g_selection.current));
+	return index >= first && index <= last;
+}
+
+// Registers the last drawn item as a selectable line outside a table.
+void AddItemLine(std::string text, std::string field = {}) {
+	const ImVec2 min = ImGui::GetItemRectMin();
+	const ImVec2 max = ImGui::GetItemRectMax();
+	if (LineSelected(g_lines.size())) {
+		ImGui::GetWindowDrawList()->AddRectFilled(min, max, SELECTION);
+	}
+	std::string value = field.empty() ? std::string() : text;
+	g_lines.push_back({std::move(text), min, max, std::move(field), std::move(value)});
+}
 
 void SetOverlayEnabled(bool enabled) {
 	{
@@ -197,9 +262,32 @@ std::string Percent(std::optional<double> value) {
 	return buffer;
 }
 
+std::string_view TrimLabel(const char* label) {
+	std::string_view name(label);
+	name.remove_prefix(std::min(name.find_first_not_of(' '), name.size()));
+	return name;
+}
+
+void ExportRow(const char* label, const std::string& value) {
+	const auto  name = TrimLabel(label);
+	std::string key(name);
+	for (int i = 2; g_export_section->contains(key); i++) {
+		key = std::string(name) + " (" + std::to_string(i) + ")";
+	}
+	(*g_export_section)[key] = value;
+}
+
 void Row(const char* label, const std::string& value, std::optional<ImU32> color = std::nullopt) {
+	if (g_export_section != nullptr) {
+		ExportRow(label, value);
+		return;
+	}
 	ImGui::TableNextRow();
+	if (LineSelected(g_lines.size())) {
+		ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, SELECTION);
+	}
 	ImGui::TableNextColumn();
+	const ImVec2 min = ImGui::GetCursorScreenPos();
 	ImGui::TextDisabled("%s", label);
 	ImGui::TableNextColumn();
 	if (color) {
@@ -207,6 +295,9 @@ void Row(const char* label, const std::string& value, std::optional<ImU32> color
 	} else {
 		ImGui::TextUnformatted(value.c_str());
 	}
+	const std::string name(TrimLabel(label));
+	g_lines.push_back({std::string(label) + ": " + value, min, ImGui::GetItemRectMax(),
+	                   g_section.empty() ? name : g_section + " / " + name, value});
 }
 
 [[gnu::format(printf, 1, 2)]] std::string Fmt(const char* format, ...) {
@@ -219,8 +310,20 @@ void Row(const char* label, const std::string& value, std::optional<ImU32> color
 }
 
 bool BeginSection(const char* title) {
+	if (g_export != nullptr) {
+		g_export_section = &(*g_export)[title];
+		return true;
+	}
 	ImGui::SeparatorText(title);
+	AddItemLine(std::string("--- ") + title + " ---");
+	g_section = title;
 	return ImGui::BeginTable(title, 2, TABLE_FLAGS);
+}
+
+void EndSection() {
+	if (g_export == nullptr) {
+		ImGui::EndTable();
+	}
 }
 
 void DrawFrameGraph(const std::array<float, FRAME_HISTORY>& history, size_t count, float width,
@@ -428,7 +531,7 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 		    Fmt("%llu  (dropped %llu)",
 		        static_cast<unsigned long long>(Total(shown, Counter::SwapchainRecreations)),
 		        static_cast<unsigned long long>(Total(shown, Counter::DroppedPresents))));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("CPU")) {
 		Row("Emulator",
@@ -461,7 +564,7 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 		    Fmt("%.0f/s  (%llu total)", unresolved,
 		        static_cast<unsigned long long>(Total(shown, Counter::UnresolvedImportCalls))),
 		    unresolved > 0.0 ? MEDIUM : GOOD);
-		ImGui::EndTable();
+		EndSection();
 	}
 }
 
@@ -501,7 +604,7 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
 		CompilationRows(shown);
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("GPU memory")) {
 		if (shown.device_memory) {
@@ -524,7 +627,7 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		TransferRow(shown, "Buffer transfers", Counter::BufferUploadBytes,
 		            Counter::BufferDownloadBytes);
 		Row("Buffer evictions", Fmt("%.0f/s", Rate(shown, Counter::BufferEvictions)));
-		ImGui::EndTable();
+		EndSection();
 	}
 }
 
@@ -553,7 +656,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		        static_cast<unsigned long long>(guest.gpu_page_entries),
 		        static_cast<unsigned long long>(guest.gpu_page_entries_total)),
 		    LevelColor(static_cast<double>(percent), 90, 100));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("Emulator process")) {
 		Row("Footprint", Bytes(host.process_memory));
@@ -564,7 +667,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		}
 		Row("File-backed", Bytes(host.process_file_backed));
 		Row("Address space", Bytes(host.process_virtual));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("System memory")) {
 		if (host.system_memory_used && host.system_memory_total) {
@@ -583,7 +686,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 			    *host.swap_used > (4ull << 30u) ? MEDIUM : GOOD);
 		}
 		Row("Pressure", PressureName(host.memory_pressure), PressureColor(host.memory_pressure));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("I/O & audio")) {
 		Row("Disk read / write", Throughput(host.disk_read_per_s.value_or(0.0)) + " / " +
@@ -596,7 +699,218 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		    Fmt("%.0f/s  (%llu total)", underruns,
 		        static_cast<unsigned long long>(Total(shown, Counter::AudioUnderruns))),
 		    underruns > 0.0 ? BAD : GOOD);
-		ImGui::EndTable();
+		EndSection();
+	}
+}
+
+double Round2(double value) {
+	return std::round(value * 100.0) / 100.0;
+}
+
+std::string Dump(const nlohmann::ordered_json& json) {
+	return json.dump(2, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+}
+
+// Writes the shown values into `json`, with the recent frame times when `history` is set.
+void ExportSnapshot(nlohmann::ordered_json& json, const Snapshot& shown,
+                    const GraphicContext& graphics, vk::Extent2D extent, bool history) {
+	// The compact panel shows a subset and does not sample guest memory, so export every
+	// section of the detailed one.
+	Snapshot full               = shown;
+	full.guest_memory           = LibKernel::Memory::GetDebugStats();
+	json["fps"]                 = Round2(shown.fps);
+	json["frame_ms"]            = Round2(shown.frame_ms);
+	json["worst_frame_ms"]      = Round2(shown.max_frame_ms);
+	json["one_percent_low_fps"] = Round2(shown.low_fps);
+	json["no_frames_s"]         = Round2(shown.stalled_s);
+	if (history) {
+		std::vector<double> frame_times;
+		for (size_t i = 0; i < shown.history_count; i++) {
+			frame_times.push_back(Round2(shown.history[i]));
+		}
+		json["frame_times_ms"] = frame_times;
+	}
+	auto sections = nlohmann::ordered_json::object();
+	g_export      = &sections;
+	DrawFramesAndCpu(full, extent);
+	DrawGpu(full, graphics);
+	DrawMemoryAndIo(full);
+	g_export         = nullptr;
+	g_export_section = nullptr;
+	json["sections"] = std::move(sections);
+}
+
+void SetStatus(std::string text) {
+	g_status      = std::move(text);
+	g_status_time = Clock::now();
+}
+
+// A recording keeps every frame time and one snapshot per refresh until it is stopped. A
+// recording of selected fields keeps only those lines' values per refresh.
+struct Recording {
+	bool                     active = false;
+	Clock::time_point        start {};
+	nlohmann::ordered_json   samples;
+	std::vector<std::string> fields;
+	bool                     fields_pending = false; // A refresh happened; sample drawn lines.
+};
+
+Recording g_recording; // Present thread only.
+
+void StartRecording(Clock::time_point now, std::vector<std::string> fields = {}) {
+	{
+		std::scoped_lock lock(g_frame_mutex);
+		g_frames.recording = fields.empty();
+		g_frames.recorded_ms.clear();
+	}
+	g_recording = {true, now, nlohmann::ordered_json::array(), std::move(fields), false};
+}
+
+double RecordingSeconds(Clock::time_point now) {
+	return std::chrono::duration<double>(now - g_recording.start).count();
+}
+
+// Names a field recording for buttons and status messages.
+std::string FieldsName(const std::vector<std::string>& fields) {
+	return fields.size() == 1 ? fields.front() : Fmt("%zu fields", fields.size());
+}
+
+void RecordFieldsSample(Clock::time_point now) {
+	nlohmann::ordered_json sample;
+	sample["t_s"] = Round2(RecordingSeconds(now));
+	for (const auto& field: g_recording.fields) {
+		const auto line = std::find_if(g_lines.begin(), g_lines.end(),
+		                               [&](const TextLine& line) { return line.field == field; });
+		// Null while the line is not shown, e.g. after switching to the compact panel.
+		sample[field] = line != g_lines.end() ? nlohmann::ordered_json(line->value) : nullptr;
+	}
+	g_recording.samples.push_back(std::move(sample));
+}
+
+void StopFieldsRecording(Clock::time_point now) {
+	const double           duration = RecordingSeconds(now);
+	nlohmann::ordered_json json;
+	json["fields"]     = g_recording.fields;
+	json["duration_s"] = Round2(duration);
+	json["samples"]    = std::move(g_recording.samples);
+	SetStatus(Fmt("Copied %.0f s of %s", duration, FieldsName(g_recording.fields).c_str()));
+	g_recording = {};
+	SetHostClipboardText(Dump(json));
+}
+
+// The recordable fields of the selected lines, once the selection is finished.
+std::vector<std::string> SelectedFields() {
+	std::vector<std::string> fields;
+	if (g_selection.dragging) {
+		return fields;
+	}
+	for (size_t i = 0; i < g_lines.size(); i++) {
+		const auto& field = g_lines[i].field;
+		if (LineSelected(i) && !field.empty() &&
+		    std::find(fields.begin(), fields.end(), field) == fields.end()) {
+			fields.push_back(field);
+		}
+	}
+	return fields;
+}
+
+void RecordSample(const Snapshot& shown, const GraphicContext& graphics, vk::Extent2D extent,
+                  Clock::time_point now) {
+	nlohmann::ordered_json sample;
+	sample["t_s"] = Round2(std::chrono::duration<double>(now - g_recording.start).count());
+	ExportSnapshot(sample, shown, graphics, extent, false);
+	g_recording.samples.push_back(std::move(sample));
+}
+
+// Ends the recording and copies it with a summary of all its frames.
+void StopRecording(Clock::time_point now) {
+	if (!g_recording.fields.empty()) {
+		StopFieldsRecording(now);
+		return;
+	}
+	std::vector<float> frames;
+	{
+		std::scoped_lock lock(g_frame_mutex);
+		g_frames.recording = false;
+		frames.swap(g_frames.recorded_ms);
+	}
+	const double duration = std::chrono::duration<double>(now - g_recording.start).count();
+	double       total_ms = 0.0;
+	for (const float ms: frames) {
+		total_ms += ms;
+	}
+	nlohmann::ordered_json summary;
+	summary["frames"] = frames.size();
+	if (!frames.empty()) {
+		const double average = total_ms / static_cast<double>(frames.size());
+		auto         sorted  = frames;
+		const auto   low = sorted.begin() + static_cast<std::ptrdiff_t>(sorted.size() * 99 / 100);
+		std::nth_element(sorted.begin(), low, sorted.end());
+		summary["avg_fps"]             = Round2(average > 0.0 ? 1000.0 / average : 0.0);
+		summary["avg_frame_ms"]        = Round2(average);
+		summary["one_percent_low_fps"] = Round2(*low > 0.0f ? 1000.0 / *low : 0.0);
+		summary["worst_frame_ms"]      = Round2(*std::max_element(frames.begin(), frames.end()));
+	}
+	std::vector<double> frame_times;
+	frame_times.reserve(frames.size());
+	for (const float ms: frames) {
+		frame_times.push_back(Round2(ms));
+	}
+	nlohmann::ordered_json json;
+	json["duration_s"]     = Round2(duration);
+	json["summary"]        = std::move(summary);
+	json["frame_times_ms"] = std::move(frame_times);
+	json["samples"]        = std::move(g_recording.samples);
+	g_recording            = {};
+	SetHostClipboardText(Dump(json));
+	SetStatus(Fmt("Copied %.0f s recording", duration));
+}
+
+void CopySelection() {
+	std::string text;
+	int         count = 0;
+	for (size_t i = 0; i < g_lines.size(); i++) {
+		if (LineSelected(i)) {
+			text += (count++ == 0 ? "" : "\n") + g_lines[i].text;
+		}
+	}
+	SetHostClipboardText(std::move(text));
+	SetStatus(count == 1 ? std::string("Copied 1 line") : Fmt("Copied %d lines", count));
+}
+
+int LineAt(ImVec2 point) {
+	const ImVec2 slack = ImGui::GetStyle().ItemSpacing;
+	for (size_t i = 0; i < g_lines.size(); i++) {
+		const auto& line = g_lines[i];
+		if (point.y >= line.min.y && point.y < line.max.y + slack.y &&
+		    point.x >= line.min.x - slack.x && point.x <= line.max.x + slack.x) {
+			return static_cast<int>(i);
+		}
+	}
+	return -1;
+}
+
+// Pressing on a line and dragging selects the lines in between; releasing copies them.
+void UpdateSelection() {
+	const auto count = static_cast<int>(g_lines.size());
+	if (g_selection.anchor >= count || g_selection.current >= count) {
+		g_selection = {};
+	}
+	const ImVec2 mouse = ImGui::GetIO().MousePos;
+	if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered() &&
+	    !ImGui::IsAnyItemHovered()) {
+		const int line = LineAt(mouse);
+		g_selection    = {line, line, line >= 0};
+	}
+	if (!g_selection.dragging) {
+		return;
+	}
+	if (const int line = LineAt(mouse); line >= 0) {
+		g_selection.current = line;
+	}
+	if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+		g_selection.dragging = false;
+		CopySelection();
 	}
 }
 
@@ -618,6 +932,9 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 		frames.next                      = (frames.next + 1) % FRAME_HISTORY;
 		frames.count                     = std::min(frames.count + 1, FRAME_HISTORY);
 		frames.max_ms                    = std::max(frames.max_ms, ms);
+		if (frames.recording && frames.recorded_ms.size() < MAX_RECORDED_FRAMES) {
+			frames.recorded_ms.push_back(ms);
+		}
 	}
 	frames.last_flip    = now;
 	frames.guest_width  = guest_width;
@@ -648,6 +965,18 @@ uint64_t PerformanceOverlayRevision() noexcept {
 	return g_revision.load(std::memory_order_acquire);
 }
 
+void RequestPerformanceOverlayRepaint() noexcept {
+	g_revision.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool PerformanceOverlayContains(float x, float y) noexcept {
+	if (!PerformanceOverlayEnabled()) {
+		return false;
+	}
+	std::scoped_lock lock(g_panel_mutex);
+	return x >= g_panel_min.x && x < g_panel_max.x && y >= g_panel_min.y && y < g_panel_max.y;
+}
+
 float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent) {
 	if (!PerformanceOverlayEnabled()) {
 		return 0.0f;
@@ -663,6 +992,10 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	if (generation != shown_generation) {
 		shown            = {};
 		shown_generation = generation;
+		g_recording      = {}; // Re-enabling the panel cleared the recorded frames.
+	}
+	if (details != shown_details) {
+		g_selection = {};
 	}
 	if (shown.sample_time == Clock::time_point {} || now - shown.sample_time >= REFRESH_INTERVAL ||
 	    details != shown_details) {
@@ -700,6 +1033,13 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			shown.low_fps = *percentile > 0.0f ? 1000.0 / *percentile : 0.0;
 		}
 		Refresh(shown, graphics, now, generation);
+		if (g_recording.active && g_recording.fields.empty()) {
+			RecordSample(shown, graphics, extent, now);
+			if (g_recording.samples.size() >= MAX_RECORDED_SAMPLES) {
+				StopRecording(now);
+			}
+		}
+		g_recording.fields_pending = g_recording.active && !g_recording.fields.empty();
 	}
 
 	const float scale = std::clamp(std::min(static_cast<float>(extent.width) / 1920.0f,
@@ -709,21 +1049,25 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	                        ImGuiCond_Always, {1.0f, 0.0f});
 	ImGui::SetNextWindowBgAlpha(details ? 0.82f : 0.72f);
 	constexpr ImGuiWindowFlags FLAGS =
-	    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-	    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-	    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
-	    ImGuiWindowFlags_AlwaysAutoResize;
+	    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove |
+	    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+	    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysAutoResize;
 	ImGui::PushFont(nullptr, (details ? 13.0f : 15.0f) * scale);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * scale);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10.0f * scale, 8.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f * scale, 2.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {4.0f * scale, 1.0f * scale});
 	if (ImGui::Begin("##kyty_performance_overlay", nullptr, FLAGS)) {
+		g_lines.clear();
+		g_section.clear();
 		if (shown.fps > 0.0) {
-			ImGui::TextColored(Color(FrameTimeColor(shown.frame_ms)), "%.1f FPS   %.1f ms",
-			                   shown.fps, shown.frame_ms);
+			const auto text = Fmt("%.1f FPS   %.1f ms", shown.fps, shown.frame_ms);
+			ImGui::TextColored(Color(FrameTimeColor(shown.frame_ms)), "%s", text.c_str());
+			AddItemLine(text, "FPS");
 		} else if (shown.stalled_s >= 1.0) {
-			ImGui::TextColored(Color(BAD), "No frames for %.0f s", shown.stalled_s);
+			const auto text = Fmt("No frames for %.0f s", shown.stalled_s);
+			ImGui::TextColored(Color(BAD), "%s", text.c_str());
+			AddItemLine(text);
 		} else {
 			ImGui::TextDisabled("Waiting for frames");
 		}
@@ -744,14 +1088,68 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 		} else {
 			DrawCompact(shown);
 		}
+		if (ImGui::SmallButton("Copy JSON")) {
+			nlohmann::ordered_json json;
+			ExportSnapshot(json, shown, graphics, extent, true);
+			SetHostClipboardText(Dump(json));
+			SetStatus("Copied JSON");
+		}
+		if (g_recording.fields_pending) {
+			g_recording.fields_pending = false;
+			RecordFieldsSample(now);
+			if (g_recording.samples.size() >= MAX_RECORDED_SAMPLES) {
+				StopRecording(now);
+			}
+		}
+		ImGui::SameLine();
+		// "###" keeps a button's id while its label counts up.
+		if (g_recording.active) {
+			const double elapsed = RecordingSeconds(now);
+			const auto   label   = g_recording.fields.empty()
+			                           ? Fmt("Stop and copy stats JSON (%.0f s)###record", elapsed)
+			                           : Fmt("Stop and copy %s (%.0f s)###record",
+			                                 FieldsName(g_recording.fields).c_str(), elapsed);
+			if (ImGui::SmallButton(label.c_str())) {
+				StopRecording(now);
+			}
+		} else {
+			if (ImGui::SmallButton("Record stats###record")) {
+				StartRecording(now);
+			}
+			ImGui::SetItemTooltip("Records every frame time and a snapshot of all overlay stats "
+			                      "each second, then copies them as JSON when stopped");
+			if (auto fields = SelectedFields(); !fields.empty()) {
+				ImGui::SameLine();
+				if (ImGui::SmallButton(
+				        Fmt("Record %s###record_fields", FieldsName(fields).c_str()).c_str())) {
+					StartRecording(now, std::move(fields));
+				}
+				ImGui::SetItemTooltip("Records the selected lines' values each second, then "
+				                      "copies them as JSON when stopped");
+			}
+		}
+		ImGui::SameLine();
+		if (!g_status.empty() && now - g_status_time < STATUS_DURATION) {
+			ImGui::TextColored(Color(GOOD), "%s", g_status.c_str());
+		} else {
 #if defined(__APPLE__)
-		ImGui::TextDisabled(details ? "Cmd+Shift+P compact   Cmd+P hide"
-		                            : "Cmd+Shift+P details   Cmd+P hide");
+			ImGui::TextDisabled(details ? "Cmd+Shift+P compact   Cmd+P hide"
+			                            : "Cmd+Shift+P details   Cmd+P hide");
 #else
-		ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide" : "Shift+F2 details   F2 hide");
+			ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide"
+			                            : "Shift+F2 details   F2 hide");
 #endif
+		}
+		UpdateSelection();
 	}
-	const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+	const ImVec2 position = ImGui::GetWindowPos();
+	const ImVec2 size     = ImGui::GetWindowSize();
+	{
+		std::scoped_lock lock(g_panel_mutex);
+		g_panel_min = position;
+		g_panel_max = {position.x + size.x, position.y + size.y};
+	}
+	const float bottom = position.y + size.y;
 	ImGui::End();
 	ImGui::PopStyleVar(4);
 	ImGui::PopFont();

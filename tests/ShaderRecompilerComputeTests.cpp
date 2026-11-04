@@ -216,6 +216,11 @@ struct RenderContextTestAccess {
   static uint64_t SuspendedMapCancels(const RenderContext &context) {
     return context.m_suspended_map_cancels.load();
   }
+
+  // Runs SuspendMemory's body directly, the way it runs when shutdown overtakes its own check.
+  static void SuspendNow(RenderContext &context, uint64_t vaddr, uint64_t size) {
+    context.SuspendNow(vaddr, size);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -5519,6 +5524,9 @@ public:
   enum class HostPageProtection { ReadOnly, ReadWrite, Other, Unknown };
 
   static constexpr uint64_t kSuspendAreaStride = 0x10000;
+  // Areas of the two late-shutdown suspend cases, clear of the areas 0 to 7 the others use.
+  static constexpr uint32_t kSuspendStoppingArea = 8;
+  static constexpr uint32_t kSuspendGoneArea = 9;
   // The cached buffer covers four tracker pages. The extra tail stays unwatched.
   static constexpr uint64_t kSuspendBufferSize = 0x4000;
   static constexpr uint64_t kSuspendRangeSize = 0x8000;
@@ -5886,6 +5894,19 @@ public:
             "a suspend with the GPU stopped kept the cache instead of invalidating it");
   }
 
+  // Shutdown can begin after SuspendMemory's own check, which then runs the suspend body with the
+  // GPU stopping or already gone. The body must then unmap exactly as a suspend at shutdown does.
+  void CheckSuspendBodyAtShutdown(const char *name, const SuspendRig &rig,
+                                  const SuspendSnapshot &baseline_unmapped, uint32_t area_index,
+                                  const char *stage) {
+    const auto area = rig.Area(area_index);
+    RenderContextTestAccess::SuspendNow(rig.context, area, kSuspendRangeSize);
+    Require(name, stage,
+            !rig.context.IsSuspended(area, kSuspendRangeSize) &&
+                TakeSuspendSnapshot(rig, area) == baseline_unmapped,
+            "a suspend body that ran during shutdown kept the cache instead of unmapping it");
+  }
+
   // Runs every suspend and resume case against a real direct-memory mapping. Where the host
   // cannot report page protection (Linux and macOS, a follow-up) the protection checks are skipped.
   void CheckBufferCacheSuspendResume() {
@@ -5925,9 +5946,18 @@ public:
     CheckSuspendMapSafetyNet(name, rig, baseline_mapped);
     CheckSuspendUnmapEndsSuspension(name, rig, baseline_unmapped);
     scheduler.Finish();
+    // Caching needs the GPU thread, so every shutdown case is primed before the GPU stops.
     PrimeCleanSuspendBuffer(name, rig, rig.Area(7));
+    PrimeCleanSuspendBuffer(name, rig, rig.Area(kSuspendStoppingArea));
+    PrimeCleanSuspendBuffer(name, rig, rig.Area(kSuspendGoneArea));
+    // The guest GPU stops first while RenderContext still owns it, as during ShutdownGpu.
+    context.GetGpu().Shutdown();
+    CheckSuspendBodyAtShutdown(name, rig, baseline_unmapped, kSuspendStoppingArea,
+                               "suspend body with the GPU stopping is an unmap");
     context.ShutdownGpu();
     CheckSuspendAtShutdown(name, rig, baseline_unmapped);
+    CheckSuspendBodyAtShutdown(name, rig, baseline_unmapped, kSuspendGoneArea,
+                               "suspend body with the GPU gone is an unmap");
     context.UnmapMemory(base, allocation_size);
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,

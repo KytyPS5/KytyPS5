@@ -152,17 +152,20 @@ void RenderContext::DrainBeforeUnmap(uint64_t vaddr, uint64_t size) {
 
 // Unmaps a range and fully invalidates its caches, including any suspension over it.
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
-	RunMemoryOperation("unmap", vaddr, size, [this, vaddr, size] {
-		DrainBeforeUnmap(vaddr, size);
-		m_buffer_cache.InvalidateMemory(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
-		m_image_heap.UnmapMemory(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-		// Nothing is suspended unless a release was suspended earlier, so this is usually a no-op.
-		// The invalidate above already covered any suspended cache here.
-		m_suspended.Subtract(vaddr, size);
-	});
+	RunMemoryOperation("unmap", vaddr, size, [this, vaddr, size] { UnmapNow(vaddr, size); });
+}
+
+// The body of UnmapMemory, shared with a suspend that finds shutdown already under way.
+void RenderContext::UnmapNow(uint64_t vaddr, uint64_t size) {
+	DrainBeforeUnmap(vaddr, size);
+	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.UnmapMemory(vaddr, size);
+	m_image_heap.UnmapMemory(vaddr, size);
+	std::lock_guard lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.Subtract(vaddr, size);
+	// Nothing is suspended unless a release was suspended earlier, so this is usually a no-op.
+	// The invalidate above already covered any suspended cache here.
+	m_suspended.Subtract(vaddr, size);
 }
 
 // Unmaps a range like UnmapMemory but keeps its buffer cache valid for a later exact resume.
@@ -172,16 +175,26 @@ void RenderContext::SuspendMemory(uint64_t vaddr, uint64_t size) {
 		UnmapMemory(vaddr, size);
 		return;
 	}
-	RunMemoryOperation("suspend", vaddr, size, [this, vaddr, size] {
-		DrainBeforeUnmap(vaddr, size);
-		// The host view is about to go away, so GPU-written bytes must reach it first.
-		m_buffer_cache.FlushGpuDirtyForSuspend(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
-		m_image_heap.UnmapMemory(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-		m_suspended.Add(vaddr, size);
-	});
+	RunMemoryOperation("suspend", vaddr, size, [this, vaddr, size] { SuspendNow(vaddr, size); });
+}
+
+// The body of SuspendMemory. Shutdown can begin after SuspendMemory's own check. The body then
+// runs on the calling thread with the GPU stopping or already gone, or on the GPU thread while
+// queued commands drain. A suspension during teardown is pointless and its waits are unsafe off
+// the GPU thread, so in every such case it unmaps the way UnmapMemory does.
+void RenderContext::SuspendNow(uint64_t vaddr, uint64_t size) {
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		UnmapNow(vaddr, size);
+		return;
+	}
+	DrainBeforeUnmap(vaddr, size);
+	// The host view is about to go away, so GPU-written bytes must reach it first.
+	m_buffer_cache.FlushGpuDirtyForSuspend(vaddr, size);
+	m_texture_cache.UnmapMemory(vaddr, size);
+	m_image_heap.UnmapMemory(vaddr, size);
+	std::lock_guard lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.Subtract(vaddr, size);
+	m_suspended.Add(vaddr, size);
 }
 
 // Maps a suspended range back after the same memory was mapped at the same address read-write.

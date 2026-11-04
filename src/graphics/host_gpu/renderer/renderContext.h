@@ -81,6 +81,10 @@ private:
 	void RunMemoryOperation(const char* name, uint64_t vaddr, uint64_t size,
 	                        Common::UniqueFunction<void>&& operation);
 	void DrainBeforeUnmap(uint64_t vaddr, uint64_t size);
+	// Drains, invalidates and unmaps a range. Runs as a memory operation or on the shutdown route.
+	void UnmapNow(uint64_t vaddr, uint64_t size);
+	// Suspends a range, or unmaps it like UnmapNow once shutdown has begun.
+	void SuspendNow(uint64_t vaddr, uint64_t size);
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;

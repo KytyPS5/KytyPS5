@@ -1269,6 +1269,19 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	                   : PAD_ERROR_INVALID_ARG;
 }
 
+// Opens the port of a third-party controller chosen by vendor and product; none is ever connected.
+int KYTY_SYSV_ABI PadOpenExt(int user_id, int type, int index, const void* param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = 0x%016" PRIx64 "\n",
+	     user_id, type, index, reinterpret_cast<uint64_t>(param));
+
+	return PAD_ERROR_DEVICE_NOT_CONNECTED;
+}
+
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 	PRINT_NAME();
 

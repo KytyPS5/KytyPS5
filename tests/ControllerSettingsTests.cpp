@@ -211,8 +211,10 @@ void TestPadPortOwnership() {
 
 void TestSpecialPortWithoutDevice() {
 	Controller controller;
-	const int  user    = Config::GetUserId();
-	const int  special = PadOpen(user, 2, 0, nullptr);
+	const int user = Config::GetUserId();
+	Check(PadOpenExt(user, 2, 0, nullptr) == PAD_ERROR_DEVICE_NOT_CONNECTED,
+	      "a third-party controller port opened without a device");
+	const int special = PadOpen(user, 2, 0, nullptr);
 	Check(special > 1 && PadGetHandle(user, 2, 0) == special,
 	      "the special port did not open its own handle");
 	SetButton(1, PAD_BUTTON_CROSS, true);

@@ -453,9 +453,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
+	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "

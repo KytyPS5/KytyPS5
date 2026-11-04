@@ -247,6 +247,10 @@ void TestRandomizedDifferential() {
   }
 }
 
+/**
+ * Checks tracker-sized bitset mutations and range queries against a boolean
+ * array, the masked-copy predicate and the existing range-discovery predicate.
+ */
 void TestTrackerSizedRandomizedDifferential() {
   using TrackerBits = Common::BitArray<1024>;
   TrackerBits bits;
@@ -316,6 +320,10 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+/**
+ * Checks every endpoint pair for boundary and density patterns against an
+ * independent prefix-count oracle, including invalid and empty ranges.
+ */
 template <size_t N>
 void TestAnyInRange() {
   using Array = Common::BitArray<N>;
@@ -351,6 +359,10 @@ void TestAnyInRange() {
   }
 }
 
+/**
+ * Verifies constant evaluation of cross-word hits, excluded boundary bits
+ * and empty or invalid ranges.
+ */
 constexpr bool TestConstexprAnyInRange() {
   Common::BitArray<128> bits;
   bits.Set(63);

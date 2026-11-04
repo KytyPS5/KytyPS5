@@ -155,6 +155,11 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	/**
+	 * Returns whether any bit is set in the half-open range [start, end).
+	 * Empty, reversed and out-of-bounds ranges return false. Only words
+	 * intersecting the range are read; the bit array is not modified.
+	 */
 	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
 		if (start >= end || end > N) {
 			return false;

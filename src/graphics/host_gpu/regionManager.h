@@ -89,6 +89,11 @@ public:
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
+	/**
+	 * Marks or clears the pages intersecting the byte range and updates their
+	 * host protection. The caller must hold lock. A CPU-dirty transition that
+	 * overlaps GPU-dirty pages terminates with a conflicting-state error.
+	 */
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t offset, uint64_t size) {
 		const auto [start, end] = GetPageRange(offset, size);

@@ -1516,6 +1516,61 @@ void CheckSubmitCadenceGpuLag() {
           "a held submit should come due at the next draw and go through once the GPU catches up");
 }
 
+// Runs packet boundaries until one comes due, and returns how many ran, or limit + 1 if none did.
+uint32_t BoundariesUntilDue(SubmitCadence &cadence, uint32_t limit) {
+  for (uint32_t count = 1; count <= limit; ++count) {
+    if (cadence.DueAtBoundary()) {
+      return count;
+    }
+  }
+  return limit + 1;
+}
+
+// T0f. A draw followed only by state packets still submits once the interval passes, without
+// waiting for another draw, on the first clock read of a boundary stride. Before any work or
+// after a hold, boundaries do not come due on time alone.
+void CheckSubmitCadenceBoundary() {
+  constexpr const char *name = "SubmitCadence";
+  // A whole number of strides, so each run of boundaries ends on a clock read and the stride
+  // count starts over for the exact check below.
+  constexpr uint32_t many = 2 * SubmitCadenceBoundaryStride;
+  auto idle = MakeTestCadence(true, SubmitCadenceInterval);
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "boundaries with no work are not due", BoundariesUntilDue(idle, many) > many,
+          "an empty command buffer should never submit early");
+  // NoteWork records nothing with the flag off, so this rests on the same gate as the case above.
+  auto off = MakeTestCadence(false, SubmitCadenceInterval);
+  off.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "boundaries with the flag off are not due", BoundariesUntilDue(off, many) > many,
+          "the flag-off policy should never ask for a submit");
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  Require(name, "boundaries before the interval are not due",
+          BoundariesUntilDue(cadence, many) > many,
+          "a submit should not come due before the interval passes");
+  // No draw follows, so only a boundary check can make this due, at the next clock read.
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "a boundary stride after the interval is due without a draw",
+          BoundariesUntilDue(cadence, many) == SubmitCadenceBoundaryStride &&
+              cadence.ShouldSubmit(0),
+          "state packets after the last draw should submit at the next stride's clock read");
+  auto held = MakeTestCadence(true, SubmitCadenceInterval);
+  held.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "a lagging GPU holds the boundary submit",
+          BoundariesUntilDue(held, many) <= SubmitCadenceBoundaryStride &&
+              !held.ShouldSubmit(SubmitCadenceMaxGpuLag),
+          "a boundary submit should be held back like a draw's");
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "a held submit waits for the next draw", BoundariesUntilDue(held, many) > many,
+          "boundaries after a hold should not poll a lagging GPU");
+  // The kept start time makes the next draw due at once.
+  held.NoteWork();
+  Require(name, "the next draw re-arms after a boundary hold", held.DueAtBoundary(),
+          "a held submit should come due again at the next draw");
+}
+
 // Covers the pure submit cadence policy, which needs no GPU.
 void CheckSubmitCadenceLogic() {
   CheckSubmitCadenceFlag();
@@ -1523,6 +1578,7 @@ void CheckSubmitCadenceLogic() {
   CheckSubmitCadenceIdleStart();
   CheckSubmitCadenceReset();
   CheckSubmitCadenceGpuLag();
+  CheckSubmitCadenceBoundary();
   CheckSubmitCadenceLagMath();
   std::printf("[host]    %-32s ok\n", "SubmitCadence");
 }
@@ -12496,6 +12552,26 @@ public:
     Require(CadenceTestName, "a true argument turns it on",
             CommandSchedulerTestAccess::CadenceEnabled(asked),
             "the baseline scheduler built with the cadence is not enabled");
+    // A draw followed only by packet boundaries must still submit once the interval passes, so
+    // the scheduler has to ask the policy at every boundary, not only when work is noted.
+    CommandSchedulerTestAccess::SetCadence(asked, MakeTestCadence(true, SubmitCadenceInterval));
+    asked.NoteRecordedWork();
+    const auto boundaries_until_submit = [&asked](uint32_t limit) {
+      for (uint32_t count = 1; count <= limit; ++count) {
+        if (asked.TakeCadenceSubmit()) {
+          return count;
+        }
+      }
+      return limit + 1;
+    };
+    constexpr uint32_t many = 2 * SubmitCadenceBoundaryStride;
+    Require(CadenceTestName, "boundaries before the interval do not submit",
+            boundaries_until_submit(many) > many,
+            "the scheduler submitted before the interval passed");
+    g_cadence_now += SubmitCadenceInterval;
+    Require(CadenceTestName, "a later boundary submits without another draw",
+            boundaries_until_submit(many) <= SubmitCadenceBoundaryStride,
+            "the scheduler waited for another draw to notice the interval had passed");
   }
 
   // T1. Each dispatch makes a submit due and the next packet boundary submits it.

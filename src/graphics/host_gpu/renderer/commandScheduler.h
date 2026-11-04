@@ -48,10 +48,12 @@ public:
 	/// Returns whether the submit cadence is on, which makes scheduler ticks much faster than
 	/// frames.
 	[[nodiscard]] bool SubmitCadenceEnabled() const noexcept { return m_cadence.Enabled(); }
-	/// Returns whether the PM4 loop should submit the current command buffer now. The inline gate
-	/// is one branch while nothing is due, so the GPU progress is read only after the time gate
-	/// passed.
-	[[nodiscard]] bool TakeCadenceSubmit() { return m_cadence.Due() && TakeDueCadenceSubmit(); }
+	/// Returns whether the PM4 loop should submit the current command buffer now. While nothing is
+	/// due the inline gate reads at most the clock, once per boundary stride, so the GPU progress
+	/// is read only after the time gate passed.
+	[[nodiscard]] bool TakeCadenceSubmit() {
+		return m_cadence.DueAtBoundary() && TakeDueCadenceSubmit();
+	}
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }

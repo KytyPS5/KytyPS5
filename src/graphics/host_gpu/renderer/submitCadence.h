@@ -13,6 +13,9 @@ inline constexpr std::chrono::microseconds SubmitCadenceInterval {1000};
 // When this many submits are still running, the GPU already has work queued, so an extra submit
 // only adds command buffers in flight without letting the GPU start any sooner.
 inline constexpr uint64_t SubmitCadenceMaxGpuLag = 2;
+// Packet boundaries read the clock only once per this many, because state packets far outnumber
+// draws. A due submit is then late by at most this many packets, which is microseconds.
+inline constexpr uint32_t SubmitCadenceBoundaryStride = 32;
 
 /// Decides when the GPU thread should submit the command buffer it is recording. It holds no
 /// Vulkan state, so the policy can be tested without a device. Used on the GPU thread only.
@@ -29,8 +32,9 @@ public:
 
 	/// Records that a draw or dispatch went into the current command buffer. The clock is read
 	/// only while the flag is on and no submit is due yet, so the off path costs one branch. The
-	/// interval starts at the first piece of work, so idle time before it does not count. Only
-	/// this sets a submit due, so a command buffer with no draw or dispatch never submits early.
+	/// interval starts at the first piece of work, so idle time before it does not count. This and
+	/// DueAtBoundary set a submit due only after work was recorded, so a command buffer with no
+	/// draw or dispatch never submits early.
 	void NoteWork() {
 		if (!m_enabled || m_due) {
 			return;
@@ -40,7 +44,9 @@ public:
 			m_start = now;
 		}
 		m_work++;
-		m_due = now - m_start >= m_interval;
+		// The clock was just read, so the boundary stride can start over.
+		m_boundaries = 0;
+		m_due        = now - m_start >= m_interval;
 	}
 
 	/// Returns whether to submit now, given how many submitted command buffers the GPU has not
@@ -54,20 +60,39 @@ public:
 		}
 		if (gpu_lag >= SubmitCadenceMaxGpuLag) {
 			m_held_back++;
-			m_due = false;
+			m_held = true;
+			m_due  = false;
 			return false;
 		}
 		return true;
 	}
 
-	/// Returns whether a submit is due, before the GPU lag is checked. A caller uses it to skip
-	/// reading the GPU progress when nothing is due.
+	/// Returns whether a submit is due without reading the clock, for tests and diagnostics.
 	[[nodiscard]] bool Due() const { return m_due; }
+
+	/// Returns whether a submit is due at a PM4 packet boundary. Once the command buffer holds
+	/// work this also reads the clock once every SubmitCadenceBoundaryStride boundaries, so a long
+	/// run of state packets after the last draw still submits on time. Without work it reads
+	/// nothing, so the flag-off path is one branch. After a hold only the next draw re-arms it,
+	/// so a lagging GPU is not polled at every packet.
+	[[nodiscard]] bool DueAtBoundary() {
+		if (m_work == 0) {
+			return false;
+		}
+		if (!m_due && !m_held && ++m_boundaries >= SubmitCadenceBoundaryStride) {
+			m_boundaries = 0;
+			m_due        = m_now() - m_start >= m_interval;
+		}
+		return m_due;
+	}
 
 	/// Starts counting again for a new command buffer.
 	void Reset() {
-		m_work = 0;
-		m_due  = false;
+		m_work       = 0;
+		m_boundaries = 0;
+		m_due        = false;
+		// The work gate already covers a new buffer, so this only keeps the state clean.
+		m_held = false;
 	}
 
 	/// Returns and clears how many times a due submit was held back by GPU lag, for the debug
@@ -86,9 +111,13 @@ private:
 	Clock::duration   m_interval;
 	NowFunc           m_now;
 	Clock::time_point m_start {};
-	uint32_t          m_work      = 0;
-	bool              m_due       = false;
-	uint64_t          m_held_back = 0;
+	uint32_t          m_work = 0;
+	bool              m_due  = false;
+	// Set while a due submit is held back for GPU lag, until the next draw re-arms it.
+	bool m_held = false;
+	// Packet boundaries since the clock was last read.
+	uint32_t m_boundaries = 0;
+	uint64_t m_held_back  = 0;
 };
 
 } // namespace Libs::Graphics

@@ -6171,6 +6171,35 @@ public:
       Require(name, "dropped before discovery", balanced,
               "an element dropped before its discovery was resolved again "
               "after its index was reused");
+      write(table, 1536u, descriptor(12u));
+      Require(name, "past end shared",
+              acquire(table, 0u, sampled) && acquire(table, 32u, sampled),
+              "the views were declined");
+      draw();
+      const auto past_end = image(whole.slots[12288u]);
+      Require(name, "past end resolved",
+              past_end &&
+                  element(whole.slots[12288u]) ==
+                      element(shifted.slots[12288u]) &&
+                  textures.GetImage(past_end).heap_refs.load() == 1u,
+              "the past-end element was not resolved once for the pool");
+      Require(
+          name, "shrunk table",
+          heap.Acquire({table, table_size / 2u, 32u, 0u, 4u, &sampled}, view),
+          "the shrunk table was declined");
+      draw();
+      Require(name, "shrunk release",
+              textures.GetImage(past_end).heap_refs.load() == 0u,
+              "shrinking did not release the past-end slots of the two idle "
+              "views exactly once");
+      Require(name, "shrunk idle back",
+              acquire(table, 0u, sampled) && acquire(table, 32u, sampled),
+              "the idle views were declined");
+      draw();
+      Require(name, "shrunk reborn",
+              image(whole.slots[12288u]) == past_end &&
+                  textures.GetImage(past_end).heap_refs.load() == 1u,
+              "the regrown table did not re-resolve its past-end descriptor");
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);

@@ -30699,7 +30699,15 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
       {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
       {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
-      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
+      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u},
+      {0x00000000u, 0x00000002u, 0x00000001u, 0x00000001u},
+      {0x80000003u, 0x80000001u, 0x80000002u, 0x80000002u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x7f800001u, 0x7fc00000u, 0xffc05678u, 0xffc05678u},
+      {0xff800000u, 0x80000001u, 0x00000000u, 0x80000001u},
+      {0xffc05678u, 0x3f800000u, 0x40000000u, 0x3f800000u},
+      {0xff800001u, 0x40000000u, 0x3f800000u, 0x3f800000u},
+      {0x7fc01234u, 0x00000000u, 0x80000000u, 0x80000000u}};
   TestCase test;
   test.name = "VectorMed3F32NanUsesMin3Path";
   test.has_compute_info = true;
@@ -54077,6 +54085,12 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, test);
       }
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-med3-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(32));
+    RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {

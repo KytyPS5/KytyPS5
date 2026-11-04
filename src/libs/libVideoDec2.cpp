@@ -41,6 +41,7 @@ constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0
 
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
@@ -113,6 +114,7 @@ struct Videodec2FrameBuffer {
 };
 
 using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
+using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
 
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
@@ -544,7 +546,7 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		return OK;
 	};
 
-	if (output_info->codec_type == 1) {
+	if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_AVC) {
 		const auto requested_size = *static_cast<const size_t*>(first_picture_info);
 		if (requested_size != sizeof(Videodec2AvcPictureInfo) &&
 		    (requested_size | 16u) != sizeof(Videodec2AvcPictureInfo)) {
@@ -553,6 +555,12 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 
 		const auto picture = Decoder::MakeAvcPictureInfo(decoded, requested_size);
 		std::memcpy(first_picture_info, &picture, requested_size);
+	} else if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
+		auto* picture = static_cast<Videodec2Vp9PictureInfo*>(first_picture_info);
+		if (picture->this_size != sizeof(Videodec2Vp9PictureInfo)) {
+			return VIDEODEC2_ERROR_STRUCT_SIZE;
+		}
+		*picture = Decoder::MakeVp9PictureInfo(decoded);
 	} else {
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {

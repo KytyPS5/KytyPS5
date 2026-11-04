@@ -772,8 +772,8 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
+		     callback_data->pMessage);
 	}
 
 	if (!skip) {

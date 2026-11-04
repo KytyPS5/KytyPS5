@@ -1350,8 +1350,8 @@ void CheckUnicodeLogPath(const std::filesystem::path &root) {
   Config::Load(options);
   Log::Initialize();
   constexpr std::string_view Payload = "Unicode log path\n";
-  Log::Write(Payload);
-  Log::Shutdown();
+  Log::Write({}, Payload);
+  Log::Flush();
 
   Common::File result(options.printf_output_file, Common::File::Mode::Read);
   Check(!result.IsInvalid(), "open Unicode log file");

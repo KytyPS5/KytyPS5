@@ -1,11 +1,18 @@
 #include "FileTimeTestUtil.h"
+#include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/virtualMemory.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <string>
 #include <thread>
 
 namespace {
@@ -36,6 +43,24 @@ TEST(SysDbg, StackUsageReportsTheCallingThreadStackBase) {
 		EXPECT_NE(s.reserved_addr, 0u);
 		EXPECT_LT(s.reserved_addr, reinterpret_cast<uintptr_t>(&s));
 	}).join();
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr int FATAL_EXIT_STATUS = 321;
+#else
+// POSIX keeps the low 8 bits of the exit status.
+constexpr int FATAL_EXIT_STATUS = 321 & 0xff;
+#endif
+
+TEST(Assert, ExitMacrosEvaluateOnceAndExitWithTheFatalStatus) {
+	int evaluations = 0;
+	EXIT_IF(++evaluations == 0);
+	EXIT_NOT_IMPLEMENTED(++evaluations == 0);
+	EXPECT_EQ(evaluations, 2);
+
+	EXPECT_EXIT(EXIT_IF(evaluations == 2), testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+	EXPECT_EXIT(EXIT_NOT_IMPLEMENTED(true), testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+	EXPECT_EXIT(EXIT("%d\n", evaluations), testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
 }
 
 TEST(File, MissingFileStaysInvalidAndCreatedFileRoundTrips) {
@@ -107,6 +132,53 @@ TEST(File, GetTimesReportsExactNanoseconds) {
 	EXPECT_EQ(open_times->write_ns, WRITE_NS);
 	in.Close();
 	std::filesystem::remove(path);
+}
+
+std::string ReadAll(const std::filesystem::path& path) {
+	std::ifstream file(path, std::ios::binary);
+	return {std::istreambuf_iterator<char>(file), {}};
+}
+
+TEST(Log, FileGetsPlainTextAndTheConsoleGetsEachLineOnce) {
+	EXPECT_EXIT(
+	    {
+		    const auto dir =
+		        std::filesystem::temp_directory_path() /
+		        ("kyty_log_test_" +
+				 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+		    std::filesystem::create_directories(dir);
+		    const auto console_file = dir / "console.txt";
+		    std::freopen(console_file.string().c_str(), "wb", stdout);
+		    Log::Write({}, "p");
+		    const auto log_file = dir / "log.txt";
+		    std::ofstream(log_file) << "previous run";
+		    Config::Initialize();
+		    Config::ConfigOptions options;
+		    options.printf_direction   = Config::LogDirection::File;
+		    options.printf_output_file = log_file;
+		    Config::Load(options);
+		    Log::Initialize();
+		    Log::Write(Log::Color::Red, "a");
+		    Log::WriteToConsoleAndLog("b");
+		    Log::Flush();
+		    const bool file_ok = ReadAll(log_file) == "ab";
+
+		    options.printf_direction = Config::LogDirection::Console;
+		    Config::Load(options);
+		    Log::Initialize();
+		    Log::Write(Log::Color::Red, "c");
+		    Log::WriteToConsoleAndLog("d");
+		    const bool console_ok = ReadAll(console_file) == "pb\x1b[31mc\x1b[0md";
+
+		    options.printf_direction = Config::LogDirection::Silent;
+		    Config::Load(options);
+		    Log::Initialize();
+		    const bool      silent_ok = Log::IsSilent();
+		    std::error_code ec;
+		    std::filesystem::remove_all(dir, ec);
+		    std::_Exit(file_ok && console_ok && silent_ok ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
 }
 
 } // namespace

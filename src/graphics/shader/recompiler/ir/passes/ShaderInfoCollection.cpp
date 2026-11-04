@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {

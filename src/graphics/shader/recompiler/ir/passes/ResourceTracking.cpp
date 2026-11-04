@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>

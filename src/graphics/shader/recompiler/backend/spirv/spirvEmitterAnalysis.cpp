@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {

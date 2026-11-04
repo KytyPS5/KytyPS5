@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>

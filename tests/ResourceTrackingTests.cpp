@@ -9122,27 +9122,21 @@ int main() {
 // target links only fmt; keep assertion failures observable without widening
 // its focused build manifest.
 namespace Common {
-int DbgExitHandler(const char *, int, std::string_view text) {
+void DbgExitHandler(const char *, int, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
 
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
-  throw std::runtime_error(std::string(text));
-}
-
-int DbgExitIfHandler(const char *expression, const char *file, int line) {
+void DbgExitIfHandler(const char *expression, const char *file, int line) {
   throw std::runtime_error(std::string("typed IR assertion: ") + expression +
                            " at " + file + ':' + std::to_string(line));
 }
 
-int DbgNotImplementedHandler(const char *expression, const char *file,
-                             int line) {
+void DbgNotImplementedHandler(const char *expression, const char *file,
+                              int line) {
   throw std::runtime_error(std::string("typed IR not implemented: ") +
                            expression + " at " + file + ':' +
                            std::to_string(line));
 }
-
-void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 } // namespace Common
 
 // Keep this focused standalone target self-contained by amalgamating its small

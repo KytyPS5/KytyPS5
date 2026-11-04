@@ -1,7 +1,9 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
+#include <atomic>
 #include <barrier>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +36,7 @@ namespace {
 
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RegionBits;
+using Libs::Graphics::TRACKER_ADDRESS_SIZE;
 using Libs::Graphics::TRACKER_PAGE_SIZE;
 using Libs::Graphics::TRACKER_REGION_SIZE;
 
@@ -166,6 +169,9 @@ struct ProtectionCall {
 };
 std::vector<ProtectionCall> g_protection_ranges;
 std::mutex g_protection_log_mutex;
+// Lets a test hold a protect call open, to observe what waits for it to finish.
+std::atomic<bool> g_block_protection{false};
+std::atomic<bool> g_protection_entered{false};
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
@@ -180,6 +186,10 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     std::lock_guard lock(g_protection_log_mutex);
     g_protection_calls++;
     g_protection_ranges.push_back({vaddr, size});
+  }
+  g_protection_entered.store(true);
+  while (g_block_protection.load()) {
+    std::this_thread::yield();
   }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
@@ -577,8 +587,276 @@ void TestConcurrentSharedWatchers() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+constexpr uint32_t MAX_READBACK_HOLDS = 255;
+
+// A hold alone must block all access, count separately from a repeat hold, and restore access.
+void TestReadbackHoldBlocksAndCounts() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  g_protection_calls = 0;
+  manager.AddReadbackHold(address, page_size);
+  Check(g_protection_calls == 1 && Protection(memory) == PAGE_NOACCESS &&
+            IsWritable(memory + page_size),
+        "hold did not block exactly its own page");
+
+  g_protection_calls = 0;
+  manager.AddReadbackHold(address, page_size);
+  Check(g_protection_calls == 0, "repeat hold changed protection");
+  manager.RemoveReadbackHold(address, page_size);
+  Check(g_protection_calls == 0 && Protection(memory) == PAGE_NOACCESS,
+        "releasing one of two holds lifted the block");
+
+  manager.RemoveReadbackHold(address, page_size);
+  Check(g_protection_calls == 1 && IsWritable(memory),
+        "releasing the last hold did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// A write watch alone leaves a page readable, which is the baseline showing that the hold is what
+// blocks reads below. Each watcher must then release independently of the hold.
+void TestReadbackHoldWithWriteWatch() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "baseline write watch not read-only");
+
+  manager.AddReadbackHold(address, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS, "hold did not override a write watch");
+  manager.RemoveReadbackHold(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "hold release dropped the write watch");
+
+  manager.AddReadbackHold(address, page_size);
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS, "write unwatch dropped the hold");
+  manager.RemoveReadbackHold(address, page_size);
+  Check(IsWritable(memory), "last release did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// A read watch allows one owner per page, so a hold sharing its counter would overflow here. Each
+// release below leaves only the other owner, so the page staying blocked proves that one still
+// counts.
+void TestReadbackHoldWithReadWatch() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(TRACKER_REGION_SIZE * 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base = (base + TRACKER_REGION_SIZE - 1) & ~(TRACKER_REGION_SIZE - 1);
+  constexpr size_t page_index = 3;
+  const auto address = region_base + page_size * page_index;
+  auto *page = reinterpret_cast<uint8_t *>(address);
+  RegionBits read_mask;
+  read_mask.Set(page_index);
+
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_mask);
+  manager.AddReadbackHold(address, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_mask);
+  Check(Protection(page) == PAGE_NOACCESS, "read unwatch dropped the hold");
+
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_mask);
+  manager.RemoveReadbackHold(address, page_size);
+  Check(Protection(page) == PAGE_NOACCESS, "hold release dropped the read watch");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_mask);
+  Check(IsWritable(page), "last release did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// One protect call per contiguous run is what keeps holds affordable for multi-page results.
+void TestReadbackHoldBatchesContiguousPages() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr uint64_t page_count = 16;
+  auto *memory = Allocate(TRACKER_REGION_SIZE * 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  const auto address = (base + TRACKER_REGION_SIZE - 1) & ~(TRACKER_REGION_SIZE - 1);
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.AddReadbackHold(address, page_size * page_count);
+  Check(g_protection_calls == 1 && g_protection_ranges[0].address == address &&
+            g_protection_ranges[0].size == page_size * page_count,
+        "contiguous hold was not batched");
+  Check(Protection(reinterpret_cast<void *>(address + page_size * (page_count - 1))) ==
+            PAGE_NOACCESS,
+        "contiguous hold did not block its last page");
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.RemoveReadbackHold(address, page_size * page_count);
+  Check(g_protection_calls == 1 && g_protection_ranges[0].size == page_size * page_count,
+        "contiguous release was not batched");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Pages in one range can need different protection, which must split the runs. An already-held
+// page in the range needs no protect call of its own.
+void TestReadbackHoldOverMixedPages() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(TRACKER_REGION_SIZE * 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  const auto address = (base + TRACKER_REGION_SIZE - 1) & ~(TRACKER_REGION_SIZE - 1);
+  auto *pages = reinterpret_cast<uint8_t *>(address);
+  constexpr uint64_t page_count = 3;
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  manager.AddReadbackHold(address + page_size * 2, page_size);
+
+  g_protection_calls = 0;
+  manager.AddReadbackHold(address, page_size * page_count);
+  Check(g_protection_calls == 1 && Protection(pages) == PAGE_NOACCESS &&
+            Protection(pages + page_size) == PAGE_NOACCESS,
+        "mixed hold did not join its pages into one protect call");
+
+  g_protection_calls = 0;
+  manager.RemoveReadbackHold(address, page_size * page_count);
+  Check(g_protection_calls == 2 && Protection(pages) == PAGE_READONLY &&
+            IsWritable(pages + page_size) && Protection(pages + page_size * 2) == PAGE_NOACCESS,
+        "mixed release did not restore each page's own protection");
+
+  manager.RemoveReadbackHold(address + page_size * 2, page_size);
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// The whole count must be usable. The overflow death case only proves that some limit exists.
+void TestReadbackHoldFullCount() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  for (uint32_t count = 0; count < MAX_READBACK_HOLDS; count++) {
+    manager.AddReadbackHold(address, page_size);
+  }
+  for (uint32_t count = 0; count < MAX_READBACK_HOLDS - 1; count++) {
+    manager.RemoveReadbackHold(address, page_size);
+  }
+  Check(Protection(memory) == PAGE_NOACCESS, "hold count lost a hold");
+  manager.RemoveReadbackHold(address, page_size);
+  Check(IsWritable(memory), "releasing every hold did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// A fault may arrive while another thread is mid-protect. The answer has to wait for that call, or
+// it could report a page as allowed before its host protection has changed.
+void TestWatchersAllowAccessWaitsForProtect() {
+  using Libs::Graphics::PageFaultAccess;
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto settle_time = std::chrono::milliseconds(50);
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.AddReadbackHold(address, page_size);
+  g_protection_entered.store(false);
+  g_block_protection.store(true);
+  std::thread releaser([&] { manager.RemoveReadbackHold(address, page_size); });
+  while (!g_protection_entered.load()) {
+    std::this_thread::yield();
+  }
+  std::atomic<bool> answered{false};
+  bool allowed = false;
+  std::thread reader([&] {
+    allowed = manager.WatchersAllowAccess(address, PageFaultAccess::Read);
+    answered.store(true);
+  });
+  std::this_thread::sleep_for(settle_time);
+  const bool answered_during_protect = answered.load();
+  g_block_protection.store(false);
+  releaser.join();
+  reader.join();
+  Check(!answered_during_protect, "answer did not wait for the protect call");
+  Check(allowed, "released page reported as blocked after the protect call");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// The caller uses this to recognise a stale fault, so each state must separate reads from writes.
+// A wrong true here would retry a real fault forever.
+void TestWatchersAllowAccess() {
+  using Libs::Graphics::PageFaultAccess;
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  Check(!manager.WatchersAllowAccess(address, PageFaultAccess::Read) &&
+            !manager.WatchersAllowAccess(address, PageFaultAccess::Write),
+        "page in no tracked region reported as allowed");
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(manager.WatchersAllowAccess(address, PageFaultAccess::Read) &&
+            !manager.WatchersAllowAccess(address, PageFaultAccess::Write),
+        "write watch should allow reads only");
+  // A fault reports the faulting byte, so the last byte must resolve to the same page.
+  Check(!manager.WatchersAllowAccess(address + page_size - 1, PageFaultAccess::Write),
+        "last byte of a page resolved to another page");
+  // The contract is about watchers, so an unwatched neighbour in this region reads as allowed.
+  Check(manager.WatchersAllowAccess(address + page_size, PageFaultAccess::Write),
+        "unwatched neighbour reported as blocked");
+
+  manager.AddReadbackHold(address, page_size);
+  Check(!manager.WatchersAllowAccess(address, PageFaultAccess::Read) &&
+            !manager.WatchersAllowAccess(address, PageFaultAccess::Write),
+        "held page reported as allowed");
+  manager.RemoveReadbackHold(address, page_size);
+  manager.UpdatePageWatchers<false>(address, page_size);
+
+  // A read watch blocks reads with no hold involved, so it needs its own check.
+  const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
+  RegionBits read_mask;
+  read_mask.Set(static_cast<size_t>((address - region_base) / page_size));
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_mask);
+  Check(!manager.WatchersAllowAccess(address, PageFaultAccess::Read) &&
+            !manager.WatchersAllowAccess(address, PageFaultAccess::Write),
+        "read-watched page reported as allowed");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_mask);
+
+  Check(manager.WatchersAllowAccess(address, PageFaultAccess::Read) &&
+            manager.WatchersAllowAccess(address, PageFaultAccess::Write) &&
+            !manager.WatchersAllowAccess(address, PageFaultAccess::Execute),
+        "unwatched page should allow reads and writes but never execute");
+  Check(!manager.WatchersAllowAccess(TRACKER_ADDRESS_SIZE, PageFaultAccess::Read),
+        "address beyond the tracked space reported as allowed");
+  // Far enough out that a missing range check would index well outside the region table.
+  Check(!manager.WatchersAllowAccess(UINT64_MAX, PageFaultAccess::Read),
+        "far address reported as allowed");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Runs the hold death cases, and returns normally for any other name.
+void RunReadbackHoldDeathCase(const char *name, PageManager &manager) {
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  if (std::strcmp(name, "hold-underflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    manager.AddReadbackHold(address, page_size);
+    manager.RemoveReadbackHold(address, page_size);
+    manager.RemoveReadbackHold(address, page_size);
+  } else if (std::strcmp(name, "hold-overflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    for (uint32_t count = 0; count < MAX_READBACK_HOLDS + 1; count++) {
+      manager.AddReadbackHold(address, page_size);
+    }
+  } else if (std::strcmp(name, "destructor-hold") == 0) {
+    auto doomed = std::make_unique<PageManager>();
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    doomed->AddReadbackHold(address, page_size);
+    doomed.reset();
+  }
+}
+
+// Runs the named case in this process, which must die on a PageManager fatal before the exit below.
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
+  RunReadbackHoldDeathCase(name, manager);
   constexpr auto page_size = TRACKER_PAGE_SIZE;
   if (std::strcmp(name, "invalid-range") == 0) {
     manager.UpdatePageWatchers<true>((1ull << 40u) - 1, 2);
@@ -668,10 +946,12 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+// Runs every death case in its own process and checks that each one ends in a fatal exit.
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
-        "known-write-underflow", "read-overflow", "write-overflow"}) {
+        "known-write-underflow", "read-overflow", "write-overflow",
+        "hold-underflow", "hold-overflow", "destructor-hold"}) {
     CheckDeathCase(name);
   }
 }
@@ -700,6 +980,14 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
+  TestReadbackHoldBlocksAndCounts();
+  TestReadbackHoldWithWriteWatch();
+  TestReadbackHoldWithReadWatch();
+  TestReadbackHoldBatchesContiguousPages();
+  TestReadbackHoldOverMixedPages();
+  TestReadbackHoldFullCount();
+  TestWatchersAllowAccess();
+  TestWatchersAllowAccessWaitsForProtect();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

@@ -77,12 +77,20 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 } // namespace
 
 struct PageManager::Impl {
-	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+	/// Which count a watcher update changes. Holds count apart from read watchers, which allow
+	/// only one owner per page.
+	enum class WatcherKind { Write, Access, ReadbackHold };
 
+	static constexpr uint32_t READBACK_HOLD_MAX = 0xff;
+
+	struct PageState {
+		uint16_t write_watchers  : 7 = 0;
+		uint16_t access_watchers : 1 = 0;
+		uint16_t readback_holds  : 8 = 0;
+
+		/// Returns the host protection these counts require. A hold blocks reads like a read watch.
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
-			if (access_watchers != 0) {
+			if (access_watchers != 0 || readback_holds != 0) {
 				return Common::VirtualMemory::Mode::NoAccess;
 			}
 			if (write_watchers != 0) {
@@ -91,10 +99,26 @@ struct PageManager::Impl {
 			return Common::VirtualMemory::Mode::ReadWrite;
 		}
 
-		template <int delta, bool is_read>
+		/// Adds delta to the count for kind and returns the new count, exiting on overflow or
+		/// underflow.
+		template <int delta, WatcherKind kind>
 		uint32_t AddDelta(uint64_t address) {
 			static_assert(delta >= -1 && delta <= 1);
-			if constexpr (is_read) {
+			if constexpr (kind == WatcherKind::ReadbackHold) {
+				if constexpr (delta == 1) {
+					if (readback_holds == READBACK_HOLD_MAX) {
+						Fatal("readback-hold overflow at 0x%016" PRIx64, address);
+					}
+					return ++readback_holds;
+				} else if constexpr (delta == -1) {
+					if (readback_holds == 0) {
+						Fatal("readback-hold underflow at 0x%016" PRIx64, address);
+					}
+					return --readback_holds;
+				} else {
+					return readback_holds;
+				}
+			} else if constexpr (kind == WatcherKind::Access) {
 				if constexpr (delta == 1) {
 					if (access_watchers != 0) {
 						Fatal("read-watcher overflow at 0x%016" PRIx64, address);
@@ -125,7 +149,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -158,7 +182,8 @@ struct PageManager::Impl {
 		for (const auto& region: region_storage) {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
-				if (page.write_watchers != 0 || page.access_watchers != 0) {
+				if (page.write_watchers != 0 || page.access_watchers != 0 ||
+				    page.readback_holds != 0) {
 					Fatal("destroyed with live page state");
 				}
 			}
@@ -192,7 +217,12 @@ struct PageManager::Impl {
 		}
 	}
 
-	template <bool track, bool is_read, bool masked>
+	/// The kind behind the public read and write watcher templates.
+	template <bool is_read>
+	static constexpr WatcherKind WATCHER_KIND = is_read ? WatcherKind::Access : WatcherKind::Write;
+
+	/// Updates a count on each selected page of one region, joining protection changes into runs.
+	template <bool track, WatcherKind kind, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
 		SpinGuard lock(region.lock);
@@ -216,8 +246,8 @@ struct PageManager::Impl {
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<delta, is_read>(address)
-			                              : page.AddDelta<0, is_read>(address);
+			const auto new_count = update ? page.AddDelta<delta, kind>(address)
+			                              : page.AddDelta<0, kind>(address);
 			const auto new_perms = page.Perms();
 
 			if (new_perms != perms) [[unlikely]] {
@@ -244,7 +274,8 @@ struct PageManager::Impl {
 		release_pending();
 	}
 
-	template <bool track, bool is_read>
+	/// Updates a count on every page of a range, one region at a time.
+	template <bool track, WatcherKind kind>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
@@ -258,7 +289,7 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, kind, false>(*region, region_base, first, last);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -274,14 +305,16 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
+/// Updates write watcher counts on every page of a range.
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+	m_impl->UpdatePageWatchers<track, Impl::WatcherKind::Write>(vaddr, size);
 }
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
+/// Updates read or write watcher counts on the pages selected by mask within one region.
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
 	const auto start_range = mask.FirstRange();
@@ -289,8 +322,8 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	const auto first       = start_range.first;
 	const auto last        = end_range.second;
 	if (start_range.second == end_range.second) {
-		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		m_impl->UpdatePageWatchers<track, Impl::WATCHER_KIND<is_read>>(base_addr + first * PAGE_SIZE,
+		                                                               (last - first) * PAGE_SIZE);
 		return;
 	}
 
@@ -298,12 +331,43 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	if (region == nullptr) {
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
-	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+	m_impl->UpdateRegionWatchers<track, Impl::WATCHER_KIND<is_read>, true>(*region, base_addr, first,
+	                                                                       last, &mask);
 }
 
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+
+void PageManager::AddReadbackHold(uint64_t vaddr, uint64_t size) {
+	m_impl->UpdatePageWatchers<true, Impl::WatcherKind::ReadbackHold>(vaddr, size);
+}
+
+void PageManager::RemoveReadbackHold(uint64_t vaddr, uint64_t size) {
+	m_impl->UpdatePageWatchers<false, Impl::WatcherKind::ReadbackHold>(vaddr, size);
+}
+
+bool PageManager::WatchersAllowAccess(uint64_t vaddr, PageFaultAccess access) const noexcept {
+	if (vaddr >= ADDRESS_SIZE) {
+		return false;
+	}
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto region_base = Common::AlignDown(vaddr, REGION_SIZE);
+	const auto page_index  = static_cast<size_t>((vaddr - region_base) / PAGE_SIZE);
+	// Taking the lock also waits out any protect call in progress, so the counts and the real page
+	// protection agree when this returns.
+	SpinGuard  lock(region->lock);
+	const auto perms = region->pages[page_index].Perms();
+	switch (access) {
+		case PageFaultAccess::Read: return perms != Common::VirtualMemory::Mode::NoAccess;
+		case PageFaultAccess::Write: return perms == Common::VirtualMemory::Mode::ReadWrite;
+		case PageFaultAccess::Execute: return false;
+	}
+	return false;
+}
 
 } // namespace Libs::Graphics

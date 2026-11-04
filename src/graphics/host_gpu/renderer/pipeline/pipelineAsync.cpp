@@ -2,11 +2,15 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/renderer/pipeline/skippedDraws.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 
+#include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -25,39 +29,88 @@ namespace Libs::Graphics {
 
 ShaderWorkers::ShaderWorkers(uint32_t threads) {
 	for (uint32_t i = 0; i < threads; i++) {
-		m_threads.emplace_back([this](std::stop_token stop) {
+		m_threads.emplace_back([this, i](std::stop_token stop) {
+			Common::Thread::LowerPriority();
 			std::unique_lock lock(m_mutex);
-			// Once stop is requested the wait returns false only when the queue is empty.
-			while (m_ready.wait(lock, stop,
-			                    [this] { return !m_urgent_jobs.empty() || !m_jobs.empty(); })) {
-				auto& queue    = m_urgent_jobs.empty() ? m_jobs : m_urgent_jobs;
-				const auto job = std::move(queue.front());
-				queue.pop();
+			// Once stop is requested the wait returns false only when no job may be taken.
+			while (m_ready.wait(lock, stop, [this, i] { return CanPick(i); })) {
+				const auto job = Pick(i);
+				if (!job) {
+					continue;
+				}
 				lock.unlock();
-				job();
+				job->run();
 				lock.lock();
 			}
 		});
 	}
 }
 
-void ShaderWorkers::Post(Common::UniqueFunction<void>&& job, Priority priority) {
+bool ShaderWorkers::CanPick(uint32_t index) const {
+	const auto now     = AskClockMs();
+	const auto allowed = [&](const JobPtr& job) {
+		return index < BackgroundWorkers ||
+		       now - job->asked.load(std::memory_order_relaxed) < StaleAfterMs;
+	};
+	return std::ranges::any_of(m_urgent_jobs, allowed) || std::ranges::any_of(m_jobs, allowed);
+}
+
+ShaderWorkers::JobPtr ShaderWorkers::Pick(uint32_t index) {
+	const auto now = AskClockMs();
+	for (auto* pool: {&m_urgent_jobs, &m_jobs}) {
+		auto best = pool->end();
+		for (auto it = pool->begin(); it != pool->end(); ++it) {
+			if (index >= BackgroundWorkers &&
+			    now - (*it)->asked.load(std::memory_order_relaxed) >= StaleAfterMs) {
+				continue;
+			}
+			// Worker 0 takes the oldest, the others the one asked for last.
+			if (best == pool->end() ||
+			    (index == 0 ? (*it)->sequence < (*best)->sequence
+			                : (*it)->asked.load(std::memory_order_relaxed) >
+			                      (*best)->asked.load(std::memory_order_relaxed))) {
+				best = it;
+			}
+		}
+		if (best != pool->end()) {
+			auto job = std::move(*best);
+			// The order in the vector does not matter: the choice scans all of it.
+			*best = std::move(pool->back());
+			pool->pop_back();
+			return job;
+		}
+	}
+	return nullptr;
+}
+
+ShaderWorkers::JobPtr ShaderWorkers::Post(Common::UniqueFunction<void>&& run, Priority priority) {
+	auto job      = std::make_shared<Job>();
+	job->run      = std::move(run);
+	job->priority = priority;
+	job->Touch();
 	{
 		std::scoped_lock lock(m_mutex);
 		if (m_stopped) {
-			return;
+			return nullptr;
 		}
-		(priority == Priority::Urgent ? m_urgent_jobs : m_jobs).push(std::move(job));
+		job->sequence = m_next_sequence++;
+		(priority == Priority::Urgent ? m_urgent_jobs : m_jobs).push_back(job);
 	}
 	m_ready.notify_one();
+	return job;
+}
+
+size_t ShaderWorkers::Queued() {
+	std::scoped_lock lock(m_mutex);
+	return m_urgent_jobs.size() + m_jobs.size();
 }
 
 void ShaderWorkers::Stop() {
 	{
 		std::scoped_lock lock(m_mutex);
-		m_stopped    = true;
-		m_jobs       = {};
-		m_urgent_jobs = {};
+		m_stopped = true;
+		m_jobs.clear();
+		m_urgent_jobs.clear();
 	}
 	for (auto& thread: m_threads) {
 		thread.request_stop();
@@ -94,12 +147,15 @@ void PipelineCache::RequestAsync(const ProgramKey& key, Program* program,
 		// is waiting, compile it for them.
 		if (const auto found = async->translations.find(key); found != async->translations.end()) {
 			const auto compiling = FlightId(key, push_data_cursor, &program->specialization);
-			if (!async->in_flight.insert(compiling).second) {
+			if (const auto flying = async->in_flight.find(compiling);
+			    flying != async->in_flight.end()) {
+				// A draw wants it again: it is the scene on screen.
+				flying->second.job->Touch();
 				return;
 			}
 			auto translation = async->translations.extract(found);
 			auto inputs      = std::move(translation.mapped().inputs);
-			async->workers.Post([this, async, device = m_graphics.device, inputs, compiling,
+			auto job = async->workers.Post([this, async, device = m_graphics.device, inputs, compiling,
 			                     push_data_cursor, specialization = program->specialization,
 			                     translated = std::move(translation.mapped().translated)]() mutable {
 				auto compiled = CompileStage(device, inputs->key, inputs->options,
@@ -119,12 +175,16 @@ void PipelineCache::RequestAsync(const ProgramKey& key, Program* program,
 					AddModule(cached, inputs->key, std::move(pending->stage));
 				});
 			}, ShaderWorkers::Priority::Urgent);
+			if (job) {
+				async->in_flight.emplace(compiling, Async::Flight {std::move(job), false});
+			}
 			return;
 		}
 	}
 
 	// Nothing to compile yet: translate the shader.
-	if (!async->in_flight.insert(translating).second) {
+	if (const auto flying = async->in_flight.find(translating); flying != async->in_flight.end()) {
+		flying->second.job->Touch();
 		return;
 	}
 	auto inputs = std::make_shared<StageInputs>();
@@ -147,7 +207,7 @@ void PipelineCache::RequestAsync(const ProgramKey& key, Program* program,
 	}
 
 	const bool new_program = program == nullptr;
-	async->workers.Post([this, async, inputs, translating, new_program] {
+	auto job = async->workers.Post([this, async, inputs, translating, new_program] {
 		auto translated = std::make_unique<ShaderRecompiler::TranslateResult>(
 		    ShaderRecompiler::TranslateProgram(inputs->code, inputs->options));
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
@@ -162,9 +222,12 @@ void PipelineCache::RequestAsync(const ProgramKey& key, Program* program,
 				m_program_cache.emplace(inputs->key, Program {.resource_plan = std::move(*plan)});
 			}
 			m_async->translations.insert_or_assign(
-			    inputs->key, Async::Translation {inputs, std::move(translated)});
+			    inputs->key, Async::Translation {inputs, std::move(translated), AskClockMs()});
 		});
 	});
+	if (job) {
+		async->in_flight.emplace(translating, Async::Flight {std::move(job), true});
+	}
 }
 
 template void PipelineCache::RequestAsync<ShaderVertexInputInfo>(
@@ -186,6 +249,40 @@ void PipelineCache::PumpAsync() {
 	for (auto& apply: done) {
 		apply();
 	}
+	m_async->ReportStatus();
+}
+
+void PipelineCache::Async::ReportStatus() {
+	const auto now = AskClockMs();
+	if (now - last_report_ms < 2000) {
+		return;
+	}
+	last_report_ms     = now;
+	size_t translating = 0;
+	for (const auto& [id, flight]: in_flight) {
+		translating += flight.translating ? 1u : 0u;
+	}
+	const size_t compiling = in_flight.size() - translating;
+	uint64_t     oldest    = 0;
+	for (const auto& [key, translation]: translations) {
+		oldest = std::max(oldest, now - translation.since);
+	}
+	const auto skipped_total = TotalDrawsSkippedForShaders();
+	const auto skipped       = skipped_total - reported_skipped;
+	reported_skipped         = skipped_total;
+	const bool busy = !in_flight.empty() || !translations.empty() || pipelines_building != 0 ||
+	                  skipped != 0;
+	if (busy) {
+		std::printf("Async shaders: %zu translating, %zu compiling, %zu waiting for a draw "
+		            "(oldest %.1f s), %u pipelines building, %zu jobs queued; %" PRIu64
+		            " draws skipped in the last 2 s\n",
+		            translating, compiling, translations.size(),
+		            static_cast<double>(oldest) / 1000.0, pipelines_building, workers.Queued(),
+		            skipped);
+	} else if (was_busy) {
+		std::printf("Async shaders: idle\n");
+	}
+	was_busy = busy;
 }
 
 bool PipelineCache::EnsureGraphicsPipeline(const CommandBuffer&   command,
@@ -200,6 +297,7 @@ bool PipelineCache::EnsureGraphicsPipeline(const CommandBuffer&   command,
 	auto& pipeline        = iter->second;
 	if (inserted) {
 		pipeline.pending = true;
+		m_async->pipelines_building++;
 		// The map's nodes do not move, and the stages' modules sit in deques that only grow.
 		m_async->workers.Post([this, async = m_async.get(), &graphics = m_graphics,
 		                       driver_cache = m_driver_cache, &pipeline, key, stages] {
@@ -211,6 +309,7 @@ bool PipelineCache::EnsureGraphicsPipeline(const CommandBuffer&   command,
 				CreatePipelineInternal(graphics, pipeline, key, stages, driver_cache);
 			}
 			async->Finish([this, &pipeline, key] {
+				m_async->pipelines_building--;
 				pipeline.pending = false;
 				StorePipeline(key);
 				CheckpointDriverCache();

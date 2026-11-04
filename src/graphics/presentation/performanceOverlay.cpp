@@ -3,21 +3,35 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "imgui.h"
 #include "kernel/memory.h"
+#include "loader/systemContent.h"
 
+#include <SDL3/SDL_filesystem.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
+#include <deque>
+#include <filesystem>
+#include <fmt/chrono.h>
+#include <fmt/format.h>
+#include <fstream>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -33,6 +47,75 @@ constexpr float  FRAME_GRAPH_MS    = 50.0f;
 constexpr float  FRAME_TIME_GOOD   = 17.5f;
 constexpr float  FRAME_TIME_MEDIUM = 34.0f;
 constexpr size_t COUNTER_COUNT     = static_cast<size_t>(Counter::Count);
+
+// JSON names of the counters. Durations are exported in milliseconds and sizes in megabytes.
+struct CounterInfo {
+	const char* name;
+	double      scale;
+};
+constexpr double                                 MS           = 1e6;
+constexpr double                                 MB           = 1024.0 * 1024.0;
+constexpr std::array<CounterInfo, COUNTER_COUNT> COUNTER_INFO = {{
+    {"draws", 1},
+    {"draw_instances", 1},
+    {"indirect_draws", 1},
+    {"dispatches", 1},
+    {"queue_submits", 1},
+    {"gpu_waits", 1},
+    {"gpu_wait_ms", MS},
+    {"gpu_faults", 1},
+    {"shaders_compiled", 1},
+    {"shader_compile_ms", MS},
+    {"pipelines_created", 1},
+    {"pipeline_create_ms", MS},
+    {"texture_upload_mb", MB},
+    {"texture_download_mb", MB},
+    {"texture_evictions", 1},
+    {"color_metadata_readbacks", 1},
+    {"color_metadata_readback_ms", MS},
+    {"color_metadata_checks", 1},
+    {"buffer_upload_mb", MB},
+    {"buffer_download_mb", MB},
+    {"buffer_evictions", 1},
+    {"flips_requested", 1},
+    {"flips_rejected", 1},
+    {"late_vblanks", 1},
+    {"swapchain_recreations", 1},
+    {"dropped_presents", 1},
+    {"emulated_instructions", 1},
+    {"unresolved_import_calls", 1},
+    {"guest_file_read_mb", MB},
+    {"guest_file_write_mb", MB},
+    {"audio_underruns", 1},
+    {"gpu_thread_busy_ms", MS},
+    {"present_ms", MS},
+    {"present_acquire_ms", MS},
+    {"overlay_ms", MS},
+}};
+static_assert(COUNTER_INFO.back().name != nullptr, "every counter needs a JSON name");
+
+using CounterTotals = std::array<uint64_t, COUNTER_COUNT>;
+
+CounterTotals ReadCounters() {
+	CounterTotals totals {};
+	for (size_t i = 0; i < COUNTER_COUNT; i++) {
+		totals[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
+	}
+	return totals;
+}
+
+// A frame much longer than the recent average, with the counters' growth during it.
+struct Hitch {
+	Clock::time_point time;
+	float             ms;
+	CounterTotals     deltas;
+};
+
+constexpr float  HITCH_MIN_MS        = 50.0f;
+constexpr float  HITCH_FACTOR        = 2.0f; // Times the recent average frame time.
+constexpr size_t HITCH_HISTORY       = 32;
+constexpr size_t MAX_RECORDED_HITCH  = 10000;
+constexpr auto   HITCH_RECENT_WINDOW = std::chrono::seconds(10);
 
 // Tables as wide as their columns; the default fills the window, which an auto-resizing
 // window then never shrinks.
@@ -54,7 +137,16 @@ struct FrameWindow {
 	uint32_t                         guest_height = 0;
 	Clock::time_point                last_flip    = {};
 	Clock::time_point                window_start = {};
+	bool                             recording    = false;
+	std::vector<float>               recorded_ms;
+	std::vector<Hitch>               recorded_hitches;
+	CounterTotals                    flip_totals {}; // Counters at the last flip.
+	float                            average_ms = 0.0f;
+	std::deque<Hitch>                hitches;
 };
+
+constexpr size_t MAX_RECORDED_FRAMES  = size_t {1} << 20;
+constexpr size_t MAX_RECORDED_SAMPLES = 3600; // One hour of refreshes.
 
 // Shown values, recomputed once per refresh interval.
 struct Snapshot {
@@ -78,6 +170,7 @@ struct Snapshot {
 	size_t                                                     history_count = 0;
 	Clock::time_point                                          sample_time {};
 	LibKernel::Memory::DebugStats                              guest_memory;
+	std::deque<Hitch>                                          hitches;
 };
 
 std::mutex            g_frame_mutex;
@@ -85,12 +178,77 @@ FrameWindow           g_frames;
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
 std::atomic<uint64_t> g_revision {0};
+std::atomic<bool>     g_record_toggle {false}; // F3 was pressed.
 
 std::mutex                  g_host_mutex;
 Common::HostStats           g_host_stats;
 uint64_t                    g_host_generation = 0;
 std::condition_variable_any g_sampler_wait;
 std::jthread                g_sampler;
+
+// Panel bounds, written by the present thread and hit-tested by the event thread.
+std::mutex g_panel_mutex;
+ImVec2     g_panel_min;
+ImVec2     g_panel_max;
+
+constexpr ImU32 SELECTION       = IM_COL32(70, 130, 230, 110);
+constexpr ImU32 HOVER           = IM_COL32(255, 255, 255, 18); // Hints that lines are selectable.
+constexpr auto  STATUS_DURATION = std::chrono::seconds(2);
+
+// A line of the panel that can be selected and copied as text.
+struct TextLine {
+	std::string text;
+	ImVec2      min;
+	ImVec2      max;
+	std::string field; // "Section / Label" of a row that can be recorded alone, else empty.
+	std::string value;
+};
+
+// Lines are selected by index, from the anchor (where the press began) to the current line.
+struct Selection {
+	int  anchor   = -1;
+	int  current  = -1;
+	bool dragging = false;
+};
+
+// Present thread only.
+std::vector<TextLine> g_lines;
+std::string           g_section; // Title of the section being drawn.
+Selection             g_selection;
+std::string           g_status;
+Clock::time_point     g_status_time {};
+// Set while the sections are written to JSON instead of drawn.
+nlohmann::ordered_json* g_export         = nullptr;
+nlohmann::ordered_json* g_export_section = nullptr;
+
+bool LineSelected(size_t index) {
+	if (g_selection.anchor < 0) {
+		return false;
+	}
+	const auto first = static_cast<size_t>(std::min(g_selection.anchor, g_selection.current));
+	const auto last  = static_cast<size_t>(std::max(g_selection.anchor, g_selection.current));
+	return index >= first && index <= last;
+}
+
+int g_hovered_line = -1; // The line under the mouse in the previous frame.
+
+std::optional<ImU32> LineColor(size_t index) {
+	if (LineSelected(index)) {
+		return SELECTION;
+	}
+	return static_cast<int>(index) == g_hovered_line ? std::optional(HOVER) : std::nullopt;
+}
+
+// Registers the last drawn item as a selectable line outside a table.
+void AddItemLine(std::string text, std::string field = {}) {
+	const ImVec2 min = ImGui::GetItemRectMin();
+	const ImVec2 max = ImGui::GetItemRectMax();
+	if (const auto color = LineColor(g_lines.size())) {
+		ImGui::GetWindowDrawList()->AddRectFilled(min, max, *color);
+	}
+	std::string value = field.empty() ? std::string() : text;
+	g_lines.push_back({std::move(text), min, max, std::move(field), std::move(value)});
+}
 
 void SetOverlayEnabled(bool enabled) {
 	{
@@ -197,9 +355,32 @@ std::string Percent(std::optional<double> value) {
 	return buffer;
 }
 
+std::string_view TrimLabel(const char* label) {
+	std::string_view name(label);
+	name.remove_prefix(std::min(name.find_first_not_of(' '), name.size()));
+	return name;
+}
+
+void ExportRow(const char* label, const std::string& value) {
+	const auto  name = TrimLabel(label);
+	std::string key(name);
+	for (int i = 2; g_export_section->contains(key); i++) {
+		key = std::string(name) + " (" + std::to_string(i) + ")";
+	}
+	(*g_export_section)[key] = value;
+}
+
 void Row(const char* label, const std::string& value, std::optional<ImU32> color = std::nullopt) {
+	if (g_export_section != nullptr) {
+		ExportRow(label, value);
+		return;
+	}
 	ImGui::TableNextRow();
+	if (const auto color = LineColor(g_lines.size())) {
+		ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, *color);
+	}
 	ImGui::TableNextColumn();
+	const ImVec2 min = ImGui::GetCursorScreenPos();
 	ImGui::TextDisabled("%s", label);
 	ImGui::TableNextColumn();
 	if (color) {
@@ -207,6 +388,9 @@ void Row(const char* label, const std::string& value, std::optional<ImU32> color
 	} else {
 		ImGui::TextUnformatted(value.c_str());
 	}
+	const std::string name(TrimLabel(label));
+	g_lines.push_back({std::string(label) + ": " + value, min, ImGui::GetItemRectMax(),
+	                   g_section.empty() ? name : g_section + " / " + name, value});
 }
 
 [[gnu::format(printf, 1, 2)]] std::string Fmt(const char* format, ...) {
@@ -219,8 +403,20 @@ void Row(const char* label, const std::string& value, std::optional<ImU32> color
 }
 
 bool BeginSection(const char* title) {
+	if (g_export != nullptr) {
+		g_export_section = &(*g_export)[title];
+		return true;
+	}
 	ImGui::SeparatorText(title);
+	AddItemLine(std::string("--- ") + title + " ---");
+	g_section = title;
 	return ImGui::BeginTable(title, 2, TABLE_FLAGS);
+}
+
+void EndSection() {
+	if (g_export == nullptr) {
+		ImGui::EndTable();
+	}
 }
 
 void DrawFrameGraph(const std::array<float, FRAME_HISTORY>& history, size_t count, float width,
@@ -340,6 +536,123 @@ void CompilationRows(const Snapshot& shown) {
 	    shown.pipeline_create_peak_ns);
 }
 
+double PerFrame(const Snapshot& shown, Counter counter) {
+	return Rate(shown, counter) / std::max(shown.fps, 1.0);
+}
+
+double PerFrameMs(const Snapshot& shown, Counter counter) {
+	return PerFrame(shown, counter) / MS;
+}
+
+// Where a frame's time goes, averaged over the last refresh interval.
+void FrameSplitRows(const Snapshot& shown) {
+	const auto row = [&](const char* label, Counter counter, bool bottleneck) {
+		const double busy = Rate(shown, counter) / 1e9 * 100.0;
+		Row(label, Fmt("%.1f ms  (%.0f%% of time)", PerFrameMs(shown, counter), busy),
+		    bottleneck ? std::optional(LevelColor(busy, 80, 95)) : std::nullopt);
+	};
+	row("GPU thread busy", Counter::GpuThreadBusyNs, true);
+	Row("Shader + pipeline compile",
+	    Fmt("%.1f ms", PerFrameMs(shown, Counter::ShaderCompileNs) +
+	                       PerFrameMs(shown, Counter::PipelineCreateNs)));
+	row("CPU waiting on GPU", Counter::GpuWaitNs, false);
+	row("Present", Counter::PresentNs, true);
+	row("  Image acquire", Counter::PresentAcquireNs, false);
+	row("  Overlays", Counter::OverlayNs, false);
+}
+
+// The counters most likely to explain a hitch, in that order.
+std::string HitchCause(const Hitch& hitch) {
+	const auto delta = [&](Counter counter) {
+		return static_cast<double>(hitch.deltas[static_cast<size_t>(counter)]);
+	};
+	std::vector<std::string> causes;
+	const auto               add = [&](double value, double min, const char* format) {
+		if (value >= min && causes.size() < 3) {
+			causes.push_back(Fmt(format, value));
+		}
+	};
+	add(delta(Counter::ShadersCompiled), 1, "%.0f shaders");
+	add(delta(Counter::PipelinesCreated), 1, "%.0f pipelines");
+	add(delta(Counter::GpuWaitNs) / MS, 5, "%.0f ms GPU wait");
+	add(delta(Counter::ColorMetadataReadbackNs) / MS, 1, "%.0f ms readbacks");
+	add((delta(Counter::TextureUploadBytes) + delta(Counter::BufferUploadBytes)) / MB, 8,
+	    "%.0f MB uploads");
+	add(delta(Counter::GuestFileReadBytes) / MB, 1, "%.0f MB file reads");
+	add(delta(Counter::SwapchainRecreations), 1, "%.0f swapchain rebuilds");
+	add(delta(Counter::EmulatedInstructions), 100, "%.0f emulated instrs");
+	if (causes.empty()) {
+		return "no counter stands out";
+	}
+	std::string text = causes.front();
+	for (size_t i = 1; i < causes.size(); i++) {
+		text += ", " + causes[i];
+	}
+	return text;
+}
+
+void HitchRows(const Snapshot& shown) {
+	const auto recent =
+	    std::count_if(shown.hitches.begin(), shown.hitches.end(), [&](const Hitch& hitch) {
+		    return shown.sample_time - hitch.time < HITCH_RECENT_WINDOW;
+	    });
+	Row("Hitches (10 s)", Fmt("%lld", static_cast<long long>(recent)), recent > 0 ? MEDIUM : GOOD);
+	if (!shown.hitches.empty()) {
+		const auto& last = shown.hitches.back();
+		Row("Last hitch",
+		    Fmt("%.0f ms, %.0f s ago", last.ms,
+		        std::chrono::duration<double>(shown.sample_time - last.time).count()),
+		    FrameTimeColor(last.ms));
+		Row("  During it", HitchCause(last));
+	}
+}
+
+// Stats of a saved recording to compare the live ones with, loaded from the baseline file.
+std::optional<nlohmann::ordered_json> g_baseline; // Present thread only.
+
+std::optional<double> BaselineValue(const char* group, const std::string& key) {
+	if (!g_baseline) {
+		return std::nullopt;
+	}
+	const auto values = g_baseline->find(group);
+	if (values == g_baseline->end() || !values->is_object()) {
+		return std::nullopt;
+	}
+	const auto value = values->find(key);
+	return value != values->end() && value->is_number() ? std::optional(value->get<double>())
+	                                                    : std::nullopt;
+}
+
+double BaselineNumber(const char* group, const char* key) {
+	return BaselineValue(group, key).value_or(0.0);
+}
+
+// "live vs baseline (+x%)", colored by whether the change is for the better.
+void CompareRow(const char* label, double live, double base, const char* unit,
+                bool higher_is_better) {
+	const double change = base != 0.0 ? (live - base) / base * 100.0 : 0.0;
+	const double better = higher_is_better ? change : -change;
+	Row(label, Fmt("%.1f vs %.1f %s  (%+.0f%%)", live, base, unit, change),
+	    better >= -2.0   ? GOOD
+	    : better >= -5.0 ? MEDIUM
+	                     : BAD);
+}
+
+void BaselineRows(const Snapshot& shown) {
+	CompareRow("FPS", shown.fps, BaselineNumber("summary", "avg_fps"), "", true);
+	CompareRow("1% low", shown.low_fps, BaselineNumber("summary", "one_percent_low_fps"), "FPS",
+	           true);
+	const auto per_frame = [&](const char* label, Counter counter) {
+		const auto& info = COUNTER_INFO[static_cast<size_t>(counter)];
+		CompareRow(label, PerFrame(shown, counter) / info.scale,
+		           BaselineNumber("per_frame", info.name), info.scale == MS ? "ms" : "", false);
+	};
+	per_frame("GPU thread busy", Counter::GpuThreadBusyNs);
+	per_frame("Present", Counter::PresentNs);
+	per_frame("CPU waiting on GPU", Counter::GpuWaitNs);
+	per_frame("Draw calls", Counter::Draws);
+}
+
 void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point now,
              uint64_t generation) {
 	const double seconds = shown.sample_time == Clock::time_point {}
@@ -390,8 +703,15 @@ void DrawCompact(const Snapshot& shown) {
 	               ? Fmt("%.0f%%  of %u threads", *host.process_cpu_percent, host.logical_cores)
 	               : std::string("n/a"));
 	Row("GPU", Percent(host.gpu_percent));
+	Row("GPU thread / present",
+	    Fmt("%.1f / %.1f ms per frame", PerFrameMs(shown, Counter::GpuThreadBusyNs),
+	        PerFrameMs(shown, Counter::PresentNs)));
 	GpuActivityRows(shown);
 	CompilationRows(shown);
+	HitchRows(shown);
+	if (g_baseline) {
+		CompareRow("vs baseline", shown.fps, BaselineNumber("summary", "avg_fps"), "FPS", true);
+	}
 	if (shown.device_memory) {
 		Row("GPU memory", Bytes(*shown.device_memory) + " / " + Bytes(shown.device_budget));
 	}
@@ -428,7 +748,11 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 		    Fmt("%llu  (dropped %llu)",
 		        static_cast<unsigned long long>(Total(shown, Counter::SwapchainRecreations)),
 		        static_cast<unsigned long long>(Total(shown, Counter::DroppedPresents))));
-		ImGui::EndTable();
+		EndSection();
+	}
+	if (BeginSection("Frame split (per frame)")) {
+		FrameSplitRows(shown);
+		EndSection();
 	}
 	if (BeginSection("CPU")) {
 		Row("Emulator",
@@ -443,7 +767,9 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("Host threads", Fmt("%u", *host.thread_count));
 		}
 		for (const auto& thread: host.busiest_threads) {
-			Row(Fmt("  %.24s", thread.name.c_str()).c_str(), Fmt("%.0f%%", thread.cpu_percent),
+			Row(Fmt("  %.24s", thread.name.c_str()).c_str(),
+			    Fmt("%.0f%%  (%.1f ms/frame)", thread.cpu_percent,
+			        thread.cpu_percent / 100.0 * shown.frame_ms),
 			    LevelColor(thread.cpu_percent, 70, 95));
 		}
 		if (host.context_switches_per_s) {
@@ -461,7 +787,7 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 		    Fmt("%.0f/s  (%llu total)", unresolved,
 		        static_cast<unsigned long long>(Total(shown, Counter::UnresolvedImportCalls))),
 		    unresolved > 0.0 ? MEDIUM : GOOD);
-		ImGui::EndTable();
+		EndSection();
 	}
 }
 
@@ -501,7 +827,7 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
 		CompilationRows(shown);
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("GPU memory")) {
 		if (shown.device_memory) {
@@ -524,7 +850,7 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		TransferRow(shown, "Buffer transfers", Counter::BufferUploadBytes,
 		            Counter::BufferDownloadBytes);
 		Row("Buffer evictions", Fmt("%.0f/s", Rate(shown, Counter::BufferEvictions)));
-		ImGui::EndTable();
+		EndSection();
 	}
 }
 
@@ -553,7 +879,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		        static_cast<unsigned long long>(guest.gpu_page_entries),
 		        static_cast<unsigned long long>(guest.gpu_page_entries_total)),
 		    LevelColor(static_cast<double>(percent), 90, 100));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("Emulator process")) {
 		Row("Footprint", Bytes(host.process_memory));
@@ -564,7 +890,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		}
 		Row("File-backed", Bytes(host.process_file_backed));
 		Row("Address space", Bytes(host.process_virtual));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("System memory")) {
 		if (host.system_memory_used && host.system_memory_total) {
@@ -583,7 +909,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 			    *host.swap_used > (4ull << 30u) ? MEDIUM : GOOD);
 		}
 		Row("Pressure", PressureName(host.memory_pressure), PressureColor(host.memory_pressure));
-		ImGui::EndTable();
+		EndSection();
 	}
 	if (BeginSection("I/O & audio")) {
 		Row("Disk read / write", Throughput(host.disk_read_per_s.value_or(0.0)) + " / " +
@@ -596,7 +922,524 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		    Fmt("%.0f/s  (%llu total)", underruns,
 		        static_cast<unsigned long long>(Total(shown, Counter::AudioUnderruns))),
 		    underruns > 0.0 ? BAD : GOOD);
-		ImGui::EndTable();
+		EndSection();
+	}
+	if (BeginSection("Hitches")) {
+		HitchRows(shown);
+		EndSection();
+	}
+	if (g_baseline && BeginSection("vs baseline")) {
+		BaselineRows(shown);
+		EndSection();
+	}
+}
+
+double Round2(double value) {
+	return std::round(value * 100.0) / 100.0;
+}
+
+// Counter values by JSON name, divided by `divisor`, leaving out zeros when `skip_zero`.
+nlohmann::ordered_json CounterJson(const CounterTotals& values, double divisor, bool skip_zero) {
+	auto json = nlohmann::ordered_json::object();
+	for (size_t i = 0; i < COUNTER_COUNT; i++) {
+		if (!skip_zero || values[i] != 0) {
+			json[COUNTER_INFO[i].name] =
+			    Round2(static_cast<double>(values[i]) / COUNTER_INFO[i].scale / divisor);
+		}
+	}
+	return json;
+}
+
+nlohmann::ordered_json HitchJson(const Hitch& hitch, const char* time_key, double time_s) {
+	nlohmann::ordered_json json;
+	json[time_key]   = Round2(time_s);
+	json["frame_ms"] = Round2(hitch.ms);
+	json["during"]   = CounterJson(hitch.deltas, 1.0, true);
+	return json;
+}
+
+std::string Dump(const nlohmann::ordered_json& json) {
+	return json.dump(2, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+}
+
+// Writes the shown values into `json`, with the recent frame times when `history` is set.
+void ExportSnapshot(nlohmann::ordered_json& json, const Snapshot& shown,
+                    const GraphicContext& graphics, vk::Extent2D extent, bool history) {
+	// The compact panel shows a subset and does not sample guest memory, so export every
+	// section of the detailed one.
+	Snapshot full               = shown;
+	full.guest_memory           = LibKernel::Memory::GetDebugStats();
+	json["fps"]                 = Round2(shown.fps);
+	json["frame_ms"]            = Round2(shown.frame_ms);
+	json["worst_frame_ms"]      = Round2(shown.max_frame_ms);
+	json["one_percent_low_fps"] = Round2(shown.low_fps);
+	json["no_frames_s"]         = Round2(shown.stalled_s);
+	if (history) {
+		std::vector<double> frame_times;
+		for (size_t i = 0; i < shown.history_count; i++) {
+			frame_times.push_back(Round2(shown.history[i]));
+		}
+		json["frame_times_ms"] = frame_times;
+		auto hitches           = nlohmann::ordered_json::array();
+		for (const auto& hitch: shown.hitches) {
+			hitches.push_back(
+			    HitchJson(hitch, "age_s",
+			              std::chrono::duration<double>(shown.sample_time - hitch.time).count()));
+		}
+		json["recent_hitches"] = std::move(hitches);
+	}
+	auto sections = nlohmann::ordered_json::object();
+	g_export      = &sections;
+	DrawFramesAndCpu(full, extent);
+	DrawGpu(full, graphics);
+	DrawMemoryAndIo(full);
+	g_export         = nullptr;
+	g_export_section = nullptr;
+	json["sections"] = std::move(sections);
+}
+
+void SetStatus(std::string text) {
+	g_status      = std::move(text);
+	g_status_time = Clock::now();
+}
+
+std::filesystem::path RecordingsDirectory() {
+	const char* base = SDL_GetBasePath();
+	return (base != nullptr ? std::filesystem::path(base) : std::filesystem::current_path()) /
+	       "perf_recordings";
+}
+
+std::string TitleId() {
+	std::string id;
+	return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && !id.empty() ? id : "unknown";
+}
+
+std::filesystem::path BaselinePath() {
+	return RecordingsDirectory() / ("baseline_" + TitleId() + ".json");
+}
+
+// UTC, sortable, and valid in file names.
+std::string Timestamp() {
+	return fmt::format("{:%Y%m%d-%H%M%S}",
+	                   std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
+}
+
+// Writes off the present thread, so saving a long recording does not stall a frame.
+void WriteFileAsync(std::filesystem::path path, std::string text) {
+	std::thread([path = std::move(path), text = std::move(text)] {
+		std::error_code error;
+		std::filesystem::create_directories(path.parent_path(), error);
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		if (!file.write(text.data(), static_cast<std::streamsize>(text.size()))) {
+			LOGF("[Overlay] could not write %s\n", Common::PathToString(path).c_str());
+		}
+	}).detach();
+}
+
+// Copies `json` to the clipboard, or saves it to a new file in the recordings folder.
+void Deliver(const nlohmann::ordered_json& json, bool save, const std::string& what) {
+	if (!save) {
+		SetHostClipboardText(Dump(json));
+		SetStatus("Copied " + what);
+		return;
+	}
+	const auto name = TitleId() + "_" + Timestamp() + ".json";
+	WriteFileAsync(RecordingsDirectory() / name, Dump(json));
+	SetStatus("Saved perf_recordings/" + name);
+}
+
+// The summary of the last finished recording of all stats, which can become the baseline.
+std::optional<nlohmann::ordered_json> g_last_recording; // Present thread only.
+
+void LoadBaseline() {
+	std::ifstream file(BaselinePath(), std::ios::binary);
+	if (!file) {
+		return;
+	}
+	auto json = nlohmann::ordered_json::parse(file, nullptr, false);
+	if (json.is_object()) {
+		g_baseline = std::move(json);
+	}
+}
+
+void SetBaseline() {
+	g_baseline = std::move(*g_last_recording);
+	g_last_recording.reset();
+	WriteFileAsync(BaselinePath(), Dump(*g_baseline));
+	SetStatus("Baseline saved");
+}
+
+// A recording keeps every frame time and one snapshot per refresh until it is stopped. A
+// recording of selected fields keeps only those lines' values per refresh.
+struct Recording {
+	bool                     active = false;
+	Clock::time_point        start {};
+	nlohmann::ordered_json   samples;
+	std::vector<std::string> fields;
+	bool                     fields_pending = false; // A refresh happened; sample drawn lines.
+	CounterTotals            start_totals {};
+	nlohmann::ordered_json   trigger_events = nlohmann::ordered_json::array();
+};
+
+Recording g_recording; // Present thread only.
+
+void StartRecording(Clock::time_point now, std::vector<std::string> fields = {}) {
+	{
+		std::scoped_lock lock(g_frame_mutex);
+		g_frames.recording = fields.empty();
+		g_frames.recorded_ms.clear();
+		g_frames.recorded_hitches.clear();
+	}
+	g_recording = {true,  now,           nlohmann::ordered_json::array(), std::move(fields),
+	               false, ReadCounters()};
+}
+
+double RecordingSeconds(Clock::time_point now) {
+	return std::chrono::duration<double>(now - g_recording.start).count();
+}
+
+// Names a field recording for buttons and status messages.
+std::string FieldsName(const std::vector<std::string>& fields) {
+	return fields.size() == 1 ? fields.front() : Fmt("%zu fields", fields.size());
+}
+
+void RecordFieldsSample(Clock::time_point now) {
+	nlohmann::ordered_json sample;
+	sample["t_s"] = Round2(RecordingSeconds(now));
+	for (const auto& field: g_recording.fields) {
+		const auto line = std::find_if(g_lines.begin(), g_lines.end(),
+		                               [&](const TextLine& line) { return line.field == field; });
+		// Null while the line is not shown, e.g. after switching to the compact panel.
+		sample[field] = line != g_lines.end() ? nlohmann::ordered_json(line->value) : nullptr;
+	}
+	g_recording.samples.push_back(std::move(sample));
+}
+
+void StopFieldsRecording(Clock::time_point now, bool save) {
+	const double           duration = RecordingSeconds(now);
+	nlohmann::ordered_json json;
+	json["title_id"]   = TitleId();
+	json["fields"]     = g_recording.fields;
+	json["duration_s"] = Round2(duration);
+	json["samples"]    = std::move(g_recording.samples);
+	if (!g_recording.trigger_events.empty()) {
+		json["trigger_events"] = std::move(g_recording.trigger_events);
+	}
+	const auto what = Fmt("%.0f s of %s", duration, FieldsName(g_recording.fields).c_str());
+	g_recording     = {};
+	Deliver(json, save, what);
+}
+
+// The recordable fields of the selected lines, once the selection is finished.
+std::vector<std::string> SelectedFields() {
+	std::vector<std::string> fields;
+	if (g_selection.dragging) {
+		return fields;
+	}
+	for (size_t i = 0; i < g_lines.size(); i++) {
+		const auto& field = g_lines[i].field;
+		if (LineSelected(i) && !field.empty() &&
+		    std::find(fields.begin(), fields.end(), field) == fields.end()) {
+			fields.push_back(field);
+		}
+	}
+	return fields;
+}
+
+void RecordSample(const Snapshot& shown, const GraphicContext& graphics, vk::Extent2D extent,
+                  Clock::time_point now) {
+	nlohmann::ordered_json sample;
+	sample["t_s"] = Round2(std::chrono::duration<double>(now - g_recording.start).count());
+	ExportSnapshot(sample, shown, graphics, extent, false);
+	g_recording.samples.push_back(std::move(sample));
+}
+
+// Ends the recording and copies or saves it with a summary of all its frames.
+void StopRecording(Clock::time_point now, bool save) {
+	if (!g_recording.fields.empty()) {
+		StopFieldsRecording(now, save);
+		return;
+	}
+	std::vector<float> frames;
+	std::vector<Hitch> hitches;
+	{
+		std::scoped_lock lock(g_frame_mutex);
+		g_frames.recording = false;
+		frames.swap(g_frames.recorded_ms);
+		hitches.swap(g_frames.recorded_hitches);
+	}
+	const auto    end_totals = ReadCounters();
+	CounterTotals deltas {};
+	for (size_t i = 0; i < COUNTER_COUNT; i++) {
+		deltas[i] = end_totals[i] - g_recording.start_totals[i];
+	}
+	const double duration = std::chrono::duration<double>(now - g_recording.start).count();
+	double       total_ms = 0.0;
+	for (const float ms: frames) {
+		total_ms += ms;
+	}
+	nlohmann::ordered_json summary;
+	summary["frames"] = frames.size();
+	if (!frames.empty()) {
+		const double average = total_ms / static_cast<double>(frames.size());
+		auto         sorted  = frames;
+		const auto   low = sorted.begin() + static_cast<std::ptrdiff_t>(sorted.size() * 99 / 100);
+		std::nth_element(sorted.begin(), low, sorted.end());
+		summary["avg_fps"]             = Round2(average > 0.0 ? 1000.0 / average : 0.0);
+		summary["avg_frame_ms"]        = Round2(average);
+		summary["one_percent_low_fps"] = Round2(*low > 0.0f ? 1000.0 / *low : 0.0);
+		summary["worst_frame_ms"]      = Round2(*std::max_element(frames.begin(), frames.end()));
+	}
+	std::vector<double> frame_times;
+	frame_times.reserve(frames.size());
+	for (const float ms: frames) {
+		frame_times.push_back(Round2(ms));
+	}
+	// The part a baseline keeps.
+	nlohmann::ordered_json result;
+	result["title_id"]    = TitleId();
+	result["recorded_at"] = Timestamp();
+	result["duration_s"]  = Round2(duration);
+	result["summary"]     = std::move(summary);
+	result["per_frame"] =
+	    CounterJson(deltas, std::max(static_cast<double>(frames.size()), 1.0), false);
+
+	nlohmann::ordered_json json = result;
+	if (g_baseline) {
+		auto vs = nlohmann::ordered_json::object();
+		for (const char* group: {"summary", "per_frame"}) {
+			for (const auto& [key, value]: result[group].items()) {
+				const auto base = BaselineValue(group, key);
+				if (value.is_number() && base) {
+					vs[group][key] = Round2(value.get<double>() - *base);
+				}
+			}
+		}
+		json["change_vs_baseline"] = std::move(vs);
+		json["baseline"]           = *g_baseline;
+	}
+	auto hitch_json = nlohmann::ordered_json::array();
+	for (const auto& hitch: hitches) {
+		hitch_json.push_back(HitchJson(
+		    hitch, "t_s", std::chrono::duration<double>(hitch.time - g_recording.start).count()));
+	}
+	json["hitches"] = std::move(hitch_json);
+	if (!g_recording.trigger_events.empty()) {
+		json["trigger_events"] = std::move(g_recording.trigger_events);
+	}
+	json["frame_times_ms"] = std::move(frame_times);
+	json["samples"]        = std::move(g_recording.samples);
+	g_recording            = {};
+	g_last_recording       = std::move(result);
+	Deliver(json, save, Fmt("%.0f s recording", duration));
+}
+
+// Fires when a field's shown value crosses a threshold, keeping a snapshot of all stats. Fields
+// change once per refresh, so a trigger sees one value per second.
+struct Trigger {
+	std::string field;
+	float       threshold = 0.0f;
+	bool        above     = true;
+	bool        armed     = true; // Fires again once the value is back on the other side.
+	uint32_t    fired     = 0;
+};
+
+struct TriggerEvent {
+	Clock::time_point      time;
+	nlohmann::ordered_json json;
+};
+
+constexpr size_t MAX_TRIGGERS                = 8;
+constexpr size_t TRIGGER_EVENT_HISTORY       = 32;
+constexpr size_t MAX_RECORDED_TRIGGER_EVENTS = 1000;
+
+// Present thread only.
+std::vector<Trigger>     g_triggers;
+std::deque<TriggerEvent> g_trigger_events;
+bool                     g_triggers_pending = false; // A refresh happened; check drawn lines.
+
+const TextLine* FindLine(const std::string& field) {
+	const auto line = std::find_if(g_lines.begin(), g_lines.end(),
+	                               [&](const TextLine& line) { return line.field == field; });
+	return line != g_lines.end() ? &*line : nullptr;
+}
+
+// The first number of a shown value, e.g. 87 in "87%" or 12.5 in "12.5 ms  (3 waits/s)".
+std::optional<double> FirstNumber(const std::string& text) {
+	const auto start = text.find_first_of("-.0123456789");
+	if (start == std::string::npos) {
+		return std::nullopt;
+	}
+	const char* begin = text.c_str() + start;
+	char*       end   = nullptr;
+	const auto  value = std::strtod(begin, &end);
+	return end != begin ? std::optional(value) : std::nullopt;
+}
+
+// `json` with `time_key` first.
+nlohmann::ordered_json WithTime(const char* time_key, double seconds,
+                                const nlohmann::ordered_json& json) {
+	nlohmann::ordered_json result;
+	result[time_key] = Round2(seconds);
+	result.update(json);
+	return result;
+}
+
+void CheckTriggers(const Snapshot& shown, const GraphicContext& graphics, vk::Extent2D extent,
+                   Clock::time_point now) {
+	for (auto& trigger: g_triggers) {
+		const auto* line  = FindLine(trigger.field);
+		const auto  value = line != nullptr ? FirstNumber(line->value) : std::nullopt;
+		if (!value) {
+			continue;
+		}
+		const bool met = trigger.above ? *value > trigger.threshold : *value < trigger.threshold;
+		if (!met) {
+			trigger.armed = true;
+			continue;
+		}
+		if (!trigger.armed) {
+			continue;
+		}
+		trigger.armed = false;
+		trigger.fired++;
+		nlohmann::ordered_json event;
+		event["field"]     = trigger.field;
+		event["condition"] = Fmt("%s %.2f", trigger.above ? ">" : "<", trigger.threshold);
+		event["value"]     = line->value;
+		auto snapshot      = nlohmann::ordered_json::object();
+		ExportSnapshot(snapshot, shown, graphics, extent, true);
+		event["snapshot"] = std::move(snapshot);
+		if (g_recording.active && g_recording.trigger_events.size() < MAX_RECORDED_TRIGGER_EVENTS) {
+			g_recording.trigger_events.push_back(WithTime("t_s", RecordingSeconds(now), event));
+		}
+		if (g_trigger_events.size() == TRIGGER_EVENT_HISTORY) {
+			g_trigger_events.pop_front();
+		}
+		g_trigger_events.push_back({now, std::move(event)});
+		SetStatus("Triggered: " + trigger.field);
+	}
+}
+
+nlohmann::ordered_json TriggersJson(Clock::time_point now) {
+	nlohmann::ordered_json json;
+	auto                   triggers = nlohmann::ordered_json::array();
+	for (const auto& trigger: g_triggers) {
+		nlohmann::ordered_json item;
+		item["field"]     = trigger.field;
+		item["condition"] = Fmt("%s %.2f", trigger.above ? ">" : "<", trigger.threshold);
+		item["fired"]     = trigger.fired;
+		triggers.push_back(std::move(item));
+	}
+	auto events = nlohmann::ordered_json::array();
+	for (const auto& event: g_trigger_events) {
+		events.push_back(
+		    WithTime("age_s", std::chrono::duration<double>(now - event.time).count(), event.json));
+	}
+	json["triggers"]       = std::move(triggers);
+	json["trigger_events"] = std::move(events);
+	return json;
+}
+
+void AddTrigger(const std::string& field) {
+	const auto* line  = FindLine(field);
+	const auto  value = line != nullptr ? FirstNumber(line->value) : std::nullopt;
+	// Start above the current value, so the trigger waits for a rise.
+	const float threshold = value && *value != 0.0 ? static_cast<float>(*value * 1.5) : 1.0f;
+	g_triggers.push_back({field, threshold});
+}
+
+void DrawTriggers(float scale) {
+	ImGui::SeparatorText("Triggers");
+	for (size_t i = 0; i < g_triggers.size();) {
+		auto& trigger = g_triggers[i];
+		ImGui::PushID(static_cast<int>(i));
+		ImGui::TextUnformatted(trigger.field.c_str());
+		ImGui::SameLine();
+		if (ImGui::SmallButton(trigger.above ? ">" : "<")) {
+			trigger.above = !trigger.above;
+			trigger.armed = true;
+		}
+		ImGui::SetItemTooltip("Fires when the value goes above or below the threshold");
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(90.0f * scale);
+		// Keyboard input does not reach the overlay, so the threshold is dragged.
+		if (ImGui::DragFloat("##threshold", &trigger.threshold,
+		                     std::max(std::abs(trigger.threshold) * 0.01f, 0.01f), 0.0f, 0.0f,
+		                     "%.2f", ImGuiSliderFlags_NoInput)) {
+			trigger.armed = true;
+		}
+		ImGui::SetItemTooltip("Drag to change the threshold");
+		ImGui::SameLine();
+		ImGui::TextDisabled("fired %u", trigger.fired);
+		ImGui::SameLine();
+		const bool remove = ImGui::SmallButton("x");
+		ImGui::PopID();
+		if (remove) {
+			g_triggers.erase(g_triggers.begin() + static_cast<std::ptrdiff_t>(i));
+		} else {
+			i++;
+		}
+	}
+}
+
+void CopySelection() {
+	std::string text;
+	int         count = 0;
+	for (size_t i = 0; i < g_lines.size(); i++) {
+		if (LineSelected(i)) {
+			text += (count++ == 0 ? "" : "\n") + g_lines[i].text;
+		}
+	}
+	SetHostClipboardText(std::move(text));
+	SetStatus(count == 1 ? std::string("Copied 1 line") : Fmt("Copied %d lines", count));
+}
+
+int LineAt(ImVec2 point) {
+	const ImVec2 slack = ImGui::GetStyle().ItemSpacing;
+	for (size_t i = 0; i < g_lines.size(); i++) {
+		const auto& line = g_lines[i];
+		if (point.y >= line.min.y && point.y < line.max.y + slack.y &&
+		    point.x >= line.min.x - slack.x && point.x <= line.max.x + slack.x) {
+			return static_cast<int>(i);
+		}
+	}
+	return -1;
+}
+
+// Pressing on a line and dragging selects the lines in between; releasing copies them.
+void UpdateSelection() {
+	const auto count = static_cast<int>(g_lines.size());
+	if (g_selection.anchor >= count || g_selection.current >= count) {
+		g_selection = {};
+	}
+	const ImVec2 mouse   = ImGui::GetIO().MousePos;
+	const bool   hovered = ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered();
+	// A faint highlight under the mouse, and a tooltip after a pause on a line, hint that lines
+	// can be selected.
+	static Clock::time_point hover_start {};
+	const int                hovered_line = hovered ? LineAt(mouse) : -1;
+	if (hovered_line != g_hovered_line) {
+		hover_start = Clock::now();
+	}
+	g_hovered_line = hovered_line;
+	if (hovered_line >= 0 && !g_selection.dragging && !LineSelected(hovered_line) &&
+	    Clock::now() - hover_start >= std::chrono::seconds(1)) {
+		ImGui::SetTooltip("Click a line to copy it, drag to copy several");
+	}
+	if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered) {
+		const int line = LineAt(mouse);
+		g_selection    = {line, line, line >= 0};
+	}
+	if (!g_selection.dragging) {
+		return;
+	}
+	if (const int line = LineAt(mouse); line >= 0) {
+		g_selection.current = line;
+	}
+	if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+		g_selection.dragging = false;
+		CopySelection();
 	}
 }
 
@@ -606,6 +1449,7 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
+	const auto       totals = ReadCounters();
 	std::scoped_lock lock(g_frame_mutex);
 	const auto       now = Clock::now();
 	if (g_frames.window_start == Clock::time_point {}) {
@@ -618,7 +1462,26 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 		frames.next                      = (frames.next + 1) % FRAME_HISTORY;
 		frames.count                     = std::min(frames.count + 1, FRAME_HISTORY);
 		frames.max_ms                    = std::max(frames.max_ms, ms);
+		if (frames.recording && frames.recorded_ms.size() < MAX_RECORDED_FRAMES) {
+			frames.recorded_ms.push_back(ms);
+		}
+		if (frames.average_ms > 0.0f &&
+		    ms >= std::max(HITCH_MIN_MS, HITCH_FACTOR * frames.average_ms)) {
+			Hitch hitch {now, ms, {}};
+			for (size_t i = 0; i < COUNTER_COUNT; i++) {
+				hitch.deltas[i] = totals[i] - frames.flip_totals[i];
+			}
+			if (frames.recording && frames.recorded_hitches.size() < MAX_RECORDED_HITCH) {
+				frames.recorded_hitches.push_back(hitch);
+			}
+			if (frames.hitches.size() == HITCH_HISTORY) {
+				frames.hitches.pop_front();
+			}
+			frames.hitches.push_back(hitch);
+		}
+		frames.average_ms = frames.average_ms > 0.0f ? frames.average_ms * 0.95f + ms * 0.05f : ms;
 	}
+	frames.flip_totals  = totals;
 	frames.last_flip    = now;
 	frames.guest_width  = guest_width;
 	frames.guest_height = guest_height;
@@ -644,8 +1507,28 @@ void TogglePerformanceOverlayDetails() noexcept {
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
+void TogglePerformanceOverlayRecording() noexcept {
+	if (!Common::DebugCounters::Enabled()) {
+		SetOverlayEnabled(true);
+	}
+	g_record_toggle.store(true, std::memory_order_release);
+	g_revision.fetch_add(1, std::memory_order_acq_rel);
+}
+
 uint64_t PerformanceOverlayRevision() noexcept {
 	return g_revision.load(std::memory_order_acquire);
+}
+
+void RequestPerformanceOverlayRepaint() noexcept {
+	g_revision.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool PerformanceOverlayContains(float x, float y) noexcept {
+	if (!PerformanceOverlayEnabled()) {
+		return false;
+	}
+	std::scoped_lock lock(g_panel_mutex);
+	return x >= g_panel_min.x && x < g_panel_max.x && y >= g_panel_min.y && y < g_panel_max.y;
 }
 
 float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent) {
@@ -663,6 +1546,21 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	if (generation != shown_generation) {
 		shown            = {};
 		shown_generation = generation;
+		g_recording      = {}; // Re-enabling the panel cleared the recorded frames.
+	}
+	static bool baseline_loaded = false;
+	if (!std::exchange(baseline_loaded, true)) {
+		LoadBaseline();
+	}
+	if (g_record_toggle.exchange(false, std::memory_order_acq_rel)) {
+		if (g_recording.active) {
+			StopRecording(now, true);
+		} else {
+			StartRecording(now);
+		}
+	}
+	if (details != shown_details) {
+		g_selection = {};
 	}
 	if (shown.sample_time == Clock::time_point {} || now - shown.sample_time >= REFRESH_INTERVAL ||
 	    details != shown_details) {
@@ -687,6 +1585,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			                        : std::chrono::duration<double>(now - frames.last_flip).count();
 			shown.guest_width = frames.guest_width;
 			shown.guest_height  = frames.guest_height;
+			shown.hitches       = frames.hitches;
 			frames.flips        = 0;
 			frames.max_ms       = 0.0f;
 			frames.window_start = now;
@@ -700,6 +1599,14 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			shown.low_fps = *percentile > 0.0f ? 1000.0 / *percentile : 0.0;
 		}
 		Refresh(shown, graphics, now, generation);
+		if (g_recording.active && g_recording.fields.empty()) {
+			RecordSample(shown, graphics, extent, now);
+			if (g_recording.samples.size() >= MAX_RECORDED_SAMPLES) {
+				StopRecording(now, true);
+			}
+		}
+		g_recording.fields_pending = g_recording.active && !g_recording.fields.empty();
+		g_triggers_pending         = !g_triggers.empty();
 	}
 
 	const float scale = std::clamp(std::min(static_cast<float>(extent.width) / 1920.0f,
@@ -709,21 +1616,25 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	                        ImGuiCond_Always, {1.0f, 0.0f});
 	ImGui::SetNextWindowBgAlpha(details ? 0.82f : 0.72f);
 	constexpr ImGuiWindowFlags FLAGS =
-	    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-	    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-	    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
-	    ImGuiWindowFlags_AlwaysAutoResize;
+	    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove |
+	    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+	    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysAutoResize;
 	ImGui::PushFont(nullptr, (details ? 13.0f : 15.0f) * scale);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * scale);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10.0f * scale, 8.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f * scale, 2.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {4.0f * scale, 1.0f * scale});
 	if (ImGui::Begin("##kyty_performance_overlay", nullptr, FLAGS)) {
+		g_lines.clear();
+		g_section.clear();
 		if (shown.fps > 0.0) {
-			ImGui::TextColored(Color(FrameTimeColor(shown.frame_ms)), "%.1f FPS   %.1f ms",
-			                   shown.fps, shown.frame_ms);
+			const auto text = Fmt("%.1f FPS   %.1f ms", shown.fps, shown.frame_ms);
+			ImGui::TextColored(Color(FrameTimeColor(shown.frame_ms)), "%s", text.c_str());
+			AddItemLine(text, "FPS");
 		} else if (shown.stalled_s >= 1.0) {
-			ImGui::TextColored(Color(BAD), "No frames for %.0f s", shown.stalled_s);
+			const auto text = Fmt("No frames for %.0f s", shown.stalled_s);
+			ImGui::TextColored(Color(BAD), "%s", text.c_str());
+			AddItemLine(text);
 		} else {
 			ImGui::TextDisabled("Waiting for frames");
 		}
@@ -744,14 +1655,116 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 		} else {
 			DrawCompact(shown);
 		}
+		if (g_recording.fields_pending) {
+			g_recording.fields_pending = false;
+			RecordFieldsSample(now);
+			if (g_recording.samples.size() >= MAX_RECORDED_SAMPLES) {
+				StopRecording(now, true);
+			}
+		}
+		if (std::exchange(g_triggers_pending, false)) {
+			CheckTriggers(shown, graphics, extent, now);
+		}
+		// The compact panel keeps only text; its tools live in the detailed one.
+		if (!details) {
+			if (g_recording.active) {
+				ImGui::TextColored(Color(BAD), "Recording %.0f s, F3 stops and saves",
+				                   RecordingSeconds(now));
+			}
+		} else {
+			if (!g_triggers.empty()) {
+				DrawTriggers(scale);
+			}
+			if (ImGui::SmallButton("Copy JSON")) {
+				nlohmann::ordered_json json;
+				ExportSnapshot(json, shown, graphics, extent, true);
+				if (!g_triggers.empty() || !g_trigger_events.empty()) {
+					json.update(TriggersJson(now));
+				}
+				SetHostClipboardText(Dump(json));
+				SetStatus("Copied JSON");
+			}
+			auto selected_fields = SelectedFields();
+			ImGui::SameLine();
+			// "###" keeps a button's id while its label counts up.
+			if (g_recording.active) {
+				const double elapsed = RecordingSeconds(now);
+				const auto   label   = g_recording.fields.empty()
+				                           ? Fmt("Stop and copy stats (%.0f s)###record", elapsed)
+				                           : Fmt("Stop and copy %s (%.0f s)###record",
+				                                 FieldsName(g_recording.fields).c_str(), elapsed);
+				if (ImGui::SmallButton(label.c_str())) {
+					StopRecording(now, false);
+				}
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Stop and save###record_save")) {
+					StopRecording(now, true);
+				}
+				ImGui::SetItemTooltip(
+				    "Saves the recording to a new file in perf_recordings next to "
+				    "the emulator");
+			} else {
+				if (ImGui::SmallButton("Record stats###record")) {
+					StartRecording(now);
+				}
+				ImGui::SetItemTooltip("Records every frame time, hitches and a snapshot of all "
+				                      "overlay stats each second until stopped (F3 also starts it, "
+				                      "and stops and saves it)");
+				if (g_last_recording) {
+					ImGui::SameLine();
+					if (ImGui::SmallButton("Set as baseline")) {
+						SetBaseline();
+					}
+					ImGui::SetItemTooltip(
+					    "Saves the last recording as this game's baseline in "
+					    "perf_recordings; the overlay then compares live stats with "
+					    "it, also after a restart");
+				}
+				if (!selected_fields.empty()) {
+					ImGui::SameLine();
+					if (ImGui::SmallButton(
+					        Fmt("Record %s###record_fields", FieldsName(selected_fields).c_str())
+					            .c_str())) {
+						StartRecording(now, selected_fields);
+					}
+					ImGui::SetItemTooltip("Records the selected lines' values each second until "
+					                      "stopped");
+				}
+			}
+			if (selected_fields.size() == 1 && g_triggers.size() < MAX_TRIGGERS &&
+			    std::none_of(g_triggers.begin(), g_triggers.end(), [&](const Trigger& trigger) {
+				    return trigger.field == selected_fields.front();
+			    })) {
+				ImGui::SameLine();
+				if (ImGui::SmallButton(
+				        Fmt("Trigger on %s###trigger", selected_fields.front().c_str()).c_str())) {
+					AddTrigger(selected_fields.front());
+				}
+				ImGui::SetItemTooltip("Saves a snapshot of all stats whenever this value crosses a "
+				                      "threshold you set below");
+			}
+		}
+		if (!g_status.empty() && now - g_status_time < STATUS_DURATION) {
+			ImGui::TextColored(Color(GOOD), "%s", g_status.c_str());
+		} else {
 #if defined(__APPLE__)
-		ImGui::TextDisabled(details ? "Cmd+Shift+P compact   Cmd+P hide"
-		                            : "Cmd+Shift+P details   Cmd+P hide");
+			ImGui::TextDisabled(details ? "Cmd+Shift+P compact   Cmd+P hide   F3 record"
+			                            : "Cmd+Shift+P details   Cmd+P hide   F3 record");
 #else
-		ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide" : "Shift+F2 details   F2 hide");
+			ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide   F3 record"
+			                            : "Shift+F2 details   F2 hide   F3 record");
 #endif
+		}
+		UpdateSelection();
 	}
-	const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+	const ImVec2 position = ImGui::GetWindowPos();
+	const ImVec2 size     = ImGui::GetWindowSize();
+	{
+		std::scoped_lock lock(g_panel_mutex);
+		g_panel_min = position;
+		g_panel_max = {position.x + size.x, position.y + size.y};
+	}
+	const float bottom = position.y + size.y;
 	ImGui::End();
 	ImGui::PopStyleVar(4);
 	ImGui::PopFont();

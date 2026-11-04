@@ -151,7 +151,7 @@ bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 	return false;
 }
 
-constexpr size_t INPUT_QUEUE_CAPACITY = 128;
+constexpr size_t INPUT_QUEUE_CAPACITY             = 128;
 constexpr int    MAX_TOUCH_CURSOR_IMAGE_DIMENSION = 2048;
 constexpr float  TOUCH_CURSOR_IMAGE_SIZE          = 48.0f;
 
@@ -230,22 +230,27 @@ bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
-bool                         g_input_active               = false;
-bool                         g_input_controller           = false;
-bool                         g_input_keyboard             = false;
-bool                         g_input_multiline            = false;
-bool                         g_input_lifecycle_active     = false;
-bool                         g_controller_captured        = false;
+bool                         g_input_active           = false;
+bool                         g_input_controller       = false;
+bool                         g_input_keyboard         = false;
+bool                         g_input_multiline        = false;
+bool                         g_input_lifecycle_active = false;
+bool                         g_controller_captured    = false;
 OverlaySession               g_session;
-SDL_Window*                  g_input_window               = nullptr;
+SDL_Window*                  g_input_window = nullptr;
+// A press that starts on the performance overlay keeps the mouse until release (event thread).
+bool                       g_performance_mouse_captured = false;
+std::atomic<Uint32>        g_clipboard_event {static_cast<Uint32>(-1)};
+std::mutex                 g_clipboard_mutex;
+std::optional<std::string> g_clipboard_text;
 struct TrophyNotification {
 	std::string            name;
 	int32_t                grade;
 	std::vector<std::byte> icon_png;
 };
-std::mutex                     g_trophy_notification_mutex;
-std::deque<TrophyNotification> g_trophy_notifications;
-std::atomic<bool>              g_trophy_notification_active {false};
+std::mutex                           g_trophy_notification_mutex;
+std::deque<TrophyNotification>       g_trophy_notifications;
+std::atomic<bool>                    g_trophy_notification_active {false};
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
@@ -253,7 +258,7 @@ bool                                 g_splash_fast = false;
 
 std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
 	std::vector<std::string_view> lines;
-	auto* const                  font = ImGui::GetFont();
+	auto* const                   font = ImGui::GetFont();
 	for (;;) {
 		const auto newline   = text.find('\n');
 		const auto paragraph = text.substr(0, newline);
@@ -264,9 +269,10 @@ std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_
 			const std::string_view candidate(line.empty() ? word.begin() : line.begin(),
 			                                 word.end());
 			// Keep an oversized word intact; the toast's clip rectangle handles overflow.
-			if (!line.empty() && font->CalcTextSizeA(font_size, std::numeric_limits<float>::max(),
-			                                       0.0f, candidate.data(),
-			                                       candidate.data() + candidate.size()).x > width) {
+			if (!line.empty() &&
+			    font->CalcTextSizeA(font_size, std::numeric_limits<float>::max(), 0.0f,
+			                        candidate.data(), candidate.data() + candidate.size())
+			            .x > width) {
 				lines.push_back(line);
 				line = word;
 			} else {
@@ -291,7 +297,7 @@ void AddSystemFontFallbacks(ImGuiIO& io) {
 			if (std::filesystem::is_regular_file(path, error)) {
 				ImFontConfig config;
 				config.MergeMode = true;
-				config.Flags = ImFontFlags_NoLoadError;
+				config.Flags     = ImFontFlags_NoLoadError;
 				if (io.Fonts->AddFontFromFileTTF(path, 0.0f, &config) != nullptr) {
 					return true;
 				}
@@ -359,6 +365,45 @@ void QueueInput(InputEvent event) {
 		g_input_reset_requested = true;
 	}
 	g_input_events.push_back(event);
+}
+
+// Without a system dialog, mouse input over the performance overlay goes to ImGui instead of
+// the guest, so its rows can be selected and its button pressed.
+bool ProcessPerformanceOverlayMouse(const SDL_Event& event) {
+	switch (event.type) {
+		case SDL_EVENT_MOUSE_MOTION:
+			if (!PerformanceOverlayEnabled()) {
+				return false;
+			}
+			QueueInput({InputKind::MousePosition,
+			            {},
+			            0,
+			            static_cast<float>(event.motion.x),
+			            static_cast<float>(event.motion.y)});
+			if (g_performance_mouse_captured) {
+				RequestPerformanceOverlayRepaint();
+			}
+			return g_performance_mouse_captured;
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP: {
+			const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+			if (down ? !(PerformanceOverlayEnabled() &&
+			             PerformanceOverlayContains(event.button.x, event.button.y))
+			         : !g_performance_mouse_captured) {
+				return false;
+			}
+			g_performance_mouse_captured = down;
+			QueueInput({InputKind::MousePosition,
+			            {},
+			            0,
+			            static_cast<float>(event.button.x),
+			            static_cast<float>(event.button.y)});
+			QueueInput({InputKind::MouseButton, {}, event.button.button, down ? 1.0f : 0.0f, 0.0f});
+			RequestPerformanceOverlayRepaint();
+			return true;
+		}
+		default: return false;
+	}
 }
 
 void RetryVisibilityWakeup() {
@@ -659,6 +704,9 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 	EXIT_IF(window == nullptr);
 	const Uint32 type = SDL_RegisterEvents(1);
 	EXIT_IF(type == static_cast<Uint32>(-1));
+	const Uint32 clipboard_type = SDL_RegisterEvents(1);
+	EXIT_IF(clipboard_type == static_cast<Uint32>(-1));
+	g_clipboard_event.store(clipboard_type, std::memory_order_release);
 	g_input_window = window;
 	{
 		std::scoped_lock lock(g_visibility_mutex);
@@ -691,11 +739,13 @@ void ShutdownSystemOverlayInput() {
 		g_visibility_updates.clear();
 		g_missing_visibility_wakeups = 0;
 	}
-	g_input_active     = false;
-	g_input_session    = {};
-	g_input_controller = false;
-	g_input_keyboard   = false;
-	g_input_multiline  = false;
+	g_clipboard_event.store(static_cast<Uint32>(-1), std::memory_order_release);
+	g_performance_mouse_captured = false;
+	g_input_active               = false;
+	g_input_session              = {};
+	g_input_controller           = false;
+	g_input_keyboard             = false;
+	g_input_multiline            = false;
 	if (g_input_window != nullptr && SDL_TextInputActive(g_input_window)) {
 		SDL_StopTextInput(g_input_window);
 	}
@@ -703,9 +753,9 @@ void ShutdownSystemOverlayInput() {
 }
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
-	const auto core   = CoreIme::GetVisualState();
-	const auto dialog = DialogIme::GetVisualState();
-	const auto system = SystemDialog::GetVisualState();
+	const auto core          = CoreIme::GetVisualState();
+	const auto dialog        = DialogIme::GetVisualState();
+	const auto system        = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
@@ -716,7 +766,34 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	            PerformanceOverlayRevision()};
 }
 
+void SetHostClipboardText(std::string text) {
+	const Uint32 type = g_clipboard_event.load(std::memory_order_acquire);
+	if (type == static_cast<Uint32>(-1)) {
+		return;
+	}
+	{
+		std::scoped_lock lock(g_clipboard_mutex);
+		g_clipboard_text = std::move(text);
+	}
+	SDL_Event event {};
+	event.type = type;
+	if (!SDL_PushEvent(&event)) {
+		LOGF("Could not queue clipboard update: %s\n", SDL_GetError());
+	}
+}
+
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
+	if (event.type == g_clipboard_event.load(std::memory_order_acquire)) {
+		std::optional<std::string> text;
+		{
+			std::scoped_lock lock(g_clipboard_mutex);
+			text.swap(g_clipboard_text);
+		}
+		if (text && !SDL_SetClipboardText(text->c_str())) {
+			LOGF("Could not set clipboard text: %s\n", SDL_GetError());
+		}
+		return true;
+	}
 	RetryVisibilityWakeup();
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
 		VisibilityUpdate update {};
@@ -750,7 +827,7 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		return false;
 	}
 	if (!g_input_active) {
-		return false;
+		return ProcessPerformanceOverlayMouse(event);
 	}
 
 	const auto     session          = g_input_session;
@@ -761,7 +838,8 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	if (controller_event && !g_input_controller) {
 		return false;
 	}
-	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_TEXT_EDITING ||
+	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT ||
+	                            event.type == SDL_EVENT_TEXT_EDITING ||
 	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
@@ -790,8 +868,8 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		case SDL_EVENT_KEY_DOWN: {
 			g_last_external_keycode = static_cast<uint16_t>(event.key.scancode);
 			g_last_external_status  = ExternalKeyStatus(event.key.mod, false);
-			auto action = Ime::ExternalAction::Text;
-			bool queue  = true;
+			auto action             = Ime::ExternalAction::Text;
+			bool queue              = true;
 			if (event.key.key == SDLK_BACKSPACE) {
 				action = Ime::ExternalAction::Backspace;
 			} else if (event.key.key == SDLK_LEFT) {
@@ -980,14 +1058,13 @@ struct SystemOverlay::Impl {
 			return nullptr;
 		}
 
-		int width = 0;
-		int height = 0;
-		auto* pixels = stbi_load_from_memory(
-		    reinterpret_cast<const stbi_uc*>(encoded.data()), static_cast<int>(encoded.size()),
-		    &width, &height, nullptr, 4);
+		int   width  = 0;
+		int   height = 0;
+		auto* pixels =
+		    stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(encoded.data()),
+		                          static_cast<int>(encoded.size()), &width, &height, nullptr, 4);
 		if (pixels == nullptr || width <= 0 || height <= 0 ||
-		    width > MAX_TOUCH_CURSOR_IMAGE_DIMENSION ||
-		    height > MAX_TOUCH_CURSOR_IMAGE_DIMENSION) {
+		    width > MAX_TOUCH_CURSOR_IMAGE_DIMENSION || height > MAX_TOUCH_CURSOR_IMAGE_DIMENSION) {
 			LOGF("Could not load touchpad cursor image %s: %s\n",
 			     Common::PathToString(path).c_str(),
 			     pixels == nullptr ? stbi_failure_reason() : "image dimensions exceed 2048x2048");
@@ -1054,8 +1131,8 @@ struct SystemOverlay::Impl {
 			if (splash_dds[i]) {
 				continue;
 			}
-			const auto& path = g_splash_paths[i];
-			auto image = std::make_unique<DdsImage>(graphics);
+			const auto& path  = g_splash_paths[i];
+			auto        image = std::make_unique<DdsImage>(graphics);
 			if (!image->Load(path)) {
 				LOGF("[Splash] could not load %s\n", path.string().c_str());
 				FinishSplash();
@@ -1446,8 +1523,8 @@ struct SystemOverlay::Impl {
 			const float fraction = std::clamp(traveled / distance, 0.0f, 1.0f);
 			particles.push_back(
 			    {{from.x + dx * fraction, from.y + dy * fraction}, now, next_particle_icon});
-			next_particle_icon = static_cast<TouchParticleIcon>(
-			    (static_cast<uint8_t>(next_particle_icon) + 1) % 4);
+			next_particle_icon =
+			    static_cast<TouchParticleIcon>((static_cast<uint8_t>(next_particle_icon) + 1) % 4);
 			if (particles.size() > MAX_TOUCH_PARTICLES) {
 				particles.erase(particles.begin());
 			}
@@ -1457,15 +1534,14 @@ struct SystemOverlay::Impl {
 	}
 
 	void DrawTouchParticles(ImDrawList* draw, Clock::time_point now) {
-		const auto skin = GetTouchParticleSkin();
+		const auto      skin              = GetTouchParticleSkin();
 		constexpr float PARTICLE_LIFETIME = 1.0f;
 		constexpr float TRAIL_LIFETIME    = 0.35f;
 		std::erase_if(trail_segments, [now](const auto& segment) {
 			return std::chrono::duration<float>(now - segment.born).count() >= TRAIL_LIFETIME;
 		});
 		std::erase_if(particles, [now](const auto& particle) {
-			return std::chrono::duration<float>(now - particle.born).count() >=
-			       PARTICLE_LIFETIME;
+			return std::chrono::duration<float>(now - particle.born).count() >= PARTICLE_LIFETIME;
 		});
 		for (const auto& segment: trail_segments) {
 			const float age =
@@ -1497,17 +1573,17 @@ struct SystemOverlay::Impl {
 			    std::chrono::duration<float>(now - particle.born).count() / PARTICLE_LIFETIME;
 			const float alpha = 1.0f - age;
 			const float size  = 9.0f * (1.0f - age * 0.35f);
-			const float drift = (static_cast<uint8_t>(particle.icon) % 2 == 0 ? -1.0f : 1.0f) *
-			                    8.0f * age;
+			const float drift =
+			    (static_cast<uint8_t>(particle.icon) % 2 == 0 ? -1.0f : 1.0f) * 8.0f * age;
 			const ImVec2 center {particle.position.x + drift, particle.position.y - 18.0f * age};
-			const auto faded = [alpha, skin, icon = particle.icon](int r, int g, int b) {
+			const auto   faded = [alpha, skin, icon = particle.icon](int r, int g, int b) {
 				if (skin == TouchParticleSkin::BlueNeon) {
 					r = 75;
 					g = 220;
 					b = 255;
 				} else if (skin == TouchParticleSkin::RedBlue) {
-					const bool red = icon == TouchParticleIcon::Square ||
-					                 icon == TouchParticleIcon::Cross;
+					const bool red =
+					    icon == TouchParticleIcon::Square || icon == TouchParticleIcon::Cross;
 					r = red ? 255 : 75;
 					g = red ? 65 : 175;
 					b = red ? 85 : 255;
@@ -1516,8 +1592,8 @@ struct SystemOverlay::Impl {
 					g = 245;
 					b = 255;
 				} else if (skin == TouchParticleSkin::Crimson) {
-					const bool ember = icon == TouchParticleIcon::Triangle ||
-					                   icon == TouchParticleIcon::Circle;
+					const bool ember =
+					    icon == TouchParticleIcon::Triangle || icon == TouchParticleIcon::Circle;
 					r = 255;
 					g = ember ? 205 : 115;
 					b = ember ? 70 : 15;
@@ -1565,8 +1641,8 @@ struct SystemOverlay::Impl {
 					              faded(80, 230, 130), 2.2f);
 					draw->AddLine({center.x - size, center.y + size},
 					              {center.x + size, center.y + size}, faded(80, 230, 130), 2.2f);
-					draw->AddLine({center.x + size, center.y + size},
-					              {center.x, center.y - size}, faded(80, 230, 130), 2.2f);
+					draw->AddLine({center.x + size, center.y + size}, {center.x, center.y - size},
+					              faded(80, 230, 130), 2.2f);
 					break;
 				case TouchParticleIcon::Cross:
 					draw->AddLine({center.x - size * 0.75f, center.y - size * 0.75f},
@@ -1598,12 +1674,11 @@ struct SystemOverlay::Impl {
 				cursor_gesture     = state.gesture;
 				particle_distance  = 0.0f;
 			} else {
-				const float dt = last_cursor_update == Clock::time_point {}
-				                     ? 1.0f / 60.0f
-				                     : std::clamp(std::chrono::duration<float>(now -
-				                                                             last_cursor_update)
-				                                      .count(),
-				                                  1.0f / 1000.0f, 0.05f);
+				const float dt =
+				    last_cursor_update == Clock::time_point {}
+				        ? 1.0f / 60.0f
+				        : std::clamp(std::chrono::duration<float>(now - last_cursor_update).count(),
+				                     1.0f / 1000.0f, 0.05f);
 				const ImVec2 previous = cursor_position;
 				const float  follow   = 1.0f - std::exp(-18.0f * dt);
 				cursor_position.x += (target.x - cursor_position.x) * follow;
@@ -1620,12 +1695,11 @@ struct SystemOverlay::Impl {
 			return;
 		}
 
-		const ImVec2 position = cursor_position;
-		const auto& cursor_image =
-		    state.drawing ? drawing_cursor_image : hand_cursor_image;
+		const ImVec2 position     = cursor_position;
+		const auto&  cursor_image = state.drawing ? drawing_cursor_image : hand_cursor_image;
 		if (cursor_image != nullptr) {
-			const float scale = TOUCH_CURSOR_IMAGE_SIZE /
-			                    static_cast<float>(std::max(cursor_image->Height, 1));
+			const float scale =
+			    TOUCH_CURSOR_IMAGE_SIZE / static_cast<float>(std::max(cursor_image->Height, 1));
 			const ImVec2 size {static_cast<float>(cursor_image->Width) * scale,
 			                   static_cast<float>(cursor_image->Height) * scale};
 			draw->AddImage(cursor_image->GetTexRef(), position,
@@ -1633,9 +1707,10 @@ struct SystemOverlay::Impl {
 			return;
 		}
 
-		const ImU32  blue     = IM_COL32(35, 145, 255, 220);
+		const ImU32  blue   = IM_COL32(35, 145, 255, 220);
 		const ImVec2 hand[] = {
-		    {position.x, position.y},         {position.x, position.y + 20.0f},
+		    {position.x, position.y},
+		    {position.x, position.y + 20.0f},
 		    {position.x + 4.0f, position.y + 16.0f},
 		    {position.x + 9.0f, position.y + 27.0f},
 		    {position.x + 13.0f, position.y + 25.0f},
@@ -1655,8 +1730,8 @@ struct SystemOverlay::Impl {
 		};
 		draw->AddConvexPolyFilled(hand, IM_ARRAYSIZE(hand), IM_COL32(250, 250, 250, 255));
 		for (std::size_t i = 0; i < IM_ARRAYSIZE(hand); i++) {
-			draw->AddLine(hand[i], hand[(i + 1) % IM_ARRAYSIZE(hand)],
-			              IM_COL32(20, 25, 35, 255), 1.5f);
+			draw->AddLine(hand[i], hand[(i + 1) % IM_ARRAYSIZE(hand)], IM_COL32(20, 25, 35, 255),
+			              1.5f);
 		}
 		if (state.drawing) {
 			const ImVec2 pen_start {position.x + 12.0f, position.y + 8.0f};
@@ -1738,7 +1813,7 @@ struct SystemOverlay::Impl {
 		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
 		auto*        draw = ImGui::GetForegroundDrawList();
 		const auto   fade = [alpha](int r, int g, int b, int a) {
-            return IM_COL32(r, g, b, static_cast<int>(static_cast<float>(a) * alpha));
+			return IM_COL32(r, g, b, static_cast<int>(static_cast<float>(a) * alpha));
 		};
 		draw->AddRectFilled({top_left.x + 3.0f, top_left.y + 5.0f},
 		                    {bottom_right.x + 3.0f, bottom_right.y + 5.0f}, fade(0, 0, 0, 90),
@@ -1771,13 +1846,14 @@ struct SystemOverlay::Impl {
 			              2.0f * u, ImDrawFlags_RoundCornersLeft, 1.8f * u);
 			draw->AddRect({cx + 6.0f * u, cy - 9.0f * u}, {cx + 11.0f * u, cy - 3.0f * u}, cup,
 			              2.0f * u, ImDrawFlags_RoundCornersRight, 1.8f * u);
-			draw->AddRectFilled({cx - 1.5f * u, cy + 2.0f * u}, {cx + 1.5f * u, cy + 7.0f * u}, cup);
-			draw->AddRectFilled({cx - 5.0f * u, cy + 7.0f * u}, {cx + 5.0f * u, cy + 10.0f * u}, cup,
-			                    1.5f * u);
+			draw->AddRectFilled({cx - 1.5f * u, cy + 2.0f * u}, {cx + 1.5f * u, cy + 7.0f * u},
+			                    cup);
+			draw->AddRectFilled({cx - 5.0f * u, cy + 7.0f * u}, {cx + 5.0f * u, cy + 10.0f * u},
+			                    cup, 1.5f * u);
 		}
 		draw->PushClipRect(top_left, {bottom_right.x - text_padding, bottom_right.y}, true);
 		float line_y = title_y;
-		for (const auto line : title_lines) {
+		for (const auto line: title_lines) {
 			draw->AddText(nullptr, title_size, {title_x, line_y}, fade(255, 255, 255, 255),
 			              line.data(), line.data() + line.size());
 			line_y += line_height;
@@ -1789,7 +1865,7 @@ struct SystemOverlay::Impl {
 		                        trophy_notification_subtitle.c_str())
 		        .x;
 		const float available_width = std::max(1.0f, width - text_offset - text_padding);
-		const float fitted_size = std::max(
+		const float fitted_size     = std::max(
 		    1.0f, subtitle_size * std::min(1.0f, available_width / std::max(1.0f, subtitle_width)));
 		draw->AddText(nullptr, fitted_size, {text_left, line_y + 8.0f * screen_scale},
 		              fade(176, 180, 192, 255), trophy_notification_subtitle.c_str());
@@ -1799,7 +1875,7 @@ struct SystemOverlay::Impl {
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
-		const auto now = Clock::now();
+		const auto      now         = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
@@ -1886,16 +1962,16 @@ struct SystemOverlay::Impl {
 		vulkan_initialized = false;
 	}
 
-	GraphicContext&                       graphics;
-	ImGuiContext*                         imgui_context      = nullptr;
-	bool                                  vulkan_initialized = false;
-	bool                                  shift              = false;
-	bool                                  symbol_mode        = false;
-	bool                                  focus_pending      = true;
-	float                                 ui_scale           = 1.0f;
-	float                                 button_height      = 42.0f;
-	ImVec2                                panel_offset {};
-	ImVec2                                right_stick {};
+	GraphicContext&                             graphics;
+	ImGuiContext*                               imgui_context      = nullptr;
+	bool                                        vulkan_initialized = false;
+	bool                                        shift              = false;
+	bool                                        symbol_mode        = false;
+	bool                                        focus_pending      = true;
+	float                                       ui_scale           = 1.0f;
+	float                                       button_height      = 42.0f;
+	ImVec2                                      panel_offset {};
+	ImVec2                                      right_stick {};
 	OverlaySession                              session;
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
 	std::unique_ptr<ImTextureData>              hand_cursor_image;
@@ -1914,8 +1990,8 @@ struct SystemOverlay::Impl {
 	std::string                                 trophy_notification_subtitle;
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
-	std::array<std::unique_ptr<DdsImage>, 2>      splash_dds;
-	Clock::time_point                             splash_born;
+	std::array<std::unique_ptr<DdsImage>, 2>    splash_dds;
+	Clock::time_point                           splash_born;
 	SDL_AudioStream*                            trophy_sound_stream      = nullptr;
 	uint8_t*                                    trophy_sound_data        = nullptr;
 	uint32_t                                    trophy_sound_size        = 0;

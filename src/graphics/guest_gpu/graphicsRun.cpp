@@ -300,8 +300,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
 }
@@ -424,7 +423,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		if (command) {
-			command();
+			{
+				Common::DebugCounters::ScopedDuration busy(
+				    Common::DebugCounters::Counter::GpuThreadBusyNs);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -434,7 +437,12 @@ void GuestGpu::ThreadRun(void* data) {
 			continue;
 		}
 
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			Common::DebugCounters::ScopedDuration busy(
+			    Common::DebugCounters::Counter::GpuThreadBusyNs);
+			complete = gpu->Process(submission);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -469,9 +477,7 @@ bool GuestGpu::Process(Submission& submission) {
 				cp.BufferFlush();
 			}
 			break;
-		case SubmissionType::FlipPreparation:
-			cp.PrepareCpuFlip(submission.flip_request_id);
-			break;
+		case SubmissionType::FlipPreparation: cp.PrepareCpuFlip(submission.flip_request_id); break;
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
@@ -638,15 +644,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
+		case 0x00: m_predicate_skip = false; return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			const auto*        results   = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
@@ -705,8 +709,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 		if (location == Pm4::SH_NOP) {
 			return;
 		}
-		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
-		                     g_hw_sh_indirect_func[location] == nullptr);
+		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM || g_hw_sh_indirect_func[location] == nullptr);
 		g_hw_sh_indirect_func[location](cp, location, value);
 	};
 	write(registers.vertex_offset, vertex_offset);

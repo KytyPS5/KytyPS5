@@ -47,6 +47,11 @@ enum class Counter {
 	GuestFileReadBytes,
 	GuestFileWriteBytes,
 	AudioUnderruns,
+	// Frame time split.
+	GpuThreadBusyNs,  // The guest GPU thread processing submissions and commands.
+	PresentNs,        // The present thread presenting a frame, including PresentAcquireNs.
+	PresentAcquireNs, // Waiting for a swapchain image.
+	OverlayNs,        // Building the system and performance overlays.
 	Count
 };
 
@@ -104,6 +109,28 @@ private:
 	Counter                               m_count;
 	Counter                               m_duration;
 	Peak                                  m_peak;
+	std::chrono::steady_clock::time_point m_start;
+};
+
+// Adds the scope's duration in nanoseconds to `duration`.
+class ScopedDuration final {
+public:
+	explicit ScopedDuration(Counter duration)
+	    : m_duration(duration), m_start(Enabled() ? std::chrono::steady_clock::now()
+	                                              : std::chrono::steady_clock::time_point {}) {}
+	~ScopedDuration() {
+		if (m_start == std::chrono::steady_clock::time_point {}) {
+			return;
+		}
+		Add(m_duration, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                          std::chrono::steady_clock::now() - m_start)
+		                                          .count()));
+	}
+	ScopedDuration(const ScopedDuration&)            = delete;
+	ScopedDuration& operator=(const ScopedDuration&) = delete;
+
+private:
+	Counter                               m_duration;
 	std::chrono::steady_clock::time_point m_start;
 };
 

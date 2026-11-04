@@ -16,9 +16,17 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 void               TogglePerformanceOverlay() noexcept;
 // Switches between the compact and the detailed panel, showing the panel if it was hidden.
 void TogglePerformanceOverlayDetails() noexcept;
+// Starts recording all stats, showing the panel if it was hidden, or stops the recording and
+// saves it to a file.
+void TogglePerformanceOverlayRecording() noexcept;
 
 // Changes when the panel needs a repaint without a guest flip (toggled, or the guest stalled).
 [[nodiscard]] uint64_t PerformanceOverlayRevision() noexcept;
+// Asks for a repaint without a guest flip, e.g. after mouse input on the panel.
+void RequestPerformanceOverlayRepaint() noexcept;
+
+// Whether the shown panel covers (x, y), in window pixels. Safe to call from any thread.
+[[nodiscard]] bool PerformanceOverlayContains(float x, float y) noexcept;
 
 // Must run between ImGui::NewFrame() and ImGui::Render(), on the present thread while the
 // graphics subsystem is alive. Draws in the top-right corner and returns the panel's bottom

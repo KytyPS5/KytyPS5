@@ -2149,6 +2149,11 @@ void TestNetCtlHostIpv4() {
 
 template <int Mode>
 void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
+  // The API refuses a callback that is already registered, so each instantiation
+  // has to stay distinct: without this per-mode counter the four identical bodies
+  // are folded into one address and the second registration is rejected.
+  static int registrations = 0;
+  ++registrations;
   auto& event = *static_cast<std::array<int, 3>*>(arg);
   ++event[0];
   event[1] = user_id;

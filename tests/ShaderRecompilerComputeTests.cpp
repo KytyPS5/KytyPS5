@@ -6135,6 +6135,15 @@ public:
                   image(shifted.slots[32]) == renewed,
               "an idle view kept the stale element after its pool renewed it");
 
+      context.UnmapMemory(texture(6u), 0x1000u);
+      context.MapMemory(texture(6u), 0x1000u);
+      heap.BeginDraw();
+      Require(name, "buried in every view",
+              whole.slots[48] == 0u && shifted.slots[48] == 0u &&
+                  copied.slots[48] == 0u && whole.slots[8] != 0u &&
+                  shifted.slots[8] != 0u && copied.slots[8] != 0u,
+              "burying an unmapped texture missed a view or nulled the slots "
+              "of other textures");
       heap.UnmapMemory(copy, table_size);
       Require(name, "dropped copy",
               ImageHeapTestAccess::MemoryCount(heap) == 1u &&

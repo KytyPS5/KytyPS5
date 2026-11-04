@@ -45484,6 +45484,7 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   // Lane L selects ordinal L - 1, so lane 0 selects 0xffffffff.
   auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
   auto &ordinal = block->AppendNewInst(ValueOpcode::ISub32, {Value(&lane), Value(1u)});
+  auto &sampler_key = block->AppendNewInst(ValueOpcode::IMul32, {Value(&ordinal), Value(4u)});
   auto &image = block->AppendNewInst(
       ValueOpcode::GetImageResource,
       {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
@@ -45551,7 +45552,21 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   // A table consecutive from ordinal 1 selects without a switch; a single candidate and a table
   // with a gap keep it.
   const std::array<std::vector<u32>, 3> tables{{{3u, 0u, 1u}, {2u}, {0u, 2u, 1u}}};
-  for (const auto &table : tables) {
+  for (size_t case_index = 0; case_index < 2u * tables.size(); ++case_index) {
+    const auto &table = tables[case_index % tables.size()];
+    const bool mapped = case_index >= tables.size();
+    sampler.SetArg(0, mapped ? Value(&sampler_key) : Value(&ordinal));
+    auto &root = program.info.samplers[0];
+    root.indirect_root = mapped ? 0u : SamplerResource::NoIndirectSampler;
+    root.indirect_mapping_offset = 0u;
+    root.indirect_search_iterations = 0u;
+    compiled.resources.flattened_srt.clear();
+    if (mapped) {
+      // Only the sampler needs a lookup buffer: reverse its keys to distinct sampler ordinals.
+      compiled.resources.flattened_srt.push_back(static_cast<u32>(table.size()));
+      for (size_t index = table.size(); index != 0; --index)
+        compiled.resources.flattened_srt.push_back(static_cast<u32>(index - 1u));
+    }
     program.info.samplers[0].indirect_resources = table;
     program.shader_info_complete = false;
     CollectShaderInfo(program, {.compute = &compute});
@@ -45568,8 +45583,11 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
     test.expected.resize(wave_size);
     for (u32 lane_index = 0; lane_index < wave_size; ++lane_index) {
       const auto selected = lane_index - 1u;
+      const auto index = selected < table.size()
+                             ? (mapped ? table.size() - 1u - selected : selected)
+                             : 0u;
       test.expected[lane_index] =
-          std::bit_cast<u32>(float(10u + table[selected < table.size() ? selected : 0u]));
+          std::bit_cast<u32>(float(10u + table[index]));
     }
     auto buffer = vulkan.CreateStorageBuffer(name, test.initial, test.initial.size());
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures,

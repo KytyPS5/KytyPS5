@@ -1,3 +1,4 @@
+#include "common/gpuStall.h"
 #include "libs/audio.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
@@ -21,6 +22,11 @@ namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
 
+// The emulator's NOT_READY result, which a push to a missing context returns.
+constexpr int AUDIO_OUT2_ERROR_NOT_READY = -2144960504; // 0x80268008
+// How long a test waits for a helper thread to reach the state it expects before failing.
+constexpr std::chrono::seconds TEST_WAIT_LIMIT {10};
+
 AudioOut2::AudioOut2UserHandle     g_user_handle = 0;
 std::mutex                        g_device_mutex;
 std::condition_variable           g_device_cv;
@@ -37,6 +43,8 @@ bool                              g_block_outputs = false;
 std::vector<int>                  g_blocked_output;
 std::atomic_uint64_t              g_process_time {0};
 std::atomic_bool                  g_process_time_frozen {false};
+// Counts clock reads, so a test can tell a push has finished a pass of its wait loop.
+std::atomic_uint64_t              g_process_time_reads {0};
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -916,10 +924,192 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 namespace Libs::LibKernel {
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	g_process_time_reads++;
 	return g_process_time_frozen ? g_process_time.load() : g_process_time.fetch_add(1000);
 }
 
 } // namespace Libs::LibKernel
+
+// Spins until done() holds or the limit passes, so a thread that never gets there fails the
+// test instead of hanging it.
+template <typename Done>
+bool WaitFor(Done done) {
+	const auto deadline = std::chrono::steady_clock::now() + TEST_WAIT_LIMIT;
+	while (!done() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	return done();
+}
+
+// Runs one push on its own thread, as a game's audio thread would.
+class GuestPush {
+public:
+	GuestPush(AudioOut2::AudioOut2ContextHandle context, uint32_t blocking) {
+		m_thread = std::thread([this, context, blocking]() {
+			m_result   = AudioOut2::AudioOut2ContextPush(context, blocking);
+			m_returned = true;
+		});
+	}
+	~GuestPush() {
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	GuestPush(const GuestPush&)            = delete;
+	GuestPush& operator=(const GuestPush&) = delete;
+
+	[[nodiscard]] bool Returned() const { return m_returned; }
+
+	// Waits for the push to return and gives its result.
+	int Result() {
+		Check(WaitFor([this]() { return m_returned.load(); }), "push never returned within the limit");
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+		return m_result;
+	}
+
+private:
+	std::atomic<bool> m_returned {false};
+	int               m_result = OK;
+	std::thread       m_thread;
+};
+
+// Pushes on its own thread and returns the result, failing instead of hanging if it never returns.
+int PushWithLimit(AudioOut2::AudioOut2ContextHandle context, uint32_t blocking) {
+	GuestPush push(context, blocking);
+	return push.Result();
+}
+
+// Stands in for the GPU command thread during a long pipeline compile. The Scope lives on its own
+// thread, as in the emulator, because the thread that owns a Scope is never held. A held push
+// only returns once this finishes, so a test must call Finish before its pushes go away.
+class GpuCompile {
+public:
+	explicit GpuCompile(bool hold_enabled) {
+		Common::GpuStall::Configure(hold_enabled, std::chrono::milliseconds(0));
+		m_gpu = std::thread([this]() {
+			Common::GpuStall::Scope compile;
+			m_started = true;
+			while (!m_finish) {
+				std::this_thread::yield();
+			}
+		});
+		Check(WaitFor([this]() { return m_started.load(); }), "GPU thread did not start compiling");
+	}
+	~GpuCompile() {
+		Finish();
+		Common::GpuStall::Configure(false);
+	}
+	GpuCompile(const GpuCompile&)            = delete;
+	GpuCompile& operator=(const GpuCompile&) = delete;
+
+	// Ends the compile, which lets every held push go.
+	void Finish() {
+		m_finish = true;
+		if (m_gpu.joinable()) {
+			m_gpu.join();
+		}
+	}
+
+private:
+	std::atomic<bool> m_started {false};
+	std::atomic<bool> m_finish {false};
+	std::thread       m_gpu;
+};
+
+// Waits until exactly count pushes are parked in the hold, with none returned early.
+void CheckHeld(std::initializer_list<const GuestPush*> pushes) {
+	const auto count     = static_cast<uint32_t>(pushes.size());
+	const auto any_freed = [&]() {
+		return std::any_of(pushes.begin(), pushes.end(), [](const auto* push) { return push->Returned(); });
+	};
+	WaitFor([&]() { return any_freed() || Common::GpuStall::WaiterCount() == count; });
+	Check(!any_freed() && Common::GpuStall::WaiterCount() == count, "push was not held");
+}
+
+// A push to a context that is gone, or never existed, returns instead of waiting for it forever.
+void TestPushToMissingContextReturns() {
+	constexpr AudioOut2::AudioOut2ContextHandle never_created = 0xdead0000u;
+	const auto                                  destroyed     = CreateContext();
+	AudioOut2::AudioOut2ContextDestroy(destroyed);
+	Check(PushWithLimit(destroyed, 1) == AUDIO_OUT2_ERROR_NOT_READY,
+	      "blocking push to a destroyed context did not report NOT_READY");
+	Check(PushWithLimit(destroyed, 0) == AUDIO_OUT2_ERROR_NOT_READY,
+	      "non-blocking push to a destroyed context changed its result");
+	Check(PushWithLimit(never_created, 1) == AUDIO_OUT2_ERROR_NOT_READY,
+	      "blocking push to an unknown context did not report NOT_READY");
+}
+
+// Blocking, non-blocking and empty-context pushes are all held during a long compile, and all
+// complete normally once it ends.
+void TestPushesHeldDuringCompile() {
+	const auto context = CreateContext();
+	const auto empty   = CreateContext();
+	const auto port    = CreatePort(context, MakeParam());
+	// One grain of the default float stereo format, the size the push copies.
+	std::vector<float> pcm(512 * 2, 0.0f);
+	SetPcm(port, pcm.data());
+	{
+		GpuCompile compile(true);
+		GuestPush  blocking_push(context, 1);
+		GuestPush  async_push(context, 0);
+		GuestPush  empty_push(empty, 1);
+		CheckHeld({&blocking_push, &async_push, &empty_push});
+		compile.Finish();
+		Check(blocking_push.Result() == OK && async_push.Result() == OK && empty_push.Result() == OK,
+		      "held push failed after release");
+	}
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(empty);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// Queue queries are not held, and a context destroyed during a hold makes the held push return
+// instead of waiting for it forever.
+void TestContextDestroyedDuringHold() {
+	const auto context = CreateContext();
+	GpuCompile compile(true);
+	GuestPush  push(context, 1);
+	CheckHeld({&push});
+	uint32_t queue_level = 0;
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queue_level, nullptr) == OK,
+	      "queue level query was held or failed during a hold");
+	AudioOut2::AudioOut2ContextDestroy(context);
+	compile.Finish();
+	Check(push.Result() == AUDIO_OUT2_ERROR_NOT_READY,
+	      "push held across a context destroy did not report NOT_READY");
+}
+
+// A blocking push already waiting for queue space when a compile starts is held on its next
+// pass, rather than slipping through once the modelled queue drains.
+void TestWaitingPushHeldOnNextPass() {
+	const auto context    = CreateContext(1);
+	g_process_time_frozen = true;
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "filling push failed");
+	// Each pass of the wait loop reads the clock once, so two reads mean the push finished a pass
+	// and is truly waiting before the compile starts.
+	const auto reads_before = g_process_time_reads.load();
+	GuestPush  push(context, 1);
+	Check(WaitFor([&]() { return g_process_time_reads > reads_before + 1; }),
+	      "push never entered its wait loop");
+	Check(!push.Returned(), "push did not wait for a full queue");
+	GpuCompile compile(true);
+	g_process_time_frozen = false; // The queue drains while the compile blocks the GPU.
+	CheckHeld({&push});
+	compile.Finish();
+	Check(push.Result() == OK, "push waiting across a hold failed after release");
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// With the switch off, the default, a long compile changes nothing.
+void TestNoPushHoldWhenDisabled() {
+	const auto context = CreateContext();
+	GpuCompile compile(false);
+	Check(PushWithLimit(context, 1) == OK, "push was held or failed with the hold switched off");
+	compile.Finish();
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
 
 int main() {
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
@@ -942,6 +1132,11 @@ int main() {
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
 	TestBlockedPushOnlyHoldsItsContext();
+	TestPushToMissingContextReturns();
+	TestPushesHeldDuringCompile();
+	TestContextDestroyedDuringHold();
+	TestWaitingPushHeldOnNextPass();
+	TestNoPushHoldWhenDisabled();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

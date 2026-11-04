@@ -5,11 +5,14 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -456,6 +459,240 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+// How long a helper thread may take to reach the state a test waits for before the test fails.
+constexpr std::chrono::seconds HOLD_TEST_LIMIT {10};
+
+// Spins until done() holds or the limit passes, so a broken hold fails instead of hanging.
+template <typename Done>
+bool WaitFor(Done done) {
+	const auto deadline = std::chrono::steady_clock::now() + HOLD_TEST_LIMIT;
+	while (!done() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	return done();
+}
+
+// Stands in for the GPU command thread during a long pipeline compile, with the public AudioOut
+// entry points pointed at the fixture's Audio. The Scope lives on its own thread, as in the
+// emulator, because the thread that owns a Scope is never held and so could not test a hold.
+class GpuCompile {
+public:
+	GpuCompile(Audio* audio, bool hold_enabled) {
+		Libs::Audio::g_audio = audio;
+		Common::GpuStall::Configure(hold_enabled, std::chrono::milliseconds(0));
+		m_gpu = std::thread([this]() {
+			Common::GpuStall::Scope compile;
+			m_started = true;
+			while (!m_finish) {
+				std::this_thread::yield();
+			}
+		});
+		Check(WaitFor([this]() { return m_started.load(); }), "GPU thread did not start compiling");
+	}
+	~GpuCompile() {
+		Finish();
+		Common::GpuStall::Configure(false);
+		Libs::Audio::g_audio = nullptr;
+	}
+	GpuCompile(const GpuCompile&)            = delete;
+	GpuCompile& operator=(const GpuCompile&) = delete;
+
+	// Ends the compile, which lets every held submit go. Writes the test made before this are seen
+	// by the held submit, because the Scope ends under the GpuStall mutex the submit retakes.
+	void Finish() {
+		m_finish = true;
+		if (m_gpu.joinable()) {
+			m_gpu.join();
+		}
+	}
+
+private:
+	std::atomic<bool> m_started {false};
+	std::atomic<bool> m_finish {false};
+	std::thread       m_gpu;
+};
+
+// Runs one guest audio submit on its own thread, as a game's audio thread would. A held submit
+// only returns once its GpuCompile finishes, so a test must call Finish before this goes away.
+class GuestSubmit {
+public:
+	template <typename Submit>
+	explicit GuestSubmit(Submit submit) {
+		m_thread = std::thread([this, submit]() {
+			m_result   = submit();
+			m_returned = true;
+		});
+	}
+	~GuestSubmit() {
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	GuestSubmit(const GuestSubmit&)            = delete;
+	GuestSubmit& operator=(const GuestSubmit&) = delete;
+
+	// Waits until the submit is parked in the hold, so the test acts while it is truly held.
+	void CheckHeld() const {
+		WaitFor([this]() { return m_returned || Common::GpuStall::WaiterCount() != 0; });
+		Check(!m_returned && Common::GpuStall::WaiterCount() == 1, "audio output was not held");
+	}
+
+	// Waits for the submit to return and gives its result.
+	int Result() {
+		Check(WaitFor([this]() { return m_returned.load(); }), "audio output never returned");
+		m_thread.join();
+		return m_result;
+	}
+
+private:
+	std::atomic<bool> m_returned {false};
+	int               m_result = 0;
+	std::thread       m_thread;
+};
+
+// Output during a long compile reaches the queue only after it ends, and the port then primes
+// its queue once without pacing, the same as after any other long gap.
+void TestOutputHeldDuringCompile() {
+	constexpr uint32_t gap_us       = 1000000;
+	constexpr uint64_t block_frames = 256; // The fixture's default port period.
+	Fixture            f;
+	const auto         port = f.Open(block_frames);
+	f.Prime(port);
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() {
+		return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), f.pcm.data());
+	});
+	submit.CheckHeld();
+	Drain(*streams.front());
+	const auto queued_before_hold = streams.front()->frames;
+	std::this_thread::yield();
+	Check(streams.front()->frames == queued_before_hold,
+	      "held output reached the queue during the compile");
+	now += gap_us; // The game is frozen for the whole compile.
+	compile.Finish();
+	Check(submit.Result() >= 0, "held output failed after release");
+	// The gap drained the queue, so it now holds exactly the one held block.
+	Check(streams.front()->frames == block_frames * 1000000,
+	      "held output did not reach the queue after release");
+	const auto start = now;
+	for (int i = 0; i < 7; i++) {
+		f.Output(port);
+	}
+	Check(now == start, "output after a hold did not re-prime its queue unpaced");
+	f.Output(port);
+	Check(now - start >= 5333 && now - start <= 5334, "output after a hold kept an old deadline");
+}
+
+// A null buffer is a submit like any other, so it is held too.
+void TestNullOutputHeld() {
+	Fixture     f;
+	const auto  port = f.Open();
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() { return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), nullptr); });
+	submit.CheckHeld();
+	compile.Finish();
+	Check(submit.Result() >= 0, "held null output failed after release");
+}
+
+// The batch entry point is held the same way, before it looks at any port.
+void TestBatchOutputHeld() {
+	Fixture     f;
+	const auto  port = f.Open();
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() {
+		Libs::Audio::AudioOut::AudioOutOutputParam param {port.ToInt(), f.pcm.data()};
+		return Libs::Audio::AudioOut::AudioOutOutputs(&param, 1);
+	});
+	submit.CheckHeld();
+	compile.Finish();
+	Check(submit.Result() >= 0, "held batch output failed after release");
+}
+
+// Port queries are not held, and a port closed during the hold makes the held output fail
+// cleanly instead of using the closed port.
+void TestCloseDuringHold() {
+	Fixture     f;
+	const auto  port = f.Open();
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() {
+		return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), f.pcm.data());
+	});
+	submit.CheckHeld();
+	Libs::Audio::AudioOut::AudioOutPortState state {};
+	Check(Libs::Audio::AudioOut::AudioOutGetPortState(port.ToInt(), &state) == OK,
+	      "port state query was held or failed during a hold");
+	Check(Libs::Audio::AudioOut::AudioOutClose(port.ToInt()) == OK,
+	      "port close failed during a hold");
+	compile.Finish();
+	Check(submit.Result() == Libs::Audio::AUDIO_OUT_ERROR_INVALID_PORT,
+	      "output held across a port close did not report an invalid port");
+}
+
+// With the switch off, the default, a long compile changes nothing.
+void TestNoHoldWhenDisabled() {
+	Fixture     f;
+	const auto  port = f.Open();
+	GpuCompile  compile(&f.audio, false);
+	GuestSubmit submit([&]() {
+		return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), f.pcm.data());
+	});
+	Check(submit.Result() >= 0, "output failed with the hold switched off");
+	Check(streams.front()->frames != 0, "output did not reach the queue with the hold switched off");
+}
+
+// A hold drains the host queue on purpose, so the first submit after it is not an underrun. A
+// real underrun on the same thread afterwards still counts, so only that one submit is exempt.
+void TestHoldIsNotAnUnderrun() {
+	using Common::DebugCounters::Counter;
+	constexpr uint32_t gap_us        = 1000000;
+	constexpr int      prime_outputs = 8; // Enough to fill the 40 ms cushion again.
+	Fixture            f;
+	const auto         port = f.Open();
+	f.Prime(port);
+	Common::DebugCounters::SetEnabled(true);
+	const auto  before     = Common::DebugCounters::Get(Counter::AudioUnderruns);
+	uint64_t    after_hold = 0;
+	uint64_t    after_real = 0;
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() {
+		const auto output = [&]() {
+			return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), f.pcm.data());
+		};
+		const int result = output();
+		after_hold       = Common::DebugCounters::Get(Counter::AudioUnderruns);
+		for (int i = 0; i < prime_outputs; i++) {
+			output();
+		}
+		now += gap_us; // A real gap with no compile behind it.
+		output();
+		after_real = Common::DebugCounters::Get(Counter::AudioUnderruns);
+		return result;
+	});
+	submit.CheckHeld();
+	now += gap_us; // The game is frozen for the whole compile.
+	compile.Finish();
+	Check(submit.Result() >= 0, "held output failed after release");
+	Common::DebugCounters::SetEnabled(false);
+	Check(after_hold == before, "the first output after a hold counted an underrun");
+	Check(after_real == before + 1, "a real underrun after a hold was not counted");
+}
+
+// A queue that drains with no hold behind it still counts as an underrun.
+void TestUnderrunCountedWithoutHold() {
+	using Common::DebugCounters::Counter;
+	constexpr uint32_t gap_us = 1000000;
+	Fixture            f;
+	const auto         port = f.Open();
+	f.Prime(port);
+	Common::DebugCounters::SetEnabled(true);
+	const auto before = Common::DebugCounters::Get(Counter::AudioUnderruns);
+	now += gap_us;
+	f.Output(port);
+	const auto after = Common::DebugCounters::Get(Counter::AudioUnderruns);
+	Common::DebugCounters::SetEnabled(false);
+	Check(after == before + 1, "a drained queue with no hold did not count an underrun");
+}
 } // namespace
 
 int main() {
@@ -470,6 +707,13 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestOutputHeldDuringCompile();
+	TestNullOutputHeld();
+	TestBatchOutputHeld();
+	TestCloseDuringHold();
+	TestNoHoldWhenDisabled();
+	TestHoldIsNotAnUnderrun();
+	TestUnderrunCountedWithoutHold();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

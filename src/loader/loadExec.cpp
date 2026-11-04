@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -24,6 +27,9 @@
 namespace Emulator {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The handle (inherited) to the process that LoadExec started this one from.
+static constexpr const char* LOAD_EXEC_PARENT_VARIABLE = "KYTY_LOAD_EXEC_PARENT";
+
 static std::wstring QuoteArgument(std::wstring_view argument) {
 	std::wstring quoted  = L"\"";
 	size_t       slashes = 0;
@@ -99,7 +105,7 @@ int LoadExec(const char* path, const char* const argv[]) {
 		command += L" " + QuoteArgument(wide);
 	}
 	// The new process writes where this one does: to its console, or to the files or pipes its
-	// output was redirected to. Only the standard handles are inherited.
+	// output was redirected to. Only the standard handles (and the one below) are inherited.
 	HANDLE std_handles[3] = {GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE),
 	                         GetStdHandle(STD_ERROR_HANDLE)};
 	std::vector<HANDLE> inherited;
@@ -110,6 +116,18 @@ int LoadExec(const char* path, const char* const argv[]) {
 		} else if (std::find(inherited.begin(), inherited.end(), handle) == inherited.end()) {
 			inherited.push_back(handle);
 		}
+	}
+	const bool has_std_handles = !inherited.empty();
+	// The new process waits for this one to exit before it reserves the guest memory: Windows
+	// commits all of it up front, and the two processes' memory at once may not fit in the paging
+	// file. It is given a handle to this process (WaitForLoadExecParent).
+	HANDLE self = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &self,
+	                    SYNCHRONIZE, TRUE, 0) != 0) {
+		inherited.push_back(self);
+		(void)SetEnvironmentVariableA(
+		    LOAD_EXEC_PARENT_VARIABLE,
+		    std::to_string(reinterpret_cast<uintptr_t>(self)).c_str());
 	}
 	SIZE_T attributes_size = 0;
 	InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
@@ -124,7 +142,12 @@ int LoadExec(const char* path, const char* const argv[]) {
 	STARTUPINFOEXW startup {};
 	startup.StartupInfo.cb = sizeof(startup);
 	if (listed) {
-		startup.lpAttributeList        = attributes;
+		startup.lpAttributeList = attributes;
+	} else if (self != nullptr) {
+		// Not inherited: the new process must not wait on whatever has that value there.
+		(void)SetEnvironmentVariableA(LOAD_EXEC_PARENT_VARIABLE, nullptr);
+	}
+	if (listed && has_std_handles) {
 		startup.StartupInfo.dwFlags    = STARTF_USESTDHANDLES;
 		startup.StartupInfo.hStdInput  = std_handles[0];
 		startup.StartupInfo.hStdOutput = std_handles[1];
@@ -144,6 +167,10 @@ int LoadExec(const char* path, const char* const argv[]) {
 		DeleteProcThreadAttributeList(attributes);
 	}
 	if (!created) {
+		if (self != nullptr) {
+			CloseHandle(self);
+			(void)SetEnvironmentVariableA(LOAD_EXEC_PARENT_VARIABLE, nullptr);
+		}
 		LOGF("LoadExec: process creation failed: %lu\n", error);
 		return SYSTEM_SERVICE_ERROR_INTERNAL;
 	}
@@ -187,6 +214,28 @@ int LoadExec(const char* path, const char* const argv[]) {
 	return SYSTEM_SERVICE_ERROR_INTERNAL;
 #else
 	return SYSTEM_SERVICE_ERROR_UNAVAILABLE;
+#endif
+}
+
+void WaitForLoadExecParent() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const char* value = std::getenv(LOAD_EXEC_PARENT_VARIABLE);
+	if (value == nullptr) {
+		return;
+	}
+	uintptr_t  handle_value = 0;
+	const bool parsed =
+	    std::from_chars(value, value + std::strlen(value), handle_value).ec == std::errc {};
+	// Not for the processes this one starts: a LoadExec from here sets its own.
+	(void)SetEnvironmentVariableA(LOAD_EXEC_PARENT_VARIABLE, nullptr);
+	if (!parsed || handle_value == 0) {
+		return;
+	}
+	auto* parent = reinterpret_cast<HANDLE>(handle_value);
+	// The old process quits right after starting this one; the bound only keeps a stuck one from
+	// holding the game back for ever.
+	(void)WaitForSingleObject(parent, 30000);
+	CloseHandle(parent);
 #endif
 }
 

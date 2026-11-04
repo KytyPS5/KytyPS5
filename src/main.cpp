@@ -558,6 +558,8 @@ static void ReportUncaughtException() {
 
 static int Main(int argc, char* argv[]) {
 	std::set_terminate(ReportUncaughtException);
+	// After a LoadExec, the guest memory of the process that started this one must be gone first.
+	Emulator::WaitForLoadExecParent();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
 	// After the address-space reservations: the thread's stack must not land in the guest range.

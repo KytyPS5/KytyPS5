@@ -8339,6 +8339,23 @@ void TestDmaAddressMaterialization() {
                {based, Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(global, 4));
 
+  // A global base loaded through a scalar pointer.
+  const auto table =
+      fixture.Address(fixture.UserData(2), fixture.UserData(3), 12);
+  std::array<Value, 2> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = word * 4u;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                               {table, Value(0u), Value(0u), Value(true)},
+                               fixture.AddMemory(scalar, 12 + word * 4u));
+  }
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(words[0], words[1], 20), Value(0u), Value(0u),
+                Value(true)},
+               fixture.AddMemory(global, 20));
+
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
   const auto unbased = fixture.Address(undef, undef, 8);
   MemoryInfo flat;
@@ -8352,13 +8369,22 @@ void TestDmaAddressMaterialization() {
 
   Check(fixture.program.info.uses_dma,
         "typed address operations did not enable DMA");
-  std::array<uint32_t, 2> user_data{0x2008u, 0u};
+  std::array<uint32_t, 4> user_data{0x2008u, 0u, 0x1000u, 0u};
+  TestMemory memory;
+  memory.words[0] = 0x4000u;
+  memory.words[1] = 0x12u;
+  FakeGuestMemory fake(ReadTestMemory, &memory);
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(resource_plan, runtime, snapshot,
                              specialization),
         "DMA shader resources did not materialize");
+  const auto &bases = fixture.program.info.address_bases;
+  const auto &srt = snapshot.flattened_srt;
+  Check(bases.size() == 1 && srt[bases[0][0]] == 0x4000u &&
+            srt[bases[0][1]] == 0x12u,
+        "flattened global access base was not recorded");
   ApplyResourceSpecialization(fixture.program, specialization);
 }
 

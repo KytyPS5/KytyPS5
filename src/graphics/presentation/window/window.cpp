@@ -702,7 +702,6 @@ void WindowContext::ProcessEvent(double time_s) {
 
 void WindowContext::Run() {
 	Common::Timer timer;
-	timer.Start();
 
 	loop.event     = {};
 	loop.need_exit = false;

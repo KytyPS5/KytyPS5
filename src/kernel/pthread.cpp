@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -14,7 +13,6 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
-#include "loader/timer.h"
 
 #include <algorithm>
 #include <array>
@@ -129,48 +127,36 @@ static uint64_t GetHostThreadId() {
 }
 #endif
 
+static constexpr uint64_t NANOS_PER_SEC = 1000000000;
+
 static uint64_t KernelHostTsc() {
 #if defined(_M_X64) || defined(__x86_64__)
 	return __rdtsc();
 #else
-	return Common::Timer::QueryPerformanceCounter();
+	return Common::SteadyNs();
 #endif
 }
 
 static uint64_t KernelHostTscFrequency() {
 	static const uint64_t frequency = [] {
 #if defined(_M_X64) || defined(__x86_64__)
-		const auto host_frequency = Common::Timer::QueryPerformanceFrequency();
-		if (host_frequency == 0) {
-			return uint64_t {1000000000};
-		}
-
 		KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		KernelHostTsc();
 
-		const auto host_start = Common::Timer::QueryPerformanceCounter();
+		const auto host_start = Common::SteadyNs();
 		const auto tsc_start  = KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		const auto host_end = Common::Timer::QueryPerformanceCounter();
+		const auto host_end = Common::SteadyNs();
 		const auto tsc_end  = KernelHostTsc();
 
-		const auto host_delta = host_end - host_start;
-		const auto tsc_delta  = tsc_end - tsc_start;
-		if (host_delta == 0 || tsc_delta == 0) {
-			return host_frequency;
-		}
-
-		auto freq = static_cast<uint64_t>(
-		    (static_cast<long double>(tsc_delta) * static_cast<long double>(host_frequency)) /
-		    static_cast<long double>(host_delta));
+		const auto freq = static_cast<uint64_t>(static_cast<long double>(tsc_end - tsc_start) *
+		                                        static_cast<long double>(NANOS_PER_SEC) /
+		                                        static_cast<long double>(host_end - host_start));
 		static constexpr uint64_t ROUND_TO = 100000;
-		const auto                mod      = freq % ROUND_TO;
-		freq = (mod >= ROUND_TO / 2 ? freq - mod + ROUND_TO : freq - mod);
-
-		return freq != 0 ? freq : host_frequency;
+		return (freq + ROUND_TO / 2) / ROUND_TO * ROUND_TO;
 #else
-		return Common::Timer::QueryPerformanceFrequency();
+		return NANOS_PER_SEC;
 #endif
 	}();
 
@@ -212,14 +198,8 @@ static uint64_t KernelGetElapsedTsc() {
 }
 
 static uint64_t KernelGetProcessTimeUsNative() {
-	const auto frequency = KernelGetTscFrequencyNative();
-	if (frequency == 0) {
-		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
-	}
-
-	const auto elapsed = KernelGetElapsedTsc();
-	return static_cast<uint64_t>((static_cast<long double>(elapsed) * 1000000.0L) /
-	                             static_cast<long double>(frequency));
+	return static_cast<uint64_t>((static_cast<long double>(KernelGetElapsedTsc()) * 1000000.0L) /
+	                             static_cast<long double>(KernelGetTscFrequencyNative()));
 }
 
 static void KernelUsToTimespec(uint64_t us, KernelTimespec* tp) {
@@ -262,20 +242,6 @@ static bool KernelRealtimeToTimespec(bool precise, KernelTimespec* tp) {
 	return true;
 }
 
-static bool KernelMonotonicToTimespec(KernelTimespec* tp) {
-	EXIT_IF(tp == nullptr);
-
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	if (frequency == 0) {
-		return false;
-	}
-
-	const auto counter = Common::Timer::QueryPerformanceCounter();
-	tp->tv_sec         = static_cast<int64_t>(counter / frequency);
-	tp->tv_nsec        = static_cast<int64_t>(((counter % frequency) * 1000000000ull) / frequency);
-	return true;
-}
-
 static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp, int* error) {
 	EXIT_IF(tp == nullptr);
 	EXIT_IF(error == nullptr);
@@ -315,11 +281,12 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		case KERNEL_CLOCK_EXT_NETWORK:
 		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
 		case KERNEL_CLOCK_EXT_AD_NETWORK:
-		case KERNEL_CLOCK_EXT_RAW_NETWORK:
-			if (!KernelMonotonicToTimespec(tp)) {
-				*error = KERNEL_ERROR_EFAULT;
-			}
+		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
+			const auto ns = Common::SteadyNs();
+			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
+			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
 			return true;
+		}
 		case KERNEL_CLOCK_THREAD_CPUTIME_ID:
 			if (!GetThreadTimes(GetCurrentThread(), &create_time, &exit_time, &kernel_time,
 			                    &user_time)) {
@@ -3678,8 +3645,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 		const auto frequency = KernelGetTscFrequencyNative();
 		tp->tv_sec           = 0;
 		tp->tv_nsec          = static_cast<int64_t>(
-		    frequency != 0 ? std::max<uint64_t>((1000000000 + (frequency >> 1)) / frequency, 1)
-		                   : 1);
+		    std::max<uint64_t>((NANOS_PER_SEC + (frequency >> 1)) / frequency, 1));
 		return OK;
 	}
 
@@ -3859,14 +3825,7 @@ uint64_t KYTY_SYSV_ABI KernelReadTsc() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
-	const auto frequency = KernelGetTscFrequencyNative();
-	if (frequency == 0) {
-		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
-	}
-
-	const auto elapsed = KernelGetElapsedTsc();
-	return static_cast<uint64_t>((static_cast<long double>(elapsed) * 1000000.0L) /
-	                             static_cast<long double>(frequency));
+	return KernelGetProcessTimeUsNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {

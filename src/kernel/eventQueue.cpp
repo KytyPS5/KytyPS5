@@ -10,7 +10,6 @@
 #include "libs/libs.h"
 
 #include <algorithm>
-#include <chrono>
 #include <fmt/format.h>
 #include <limits>
 #include <list>
@@ -25,12 +24,6 @@ constexpr uint16_t EV_ADD     = 0x01;
 constexpr uint16_t EV_ONESHOT = 0x10;
 constexpr uint16_t EV_CLEAR   = 0x20;
 constexpr uint16_t EV_ERROR   = 0x4000;
-
-static uint64_t MonotonicTimeNs() {
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                                 std::chrono::steady_clock::now().time_since_epoch())
-	                                 .count());
-}
 
 static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
 static Common::Mutex                                     g_equeues_mutex;
@@ -95,7 +88,7 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	TriggerExpiredTimers(MonotonicTimeNs());
+	TriggerExpiredTimers(Common::SteadyNs());
 
 	int ret = 0;
 
@@ -182,7 +175,6 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
-	t.Start();
 
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
@@ -192,7 +184,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 		}
 
 		uint32_t   timer_wait = 0;
-		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
+		const bool has_timer  = GetNextTimerWaitMicros(Common::SteadyNs(), &timer_wait);
 		if (micros == 0 && !has_timer) {
 			m_cond_var.Wait(&m_mutex);
 		} else {
@@ -218,7 +210,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		                       return e.event.ident == ident && e.event.filter == filter;
 	                       });
 	if (it != m_events.end()) {
-		TriggerExpiredTimers(MonotonicTimeNs());
+		TriggerExpiredTimers(Common::SteadyNs());
 		it->deadline_ns = event.deadline_ns;
 		it->interval_ns = event.interval_ns;
 		it->event.udata = event.event.udata;
@@ -523,7 +515,7 @@ int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 }
 
 static int AddTimerEvent(KernelEqueue eq, int id, uint64_t delay_ns, bool periodic, void* udata) {
-	const auto now_ns = MonotonicTimeNs();
+	const auto now_ns = Common::SteadyNs();
 	KernelEqueueEvent event {};
 	event.deadline_ns  = delay_ns <= UINT64_MAX - now_ns ? now_ns + delay_ns : UINT64_MAX;
 	event.interval_ns  = periodic ? delay_ns : 0;

@@ -212,7 +212,6 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
-	t.Start();
 
 	int id = Common::Thread::GetThreadIdUnique();
 
@@ -405,7 +404,6 @@ public:
 		uint32_t      elapsed    = 0;
 		const bool    timed_wait = (micros != nullptr);
 		Common::Timer timer;
-		timer.Start();
 
 		while (m_count <= 0) {
 			if (timed_wait && elapsed >= *micros) {

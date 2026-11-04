@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <codecvt>
 #include <filesystem>
 #include <locale>
@@ -48,13 +47,6 @@ inline std::string ToLower(std::string_view text) {
 	std::transform(ret.begin(), ret.end(), ret.begin(),
 	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 	return ret;
-}
-
-inline std::string Mid(std::string_view text, size_t first, size_t count = std::string_view::npos) {
-	if (first >= text.size()) {
-		return {};
-	}
-	return std::string(text.substr(first, count));
 }
 
 inline std::string RemoveFirst(std::string_view text, size_t count) {
@@ -135,12 +127,6 @@ inline std::vector<std::string> Split(std::string_view text, std::string_view se
 
 inline std::vector<std::string> Split(std::string_view text, char sep, bool keep_empty = false) {
 	return Split(text, std::string_view(&sep, 1), keep_empty);
-}
-
-inline int32_t ToInt32(std::string_view text, int base = 10) {
-	int32_t value = 0;
-	std::from_chars(text.data(), text.data() + text.size(), value, base);
-	return value;
 }
 
 inline std::string Utf16ToUtf8(std::u16string_view utf16) {

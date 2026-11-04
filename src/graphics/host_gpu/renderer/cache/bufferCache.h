@@ -93,6 +93,9 @@ public:
 	void               RunGarbageCollector();
 
 private:
+	/// Copies between overlapping ranges of one buffer on the GPU, with memmove's result.
+	void CopyOverlapping(CommandBuffer& command, Buffer& buffer, uint64_t source_offset,
+	                     uint64_t destination_offset, uint64_t size);
 	friend struct BufferCacheTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }

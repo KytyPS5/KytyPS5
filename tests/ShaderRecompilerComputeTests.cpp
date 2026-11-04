@@ -3138,6 +3138,99 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // One overlapping DMA copy case, run on the path the case names.
+  struct OverlappingCopyCase {
+    const char *label;
+    bool gpu_path;
+    bool forward;
+  };
+
+  // Each case owns one slot of the mapping. The copy spans several pages and overlaps itself by a
+  // few words.
+  static constexpr uint64_t kOverlapSlotSize = 0x8000;
+  static constexpr uint64_t kOverlapCopySize = 0x4000;
+  static constexpr uint64_t kOverlapShift = 0x10;
+  static constexpr uint64_t kOverlapSourceOffset = 0x1000;
+  static constexpr uint32_t kOverlapPatternBase = 0x6e000000u;
+  // Each case's words start this far apart, so every word in every case is unique and a copy that
+  // reads from the wrong place cannot produce the expected bytes.
+  static constexpr uint32_t kOverlapCaseStride = 0x10000u;
+
+  // Fills the source, runs the copy on the case's path, and checks the destination holds what
+  // memmove would leave there.
+  void RunOverlappingCopyCase(RenderContext &resources, auto &gpu, const OverlappingCopyCase &test,
+                              uint64_t slot, uint32_t first_word) {
+    constexpr const char *name = "OverlappingDmaCopies";
+    constexpr uint64_t gds_offset = 0;
+    constexpr uint64_t words = kOverlapCopySize / sizeof(uint32_t);
+    const uint64_t source = slot + kOverlapSourceOffset;
+    const uint64_t destination = test.forward ? source + kOverlapShift : source - kOverlapShift;
+    auto *words_at_source = reinterpret_cast<uint32_t *>(source);
+    for (uint64_t word = 0; word < words; ++word) {
+      words_at_source[word] = first_word + static_cast<uint32_t>(word);
+    }
+    const std::vector<uint32_t> expected(words_at_source, words_at_source + words);
+    auto &buffer_cache = resources.GetBufferCache();
+    gpu.SendCommandSync([&] {
+      if (test.gpu_path) {
+        // A round trip through GDS leaves the source GPU-written, so the copy takes the GPU path.
+        buffer_cache.CopyBuffer(gds_offset, source, kOverlapCopySize, true, false);
+        buffer_cache.CopyBuffer(source, gds_offset, kOverlapCopySize, false, true);
+      }
+      Require(name, (std::string(test.label) + " path").c_str(),
+              buffer_cache.IsRegionGpuModified(source, kOverlapCopySize) == test.gpu_path &&
+                  (test.gpu_path ||
+                   !buffer_cache.IsRegionGpuModified(destination, kOverlapCopySize)),
+              "the copy would not take the path this case is about");
+      buffer_cache.CopyBuffer(destination, source, kOverlapCopySize, false, false);
+    });
+    if (test.gpu_path) {
+      Require(name, (std::string(test.label) + " readback").c_str(),
+              resources.HandleFault(PageFaultAccess::Read, destination),
+              "the destination was not mapped for the readback");
+    }
+    Require(name, (std::string(test.label) + " bytes").c_str(),
+            std::memcmp(reinterpret_cast<const void *>(destination), expected.data(),
+                        kOverlapCopySize) == 0,
+            "the overlapping copy did not give memmove's result");
+  }
+
+  // A DMA copy whose source and destination overlap must give memmove's result, as if the bytes
+  // went through a temporary buffer, on the CPU path and on the GPU path, in both directions.
+  void CheckOverlappingDmaCopies(RenderContext &resources, auto &gpu) {
+    constexpr const char *name = "OverlappingDmaCopies";
+    constexpr uintptr_t base = 0x0000000200d00000ull;
+    constexpr uint64_t map_size = 0x20000;
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), map_size, map_size, 0,
+                &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, map_size, 0x3, 0x10,
+                                                           direct_offset, map_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    resources.MapMemory(base, map_size);
+    const OverlappingCopyCase cases[] = {{"CPU forward", false, true},
+                                         {"CPU backward", false, false},
+                                         {"GPU forward", true, true},
+                                         {"GPU backward", true, false}};
+    static_assert(std::size(cases) * kOverlapSlotSize <= map_size, "the cases must fit the map");
+    for (uint32_t index = 0; index < std::size(cases); ++index) {
+      RunOverlappingCopyCase(resources, gpu, cases[index], base + index * kOverlapSlotSize,
+                             kOverlapPatternBase + index * kOverlapCaseStride);
+    }
+    resources.UnmapMemory(base, map_size);
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, map_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, map_size) == 0,
+            "direct-memory release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -4179,6 +4272,7 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 fault_direct_offset, fault_size) == 0,
             "processor-fault direct-memory allocation release failed");
+    CheckOverlappingDmaCopies(resources, gpu);
 
     std::binary_semaphore command_entered{0};
     std::binary_semaphore release_command{0};

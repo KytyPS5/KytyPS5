@@ -1038,6 +1038,9 @@ void Presenter::ClearLayer(int bus) {
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+	using Common::DebugCounters::Counter;
+	using Common::DebugCounters::ScopedTimer;
+	ScopedTimer present_time(Counter::PresentNs);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
@@ -1049,7 +1052,10 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage(present_scheduler);
+		auto status = [&] {
+			ScopedTimer acquire_time(Counter::PresentAcquireNs);
+			return swapchain.AcquireNextImage(present_scheduler);
+		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
@@ -1057,8 +1063,11 @@ void Presenter::Impl::Present() {
 		// present_mutex owns the prepared frames and this scheduler. Only queue submission
 		// is shared with rendering, and it has its own queue_mutex.
 		auto&      command = present_scheduler.BeginCommand();
-		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
-		                                 swapchain.PrepareSystemOverlay();
+		const bool draw_system_overlay = [&] {
+			ScopedTimer overlay_time(Counter::OverlayNs);
+			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			       swapchain.PrepareSystemOverlay();
+		}();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
 		const auto tick = swapchain.Submit(present_scheduler);

@@ -424,7 +424,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		if (command) {
-			command();
+			{
+				Common::DebugCounters::ScopedTimer busy(
+				    Common::DebugCounters::Counter::GpuThreadBusyNs);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -434,7 +438,11 @@ void GuestGpu::ThreadRun(void* data) {
 			continue;
 		}
 
-		const bool complete = gpu->Process(submission);
+		const bool complete = [&] {
+			Common::DebugCounters::ScopedTimer busy(
+			    Common::DebugCounters::Counter::GpuThreadBusyNs);
+			return gpu->Process(submission);
+		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

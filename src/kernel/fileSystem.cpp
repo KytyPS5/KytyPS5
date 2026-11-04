@@ -1278,6 +1278,24 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 			std::filesystem::resize_file(real_name, static_cast<uint64_t>(length), error);
 		}
 	}
+	if (error == std::errc::no_such_file_or_directory) {
+		// Windows reports a path reached through a regular file as ENOENT, while truncate
+		// reports ENOTDIR. Look at the first ancestor that exists.
+		std::error_code ancestor_error;
+		auto            ancestor = real_name.parent_path();
+		while (!ancestor.empty()) {
+			const auto ancestor_status = std::filesystem::status(ancestor, ancestor_error);
+			if (!ancestor_error) {
+				if (std::filesystem::exists(ancestor_status) &&
+				    !std::filesystem::is_directory(ancestor_status)) {
+					return KERNEL_ERROR_ENOTDIR;
+				}
+				break;
+			}
+			ancestor_error.clear();
+			ancestor = ancestor.parent_path();
+		}
+	}
 	if (error) {
 		switch (static_cast<std::errc>(error.default_error_condition().value())) {
 			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;

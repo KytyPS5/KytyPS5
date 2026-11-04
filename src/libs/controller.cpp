@@ -202,13 +202,12 @@ static uint32_t g_keyboard_player = 0;
 static void RefreshPlayers();
 static void StopHostPad(SDL_Gamepad* pad);
 
-static void SetLightBarColor(SDL_Gamepad* pad, uint8_t r, uint8_t g, uint8_t b) {
-	const auto properties = SDL_GetGamepadProperties(pad);
-	if (SDL_GetBooleanProperty(properties, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN, false) &&
-	    !SDL_GetBooleanProperty(properties, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false)) {
-		return;
+// A mono LED cannot show the colour, and on Switch pads each write waits for the pad's reply.
+static void SetHostPadLED(SDL_Gamepad* pad, uint8_t r, uint8_t g, uint8_t b) {
+	if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad),
+	                            SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN, false)) {
+		(void)SDL_SetGamepadLED(pad, r, g, b);
 	}
-	(void)SDL_SetGamepadLED(pad, r, g, b);
 }
 
 static int KeyboardPlayer() {
@@ -508,7 +507,7 @@ void GameController::SetDevices(int active_id) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
 		    pad != nullptr) {
 			if (const auto& color = Config::GetControllerColor()) {
-				SetLightBarColor(pad, (*color)[0], (*color)[1], (*color)[2]);
+				SetHostPadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
 			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
@@ -862,7 +861,7 @@ static void StopHostPad(SDL_Gamepad* pad) {
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
 	(void)SDL_RumbleGamepad(pad, 0, 0, 0);
-	SetLightBarColor(pad, 0, 0, 0);
+	SetHostPadLED(pad, 0, 0, 0);
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -915,7 +914,7 @@ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
-		SetLightBarColor(pad, r, g, b);
+		SetHostPadLED(pad, r, g, b);
 	}
 }
 

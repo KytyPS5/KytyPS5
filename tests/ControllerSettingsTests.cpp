@@ -28,7 +28,6 @@ std::array<Rumble, 6>               pad_rumble {};
 std::vector<int>                    closed_pads;
 std::array<std::array<Uint8, 3>, 6> pad_colors {};
 std::array<bool, 6>                 mono_led {};
-std::array<bool, 6>                 rgb_led {true, true, true, true, true, true};
 } // namespace
 
 namespace Fake {
@@ -71,14 +70,8 @@ void Delay(Uint32) {}
 SDL_PropertiesID GetGamepadProperties(SDL_Gamepad* pad) {
 	return static_cast<SDL_PropertiesID>(reinterpret_cast<uintptr_t>(pad));
 }
-bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool default_value) {
-	if (std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0) {
-		return mono_led[pad];
-	}
-	if (std::strcmp(name, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN) == 0) {
-		return rgb_led[pad];
-	}
-	return default_value;
+bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
+	return std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0 && mono_led[pad];
 }
 } // namespace Fake
 
@@ -452,31 +445,15 @@ void TestIndependentOutputsAndPadSwitch() {
 }
 
 void TestMonoLedPadGetsNoLightBar() {
-	Controller controller;
-	struct Case {
-		bool        mono;
-		bool        rgb;
-		bool        receives;
-		const char* failure;
-	};
-	const Case cases[] = {
-	    {false, true, true, "a pad with an RGB LED did not receive the light bar"},
-	    {true, true, true, "a pad with an RGB and a mono LED did not receive the light bar"},
-	    {false, false, true, "a pad that reports no LED did not receive the light bar"},
-	    {true, false, false, "a pad with only a mono LED received the light bar"},
-	};
-	Uint8 value = 0;
-	for (const auto& c: cases) {
-		mono_led[1] = c.mono;
-		rgb_led[1]  = c.rgb;
-		value += 10;
-		const auto expected =
-		    c.receives ? std::array<Uint8, 3> {value, value, value} : pad_colors[1];
-		const PadLightBarParam color {value, value, value, 0};
-		Check(PadSetLightBar(1, &color) == 0 && pad_colors[1] == expected, c.failure);
-	}
+	Controller             controller;
+	const PadLightBarParam first {10, 20, 30, 0};
+	const PadLightBarParam second {40, 50, 60, 0};
+	Check(PadSetLightBar(1, &first) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a pad without an LED capability did not receive the light bar");
+	mono_led[1] = true;
+	Check(PadSetLightBar(1, &second) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a mono-LED pad received the light bar");
 	mono_led[1] = false;
-	rgb_led[1]  = true;
 }
 
 void TestPlayerUserIds() {

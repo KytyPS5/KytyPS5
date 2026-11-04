@@ -233,6 +233,10 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
+bool PollBackoffEnabled() {
+	return g_config->poll_backoff_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

@@ -1,6 +1,5 @@
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -135,48 +134,6 @@ static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	}
 	*out = it->second;
 	return true;
-}
-
-static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
-	if (st == nullptr) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
-	}
-
-	const bool is_dir  = Common::File::IsDirectoryExisting(host_path);
-	const bool is_file = Common::File::IsFileExisting(host_path);
-	if (!is_dir && !is_file) {
-		return LibKernel::KERNEL_ERROR_ENOENT;
-	}
-
-	LibKernel::FileSystem::FileStat stat {};
-	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-
-	auto at = Common::DateTime::FromSystemUTC();
-	auto wt = at;
-
-	if (is_dir) {
-		stat.st_size    = 0;
-		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
-	} else {
-		stat.st_size    = static_cast<int64_t>(Common::File::Size(host_path));
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
-
-		Common::File::GetLastAccessAndWriteTimeUTC(host_path, &at, &wt);
-	}
-
-	stat.st_atim.tv_sec  = static_cast<int64_t>(at.ToUnix());
-	stat.st_atim.tv_nsec = static_cast<int64_t>(
-	    (at.ToUnix() - static_cast<double>(stat.st_atim.tv_sec)) * 1000000000.0);
-	stat.st_mtim.tv_sec  = static_cast<int64_t>(wt.ToUnix());
-	stat.st_mtim.tv_nsec = static_cast<int64_t>(
-	    (wt.ToUnix() - static_cast<double>(stat.st_mtim.tv_sec)) * 1000000000.0);
-	stat.st_ctim     = stat.st_atim;
-	stat.st_birthtim = stat.st_mtim;
-	*st              = stat;
-
-	return OK;
 }
 
 // Mounts can appear after a failed lookup (e.g. additional content), so forget negative results.
@@ -433,7 +390,7 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	return KernelSyscallResult(AprShared::GetHostPathStat(host_path, st));
+	return KernelSyscallResult(LibKernel::FileSystem::StatHostPath(host_path, st));
 }
 
 static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {

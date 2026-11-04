@@ -420,9 +420,8 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 			continue;
 		}
 		if (it->is_regular_file(error) && !error) {
-			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
-			if (!time.IsInvalid()) {
-				mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
+			if (const auto times = Common::File::GetTimes(it->path())) {
+				mtime = std::max(mtime, times->write_ns / 1000000000);
 			}
 		}
 		error.clear();

@@ -53396,9 +53396,14 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
             processor.Process(execution, nop_commands) == Pm4ProcessResult::Complete && selected == 7,
             "one-DWORD NOP prevented the completion write or overread the stream end");
   }
+  const auto dump_path =
+      std::filesystem::temp_directory_path() /
+      fmt::format("kyty_pm4_nop_dump_{}.txt", std::chrono::steady_clock::now().time_since_epoch().count());
   Common::File dump;
-  Require(name, "NOP dump file", dump.CreateInMem(), "could not create PM4 dump");
+  Require(name, "NOP dump file", dump.Create(dump_path), "could not create PM4 dump");
   Pm4::DumpPm4PacketStream(&dump, nop_commands.data(), 0, nop_commands.size());
+  dump.Close();
+  std::filesystem::remove(dump_path);
   std::array<uint32_t, 3> payload{0, 0x12345678u, 0x9abcdef0u};
   CommandBufferLayout payload_dcb{payload.data(), payload.data() + payload.size(),
       payload.data(), payload.data() + payload.size(), nullptr, nullptr, 0};

@@ -32,6 +32,11 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#endif
+
 #include "stb_image.h"
 
 // IWYU pragma: no_include <intrin.h>
@@ -131,8 +136,51 @@ struct EventController {
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+Common::Mutex                  g_luminance_mutex;
+DisplayLuminance               g_luminance;
 
 } // namespace
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// A factory caches output descriptions, so each query creates a new one.
+static bool GetOutputDesc(HMONITOR monitor, DXGI_OUTPUT_DESC1* desc) {
+	Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+	Microsoft::WRL::ComPtr<IDXGIOutput>   output;
+	Microsoft::WRL::ComPtr<IDXGIOutput6>  output6;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+		return false;
+	}
+	for (UINT a = 0; factory->EnumAdapters1(a, &adapter) == S_OK; a++) {
+		for (UINT o = 0; adapter->EnumOutputs(o, &output) == S_OK; o++) {
+			if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(desc)) &&
+			    desc->Monitor == monitor) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// The DXGI values include the monitor's calibration profile when one exists.
+static void RefreshDisplayLuminance(SDL_Window* window) {
+	auto* hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+	    SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+
+	DXGI_OUTPUT_DESC1 desc {};
+	DisplayLuminance  luminance;
+	if (GetOutputDesc(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &desc) &&
+	    desc.MaxLuminance > 0.0f && desc.MaxFullFrameLuminance > 0.0f) {
+		luminance = {desc.MaxFullFrameLuminance, desc.MaxLuminance, desc.MinLuminance};
+	}
+	LOGF("Display luminance: max full frame = %g, max = %g, min = %g nits\n",
+	     luminance.max_full_frame, luminance.max, luminance.min);
+	Common::LockGuard lock(g_luminance_mutex);
+	g_luminance = luminance;
+}
+#else
+static void RefreshDisplayLuminance(SDL_Window* /*window*/) {}
+#endif
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 
@@ -397,6 +445,8 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
 			break;
+		case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+		case SDL_EVENT_WINDOW_HDR_STATE_CHANGED: RefreshDisplayLuminance(window); break;
 		default:
 			LOGF("Window %" PRIu32 " got unknown event %" PRIu32 "\n", window_event.windowID,
 			     static_cast<uint32_t>(window_event.type));
@@ -783,6 +833,7 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
+	RefreshDisplayLuminance(context.window);
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
@@ -828,6 +879,11 @@ void WindowShutdown() {
 		Controller::EmergencyShutdown();
 		g_window.reset();
 	}
+}
+
+DisplayLuminance WindowGetDisplayLuminance() {
+	Common::LockGuard lock(g_luminance_mutex);
+	return g_luminance;
 }
 
 static int WindowIconRead(void* user, char* data, int size) {

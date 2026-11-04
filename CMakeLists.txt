@@ -427,7 +427,7 @@ target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
 )
-target_link_libraries(trophy_system_tests common)
+target_link_libraries(trophy_system_tests common Vulkan::Headers)
 target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
 
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL

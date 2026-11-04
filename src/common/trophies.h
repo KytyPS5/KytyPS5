@@ -38,13 +38,17 @@ struct Trophy {
 };
 
 struct UdsRule {
+	enum class Type { Uint32, Uint64, Int64 };
+
 	uint64_t    stat_id;
 	std::string input;
-	bool        is_uint32;
+	Type        type;
+	bool        maximum;
+	uint64_t    initial_value;
 };
 
 using UdsRules   = std::map<std::string, std::vector<UdsRule>>;
-using UdsInteger = std::variant<int32_t, uint32_t, uint64_t>;
+using UdsInteger = std::variant<int32_t, uint32_t, uint64_t, int64_t>;
 
 struct Package {
 	std::string                title;
@@ -54,8 +58,14 @@ struct Package {
 };
 
 struct UnlockData {
-	std::set<int>           unlocked;
-	std::map<int, uint64_t> timestamps;
+	std::set<int>                unlocked;
+	std::map<int, uint64_t>      timestamps;
+	std::map<uint64_t, uint64_t> max_stats;
+};
+
+struct UdsResult {
+	std::vector<int> trophies;
+	bool             stats_changed = false;
 };
 
 struct Progress {
@@ -74,8 +84,9 @@ struct Progress {
 [[nodiscard]] std::filesystem::path PackagePath(uint32_t service_label);
 [[nodiscard]] std::filesystem::path UdsPackagePath(uint32_t service_label);
 [[nodiscard]] UdsRules              LoadUdsRules(const std::filesystem::path& path);
-[[nodiscard]] std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
-                                               const std::map<std::string, UdsInteger>& properties);
+[[nodiscard]] UdsResult ApplyUdsEvent(
+    const Package& package, UnlockData& unlocks, std::string_view event_name,
+    const std::map<std::string, UdsInteger>& properties);
 [[nodiscard]] std::filesystem::path UnlocksPath(const std::filesystem::path& root,
                                                 std::string_view title_id, int user_id,
                                                 uint32_t service_label);

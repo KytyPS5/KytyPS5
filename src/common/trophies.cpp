@@ -274,6 +274,13 @@ UnlockData LoadUnlockData(const std::filesystem::path& path) {
 			}
 		}
 	}
+	if (json.contains("maxStats") && json["maxStats"].is_object()) {
+		for (auto it = json["maxStats"].begin(); it != json["maxStats"].end(); ++it) {
+			const auto id    = ReadUnsigned(Json(it.key()));
+			const auto value = ReadUnsigned(it.value());
+			if (id && value) unlocks.max_stats.emplace(*id, *value);
+		}
+	}
 	return unlocks;
 }
 
@@ -287,8 +294,13 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 			timestamps[std::to_string(id)] = tick;
 		}
 	}
-	const auto text =
-	    Json {{"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", timestamps}}.dump();
+	Json stats = Json::object();
+	for (const auto& [id, value]: unlocks.max_stats) {
+		stats[std::to_string(id)] = value;
+	}
+	const auto text = Json {{"unlockedTrophies", unlocks.unlocked},
+	                        {"unlockedAt", timestamps},
+	                        {"maxStats", stats}}.dump();
 	auto temporary = path;
 	temporary += ".tmp";
 	File file;
@@ -329,26 +341,37 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 	    !extraction["statsExtractionRuleArray"].is_array()) {
 		return {};
 	}
-	// Only direct unsigned latest-value stats are evaluated here. Aggregated stats
-	// and filtered/nested extraction require UDS state and event types we do not implement.
-	std::map<uint64_t, bool> stats;
+	// Support direct unsigned latest values and nonnegative integer maxima.
+	std::map<uint64_t, UdsRule> stats;
 	for (const auto& definition: definitions["statDefinitionArray"]) {
 		if (!definition.is_object() || !definition.contains("statId") ||
-		    !definition.contains("aggregation") || definition["aggregation"] != "latest" ||
+		    !definition.contains("aggregation") ||
+		    (definition["aggregation"] != "latest" && definition["aggregation"] != "max") ||
 		    !definition.contains("dataType")) {
 			continue;
 		}
 		const auto  id   = ReadUnsigned(definition["statId"]);
 		const auto& type = definition["dataType"];
-		if (!id || (type != "uint64" && type != "uint32")) {
+		const bool  maximum = definition["aggregation"] == "max";
+		if (!id || (type != "uint64" && type != "uint32" && type != "int64") ||
+		    (type == "int64" && (!maximum || !definition.contains("minValue")))) {
 			continue;
 		}
-		const uint64_t maximum = type == "uint32" ? UINT32_MAX : UINT64_MAX;
+		const uint64_t limit   = type == "uint32"  ? UINT32_MAX
+		                         : type == "int64" ? INT64_MAX
+		                                           : UINT64_MAX;
+		const auto     initial = definition.contains("initialValue")
+		                             ? ReadUnsigned(definition["initialValue"])
+		                             : std::optional<uint64_t>(0);
 		if ((definition.contains("minValue") && ReadUnsigned(definition["minValue"]) != 0) ||
-		    (definition.contains("maxValue") && ReadUnsigned(definition["maxValue"]) != maximum)) {
+		    (definition.contains("maxValue") && ReadUnsigned(definition["maxValue"]) != limit) ||
+		    !initial || *initial > limit) {
 			continue;
 		}
-		stats.emplace(*id, type == "uint32");
+		const auto value_type = type == "uint32"  ? UdsRule::Type::Uint32
+		                        : type == "int64" ? UdsRule::Type::Int64
+		                                          : UdsRule::Type::Uint64;
+		stats.emplace(*id, UdsRule {*id, {}, value_type, maximum, *initial});
 	}
 	UdsRules events;
 	for (const auto& rule: extraction["statsExtractionRuleArray"]) {
@@ -372,8 +395,9 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 		        std::string::npos) {
 			continue;
 		}
-		events[condition["eventName"].get<std::string>()].push_back(
-		    {*id, input.substr(2), stats.at(*id)});
+		auto parsed  = stats.at(*id);
+		parsed.input = input.substr(2);
+		events[condition["eventName"].get<std::string>()].push_back(std::move(parsed));
 	}
 	return events;
 }
@@ -382,44 +406,62 @@ std::filesystem::path UdsPackagePath(uint32_t service_label) {
 	return std::filesystem::path("sce_sys/uds") / fmt::format("uds{:02}.ucp", service_label);
 }
 
-std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
-                                 const std::map<std::string, UdsInteger>& properties) {
+UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks, std::string_view event_name,
+                        const std::map<std::string, UdsInteger>& properties) {
 	const auto rules = package.event_rules.find(std::string(event_name));
 	if (rules == package.event_rules.end()) {
 		return {};
 	}
-	std::vector<int> ids;
+	UdsResult                                  result;
+	std::vector<std::pair<uint64_t, uint64_t>> values;
+	for (const auto& rule: rules->second) {
+		const auto value = properties.find(rule.input);
+		if (value == properties.end()) continue;
+		std::optional<uint64_t> number;
+		switch (rule.type) {
+			case UdsRule::Type::Uint32:
+				if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
+				break;
+			case UdsRule::Type::Uint64:
+				if (const auto* input = std::get_if<uint64_t>(&value->second)) number = *input;
+				break;
+			case UdsRule::Type::Int64:
+				if (const auto* input = std::get_if<int64_t>(&value->second); input && *input >= 0)
+					number = static_cast<uint64_t>(*input);
+				break;
+		}
+		if (!number) continue;
+		if (rule.maximum) {
+			auto [stat, inserted] = unlocks.max_stats.try_emplace(rule.stat_id, rule.initial_value);
+			const auto next       = std::max({stat->second, rule.initial_value, *number});
+			result.stats_changed |= inserted || next != stat->second;
+			stat->second = next;
+			number       = next;
+		}
+		values.emplace_back(rule.stat_id, *number);
+	}
 	for (const auto& [id, trophy]: package.trophies) {
-		if (trophy.grade == 1 || !trophy.uds_stat_id || !trophy.target) {
+		if (trophy.grade == 1 || unlocks.unlocked.contains(id) || !trophy.uds_stat_id ||
+		    !trophy.target) {
 			continue;
 		}
-		for (const auto& rule: rules->second) {
-			const auto value = properties.find(rule.input);
-			if (rule.stat_id != *trophy.uds_stat_id || value == properties.end()) {
-				continue;
-			}
-			std::optional<uint64_t> number;
-			if (rule.is_uint32) {
-				if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
-			} else if (const auto* input = std::get_if<uint64_t>(&value->second)) {
-				number = *input;
-			}
-			if (!number) continue;
+		for (const auto& [stat_id, number]: values) {
+			if (stat_id != *trophy.uds_stat_id) continue;
 			bool matched = false;
 			switch (trophy.comparison) {
-				case Comparison::GreaterEqual: matched = *number >= *trophy.target; break;
-				case Comparison::Greater: matched = *number > *trophy.target; break;
-				case Comparison::LessEqual: matched = *number <= *trophy.target; break;
-				case Comparison::Less: matched = *number < *trophy.target; break;
+				case Comparison::GreaterEqual: matched = number >= *trophy.target; break;
+				case Comparison::Greater: matched = number > *trophy.target; break;
+				case Comparison::LessEqual: matched = number <= *trophy.target; break;
+				case Comparison::Less: matched = number < *trophy.target; break;
 				case Comparison::None: break;
 			}
 			if (matched) {
-				ids.push_back(id);
+				result.trophies.push_back(id);
 				break;
 			}
 		}
 	}
-	return ids;
+	return result;
 }
 
 uint32_t Progress::Percentage() const {

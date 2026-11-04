@@ -159,6 +159,16 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 	auto       path  = guest ? std::filesystem::path {}
 	                         : Trophies::UnlocksPath({}, title_id, key.first, key.second);
 	auto unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
+	if (!guest) {
+		for (const auto& [event, rules]: package.event_rules) {
+			for (const auto& rule: rules) {
+				if (rule.maximum) {
+					auto& value = unlocks.max_stats[rule.stat_id];
+					value       = std::max(value, rule.initial_value);
+				}
+			}
+		}
+	}
 	return &g_states
 	            .emplace(key, TrophyState {&package, std::move(unlocks), std::move(path), guest})
 	            .first->second;
@@ -202,6 +212,12 @@ static void FillTrophyInfo(const TrophyState& state, const Trophies::Trophy& tro
 		if (trophy.progressive && trophy.target) {
 			data->progress.type  = 1;
 			data->progress.value = data->unlocked ? *trophy.target : 0;
+			if (!data->unlocked && trophy.uds_stat_id) {
+				if (const auto stat = state.unlocks.max_stats.find(*trophy.uds_stat_id);
+				    stat != state.unlocks.max_stats.end()) {
+					data->progress.value = std::min(stat->second, *trophy.target);
+				}
+			}
 		}
 	}
 }
@@ -715,11 +731,16 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 			LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id);
 		}
 	} else if (!uds_event.properties.integers.empty()) {
-		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
-			const auto ids = LibNpTrophy2::Trophies::FindUdsTrophies(
-			    *state->package, uds_event.name, uds_event.properties.integers);
-			for (const auto trophy_id: ids) {
+		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key);
+		    state != nullptr && !state->guest) {
+			const auto result = LibNpTrophy2::Trophies::ApplyUdsEvent(
+			    *state->package, state->unlocks, uds_event.name, uds_event.properties.integers);
+			for (const auto trophy_id: result.trophies) {
 				LibNpTrophy2::RecordTrophyUnlock(*state, trophy_id, true);
+			}
+			if (result.trophies.empty() && result.stats_changed &&
+			    !LibNpTrophy2::Trophies::SaveUnlockData(state->path, state->unlocks)) {
+				LOGF("[Trophy] could not save progress to %s\n", state->path.string().c_str());
 			}
 		}
 	}
@@ -901,7 +922,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetInteger(key, std::nullopt);
+	object->SetInteger(key, value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"

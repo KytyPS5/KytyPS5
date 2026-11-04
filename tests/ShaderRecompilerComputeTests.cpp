@@ -252,6 +252,7 @@ struct ImageHeapTestAccess {
 };
 
 struct TextureCacheTestAccess {
+  using PageTable = TextureCache::ImagePageTable;
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
@@ -315,6 +316,64 @@ struct TextureCacheTestAccess {
       result.push_back(id);
     }
     return result;
+  }
+
+  // Copies an owner list into a vector so tests can compare ids in order.
+  static std::vector<ImageId> ToVector(const TextureCache::ImageIds &ids) {
+    std::vector<ImageId> result;
+    result.reserve(ids.size());
+    for (const auto id : ids) {
+      result.push_back(id);
+    }
+    return result;
+  }
+
+  // The straightforward lookup used as the oracle. It walks every page, drops an owner already
+  // accepted through a per-id flag, and tests overlap on the Image object itself. This is the
+  // algorithm the span-table walk replaced.
+  static std::vector<ImageId> FindImagesOracle(TextureCache &cache,
+                                               uint64_t address, uint64_t size) {
+    std::lock_guard lock(cache.m_lock);
+    std::vector<ImageId> result;
+    TextureCache::ImagePageTable::PageRange pages{};
+    if (!TextureCache::ImagePageTable::TryGetPageRange(address, size, pages)) {
+      return result;
+    }
+    std::vector<uint8_t> picked(cache.m_image_spans.size(), 0);
+    for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+      const auto *owners = cache.m_image_page_table.Find(page);
+      if (owners == nullptr) {
+        continue;
+      }
+      for (const auto id : *owners) {
+        if (picked[id.index] == 0 &&
+            cache.m_slot_images[id].Overlaps(address, size)) {
+          picked[id.index] = 1;
+          result.push_back(id);
+        }
+      }
+    }
+    return result;
+  }
+
+  // The production walk, also reporting how many span overlap tests it ran.
+  static std::vector<ImageId> FindImagesCounted(TextureCache &cache,
+                                                uint64_t address, uint64_t size,
+                                                uint64_t &overlap_tests) {
+    std::lock_guard lock(cache.m_lock);
+    overlap_tests = 0;
+    return ToVector(
+        cache.FindImagesInRegionCounted(address, size, &overlap_tests));
+  }
+
+  // Begin and end of the cached span for an image slot, or zeros past the table.
+  static std::pair<uint64_t, uint64_t> SpanOf(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    if (id.index >= cache.m_image_spans.size()) {
+      return {0, 0};
+    }
+    const auto &span = cache.m_image_spans[id.index];
+    return {span.begin, span.end};
   }
 
   static size_t PageOwnerCount(TextureCache &cache, uint64_t address) {
@@ -6336,6 +6395,312 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Deterministic generator so a failure reproduces from the printed step.
+  struct LookupRandom {
+    uint64_t state = 0x9e3779b97f4a7c15ull;
+    uint64_t Next() {
+      state += 0x9e3779b97f4a7c15ull;
+      uint64_t value = state;
+      value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+      value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+      return value ^ (value >> 31);
+    }
+    uint64_t Below(uint64_t limit) { return Next() % limit; }
+  };
+
+  // A guest address window that the random images and queries stay inside.
+  struct LookupArena {
+    uint64_t begin;
+    uint64_t end;
+  };
+
+  // The test's own record of a registered image, used to model what a lookup must test.
+  struct LookupImage {
+    ImageId id;
+    uint64_t begin;
+    uint64_t end;
+  };
+
+  // A guest byte range for an image or a query.
+  struct LookupRange {
+    uint64_t address;
+    uint64_t size;
+  };
+
+  // Counts of the cases the random run reached, so a run that missed one fails loudly.
+  struct LookupStats {
+    uint64_t nonempty = 0, multi = 0, wide = 0, invalid = 0;
+    uint64_t reused = 0, crowded = 0, shrunk = 0, top_hits = 0;
+  };
+
+  using LookupPageTable = TextureCacheTestAccess::PageTable;
+  static constexpr uint64_t kLookupPageSize = 1ull << LookupPageTable::kPageBits;
+  static constexpr uint64_t kLookupSmallPage = 0x1000;
+  static constexpr uint64_t kLookupGuestEnd = LookupPageTable::kAddressSpaceSize;
+  static constexpr uint64_t kLookupArenaSize = 96 * kLookupPageSize;
+  // A page owner list keeps this many owners inline before it spills to a vector.
+  static constexpr size_t kLookupInlineOwners = 16;
+  // A lookup this wide has more distinct owners than any small fixed seen list could hold.
+  static constexpr uint64_t kLookupWideOwners = 33;
+  // Arena page that collects many owners, to push one owner list past its inline limit.
+  static constexpr uint64_t kLookupCrowdPage = 7;
+  static constexpr size_t kLookupMaxLive = 70;
+  static constexpr uint64_t kLookupSteps = 6000;
+  static constexpr uint64_t kLookupCrowdPeriod = 400;
+  // Freed slots are erased by deferred scheduler work, so finish it now and then to let new
+  // images reuse ids.
+  static constexpr uint64_t kLookupFinishPeriod = 150;
+
+  // Builds one image or query range inside an arena. The kinds hit page and 4 KiB edges,
+  // images that span many pages, and a crowd page that collects many owners.
+  static LookupRange MakeLookupRange(LookupRandom &random,
+                                     const LookupArena &arena) {
+    const uint64_t pages = (arena.end - arena.begin) / kLookupPageSize;
+    const uint64_t page_start = arena.begin + random.Below(pages) * kLookupPageSize;
+    uint64_t address = page_start + random.Below(kLookupPageSize);
+    uint64_t size = 1 + random.Below(0x3000);
+    switch (random.Below(9)) {
+    case 1: address = page_start; size = kLookupPageSize; break;
+    case 2:
+      address = page_start - 1 - random.Below(0x2000);
+      size = 2 + random.Below(0x4000);
+      break;
+    case 3: size = (20 + random.Below(21)) * kLookupPageSize; break;
+    case 4:
+      size = 1 + random.Below(0x5000);
+      address = page_start - size;
+      break;
+    case 5:
+      address = page_start + kLookupPageSize - kLookupSmallPage;
+      size = kLookupSmallPage * (1 + random.Below(3));
+      break;
+    case 6: size = (2 + random.Below(5)) * kLookupPageSize; break;
+    case 7:
+      address = arena.begin + kLookupCrowdPage * kLookupPageSize +
+                random.Below(kLookupInlineOwners) * kLookupSmallPage;
+      size = kLookupSmallPage;
+      break;
+    case 8:
+      address = page_start + kLookupSmallPage * random.Below(256);
+      size = kLookupSmallPage;
+      break;
+    default: break;
+    }
+    address = address < arena.begin || address >= arena.end ? arena.begin : address;
+    return {address, std::max<uint64_t>(std::min(size, arena.end - address), 1)};
+  }
+
+  // Picks a lookup that may be invalid, adjacent to a live image, exact on one, or on a page edge.
+  static LookupRange MakeLookupQuery(LookupRandom &random,
+                                     const LookupArena &arena,
+                                     const std::vector<LookupImage> &live) {
+    const auto pick = random.Below(8);
+    if (pick == 0) {
+      const std::array<LookupRange, 6> invalid{
+          {{arena.begin, 0},
+           {kLookupGuestEnd, 1},
+           {kLookupGuestEnd - 1, 2},
+           {UINT64_MAX - 1, 4},
+           {kLookupGuestEnd - kLookupSmallPage, 2 * kLookupSmallPage},
+           {0, 0}}};
+      return invalid[random.Below(invalid.size())];
+    }
+    if (pick <= 3 && !live.empty()) {
+      const auto &image = live[random.Below(live.size())];
+      const auto length = 1 + random.Below(0x3000);
+      if (pick == 1) {
+        return {image.begin, image.end - image.begin};
+      }
+      if (pick == 2) {
+        return {image.end, std::min(length, kLookupGuestEnd - image.end)};
+      }
+      return image.begin >= length ? LookupRange{image.begin - length, length}
+                                   : LookupRange{image.begin, 1};
+    }
+    if (pick == 4) {
+      return {arena.begin, arena.end - arena.begin};
+    }
+    if (pick == 5) {
+      const uint64_t edge =
+          arena.begin + (1 + random.Below(kLookupArenaSize / kLookupPageSize - 1)) *
+                            kLookupPageSize;
+      const std::array<LookupRange, 4> edges{
+          {{edge, 1}, {edge - 1, 2}, {edge - 1, 1}, {edge - kLookupPageSize, kLookupPageSize}}};
+      return edges[random.Below(edges.size())];
+    }
+    return MakeLookupRange(random, arena);
+  }
+
+  // The arenas sit at the top of the low region and at both ends of the extended region, because
+  // images must lie in guest memory. Queries past the 44-bit table limit are still tried.
+  // The distinct-owner model counts only images this test made, so the arenas must stay far from
+  // the images CheckUnifiedTextureCacheFlow created earlier.
+  static std::array<LookupArena, 3> MakeLookupArenas() {
+    constexpr uint64_t low_end = 1ull << 40;
+    constexpr uint64_t extended_begin = Libs::LibKernel::Memory::kExtendedMemoryBase;
+    constexpr uint64_t extended_end =
+        extended_begin + Libs::LibKernel::Memory::kExtendedMemorySize;
+    return {{{low_end - kLookupArenaSize, low_end},
+             {extended_begin, extended_begin + kLookupArenaSize},
+             {extended_end - kLookupArenaSize, extended_end}}};
+  }
+
+  // Random registers, unregisters and lookups, with the model the lookups are checked against.
+  struct LookupFixture {
+    const char *name;
+    TextureCache &cache;
+    LookupRandom random;
+    std::array<LookupArena, 3> arenas = MakeLookupArenas();
+    std::vector<LookupImage> live;
+    std::vector<ImageId> dead;
+    LookupStats stats;
+
+    // Registers one image and checks the cached span matches its range.
+    void Insert(LookupRange range) {
+      ImageInfo info{};
+      info.data = {range.address, range.size};
+      info.extent = {1, 1, 1};
+      info.resources = {1, 1};
+      info.samples = 1;
+      const auto id = TextureCacheTestAccess::InsertImage(cache, info);
+      stats.reused += std::erase(dead, id);
+      live.push_back({id, range.address, range.address + range.size});
+      const auto span = TextureCacheTestAccess::SpanOf(cache, id);
+      Require(name, "lookup span filled on register",
+              span.first == live.back().begin && span.second == live.back().end,
+              "RegisterImage did not store the image byte range");
+    }
+
+    // Unregisters one live image and checks its cached span is cleared.
+    void Remove(size_t index) {
+      const auto id = live[index].id;
+      TextureCacheTestAccess::DeleteImage(cache, id);
+      dead.push_back(id);
+      live.erase(live.begin() + static_cast<ptrdiff_t>(index));
+      Require(name, "lookup span cleared on unregister",
+              TextureCacheTestAccess::SpanOf(cache, id) ==
+                  std::pair<uint64_t, uint64_t>{0, 0},
+              "UnregisterImage left the image byte range behind");
+    }
+
+    uint64_t CrowdBegin(const LookupArena &arena) const {
+      return arena.begin + kLookupCrowdPage * kLookupPageSize;
+    }
+
+    // Piles more than the inline capacity of owners onto one page.
+    void CrowdBurst(const LookupArena &arena) {
+      for (size_t added = 0; added < kLookupInlineOwners + 4; ++added) {
+        Insert({CrowdBegin(arena) + added * kLookupSmallPage, kLookupSmallPage});
+      }
+      stats.crowded += TextureCacheTestAccess::PageOwnerCount(
+                           cache, CrowdBegin(arena)) > kLookupInlineOwners;
+    }
+
+    // Removes about half the crowd so the owner list shrinks back to inline storage.
+    void CrowdThin(const LookupArena &arena) {
+      for (size_t index = live.size(); index-- > 0;) {
+        if (live[index].begin >= CrowdBegin(arena) &&
+            live[index].begin < CrowdBegin(arena) + kLookupPageSize &&
+            random.Below(2) == 0) {
+          Remove(index);
+        }
+      }
+      stats.shrunk += TextureCacheTestAccess::PageOwnerCount(
+                          cache, CrowdBegin(arena)) <= kLookupInlineOwners;
+    }
+
+    // Owners on the walked pages, counted from the model and not from the page table.
+    uint64_t DistinctOwners(const LookupRange &query, bool valid) const {
+      uint64_t distinct = 0;
+      for (const auto &image : live) {
+        distinct += valid &&
+                    (image.begin >> LookupPageTable::kPageBits) <=
+                        ((query.address + query.size - 1) >> LookupPageTable::kPageBits) &&
+                    ((image.end - 1) >> LookupPageTable::kPageBits) >=
+                        (query.address >> LookupPageTable::kPageBits);
+      }
+      return distinct;
+    }
+
+    // Runs one lookup and compares it with the oracle, then checks each owner was tested once.
+    void Query(const LookupArena &arena, uint64_t step) {
+      const auto query = MakeLookupQuery(random, arena, live);
+      uint64_t tests = 0;
+      const auto expected = TextureCacheTestAccess::FindImagesOracle(
+          cache, query.address, query.size);
+      const auto actual = TextureCacheTestAccess::FindImagesCounted(
+          cache, query.address, query.size, tests);
+      Require(name, "lookup order and content match the oracle", actual == expected,
+              "span-table lookup differs from the oracle at step " + std::to_string(step));
+      const bool valid = query.size != 0 && query.address < kLookupGuestEnd &&
+                         query.size <= kLookupGuestEnd - query.address;
+      const auto distinct = DistinctOwners(query, valid);
+      Require(name, "each owner overlap-tested once", tests == distinct,
+              "lookup tested " + std::to_string(tests) + " owners, expected " +
+                  std::to_string(distinct) + " at step " + std::to_string(step));
+      stats.invalid += !valid;
+      stats.nonempty += !expected.empty();
+      stats.multi += expected.size() >= 2;
+      stats.wide += distinct >= kLookupWideOwners;
+      stats.top_hits += !expected.empty() && query.address >= arenas[2].begin;
+    }
+
+    // Fails when the random run missed a case the equivalence claim depends on.
+    void CheckCoverage() const {
+      Require(name, "lookup differential coverage",
+              stats.nonempty >= 500 && stats.multi >= 100 && stats.wide >= 5 &&
+                  stats.invalid >= 100 && stats.reused >= 20 && stats.crowded >= 3 &&
+                  stats.shrunk >= 3 && stats.top_hits >= 100,
+              "random lookup steps missed a case: nonempty=" +
+                  std::to_string(stats.nonempty) + " multi=" + std::to_string(stats.multi) +
+                  " wide=" + std::to_string(stats.wide) +
+                  " invalid=" + std::to_string(stats.invalid) +
+                  " reused=" + std::to_string(stats.reused) +
+                  " crowded=" + std::to_string(stats.crowded) +
+                  " shrunk=" + std::to_string(stats.shrunk) +
+                  " top=" + std::to_string(stats.top_hits));
+    }
+  };
+
+  // Compares the span-table walk with the oracle over random register, unregister and lookup
+  // steps. Every lookup also checks that each owner on the walked pages is overlap-tested once.
+  void CheckImageLookupMatchesOracle(const char *name, TextureCache &cache,
+                                     CommandScheduler &scheduler) {
+    LookupFixture fixture{name, cache};
+    for (uint64_t step = 0; step < kLookupSteps; ++step) {
+      const auto &arena = fixture.arenas[fixture.random.Below(fixture.arenas.size())];
+      const auto action = fixture.random.Below(10);
+      if (step % kLookupFinishPeriod == kLookupFinishPeriod - 1) {
+        scheduler.Finish();
+      }
+      if (step % kLookupCrowdPeriod == 0) {
+        fixture.CrowdBurst(arena);
+      } else if (step % kLookupCrowdPeriod == kLookupCrowdPeriod / 2) {
+        fixture.CrowdThin(arena);
+      } else if (action < 2 && fixture.live.size() < kLookupMaxLive) {
+        fixture.Insert(MakeLookupRange(fixture.random, arena));
+      } else if (action < 4 && !fixture.live.empty()) {
+        fixture.Remove(fixture.random.Below(fixture.live.size()));
+      } else {
+        fixture.Query(arena, step);
+      }
+    }
+    for (const auto id : fixture.dead) {
+      Require(name, "dead span cleared",
+              TextureCacheTestAccess::SpanOf(cache, id) ==
+                  std::pair<uint64_t, uint64_t>{0, 0},
+              "an unregistered image kept its byte range");
+    }
+    fixture.CheckCoverage();
+    while (!fixture.live.empty()) {
+      fixture.Remove(fixture.live.size() - 1);
+    }
+    std::printf("[gpu]     %-32s lookups nonempty=%" PRIu64 " multi=%" PRIu64
+                " wide=%" PRIu64 " invalid=%" PRIu64 " reused=%" PRIu64 "\n",
+                name, fixture.stats.nonempty, fixture.stats.multi,
+                fixture.stats.wide, fixture.stats.invalid, fixture.stats.reused);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -6496,6 +6861,7 @@ public:
                   texture_cache, large_info.data.address, large_info.data.size,
                   large_owner) == 0,
               "large image unregister left coarse memberships behind");
+      CheckImageLookupMatchesOracle(name, texture_cache, scheduler);
 
 
       auto &image = texture_cache.GetImage(first);

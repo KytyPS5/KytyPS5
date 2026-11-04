@@ -120,6 +120,10 @@ int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	return FinishNetCall(Net::NetPoolDestroy(memid));
 }
 
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
+	return FinishNetCall(Net::NetGetMemoryPoolStats(memid, stats));
+}
+
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	return FinishNetCall(Net::NetResolverCreate(name, memid, flags));
 }
@@ -246,6 +250,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("OXXX4mUk3uk", LibNet::NetConnect);
 	LIB_FUNC("dgJBaeJnGpo", LibNet::NetPoolCreate);
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
+	LIB_FUNC("rMyh97BU5pY", LibNet::NetGetMemoryPoolStats);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);

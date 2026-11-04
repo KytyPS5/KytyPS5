@@ -115,6 +115,7 @@ public:
 
 	int  PoolCreate(const char* name, int size);
 	bool PoolDestroy(int memid);
+	int  PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats);
 	int  ResolverCreate(const char* name, int memid);
 	bool ResolverDestroy(int rid);
 	bool ResolverValid(int rid);
@@ -286,6 +287,22 @@ bool Network::PoolDestroy(int memid) {
 	}
 
 	return false;
+}
+
+int Network::PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
+	Common::LockGuard lock(m_mutex);
+
+	if (memid < 0 || memid >= POOLS_MAX || !m_pools[memid].used) {
+		return NET_ERROR_EBADF;
+	}
+	if (stats == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	// Pool allocations are not tracked; only the configured size is available.
+	*stats = {};
+	stats->pool_size = static_cast<uint64_t>(m_pools[memid].size);
+	return OK;
 }
 
 int Network::ResolverCreate(const char* name, int memid) {
@@ -1418,6 +1435,13 @@ int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	}
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->PoolGetMemoryPoolStats(memid, stats);
 }
 
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {

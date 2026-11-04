@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -151,6 +152,19 @@ struct PipelineCache::Async {
 	std::unordered_map<ProgramKey, Translation, ProgramKeyHash> translations;
 	// Render thread only: pipelines being created on workers.
 	uint32_t pipelines_building = 0;
+
+	// Render thread only: when the game last drew into each render target, and in which of the
+	// frames before that.
+	struct TargetHistory {
+		uint64_t frame = 0;
+		// Bit n: drawn n frames before `frame`.
+		uint8_t seen = 0;
+	};
+	std::unordered_map<uint64_t, TargetHistory> targets;
+	// Records a draw into the target at `address` in the current frame. True when the game redraws
+	// it every frame: it was drawn in at least three of the last six. Only then may a draw into it
+	// be skipped while its shaders are built, because the next frame draws it again.
+	bool NoteTargetDraw(uint64_t address);
 
 	// Render thread only: every two seconds while anything is pending, one line on the console
 	// with what the workers are doing and how many draws were skipped meanwhile.

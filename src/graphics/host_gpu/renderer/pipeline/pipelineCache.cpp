@@ -495,7 +495,21 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
 	ShaderRecompiler::TranslateResult translated;
-	if (current != nullptr) {
+	bool                              reused = false;
+	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (m_async != nullptr && current == nullptr) {
+			// A worker may have translated this stage while draws waited for it. The translation
+			// depends only on the stage's static state, so it serves this draw too.
+			if (const auto waiting = m_async->translations.find(m_lookup_key);
+			    waiting != m_async->translations.end()) {
+				translated = std::move(*waiting->second.translated);
+				m_async->translations.erase(waiting);
+				reused = true;
+			}
+		}
+	}
+	if (reused) {
+	} else if (current != nullptr) {
 		if (!current->calls.empty()) {
 			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
@@ -938,20 +952,36 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
-	// A small color target is often a cache the game fills once (glyphs, UI layers) and samples
-	// for many frames, so a draw into it would be lost for good, not just for a frame. Those
-	// draws wait for their shaders.
+	// A draw is skipped while its shaders are built, so what it draws is missing from that frame.
+	// That is harmless when the game draws the target again every frame, and lost for good when it
+	// draws it once and samples it for many frames (glyphs, UI layers, baked textures). So only a
+	// draw into a target the game was seen to redraw is skipped; the others wait for their shaders.
+	// Small targets always wait: they are mostly such caches. (usa-ratt/KytyPS5-GT7 decides the
+	// same way, with a longer list of cases.)
 	uint32_t color_targets = 0;
 	bool     all_small     = true;
+	bool     redrawn       = m_async != nullptr;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = context.GetRenderTarget(slot);
 		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
 			color_targets++;
 			all_small &= rt.attrib2.width < SmallTargetSyncPixels &&
 			             rt.attrib2.height < SmallTargetSyncPixels;
+			if (m_async != nullptr) {
+				// Every target is noted, so that the history is complete when it is needed.
+				redrawn = m_async->NoteTargetDraw(rt.base.addr) && redrawn;
+			}
 		}
 	}
-	state.deferrable = color_targets == 0 || !all_small;
+	if (m_async != nullptr && color_targets == 0) {
+		// A depth-only draw (a shadow map): its target is the depth buffer.
+		const auto& depth_target = context.GetDepthRenderTarget();
+		const auto  depth_base   = depth_target.z_write_base_addr != 0
+		                               ? depth_target.z_write_base_addr
+		                               : depth_target.z_read_base_addr;
+		redrawn = depth_base != 0 && m_async->NoteTargetDraw(depth_base);
+	}
+	state.deferrable = redrawn && (color_targets == 0 || !all_small);
 	const auto mode  = m_async != nullptr && state.deferrable ? AsyncMode::On : AsyncMode::Off;
 	// With async compile on, a stage that is not ready skips the draw. The stages behind it
 	// cannot be looked up without its push data layout, but their translation can start.

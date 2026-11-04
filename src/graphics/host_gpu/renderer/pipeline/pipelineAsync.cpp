@@ -252,12 +252,42 @@ void PipelineCache::PumpAsync() {
 	m_async->ReportStatus();
 }
 
+bool PipelineCache::Async::NoteTargetDraw(uint64_t address) {
+	const auto frame = CurrentFrame();
+	auto&      seen  = targets[address];
+	if (seen.frame != frame) {
+		const auto age = frame - seen.frame;
+		seen.seen      = age >= 8 ? 0 : static_cast<uint8_t>(seen.seen << age);
+		seen.frame     = frame;
+	}
+	seen.seen |= 1u;
+	if (targets.size() > 4096) {
+		// Targets of scenes long gone.
+		std::erase_if(targets, [frame](const auto& entry) { return frame - entry.second.frame > 600; });
+	}
+	return std::popcount(static_cast<unsigned>(seen.seen & 0x3Fu)) >= 3;
+}
+
+// Whether the module writes buffers, images or memory through addresses, which other draws and
+// dispatches may read: a draw with such a module is never skipped, because the writes are lost.
+static bool WritesMemory(const ShaderModule& module) {
+	if (module.info.has_address_writes) {
+		return true;
+	}
+	const auto& info = module.info.info;
+	return std::ranges::any_of(info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; });
+}
+
 void PipelineCache::Async::ReportStatus() {
 	const auto now = AskClockMs();
 	if (now - last_report_ms < 2000) {
 		return;
 	}
-	last_report_ms     = now;
+	last_report_ms = now;
+	// A translation no draw has come back for in a minute belongs to something no longer on
+	// screen; a later draw translates it again.
+	std::erase_if(translations, [now](const auto& entry) { return now - entry.second.since > 60000; });
 	size_t translating = 0;
 	for (const auto& [id, flight]: in_flight) {
 		translating += flight.translating ? 1u : 0u;
@@ -267,20 +297,28 @@ void PipelineCache::Async::ReportStatus() {
 	for (const auto& [key, translation]: translations) {
 		oldest = std::max(oldest, now - translation.since);
 	}
+	const auto frame   = CurrentFrame();
+	size_t     redrawn = 0;
+	for (const auto& [address, history]: targets) {
+		// Drawn in the last six frames, and in at least three of them.
+		redrawn += frame - history.frame < 6 &&
+		                   std::popcount(static_cast<unsigned>(history.seen & 0x3Fu)) >= 3
+		               ? 1u
+		               : 0u;
+	}
 	const auto skipped_total = TotalDrawsSkippedForShaders();
 	const auto skipped       = skipped_total - reported_skipped;
 	reported_skipped         = skipped_total;
 	const bool busy = !in_flight.empty() || !translations.empty() || pipelines_building != 0 ||
 	                  skipped != 0;
 	if (busy) {
-		std::printf("Async shaders: %zu translating, %zu compiling, %zu waiting for a draw "
-		            "(oldest %.1f s), %u pipelines building, %zu jobs queued; %" PRIu64
-		            " draws skipped in the last 2 s\n",
+		std::printf("Async: %zu translating, %zu compiling, %zu waiting (oldest %.0f s), %u pipelines, "
+		            "%zu queued, %" PRIu64 " skipped/2s, %zu/%zu redrawn\n",
 		            translating, compiling, translations.size(),
 		            static_cast<double>(oldest) / 1000.0, pipelines_building, workers.Queued(),
-		            skipped);
+		            skipped, redrawn, targets.size());
 	} else if (was_busy) {
-		std::printf("Async shaders: idle\n");
+		std::printf("Async: idle\n");
 	}
 	was_busy = busy;
 }
@@ -293,6 +331,11 @@ bool PipelineCache::EnsureGraphicsPipeline(const CommandBuffer&   command,
 	}
 	std::array<const ShaderModule*, 4> stages {};
 	const auto key = MakeGraphicsPipelineKey(command, state, stages);
+	if (std::ranges::any_of(stages, [](const ShaderModule* stage) {
+		    return stage != nullptr && WritesMemory(*stage);
+	    })) {
+		return true;
+	}
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (inserted) {

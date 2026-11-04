@@ -9,6 +9,7 @@ namespace Libs::Graphics {
 namespace Detail {
 inline std::atomic<uint32_t> g_draws_skipped_for_shaders {0};
 inline std::atomic<uint64_t> g_total_draws_skipped {0};
+inline std::atomic<uint64_t> g_frame {0};
 } // namespace Detail
 
 // With --async-shader-compile, a draw whose shader or pipeline is still being built is skipped.
@@ -27,6 +28,16 @@ inline void NoteDrawSkippedForShaders() noexcept {
 // Every draw skipped for shaders since the start, for the status line.
 [[nodiscard]] inline uint64_t TotalDrawsSkippedForShaders() noexcept {
 	return Detail::g_total_draws_skipped.load(std::memory_order_relaxed);
+}
+
+// A flip was recorded: the draws after it belong to the next frame. Called in order with the
+// draws, so the draws of one frame share a number.
+inline void NoteFrameFlipped() noexcept {
+	Detail::g_frame.fetch_add(1, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline uint64_t CurrentFrame() noexcept {
+	return Detail::g_frame.load(std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics

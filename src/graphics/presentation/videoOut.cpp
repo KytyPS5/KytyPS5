@@ -953,6 +953,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	// The draws recorded before this flip are the ones its frame is made of.
 	const bool incomplete = Graphics::TakeDrawsSkippedForShaders();
+	Graphics::NoteFrameFlipped();
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;

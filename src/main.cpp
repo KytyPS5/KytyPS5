@@ -5,7 +5,6 @@
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -444,7 +443,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
-	VirtualMemory::Init();
 	InitializeThreads();
 
 	RunOptions options;

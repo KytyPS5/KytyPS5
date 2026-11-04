@@ -1259,8 +1259,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	// initializers execute on the host stack too, so grow it before calling any guest code.
 	size_t expanded_size = 0;
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		sys_dbg_stack_info_t stack {};
-		SysStackUsage(stack);
+		const auto stack = SysStackUsage();
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}

@@ -5,7 +5,6 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
-#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"

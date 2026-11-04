@@ -201,7 +201,7 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	output_info->frame_buffer_size = decoded.buffer_size;
 	if (output_info->this_size == sizeof(Videodec2OutputInfo)) {
 		output_info->frame_format         = VIDEODEC2_FRAME_FORMAT_DEFAULT;
-		output_info->frame_pitch_in_bytes = decoded.pitch;
+		output_info->frame_pitch_in_bytes = decoded.pitch_in_bytes;
 	}
 }
 
@@ -303,14 +303,20 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 }
 
 static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
-	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
-	    config.max_frame_height <= 0) {
+	const bool avc = config.codec_type == VIDEODEC2_CODEC_TYPE_AVC;
+	if (avc && (config.max_frame_width <= 0 || config.max_frame_height <= 0)) {
 		return VIDEODEC2_MIN_MEMORY_SIZE;
 	}
-	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
-	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
-	const auto height = (static_cast<size_t>(config.max_frame_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
+	// Reserve the largest supported dimensions when the maximum is automatic.
+	const auto width =
+	    static_cast<size_t>(config.max_frame_width > 0 ? config.max_frame_width : 8192);
+	const auto height =
+	    static_cast<size_t>(config.max_frame_height > 0 ? config.max_frame_height : 4352);
+	const auto   pitch            = (width + 255u) & ~size_t {255};
+	const size_t height_alignment = avc ? 16u : 8u;
+	const auto   rows             = (height + height_alignment - 1u) & ~(height_alignment - 1u);
+	const auto   sample           = !avc && config.profile == 2u ? 2u : 1u;
+	return pitch * rows * 3 / 2 * sample + 4096;
 }
 
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,

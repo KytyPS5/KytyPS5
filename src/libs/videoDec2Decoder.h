@@ -46,6 +46,7 @@ struct Output {
 	uint32_t codec_type      = 0;
 	uint32_t width           = 0;
 	uint32_t pitch           = 0;
+	uint32_t pitch_in_bytes  = 0;
 	uint32_t height          = 0;
 	void*    buffer          = nullptr;
 	size_t   buffer_size     = 0;

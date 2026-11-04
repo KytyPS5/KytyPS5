@@ -166,6 +166,24 @@ struct PipelineCache::Async {
 	// be skipped while its shaders are built, because the next frame draws it again.
 	bool NoteTargetDraw(uint64_t address);
 
+	// Render thread only: what the render thread built itself since the last report, because a
+	// draw or dispatch could not be skipped. These are the freezes async compile leaves.
+	// Why the draw or dispatch could not be skipped.
+	enum class StallReason : uint8_t { SmallTarget, NotRedrawn, Compute, WritesMemory, Count };
+	struct StallCost {
+		uint32_t shaders   = 0;
+		uint32_t pipelines = 0;
+		uint64_t us        = 0;
+	};
+	struct Stalls {
+		std::array<StallCost, static_cast<size_t>(StallReason::Count)> by_reason {};
+		uint64_t                                                       worst_us = 0;
+	};
+	Stalls      stalls;
+	// Set by the code that decides whether a draw may be skipped, for the builds that follow.
+	StallReason reason = StallReason::NotRedrawn;
+	void   NoteStall(bool pipeline, std::chrono::steady_clock::time_point begin);
+
 	// Render thread only: every two seconds while anything is pending, one line on the console
 	// with what the workers are doing and how many draws were skipped meanwhile.
 	void     ReportStatus();

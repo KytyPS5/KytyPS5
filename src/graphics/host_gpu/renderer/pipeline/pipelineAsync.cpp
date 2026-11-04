@@ -12,6 +12,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <xxhash.h>
@@ -279,6 +280,16 @@ static bool WritesMemory(const ShaderModule& module) {
 	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; });
 }
 
+void PipelineCache::Async::NoteStall(bool pipeline, std::chrono::steady_clock::time_point begin) {
+	const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                          std::chrono::steady_clock::now() - begin)
+	                                          .count());
+	auto& cost = stalls.by_reason[static_cast<size_t>(reason)];
+	(pipeline ? cost.pipelines : cost.shaders)++;
+	cost.us += us;
+	stalls.worst_us = std::max(stalls.worst_us, us);
+}
+
 void PipelineCache::Async::ReportStatus() {
 	const auto now = AskClockMs();
 	if (now - last_report_ms < 2000) {
@@ -321,6 +332,30 @@ void PipelineCache::Async::ReportStatus() {
 		std::printf("Async: idle\n");
 	}
 	was_busy = busy;
+	uint64_t stalled_us = 0;
+	for (const auto& cost: stalls.by_reason) {
+		stalled_us += cost.us;
+	}
+	if (stalled_us >= 20000) {
+		static constexpr const char* names[] = {"small targets", "targets not yet redrawn", "compute",
+		                                        "writes memory"};
+		std::string text;
+		for (size_t i = 0; i < stalls.by_reason.size(); i++) {
+			const auto& cost = stalls.by_reason[i];
+			if (cost.shaders + cost.pipelines == 0) {
+				continue;
+			}
+			char part[160];
+			std::snprintf(part, sizeof(part), "%s%s %.0f ms (%u shaders, %u pipelines)",
+			              text.empty() ? "" : "; ", names[i], static_cast<double>(cost.us) / 1000.0,
+			              cost.shaders, cost.pipelines);
+			text += part;
+		}
+		std::printf("Async STALL: the render thread built %.0f ms in 2 s (worst %.0f ms): %s\n",
+		            static_cast<double>(stalled_us) / 1000.0,
+		            static_cast<double>(stalls.worst_us) / 1000.0, text.c_str());
+	}
+	stalls = {};
 }
 
 bool PipelineCache::EnsureGraphicsPipeline(const CommandBuffer&   command,
@@ -334,6 +369,7 @@ bool PipelineCache::EnsureGraphicsPipeline(const CommandBuffer&   command,
 	if (std::ranges::any_of(stages, [](const ShaderModule* stage) {
 		    return stage != nullptr && WritesMemory(*stage);
 	    })) {
+		m_async->reason = Async::StallReason::WritesMemory;
 		return true;
 	}
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);

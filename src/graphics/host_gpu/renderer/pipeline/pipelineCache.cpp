@@ -52,6 +52,8 @@ constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 // Draws into color targets up to this many pixels wide and high are never skipped while their
 // shaders are built on workers.
 constexpr uint32_t SmallTargetSyncPixels = 1024;
+// A G-buffer pass writes at least two color targets, each at least this many pixels each way.
+constexpr uint32_t GbufferMinPixels = 256;
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -480,6 +482,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return nullptr;
 		}
 	}
+	const auto sync_begin = std::chrono::steady_clock::now();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -537,8 +540,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return bind(*module);
 		}
 	}
-	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data_cursor));
+	auto& built = CompileModule(entry->second, entry->first, options, std::move(translated),
+	                            push_data_cursor);
+	if (m_async != nullptr) {
+		m_async->NoteStall(false, sync_begin);
+	}
+	return bind(built);
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -956,9 +963,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	// That is harmless when the game draws the target again every frame, and lost for good when it
 	// draws it once and samples it for many frames (glyphs, UI layers, baked textures). So only a
 	// draw into a target the game was seen to redraw is skipped; the others wait for their shaders.
-	// Small targets always wait: they are mostly such caches. (usa-ratt/KytyPS5-GT7 decides the
-	// same way, with a longer list of cases.)
+	// That holds for small targets too: a glyph or UI cache is drawn once, a UI layer every frame.
+	// A scene's G-buffer pass is skipped from its first frame, as the game draws it every frame.
+	// (usa-ratt/KytyPS5-GT7 decides the same way, with a longer list of cases.)
 	uint32_t color_targets = 0;
+	uint32_t large_targets = 0;
 	bool     all_small     = true;
 	bool     redrawn       = m_async != nullptr;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -967,6 +976,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			color_targets++;
 			all_small &= rt.attrib2.width < SmallTargetSyncPixels &&
 			             rt.attrib2.height < SmallTargetSyncPixels;
+			large_targets += rt.attrib2.width >= GbufferMinPixels && rt.attrib2.height >= GbufferMinPixels
+			                     ? 1u
+			                     : 0u;
 			if (m_async != nullptr) {
 				// Every target is noted, so that the history is complete when it is needed.
 				redrawn = m_async->NoteTargetDraw(rt.base.addr) && redrawn;
@@ -981,7 +993,14 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                               : depth_target.z_read_base_addr;
 		redrawn = depth_base != 0 && m_async->NoteTargetDraw(depth_base);
 	}
-	state.deferrable = redrawn && (color_targets == 0 || !all_small);
+	const auto& depth_control = context.GetDepthControl();
+	const bool  gbuffer_pass  = color_targets >= 2 && large_targets == color_targets &&
+	                           depth_control.z_enable && depth_control.z_write_enable;
+	state.deferrable          = m_async != nullptr && (redrawn || gbuffer_pass);
+	if (m_async != nullptr) {
+		m_async->reason = all_small && color_targets != 0 ? Async::StallReason::SmallTarget
+		                                                  : Async::StallReason::NotRedrawn;
+	}
 	const auto mode  = m_async != nullptr && state.deferrable ? AsyncMode::On : AsyncMode::Off;
 	// With async compile on, a stage that is not ready skips the draw. The stages behind it
 	// cannot be looked up without its push data layout, but their translation can start.
@@ -1016,6 +1035,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
+	if (m_async != nullptr) {
+		m_async->reason = Async::StallReason::Compute;
+	}
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
@@ -1227,7 +1249,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto begin = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+		if (m_async != nullptr) {
+			m_async->NoteStall(true, begin);
+		}
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
@@ -1254,7 +1280,12 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto begin = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		if (m_async != nullptr) {
+			m_async->reason = Async::StallReason::Compute;
+			m_async->NoteStall(true, begin);
+		}
 	}
 	CheckpointDriverCache();
 

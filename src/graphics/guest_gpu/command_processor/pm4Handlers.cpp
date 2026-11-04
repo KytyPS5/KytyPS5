@@ -2150,8 +2150,9 @@ static constexpr auto MakeShaderIndirectTable() {
 	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
-	// GS-front allocation metadata; the native GS resource registers already carry it.
+	// GS- and HS-front allocation metadata; the fused GS and HS resource registers carry it.
 	table[0x0ca] = IgnoreRegister;
+	table[0x14a] = IgnoreRegister;
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		table[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_REG_ARGS) {

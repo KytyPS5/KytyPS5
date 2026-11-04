@@ -61,6 +61,7 @@ struct UnlockData {
 	std::set<int>                unlocked;
 	std::map<int, uint64_t>      timestamps;
 	std::map<uint64_t, uint64_t> max_stats;
+	std::map<int, uint64_t>      progress; // Reported by the game through _UpdateTrophyProgress.
 };
 
 struct UdsResult {
@@ -84,13 +85,21 @@ struct Progress {
 [[nodiscard]] std::filesystem::path PackagePath(uint32_t service_label);
 [[nodiscard]] std::filesystem::path UdsPackagePath(uint32_t service_label);
 [[nodiscard]] UdsRules              LoadUdsRules(const std::filesystem::path& path);
-[[nodiscard]] UdsResult ApplyUdsEvent(
-    const Package& package, UnlockData& unlocks, std::string_view event_name,
-    const std::map<std::string, UdsInteger>& properties);
-[[nodiscard]] std::filesystem::path UnlocksPath(const std::filesystem::path& root,
-                                                std::string_view title_id, int user_id,
-                                                uint32_t service_label);
-[[nodiscard]] UnlockData            LoadUnlockData(const std::filesystem::path& path);
+[[nodiscard]] UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks,
+                                      std::string_view                         event_name,
+                                      const std::map<std::string, UdsInteger>& properties);
+// Raises the reported progress of a locked progressive trophy; lower values are ignored.
+// Returns whether the progress reached the target; `changed` reports whether `progress`
+// was modified.
+[[nodiscard]] bool UpdateTrophyProgress(const Package& package, int trophy_id, uint64_t value,
+                                        UnlockData& unlocks, bool& changed);
+// Progress of a progressive trophy from its stat or the reported progress, capped at the target.
+[[nodiscard]] std::optional<uint64_t> TrophyProgress(const Trophy&     trophy,
+                                                     const UnlockData& unlocks);
+[[nodiscard]] std::filesystem::path   UnlocksPath(const std::filesystem::path& root,
+                                                  std::string_view title_id, int user_id,
+                                                  uint32_t service_label);
+[[nodiscard]] UnlockData              LoadUnlockData(const std::filesystem::path& path);
 [[nodiscard]] bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks);
 
 } // namespace Common::Trophies

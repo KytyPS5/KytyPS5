@@ -281,6 +281,13 @@ UnlockData LoadUnlockData(const std::filesystem::path& path) {
 			if (id && value) unlocks.max_stats.emplace(*id, *value);
 		}
 	}
+	if (json.contains("progressValues") && json["progressValues"].is_object()) {
+		for (auto it = json["progressValues"].begin(); it != json["progressValues"].end(); ++it) {
+			const auto id    = ReadId(Json(it.key()));
+			const auto value = ReadUnsigned(it.value());
+			if (id >= 0 && value) unlocks.progress.emplace(id, *value);
+		}
+	}
 	return unlocks;
 }
 
@@ -298,9 +305,14 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 	for (const auto& [id, value]: unlocks.max_stats) {
 		stats[std::to_string(id)] = value;
 	}
+	Json progress = Json::object();
+	for (const auto& [id, value]: unlocks.progress) {
+		progress[std::to_string(id)] = value;
+	}
 	const auto text = Json {{"unlockedTrophies", unlocks.unlocked},
 	                        {"unlockedAt", timestamps},
-	                        {"maxStats", stats}}.dump();
+	                        {"maxStats", stats},
+	                        {"progressValues", progress}}.dump();
 	auto temporary = path;
 	temporary += ".tmp";
 	File file;
@@ -462,6 +474,47 @@ UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks, std::string
 		}
 	}
 	return result;
+}
+
+static bool IsProgressTrophy(const Trophy& trophy) {
+	return trophy.grade != 1 && trophy.progressive && trophy.target;
+}
+
+bool UpdateTrophyProgress(const Package& package, int trophy_id, uint64_t value,
+                          UnlockData& unlocks, bool& changed) {
+	changed          = false;
+	const auto found = package.trophies.find(trophy_id);
+	if (found == package.trophies.end() || !IsProgressTrophy(found->second) ||
+	    unlocks.unlocked.contains(trophy_id)) {
+		return false;
+	}
+	auto [current, inserted] = unlocks.progress.try_emplace(trophy_id, value);
+	if (inserted || current->second < value) {
+		current->second = value;
+		changed         = true;
+	}
+	return current->second >= *found->second.target;
+}
+
+std::optional<uint64_t> TrophyProgress(const Trophy& trophy, const UnlockData& unlocks) {
+	if (!IsProgressTrophy(trophy)) {
+		return std::nullopt;
+	}
+	std::optional<uint64_t> progress;
+	if (trophy.uds_stat_id) {
+		if (const auto stat = unlocks.max_stats.find(*trophy.uds_stat_id);
+		    stat != unlocks.max_stats.end()) {
+			progress = stat->second;
+		}
+	}
+	if (const auto reported = unlocks.progress.find(trophy.id);
+	    reported != unlocks.progress.end()) {
+		progress = std::max(progress.value_or(0), reported->second);
+	}
+	if (progress) {
+		progress = std::min(*progress, *trophy.target);
+	}
+	return progress;
 }
 
 uint32_t Progress::Percentage() const {

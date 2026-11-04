@@ -34,6 +34,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -685,6 +686,11 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+  Check(FileSystem::KernelUnlink("/savedata0") == Libs::LibKernel::KERNEL_ERROR_EPERM,
+        "unlink refuses a directory");
+  Check(FileSystem::KernelMkdir(Path, 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST &&
+            FileSystem::KernelMkdir("/savedata0", 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST,
+        "mkdir reports an existing file or directory");
 }
 
 bool HasTestWriteTime(const FileSystem::FileStat &stat) {
@@ -1392,6 +1398,8 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
 
   std::array<char, 512> block{};
   int64_t base = -1;
+  std::set<uint32_t> filenos;
+  size_t entries = 0;
   for (int64_t offset = 0; offset < end; offset += block.size()) {
     Check(FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
                                           &base) == block.size() &&
@@ -1407,9 +1415,15 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
       Check(length >= 9 + name_length && length <= block.size() - pos &&
                 block[pos + 8 + name_length] == '\0',
             "directory entries remain complete within every block");
+      uint32_t fileno = 0;
+      std::memcpy(&fileno, block.data() + pos, sizeof(fileno));
+      filenos.insert(fileno);
+      entries++;
       pos += length;
     }
   }
+  Check(entries > 2 && filenos.size() == entries,
+        "directory entries carry distinct file numbers");
   Check(FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
                                         &base) == 0 &&
             base == end,
@@ -1814,6 +1828,14 @@ void CheckAprPaths(const std::filesystem::path &root) {
               stat.st_size == static_cast<int64_t>(sizes[i]) && size == sizes[i],
           "APR re-resolution preserves each file's ID, host path and cached size");
   }
+  const char *directory_path[] = {"perf-audit"};
+  uint64_t directory_size = 0, cached_size = 1;
+  Check(resolve("/app0/", directory_path, 1, ids, &directory_size, &error_index) == OK &&
+            directory_size == 0x10000 &&
+            reinterpret_cast<Size>(size_symbol->vaddr)(ids[0], &cached_size) == OK &&
+            cached_size == 0 &&
+            reinterpret_cast<Size>(size_symbol->vaddr)(0xfffffffeu, &cached_size) != OK,
+        "APR resolves a directory and reports sizes only for known IDs");
 
   // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
   std::string longest = "/app0/";

@@ -6,7 +6,6 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
-#include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -22,8 +21,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <random>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -153,7 +154,7 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 			dirents.resize(offset + DIR_BLOCK_SIZE);
 		}
 		*reinterpret_cast<uint32_t*>(dirents.data() + offset) =
-		    Common::hash(name.data(), static_cast<uint32_t>(name.size()));
+		    static_cast<uint32_t>(std::hash<std::string_view> {}(name));
 		*reinterpret_cast<uint16_t*>(dirents.data() + offset + 4) = static_cast<uint16_t>(reclen);
 		dirents[offset + 6]                                       = entry.is_file ? 8 : 4;
 		dirents[offset + 7] = static_cast<uint8_t>(name.size());
@@ -1369,15 +1370,13 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
-	bool is_file = Common::File::IsFileExisting(real_file_name);
-
-	if (is_dir) {
-		return KERNEL_ERROR_EPERM;
+	const auto info = Common::File::GetInfo(real_file_name);
+	if (!info) {
+		return KERNEL_ERROR_ENOENT;
 	}
 
-	if (!is_file) {
-		return KERNEL_ERROR_ENOENT;
+	if (!info->is_file) {
+		return KERNEL_ERROR_EPERM;
 	}
 
 	auto* open_file = g_files->GetFile(real_file_name);
@@ -1496,19 +1495,11 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (Common::File::IsDirectoryExisting(real_name)) {
+	if (Common::File::GetInfo(real_name)) {
 		return KERNEL_ERROR_EEXIST;
 	}
 
-	if (!Common::File::CreateDirectory(real_name)) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	if (!Common::File::IsDirectoryExisting(real_name)) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	return OK;
+	return Common::File::CreateDirectory(real_name) ? OK : KERNEL_ERROR_EIO;
 }
 
 int KYTY_SYSV_ABI KernelRmdir(const char* path) {
@@ -1557,11 +1548,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 
 	auto real_name = g_mount_points->ResolvePath(mounted_path);
 
-	if (Common::File::IsFileExisting(real_name) || Common::File::IsDirectoryExisting(real_name)) {
-		return OK;
-	}
-
-	return KERNEL_ERROR_ENOENT;
+	return Common::File::GetInfo(real_name) ? OK : KERNEL_ERROR_ENOENT;
 }
 
 } // namespace Libs::LibKernel::FileSystem

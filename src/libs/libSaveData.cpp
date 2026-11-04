@@ -728,16 +728,17 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
-	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
+	const bool exists = Common::File::IsDirectoryExisting(mount_dir);
+	if (open && !exists) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
+	if (create && exists) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
-	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
+	if ((create || create2) && !exists) {
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}

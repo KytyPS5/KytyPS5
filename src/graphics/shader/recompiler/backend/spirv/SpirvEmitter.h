@@ -13,6 +13,11 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// The user opted in to host min/max on a non-AMD GPU and accepts its differences from the guest,
+	// the sign of a zero result for mixed-sign zeros and the payload when both operands are NaN.
+	// It covers MIN, MAX, MIN3 and MAX3 in F32 and F16 and not MED3, which stays emulated.
+	// native_float_min_max instead means the host is exact for the guest (AMD), so it needs no opt-in.
+	bool host_float_min_max = false;
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
 	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.

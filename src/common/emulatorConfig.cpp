@@ -221,6 +221,10 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
+bool NativeFloatMinMaxEnabled() {
+	return g_config->native_float_min_max_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

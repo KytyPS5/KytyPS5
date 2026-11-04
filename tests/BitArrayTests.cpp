@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <utility>
 
 namespace {
@@ -273,6 +274,24 @@ void TestTrackerSizedRandomizedDifferential() {
       reference[index] = set;
     }
 
+    for (size_t query = 0; query < 8; query++) {
+      const auto begin = static_cast<size_t>(next_random() % 1025);
+      const auto end = begin + static_cast<size_t>(next_random() % (1025 - begin));
+      bool expected_any = false;
+      for (auto index = begin; index < end; index++) {
+        expected_any |= reference[index];
+      }
+      Check(bits.AnyInRange(begin, end) == expected_any,
+            "tracker-sized randomized AnyInRange diverged");
+      if (begin < end) {
+        Check(bits.AnyInRange(begin, end) ==
+                  (bits.FirstRangeFrom(begin).first < end),
+              "bounded query differs from previous tracker query");
+      }
+      Check(bits.AnyInRange(begin, end) == TrackerBits(bits, begin, end).Any(),
+            "bounded query differs from masked conflict check");
+    }
+
     for (size_t index = 0; index < reference.size(); index++) {
       Check(bits.Get(index) == reference[index],
             "tracker-sized randomized bit state diverged");
@@ -297,9 +316,58 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+template <size_t N>
+void TestAnyInRange() {
+  using Array = Common::BitArray<N>;
+  for (size_t pattern = 0; pattern < 12; pattern++) {
+    Array bits;
+    std::array<size_t, N + 1> prefix{};
+    for (size_t index = 0; index < N; index++) {
+      const bool set =
+          pattern == 1 || (pattern == 2 && index % 2 == 0) ||
+          (pattern == 3 && index >= 31 && index < N - 1) ||
+          (pattern == 4 && index == 0) ||
+          (pattern == 5 && index == 63) ||
+          (pattern == 6 && index == 64) ||
+          (pattern == 7 && index == 127) ||
+          (pattern == 8 && index == 128) ||
+          (pattern == 9 && index == N - 1) ||
+          (pattern == 10 && index % 64 == 0) ||
+          (pattern == 11 && index % 64 == 63);
+      if (set) bits.Set(index);
+      prefix[index + 1] = prefix[index] + set;
+    }
+    for (size_t begin = 0; begin <= N; begin++) {
+      for (size_t end = 0; end <= N; end++) {
+        const bool expected = begin < end && prefix[end] != prefix[begin];
+        Check(bits.AnyInRange(begin, end) == expected,
+              "AnyInRange differs from independent prefix-count oracle");
+      }
+    }
+    const auto huge = std::numeric_limits<size_t>::max();
+    Check(!bits.AnyInRange(0, N + 1) && !bits.AnyInRange(N + 1, N + 2) &&
+              !bits.AnyInRange(0, huge) && !bits.AnyInRange(huge, huge),
+          "AnyInRange accepted an invalid range");
+  }
+}
+
+constexpr bool TestConstexprAnyInRange() {
+  Common::BitArray<128> bits;
+  bits.Set(63);
+  bits.Set(64);
+  return bits.AnyInRange(63, 64) && bits.AnyInRange(64, 65) &&
+         bits.AnyInRange(0, 128) && !bits.AnyInRange(0, 63) &&
+         !bits.AnyInRange(65, 128) && !bits.AnyInRange(64, 64) &&
+         !bits.AnyInRange(0, 129);
+}
+static_assert(TestConstexprAnyInRange());
+
 } // namespace
 
 int main() {
+  TestAnyInRange<64>();
+  TestAnyInRange<128>();
+  TestAnyInRange<1024>();
   TestPointAndRangeOperations();
   TestMaskedConstructionAndBitwiseOperations();
   TestRangeDiscoveryAndIteration();

@@ -155,6 +155,22 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
+		if (start >= end || end > N) {
+			return false;
+		}
+		auto       word_index = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		auto word = m_data[word_index] & (~uint64_t {0} << (start % BITS_PER_WORD));
+		while (word == 0) {
+			if (word_index == last_word) {
+				return false;
+			}
+			word = m_data[++word_index];
+		}
+		return word_index * BITS_PER_WORD + std::countr_zero(word) < end;
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

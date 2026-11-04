@@ -93,7 +93,7 @@ public:
 	void ChangeState(uint64_t offset, uint64_t size) {
 		const auto [start, end] = GetPageRange(offset, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.FirstRangeFrom(start).first < end) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}

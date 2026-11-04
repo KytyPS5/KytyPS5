@@ -556,7 +556,8 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 					if (branch_target >= segment_start && branch_target < segment_end) {
 						function.callees.insert(branch_target);
 					}
-				} else if (branch_target >= function_start && branch_target < function_end) {
+				}
+				if (branch_target >= function_start && branch_target < function_end) {
 					function.branch_targets.insert(branch_target);
 				}
 				function.instructions.emplace(address, decoded);

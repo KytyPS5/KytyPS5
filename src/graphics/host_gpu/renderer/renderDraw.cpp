@@ -1224,6 +1224,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	m_context.GetCommandScheduler().NoteRecordedWork();
 
 	if (shader_write_stages) {
 		buffer.EndRendering();

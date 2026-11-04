@@ -39,6 +39,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/submitCadence.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
@@ -218,6 +219,27 @@ struct StreamBufferTestAccess {
   }
 };
 
+struct CommandSchedulerTestAccess {
+  // Replaces the policy so a test picks the flag, interval and clock. It runs on the GPU thread
+  // between streams, so nothing else reads the policy meanwhile.
+  static void SetCadence(CommandScheduler &scheduler, const SubmitCadence &cadence) {
+    scheduler.m_cadence = cadence;
+  }
+
+  static bool CadenceEnabled(const CommandScheduler &scheduler) {
+    return scheduler.m_cadence.Enabled();
+  }
+
+  static uint64_t GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) {
+    return CommandScheduler::GpuLag(current_tick, known_gpu_tick);
+  }
+};
+
+struct CommandBufferTestAccess {
+  // Whether a render pass is open in the command buffer.
+  static bool Rendering(const CommandBuffer &command) { return command.m_rendering; }
+};
+
 struct ImageTestAccess {
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
@@ -259,6 +281,18 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
+
+  static void SetGcTick(TextureCache &cache, uint64_t tick) { cache.m_gc_tick = tick; }
+
+  // A freed image may stay allocated until the GPU is done with it, but it is no longer
+  // registered for lookups.
+  static bool IsImageRegistered(const TextureCache &cache, ImageId id) {
+    return cache.m_slot_images.is_allocated(id) && cache.m_slot_images[id].registered;
+  }
+
+  static bool AccessedLongAgo(const TextureCache &cache, const Image &image) {
+    return cache.AccessedLongAgo(image);
+  }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -1332,6 +1366,222 @@ void ExpectFatal(const char *name, Function function) {
   std::printf("[host]    %-32s ok\n", name);
 }
 #endif
+
+// The submit cadence is off by default and its accessor reads its own field. The CLI test only
+// proves the name is accepted, so this pins the field the accessor returns.
+void CheckSubmitCadenceConfig() {
+  constexpr const char *name = "SubmitCadenceConfig";
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  Config::Load(options);
+  Require(name, "off by default", !Config::GpuSubmitCadenceEnabled(),
+          "the submit cadence must be opt-in");
+  // Only the cadence field differs from the default options above.
+  options.gpu_submit_cadence_enabled = true;
+  Config::Load(options);
+  Require(name, "the flag turns it on", Config::GpuSubmitCadenceEnabled(),
+          "the accessor should return the gpu_submit_cadence_enabled field");
+  options.gpu_submit_cadence_enabled = false;
+  Config::Load(options);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// The submit cadence tests drive this clock, so elapsed time is exact and the tests never sleep.
+SubmitCadence::Clock::time_point g_cadence_now {};
+
+SubmitCadence::Clock::time_point CadenceTestNow() {
+  return g_cadence_now;
+}
+
+// A cadence policy on the fake clock, with the clock reset to its epoch.
+SubmitCadence MakeTestCadence(bool enabled, SubmitCadence::Clock::duration interval) {
+  g_cadence_now = {};
+  return SubmitCadence(enabled, interval, &CadenceTestNow);
+}
+
+// The lag is the submitted but unfinished ticks, and it saturates instead of wrapping.
+void CheckSubmitCadenceLagMath() {
+  constexpr const char *name = "SubmitCadence";
+  using Access = CommandSchedulerTestAccess;
+  // The first tick is 1, so a fresh timeline has nothing submitted.
+  Require(name, "nothing submitted", Access::GpuLag(1, 0) == 0,
+          "a fresh timeline should have no lag");
+  Require(name, "three submitted, one finished", Access::GpuLag(4, 1) == 2,
+          "ticks 2 and 3 are submitted but not finished");
+  Require(name, "all finished", Access::GpuLag(4, 3) == 0,
+          "a GPU that caught up has no lag");
+  // The GPU tick can be read after the current tick was, so it may pass it.
+  Require(name, "stale current tick saturates",
+          Access::GpuLag(3, 5) == 0 && Access::GpuLag(0, 0) == 0,
+          "the lag must not wrap around to a huge value");
+}
+
+// T0a. With the flag on and no interval, one piece of work makes a submit due, and with the flag
+// off the same work never does.
+void CheckSubmitCadenceFlag() {
+  constexpr const char *name = "SubmitCadence";
+  auto on = MakeTestCadence(true, SubmitCadence::Clock::duration::zero());
+  on.NoteWork();
+  Require(name, "flag on makes work due", on.Due() && on.ShouldSubmit(0),
+          "one draw with no interval should make a submit due");
+  // Only the flag differs from the case above.
+  auto off = MakeTestCadence(false, SubmitCadence::Clock::duration::zero());
+  off.NoteWork();
+  Require(name, "flag off never submits", !off.Due() && !off.ShouldSubmit(0),
+          "the cadence must do nothing with the flag off");
+}
+
+// T0b. A submit becomes due exactly when the interval has passed since the first work.
+void CheckSubmitCadenceInterval() {
+  constexpr const char *name = "SubmitCadence";
+  constexpr auto just_short = SubmitCadenceInterval - std::chrono::microseconds {1};
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  g_cadence_now += just_short;
+  cadence.NoteWork();
+  Require(name, "work inside the interval is not due", !cadence.Due(),
+          "a submit came due before the interval passed");
+  // One more microsecond reaches the interval, which is the only difference from the check above.
+  g_cadence_now += std::chrono::microseconds {1};
+  cadence.NoteWork();
+  Require(name, "work at the interval is due", cadence.Due(),
+          "a submit should come due once the interval has passed");
+}
+
+// T0e. Idle time before the first work does not count toward the interval, so a GPU thread that
+// waited for its next submission does not submit after one draw.
+void CheckSubmitCadenceIdleStart() {
+  constexpr const char *name = "SubmitCadence";
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.Reset();
+  g_cadence_now += 5 * SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "idle time before the first work is not counted", !cadence.Due(),
+          "the interval should start at the first draw, not when the buffer began");
+  // A policy that ignored work would also pass the check above, so the interval must still run.
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "the interval runs from the first work", cadence.Due(),
+          "a submit should come due an interval after the first draw");
+}
+
+// T0c. Reset starts a new command buffer with no work and nothing due.
+void CheckSubmitCadenceReset() {
+  constexpr const char *name = "SubmitCadence";
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "the setup makes a submit due", cadence.Due(),
+          "the submit was never due, so the reset check below proves nothing");
+  cadence.Reset();
+  Require(name, "reset clears due", !cadence.Due() && !cadence.ShouldSubmit(0),
+          "a new command buffer should start with nothing due");
+  // The clock is already an interval past the first note, so a kept start time would be due here.
+  cadence.NoteWork();
+  Require(name, "reset restarts the interval", !cadence.Due(),
+          "the interval should restart with the new command buffer");
+  // A reset that left the policy dead would pass the checks above, so it must still come due.
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "the policy works after a reset", cadence.Due(),
+          "a submit should come due an interval after the first draw of the new buffer");
+}
+
+// T0d. A due submit is held back while the GPU has enough submits queued. The hold clears due but
+// keeps the start time, so the next draw re-arms it, and it goes through once the GPU catches up.
+void CheckSubmitCadenceGpuLag() {
+  constexpr const char *name = "SubmitCadence";
+  auto idle = MakeTestCadence(true, SubmitCadenceInterval);
+  Require(name, "lag with nothing due counts nothing",
+          !idle.ShouldSubmit(SubmitCadenceMaxGpuLag) && idle.TakeHeldBack() == 0,
+          "only a due submit can be held back");
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  cadence.NoteWork();
+  Require(name, "a lag below the limit submits", cadence.ShouldSubmit(SubmitCadenceMaxGpuLag - 1),
+          "a GPU just under the lag limit should still take a submit");
+  // Only the lag differs from the check above.
+  Require(name, "a lag at the limit holds the submit back",
+          !cadence.ShouldSubmit(SubmitCadenceMaxGpuLag) && !cadence.Due() &&
+              cadence.TakeHeldBack() == 1 && cadence.TakeHeldBack() == 0,
+          "a GPU with enough work queued should not get another submit, counted once");
+  Require(name, "a hold with no new work counts nothing more",
+          !cadence.ShouldSubmit(SubmitCadenceMaxGpuLag) && cadence.TakeHeldBack() == 0,
+          "packet boundaries without new work should not recheck the lag");
+  // No time passes here, so only a kept start time makes the next draw due again.
+  cadence.NoteWork();
+  Require(name, "the next draw re-arms a held submit", cadence.Due() && cadence.ShouldSubmit(0),
+          "a held submit should come due at the next draw and go through once the GPU catches up");
+}
+
+// Runs packet boundaries until one comes due, and returns how many ran, or limit + 1 if none did.
+uint32_t BoundariesUntilDue(SubmitCadence &cadence, uint32_t limit) {
+  for (uint32_t count = 1; count <= limit; ++count) {
+    if (cadence.DueAtBoundary()) {
+      return count;
+    }
+  }
+  return limit + 1;
+}
+
+// T0f. A draw followed only by state packets still submits once the interval passes, without
+// waiting for another draw, on the first clock read of a boundary stride. Before any work or
+// after a hold, boundaries do not come due on time alone.
+void CheckSubmitCadenceBoundary() {
+  constexpr const char *name = "SubmitCadence";
+  // A whole number of strides, so each run of boundaries ends on a clock read and the stride
+  // count starts over for the exact check below.
+  constexpr uint32_t many = 2 * SubmitCadenceBoundaryStride;
+  auto idle = MakeTestCadence(true, SubmitCadenceInterval);
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "boundaries with no work are not due", BoundariesUntilDue(idle, many) > many,
+          "an empty command buffer should never submit early");
+  // NoteWork records nothing with the flag off, so this rests on the same gate as the case above.
+  auto off = MakeTestCadence(false, SubmitCadenceInterval);
+  off.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "boundaries with the flag off are not due", BoundariesUntilDue(off, many) > many,
+          "the flag-off policy should never ask for a submit");
+  auto cadence = MakeTestCadence(true, SubmitCadenceInterval);
+  cadence.NoteWork();
+  Require(name, "boundaries before the interval are not due",
+          BoundariesUntilDue(cadence, many) > many,
+          "a submit should not come due before the interval passes");
+  // No draw follows, so only a boundary check can make this due, at the next clock read.
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "a boundary stride after the interval is due without a draw",
+          BoundariesUntilDue(cadence, many) == SubmitCadenceBoundaryStride &&
+              cadence.ShouldSubmit(0),
+          "state packets after the last draw should submit at the next stride's clock read");
+  auto held = MakeTestCadence(true, SubmitCadenceInterval);
+  held.NoteWork();
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "a lagging GPU holds the boundary submit",
+          BoundariesUntilDue(held, many) <= SubmitCadenceBoundaryStride &&
+              !held.ShouldSubmit(SubmitCadenceMaxGpuLag),
+          "a boundary submit should be held back like a draw's");
+  g_cadence_now += SubmitCadenceInterval;
+  Require(name, "a held submit waits for the next draw", BoundariesUntilDue(held, many) > many,
+          "boundaries after a hold should not poll a lagging GPU");
+  // The kept start time makes the next draw due at once.
+  held.NoteWork();
+  Require(name, "the next draw re-arms after a boundary hold", held.DueAtBoundary(),
+          "a held submit should come due again at the next draw");
+}
+
+// Covers the pure submit cadence policy, which needs no GPU.
+void CheckSubmitCadenceLogic() {
+  CheckSubmitCadenceFlag();
+  CheckSubmitCadenceInterval();
+  CheckSubmitCadenceIdleStart();
+  CheckSubmitCadenceReset();
+  CheckSubmitCadenceGpuLag();
+  CheckSubmitCadenceBoundary();
+  CheckSubmitCadenceLagMath();
+  std::printf("[host]    %-32s ok\n", "SubmitCadence");
+}
 
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
@@ -2519,7 +2769,7 @@ public:
 
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context, false);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -2649,7 +2899,7 @@ public:
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
 
-    CommandScheduler draining(Renderer(), m_runtime_context);
+    CommandScheduler draining(Renderer(), m_runtime_context, false);
     HW::Context drain_registers{};
     HW::UserConfig drain_user_config{};
     HW::Shader drain_shaders{};
@@ -4217,7 +4467,7 @@ public:
   void CheckUnifiedImageViewCache() {
     EnsureRuntimeContext();
     constexpr const char *name = "UnifiedImageViewCache";
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context, false);
 
     ImageInfo color_info{};
     color_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -5878,11 +6128,18 @@ public:
               ImageHeapTestAccess::ImageOf(heap, filtered.slots[table_size / 4u]) == added,
               "a table grown again after shrinking missed its descriptor");
 
+      // One frame past the last access, so only the release itself can have stamped it. A larger
+      // jump would make the later collector runs treat every image as old.
+      TextureCacheTestAccess::SetGcTick(textures, TextureCacheTestAccess::GcTick(textures) + 1u);
       heap.UnmapMemory(table, table_size);
       Require(name, "unmapped table",
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "unmapping the table kept its images pinned");
+      Require(name, "release stamps the frame",
+              textures.GetImage(resident).gc_tick_accessed_last ==
+                  TextureCacheTestAccess::GcTick(textures),
+              "releasing a heap reference did not record the frame of the use");
       // A smaller table enters once a second draw acquires it and leaves at the suspend point
       // after a frame that did not acquire it. Larger tables stay.
       const IR::ImageHeapRequest small_request{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
@@ -12145,6 +12402,884 @@ public:
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(
         physical, size) == 0, "buffer binding release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Counter changes over one PM4 stream.
+  struct CadenceCounts {
+    uint64_t cadence_submits = 0;
+    uint64_t queue_submits = 0;
+    uint64_t held_back = 0;
+  };
+
+  // What the cadence cases share, so each case stays a short function.
+  struct CadenceFixture {
+    RenderContext &context;
+    CommandScheduler &scheduler;
+    CommandProcessor &processor;
+    vk::Semaphore gate = nullptr;
+    uint64_t empty_shader = 0;
+    std::once_flag gate_released;
+  };
+
+  static constexpr const char *CadenceTestName = "GpuSubmitCadence";
+  static constexpr u32 CadenceDispatches = 8;
+  static constexpr uint64_t CadenceMinimumSplits = 2;
+  static constexpr u32 CadenceNopOnlyPackets = 17;
+  static constexpr u32 CadenceWaveSize = 64;
+  static constexpr u32 CadenceInitialWord = 100;
+  // Out of bounds select 3 turns off the range checks, which would zero loads from a raw buffer.
+  static constexpr u32 CadenceRawBoundsMode = 3;
+  // The kernel mapping arguments: read and write access at a fixed address.
+  static constexpr int CadenceProtectReadWrite = 0x3;
+  static constexpr int CadenceMapFixed = 0x10;
+  static constexpr uint64_t CadenceMemorySize = 0x10000;
+  // Where the second buffer or target of a case lives, so both runs have their own memory.
+  static constexpr uint64_t CadenceSecondRegion = 0x4000;
+  // A raw buffer descriptor is four dwords, which are the user registers the shader receives.
+  static constexpr u32 CadenceDescriptorDwords = 4;
+  static constexpr u32 CadenceFormatShift = 12;
+  static constexpr u32 CadenceBoundsShift = 28;
+  static constexpr u32 CadenceNopPacketDw = 3;
+  static constexpr u32 CadenceDispatchPacketDw = 5;
+  static constexpr u32 CadenceIndirectPacketDw = 4;
+  static constexpr u32 CadenceDispatchMode = 0x41u;
+  static constexpr auto CadenceNever = std::chrono::hours {1};
+  static constexpr auto CadenceImmediately = SubmitCadence::Clock::duration::zero();
+  // A gated GPU that stays blocked this long means the case hung, so the watchdog frees it.
+  static constexpr auto CadenceWatchdog = std::chrono::seconds {2};
+
+  // A NOP packet, which records no draw or dispatch.
+  static void AppendCadenceNop(std::vector<u32> *stream) {
+    stream->insert(stream->end(),
+                   {KYTY_PM4(CadenceNopPacketDw, Pm4::IT_NOP, Pm4::R_ZERO), 0u, 0u});
+  }
+
+  // A stream with a NOP before and after every dispatch, so each dispatch ends at a packet
+  // boundary that has other packets around it.
+  static std::vector<u32> CadenceDispatchStream(u32 dispatches) {
+    std::vector<u32> stream;
+    AppendCadenceNop(&stream);
+    for (u32 i = 0; i < dispatches; ++i) {
+      stream.insert(stream.end(),
+                    {KYTY_PM4(CadenceDispatchPacketDw, Pm4::IT_DISPATCH_DIRECT, 0u), 1u, 1u, 1u,
+                     CadenceDispatchMode});
+      AppendCadenceNop(&stream);
+    }
+    return stream;
+  }
+
+  // One indirect dispatch between two NOPs, reading its group counts from the given address.
+  static std::vector<u32> CadenceIndirectStream(uint64_t args_address) {
+    std::vector<u32> stream;
+    AppendCadenceNop(&stream);
+    stream.insert(stream.end(),
+                  {KYTY_PM4(CadenceIndirectPacketDw, Pm4::IT_DISPATCH_INDIRECT, 0u),
+                   static_cast<u32>(args_address), static_cast<u32>(args_address >> 32u),
+                   CadenceDispatchMode});
+    AppendCadenceNop(&stream);
+    return stream;
+  }
+
+  // Runs a stream on the GPU thread and returns how far the counters moved.
+  static CadenceCounts RunCadenceStream(CommandProcessor &processor,
+                                        std::span<const u32> stream) {
+    namespace Counters = Common::DebugCounters;
+    const auto read = [] {
+      return CadenceCounts{Counters::Get(Counters::Counter::CadenceSubmits),
+                           Counters::Get(Counters::Counter::QueueSubmits),
+                           Counters::Get(Counters::Counter::CadenceHeldBack)};
+    };
+    const auto before = read();
+    Pm4Execution execution;
+    Require(CadenceTestName, "stream completes",
+            processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+            "the PM4 stream did not run to its end");
+    const auto after = read();
+    return {after.cadence_submits - before.cadence_submits,
+            after.queue_submits - before.queue_submits, after.held_back - before.held_back};
+  }
+
+  // Starts from a caught up GPU, so the lag guard has nothing to hold back, then runs a stream
+  // with the given policy.
+  static CadenceCounts RunCadence(CadenceFixture &fixture, bool enabled,
+                                  SubmitCadence::Clock::duration interval,
+                                  std::span<const u32> stream) {
+    fixture.scheduler.Finish();
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler, SubmitCadence(enabled, interval));
+    return RunCadenceStream(fixture.processor, stream);
+  }
+
+  // One dispatch per stream, so the GPU is caught up for each and the counts add up.
+  static CadenceCounts RunCadenceEach(CadenceFixture &fixture, bool enabled,
+                                      SubmitCadence::Clock::duration interval) {
+    CadenceCounts total;
+    const auto single_stream = CadenceDispatchStream(1);
+    for (u32 i = 0; i < CadenceDispatches; ++i) {
+      const auto counts = RunCadence(fixture, enabled, interval, single_stream);
+      total.cadence_submits += counts.cadence_submits;
+      total.queue_submits += counts.queue_submits;
+      total.held_back += counts.held_back;
+    }
+    return total;
+  }
+
+  // The schedulers are built from the flag, and a false argument keeps one off.
+  void CheckGpuSubmitCadenceWiring() {
+    EnsureRuntimeContext();
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    Config::Load(options);
+    {
+      RenderContext off_context(m_runtime_context);
+      Require(CadenceTestName, "flag off leaves the render scheduler off",
+              !CommandSchedulerTestAccess::CadenceEnabled(off_context.GetCommandScheduler()),
+              "the render scheduler enabled the cadence without the flag");
+    }
+    options.gpu_submit_cadence_enabled = true;
+    Config::Load(options);
+    {
+      RenderContext on_context(m_runtime_context);
+      Require(CadenceTestName, "flag on turns the render scheduler on",
+              CommandSchedulerTestAccess::CadenceEnabled(on_context.GetCommandScheduler()),
+              "the render scheduler ignored the flag");
+    }
+    // The flag is still on, so only the argument can keep this scheduler off.
+    CommandScheduler declined(Renderer(), m_runtime_context, false);
+    Require(CadenceTestName, "a false argument keeps it off",
+            !CommandSchedulerTestAccess::CadenceEnabled(declined),
+            "the constructor argument was ignored");
+    CommandScheduler asked(Renderer(), m_runtime_context, true);
+    Require(CadenceTestName, "a true argument turns it on",
+            CommandSchedulerTestAccess::CadenceEnabled(asked),
+            "the baseline scheduler built with the cadence is not enabled");
+    // A draw followed only by packet boundaries must still submit once the interval passes, so
+    // the scheduler has to ask the policy at every boundary, not only when work is noted.
+    CommandSchedulerTestAccess::SetCadence(asked, MakeTestCadence(true, SubmitCadenceInterval));
+    asked.NoteRecordedWork();
+    const auto boundaries_until_submit = [&asked](uint32_t limit) {
+      for (uint32_t count = 1; count <= limit; ++count) {
+        if (asked.TakeCadenceSubmit()) {
+          return count;
+        }
+      }
+      return limit + 1;
+    };
+    constexpr uint32_t many = 2 * SubmitCadenceBoundaryStride;
+    Require(CadenceTestName, "boundaries before the interval do not submit",
+            boundaries_until_submit(many) > many,
+            "the scheduler submitted before the interval passed");
+    g_cadence_now += SubmitCadenceInterval;
+    Require(CadenceTestName, "a later boundary submits without another draw",
+            boundaries_until_submit(many) <= SubmitCadenceBoundaryStride,
+            "the scheduler waited for another draw to notice the interval had passed");
+  }
+
+  // T1. Each dispatch makes a submit due and the next packet boundary submits it.
+  void CheckCadenceDispatches(CadenceFixture &fixture) {
+    const auto on = RunCadenceEach(fixture, true, CadenceImmediately);
+    // Only the flag differs from the case above.
+    const auto off = RunCadenceEach(fixture, false, CadenceImmediately);
+    Require(CadenceTestName, "T1 one cadence submit per dispatch",
+            on.cadence_submits == CadenceDispatches,
+            "cadence submits were " + std::to_string(on.cadence_submits));
+    Require(CadenceTestName, "T1 the cadence reaches the queue",
+            on.queue_submits >= off.queue_submits + CadenceDispatches,
+            "queue submits on=" + std::to_string(on.queue_submits) +
+                " off=" + std::to_string(off.queue_submits));
+    Require(CadenceTestName, "T1 flag off makes none", off.cadence_submits == 0,
+            "cadence submits with the flag off were " + std::to_string(off.cadence_submits));
+    // In one stream the GPU may still run earlier work, so each due submit is either made or
+    // held back, and the first one finds the GPU caught up.
+    const auto streamed = RunCadence(fixture, true, CadenceImmediately,
+                                     CadenceDispatchStream(CadenceDispatches));
+    Require(CadenceTestName, "T1 a long stream submits or holds every dispatch",
+            streamed.cadence_submits >= 1 &&
+                streamed.cadence_submits + streamed.held_back == CadenceDispatches,
+            "submits=" + std::to_string(streamed.cadence_submits) +
+                " held back=" + std::to_string(streamed.held_back));
+  }
+
+  // T2 and T3. Packets without work never submit, and an unelapsed interval never submits.
+  void CheckCadenceIdle(CadenceFixture &fixture) {
+    std::vector<u32> nops;
+    for (u32 i = 0; i < CadenceNopOnlyPackets; ++i) {
+      AppendCadenceNop(&nops);
+    }
+    const auto idle = RunCadence(fixture, true, CadenceImmediately, nops);
+    // Only one dispatch differs from the case above.
+    const auto single = RunCadence(fixture, true, CadenceImmediately, CadenceDispatchStream(1));
+    Require(CadenceTestName, "T2 NOPs alone never submit", idle.cadence_submits == 0,
+            "cadence submits for NOPs were " + std::to_string(idle.cadence_submits));
+    Require(CadenceTestName, "T2 one dispatch submits once", single.cadence_submits == 1,
+            "cadence submits for one dispatch were " + std::to_string(single.cadence_submits));
+    // T1 shows the same dispatches submit with no interval.
+    const auto slow = RunCadenceEach(fixture, true, CadenceNever);
+    Require(CadenceTestName, "T3 an unelapsed interval never submits", slow.cadence_submits == 0,
+            "cadence submits within the interval were " + std::to_string(slow.cadence_submits));
+  }
+
+  // An indirect dispatch notes its work too. Its group counts come from guest memory.
+  void CheckCadenceIndirect(CadenceFixture &fixture) {
+    constexpr uintptr_t base = 0x0000000204e00000ull;
+    constexpr uint64_t size = 0x10000;
+    int64_t physical = -1;
+    Require(CadenceTestName, "indirect allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+            "indirect argument allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(CadenceTestName, "indirect map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, physical, size) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "indirect argument mapping failed");
+    fixture.context.MapMemory(base, size);
+    const std::array<u32, 3> groups{1, 1, 1};
+    Require(CadenceTestName, "indirect arguments",
+            LibKernel::Memory::TryWriteBacking(base, groups.data(), sizeof(groups)),
+            "indirect arguments could not be written");
+    const auto stream = CadenceIndirectStream(base);
+    const auto on = RunCadence(fixture, true, CadenceImmediately, stream);
+    // Only the flag differs from the case above.
+    const auto off = RunCadence(fixture, false, CadenceImmediately, stream);
+    Require(CadenceTestName, "indirect dispatch submits once", on.cadence_submits == 1,
+            "cadence submits were " + std::to_string(on.cadence_submits));
+    Require(CadenceTestName, "indirect dispatch with the flag off makes none",
+            off.cadence_submits == 0,
+            "cadence submits with the flag off were " + std::to_string(off.cadence_submits));
+    fixture.scheduler.Finish();
+    fixture.context.UnmapMemory(base, size);
+    Require(CadenceTestName, "indirect release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "indirect argument release failed");
+  }
+
+  // Signals the gate once, from the case or from the watchdog, whichever comes first.
+  void ReleaseCadenceGate(CadenceFixture &fixture) {
+    std::call_once(fixture.gate_released, [&] {
+      vk::SemaphoreSignalInfo release{};
+      release.sType = vk::StructureType::eSemaphoreSignalInfo;
+      release.semaphore = fixture.gate;
+      release.value = 1;
+      Require(CadenceTestName, "gate release",
+              m_runtime_context.device.signalSemaphore(&release) == vk::Result::eSuccess,
+              "failed to release the gated GPU work");
+    });
+  }
+
+  // Waits on the host for the scheduler's timeline without telling the scheduler about it, so
+  // its known GPU tick stays stale until the scheduler refreshes it.
+  void WaitForTimelineOnHost(CadenceFixture &fixture, uint64_t tick) {
+    auto semaphore = fixture.scheduler.GetMasterSemaphore().Handle();
+    vk::SemaphoreWaitInfo wait{};
+    wait.sType = vk::StructureType::eSemaphoreWaitInfo;
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &semaphore;
+    wait.pValues = &tick;
+    const auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(CadenceWatchdog);
+    Require(CadenceTestName, "host wait",
+            m_runtime_context.device.waitSemaphores(&wait, timeout.count()) ==
+                vk::Result::eSuccess,
+            "the released GPU work did not finish");
+  }
+
+  // T-lag and the refresh. Two submits waiting on the gate leave the GPU behind, so a due submit
+  // is held back. Once the GPU finished, the next due submit must see that without anything else
+  // having refreshed the scheduler.
+  void CheckCadenceLag(CadenceFixture &fixture) {
+    const auto one_dispatch = CadenceDispatchStream(1);
+    std::binary_semaphore finished{0};
+    std::atomic<bool> timed_out{false};
+    std::jthread watchdog([&] {
+      if (!finished.try_acquire_for(CadenceWatchdog)) {
+        timed_out = true;
+        ReleaseCadenceGate(fixture);
+      }
+    });
+    for (uint64_t i = 0; i < SubmitCadenceMaxGpuLag; ++i) {
+      SubmitInfo blocked;
+      blocked.AddWait(fixture.gate, 1);
+      fixture.scheduler.Flush(blocked);
+    }
+    // No Finish here, because the GPU is held on purpose.
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler,
+                                           SubmitCadence(true, CadenceImmediately));
+    const auto lagging = RunCadenceStream(fixture.processor, one_dispatch);
+    const auto last_blocked_tick = fixture.scheduler.CurrentTick() - 1;
+    ReleaseCadenceGate(fixture);
+    WaitForTimelineOnHost(fixture, last_blocked_tick);
+    // Only the GPU having finished differs from the case above. A recorded dispatch would
+    // refresh the scheduler itself before the hook, so the work is noted and the hook asked
+    // directly. Then only the cadence check can bring the known GPU tick up to date.
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler,
+                                           SubmitCadence(true, CadenceImmediately));
+    fixture.scheduler.NoteRecordedWork();
+    const bool submits_after_finish = fixture.scheduler.TakeCadenceSubmit();
+    finished.release();
+    watchdog.join();
+    Require(CadenceTestName, "T-lag no hang", !timed_out, "the gated GPU work never ended");
+    Require(CadenceTestName, "T-lag a due submit is held back while the GPU lags",
+            lagging.cadence_submits == 0 && lagging.held_back >= 1,
+            "submits=" + std::to_string(lagging.cadence_submits) +
+                " held back=" + std::to_string(lagging.held_back));
+    Require(CadenceTestName, "T-lag the scheduler sees the GPU finished",
+            submits_after_finish,
+            "the due submit was held back by a lag that no longer exists");
+  }
+
+  // Guest memory a case reads or writes, mapped for the GPU for as long as the case runs.
+  struct CadenceMemory {
+    uintptr_t base;
+    uint64_t size;
+    int64_t physical = -1;
+  };
+
+  // Allocates, maps and registers guest memory with the GPU caches.
+  void MapCadenceMemory(RenderContext &context, CadenceMemory &memory) {
+    Require(CadenceTestName, "memory allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), memory.size, memory.size, 0,
+                &memory.physical) == 0,
+            "cadence memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(memory.base);
+    Require(CadenceTestName, "memory map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, memory.size, CadenceProtectReadWrite,
+                                                     CadenceMapFixed,
+                                                     memory.physical, memory.size) == 0 &&
+                mapped == reinterpret_cast<void *>(memory.base),
+            "cadence memory mapping failed");
+    // Filled before the GPU tracks the pages, so the first upload carries this word.
+    const std::vector<u32> initial(memory.size / sizeof(u32), CadenceInitialWord);
+    Require(CadenceTestName, "memory fill",
+            LibKernel::Memory::TryWriteBacking(memory.base, initial.data(), memory.size),
+            "cadence memory could not be filled");
+    context.MapMemory(memory.base, memory.size);
+  }
+
+  // Drains the GPU before the memory goes away.
+  void UnmapCadenceMemory(RenderContext &context, const CadenceMemory &memory) {
+    context.GetCommandScheduler().Finish();
+    context.UnmapMemory(memory.base, memory.size);
+    Require(CadenceTestName, "memory release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(memory.physical, memory.size) == 0,
+            "cadence memory release failed");
+  }
+
+  // Makes a compute shader current, with the user registers the cases fill in afterwards.
+  static void SelectCadenceShader(CommandProcessor &processor, uint64_t address,
+                                  uint8_t user_sgpr) {
+    processor.GetShCtx().SetCsShader({.data_addr = address, .num_thread_x = CadenceWaveSize,
+                                      .num_thread_y = 1, .num_thread_z = 1,
+                                      .wave_size = CadenceWaveSize, .user_sgpr = user_sgpr});
+  }
+
+  // out[lane] += 1 on the buffer in the first four user registers. Each lane owns one dword, so
+  // the result only comes out right if every dispatch sees the stores of the earlier ones.
+  static std::vector<u32> CadenceReadModifyWriteShader() {
+    constexpr u32 lshlrev_opcode = 0x1a;
+    constexpr u32 add_opcode = 0x25;
+    constexpr u32 load_dword_opcode = 0x0c;
+    constexpr u32 store_dword_opcode = 0x1c;
+    constexpr u32 waitcnt_opcode = 0x0c;
+    constexpr u32 dword_shift = 2;
+    constexpr u32 lane_vgpr = 0;
+    constexpr u32 address_vgpr = 2;
+    constexpr u32 data_vgpr = 1;
+    constexpr u32 buffer_descriptor = 0;
+    constexpr u32 wait_for_everything = 0;
+    constexpr u32 increment = 1;
+    std::vector<u32> code{
+        EncodeVop2(lshlrev_opcode, address_vgpr, InlineU32(dword_shift), lane_vgpr),
+        EncodeMubuf0(load_dword_opcode), EncodeMubuf1(data_vgpr, buffer_descriptor, address_vgpr),
+        EncodeSopp(waitcnt_opcode, wait_for_everything),
+        EncodeVop2(add_opcode, data_vgpr, InlineU32(increment), data_vgpr),
+        EncodeMubuf0(store_dword_opcode), EncodeMubuf1(data_vgpr, buffer_descriptor, address_vgpr)};
+    AppendEnd(&code);
+    return code;
+  }
+
+  // Points the compute shader at a raw buffer of one dword per lane.
+  static void BindCadenceBuffer(CommandProcessor &processor, uint64_t address) {
+    ShaderBufferResource descriptor{};
+    descriptor.UpdateAddress48(address);
+    descriptor.fields[2] = CadenceWaveSize * sizeof(u32);
+    // DstSel(4, 5, 6, 7) is the identity channel select, x y z w.
+    descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+                           (static_cast<u32>(Prospero::BufferFormat::k32UInt) << CadenceFormatShift) |
+                           (CadenceRawBoundsMode << CadenceBoundsShift);
+    for (u32 i = 0; i < CadenceDescriptorDwords; ++i) {
+      processor.GetShCtx().SetCsUserSgpr(i, descriptor.fields[i]);
+    }
+  }
+
+  // Runs N read-modify-write dispatches in one stream over a buffer of the initial word, drains
+  // the GPU and returns the buffer and what the stream did to the counters.
+  std::pair<std::vector<u32>, CadenceCounts> RunCadenceReadModifyWrite(
+      CadenceFixture &fixture, uint64_t address, bool enabled) {
+    constexpr u32 byte_size = CadenceWaveSize * sizeof(u32);
+    BindCadenceBuffer(fixture.processor, address);
+    const auto counts = RunCadence(fixture, enabled, CadenceImmediately,
+                                   CadenceDispatchStream(CadenceDispatches));
+    fixture.scheduler.Finish();
+    fixture.context.GetBufferCache().ReadMemory(address, byte_size);
+    std::vector<u32> words(CadenceWaveSize);
+    Require(CadenceTestName, "buffer read",
+            LibKernel::Memory::TryReadBacking(address, words.data(), byte_size),
+            "the buffer could not be read back");
+    return {words, counts};
+  }
+
+  // T4. The same dispatches over the same buffer give the same words with the cadence on and off.
+  // One stream is used, rather than one stream per dispatch with a Finish between, because a
+  // Finish would hide a lost barrier or lost work at a split. In one stream the lag guard may
+  // hold some submits back, but the first dispatch always finds the GPU caught up, so at least
+  // one split lies between dependent dispatches. The second dispatch finds at most one submit
+  // still running, which is below the lag limit, so two splits are certain.
+  void CheckCadenceBuffers(CadenceFixture &fixture) {
+    constexpr uintptr_t base = 0x0000000204f00000ull;
+    const auto code = CadenceReadModifyWriteShader();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture.context, memory);
+    SelectCadenceShader(fixture.processor, reinterpret_cast<uint64_t>(code.data()),
+                        CadenceDescriptorDwords);
+    const auto off = RunCadenceReadModifyWrite(fixture, base, false);
+    // Only the flag differs from the case above.
+    const auto on = RunCadenceReadModifyWrite(fixture, base + CadenceSecondRegion, true);
+    const std::vector<u32> expected(CadenceWaveSize, CadenceInitialWord + CadenceDispatches);
+    Require(CadenceTestName, "T4 flag off counts every dispatch", off.first == expected,
+            "the unsplit run did not add once per dispatch");
+    Require(CadenceTestName, "T4 the split run is split",
+            on.second.cadence_submits >= CadenceMinimumSplits &&
+                on.second.cadence_submits + on.second.held_back == CadenceDispatches,
+            "submits=" + std::to_string(on.second.cadence_submits) +
+                " held back=" + std::to_string(on.second.held_back));
+    Require(CadenceTestName, "T4 splitting changes no word", on.first == off.first,
+            "the words differ between the split and the unsplit run");
+    UnmapCadenceMemory(fixture.context, memory);
+    SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
+  }
+
+  // A triangle covering the whole viewport, built from the vertex id in v5. Vertex 0 is (-1, -1),
+  // vertex 1 is (3, -1) and vertex 2 is (-1, 3). That is the usual big triangle, whose visible
+  // part is the whole clip square. The position goes out as x y 0 1.
+  static std::vector<u32> CadenceTriangleVertexShader() {
+    constexpr u32 minus_one_bits = 0xbf800000u;
+    constexpr u32 three_bits = 0x40400000u;
+    constexpr u32 one_bits = 0x3f800000u;
+    constexpr u32 compare_eq_opcode = 0xc2;
+    constexpr u32 cndmask_opcode = 0x01;
+    constexpr u32 vertex_id_vgpr = 5;
+    constexpr u32 low_vgpr = 1;
+    constexpr u32 high_vgpr = 2;
+    constexpr u32 x_vgpr = 3;
+    constexpr u32 y_vgpr = 4;
+    constexpr u32 zero_vgpr = 0;
+    constexpr u32 one_vgpr = 6;
+    constexpr u32 position_target = 0x0c;
+    constexpr u32 all_components = 0xf;
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, low_vgpr, minus_one_bits);
+    AppendVMovLiteral(&code, high_vgpr, three_bits);
+    // Each coordinate takes 3 for its own vertex id and -1 otherwise.
+    code.push_back(EncodeVopc(compare_eq_opcode, InlineU32(1), vertex_id_vgpr));
+    code.push_back(EncodeVop2(cndmask_opcode, x_vgpr, Vgpr(low_vgpr), high_vgpr));
+    code.push_back(EncodeVopc(compare_eq_opcode, InlineU32(2), vertex_id_vgpr));
+    code.push_back(EncodeVop2(cndmask_opcode, y_vgpr, Vgpr(low_vgpr), high_vgpr));
+    AppendVMovU32(&code, zero_vgpr, 0);
+    AppendVMovLiteral(&code, one_vgpr, one_bits);
+    code.push_back(EncodeExp0(position_target, all_components));
+    code.push_back(EncodeExp1(x_vgpr, y_vgpr, zero_vgpr, one_vgpr));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // A pixel shader exporting one constant colour to target 0.
+  static std::vector<u32> CadenceColorPixelShader(const std::array<float, 4> &color) {
+    std::vector<u32> code;
+    for (u32 component = 0; component < color.size(); ++component) {
+      AppendVMovLiteral(&code, component, std::bit_cast<u32>(color[component]));
+    }
+    code.push_back(EncodeExp0(0, 0xf));
+    code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // Registers one float colour target in linear memory, with the viewport covering all of it.
+  static void SetupCadenceColorTarget(HW::Context &registers, uint64_t address, u32 extent) {
+    constexpr u32 viewport_transform = 0x300;
+    constexpr u32 pixel_input_control = 0x8000;
+    constexpr u32 color_export_mode = 4;
+    constexpr u32 first_slot_mask = 0xf;
+    registers.Reset();
+    registers.SetViewportTransformControl(viewport_transform);
+    registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+    registers.SetViewportZMax(0, 1);
+    registers.SetRenderTargetMask(first_slot_mask);
+    registers.SetShaderMask(first_slot_mask);
+    registers.SetPsInControl(pixel_input_control);
+    registers.SetColorBase(0, {.addr = address});
+    registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                               .channel_type = Prospero::ChannelType::kFloat,
+                               .channel_order = Prospero::ChannelOrder::kStandard});
+    registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+    registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    registers.SetTargetOutputMode(0, color_export_mode);
+  }
+
+  // Limits the next draw to the columns [left, right) of the target.
+  static void SetCadenceDrawColumns(HW::Context &registers, u32 left, u32 right, u32 extent) {
+    registers.SetScreenScissor(left, 0, right, extent);
+    registers.SetWindowScissor(left, 0, right, extent, false);
+    registers.SetGenericScissor(left, 0, right, extent, false);
+    registers.SetViewportScissorTL(0, left, 0, false);
+    registers.SetViewportScissorBR(0, right, extent);
+  }
+
+  // Maps a pixel shader and makes it the current one.
+  static void SelectCadencePixelShader(CommandProcessor &processor, const std::vector<u32> &code) {
+    const auto address = reinterpret_cast<uint64_t>(code.data());
+    ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kPs,
+                                .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    processor.GetShCtx().SetPsShaderBase(address);
+  }
+
+  // One draw of the vertex shader's triangle as a PM4 packet, so the cadence hook sees it.
+  static std::vector<u32> CadenceDrawStream() {
+    constexpr u32 draw_packet_dw = 3;
+    constexpr u32 vertex_count = 3;
+    constexpr u32 auto_index_initiator = 2;
+    return {KYTY_PM4(draw_packet_dw, Pm4::IT_DRAW_INDEX_AUTO, 0u), vertex_count,
+            auto_index_initiator};
+  }
+
+  // What one run of the two draws produced.
+  struct CadenceDraws {
+    std::vector<u32> pixels;
+    bool pass_open_after_a;
+    uint64_t cadence_submits;
+  };
+
+  // Draws A into the left columns and B into the right ones of the target at the given address,
+  // as two streams so that a split falls between them. Each run has its own target, so pixels left
+  // by an earlier run can never stand in for work a run lost. Returns the target, whether A's
+  // pass was still open when its stream ended, and the cadence submits the two streams made.
+  CadenceDraws RunCadenceDraws(CadenceFixture &fixture, uint64_t target_address, bool enabled,
+                               const std::array<std::vector<u32>, 2> &pixel_shaders, u32 extent) {
+    auto &registers = fixture.processor.GetCtx();
+    fixture.scheduler.Finish();
+    registers.SetColorBase(0, {.addr = target_address});
+    RenderColorInfo color{};
+    RenderExecutorTestAccess::ResolveRenderColorTarget(
+        fixture.context.GetRenderExecutor(), fixture.scheduler.Current(), color, 0);
+    const auto image = color.image_id;
+    // A known start, so a region nobody drew into is comparable between the runs.
+    TextureCacheTestAccess::ClearImage(fixture.context.GetTextureCache(),
+                                       fixture.scheduler.Current(), image,
+                                       {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+    CommandSchedulerTestAccess::SetCadence(fixture.scheduler,
+                                           SubmitCadence(enabled, CadenceImmediately));
+    CadenceDraws result{};
+    for (u32 draw = 0; draw < pixel_shaders.size(); ++draw) {
+      SetCadenceDrawColumns(registers, draw * extent / 2, (draw + 1) * extent / 2, extent);
+      SelectCadencePixelShader(fixture.processor, pixel_shaders[draw]);
+      result.cadence_submits +=
+          RunCadenceStream(fixture.processor, CadenceDrawStream()).cadence_submits;
+      if (draw == 0) {
+        result.pass_open_after_a = CommandBufferTestAccess::Rendering(fixture.scheduler.Current());
+      }
+    }
+    fixture.scheduler.Finish();
+    result.pixels = ReadCachedTexel(CadenceTestName, fixture.context, image, {},
+                                    {extent, extent, 1});
+    return result;
+  }
+
+  // T5. A render pass split by a cadence submit between two draws keeps the first draw's pixels.
+  // The draws cover disjoint columns in different colours, so a pass that reopened with a clear
+  // would wipe the first colour from the left half. The draws are separate streams, so a hook
+  // that fired only at the end of a stream would pass too. T1 to T3 cover where the hook sits in
+  // the packet loop. The depth case needs no split test. The HTILE meta clear is consumed per
+  // draw in AcquireRenderTargets through TouchMeta, before any pass begins, and BeginRendering
+  // only clears depth when depth_clear is set. A split therefore changes neither whether the
+  // clear is consumed nor when.
+  void CheckCadenceRenderPass(CadenceFixture &fixture) {
+    constexpr u32 extent = 16;
+    constexpr std::array<float, 4> first_color{1.0f, 0.0f, 0.0f, 1.0f};
+    constexpr std::array<float, 4> second_color{0.0f, 0.0f, 1.0f, 1.0f};
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture.context, memory);
+    const auto vertex = CadenceTriangleVertexShader();
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex.data());
+    ShaderMapUserData(vertex_address, {.type = Prospero::ShaderBinaryType::kGs,
+                                       .user_data = &vertex_user_data,
+                                       .code_size_bytes = static_cast<u32>(vertex.size() * sizeof(u32))});
+    auto &registers = fixture.processor.GetCtx();
+    SetupCadenceColorTarget(registers, base, extent);
+    fixture.processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    fixture.processor.GetShCtx().SetEsShaderBase(vertex_address);
+    const std::array pixel_shaders{CadenceColorPixelShader(first_color),
+                                   CadenceColorPixelShader(second_color)};
+    const auto unsplit = RunCadenceDraws(fixture, base, false, pixel_shaders, extent);
+    // Only the flag and the target differ from the case above.
+    const auto split =
+        RunCadenceDraws(fixture, base + CadenceSecondRegion, true, pixel_shaders, extent);
+    CheckCadenceRenderPassResults(unsplit, split, first_color, second_color, extent,
+                                  pixel_shaders.size());
+    UnmapCadenceMemory(fixture.context, memory);
+    SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
+  }
+
+  // The checks of T5, separate to keep each function short.
+  void CheckCadenceRenderPassResults(const CadenceDraws &unsplit, const CadenceDraws &split,
+                                     const std::array<float, 4> &first_color,
+                                     const std::array<float, 4> &second_color, u32 extent,
+                                     size_t draw_count) {
+    const auto region_is = [&](const CadenceDraws &draws, u32 left, u32 right,
+                               const std::array<float, 4> &color) {
+      for (u32 y = 0; y < extent; ++y) {
+        for (u32 x = left; x < right; ++x) {
+          for (u32 c = 0; c < color.size(); ++c) {
+            if (draws.pixels[(y * extent + x) * color.size() + c] !=
+                std::bit_cast<u32>(color[c])) {
+              return false;
+            }
+          }
+        }
+      }
+      return true;
+    };
+    Require(CadenceTestName, "T5 the unsplit pass is open between the draws",
+            unsplit.pass_open_after_a && unsplit.cadence_submits == 0,
+            "the baseline closed its pass or made a cadence submit");
+    Require(CadenceTestName, "T5 the cadence closed the pass between the draws",
+            !split.pass_open_after_a && split.cadence_submits == draw_count,
+            "cadence submits were " + std::to_string(split.cadence_submits));
+    Require(CadenceTestName, "T5 the unsplit draws land",
+            region_is(unsplit, 0, extent / 2, first_color) &&
+                region_is(unsplit, extent / 2, extent, second_color),
+            "the baseline did not draw both regions");
+    Require(CadenceTestName, "T5 a split pass keeps the first draw", split.pixels == unsplit.pixels,
+            "the pixels changed when the pass was split");
+  }
+
+  // A small linear float colour target at the address, which the texture cache can create.
+  static RenderColorInfo CadenceAgeTarget(uint64_t address) {
+    constexpr u32 extent = 16;
+    constexpr u32 bytes_per_texel = 16;
+    RenderColorInfo color{};
+    color.desc.type = BindingType::RenderTarget;
+    color.desc.info.data = {address, extent * extent * bytes_per_texel};
+    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent,
+                                     0, color.desc.info.data.size, extent};
+    color.desc.info.tiling.block.bytes_per_element = bytes_per_texel;
+    color.desc.info.linear_slice_stride = color.desc.info.data.size;
+    color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+    color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+    color.desc.info.extent = {extent, extent, 1};
+    color.desc.info.pitch = extent;
+    color.desc.info.bytes_per_block = bytes_per_texel;
+    color.desc.view_info.format = color.desc.info.pixel_format;
+    color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    return color;
+  }
+
+  // Turns the submit cadence on or off for the case, due at once.
+  static void SetCadenceEnabled(CommandScheduler &scheduler, bool enabled) {
+    CommandSchedulerTestAccess::SetCadence(
+        scheduler, SubmitCadence(enabled, SubmitCadence::Clock::duration::zero()));
+  }
+
+  // T7. A cached image may only be replaced after it went unused for a while. Without the submit
+  // cadence that is more than 32 scheduler ticks, as before. With it, the submits are far more
+  // frequent than frames, so the age counts frames instead, and more than 3 of them. The two
+  // thresholds repeat the constants in textureCache.cpp.
+  void CheckCadenceTextureAge() {
+    constexpr const char *name = "GpuSubmitCadenceTextureAge";
+    constexpr uintptr_t base = 0x0000000205100000ull;
+    constexpr uint64_t tick_threshold = 32;
+    constexpr uint64_t frame_threshold = 3;
+    constexpr u32 many_submits = 40;
+    constexpr u32 frames_before_access = 5;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(context, memory);
+    auto &cache = context.GetTextureCache();
+    // Frames pass first, so a stamp that was never written would not match the frame count. Five
+    // collector ticks cannot evict the images made next. The collector's age is min(16, tick),
+    // which is the tick itself here, so its cutoff is tick zero and no image is older than that.
+    for (u32 i = 0; i < frames_before_access; ++i) {
+      cache.RunGarbageCollector();
+    }
+    auto color = CadenceAgeTarget(base);
+    color.image_id = cache.FindImage(color.desc);
+    // Two more images for the replacement case, which frees what it replaces. They are made
+    // alike at the same time, so the two runs of the case differ only in the flag.
+    auto kept = CadenceAgeTarget(base + CadenceSecondRegion);
+    kept.image_id = cache.FindImage(kept.desc);
+    auto freed = CadenceAgeTarget(base + 2 * CadenceSecondRegion);
+    freed.image_id = cache.FindImage(freed.desc);
+    auto &image = cache.GetImage(color.image_id);
+    Require(name, "access stamps both clocks",
+            image.gc_tick_accessed_last == TextureCacheTestAccess::GcTick(cache) &&
+                image.tick_accessed_last == scheduler.CurrentTick(),
+            "an access did not record the frame and the tick");
+    // Many submits, and no frame at all.
+    for (u32 i = 0; i < many_submits; ++i) {
+      scheduler.Flush();
+    }
+    Require(name, "the submits outran the tick threshold",
+            scheduler.CurrentTick() - image.tick_accessed_last > tick_threshold,
+            "the fixture did not submit enough");
+    CheckCadenceTextureSubmits(name, cache, image, scheduler);
+    CheckCadenceTextureReplacement(name, cache, scheduler, kept, freed);
+    CheckCadenceTextureFrames(name, cache, image, scheduler, frame_threshold);
+    CheckCadenceTextureTicks(name, cache, image, scheduler, tick_threshold);
+    UnmapCadenceMemory(context, memory);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Many submits and no frame leave a recently used image alone with the flag on and make it
+  // stale by ticks with the flag off.
+  void CheckCadenceTextureSubmits(const char *name, TextureCache &cache,
+                                  const Libs::Graphics::Image &image, CommandScheduler &scheduler) {
+    SetCadenceEnabled(scheduler, true);
+    const bool on_after_submits = TextureCacheTestAccess::AccessedLongAgo(cache, image);
+    // Only the flag differs from the case above.
+    SetCadenceEnabled(scheduler, false);
+    const bool off_after_submits = TextureCacheTestAccess::AccessedLongAgo(cache, image);
+    Require(name, "flag on ignores submits", !on_after_submits,
+            "an image used this frame was called stale after many submits");
+    Require(name, "flag off still counts ticks", off_after_submits,
+            "the tick age no longer applies with the flag off");
+  }
+
+  // A request at the same address and block size but another mip layout replaces the cached
+  // image only when it counts as unused. With the flag on it was used this frame, so it stays.
+  // With it off, the many submits made it stale, so it is freed.
+  void CheckCadenceTextureReplacement(const char *name, TextureCache &cache,
+                                      CommandScheduler &scheduler, const RenderColorInfo &kept,
+                                      const RenderColorInfo &freed) {
+    const auto replace = [&](const RenderColorInfo &cached, bool enabled) {
+      auto request = CadenceAgeTarget(cached.desc.info.data.address);
+      // Twice the size at the same address is another backing with another mip layout.
+      request.desc.info.data.size *= 2;
+      request.desc.info.mip_layout[0].size = request.desc.info.data.size;
+      request.desc.info.mip_layout[0].linear_size = request.desc.info.data.size;
+      SetCadenceEnabled(scheduler, enabled);
+      (void)cache.FindImage(request.desc);
+      return TextureCacheTestAccess::IsImageRegistered(cache, cached.image_id);
+    };
+    const bool kept_with_flag = replace(kept, true);
+    // Only the flag differs from the request above.
+    const bool kept_without_flag = replace(freed, false);
+    Require(name, "flag on keeps a recently used image", kept_with_flag,
+            "a replacing request freed an image used this frame");
+    Require(name, "flag off frees by ticks", !kept_without_flag,
+            "a replacing request kept an image that the tick age had made stale");
+  }
+
+  // The frame boundary with the flag on. One and two frames, and the threshold itself, are not
+  // stale, and one frame past it is.
+  void CheckCadenceTextureFrames(const char *name, TextureCache &cache,
+                                 const Libs::Graphics::Image &image, CommandScheduler &scheduler,
+                                 uint64_t frame_threshold) {
+    SetCadenceEnabled(scheduler, true);
+    for (uint64_t frame = 1; frame <= frame_threshold + 1; ++frame) {
+      cache.RunGarbageCollector();
+      Require(name, "flag on frame boundary",
+              TextureCacheTestAccess::AccessedLongAgo(cache, image) == (frame > frame_threshold),
+              "the image was stale after " + std::to_string(frame) + " frames");
+    }
+  }
+
+  // The tick boundary with the flag off. The frames are already beyond their threshold, so only
+  // ticks can say not stale here.
+  void CheckCadenceTextureTicks(const char *name, TextureCache &cache,
+                                Libs::Graphics::Image &image, CommandScheduler &scheduler,
+                                uint64_t tick_threshold) {
+    SetCadenceEnabled(scheduler, false);
+    const auto tick = scheduler.CurrentTick();
+    image.tick_accessed_last = tick - tick_threshold;
+    Require(name, "flag off at the tick threshold",
+            !TextureCacheTestAccess::AccessedLongAgo(cache, image),
+            "the tick threshold changed with the flag off");
+    image.tick_accessed_last = tick - tick_threshold - 1;
+    Require(name, "flag off past the tick threshold",
+            TextureCacheTestAccess::AccessedLongAgo(cache, image),
+            "the tick threshold changed with the flag off");
+  }
+
+  // Creates the timeline semaphore that holds the GPU in the lag case.
+  vk::Semaphore CreateCadenceGate() {
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    Require(CadenceTestName, "gate create",
+            m_runtime_context.device.createSemaphore(&timeline_create, nullptr, &gate) ==
+                vk::Result::eSuccess,
+            "failed to create the GPU gate");
+    return gate;
+  }
+
+  // T1 to T3, the indirect dispatch and the lag cases. Dispatches in a PM4 stream make a submit
+  // due, and the hook submits it at the next packet boundary.
+  void CheckGpuSubmitCadence() {
+    CheckGpuSubmitCadenceWiring();
+    std::vector<u32> code;
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.gpu_submit_cadence_enabled = true;
+    Config::Load(options);
+    Common::DebugCounters::SetEnabled(true);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    const auto gate = CreateCadenceGate();
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      processor.GetShCtx().SetCsShader(
+          {.data_addr = reinterpret_cast<uint64_t>(code.data()), .num_thread_x = CadenceWaveSize,
+           .num_thread_y = 1, .num_thread_z = 1, .wave_size = CadenceWaveSize, .user_sgpr = 0});
+      CadenceFixture fixture{context, context.GetCommandScheduler(), processor, gate};
+      // The first dispatch compiles its pipeline, which is not part of any case below.
+      (void)RunCadence(fixture, false, CadenceImmediately, CadenceDispatchStream(1));
+      fixture.empty_shader = reinterpret_cast<uint64_t>(code.data());
+      CheckCadenceBuffers(fixture);
+      CheckCadenceRenderPass(fixture);
+      CheckCadenceDispatches(fixture);
+      CheckCadenceIdle(fixture);
+      CheckCadenceIndirect(fixture);
+      CheckCadenceLag(fixture);
+      fixture.scheduler.Finish();
+    });
+    m_runtime_context.device.destroySemaphore(gate, nullptr);
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Common::DebugCounters::SetEnabled(false);
+    options.gpu_submit_cadence_enabled = false;
+    Config::Load(options);
+    std::printf("[gpu]     %-32s ok\n", CadenceTestName);
   }
 
   void CheckOrderedDispatch() {
@@ -21161,7 +22296,7 @@ public:
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
 
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context, false);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -49239,7 +50374,7 @@ void CheckRenderTargetFormatContract() {
              std::strcmp(kind, "volume-slice-range") == 0) {
     VulkanHarness vulkan;
     auto &graphics = vulkan.RuntimeContext();
-    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics);
+    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics, false);
     ImageInfo volume_info{};
     volume_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
     volume_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
@@ -49586,7 +50721,7 @@ void CheckSampledDepthResource() {
 void CheckImageTransitionState(RenderContext &renderer) {
   constexpr const char *name = "ImageTransitionState";
   auto &context = renderer.GetGraphics();
-  CommandScheduler scheduler(renderer, context);
+  CommandScheduler scheduler(renderer, context, false);
   const auto MakeInfo = [](vk::Format format, uint32_t levels,
                            uint32_t layers) {
     ImageInfo info{};
@@ -53737,6 +54872,118 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// What the occlusion cadence case saw around one stream.
+struct CadenceOcclusionRun {
+  bool pending = false;
+  bool published_by_flush = false;
+  uint64_t cadence_submits = 0;
+  uint64_t gpu_waits = 0;
+};
+
+constexpr uint32_t CadenceDumpPacketDw = 4;
+constexpr uint32_t CadenceNopDw = 3;
+constexpr uint32_t CadenceDispatchPacketDw = 5;
+// The dump, a NOP, the dispatch and a NOP.
+constexpr size_t CadenceOcclusionStreamDw =
+    CadenceDumpPacketDw + CadenceNopDw + CadenceDispatchPacketDw + CadenceNopDw;
+
+// A dump to the results, then a dispatch between NOPs. Only the dispatch makes a submit due.
+std::array<uint32_t, CadenceOcclusionStreamDw> CadenceOcclusionStream(uint64_t results_address) {
+  constexpr uint32_t dump_packet_dw = CadenceDumpPacketDw;
+  constexpr uint32_t dump_event_word = 0x139u;
+  constexpr uint32_t nop_packet_dw = CadenceNopDw;
+  constexpr uint32_t dispatch_packet_dw = CadenceDispatchPacketDw;
+  constexpr uint32_t dispatch_mode = 0x41u;
+  const auto nop = KYTY_PM4(nop_packet_dw, Pm4::IT_NOP, Pm4::R_ZERO);
+  return {KYTY_PM4(dump_packet_dw, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO), dump_event_word,
+          static_cast<uint32_t>(results_address), static_cast<uint32_t>(results_address >> 32u),
+          nop, 0, 0,
+          KYTY_PM4(dispatch_packet_dw, Pm4::IT_DISPATCH_DIRECT, 0u), 1, 1, 1, dispatch_mode,
+          nop, 0, 0};
+}
+
+// Runs the stream with a cadence that is due at once, then publishes the dumps by hand to show
+// that they were still there to publish.
+CadenceOcclusionRun RunCadenceOcclusionStream(
+    RenderContext &renderer, const std::vector<uint32_t> &shader,
+    std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> &results, uint64_t untouched) {
+  constexpr uint32_t wave_size = 64;
+  namespace Counters = Common::DebugCounters;
+  CadenceOcclusionRun run;
+  auto &scheduler = renderer.GetCommandScheduler();
+  const auto stream = CadenceOcclusionStream(reinterpret_cast<uint64_t>(results.data()));
+  renderer.GetGpu().SendCommandSync([&] {
+    CommandProcessor processor(renderer, 0);
+    processor.BufferInit();
+    processor.GetShCtx().SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader.data()),
+                                      .num_thread_x = wave_size, .num_thread_y = 1,
+                                      .num_thread_z = 1, .wave_size = wave_size, .user_sgpr = 0});
+    scheduler.Finish();
+    CommandSchedulerTestAccess::SetCadence(
+        scheduler, SubmitCadence(true, SubmitCadence::Clock::duration::zero()));
+    const auto submits_before = Counters::Get(Counters::Counter::CadenceSubmits);
+    const auto waits_before = Counters::Get(Counters::Counter::GpuWaits);
+    Pm4Execution execution;
+    Require("GpuSubmitCadenceOcclusion", "stream completes",
+            processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+            "the PM4 stream did not run to its end");
+    run.cadence_submits = Counters::Get(Counters::Counter::CadenceSubmits) - submits_before;
+    run.gpu_waits = Counters::Get(Counters::Counter::GpuWaits) - waits_before;
+    run.pending = std::ranges::all_of(results, [&](uint64_t word) { return word == untouched; });
+    processor.BufferFlush();
+    run.published_by_flush = (results[0] & OCCLUSION_QUERY_READY) != 0;
+    scheduler.Finish();
+  });
+  return run;
+}
+
+// T6. Runs a dump, then a dispatch, then lets the cadence submit. The dump is still pending
+// afterwards, because only BufferFlush and the fences publish occlusion counters.
+void CheckGpuSubmitCadenceOcclusion() {
+  constexpr const char *name = "GpuSubmitCadenceOcclusion";
+  constexpr uint32_t window_extent = 64;
+  constexpr uint32_t end_program = 0xbf810000u;
+  constexpr uint64_t untouched = 0x1122334455667788ull;
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .occlusion_queries_enabled = true,
+                .gpu_submit_cadence_enabled = true});
+  Common::DebugCounters::SetEnabled(true);
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = window_extent;
+  window.graphic_ctx.screen_height = window_extent;
+  window.window = SDL_CreateWindow(name, window_extent, window_extent,
+                                   SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(nullptr);
+  Require(name, "occlusion queries", renderer.GetOcclusionQueries().Enabled(),
+          "the device has no host occlusion queries");
+  Require(name, "cadence built from the flag",
+          CommandSchedulerTestAccess::CadenceEnabled(renderer.GetCommandScheduler()),
+          "the render scheduler ignored the flag");
+  const std::vector<uint32_t> shader{end_program};
+  ShaderMapUserData(reinterpret_cast<uint64_t>(shader.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<uint32_t>(shader.size() * sizeof(uint32_t))});
+  alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results;
+  results.fill(untouched);
+  const auto run = RunCadenceOcclusionStream(renderer, shader, results, untouched);
+  Require(name, "the cadence submitted", run.cadence_submits == 1,
+          "cadence submits were " + std::to_string(run.cadence_submits));
+  Require(name, "the dump is still pending", run.pending,
+          "a cadence submit published the occlusion counters");
+  Require(name, "the cadence waited on nothing", run.gpu_waits == 0,
+          "the cadence blocked on the GPU " + std::to_string(run.gpu_waits) + " times");
+  Require(name, "a buffer flush publishes the dump", run.published_by_flush,
+          "the dump could not be published, so the pending check proves nothing");
+  renderer.ShutdownGpu();
+  Common::DebugCounters::SetEnabled(false);
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
 
@@ -54009,6 +55256,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckSubmitCadenceConfig();
+  CheckSubmitCadenceLogic();
+  if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-only") == 0) {
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));
@@ -54654,6 +55906,12 @@ int main(int argc, char **argv) {
     CheckReferenceClockScale();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuSubmitCadence();
+    vulkan.CheckCadenceTextureAge();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
@@ -54783,6 +56041,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckScalarLeafCall();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-occlusion-only") == 0) {
+    CheckGpuSubmitCadenceOcclusion();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
@@ -55347,6 +56609,8 @@ int main(int argc, char **argv) {
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
+  vulkan.CheckGpuSubmitCadence();
+  vulkan.CheckCadenceTextureAge();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();
   vulkan.CheckNullTextureDescriptors();

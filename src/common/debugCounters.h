@@ -18,6 +18,8 @@ enum class Counter {
 	IndirectDraws,
 	Dispatches,
 	QueueSubmits,
+	CadenceSubmits,  // Submits the submit cadence made at a PM4 packet boundary.
+	CadenceHeldBack, // Due cadence submits skipped because the GPU was already behind.
 	GpuWaits, // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
 	GpuFaults, // Guest writes to GPU-tracked memory.

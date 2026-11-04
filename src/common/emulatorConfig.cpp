@@ -221,6 +221,10 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
+bool GpuSubmitCadenceEnabled() {
+	return g_config->gpu_submit_cadence_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

@@ -128,6 +128,7 @@ private:
 	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
+	friend struct CommandBufferTestAccess;
 };
 
 namespace Pssr {

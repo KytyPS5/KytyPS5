@@ -674,6 +674,8 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_gpu_submit_cadence_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --gpu-submit-cadence)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -709,6 +711,14 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_submit_cadence
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
+	add_test(NAME shader_recompiler_submit_cadence_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-gpu-only)
+	set_tests_properties(shader_recompiler_submit_cadence_gpu PROPERTIES TIMEOUT 60)
+	add_test(NAME shader_recompiler_submit_cadence_occlusion
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-occlusion-only)
+	set_tests_properties(shader_recompiler_submit_cadence_occlusion PROPERTIES TIMEOUT 60)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max

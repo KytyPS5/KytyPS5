@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -10,7 +11,8 @@
 namespace Libs::Graphics {
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_render_executor(*this),
+      m_command_scheduler(*this, graphics, Config::GpuSubmitCadenceEnabled()),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),

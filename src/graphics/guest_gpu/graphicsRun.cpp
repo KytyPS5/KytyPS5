@@ -212,6 +212,15 @@ void CommandProcessor::BufferFlush() {
 	m_renderer.GetOcclusionQueries().Publish();
 }
 
+void CommandProcessor::FlushForCadence() {
+	if (!GetScheduler().TakeCadenceSubmit()) {
+		return;
+	}
+	// Not BufferFlush, which also publishes the occlusion queries and so waits on the GPU.
+	GetScheduler().Flush();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::CadenceSubmits);
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -592,6 +601,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			execution.m_next_buffer = {};
 		}
+		// Only here, after a whole packet, and never inside a handler. Handlers hold a
+		// CommandBuffer reference and some capture CurrentTick() as covering what they just
+		// recorded. The cursor is not used, because the call push_back above can dangle it.
+		FlushForCadence();
 	}
 }
 

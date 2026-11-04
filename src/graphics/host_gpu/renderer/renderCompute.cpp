@@ -451,6 +451,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	m_context.GetCommandScheduler().NoteRecordedWork();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -515,6 +516,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	m_context.GetCommandScheduler().NoteRecordedWork();
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

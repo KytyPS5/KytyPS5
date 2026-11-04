@@ -118,6 +118,9 @@ public:
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	/// Submits the current command buffer when the submit cadence says the GPU should start on
+	/// the work recorded so far.
+	void FlushForCadence();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }

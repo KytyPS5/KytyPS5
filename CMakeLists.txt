@@ -409,6 +409,14 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(readback_guard_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackGuardTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/readbackGuard.cpp"
+)
+target_link_libraries(readback_guard_tests common)
+target_include_directories(readback_guard_tests PRIVATE ${inc_headers})
+
 add_executable(archive_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
 )
@@ -682,6 +690,10 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME readback_guard COMMAND $<TARGET_FILE:readback_guard_tests>)
+	# Shorter than the 60 second wait slice in the tests, so a missing wake-up fails instead of
+	# passing slowly when the slice runs out.
+	set_tests_properties(readback_guard PROPERTIES TIMEOUT 30)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
@@ -797,6 +809,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		readback_guard_tests
 		build_flags_tests
 		archive_file_tests
 		trophy_system_tests

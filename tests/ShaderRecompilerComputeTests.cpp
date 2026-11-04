@@ -3145,8 +3145,8 @@ public:
     bool forward;
   };
 
-  // Each case owns one slot of the mapping. The copy spans several pages and overlaps itself by a
-  // few words.
+  // Each case owns one slot of the mapping. The copy spans several pages, and its destination is
+  // shifted from its source by a few words.
   static constexpr uint64_t kOverlapSlotSize = 0x8000;
   static constexpr uint64_t kOverlapCopySize = 0x4000;
   static constexpr uint64_t kOverlapShift = 0x10;
@@ -3155,6 +3155,10 @@ public:
   // Each case's words start this far apart, so every word in every case is unique and a copy that
   // reads from the wrong place cannot produce the expected bytes.
   static constexpr uint32_t kOverlapCaseStride = 0x10000u;
+  // The self-copy check uses one slot for its image and one for its baseline.
+  static constexpr uint64_t kSelfCopySlots = 2;
+  // The baseline's image and its source sit side by side in one slot.
+  static_assert(2 * kOverlapCopySize <= kOverlapSlotSize);
 
   // Fills the source, runs the copy on the case's path, and checks the destination holds what
   // memmove would leave there.
@@ -3195,12 +3199,65 @@ public:
             "the overlapping copy did not give memmove's result");
   }
 
+  // Inserts a GPU-written image over a range, with no pending CPU or buffer changes.
+  static ImageId InsertGpuWrittenImage(TextureCache &texture_cache, uint64_t address) {
+    ImageInfo info{};
+    info.data = {address, kOverlapCopySize};
+    info.extent = {1, 1, 1};
+    info.resources = {1, 1};
+    info.samples = 1;
+    const auto id = TextureCacheTestAccess::InsertImage(texture_cache, info);
+    texture_cache.GetImage(id).RefreshComplete();
+    texture_cache.GetImage(id).MarkGpuModified();
+    return id;
+  }
+
+  // A copy onto itself changes nothing, so an image based there must keep what the GPU wrote. The
+  // baseline copies onto an identical image's base from a GPU-written source, because a source
+  // with no image would otherwise take the CPU path. That copy does refresh its image, which
+  // shows the flags checked below really do change for a copy that writes.
+  void CheckSelfCopyKeepsGpuImage(RenderContext &resources, auto &gpu, uint64_t tested_slot,
+                                  uint64_t baseline_slot) {
+    constexpr const char *name = "OverlappingDmaCopies";
+    constexpr uint64_t gds_offset = 0;
+    auto &buffer_cache = resources.GetBufferCache();
+    auto &texture_cache = resources.GetTextureCache();
+    const auto tested = InsertGpuWrittenImage(texture_cache, tested_slot);
+    const auto baseline = InsertGpuWrittenImage(texture_cache, baseline_slot);
+    const uint64_t baseline_source = baseline_slot + kOverlapCopySize;
+    gpu.SendCommandSync([&] {
+      // A round trip through GDS leaves the source GPU-written, so the copy takes the GPU path.
+      buffer_cache.CopyBuffer(gds_offset, baseline_source, kOverlapCopySize, true, false);
+      buffer_cache.CopyBuffer(baseline_source, gds_offset, kOverlapCopySize, false, true);
+      Require(name, "self-copy baseline path",
+              buffer_cache.IsRegionGpuModified(baseline_source, kOverlapCopySize),
+              "the baseline copy would not take the GPU path");
+      buffer_cache.CopyBuffer(baseline_slot, baseline_source, kOverlapCopySize, false, false);
+      buffer_cache.CopyBuffer(tested_slot, tested_slot, kOverlapCopySize, false, false);
+      Require(name, "self-copy marks nothing",
+              !buffer_cache.IsRegionGpuModified(tested_slot, kOverlapCopySize),
+              "a copy onto itself still went down the GPU path");
+    });
+    const auto &baseline_image = texture_cache.GetImage(baseline);
+    Require(name, "self-copy baseline refresh",
+            !baseline_image.IsGpuModified() && baseline_image.IsBufferModified(),
+            "a GPU copy onto an image's base did not refresh the image");
+    const auto &tested_image = texture_cache.GetImage(tested);
+    Require(name, "self-copy keeps the image",
+            tested_image.IsGpuModified() && !tested_image.IsBufferModified(),
+            "a copy onto itself would replace what the GPU wrote to the image");
+    // The test images never held real GPU contents, so there is nothing to resolve.
+    texture_cache.GetImage(tested).ClearGpuModified();
+    TextureCacheTestAccess::DeleteImage(texture_cache, tested);
+    TextureCacheTestAccess::DeleteImage(texture_cache, baseline);
+  }
+
   // A DMA copy whose source and destination overlap must give memmove's result, as if the bytes
   // went through a temporary buffer, on the CPU path and on the GPU path, in both directions.
   void CheckOverlappingDmaCopies(RenderContext &resources, auto &gpu) {
     constexpr const char *name = "OverlappingDmaCopies";
     constexpr uintptr_t base = 0x0000000200d00000ull;
-    constexpr uint64_t map_size = 0x20000;
+    constexpr uint64_t map_size = 0x40000;
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -3218,11 +3275,14 @@ public:
                                          {"CPU backward", false, false},
                                          {"GPU forward", true, true},
                                          {"GPU backward", true, false}};
-    static_assert(std::size(cases) * kOverlapSlotSize <= map_size, "the cases must fit the map");
+    static_assert((std::size(cases) + kSelfCopySlots) * kOverlapSlotSize <= map_size,
+                  "the cases must fit the map");
     for (uint32_t index = 0; index < std::size(cases); ++index) {
       RunOverlappingCopyCase(resources, gpu, cases[index], base + index * kOverlapSlotSize,
                              kOverlapPatternBase + index * kOverlapCaseStride);
     }
+    const uint64_t self_copy_slot = base + std::size(cases) * kOverlapSlotSize;
+    CheckSelfCopyKeepsGpuImage(resources, gpu, self_copy_slot, self_copy_slot + kOverlapSlotSize);
     resources.UnmapMemory(base, map_size);
     Require(name, "unmap",
             Libs::LibKernel::Memory::KernelMunmap(base, map_size) == 0 &&

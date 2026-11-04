@@ -579,6 +579,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	// A copy onto itself changes no bytes. Invalidating here would refresh an image based at this
+	// address from a buffer that never received what the GPU wrote to the image.
+	if (src_memory && dst_memory && src_vaddr == dst_vaddr) {
+		return;
+	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		// A guest copy may overlap itself, where memcpy is undefined. memmove copies as if through a
@@ -600,10 +605,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	// Cached buffers never overlap, so overlapping guest ranges always share one buffer.
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
-		// A copy onto itself changes no bytes, and ObtainBuffer has already marked the range.
-		if (src_offset != dst_offset) {
-			CopyOverlapping(command, *dst, src_offset, dst_offset, size);
-		}
+		CopyOverlapping(command, *dst, src_offset, dst_offset, size);
 		return;
 	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);

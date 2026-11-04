@@ -239,6 +239,9 @@ struct ImageHeapTestAccess {
   static size_t ElementCount(const ImageHeap &heap) { return heap.m_elements.size(); }
   static size_t MemoryCount(const ImageHeap &heap) { return heap.m_memories.size(); }
   static const auto &Views(const ImageHeap &heap) { return heap.m_memories.at(0)->views; }
+  static const auto &ViewsOf(const ImageHeap &heap, size_t memory) {
+    return heap.m_memories.at(memory)->views;
+  }
   static const auto &Element(const ImageHeap &heap, uint32_t entry) {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
@@ -5924,6 +5927,251 @@ public:
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "image heap unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckImageHeapSharedElements() {
+    constexpr const char *name = "ImageHeapSharedElements";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t copy = base + 0x180000;
+    constexpr uint64_t table_size = 0x10000;
+    constexpr uint32_t used = 8;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto texture = [](uint32_t index) {
+      return base + 0x10000u + index * 0x1000u;
+    };
+    const auto descriptor = [&](uint32_t index) {
+      const uint64_t address = texture(index);
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(address >> 8u);
+      words[1] = static_cast<uint32_t>(address >> 40u) |
+                 (static_cast<uint32_t>(Format::k8_8_8_8UNorm) << 20u);
+      words[2] = 3u | (3u << 14u);
+      words[3] = DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    for (uint32_t probe = 0; probe < used; ++probe) {
+      const auto words = descriptor(probe);
+      std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(),
+                  sizeof(words));
+      std::memcpy(reinterpret_cast<void *>(copy + probe * 32u), words.data(),
+                  sizeof(words));
+    }
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty,
+                                   context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) ==
+                  vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      auto unfiltered = sampled;
+      unfiltered.unfiltered_access_only = true;
+      IR::ImageHeapView view{};
+      const auto acquire = [&](uint64_t address, uint64_t first,
+                               const IR::ImageResource &root) {
+        return heap.Acquire(
+            {address, table_size, 32u, first, table_size / 32u, &root}, view);
+      };
+      const auto draw = [&] {
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute,
+                    layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+      };
+      const auto write = [&](uint64_t address, uint64_t probe,
+                             const std::array<uint32_t, 8> &words) {
+        Libs::LibKernel::Memory::WriteBacking(address + probe * 32u,
+                                              words.data(), sizeof(words));
+        Require(name, "table write",
+                context.InvalidateMemory(address + probe * 32u, sizeof(words)),
+                "the table was not mapped");
+      };
+      const auto element = [](uint32_t entry) {
+        return entry & ((1u << IR::ImageHeapKindShift) - 1u);
+      };
+      const auto image = [&](uint32_t entry) {
+        return ImageHeapTestAccess::ImageOf(heap, entry);
+      };
+
+      Require(name, "first view", acquire(table, 0u, sampled),
+              "a 64-KiB table was not kept resident");
+      const auto interned = ImageHeapTestAccess::ElementCount(heap);
+      Require(name, "shifted view",
+              acquire(table, 32u, sampled) &&
+                  ImageHeapTestAccess::ElementCount(heap) == interned,
+              "a second view of one table with the same profile interned its "
+              "descriptors again");
+      Require(
+          name, "table copy",
+          acquire(copy, 0u, sampled) &&
+              ImageHeapTestAccess::ElementCount(heap) == interned,
+          "a copy of a table at another base interned its descriptors again");
+      Require(name, "other profile",
+              acquire(table, 0u, unfiltered) &&
+                  ImageHeapTestAccess::ElementCount(heap) == interned + used,
+              "another profile shared the elements of a different binding");
+      draw();
+      const auto &views = ImageHeapTestAccess::ViewsOf(heap, 0u);
+      const auto &copies = ImageHeapTestAccess::ViewsOf(heap, 1u);
+      const auto &whole = *views[0];
+      const auto &shifted = *views[1];
+      const auto &other = *views[2];
+      const auto &copied = *copies[0];
+      bool shared = true;
+      for (uint32_t probe = 1; probe < used; ++probe) {
+        const auto slot = probe * 8u;
+        shared = shared && whole.slots[slot] != 0u &&
+                 element(shifted.slots[slot]) == element(whole.slots[slot]) &&
+                 element(copied.slots[slot]) == element(whole.slots[slot]) &&
+                 element(other.slots[slot]) != element(whole.slots[slot]);
+      }
+      Require(name, "shared slots", shared,
+              "views of one profile selected different elements for one "
+              "descriptor");
+      const auto first_image = image(whole.slots[8]);
+      Require(name, "pinned once per profile",
+              first_image && image(other.slots[8]) == first_image &&
+                  textures.GetImage(first_image).heap_refs.load() == 2u,
+              "a shared element pinned its image once per view");
+
+      write(table, 3u, descriptor(9u));
+      Require(name, "changed whole view", acquire(table, 0u, sampled),
+              "the view was declined");
+      draw();
+      const auto third = image(copied.slots[24]);
+      Require(name, "still selected",
+              third && image(shifted.slots[24]) == third &&
+                  image(whole.slots[24]) != third &&
+                  static_cast<bool>(image(whole.slots[24])),
+              "an element another view still selects was released");
+      const auto before = ImageHeapTestAccess::ElementCount(heap);
+      Require(name, "changed shifted view",
+              acquire(table, 32u, sampled) &&
+                  element(shifted.slots[24]) == element(whole.slots[24]) &&
+                  ImageHeapTestAccess::ElementCount(heap) == before,
+              "a view taking a change another view took made a second element");
+      draw();
+      write(copy, 3u, descriptor(9u));
+      Require(name, "changed copy",
+              acquire(copy, 0u, sampled) &&
+                  element(copied.slots[24]) == element(whole.slots[24]),
+              "a copy taking the change did not share the element");
+      draw();
+      Require(
+          name, "released last selection",
+          textures.GetImage(third).heap_refs.load() == 1u,
+          "an element no view of its profile selects kept its image pinned");
+      write(table, 5u, descriptor(10u));
+      Require(name, "reuse", acquire(table, 0u, sampled),
+              "the view was declined");
+      draw();
+      Require(name, "reused index",
+              ImageHeapTestAccess::ElementCount(heap) == before,
+              "the index of the released element was not reused");
+
+      const auto fourth = element(whole.slots[32]);
+      textures.UnmapMemory(texture(4u), 0x1000u);
+      Require(name, "renewed whole view", acquire(table, 0u, sampled),
+              "the view was declined");
+      draw();
+      const auto renewed = image(whole.slots[32]);
+      Require(name, "renewed element",
+              renewed && element(whole.slots[32]) != fourth &&
+                  element(shifted.slots[32]) == fourth,
+              "a changed image did not get a new element, or an idle view took "
+              "it early");
+      Require(name, "renewed idle view", acquire(table, 32u, sampled),
+              "the view was declined");
+      draw();
+      Require(name, "renewed shared",
+              element(shifted.slots[32]) == element(whole.slots[32]) &&
+                  image(shifted.slots[32]) == renewed,
+              "an idle view kept the stale element after its pool renewed it");
+
+      heap.UnmapMemory(copy, table_size);
+      Require(name, "dropped copy",
+              ImageHeapTestAccess::MemoryCount(heap) == 1u &&
+                  image(whole.slots[8]) == first_image &&
+                  textures.GetImage(first_image).heap_refs.load() == 2u,
+              "dropping a copy released elements other views still select");
+      Require(name, "unresolved copy", acquire(copy, 0u, sampled),
+              "the copy was declined");
+      heap.UnmapMemory(copy, table_size);
+      scheduler.Finish();
+      heap.BeginDraw();
+      Require(name, "other profile changes", acquire(table, 0u, unfiltered),
+              "the view was declined");
+      draw();
+      Require(name, "whole view again", acquire(table, 0u, sampled),
+              "the view was declined");
+      draw();
+      bool balanced = true;
+      for (const uint32_t slot : {24u, 32u, 40u}) {
+        const auto resolved = image(other.slots[slot]);
+        balanced = balanced && resolved &&
+                   image(whole.slots[slot]) == resolved &&
+                   textures.GetImage(resolved).heap_refs.load() == 2u;
+      }
+      Require(name, "dropped before discovery", balanced,
+              "an element dropped before its discovery was resolved again "
+              "after its index was reused");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "image heap release failed");
     std::printf("[host]    %-32s ok\n", name);
@@ -55124,6 +55372,12 @@ int main(int argc, char **argv) {
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-heap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResidentImageHeap();
+    vulkan.CheckImageHeapSharedElements();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -55141,6 +55395,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckImageHeapSharedElements();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -55328,6 +55583,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckImageHeapSharedElements();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

@@ -209,6 +209,23 @@ void TestPadPortOwnership() {
 	Shutdown();
 }
 
+void TestSpecialPortWithoutDevice() {
+	Controller controller;
+	const int  user    = Config::GetUserId();
+	const int  special = PadOpen(user, 2, 0, nullptr);
+	Check(special > 1 && PadGetHandle(user, 2, 0) == special,
+	      "the special port did not open its own handle");
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	PadData data {};
+	Check(PadReadState(special, &data) == OK && !data.connected && data.buttons == 0,
+	      "host input reached the special port");
+	Check(PadReadState(1, &data) == OK && data.connected && data.buttons == PAD_BUTTON_CROSS,
+	      "the special port took the standard pad");
+	Check(PadClose(special) == OK && PadGetHandle(user, 2, 0) == PAD_ERROR_NO_HANDLE &&
+	          PadGetHandle(user, 0, 0) == 1,
+	      "closing the special port changed the standard one");
+}
+
 void TestSettingCycles() {
 	Controller controller;
 	for (auto setting:
@@ -716,6 +733,7 @@ int main() {
 	Config::Initialize();
 	TestPlayerUserIds();
 	TestPadPortOwnership();
+	TestSpecialPortWithoutDevice();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.

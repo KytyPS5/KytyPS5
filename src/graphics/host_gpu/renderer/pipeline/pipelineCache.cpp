@@ -5,8 +5,11 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/parallelFor.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineAsync.h"
+#include "graphics/host_gpu/renderer/pipeline/skippedDraws.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -35,6 +38,7 @@
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -44,6 +48,10 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+
+// Draws into color targets up to this many pixels wide and high are never skipped while their
+// shaders are built on workers.
+constexpr uint32_t SmallTargetSyncPixels = 1024;
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -298,37 +306,79 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 	return nullptr;
 }
 
+ShaderModule* PipelineCache::Program::FindCandidate(
+    const ShaderRecompiler::IR::ResourceSpecialization& wanted, uint32_t push_data_cursor) {
+	for (auto& candidate: modules) {
+		const auto& layout = candidate.info.bindings;
+		if (layout.push_data_start_dword ==
+		        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+		                                                 layout.ShaderDataDwords()) &&
+		    candidate.specialization == wanted) {
+			return &candidate;
+		}
+	}
+	return nullptr;
+}
+
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
                                            uint32_t                          push_data_cursor) {
+	const auto profile = SpirvProfile(m_graphics);
+	options.profile    = &profile;
+	return AddModule(program, key,
+	                 CompileStage(m_graphics.device, key, options, std::move(translated),
+	                              program.specialization, push_data_cursor, program.FunctionCode()));
+}
+
+PipelineCache::CompiledStage
+PipelineCache::CompileStage(vk::Device device, const ProgramKey& key,
+                            ShaderRecompiler::CompileOptions  options,
+                            ShaderRecompiler::TranslateResult translated,
+                            const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                            uint32_t push_data_cursor, std::span<const uint32_t> function_code) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
-	const auto profile = SpirvProfile(m_graphics);
-	options.profile    = &profile;
+	const auto& profile = *options.profile;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-	                                               program.specialization, push_data_cursor);
+	                                               specialization, push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
-	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, program.specialization);
+	                            info.bindings.push_data_start_dword, specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
-	auto& module = program.modules.emplace_back(ShaderModule {
+	CompiledStage compiled {.module = ShaderModule {
 	    .id             = id,
-	    .module         = CompileSPV(result.spirv, m_graphics.device),
+	    .module         = CompileSPV(result.spirv, device),
 	    .info           = std::move(info),
-	    .specialization = program.specialization,
+	    .specialization = specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
-	});
+	}};
+	auto& module = compiled.module;
+	// The inputs of these come from the stage's static key.
+	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
+		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
+	} else if (key.stage == ShaderType::Pixel &&
+	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
+		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
+	} else if (key.stage == ShaderType::Mesh) {
+		module.mesh_task = options.input_info.vertex->indirect_draw;
+	}
+	compiled.spirv = std::move(result.spirv);
+	return compiled;
+}
+
+ShaderModule& PipelineCache::AddModule(Program& program, const ProgramKey& key,
+                                       CompiledStage compiled) {
+	auto& module = program.modules.emplace_back(std::move(compiled.module));
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -339,25 +389,16 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	            m_compiled[static_cast<size_t>(ShaderType::Local)],
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-	// The inputs of these come from the stage's static key.
-	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
-		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
-	} else if (key.stage == ShaderType::Pixel &&
-	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
-		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
-	} else if (key.stage == ShaderType::Mesh) {
-		module.mesh_task = options.input_info.vertex->indirect_draw;
-	}
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
-		StoreModule(key, program, module, result.spirv);
+		StoreModule(key, program, module, compiled.spirv);
 	}
 	return module;
 }
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor, AsyncMode mode) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -396,6 +437,25 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
 	};
+	const auto finish_options = [&] {
+		options.shader_hash     = params.hash;
+		options.user_data       = user_data;
+		options.back_code       = params.back_code;
+		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	};
+	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (mode == AsyncMode::PrefetchOnly) {
+			// Translation needs no push data layout, so a stage behind one that is not ready can
+			// start. A program the cache has already seen waits for its predecessors.
+			if (entry == m_program_cache.end()) {
+				finish_options();
+				RequestAsync(m_lookup_key, nullptr, params, input_info, options, push_data_cursor,
+				             mode);
+			}
+			return nullptr;
+		}
+	}
 	bool source_changed = false;
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
@@ -410,11 +470,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 
-	options.shader_hash     = params.hash;
-	options.user_data       = user_data;
-	options.back_code       = params.back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	finish_options();
+	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (mode == AsyncMode::On) {
+			// Stages with GPU-selected calls are compute only, which is never made async.
+			EXIT_IF(entry != m_program_cache.end() && entry->second.call_source != nullptr);
+			RequestAsync(m_lookup_key, entry != m_program_cache.end() ? &entry->second : nullptr,
+			             params, input_info, options, push_data_cursor, mode);
+			return nullptr;
+		}
+	}
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -470,9 +535,21 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	WarmUp(shader_store);
+	if (Config::AsyncShaderCompileEnabled()) {
+		const auto threads = static_cast<uint32_t>(Common::ParallelThreads());
+		m_async            = std::make_unique<Async>(threads);
+		PipelineCacheLog("Async shader compile: {} worker threads", threads);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	// Nothing may still be making modules or pipelines while they are destroyed.
+	if (m_async != nullptr) {
+		m_async->workers.Stop();
+	}
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -571,16 +648,27 @@ void PipelineCache::CheckpointDriverCache() {
 		return;
 	}
 	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+	const auto now = std::chrono::steady_clock::now();
+	// Reading and writing the whole cache takes long enough to be seen as a stutter, so another
+	// thread does it; a save still running when the next is due just delays it.
+	if (now >= m_next_driver_cache_save && !m_save_running.exchange(true)) {
+		m_next_driver_cache_save = now + DriverCacheSaveInterval;
+		if (m_save_thread.joinable()) {
+			m_save_thread.join(); // The previous save has finished.
+		}
+		m_save_thread = std::jthread([this] {
+			Save();
+			m_save_running = false;
+		});
 	}
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+	std::scoped_lock save_lock(m_save_mutex);
+	// Pipelines created while the cache is being read mark it dirty again for the next save.
+	if (m_driver_cache == nullptr || !m_driver_cache_dirty.exchange(false)) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -602,6 +690,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
+		m_driver_cache_dirty = true;
 		return;
 	}
 	payload.resize(size);
@@ -610,6 +699,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		m_driver_cache_dirty = true;
 		return;
 	}
 	auto temp_path = m_driver_cache_path;
@@ -631,15 +721,16 @@ void PipelineCache::Save() {
 	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
+		m_driver_cache_dirty = true;
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	PumpAsync();
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();
@@ -847,18 +938,49 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
-	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
-		for (const auto& output: pixel_module.info.info.outputs) {
-			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
-			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
-				state.mrt_mask |= 1u << output.location;
-			}
+	// A small color target is often a cache the game fills once (glyphs, UI layers) and samples
+	// for many frames, so a draw into it would be lost for good, not just for a frame. Those
+	// draws wait for their shaders.
+	uint32_t color_targets = 0;
+	bool     all_small     = true;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = context.GetRenderTarget(slot);
+		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+			color_targets++;
+			all_small &= rt.attrib2.width < SmallTargetSyncPixels &&
+			             rt.attrib2.height < SmallTargetSyncPixels;
 		}
-		state.mrt_mask &= color_output_mask;
+	}
+	state.deferrable = color_targets == 0 || !all_small;
+	const auto mode  = m_async != nullptr && state.deferrable ? AsyncMode::On : AsyncMode::Off;
+	// With async compile on, a stage that is not ready skips the draw. The stages behind it
+	// cannot be looked up without its push data layout, but their translation can start.
+	bool ready = true;
+	if (pixel_active) {
+		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor, mode);
+		if (pixel_module == nullptr) {
+			EXIT_IF(m_async == nullptr);
+			ready = false;
+		} else {
+			for (const auto& output: pixel_module->info.info.outputs) {
+				if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+				    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
+					state.mrt_mask |= 1u << output.location;
+				}
+			}
+			state.mrt_mask &= color_output_mask;
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor,
+		               ready ? mode : AsyncMode::PrefetchOnly) == nullptr) {
+			ready = false;
+		}
+	}
+	if (!ready) {
+		// PrepareDrawRenderState skips a draw without a vertex module.
+		vertex_info[0].stage.module = nullptr;
+		NoteDrawSkippedForShaders();
 	}
 }
 
@@ -872,18 +994,17 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
+GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
+    const CommandBuffer& command, const DrawRenderState& state,
+    std::array<const ShaderModule*, 4>& stages) {
 	const auto* colors        = state.color_info;
 	const auto& depth         = state.depth_info;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	const bool ps_active    = state.ps_active;
 	const bool tessellation = vertex_info.size() == 3;
-	std::array<const ShaderModule*, 4> stages {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		stages[i] = vertex_info[i].stage.module;
 	}
@@ -1040,9 +1161,28 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+	return key;
+}
+
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+                                                            const DrawRenderState& state) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	const auto  vertex_info   = state.VertexStages();
+	const auto& ps_input_info = state.ps_input_info;
+	const auto& vs_input_info = vertex_info.front();
+	const bool  ps_active     = state.ps_active;
+
+	std::array<const ShaderModule*, 4> stages {};
+	const auto key        = MakeGraphicsPipelineKey(command, state, stages);
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (!inserted) {
+		// Only EnsureGraphicsPipeline starts one on a worker, and a draw waits for it before
+		// coming here, so this does not spin.
+		while (pipeline.pending) {
+			PumpAsync();
+			std::this_thread::yield();
+		}
 		return pipeline;
 	}
 

@@ -76,6 +76,7 @@ int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata);
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec,
                                       void* udata);
+int KYTY_SYSV_ABI KernelDeleteTimerEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata);
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id);

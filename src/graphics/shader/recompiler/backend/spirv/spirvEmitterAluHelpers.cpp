@@ -95,19 +95,15 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 
 static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, uint32_t lhs_bits,
                               uint32_t rhs_bits, bool max_value) {
-	// PS5 V_MIN/V_MAX_F32 return the other source for a NaN source (S0 when both are NaN)
-	// and order -0 below +0. An ordered compare takes S1 for a NaN S0 and, unlike NMin/NMax,
-	// always returns the exact bits of one source.
-	const auto either    = EmitOrU32(state, lhs_bits, rhs_bits);
-	const auto both_zero = EmitCompareU32Constant(state, spv::OpIEqual,
-	                                              EmitAndConstant(state, either, 0x7fffffffu), 0);
-	const auto zero =
-	    EmitBitcastU32ToF32(state, max_value ? EmitAndU32(state, lhs_bits, rhs_bits) : either);
+	const auto both_negative =
+	    EmitCompareU32Constant(state, spv::OpSLessThan, EmitAndU32(state, lhs_bits, rhs_bits), 0);
+	const auto less = Binary(state, spv::OpSLessThan, TypeBool(state),
+	                         max_value ? rhs_bits : lhs_bits, max_value ? lhs_bits : rhs_bits);
 	const auto keep_lhs =
-	    Binary(state, max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-		       TypeBool(state), lhs, rhs);
+	    Binary(state, spv::OpLogicalNotEqual, TypeBool(state), less, both_negative);
 	const auto ordered = Select(state, TypeF32(state), keep_lhs, lhs, rhs);
-	const auto numeric = Select(state, TypeF32(state), both_zero, zero, ordered);
+	const auto numeric = Select(state, TypeF32(state),
+	                            Unary(state, spv::OpIsNan, TypeBool(state), lhs), rhs, ordered);
 	return Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs), lhs,
 	              numeric);
 }

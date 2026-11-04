@@ -55,6 +55,9 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	/// Like InvalidateMemory for a CPU write treated as running front to back over the range, so
+	/// images end up as its page-by-page faults would have left them. False if not fully mapped.
+	[[nodiscard]] bool InvalidateSequentialWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

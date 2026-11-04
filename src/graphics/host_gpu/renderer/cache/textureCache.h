@@ -68,6 +68,9 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	/// Invalidates images for a CPU write treated as running front to back over the range, such as
+	/// a DMA fill or copy, as its page-by-page faults on a fully watched range would have.
+	void               InvalidateSequentialWrite(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
@@ -165,7 +168,9 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// Caller holds m_lock. A sequential write marks only the images its per-page faults reach.
+	void               InvalidateCpuAliases(uint64_t address, uint64_t size,
+	                                        bool sequential_write = false);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;

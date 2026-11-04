@@ -82,6 +82,16 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool RenderContext::InvalidateSequentialWrite(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.InvalidateSequentialWrite(vaddr, size);
+	m_image_heap.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;

@@ -3238,7 +3238,9 @@ public:
   static constexpr uint64_t BulkCopyBaselineSlot = 3;
   static constexpr uint64_t BulkCopyTestedSlot = 4;
   static constexpr uint64_t BulkReadbackSlot = 5;
-  static constexpr uint64_t BulkTotalSize = 6 * BulkSize;
+  static constexpr uint64_t BulkHeadBaselineSlot = 6;
+  static constexpr uint64_t BulkHeadTestedSlot = 7;
+  static constexpr uint64_t BulkTotalSize = 8 * BulkSize;
   // The allocate and map calls also take this value as their alignment, which must be a power of
   // two, so the mapping is larger than the ranges use.
   static constexpr uint64_t BulkMapSize = 0x40000;
@@ -3310,6 +3312,73 @@ public:
     }
   }
 
+  // An image that starts mid-page, and a fill that stops inside the image's first page. The
+  // fill's per-page faults land only before the image, which untracks the image's head page but
+  // leaves it not CPU dirty, so a GPU-written image keeps its contents. The bulk fill must leave
+  // the image the same way. Marking it CPU dirty from the exact overlap would re-upload it from
+  // guest memory and lose what the GPU wrote.
+  void CheckBulkHeadPageFill(RenderContext &resources, auto &gpu, uint64_t baseline_slot,
+                             uint64_t tested_slot) {
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    constexpr uint64_t image_offset = page + page / 2;
+    constexpr uint64_t image_size = 2 * page;
+    // Ends a quarter page into the image, so the image's next page boundary is never written.
+    constexpr uint64_t fill_size = image_offset + page / 4;
+    constexpr uint64_t head_end_offset = 2 * page;
+    constexpr uint32_t fill_value = 0x600dcafeu;
+    auto &texture_cache = resources.GetTextureCache();
+    const auto prepare = [&](uint64_t slot) {
+      ImageInfo info{};
+      info.data = {slot + image_offset, image_size};
+      info.extent = {1, 1, 1};
+      info.resources = {1, 1};
+      info.samples = 1;
+      const auto id = TextureCacheTestAccess::InsertImage(texture_cache, info);
+      TextureCacheTestAccess::TrackImage(texture_cache, id);
+      texture_cache.GetImage(id).RefreshComplete();
+      texture_cache.GetImage(id).MarkGpuModified();
+      gpu.SendCommandSync([&] {
+        (void)resources.GetBufferCache().ObtainBuffer(slot, BulkSize, false);
+      });
+      gpu.WaitForIdle();
+      return id;
+    };
+    const auto baseline = prepare(baseline_slot);
+    const auto tested = prepare(tested_slot);
+    const auto fault_count = [] {
+      return Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+    };
+    auto before = fault_count();
+    std::fill_n(reinterpret_cast<uint32_t *>(baseline_slot), fill_size / sizeof(uint32_t),
+                fill_value);
+    const auto baseline_faults = fault_count() - before;
+    before = fault_count();
+    gpu.SendCommandSync([&] {
+      resources.GetBufferCache().FillBuffer(tested_slot, fill_size, fill_value, false);
+    });
+    const auto tested_faults = fault_count() - before;
+    const auto &baseline_image = texture_cache.GetImage(baseline);
+    const auto &tested_image = texture_cache.GetImage(tested);
+    // The baseline proves the setup really faults only before the image.
+    Require("GpuCommandLane", "bulk head-page baseline",
+            !baseline_image.IsDefinitelyCpuDirty() &&
+                baseline_image.track_addr == baseline_slot + head_end_offset,
+            "a plain fill that stops in an image's first page did more than untrack that page");
+    // Faults alone would leave the image the same way, so the fill must not fault at all.
+    Require("GpuCommandLane", "bulk head-page faults", baseline_faults > 0 && tested_faults == 0,
+            "the plain fill did not fault or the bulk fill did, so the bulk invalidation was not "
+            "what left the image");
+    Require("GpuCommandLane", "bulk head-page fill",
+            !tested_image.IsDefinitelyCpuDirty() &&
+                tested_image.track_addr == tested_slot + head_end_offset,
+            "the bulk fill marked an image its per-page faults never reached");
+    for (const auto id : {baseline, tested}) {
+      // The test images never held real GPU contents, so there is nothing to resolve.
+      texture_cache.GetImage(id).ClearGpuModified();
+      TextureCacheTestAccess::DeleteImage(texture_cache, id);
+    }
+  }
+
   // Compares per-page faulting with bulk invalidation for FillBuffer and CopyBuffer.
   void CheckBulkInvalidateDma(RenderContext &resources, auto &gpu) {
     constexpr uintptr_t base = 0x0000000200800000ull;
@@ -3346,6 +3415,7 @@ public:
                   buffer_cache.CopyBuffer(address, slot(BulkCopySourceSlot), BulkSize,
                                           false, false);
                 });
+    CheckBulkHeadPageFill(resources, gpu, slot(BulkHeadBaselineSlot), slot(BulkHeadTestedSlot));
     Common::DebugCounters::SetEnabled(counters_were_enabled);
     UnmapBulkMemory(resources, base, direct_offset);
   }

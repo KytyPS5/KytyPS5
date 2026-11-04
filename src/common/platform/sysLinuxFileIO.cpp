@@ -9,6 +9,8 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +21,7 @@
 #include <system_error>
 #include <unistd.h>
 #include <utime.h>
+#include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
@@ -81,9 +84,56 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 #endif
 }
 
+static std::atomic<SysFileRecoverableDestination> g_recoverable_destination {nullptr};
+
+void SysFileSetRecoverableDestination(SysFileRecoverableDestination probe) {
+	g_recoverable_destination.store(probe, std::memory_order_release);
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		size_t w = fread(data, 1, size, f.f);
+		const off_t start = ftello(f.f);
+		size_t      w     = fread(data, 1, size, f.f);
+		if (w < size && ferror(f.f) && errno == EFAULT && start >= 0) {
+			// The destination can be write-protected guest memory (pages tracked for GPU
+			// synchronization). read() fails with EFAULT there instead of raising the fault the
+			// emulator handles, so finish through a host buffer copied from user mode (as on
+			// Windows and in the AMPR read path). Other destinations keep the short read.
+			clearerr(f.f);
+			thread_local std::vector<uint8_t> chunk(1u << 20u);
+			if (fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET) == 0) {
+				// Probe only bytes the file can still supply: the tail past EOF is never written.
+				size_t      remaining = size - w;
+				struct stat file_stat {};
+				if (fstat(fileno(f.f), &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+					const off_t at = start + static_cast<off_t>(w);
+					remaining =
+					    file_stat.st_size > at
+					        ? std::min(remaining, static_cast<size_t>(file_stat.st_size - at))
+					        : 0;
+				}
+				while (remaining != 0) {
+					const size_t step = std::min(remaining, chunk.size());
+					const auto   recoverable =
+					    g_recoverable_destination.load(std::memory_order_acquire);
+					if (recoverable == nullptr ||
+					    !recoverable(static_cast<uint8_t*>(data) + w, step)) {
+						break;
+					}
+					const size_t got = fread(chunk.data(), 1, step, f.f);
+					if (got == 0) {
+						break;
+					}
+					std::memcpy(static_cast<uint8_t*>(data) + w, chunk.data(), got);
+					w += got;
+					remaining -= got;
+					if (got < step) {
+						break;
+					}
+				}
+				fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET);
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

@@ -829,6 +829,7 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
+		psml_tests
 	)
 endif()
 

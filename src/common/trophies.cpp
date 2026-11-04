@@ -106,7 +106,7 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		return {};
 	}
 	const auto locale = Localization::LocaleName(console_language);
-	auto       meta   = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
+	auto meta = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
 	if (meta.is_null()) {
 		meta = ReadJson(files, fmt::format("tropmeta_{}.json",
 		                                   conf["defaultLanguage"].get_ref<const std::string&>()));
@@ -309,12 +309,10 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 	for (const auto& [id, value]: unlocks.progress) {
 		progress[std::to_string(id)] = value;
 	}
-	const auto text = Json {
-	    {"unlockedTrophies", unlocks.unlocked},
-	    {"unlockedAt", timestamps},
-	    {"maxStats", stats},
-	    {"progressValues",
-	     progress}}.dump();
+	const auto text = Json {{"unlockedTrophies", unlocks.unlocked},
+	                        {"unlockedAt", timestamps},
+	                        {"maxStats", stats},
+	                        {"progressValues", progress}}.dump();
 	auto temporary = path;
 	temporary += ".tmp";
 	File file;
@@ -364,8 +362,8 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 		    !definition.contains("dataType")) {
 			continue;
 		}
-		const auto  id      = ReadUnsigned(definition["statId"]);
-		const auto& type    = definition["dataType"];
+		const auto  id   = ReadUnsigned(definition["statId"]);
+		const auto& type = definition["dataType"];
 		const bool  maximum = definition["aggregation"] == "max";
 		if (!id || (type != "uint64" && type != "uint32" && type != "int64") ||
 		    (type == "int64" && (!maximum || !definition.contains("minValue")))) {

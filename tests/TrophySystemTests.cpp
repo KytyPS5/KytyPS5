@@ -570,12 +570,12 @@ void TestReportedEventHle(const std::filesystem::path &directory) {
   };
   const int base = Libs::Graphics::notifications;
   Check(progress() == 0 && !data.unlocked, "reported progress starts empty");
-  const auto post = [&](int target_context, int trophy, int64_t value) {
+  const auto post = [&](int target_context, int32_t trophy, int32_t value) {
     NpUniversalDataSystemEventPropertyObject properties;
-    Check(NpUniversalDataSystemEventPropertyObjectSetInt64(
+    Check(NpUniversalDataSystemEventPropertyObjectSetInt32(
               &properties, "_trophy_id", trophy) == 0,
           "set reported trophy id");
-    Check(NpUniversalDataSystemEventPropertyObjectSetInt64(
+    Check(NpUniversalDataSystemEventPropertyObjectSetInt32(
               &properties, "_trophy_progress", value) == 0,
           "set reported progress value");
     NpUniversalDataSystemEvent *event = nullptr;
@@ -587,24 +587,32 @@ void TestReportedEventHle(const std::filesystem::path &directory) {
           "destroy reported progress event");
     return result;
   };
-  {
-    NpUniversalDataSystemEventPropertyObject properties;
-    Check(NpUniversalDataSystemEventPropertyObjectSetInt64(&properties,
-                                                           "_trophy_id", 2) == 0,
-          "set incomplete reported trophy id");
-    NpUniversalDataSystemEvent *event = nullptr;
-    Check(NpUniversalDataSystemCreateEvent("_UpdateTrophyProgress", &properties,
-                                           &event, nullptr) == 0,
-          "create incomplete reported progress event");
-    Check(NpUniversalDataSystemPostEvent(context, 1, event, 0) ==
-              NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT,
-          "incomplete reported progress event is rejected");
-    Check(NpUniversalDataSystemDestroyEvent(event) == 0,
-          "destroy incomplete reported progress event");
-  }
   Check(post(context, 1, 4) == 0 && state->unlocks.progress.empty() &&
             Libs::Graphics::notifications == base,
         "non-progressive trophies ignore reported progress");
+  Check(post(context, 2, 0) == 0 && state->unlocks.progress.at(2) == 0,
+        "zero is valid reported progress");
+  const std::optional<Trophies::UdsInteger> invalid[] = {
+      std::nullopt, int32_t{-1}, uint32_t{2}, int64_t{2}, uint64_t{2},
+      uint64_t{UINT64_MAX}};
+  for (const auto *key : {"_trophy_id", "_trophy_progress"}) {
+    for (const auto &value : invalid) {
+      NpUniversalDataSystemEvent event{
+          "_UpdateTrophyProgress",
+          {{{"_trophy_id", int32_t{2}}, {"_trophy_progress", int32_t{8}}}}};
+      event.properties.SetInteger(key, value);
+      Check(NpUniversalDataSystemPostEvent(context, 1, &event, 0) ==
+                NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT,
+            "progress events require two nonnegative Int32 properties");
+    }
+  }
+  const auto saved = Trophies::LoadUnlockData(state->path);
+  Check(state->unlocks.progress == (std::map<int, uint64_t>{{2, 0}}) &&
+            saved.progress == state->unlocks.progress &&
+            state->unlocks.unlocked.empty() && saved.unlocked.empty() &&
+            state->unlocks.timestamps.empty() && saved.timestamps.empty() &&
+            Libs::Graphics::notifications == base,
+        "invalid progress events leave memory, disk and notifications unchanged");
   Check(post(context, 2, 3) == 0 && progress() == 3 && !data.unlocked &&
             Trophies::LoadUnlockData(state->path).progress.at(2) == 3,
         "partial report is saved as trophy progress");
@@ -616,6 +624,8 @@ void TestReportedEventHle(const std::filesystem::path &directory) {
             state->unlocks.unlocked == std::set<int>{2} &&
             Libs::Graphics::notifications == base + 1,
         "reaching the target awards the trophy");
+  Check(Trophies::LoadUnlockData(state->path).unlocked == std::set<int>{2},
+        "reaching the target persists the trophy award");
   NpUniversalDataSystemEvent direct{"_UnlockTrophy",
                                     {{{"_trophy_id", int32_t{1}}}}};
   Check(NpUniversalDataSystemPostEvent(context, 1, &direct, 0) == 0 &&

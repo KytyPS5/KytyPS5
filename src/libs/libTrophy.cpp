@@ -158,10 +158,10 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 			     package.event_rules.size(), uds_filename.c_str());
 		}
 	}
-	const bool guest   = Config::IsGuestUserId(key.first);
-	auto       path    = guest ? std::filesystem::path {}
-	                           : Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto       unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
+	const bool guest = Config::IsGuestUserId(key.first);
+	auto       path  = guest ? std::filesystem::path {}
+	                         : Trophies::UnlocksPath({}, title_id, key.first, key.second);
+	auto unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
 	if (!guest) {
 		for (const auto& [event, rules]: package.event_rules) {
 			for (const auto& rule: rules) {
@@ -589,6 +589,11 @@ struct NpUniversalDataSystemMemoryStat {
 struct NpUniversalDataSystemEventPropertyObject {
 	std::map<std::string, Common::Trophies::UdsInteger> integers;
 
+	const int32_t* Int32(const char* key) const {
+		const auto property = integers.find(key);
+		return property == integers.end() ? nullptr : std::get_if<int32_t>(&property->second);
+	}
+
 	void SetInteger(const char* key, std::optional<Common::Trophies::UdsInteger> value) {
 		if (value) {
 			integers.insert_or_assign(key, *value);
@@ -702,22 +707,6 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
 	return 0;
 }
 
-// Reads a nonnegative integer property set with any of the integer setters.
-static std::optional<uint64_t>
-ReadNonNegative(const std::map<std::string, LibNpTrophy2::Trophies::UdsInteger>& properties,
-                const std::string&                                               key) {
-	const auto property = properties.find(key);
-	if (property == properties.end()) {
-		return std::nullopt;
-	}
-	return std::visit(
-	    [](auto value) -> std::optional<uint64_t> {
-		    return std::cmp_less(value, 0) ? std::nullopt
-		                                   : std::optional(static_cast<uint64_t>(value));
-	    },
-	    property->second);
-}
-
 static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle, const void* event,
                                                         uint64_t options) {
 	PRINT_NAME();
@@ -735,10 +724,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 	const auto& uds_event = *static_cast<const NpUniversalDataSystemEvent*>(event);
 	LOGF("[UDS] posted event: %s\n", uds_event.name.c_str());
 	if (uds_event.name == "_UnlockTrophy") {
-		const auto  property  = uds_event.properties.integers.find("_trophy_id");
-		const auto* trophy_id = property == uds_event.properties.integers.end()
-		                            ? nullptr
-		                            : std::get_if<int32_t>(&property->second);
+		const auto* trophy_id = uds_event.properties.Int32("_trophy_id");
 		if (trophy_id == nullptr || *trophy_id < 0) {
 			return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 		}
@@ -746,18 +732,17 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 			LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id);
 		}
 	} else if (uds_event.name == "_UpdateTrophyProgress") {
-		const auto trophy_id = ReadNonNegative(uds_event.properties.integers, "_trophy_id");
-		const auto progress  = ReadNonNegative(uds_event.properties.integers, "_trophy_progress");
-		if (!trophy_id || *trophy_id > INT32_MAX || !progress) {
+		const auto* trophy_id = uds_event.properties.Int32("_trophy_id");
+		const auto* progress  = uds_event.properties.Int32("_trophy_progress");
+		if (trophy_id == nullptr || *trophy_id < 0 || progress == nullptr || *progress < 0) {
 			return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 		}
 		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key);
 		    state != nullptr && !state->guest) {
-			const auto id      = static_cast<int>(*trophy_id);
-			bool       changed = false;
-			if (LibNpTrophy2::Trophies::UpdateTrophyProgress(*state->package, id, *progress,
+			bool changed = false;
+			if (LibNpTrophy2::Trophies::UpdateTrophyProgress(*state->package, *trophy_id, *progress,
 			                                                 state->unlocks, changed)) {
-				LibNpTrophy2::RecordTrophyUnlock(*state, id, true);
+				LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id, true);
 			} else if (changed &&
 			           !LibNpTrophy2::Trophies::SaveUnlockData(state->path, state->unlocks)) {
 				LOGF("[Trophy] could not save trophy progress to %s\n",

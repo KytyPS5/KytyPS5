@@ -1722,6 +1722,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
 
+	LOGF("\t resolution   = %" PRIu32 "\n"
+	     "\t dynamicRange = %" PRIu32 "\n"
+	     "\t refreshRate  = %" PRIu64 "\n",
+	     status->resolution, status->dynamicRange, status->refreshRate);
+
 	return OK;
 }
 

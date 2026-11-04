@@ -3,6 +3,7 @@
 #include "common/config.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
@@ -10,6 +11,7 @@
 #include "common/virtualMemory.h"
 
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +43,63 @@ TEST(VirtualMemory, AllocFixedRefusesMappedPagesAndFreeReleasesOnlyItsRange) {
 	EXPECT_TRUE(VirtualMemory::Free(BASE, PAGE));
 	EXPECT_TRUE(VirtualMemory::Free(BASE + PAGE, PAGE));
 }
+
+volatile uint64_t g_fault_rsp = 0;
+
+// Resolves the write fault on BASE by making the page writable.
+bool MakeBaseWritable(const Common::HostException::ExceptionInfo& info) {
+	g_fault_rsp = info.rsp;
+	return info.type == Common::HostException::ExceptionType::AccessViolation &&
+	       info.access_violation_type == Common::HostException::AccessViolationType::Write &&
+	       info.access_violation_vaddr == BASE &&
+	       VirtualMemory::Protect(BASE, PAGE, VirtualMemory::Mode::ReadWrite);
+}
+
+bool RefuseFault(const Common::HostException::ExceptionInfo& /*info*/) {
+	return false;
+}
+
+TEST(HostException, TheFirstHandlerStaysInstalledAndResolvesFaults) {
+	EXPECT_EXIT(
+	    {
+		    namespace HostException = Common::HostException;
+		    const bool installs     = HostException::InstallHandler(MakeBaseWritable) &&
+			                          HostException::InstallHandler(MakeBaseWritable) &&
+			                          !HostException::InstallHandler(RefuseFault);
+		    const bool mapped = VirtualMemory::AllocFixed(BASE, PAGE, VirtualMemory::Mode::Read);
+		    auto*      value  = reinterpret_cast<volatile uint32_t*>(BASE);
+		    *value            = 7;
+		    // The faulting frame's stack pointer lies just below this local.
+		    const auto local  = reinterpret_cast<uint64_t>(&value);
+		    const bool rsp_ok = g_fault_rsp <= local && local - g_fault_rsp < 0x10000;
+		    std::_Exit(installs && mapped && *value == 7 && rsp_ok ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+volatile sig_atomic_t g_dispatched = 0;
+
+// Refuses the fault if the guest signal it raises was delivered before the handler returned.
+bool RaiseDispatchDuringFault(const Common::HostException::ExceptionInfo& info) {
+	std::raise(Common::HostException::GuestSignalDispatchSignal());
+	return g_dispatched == 0 && info.access_violation_vaddr == BASE &&
+	       VirtualMemory::Protect(BASE, PAGE, VirtualMemory::Mode::ReadWrite);
+}
+
+TEST(HostException, GuestSignalWaitsUntilTheFaultHandlerReturns) {
+	EXPECT_EXIT(
+	    {
+		    std::signal(Common::HostException::GuestSignalDispatchSignal(),
+			            [](int) { g_dispatched = 1; });
+		    const bool installs = Common::HostException::InstallHandler(RaiseDispatchDuringFault);
+		    const bool mapped   = VirtualMemory::AllocFixed(BASE, PAGE, VirtualMemory::Mode::Read);
+		    *reinterpret_cast<volatile uint32_t*>(BASE) = 1;
+		    std::_Exit(installs && mapped && g_dispatched == 1 ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+#endif
 
 TEST(SysDbg, StackUsageReportsTheCallingThreadStackBase) {
 	std::thread([] {

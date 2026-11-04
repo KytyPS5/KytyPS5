@@ -3154,6 +3154,7 @@ LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("F6e0kwo4cnk", EventQueue::KernelTriggerUserEvent);
 	LIB_FUNC("LJDwdSNTnDg", EventQueue::KernelDeleteUserEvent);
 	LIB_FUNC("57ZK+ODEXWY", EventQueue::KernelAddTimerEvent);
+	LIB_FUNC("YWQFUyXIVdU", EventQueue::KernelDeleteTimerEvent);
 	LIB_FUNC("R74tt43xP6k", EventQueue::KernelAddHRTimerEvent);
 	LIB_FUNC("J+LF6LwObXU", EventQueue::KernelDeleteHRTimerEvent);
 	LIB_FUNC("bBfz7kMF2Ho", EventQueue::KernelAddAmprEvent);

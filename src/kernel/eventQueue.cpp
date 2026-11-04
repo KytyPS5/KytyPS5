@@ -530,6 +530,10 @@ int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds us
 	return AddTimerEvent(eq, id, static_cast<uint64_t>(usec) * 1000, true, udata);
 }
 
+int KYTY_SYSV_ABI KernelDeleteTimerEvent(KernelEqueue eq, int id) {
+	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_TIMER);
+}
+
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata) {
 	if (ts == nullptr) {

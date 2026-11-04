@@ -134,13 +134,9 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 }
 
 static void Execute(const std::filesystem::path& game_patch) {
-	auto           patch_path = game_patch;
-	Common::Thread guest_thread(
-	    [](void* param) {
-		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
-	    },
-	    &patch_path);
+	std::thread([game_patch] {
+		Common::Singleton<Loader::RuntimeLinker>::Instance()->Execute(game_patch);
+	}).detach();
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);
 }

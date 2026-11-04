@@ -4,8 +4,10 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
+#include "common/threads.h"
 #include "common/virtualMemory.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -179,6 +181,54 @@ TEST(Log, FileGetsPlainTextAndTheConsoleGetsEachLineOnce) {
 		    std::_Exit(file_ok && console_ok && silent_ok ? 0 : 1);
 	    },
 	    testing::ExitedWithCode(0), "");
+}
+
+TEST(Thread, MutexIsRecursiveAndCondVarTimesOutOrWakes) {
+	Common::Mutex   mutex;
+	Common::CondVar cond_var;
+	mutex.Lock();
+	mutex.Lock();
+	mutex.Unlock();
+	EXPECT_FALSE(cond_var.WaitFor(&mutex, 1000));
+
+	static int polls = 0;
+	polls            = 0;
+	Common::CondVar::SetWaitPollCallback([] { polls++; });
+	cond_var.Wait(&mutex);
+	Common::CondVar::SetWaitPollCallback(nullptr);
+	EXPECT_EQ(polls, 1);
+
+	bool        ready = false;
+	std::thread signaller([&] {
+		Common::LockGuard lock(mutex);
+		ready = true;
+		cond_var.Signal();
+	});
+	while (!ready) {
+		cond_var.Wait(&mutex);
+	}
+	mutex.Unlock();
+	signaller.join();
+}
+
+TEST(Thread, SleepsAtLeastTheRequestedTimeAndIdsAreUniquePerThread) {
+	Common::InitializeThreads();
+	EXPECT_TRUE(Common::Thread::IsMainThread());
+
+	const auto start = std::chrono::steady_clock::now();
+	Common::Thread::SleepMicro(2000);
+	EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::microseconds(2000));
+
+	const int id = Common::Thread::GetThreadIdUnique();
+	EXPECT_EQ(Common::Thread::GetThreadIdUnique(), id);
+	int  other_id   = id;
+	bool other_main = true;
+	std::thread([&] {
+		other_id   = Common::Thread::GetThreadIdUnique();
+		other_main = Common::Thread::IsMainThread();
+	}).join();
+	EXPECT_NE(other_id, id);
+	EXPECT_FALSE(other_main);
 }
 
 } // namespace

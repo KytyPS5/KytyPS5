@@ -1124,8 +1124,7 @@ void Initialize() {
 
 	PRINT_NAME_ENABLE(true);
 
-	Common::Thread thread(FreeDetachedThreads, nullptr);
-	thread.Detach();
+	std::thread(FreeDetachedThreads, nullptr).detach();
 }
 
 static int PthreadAttrCopy(PthreadAttr* dst, const PthreadAttr* src) {

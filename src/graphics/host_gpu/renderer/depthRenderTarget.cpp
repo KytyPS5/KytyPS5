@@ -155,10 +155,34 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		           z.depth_view.slice_max);
 	}
 	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
+	if (z.z_info.format == Prospero::DepthFormat::kInvalid) {
+		DepthFatal("unsupported target without a Z buffer (stencil only): stencil_format=%u "
+		           "stencil_read=0x%016" PRIx64 " stencil_write=0x%016" PRIx64
+		           " extent=%ux%u slices=%u..%u htile=%d",
+		           static_cast<uint32_t>(z.stencil_info.format), z.stencil_read_base_addr,
+		           z.stencil_write_base_addr, z.size.x_max + 1u, z.size.y_max + 1u,
+		           z.depth_view.slice_start, z.depth_view.slice_max, has_htile);
+	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
 	if (z.z_info.max_mip_level != 0 || unsupported_shading_rate_encoding || depth_address == 0 ||
 	    (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state:%s%s%s%s format=%u samples=%u "
+		           "max_mip=%u mip=%u slices=%u..%u extent=%ux%u htile=%d expclear=%d "
+		           "shading_rate=%u %s=0x%016" PRIx64 " z_read=0x%016" PRIx64
+		           " z_write=0x%016" PRIx64 " stencil_format=%u",
+		           z.z_info.max_mip_level != 0 ? " mip chain" : "",
+		           unsupported_shading_rate_encoding ? " shading rate encoding" : "",
+		           depth_address == 0 ? " no depth address" : "",
+		           depth_address != 0 && (depth_address & 0xffffu) != 0
+		               ? " depth address not 64 KiB aligned"
+		               : "",
+		           static_cast<uint32_t>(z.z_info.format), z.z_info.num_samples,
+		           z.z_info.max_mip_level, z.depth_view.current_mip_level,
+		           z.depth_view.slice_start, z.depth_view.slice_max, z.size.x_max + 1u,
+		           z.size.y_max + 1u, has_htile, z.z_info.expclear_enabled,
+		           z.shading_rate_encoding, write_buffer ? "write" : "read", depth_address,
+		           z.z_read_base_addr, z.z_write_base_addr,
+		           static_cast<uint32_t>(z.stencil_info.format));
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || stencil_address == 0 ||

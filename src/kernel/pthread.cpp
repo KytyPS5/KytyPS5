@@ -949,10 +949,12 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS) && KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 struct GuestStackTestState {
-	bool      called      = false;
-	uintptr_t rsp         = 0;
-	uintptr_t stack_base  = 0;
-	uintptr_t stack_limit = 0;
+	bool      called             = false;
+	bool      exit_via_pthread   = false;
+	bool      returned_from_exit = false;
+	uintptr_t rsp                = 0;
+	uintptr_t stack_base         = 0;
+	uintptr_t stack_limit        = 0;
 };
 
 static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
@@ -966,10 +968,16 @@ static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
 	             : "memory");
 
 	state->called = true;
+
+	if (state->exit_via_pthread) {
+		PthreadExit(arg);
+		state->returned_from_exit = true;
+	}
+
 	return arg;
 }
 
-bool TestGuestStackNormalReturn() {
+static bool TestGuestStackReturn(bool exit_via_pthread) {
 	constexpr uint64_t stack_size = 0x10000;
 
 	const auto stack_low = Memory::AllocateRuntimeMemory(
@@ -980,6 +988,7 @@ bool TestGuestStackNormalReturn() {
 	}
 
 	GuestStackTestState state {};
+	state.exit_via_pthread = exit_via_pthread;
 
 	uintptr_t original_stack_base  = 0;
 	uintptr_t original_stack_limit = 0;
@@ -992,8 +1001,18 @@ bool TestGuestStackNormalReturn() {
 
 	const auto stack_high = stack_low + stack_size;
 
+	PthreadPrivate test_thread {};
+
+	const auto previous_self       = g_pthread_self;
+	const auto previous_return_rsp = g_guest_entry_return_rsp;
+
+	g_pthread_self = &test_thread;
+
 	void* result = RunOnGuestStack(&state, GuestStackTestEntry, reinterpret_cast<void*>(stack_high),
 	                               reinterpret_cast<void*>(stack_low), stack_high);
+
+	g_pthread_self           = previous_self;
+	g_guest_entry_return_rsp = previous_return_rsp;
 
 	uintptr_t restored_stack_base  = 0;
 	uintptr_t restored_stack_limit = 0;
@@ -1006,7 +1025,7 @@ bool TestGuestStackNormalReturn() {
 
 	const bool guest_ok = state.called && state.rsp >= stack_low && state.rsp < stack_high &&
 	                      state.stack_base == stack_high && state.stack_limit == stack_low &&
-	                      result == &state;
+	                      result == &state && !state.returned_from_exit;
 
 	const bool host_ok =
 	    restored_stack_base == original_stack_base && restored_stack_limit == original_stack_limit;
@@ -1014,6 +1033,13 @@ bool TestGuestStackNormalReturn() {
 	const bool freed = Memory::FreeGuestMemory(stack_low, stack_size);
 
 	return guest_ok && host_ok && freed;
+}
+
+bool TestGuestStackNormalReturn() {
+	return TestGuestStackReturn(false);
+}
+bool TestGuestStackPthreadExit() {
+	return TestGuestStackReturn(true);
 }
 
 #endif

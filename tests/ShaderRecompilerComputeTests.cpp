@@ -19507,8 +19507,6 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      const vk::Bool32 write = true;
-      cmd.setColorWriteEnableEXT(1, &write);
       cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
@@ -22698,10 +22696,8 @@ private:
     available_depth_clip.pNext = &available_derivatives;
     vk::PhysicalDeviceDepthClipControlFeaturesEXT available_clip_control{};
     available_clip_control.pNext = &available_depth_clip;
-    vk::PhysicalDeviceColorWriteEnableFeaturesEXT available_color_write{};
-    available_color_write.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT available_feedback_layout{};
-    available_feedback_layout.pNext = &available_color_write;
+    available_feedback_layout.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
@@ -22790,7 +22786,6 @@ private:
                                 available_features.fragmentStoresAndAtomics &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
-                                available_color_write.colorWriteEnable &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
                                 available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
@@ -22839,7 +22834,6 @@ private:
     // rasterization feature chain is only chained in when every part is available.
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
-    vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write{};
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
@@ -22848,9 +22842,7 @@ private:
       depth_clip.depthClipEnable = true;
       clip_control.pNext = &depth_clip;
       clip_control.depthClipControl = true;
-      color_write.pNext = &clip_control;
-      color_write.colorWriteEnable = true;
-      feedback_layout.pNext = &color_write;
+      feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
       feedback_dynamic.pNext = &feedback_layout;
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
@@ -22912,7 +22904,6 @@ private:
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
-      device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);

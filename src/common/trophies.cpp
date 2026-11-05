@@ -466,8 +466,8 @@ UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks, std::string
 		const auto current = std::min(base, limit);
 		return addend > limit - current ? limit : current + addend;
 	};
-	// Maxima floor at the configured initial value; minima, sums and tallies start from
-	// the first event or zero.
+	// Maxima floor at the configured initial value, sums and tallies accumulate from it,
+	// minima start from the first event (an initial zero would pin them down).
 	const auto update = [&](const UdsRule& rule, uint64_t input) {
 		auto       next    = input;
 		const bool counted = rule.aggregation == Aggregation::Count;
@@ -489,7 +489,7 @@ UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks, std::string
 			}
 			case Aggregation::Sum:
 			case Aggregation::Count: {
-				auto [stat, inserted] = unlocks.stats.try_emplace(rule.stat_id, uint64_t {0});
+				auto [stat, inserted] = unlocks.stats.try_emplace(rule.stat_id, rule.initial_value);
 				next                  = add(stat->second, counted ? 1 : input, rule.type);
 				result.stats_changed |= inserted || next != stat->second;
 				stat->second = next;

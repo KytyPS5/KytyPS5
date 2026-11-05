@@ -482,17 +482,21 @@ void TestAggregatedStats(const std::filesystem::path &directory) {
 			{"statId":200,"dataType":"uint64","aggregation":"count"},
 			{"statId":300,"dataType":"uint64","aggregation":"sum"},
 			{"statId":400,"dataType":"uint32","aggregation":"min"},
-			{"statId":500,"dataType":"uint32","aggregation":"sum"}
+			{"statId":500,"dataType":"uint32","aggregation":"sum"},
+			{"statId":600,"dataType":"uint64","aggregation":"sum","initialValue":"3"},
+			{"statId":700,"dataType":"uint64","aggregation":"count","initialValue":"2"}
 		]})"},
        {"stats_extraction.json", R"({"statsExtractionRuleArray":[
 			{"condition":{"eventName":"UpdateNbSpikesKills"},"action":{"input":"$.newValue","output":{"statId":113}}},
 			{"condition":{"eventName":"KILL"},"action":{"output":{"statId":200}}},
 			{"condition":{"eventName":"SCORE"},"action":{"input":"$.delta","output":{"statId":300}}},
 			{"condition":{"eventName":"LAP"},"action":{"input":"$.seconds","output":{"statId":400}}},
-			{"condition":{"eventName":"RAID"},"action":{"input":"$.hits","output":{"statId":500}}}
+			{"condition":{"eventName":"RAID"},"action":{"input":"$.hits","output":{"statId":500}}},
+			{"condition":{"eventName":"BONUS"},"action":{"input":"$.points","output":{"statId":600}}},
+			{"condition":{"eventName":"STEP"},"action":{"output":{"statId":700}}}
 		]})"}});
   package.event_rules = Trophies::LoadUdsRules(uds_path);
-  Check(package.trophies.size() == 5 && package.event_rules.size() == 5,
+  Check(package.trophies.size() == 5 && package.event_rules.size() == 7,
         "load aggregated rules and count rules without input");
 
   Trophies::UnlockData unlocks;
@@ -517,6 +521,10 @@ void TestAggregatedStats(const std::filesystem::path &directory) {
   Check(post("KILL", {{"unrelated", int32_t{1}}}).trophies.empty() &&
             post("KILL").trophies == std::vector<int>{2} && unlocks.stats.at(200) == 3,
         "count stats accumulate across events of any shape");
+  Check(post("BONUS", {{"points", uint64_t{4}}}).trophies.empty() &&
+            unlocks.stats.at(600) == 7 && post("STEP").trophies.empty() &&
+            unlocks.stats.at(700) == 3,
+        "sums and tallies start at the configured initial value");
 
   Check(post("SCORE", {{"delta", uint64_t{6}}}).trophies.empty(),
         "subthreshold sums do not unlock");

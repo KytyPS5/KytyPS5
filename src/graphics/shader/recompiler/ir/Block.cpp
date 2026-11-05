@@ -35,6 +35,7 @@ void Block::AddBranch(Block* block) {
 	EXIT_IF(std::ranges::find(block->predecessors, this) != block->predecessors.end());
 	successors.push_back(block);
 	block->predecessors.push_back(this);
+	NoteIrMutation();
 }
 
 Block::InstructionList& Block::Instructions() {

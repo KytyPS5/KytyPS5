@@ -218,20 +218,6 @@ vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_compo
 	return NarrowInputFormat(format, used_components);
 }
 
-// The host format of each vertex input attribute, narrowed to the components the stage reads.
-std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
-                                           const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	std::vector<vk::Format> formats(input_info.resources_num);
-	for (int index = 0; index < input_info.resources_num; index++) {
-		const auto registers_num = input_info.resources_dst[index].registers_num;
-		EXIT_IF(registers_num < 1 || registers_num > 4);
-		const auto fetched = program.info.vertex_fetch_components[index];
-		formats[index] = InputFormat(input_info.resources[index],
-		                             fetched > 0 ? fetched : static_cast<uint32_t>(registers_num));
-	}
-	return formats;
-}
-
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
@@ -340,10 +326,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	// The inputs of these come from the stage's static key.
-	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
-		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
-	} else if (key.stage == ShaderType::Pixel &&
-	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
+	if (key.stage == ShaderType::Pixel &&
+	    options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
@@ -1037,9 +1021,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
 			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
+			const auto registers_num = vs_input_info.resources_dst[attribute].registers_num;
+			EXIT_IF(registers_num < 1 || registers_num > 4);
+			const auto fetched = stages[0]->info.info.vertex_fetch_components[attribute];
 			key.vertex_input.attributes[attribute] = {
 			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
 			                                    vs_input_info.buffers[binding].addr),
+			    .format = InputFormat(vs_input_info.resources[attribute],
+			                          fetched > 0 ? fetched : static_cast<uint32_t>(registers_num)),
 			    .binding = static_cast<uint8_t>(binding),
 			};
 		}

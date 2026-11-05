@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -7946,6 +7947,27 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
 void TestEmbeddedVertexFormatSwizzle() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
+  const auto signature = Format::VertexFetchSignature(0x4022c);
+  Check(signature == Format::VertexFetchSignature(0x1722c) &&
+            signature == Format::VertexFetchSignature(0x42fac) &&
+            signature == Format::VertexFetchSignature(0x4a3ac),
+        "Vulkan default channels fragmented the vertex fetch signature");
+  Check(signature != Format::VertexFetchSignature((66u << 12u) | DstSel(4, 5, 6, 1)) &&
+            signature != Format::VertexFetchSignature((64u << 12u) | DstSel(1, 5, 0, 1)) &&
+            signature != Format::VertexFetchSignature((64u << 12u) | DstSel(4, 5, 0, 0)),
+        "vertex fetch signature merged a constant into a memory read");
+  Check(Format::VertexFetchSignature((62u << 12u) | DstSel(4, 5, 0, 1)) !=
+                Format::VertexFetchSignature((64u << 12u) | DstSel(4, 5, 0, 1)) &&
+            Format::VertexFetchSignature((63u << 12u) | DstSel(4, 5, 0, 1)) !=
+                Format::VertexFetchSignature((64u << 12u) | DstSel(4, 5, 0, 1)) &&
+            Format::VertexFetchSignature((62u << 12u) | DstSel(4, 5, 0, 1)) !=
+                Format::VertexFetchSignature((63u << 12u) | DstSel(4, 5, 0, 1)),
+        "vertex fetch signature merged float, uint and sint fetches");
+  for (const uint32_t word : {(113u << 12u) | DstSel(4, 5, 6, 7), (121u << 12u) | DstSel(4, 5, 0, 1),
+                              (64u << 12u) | DstSel(2, 5, 0, 1), (64u << 12u) | DstSel(4, 3, 0, 1)}) {
+    Check(Format::VertexFetchSignature(word) == word,
+          "raw formats and invalid selectors must keep the raw word");
+  }
   struct Case {
     Prospero::BufferFormat format;
     uint32_t swizzle, opcode, components, source_width;
@@ -7955,23 +7977,23 @@ void TestEmbeddedVertexFormatSwizzle() {
   const Case cases[] = {
       {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 7), 3, 4, 3,
        {0x3e800000, 0x3f000000, 0x3f400000, 0x3e800000}},
-      {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 1), 3, 4, 3,
+      {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 1), 3, 4, 4,
        {0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000}},
       {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(7, 6, 5, 0), 3, 4, 4,
        {0x40000000, 0x3f400000, 0x3f000000, 0}},
       {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(7, 0, 0, 0), 0, 1, 4,
        {0x40000000, 0, 0, 0}},
-      {Prospero::BufferFormat::k32UInt, DstSel(1, 0, 1, 0), 3, 4, 0,
+      {Prospero::BufferFormat::k32UInt, DstSel(1, 0, 1, 0), 3, 4, 2,
        {1, 0, 1, 0}},
-      {Prospero::BufferFormat::k32Float, DstSel(1, 0, 1, 0), 3, 4, 0,
+      {Prospero::BufferFormat::k32Float, DstSel(1, 0, 1, 0), 3, 4, 2,
        {0x3f800000, 0, 0x3f800000, 0}},
       {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 0x0e, 4, 4,
        {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000}},
-      {Prospero::BufferFormat::k32UInt, DstSel(7, 6, 5, 4), 3, 4, 1,
+      {Prospero::BufferFormat::k32UInt, DstSel(7, 6, 5, 4), 3, 4, 4,
        {0x3e800000, 0, 0, 1}, Prospero::VertexAttribFormat::k32UInt},
-      {Prospero::BufferFormat::k32_32Float, DstSel(7, 6, 5, 4), 3, 4, 2,
+      {Prospero::BufferFormat::k32_32Float, DstSel(7, 6, 5, 4), 3, 4, 4,
        {0x3e800000, 0x3f000000, 0, 0x3f800000}, Prospero::VertexAttribFormat::k32_32Float},
-      {Prospero::BufferFormat::k32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 3,
+      {Prospero::BufferFormat::k32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 4,
        {0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000},
        Prospero::VertexAttribFormat::k32_32_32Float},
       {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 4,
@@ -8032,7 +8054,13 @@ void TestEmbeddedVertexFormatSwizzle() {
     auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
     Check(program.info.vertex_fetch_components[0] == test.source_width,
           "vertex fetch width follows destination VGPR count instead of selected source channels");
-    const uint32_t source[] = {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000};
+    uint32_t source[] = {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000};
+    const auto format = Format::GetFormatInfo(input.resources[0].Format());
+    for (uint32_t component = format.component_count; component < 4; ++component) {
+      source[component] = Format::FormattedConstantBits(
+          format, component == 3 ? Format::FormattedSourceKind::One
+                                 : Format::FormattedSourceKind::Zero);
+    }
     for (auto *block : program.blocks) {
       for (auto &inst : *block) {
         if (inst.GetOpcode() == ValueOpcode::GetAttribute) {

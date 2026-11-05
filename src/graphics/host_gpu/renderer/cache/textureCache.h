@@ -47,6 +47,7 @@ public:
 		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
 
+	/// Reads the readback options once. Fault waits need their own flag and a readback option.
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
 	~TextureCache();

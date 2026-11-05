@@ -78,6 +78,8 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
+	::printf("  --readback-fault-wait                Make CPU access wait for pending linear image readbacks.\n");
+	::printf("                                       Needs --readback-linear-images.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
@@ -202,6 +204,7 @@ static constexpr Flag FLAGS[] = {
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
+    {"--readback-fault-wait", &ConfigOptions::readback_fault_wait},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},

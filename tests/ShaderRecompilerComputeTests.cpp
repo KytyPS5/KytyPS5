@@ -11251,6 +11251,41 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // The flag has to reach the texture cache, and alone must not change anything, since it only
+  // refines readback. Each case changes one option from another case.
+  void CheckReadbackFaultWaitFlag() {
+    constexpr const char *name = "ReadbackFaultWaitFlag";
+    EnsureRuntimeContext();
+    const auto enabled_with = [this](bool fault_wait, bool linear, bool tiled) {
+      Config::ConfigOptions options;
+      options.printf_direction = Config::LogDirection::Silent;
+      options.readback_fault_wait = fault_wait;
+      options.readback_linear_images = linear;
+      options.readback_tiled_images = tiled;
+      Config::Load(options);
+      RenderContext context(m_runtime_context);
+      return context.GetTextureCache().ReadbackFaultWaitEnabled();
+    };
+    const bool everything_off = enabled_with(false, false, false);
+    const bool flag_alone = enabled_with(true, false, false);
+    const bool linear_alone = enabled_with(false, true, false);
+    const bool tiled_alone = enabled_with(false, false, true);
+    const bool with_linear = enabled_with(true, true, false);
+    const bool with_tiled = enabled_with(true, false, true);
+    Config::ConfigOptions restored;
+    restored.printf_direction = Config::LogDirection::Silent;
+    Config::Load(restored);
+    // Read from the struct, because a wrong default would turn holds on for anyone using readback.
+    Require(name, "off by default", !Config::ConfigOptions{}.readback_fault_wait,
+            "the flag was on by default");
+    Require(name, "everything off", !everything_off, "the switch was on with every option off");
+    Require(name, "no effect alone", !flag_alone, "the flag had an effect without readback");
+    Require(name, "readback alone", !linear_alone && !tiled_alone,
+            "readback turned the switch on without the flag");
+    Require(name, "on with linear", with_linear, "the flag did not reach linear readback");
+    Require(name, "on with tiled", with_tiled, "the flag did not reach tiled readback");
+  }
+
   // A fault on a held page has to end with the guest able to see the GPU's data, by the route each
   // kind of thread can safely take. Reads and writes compare against a baseline with the switch
   // off, and the other scenarios check their own starting state first.
@@ -56522,6 +56557,7 @@ int main(int argc, char **argv) {
   vulkan.CheckReadbackAtLabel();
   vulkan.CheckReadbackHoldAtLabel();
   vulkan.CheckReadbackFaultWait();
+  vulkan.CheckReadbackFaultWaitFlag();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

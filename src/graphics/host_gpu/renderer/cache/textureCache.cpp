@@ -133,7 +133,13 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	                       return master.KnownGpuTick();
                        }),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_readback_fault_wait(Config::ReadbackFaultWaitEnabled() &&
+                            (m_readback_linear_images || m_readback_tiled_images)) {
+	// The flag doesn't turn readback on itself, so say why it has no effect here.
+	if (Config::ReadbackFaultWaitEnabled() && !m_readback_fault_wait) {
+		LOGF("TextureCache: --readback-fault-wait has no effect without image readback\n");
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =

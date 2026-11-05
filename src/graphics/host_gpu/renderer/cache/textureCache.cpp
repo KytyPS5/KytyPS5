@@ -124,6 +124,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
+      // Refreshes first, since nothing else updates the tick while the GPU thread is stalled and
+      // the priority thread is blocked waiting, and a stale tick would look like a stuck GPU.
+      m_readback_guard(page_manager,
+                       [&scheduler] {
+	                       auto& master = scheduler.GetMasterSemaphore();
+	                       master.Refresh();
+	                       return master.KnownGpuTick();
+                       }),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -1788,6 +1796,38 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+GuestRange TextureCache::HoldReadback(const Image& image) {
+	if (!m_readback_fault_wait) {
+		return {};
+	}
+	const auto& info  = image.info;
+	const auto  range = ReadbackGuard::HoldRange({.data   = info.data,
+	                                              .levels = info.resources.levels,
+	                                              .layers = info.resources.layers,
+	                                              .depth  = info.extent.depth,
+	                                              .tiled  = info.IsTiled()});
+	return !range.Empty() && m_readback_guard.Hold(range) ? range : GuestRange {};
+}
+
+void TextureCache::RecordReadbackCopy(Image& image, Buffer& download, uint64_t offset,
+                                      GuestRange range) {
+	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download.Handle();
+	barrier.offset              = offset;
+	barrier.size                = range.size;
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                                               1, &barrier, 0, nullptr);
+}
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -1808,28 +1848,25 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
+	const auto held = HoldReadback(image);
+	// Read again now the pages are held, so a guest write just before the hold isn't lost in any
+	// bytes the GPU copy leaves alone when the landing writes this snapshot back.
+	if (!held.Empty() && !LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+		m_readback_guard.Release(held);
+		return false;
+	}
 	download.Commit();
 	download.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
-	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
-	                        vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
-	barrier.offset              = offset;
-	barrier.size                = range.size;
-	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
-	                                               1, &barrier, 0, nullptr);
+	RecordReadbackCopy(image, download, offset, range);
 	m_readbacks_in_flight.fetch_add(1, std::memory_order_acq_rel);
-	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, held] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		// Only after the write, or a waiting guest could wake and read the old bytes.
+		if (!held.Empty()) {
+			m_readback_guard.Release(held);
+		}
 		m_readbacks_in_flight.fetch_sub(1, std::memory_order_acq_rel);
 	});
 	return true;
@@ -1912,6 +1949,9 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
+	// The pages are going away, so nothing may wait on them or find them still protected. The lock
+	// keeps a download from taking a new hold on this range after the lift.
+	m_readback_guard.LiftRange(address, size);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
 	auto images = FindImagesInRegion(address, size);

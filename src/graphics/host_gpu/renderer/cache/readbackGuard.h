@@ -61,7 +61,8 @@ public:
 
 	/// Uses the default limits.
 	/// @param progress returns a value that changes whenever the GPU makes progress. It runs with
-	/// the guard's mutex held and on faulting threads, so it must not block or take other locks.
+	/// the guard's mutex held and on faulting threads, when a wait starts and after each wake, so it
+	/// must not block or take locks that a landing needs.
 	ReadbackGuard(PageManager& page_manager, std::function<uint64_t()> progress);
 	/// Uses the given limits, which tests shorten.
 	ReadbackGuard(PageManager& page_manager, std::function<uint64_t()> progress, Limits limits);

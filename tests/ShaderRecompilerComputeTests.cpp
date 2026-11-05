@@ -373,6 +373,20 @@ struct TextureCacheTestAccess {
     (void)cache.AssociateStencil(depth, stencil);
   }
 
+  static void SetReadbackFaultWait(TextureCache &cache, bool enabled) {
+    cache.m_readback_fault_wait = enabled;
+  }
+
+  static bool ReachesBackingRead(const TextureCache &cache, ImageId id) {
+    const auto &image = cache.m_slot_images[id];
+    return image.registered && !image.depth_id && image.SafeToDownload() &&
+           cache.CanDownload(image) && cache.m_download_images.contains(id);
+  }
+
+  static bool ReadBlocked(const TextureCache &cache, uint64_t address) {
+    return !cache.m_page_manager.WatchersAllowAccess(address, PageFaultAccess::Read);
+  }
+
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
     cache.m_readback_linear_images = enabled;
   }
@@ -10902,6 +10916,325 @@ public:
     scheduler.Finish();
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A held readback has to block guest access from queueing until landing, with its label still
+  // written at once, because a held label is what lowered Astro Bot's resolution. Each scenario
+  // runs the same release with one thing changed, so a held page can't come from the setup.
+  void CheckReadbackHoldAtLabel() {
+    constexpr const char *name = "ReadbackHoldAtLabel";
+    constexpr uintptr_t base = 0x0000000240800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t page_size = TRACKER_PAGE_SIZE;
+    constexpr uint32_t page_width = page_size / sizeof(uint32_t);
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t stale_value = 0x2468ace0u;
+    constexpr uint32_t label_value = 0x55u;
+    constexpr auto unmap_settle_time = std::chrono::milliseconds(50);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    // Flexible and direct memory are both backed, and only runtime allocations are private.
+    const auto private_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+        0, allocation_size, Common::VirtualMemory::Mode::ReadWrite, "readback_hold_private");
+    Require(name, "private mapping", private_base != 0, "private allocation failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, allocation_size);
+    context.MapMemory(private_base, allocation_size);
+    auto &texture_cache = context.GetTextureCache();
+    auto &guard = texture_cache.GetReadbackGuard();
+    CommandProcessor processor(context, 0);
+
+    alignas(uint64_t) uint32_t label = 0;
+    const auto label_address = reinterpret_cast<uint64_t>(&label);
+    constexpr uint32_t bottom_of_pipe_event = 0x28u;
+    constexpr uint32_t event_index = 5u;
+    std::array<uint32_t, 8> release{};
+    release[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+    release[1] = bottom_of_pipe_event | (event_index << 8u);
+    release[2] = 1u << 29u; // INT_SEL 0 (none), DATA_SEL 1 (32-bit value)
+    release[3] = static_cast<uint32_t>(label_address);
+    release[4] = static_cast<uint32_t>(label_address >> 32u);
+    release[5] = label_value;
+
+    const auto read_guest = [] {
+      uint32_t value = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value));
+      return value;
+    };
+    const auto make_gpu_image = [&](uint64_t address, uint32_t width) {
+      auto desc = MakeLinearDesc(address, uint64_t{width} * sizeof(uint32_t), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {width, 1, 1}, 1, 4, 1);
+      desc.type = BindingType::Storage;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      return image;
+    };
+    // Runs one release with the priority thread parked, so nothing can land before the checks.
+    const auto release_parked = [&](auto &&check) {
+      std::binary_semaphore parked{0};
+      gpu.SendCommandSync([&] {
+        scheduler.DeferPriorityOperation([&] { parked.acquire(); });
+        Pm4Execution execution;
+        label = 0;
+        const bool processed = processor.Process(execution, release) == Pm4ProcessResult::Complete;
+        check(processed && label == label_value);
+      });
+      parked.release();
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      });
+    };
+    ImageId image{};
+    const auto prepare_page_image = [&] {
+      gpu.SendCommandSync([&] {
+        processor.BufferInit();
+        image = make_gpu_image(base, page_width);
+        Require(name, "image clear",
+                texture_cache.ClearImageFromBuffer(scheduler.Current(), base, page_size, gpu_value),
+                "failed to create GPU-current image contents");
+        TextureCacheTestAccess::TrackDownload(texture_cache, image);
+        Libs::LibKernel::Memory::WriteBacking(base, &stale_value, sizeof(stale_value));
+      });
+    };
+
+    TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+
+    // Baseline with the switch off. The same readback lands without any protection.
+    prepare_page_image();
+    bool off_clean = false;
+    release_parked([&](bool label_written) {
+      off_clean = label_written && texture_cache.HasReadbacksInFlight() && !guard.HasPending() &&
+                  guard.GetCounters().holds == 0 && read_guest() == stale_value &&
+                  !TextureCacheTestAccess::ReadBlocked(texture_cache, base);
+    });
+    Require(name, "switch off", off_clean, "a readback was held with the switch off");
+    Require(name, "switch off landed", read_guest() == gpu_value,
+            "the baseline readback did not land");
+
+    // The same readback with the switch on. Only the protection changes.
+    TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, true);
+    prepare_page_image();
+    bool on_label = false;
+    bool on_pending = false;
+    bool on_counted = false;
+    bool on_blocked = false;
+    bool on_stale = false;
+    release_parked([&](bool label_written) {
+      on_label = label_written;
+      on_pending = guard.HasPending();
+      on_counted = guard.GetCounters().holds == 1;
+      on_blocked = TextureCacheTestAccess::ReadBlocked(texture_cache, base);
+      on_stale = read_guest() == stale_value;
+    });
+    Require(name, "held label", on_label, "a held readback held its label back too");
+    Require(name, "held pending", on_pending, "a qualifying readback was not held");
+    Require(name, "held count", on_counted, "a qualifying readback was not held exactly once");
+    Require(name, "held blocked", on_blocked, "a held readback left its page readable");
+    Require(name, "held stale", on_stale, "a readback landed before its priority operation");
+    Require(name, "landed",
+            read_guest() == gpu_value && !guard.HasPending() && guard.TrackedRanges() == 0 &&
+                !TextureCacheTestAccess::ReadBlocked(texture_cache, base),
+            "a landing did not write the data and lift the hold");
+
+    // An image with no whole page is not held, so unrelated data on its page never waits.
+    bool small_clear = false;
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      image = make_gpu_image(base + page_size * 2, 1);
+      Require(name, "small clear",
+              texture_cache.ClearImageFromBuffer(scheduler.Current(), base + page_size * 2,
+                                                 sizeof(uint32_t), gpu_value),
+              "failed to create GPU-current small image");
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+    });
+    release_parked([&](bool label_written) {
+      small_clear = label_written && texture_cache.HasReadbacksInFlight() && !guard.HasPending() &&
+                    guard.GetCounters().holds == 1;
+    });
+    Require(name, "small image", small_clear, "an image with no whole page was held");
+
+    // Private memory is never held, because a thread copying from it keeps the address-space lock.
+    bool private_clear = false;
+    bool private_ready = false;
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      // An upload from private memory exits, so this image skips it and only looks GPU-written. It
+      // must be downloadable, or the check below would pass without reaching the backing read.
+      const auto desc = MakeLinearDesc(private_base, page_size, vk::Format::eR32Uint,
+                                       Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {page_width, 1, 1}, 1, 4, 1);
+      image = TextureCacheTestAccess::InsertImage(texture_cache, desc.info);
+      auto &owner = TextureCacheTestAccess::MutableImage(texture_cache, image);
+      owner.RefreshComplete();
+      owner.MarkGpuModified();
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+      private_ready = TextureCacheTestAccess::ReachesBackingRead(texture_cache, image);
+    });
+    Require(name, "private image ready", private_ready, "the private image was not downloadable");
+    release_parked([&](bool label_written) {
+      private_clear = label_written && !guard.HasPending() && guard.GetCounters().holds == 1;
+    });
+    Require(name, "private memory", private_clear, "a private mapping was held");
+    gpu.SendCommandSync([&] {
+      TextureCacheTestAccess::MutableImage(texture_cache, image).ClearGpuModified();
+    });
+
+    // An image with several levels or layers, or a volume, doesn't qualify, whatever its size. Each
+    // differs from the page image in one way, and reaches the download so a refusal can't come from
+    // elsewhere.
+    const auto check_not_held = [&](const char *scenario, auto &&change) {
+      bool ready = false;
+      const auto address = base + page_size * 8;
+      gpu.SendCommandSync([&] {
+        processor.BufferInit();
+        auto desc = MakeLinearDesc(address, page_size * 2, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {page_width, 1, 1}, 1, 4, 1);
+        change(desc);
+        image = TextureCacheTestAccess::InsertImage(texture_cache, desc.info);
+        auto &owner = TextureCacheTestAccess::MutableImage(texture_cache, image);
+        owner.RefreshComplete();
+        owner.MarkGpuModified();
+        TextureCacheTestAccess::TrackDownload(texture_cache, image);
+        ready = TextureCacheTestAccess::ReachesBackingRead(texture_cache, image);
+      });
+      Require(name, scenario, ready, "the image was not downloadable");
+      const auto holds_before = guard.GetCounters().holds;
+      bool clear = false;
+      release_parked([&](bool label_written) {
+        clear = label_written && texture_cache.HasReadbacksInFlight() && !guard.HasPending() &&
+                guard.GetCounters().holds == holds_before;
+      });
+      Require(name, scenario, clear, "a non-qualifying image was held");
+      gpu.SendCommandSync([&] {
+        TextureCacheTestAccess::MutableImage(texture_cache, image).ClearGpuModified();
+        TextureCacheTestAccess::DeleteImage(texture_cache, image);
+      });
+    };
+    check_not_held("two layers", [&](auto &desc) {
+      desc.info.resources.layers = 2;
+      desc.info.linear_slice_stride = page_size;
+    });
+    check_not_held("two levels", [&](auto &desc) {
+      desc.info.resources.levels = 2;
+      auto second_level = desc.info.mip_layout[0];
+      second_level.offset = page_size;
+      second_level.size = page_size / 2;
+      second_level.pitch = page_width / 2;
+      second_level.linear_offset = page_size;
+      second_level.linear_size = page_size / 2;
+      second_level.linear_pitch = page_width / 2;
+      desc.info.mip_layout[1] = second_level;
+    });
+    check_not_held("volume", [&](auto &desc) {
+      desc.info.type = Prospero::ImageType::kColor3D;
+      desc.info.extent = {page_width, 1, 2};
+      desc.info.UpdateSize();
+    });
+
+    // An unaligned image holds only its whole pages, so unrelated data on its edge pages never
+    // waits. It lands and releases exactly what it held.
+    constexpr uint64_t unaligned_pages = 3;
+    const auto unaligned_base = base + page_size * 16 + page_size / 2;
+    const auto first_whole_page = base + page_size * 17;
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      image = make_gpu_image(unaligned_base, page_width * unaligned_pages);
+      Require(name, "unaligned clear",
+              texture_cache.ClearImageFromBuffer(scheduler.Current(), unaligned_base,
+                                                 page_size * unaligned_pages, gpu_value),
+              "failed to create GPU-current unaligned image");
+      TextureCacheTestAccess::TrackDownload(texture_cache, image);
+    });
+    bool whole_held = false;
+    bool edges_open = false;
+    release_parked([&](bool label_written) {
+      whole_held = label_written && guard.HasPending() &&
+                   TextureCacheTestAccess::ReadBlocked(texture_cache, first_whole_page) &&
+                   TextureCacheTestAccess::ReadBlocked(texture_cache, first_whole_page + page_size);
+      edges_open = !TextureCacheTestAccess::ReadBlocked(texture_cache, first_whole_page - 1) &&
+                   !TextureCacheTestAccess::ReadBlocked(
+                       texture_cache, first_whole_page + page_size * (unaligned_pages - 1));
+    });
+    Require(name, "whole pages held", whole_held, "an unaligned image's whole pages were not held");
+    Require(name, "edge pages open", edges_open, "an unaligned image held its partial pages");
+    Require(name, "unaligned landed", !guard.HasPending() && guard.TrackedRanges() == 0,
+            "an unaligned image's landing did not release its hold");
+
+    // The cache's own unmap lifts a pending hold, and the landing still releases it afterwards.
+    prepare_page_image();
+    bool unmap_lifted = false;
+    release_parked([&](bool label_written) {
+      const bool held = label_written && guard.HasPending();
+      texture_cache.UnmapMemory(base, allocation_size);
+      unmap_lifted = held && !guard.HasPending() && guard.TrackedRanges() == 1;
+    });
+    Require(name, "unmap", unmap_lifted, "unmapping did not lift a pending hold");
+    Require(name, "unmap landing", guard.TrackedRanges() == 0,
+            "a landing after an unmap left its range tracked");
+
+    // A real unmap waits for a pending landing, so the landing can't write into memory that has
+    // gone. Parking the landing shows the wait, and it finishes cleanly once the landing runs.
+    prepare_page_image();
+    std::binary_semaphore unmap_parked{0};
+    bool held_for_unmap = false;
+    gpu.SendCommandSync([&] {
+      scheduler.DeferPriorityOperation([&] { unmap_parked.acquire(); });
+      Pm4Execution execution;
+      held_for_unmap = processor.Process(execution, release) == Pm4ProcessResult::Complete &&
+                       guard.HasPending();
+    });
+    Require(name, "held for unmap", held_for_unmap, "the readback before the unmap was not held");
+    std::atomic<bool> unmapped{false};
+    std::thread unmapper([&] {
+      context.UnmapMemory(base, allocation_size);
+      unmapped = true;
+    });
+    std::this_thread::sleep_for(unmap_settle_time);
+    const bool unmapped_early = unmapped.load();
+    unmap_parked.release();
+    unmapper.join();
+    Require(name, "unmap waits", !unmapped_early, "an unmap did not wait for a pending landing");
+    Require(name, "unmap clean", !guard.HasPending() && guard.TrackedRanges() == 0,
+            "an unmap left a hold behind");
+    Require(name, "unmap data", read_guest() == gpu_value,
+            "the landing an unmap waited for did not write its data");
+
+    TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, false);
+    TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+    context.UnmapMemory(private_base, allocation_size);
+    scheduler.Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap private mapping",
+            Libs::LibKernel::Memory::FreeGuestMemory(private_base, allocation_size),
+            "private allocation release failed");
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "direct-memory mapping release failed");
@@ -55807,6 +56140,7 @@ int main(int argc, char **argv) {
   vulkan.CheckTextureCacheDownloadRetry();
   vulkan.CheckTextureCacheDownloadDropAtLabel();
   vulkan.CheckReadbackAtLabel();
+  vulkan.CheckReadbackHoldAtLabel();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

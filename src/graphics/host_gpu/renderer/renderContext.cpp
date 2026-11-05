@@ -22,6 +22,8 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	// Every landing has run by now, so this only lifts what a landing missed.
+	m_texture_cache.GetReadbackGuard().LiftAll();
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {

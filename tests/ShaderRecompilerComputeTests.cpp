@@ -622,11 +622,30 @@ struct PipelineCacheTestAccess {
     cache.StoreLayout(key, layout);
   }
 
-  // Holds the store thread until the cache is destroyed.
+  // Holds the store thread until Save(), which destroying the cache also calls.
   static void HoldStoreUntilExit(PipelineCache &cache) {
     cache.m_store.Post([stop = cache.m_store.m_thread.get_stop_token()] {
       while (!stop.stop_requested()) std::this_thread::yield();
     });
+  }
+
+  static void Post(PipelineCache &cache, Common::UniqueFunction<void> &&job) {
+    cache.m_store.Post(std::move(job));
+  }
+
+  // Gives the cache an empty driver cache saved to `path`.
+  static void UseDriverCache(PipelineCache &cache, const std::filesystem::path &path) {
+    const vk::PipelineCacheCreateInfo create{};
+    EXIT_IF(cache.m_driver_cache != nullptr ||
+            cache.m_graphics.device.createPipelineCache(&create, nullptr, &cache.m_driver_cache) !=
+                vk::Result::eSuccess);
+    cache.m_driver_cache_path = path;
+  }
+
+  // A due checkpoint has the store thread write the driver cache.
+  static void CheckpointDriverCache(PipelineCache &cache, bool due) {
+    if (due) cache.m_next_driver_cache_save = {};
+    cache.CheckpointDriverCache();
   }
 
   static const auto &TessLayouts(const PipelineCache &cache) { return cache.m_tess_layouts; }
@@ -48363,6 +48382,37 @@ void CheckShaderStore(VulkanHarness &vulkan) {
             "a restart did not load the stored tessellation layout");
     Require(name, "drain at exit", layouts.contains(2),
             "a record still queued when the cache was destroyed was dropped");
+  }
+  // A due driver cache is written on the store thread, which runs without a store too; Save()
+  // finishes a queued write and writes what changed after it before it returns.
+  {
+    const auto driver_cache = store.parent_path() / "TEST00000.bin";
+    RenderContext context(vulkan.RuntimeContext());
+    auto &cache = context.GetPipelineCache();
+    PipelineCacheTestAccess::UseDriverCache(cache, driver_cache);
+    std::atomic_bool held = true;
+    PipelineCacheTestAccess::Post(cache, [&held] {
+      while (held) std::this_thread::yield();
+    });
+    PipelineCacheTestAccess::CheckpointDriverCache(cache, /*due=*/true);
+    const bool deferred = !std::filesystem::exists(driver_cache);
+    held = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!std::filesystem::exists(driver_cache) && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    Require(name, "driver cache thread", deferred && std::filesystem::exists(driver_cache),
+            "a due driver cache was written on the creating thread or not at all");
+    std::filesystem::remove(driver_cache);
+    PipelineCacheTestAccess::HoldStoreUntilExit(cache);
+    PipelineCacheTestAccess::CheckpointDriverCache(cache, /*due=*/true);
+    cache.Save();
+    Require(name, "queued driver cache", std::filesystem::exists(driver_cache),
+            "Save() returned before a queued driver cache write ran");
+    std::filesystem::remove(driver_cache);
+    PipelineCacheTestAccess::CheckpointDriverCache(cache, /*due=*/false);
+    cache.Save();
+    Require(name, "driver cache at exit", std::filesystem::exists(driver_cache),
+            "Save() returned before the changed driver cache was written");
   }
   std::filesystem::remove_all(store.parent_path());
   Require(name, "release",

@@ -54,6 +54,12 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	/// Waits until no pending readback holds this range, for host calls that can't take a fault.
+	/// Only guest threads may wait on a held range. The GPU thread submits the landing, the priority
+	/// thread runs it, and a pending operation can't wait on it, so those would only time out.
+	void               WaitForReadbacks(uint64_t vaddr, uint64_t size) noexcept;
+	/// Tells the caches the host is about to write this range. It waits first as WaitForReadbacks
+	/// does, so the same rule applies when part of the range may be held.
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

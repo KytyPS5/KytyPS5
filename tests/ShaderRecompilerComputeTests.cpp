@@ -57,6 +57,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/dialog.h"
@@ -11409,6 +11410,66 @@ public:
       Require(name, "write survives", read_guest() == guest_value,
               "a guest write during a pending readback was lost");
       gpu.SendCommandSync([&] { (void)context.InvalidateMemory(base, page_size); });
+    }
+
+    // A host call fails on a held page instead of faulting, so it has to wait before it starts.
+    // Returns whether the call waited while the landing was parked, and saw the data once it ended.
+    const auto host_call_waits = [&](auto &&host_call) {
+      prepare();
+      std::binary_semaphore parked{0};
+      release_with_landing_parked(parked);
+      bool landed = false;
+      std::thread caller([&] {
+        host_call();
+        landed = read_guest() == gpu_value;
+      });
+      const bool waited = await_waiter();
+      parked.release();
+      caller.join();
+      finish();
+      gpu.SendCommandSync([&] { (void)context.InvalidateMemory(base, page_size); });
+      return waited && landed;
+    };
+    const auto invalidate_held_page = [&] { (void)context.InvalidateMemory(base, page_size); };
+    Require(name, "host read waits", host_call_waits(invalidate_held_page),
+            "invalidating a held page did not wait");
+    // Starts on a page that isn't mapped, so the call can't reach the caches, yet the host would
+    // still touch the held page after it.
+    Require(name, "host read straddling waits", host_call_waits([&] {
+              (void)context.InvalidateMemory(base - page_size, page_size * 2);
+            }),
+            "invalidating a partly mapped range did not wait for its held page");
+    Require(name, "kernel straddling waits", host_call_waits([] {
+              Libs::LibKernel::Memory::WaitForGpuReadbacks(base - page_size, page_size * 2);
+            }),
+            "the kernel wait missed a held page after the start of its range");
+    // A bad descriptor fails without touching the buffer, so no fault can stand in for the wait.
+    Require(name, "host write waits", host_call_waits([] {
+              constexpr int bad_descriptor = -1;
+              (void)Libs::LibKernel::FileSystem::KernelWrite(
+                  bad_descriptor, reinterpret_cast<const void *>(base), page_size);
+            }),
+            "a write from a held page did not wait");
+
+    // Baseline for the host waits with only the switch changed. The readback is still in flight but
+    // nothing is held, so nothing waits.
+    {
+      TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, false);
+      const auto waits_before = guard.GetCounters().waits;
+      prepare();
+      std::binary_semaphore parked{0};
+      release_with_landing_parked(parked);
+      const bool in_flight_unheld = texture_cache.HasReadbacksInFlight() && !guard.HasPending();
+      invalidate_held_page();
+      Libs::LibKernel::Memory::WaitForGpuReadbacks(base, page_size);
+      const bool nothing_waited = guard.GetCounters().waits == waits_before;
+      parked.release();
+      finish();
+      gpu.SendCommandSync([&] { (void)context.InvalidateMemory(base, page_size); });
+      TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, true);
+      Require(name, "host off state", in_flight_unheld,
+              "the baseline did not have an unheld readback in flight");
+      Require(name, "host off", nothing_waited, "a host call waited with the switch off");
     }
 
     // The GPU thread can't wait on a guard, since only it can submit the landing. A fault there

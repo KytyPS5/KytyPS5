@@ -105,7 +105,14 @@ bool RenderContext::ResolveReadbackFault(PageFaultAccess access, uint64_t fault_
 	return m_page_manager.WatchersAllowAccess(fault_vaddr, access);
 }
 
+void RenderContext::WaitForReadbacks(uint64_t vaddr, uint64_t size) noexcept {
+	(void)m_texture_cache.GetReadbackGuard().WaitRange(vaddr, size);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	// Host calls fail on a held page rather than fault. This comes first because a range that isn't
+	// wholly mapped can still overlap a held page.
+	WaitForReadbacks(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}

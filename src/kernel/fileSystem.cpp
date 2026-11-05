@@ -643,6 +643,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	}
 
 	if (::Libs::Network::Net::IsSocket(d)) {
+		Memory::WaitForGpuReadbacks(reinterpret_cast<uint64_t>(buf), nbytes);
 		const auto result = ::Libs::Network::Net::Recv(d, buf, nbytes, 0);
 		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
 	}
@@ -705,6 +706,8 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (buf == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
+
+	Memory::WaitForGpuReadbacks(reinterpret_cast<uint64_t>(buf), nbytes);
 
 	if (d == 1 || d == 2) {
 		auto*      out      = (d == 1 ? stdout : stderr);
@@ -958,6 +961,8 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
+	Memory::WaitForGpuReadbacks(reinterpret_cast<uint64_t>(buf), nbytes);
+
 	file->mutex.Lock();
 
 	bool     is_invalid    = file->f.IsInvalid();
@@ -1035,6 +1040,7 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 		if (buffer.iov_len == 0) {
 			continue;
 		}
+		Memory::WaitForGpuReadbacks(reinterpret_cast<uint64_t>(buffer.iov_base), buffer.iov_len);
 		uint32_t bytes = 0;
 		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);

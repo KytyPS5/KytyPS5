@@ -363,7 +363,7 @@ uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
-void     DefineModule(EmitterState& state);
+void     DefineModule(EmitterState& state, uint32_t push_data_ceiling);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,

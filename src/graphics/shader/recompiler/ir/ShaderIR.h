@@ -381,11 +381,16 @@ struct PushData {
 		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
 	}
 
-	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
-		return size != 0 && start <= DwordCount && size <= DwordCount - start;
+	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size,
+	                                           uint32_t ceiling = DwordCount) {
+		return size != 0 && ceiling <= DwordCount && start <= ceiling && size <= ceiling - start;
 	}
-	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
-		return CanFit(cursor, size) ? cursor : NoStart;
+	[[nodiscard]] static constexpr uint32_t StartFor(ShaderType stage, uint32_t floor,
+	                                                 uint32_t size, uint32_t ceiling = DwordCount) {
+		if (stage == ShaderType::Pixel || stage == ShaderType::Compute) {
+			return CanFit(floor, size) ? floor : NoStart;
+		}
+		return CanFit(floor, size, ceiling) ? ceiling - size : NoStart;
 	}
 };
 

@@ -451,10 +451,30 @@ void Mp3ParseFrame() {
 	      "MP3 parse of a Layer II frame");
 }
 
+// Demon's Souls' haptic banks hold 48 kHz dual-mono ATRAC9 streams (192-byte superframes of one
+// frame) with a few frames LibAtrac9 cannot unpack; PS5 keeps decoding them. An all-zero frame
+// fails to unpack the same way (scale factor out of range).
+void UndecodableAt9FrameIsSilent() {
+	AjmAt9Decoder decoder(2, 48000, AjmSampleEncoding::S16, 0);
+	const AjmDecAt9InitializeParameters parameters {{0xfe, 0x72, 0x17, 0xe0}, 0};
+	Check(decoder.Initialize(&parameters, sizeof(parameters)).result == OK, "initialize ATRAC9");
+	const std::vector<uint8_t> input(2 * 192, 0);
+	std::vector<uint8_t>       output(2 * 256 * 2 * sizeof(int16_t), 0xcd);
+	const auto result = decoder.Decode(input.data(), input.size(), output.data(), output.size(),
+	                                   true, nullptr);
+	Check(result.result == OK, "an unpackable ATRAC9 frame does not fail the job");
+	Check(result.frames == 2 && result.input_consumed == input.size() &&
+	          result.output_written == output.size() && result.total_decoded_samples == 512,
+	      "an unpackable ATRAC9 frame takes its superframe and plays its samples");
+	Check(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0; }),
+	      "an unpackable ATRAC9 frame plays as silence");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
 	Mp3ParseFrame();
+	UndecodableAt9FrameIsSilent();
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
 	SmallOutputs(packet, 312);

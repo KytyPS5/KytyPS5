@@ -5898,6 +5898,37 @@ void TestNativeConstantSamplerSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNullImageTakesDeclaredCube() {
+  using namespace ShaderRecompiler::IR;
+  // image_sample_lz v0, v[2:4], s[8:15], s[16:19] dmask:0x1 dim:CUBE, then the result is stored.
+  const uint32_t shader[] = {
+      EncodeMimg0(0x27, 0x1, false, 3), EncodeMimg1(0, 2, 4, 2),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto user_data = ImageTestUserData();
+  user_data[0] = 0x1000u;
+  user_data[1] = 0u;
+  user_data[2] = 4u;
+  user_data[3] = 0x30005204u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto plan = ExtractResourcePlan(ShaderRecompiler::TranslateProgram(shader, options).program);
+  const auto specialize = [&](std::array<uint32_t, 8> descriptor) {
+    std::ranges::copy(descriptor, user_data.begin() + 8);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization),
+          "cube sample resources did not materialize");
+    return specialization;
+  };
+  const auto cube = specialize({0x100u, static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u,
+                                0u, DstSel(4, 5, 6, 7) |
+                                    (static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u)});
+  Check(cube.images.size() == 1u && cube.images[0].cube && specialize({}) == cube,
+        "a null T# sampled as a cube specialized as another image type");
+}
+
 void TestPackedZeroHighSamplerTableKey() {
   // s_pack_ll_b32_b16 with a zero high lane zero-extends a GPU-selected table key, so the
   // sampler table stays bounded to 64Ki records.
@@ -13508,6 +13539,7 @@ int main() {
   TestNativeGuardedSamplerSource(false);
   TestNativeGuardedSamplerSource(true);
   TestNativeConstantSamplerSelection();
+  TestNullImageTakesDeclaredCube();
   TestPackedZeroHighSamplerTableKey();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();

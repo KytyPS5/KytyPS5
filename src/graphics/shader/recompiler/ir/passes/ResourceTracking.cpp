@@ -163,7 +163,7 @@ public:
 	bool Excludes(Value condition, bool positive) {
 		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
 			m_incoming = m_induction.PhiBlock(incoming);
-			m_values[1].clear();
+			m_current  = 1u + incoming;
 			if (Evaluate(condition, true) != (positive ? 0u : 1u)) return false;
 		}
 		return true;
@@ -298,7 +298,7 @@ private:
 		}
 		const auto* inst = value.TryInstruction();
 		if (current && m_exclude_bound && inst == &m_bound) return 0u;
-		auto& values = m_values[current];
+		auto& values = m_values[current ? m_current : 0u];
 		if (const auto found = values.find(inst); found != values.end()) {
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
 			return found->second;
@@ -362,11 +362,13 @@ private:
 	const Inst& m_induction;
 	const Inst& m_bound;
 	const Block* m_incoming = nullptr;
+	uint32_t m_current = 1;
 	uint32_t m_variables = 0;
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
-	std::array<std::map<const Inst*, uint32_t>, 2> m_values;
+	// Previous-iteration values, then current ones per incoming edge, kept across conditions.
+	std::array<std::map<const Inst*, uint32_t>, 3> m_values;
 	std::map<std::array<uint32_t, 3>, uint32_t> m_nodes_by_key;
 	std::map<std::array<uint32_t, 3>, uint32_t> m_choices;
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;

@@ -37,6 +37,7 @@ struct OutputBinding : IR::StageOutput {
 
 using ImageDimension = Decoder::ImageDimension;
 
+// Component counts are the guest's; 1D images are host 2D images one texel high.
 struct ImageDimensionInfo {
 	ImageDimension dimension;
 	uint32_t       spirv_dimension;
@@ -44,16 +45,17 @@ struct ImageDimensionInfo {
 	uint32_t       spatial_components;
 	uint32_t       arrayed;
 	uint32_t       multisampled;
+	bool           one_dimensional;
 };
 
 constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
-    {ImageDimension::Dim1D, spv::Dim1D, 1, 1, 0, 0},
-    {ImageDimension::Dim1DArray, spv::Dim1D, 2, 1, 1, 0},
-    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0},
-    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0},
-    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0},
-    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1},
-    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1},
+    {ImageDimension::Dim1D, spv::Dim2D, 1, 1, 0, 0, true},
+    {ImageDimension::Dim1DArray, spv::Dim2D, 2, 1, 1, 0, true},
+    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0, false},
+    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0, false},
+    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0, false},
+    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1, false},
+    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1, false},
 }};
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);

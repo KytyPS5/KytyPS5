@@ -23,7 +23,6 @@ namespace {
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
-		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
 		case Prospero::ImageType::kColor3D: return vk::ImageType::e3D;
 		case Prospero::ImageType::kColor2D: return vk::ImageType::e2D;
 		default: EXIT("non-base image type: %u\n", static_cast<uint32_t>(type));
@@ -339,9 +338,9 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	}
 	if (source_type == destination_type) {
 		source_layers = destination_layers = std::min(source_layers, destination_layers);
-	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
+	} else if (source_type == vk::ImageType::e2D) {
 		source_layers = depth;
-	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
+	} else {
 		destination_layers = depth;
 	}
 	return {source_layers, destination_layers};
@@ -630,11 +629,6 @@ void Validate(const ImageInfo& info) {
 	}
 
 	switch (info.type) {
-		case Prospero::ImageType::kColor1D:
-			if (info.extent.height != 1 || info.extent.depth != 1) {
-				EXIT("invalid 1D image shape\n");
-			}
-			break;
 		case Prospero::ImageType::kColor3D:
 			if (info.resources.layers != 1) {
 				EXIT("3D images cannot have array layers\n");

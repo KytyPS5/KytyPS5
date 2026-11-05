@@ -4408,27 +4408,6 @@ public:
                                                  vk::Format::eR32Sfloat),
             "role-free image backing or host format compatibility diverged");
 
-    auto line_info = color_info;
-    line_info.type = Prospero::ImageType::kColor1D;
-    line_info.extent = {8, 1, 1};
-    line_info.resources = {2, 2};
-    line_info.mip_layout[0] = {0, 64, 8, 1};
-    line_info.mip_layout[1] = {64, 16, 4, 1};
-    Libs::Graphics::Image line(m_runtime_context, scheduler, line_info);
-    auto line_view_info = sampled;
-    line_view_info.type = vk::ImageViewType::e1D;
-    const auto line_view = line.FindView(line_view_info);
-    auto line_array_info = line_view_info;
-    line_array_info.type = vk::ImageViewType::e1DArray;
-    line_array_info.layer_count = 2;
-    const auto line_array = line.FindView(line_array_info);
-    Require(name, "1D views",
-            line_view != nullptr && line_array != nullptr &&
-                line_array != line_view &&
-                line.backing.image_type == vk::ImageType::e1D &&
-                line.backing.layers == 2,
-            "1D and 1D-array views did not use a first-class 1D backing");
-
     auto volume_info = color_info;
     volume_info.type = Prospero::ImageType::kColor3D;
     volume_info.extent = {8, 8, 4};
@@ -10905,8 +10884,7 @@ public:
       Require(name, "captured color target",
               color.image_id && attachment != nullptr &&
                   rendering.color_attachments[0].image_view != nullptr &&
-                  color.desc.info.type == (is_1d ? Prospero::ImageType::kColor1D
-                                                  : Prospero::ImageType::kColor2D) &&
+                  color.desc.info.type == Prospero::ImageType::kColor2D &&
                   color.desc.info.extent == vk::Extent3D{width, height, 1} &&
                   color.desc.info.resources == ImageSubresources{target.levels, 1} &&
                   color.desc.info.pitch == target.pitch &&
@@ -10915,10 +10893,8 @@ public:
                       (target.levels == 1 ? 0 : 0xbe00) &&
                   color.desc.info.mip_layout[0].size ==
                       (target.levels == 1 ? target.size : 0x20000) &&
-                  color.desc.view_info.type == (is_1d ? vk::ImageViewType::e1D
-                                                       : vk::ImageViewType::e2D) &&
-                  image.backing.image_type == (is_1d ? vk::ImageType::e1D
-                                                      : vk::ImageType::e2D) &&
+                  color.desc.view_info.type == vk::ImageViewType::e2D &&
+                  image.backing.image_type == vk::ImageType::e2D &&
                   rendering.width == width && rendering.height == height &&
                   rendering.num_layers == 1 &&
                   rendering.num_color_attachments == 1,
@@ -11010,14 +10986,12 @@ public:
             const auto repeated =
                 RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
             Require(name, "1D sampled backing and reuse",
-                    one_d.image_id != color.image_id && one_d_view != nullptr &&
-                        one_d.desc.view_info.type == vk::ImageViewType::e1D &&
-                        texture_cache.GetImage(one_d.image_id).backing.image_type ==
-                            vk::ImageType::e1D &&
+                    one_d.image_id == color.image_id && one_d_view != nullptr &&
+                        one_d.desc.view_info.type == vk::ImageViewType::e2D &&
                         repeated.image_id == one_d.image_id &&
                         texture_cache.FindTexture(repeated.image_id, repeated.desc) == one_d_view &&
                         ReadCachedTexel(name, context, one_d.image_id) == expected,
-                    "the 1D alias reused an incompatible backing or lost the rendered texel");
+                    "the 1D alias did not share the 2D target or lost the rendered texel");
 
             RenderExecutorTestAccess::ResetBindings(executor);
             RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -11027,14 +11001,12 @@ public:
             scheduler.Current().BeginRendering(restored);
             scheduler.Current().EndRendering();
             Require(name, "2D target restoration",
-                    color.image_id != one_d.image_id &&
+                    color.image_id == one_d.image_id &&
                         restored.color_attachments[0].image_view != nullptr &&
-                        texture_cache.GetImage(color.image_id).backing.image_type ==
-                            vk::ImageType::e2D &&
                         texture_cache.GetImage(color.image_id).info.pixel_format ==
                             vk::Format::eR16G16B16A16Sfloat &&
                         ReadCachedTexel(name, context, color.image_id) == expected,
-                    "restoring the 2D target lost its view type or GPU-written texel");
+                    "restoring the 2D target lost its format or GPU-written texel");
             RenderExecutorTestAccess::ResetBindings(executor);
           }
         }
@@ -11148,23 +11120,22 @@ public:
           color.image_id && attachment != nullptr &&
               rendering.color_attachments[0].image_view == attachment &&
               color.guest_array_layer == first_slice &&
-              color.desc.info.type == Prospero::ImageType::kColor1D &&
+              color.desc.info.type == Prospero::ImageType::kColor2D &&
               color.desc.info.extent == vk::Extent3D{width, height, 1} &&
               color.desc.info.resources == ImageSubresources{1, image_layers} &&
               color.desc.info.pitch == pitch &&
               color.desc.info.data.size == allocation_size &&
               color.desc.info.mip_layout[0].offset == 0 &&
               color.desc.info.mip_layout[0].size == allocation_size &&
-              color.desc.view_info.type == vk::ImageViewType::e1DArray &&
+              color.desc.view_info.type == vk::ImageViewType::e2DArray &&
               color.desc.view_info.base_layer == first_slice &&
               color.desc.view_info.layer_count == view_layers &&
-              image.backing.image_type == vk::ImageType::e1D &&
+              image.backing.image_type == vk::ImageType::e2D &&
               image.backing.layers == image_layers &&
               rendering.width == width && rendering.height == height &&
               rendering.num_layers == view_layers &&
               rendering.num_color_attachments == 1,
-          "dimension=0 slice range did not create a Vulkan 1D-array "
-          "attachment view");
+          "dimension=0 slice range did not create a 2D-array attachment view");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
@@ -14671,8 +14642,7 @@ public:
                   image.info.pixel_format == vk::Format::eD16Unorm &&
                   image.info.guest_format == Prospero::BufferFormat::k16UNorm &&
                   image.info.tile_mode == descriptor.TileMode() &&
-                  image.info.type == (cube ? Prospero::ImageType::kColor2D
-                                          : Prospero::ImageType::kColor1D) &&
+                  image.info.type == Prospero::ImageType::kColor2D &&
                   image.info.data.size == (cube ? 0x600u : 0x10000u) &&
                   image.info.resources.layers == layers,
               "comparison texture lost its guest layout or depth representation");
@@ -14850,6 +14820,71 @@ public:
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "comparison texture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // PPSA11264 samples a 1x1 depth target through a 1D comparison texture at its address.
+  void CheckOneDimensionalDepthAlias() {
+    constexpr const char *name = "OneDimensionalDepthAlias";
+    constexpr uintptr_t base = 0x0000000204300000ull;
+    constexpr uint64_t size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &direct_offset) == 0 &&
+                Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                               direct_offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "depth alias mapping failed");
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    context.MapMemory(base, size);
+    TextureCache::ImageDesc target{};
+    target.type = BindingType::DepthTarget;
+    target.info.data = {base, 0};
+    target.info.pixel_format = vk::Format::eD16Unorm;
+    target.info.guest_format = Prospero::BufferFormat::k16UNorm;
+    target.info.bytes_per_block = 2;
+    target.info.tile_mode = Prospero::TileMode::kDepth;
+    target.info.UpdateSize();
+    target.view_info.format = vk::Format::eD16Unorm;
+    target.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    target.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto target_id = cache.FindImage(target);
+    (void)cache.FindDepthTarget(target_id, target);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dwords = {static_cast<u32>(base >> 8u), 0x00700000u, 0,
+                    0x81800000u | DstSel(4, 4, 4, 4), 0, 0x00700000u, 0, 0};
+    value.dword_count = 8;
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+    resource.depth_compare = true;
+    resource.read = true;
+    const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+    Require(name, "shared 2D image",
+            binding.image_id == target_id &&
+                binding.desc.view_info.type == vk::ImageViewType::e2D &&
+                cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+            "the 1D comparison texture did not view the depth target's 2D image");
+    RenderExecutorTestAccess::ResetBindings(executor);
+    context.UnmapMemory(base, size);
+    scheduler.Finish();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "depth alias unmap failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "depth alias release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -16268,16 +16303,16 @@ public:
       Require(name, "narrowed 1D array storage view",
               narrowed_storage_view != nullptr &&
                   narrowed_storage_binding.desc.info.type ==
-                      Prospero::ImageType::kColor1D &&
+                      Prospero::ImageType::kColor2D &&
                   narrowed_storage_binding.desc.info.resources.layers == 2 &&
                   narrowed_storage_binding.desc.view_info.type ==
-                      vk::ImageViewType::e1D &&
+                      vk::ImageViewType::e2D &&
                   narrowed_storage_binding.desc.view_info.base_layer == 1 &&
                   narrowed_storage_binding.desc.view_info.layer_count == 1 &&
                   narrowed_storage_image.backing.image_type ==
-                      vk::ImageType::e1D,
+                      vk::ImageType::e2D,
               "non-array 1D specialization did not select the descriptor "
-              "base layer from its 1D-array backing");
+              "base layer from its 1D-array descriptor");
 
       ShaderRecompiler::IR::ResourceSnapshot storage_snapshot{};
       storage_snapshot.images.push_back(storage_descriptor);
@@ -40980,8 +41015,6 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   test.sampled_image_rgba = {0, 0, 0xdeadbeefu, 0};
   test.sampled_image_format = vk::Format::eR32Uint;
   test.sampled_image_dwords_per_pixel = 1;
-  test.sampled_image_type = vk::ImageType::e1D;
-  test.sampled_image_view_type = vk::ImageViewType::e1D;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
@@ -41016,8 +41049,6 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = image;
-  test.sampled_image_type = vk::ImageType::e1D;
-  test.sampled_image_view_type = vk::ImageViewType::e1D;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
@@ -41050,8 +41081,7 @@ TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   test.sampled_image_rgba = {0, 0, 0, 0, 0, 0, 0xcafebabeu, 0};
   test.sampled_image_format = vk::Format::eR32Uint;
   test.sampled_image_dwords_per_pixel = 1;
-  test.sampled_image_type = vk::ImageType::e1D;
-  test.sampled_image_view_type = vk::ImageViewType::e1DArray;
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
   test.sampled_image_layers = 2;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1DArray)
@@ -41084,8 +41114,6 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
   };
   test.sampled_image_format = vk::Format::eR32Uint;
   test.sampled_image_dwords_per_pixel = 1;
-  test.sampled_image_type = vk::ImageType::e1D;
-  test.sampled_image_view_type = vk::ImageViewType::e1D;
   test.sampled_image_layers = 2;
   test.sampled_image_view_base_layer = 1;
   test.sampled_image_view_layers = 1;
@@ -41819,8 +41847,8 @@ template <u32 dim> TestCase ImageA16GradientsTakeOwnVgpr() {
                              "ImageA16GradientsTakeOwnVgpr1DArray"};
   constexpr std::array types{Prospero::ImageType::kColor1D, Prospero::ImageType::kColor3D,
                              Prospero::ImageType::kColor1DArray};
-  constexpr std::array views{vk::ImageViewType::e1D, vk::ImageViewType::e3D,
-                             vk::ImageViewType::e1DArray};
+  constexpr std::array views{vk::ImageViewType::e2D, vk::ImageViewType::e3D,
+                             vk::ImageViewType::e2DArray};
   TestCase test;
   test.name = names[dim / 2u];
   u32 vaddr = 20;
@@ -41845,7 +41873,7 @@ template <u32 dim> TestCase ImageA16GradientsTakeOwnVgpr() {
   // Row y of the ramp is 1D-array layer y.
   test.sampled_image_rgba = MakeRampImage();
   test.image_height = volume ? 4u : 1u;
-  test.sampled_image_type = volume ? vk::ImageType::e3D : vk::ImageType::e1D;
+  test.sampled_image_type = volume ? vk::ImageType::e3D : vk::ImageType::e2D;
   test.sampled_image_view_type = views[dim / 2u];
   test.sampled_image_layers = dim == 4u ? 2u : 1u;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
@@ -45266,8 +45294,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
         address.SetArg(2, Value(1u));
         address.SetArg(3, Value(0u));
         for (const u32 resource : {3u, 4u}) {
-          const bool one_d = resource == 3u;
-          compiled.program.info.images[resource].dimension = one_d
+          compiled.program.info.images[resource].dimension = resource == 3u
               ? ShaderRecompiler::Decoder::ImageDimension::Dim1D
               : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
           vulkan.DestroyImage(&textures[resource]);
@@ -45275,9 +45302,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
               vk::ImageUsageFlagBits::eSampled,
               {std::vector<u32>(8u, std::bit_cast<u32>(float(resource))),
                std::vector<u32>(4u, std::bit_cast<u32>(float(resource + 10u)))},
-              4u, vk::ImageLayout::eShaderReadOnlyOptimal,
-              one_d ? vk::ImageType::e1D : vk::ImageType::e2D,
-              one_d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D, 1u);
+              4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+              vk::ImageViewType::e2D, 1u);
         }
       }
     }
@@ -45412,9 +45438,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     textures[resource] = vulkan.CreateImageMips(test.name, size[0], height,
         resource == 3u ? vk::Format::eR32G32B32A32Uint : vk::Format::eR32G32B32A32Sfloat,
         vk::ImageUsageFlagBits::eSampled, mips, 4u, vk::ImageLayout::eShaderReadOnlyOptimal,
-        resource == 3u ? vk::ImageType::e1D : vk::ImageType::e2D,
-        resource == 3u ? vk::ImageViewType::e1D
-                      : resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers);
+        vk::ImageType::e2D,
+        resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers);
   }
   compiled.program.shader_info_complete = false;
   CollectShaderInfo(compiled.program, {.compute = &compute});
@@ -45520,13 +45545,10 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       std::vector<std::vector<u32>> expected_images;
       for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
         expected_images.emplace_back((wave_size + 2u) * 4u, 0x41000000u + resource);
-        const bool one_d = compiled.program.info.images[resource].dimension ==
-            ShaderRecompiler::Decoder::ImageDimension::Dim1D;
         textures.push_back(vulkan.CreateImageMips(test.name, wave_size + 2u, 1,
             vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eStorage,
-            {expected_images.back()}, 4u, vk::ImageLayout::eGeneral,
-            one_d ? vk::ImageType::e1D : vk::ImageType::e2D,
-            one_d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D, 1u));
+            {expected_images.back()}, 4u, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+            vk::ImageViewType::e2D, 1u));
       }
       test.initial = {0xdeadbeefu};
       for (u32 lane = 0; lane < wave_size; ++lane) {
@@ -55385,6 +55407,7 @@ int main(int argc, char **argv) {
     CheckSampledDepthResource();
     CheckDepthTextureEncoding();
     vulkan.CheckComparisonDepthTexture();
+    vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
@@ -55504,6 +55527,7 @@ int main(int argc, char **argv) {
   vulkan.CheckSamplerFilterMode();
   if (rasterization) {
     vulkan.CheckComparisonDepthTexture();
+    vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
   } else {
     skipped_device_checks = true;

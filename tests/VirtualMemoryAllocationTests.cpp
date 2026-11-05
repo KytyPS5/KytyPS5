@@ -1299,6 +1299,7 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+/// Reports failures from the Windows normal-return guest-stack fixture.
 void TestGuestStackNormalReturn() {
 	const char* test = "GuestStackNormalReturn";
 
@@ -1308,6 +1309,7 @@ void TestGuestStackNormalReturn() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+/// Reports failures from the Windows PthreadExit guest-stack fixture.
 void TestGuestStackPthreadExit() {
 	const char* test = "GuestStackPthreadExit";
 
@@ -1317,6 +1319,7 @@ void TestGuestStackPthreadExit() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+/// Reports failures when a handled guest-stack read fault cannot resume and return correctly.
 void TestGuestStackHandledFault() {
 	const char* test = "GuestStackHandledFault";
 
@@ -1327,6 +1330,7 @@ void TestGuestStackHandledFault() {
 }
 #endif
 
+/// Reports failures in the loader's main-entry stack and host-bound restoration checks.
 void TestMainEntryUsesGuestStackAndRestoresHostBounds() {
 	const char* test = "MainEntryUsesGuestStackAndRestoresHostBounds";
 
@@ -5833,6 +5837,8 @@ void TestTlsStubsPreserveFlags() {
 
 int RunTrinityTests();
 
+/// Initializes the test subsystems and runs the suite or the subset selected by one option.
+/// Returns a nonzero exit status if a selected test fails.
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();

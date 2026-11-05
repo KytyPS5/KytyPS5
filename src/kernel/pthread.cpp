@@ -732,6 +732,7 @@ static void FreeGuestStack(PthreadAttr attr) {
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+/// Checks private guest-stack allocation, release, and reuse for one stack owner.
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size) {
 
@@ -805,6 +806,12 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 }
 #endif
 
+/**
+ * Calls func(arg) on the supplied guest stack and returns its result.
+ * stack_limit is the allocation's low address; stack_base is its exclusive high address.
+ * On Windows, publishes these bounds in the TEB during guest execution and restores
+ * the host bounds on return. The PthreadExit fast path uses the saved host frame too.
+ */
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top,
                                            void* stack_limit, uintptr_t stack_base) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -964,6 +971,10 @@ struct GuestStackTestState {
 
 static thread_local GuestStackTestState* g_guest_stack_fault_state = nullptr;
 
+/**
+ * Handles only the active test's first read fault on its private protected page.
+ * Makes the page readable and lets Windows retry the instruction; leaves other faults unhandled.
+ */
 static LONG WINAPI GuestStackFaultHandler(PEXCEPTION_POINTERS exception) {
 	auto*       state  = g_guest_stack_fault_state;
 	const auto* record = exception->ExceptionRecord;
@@ -985,6 +996,7 @@ static LONG WINAPI GuestStackFaultHandler(PEXCEPTION_POINTERS exception) {
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+/// Records guest RSP and TEB bounds, then exercises the requested fault or exit path.
 static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
 	auto* state = static_cast<GuestStackTestState*>(arg);
 
@@ -1013,6 +1025,11 @@ static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
 	return arg;
 }
 
+/**
+ * Runs a guest-stack fixture through normal return, PthreadExit, or a handled read fault.
+ * Returns true only if guest state, host-bound restoration, and resource cleanup pass.
+ * The local thread record exercises the exit fast path, not the full pthread lifecycle.
+ */
 static bool TestGuestStackReturn(bool exit_via_pthread, bool trigger_fault = false) {
 	constexpr uint64_t stack_size = 0x10000;
 
@@ -1104,13 +1121,16 @@ static bool TestGuestStackReturn(bool exit_via_pthread, bool trigger_fault = fal
 	return guest_ok && host_ok && fault_ok && handler_removed && page_freed && freed;
 }
 
+/// Checks guest bounds, the result, host-bound restoration, and cleanup after normal return.
 bool TestGuestStackNormalReturn() {
 	return TestGuestStackReturn(false);
 }
+/// Checks the PthreadExit fast path's result, stack restoration, and fixture cleanup.
 bool TestGuestStackPthreadExit() {
 	return TestGuestStackReturn(true);
 }
 
+/// Checks Windows exception continuation on a guest stack and restoration after return.
 bool TestGuestStackHandledFault() {
 	return TestGuestStackReturn(false, true);
 }
@@ -1423,6 +1443,7 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+/// Unlinks a waiter from both ends of the queue; the caller holds mutex->m.
 static void NativeMutexRemoveWaiter(PthreadMutexPrivate*         mutex,
                                     PthreadMutexPrivate::Waiter* waiter) {
 	if (waiter->previous != nullptr) {
@@ -1437,6 +1458,11 @@ static void NativeMutexRemoveWaiter(PthreadMutexPrivate*         mutex,
 	}
 }
 
+/**
+ * Acquires the guest mutex, respecting recursion and an optional timeout in microseconds.
+ * Disables host cancellation while queued and polls pending guest signals between waits.
+ * Returns OK on acquisition or an error for recursion, contention timeout, or overflow.
+ */
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -3372,6 +3398,8 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// Initializes a host worker's guest-thread state, invokes its entry on the guest stack,
+/// and runs the registered cleanup handler before returning the guest result.
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

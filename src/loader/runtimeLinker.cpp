@@ -132,6 +132,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 	return changed;
 }
 
+/// Allocates an executable guest-call thunk that identifies and dispatches an unresolved import.
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	constexpr uint64_t thunk_size = 34;
 
@@ -222,6 +223,12 @@ static Program*              g_tls_main_program        = nullptr;
 static thread_local Program* g_tls_cached_main_program = nullptr;
 static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
 
+/**
+ * Calls a program entry with its startup parameters on the supplied guest stack.
+ * stack_top selects the initial stack position; stack_limit and stack_base describe
+ * the complete allocation's low and exclusive high bounds. On Windows, installs those
+ * bounds during the call and restores the original host bounds when the entry returns.
+ */
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top, uintptr_t stack_limit, uintptr_t stack_base) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -398,6 +405,7 @@ static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
 	state->called = true;
 }
 
+/// Checks main-entry RSP, the root frame, Windows guest bounds, host restoration, and cleanup.
 bool TestMainEntryUsesGuestStack() {
 	constexpr uint64_t stack_size = 0x10000;
 	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
@@ -652,6 +660,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+/// Resumes supported emulated faults and reports diagnostic context for unhandled exceptions.
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -875,6 +884,8 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	return ret;
 }
 
+/// Patches one relocation, using an import stub or invalid-object address when unresolved.
+/// Returns whether the symbol resolved, independently of whether the memory patch succeeded.
 static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1117,6 +1128,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	}
 }
 
+/// Removes a loaded program, invalidates imports into its mapping, and releases its resources.
 void RuntimeLinker::UnloadProgram(Program* program) {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -1250,6 +1262,8 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+/// Prepares the main guest stack and startup arguments, applies startup patches,
+/// and invokes the loaded programs' entry points.
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
@@ -1337,6 +1351,8 @@ void RuntimeLinker::Clear() {
 	m_symbols.reset();
 }
 
+/// Looks up a symbol in the requesting program and available exports under the linker lock.
+/// Writes the resolved record to out_info and reports self-binding when requested.
 void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* program,
                             SymbolRecord* out_info, bool* bind_self) {
 	KYTY_PROFILER_FUNCTION();
@@ -1673,6 +1689,7 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+/// Allocates and maps an ELF program's segments and prepares its guest instruction patches.
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1915,6 +1932,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	}
 }
 
+/// Reads ELF dynamic tables into a newly allocated DynamicInfo for later symbol relocation.
 void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2022,6 +2040,7 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	           DT_OS_EXPORT_LIB_1);
 }
 
+/// Applies pending program relocations and records which symbols resolved successfully.
 void RuntimeLinker::Relocate(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 

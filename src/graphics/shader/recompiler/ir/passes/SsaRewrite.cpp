@@ -17,7 +17,9 @@ struct ScalarMaskTag {
 	auto      operator<=>(const ScalarMaskTag&) const = default;
 };
 // Indexes Block::ssa_flag_values.
-enum class Flag : uint8_t { Scc, Exec, ExecLo, ExecHi, Vcc, VccLo, VccHi, M0 };
+enum class Flag : uint8_t { Scc, Exec, ExecLo, ExecHi, Vcc, VccLo, VccHi, M0, Count };
+static_assert(std::tuple_size_v<decltype(Block::ssa_flag_values)> ==
+              static_cast<size_t>(Flag::Count));
 struct GotoVariable {
 	uint32_t index                                  = 0;
 	auto     operator<=>(const GotoVariable&) const = default;

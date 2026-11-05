@@ -59,6 +59,23 @@ std::optional<uint64_t> ReadUnsigned(const Json& value) {
 	           : std::nullopt;
 }
 
+std::optional<Aggregation> ReadAggregation(const Json& value) {
+	static constexpr std::pair<std::string_view, Aggregation> Names[] = {
+	    {"latest", Aggregation::Latest}, {"max", Aggregation::Max},     {"min", Aggregation::Min},
+	    {"sum", Aggregation::Sum},       {"count", Aggregation::Count},
+	};
+	if (!value.is_string()) {
+		return std::nullopt;
+	}
+	const auto& name = value.get_ref<const std::string&>();
+	for (const auto& [text, aggregation]: Names) {
+		if (name == text) {
+			return aggregation;
+		}
+	}
+	return std::nullopt;
+}
+
 Json ReadJson(const Files& files, std::string_view name) {
 	const auto entry = files.find(name);
 	if (entry == files.end()) {
@@ -106,7 +123,7 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		return {};
 	}
 	const auto locale = Localization::LocaleName(console_language);
-	auto meta = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
+	auto       meta   = ReadJson(files, fmt::format("tropmeta_{}.json", locale));
 	if (meta.is_null()) {
 		meta = ReadJson(files, fmt::format("tropmeta_{}.json",
 		                                   conf["defaultLanguage"].get_ref<const std::string&>()));
@@ -274,11 +291,15 @@ UnlockData LoadUnlockData(const std::filesystem::path& path) {
 			}
 		}
 	}
-	if (json.contains("maxStats") && json["maxStats"].is_object()) {
-		for (auto it = json["maxStats"].begin(); it != json["maxStats"].end(); ++it) {
-			const auto id    = ReadUnsigned(Json(it.key()));
-			const auto value = ReadUnsigned(it.value());
-			if (id && value) unlocks.max_stats.emplace(*id, *value);
+	if (json.contains("statValues") || json.contains("maxStats")) {
+		// maxStats is the save name from before sums and tallies were supported.
+		const auto& values = json.contains("statValues") ? json["statValues"] : json["maxStats"];
+		if (values.is_object()) {
+			for (auto it = values.begin(); it != values.end(); ++it) {
+				const auto id    = ReadUnsigned(Json(it.key()));
+				const auto value = ReadUnsigned(it.value());
+				if (id && value) unlocks.stats.emplace(*id, *value);
+			}
 		}
 	}
 	if (json.contains("progressValues") && json["progressValues"].is_object()) {
@@ -302,17 +323,19 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 		}
 	}
 	Json stats = Json::object();
-	for (const auto& [id, value]: unlocks.max_stats) {
+	for (const auto& [id, value]: unlocks.stats) {
 		stats[std::to_string(id)] = value;
 	}
 	Json progress = Json::object();
 	for (const auto& [id, value]: unlocks.progress) {
 		progress[std::to_string(id)] = value;
 	}
-	const auto text = Json {{"unlockedTrophies", unlocks.unlocked},
-	                        {"unlockedAt", timestamps},
-	                        {"maxStats", stats},
-	                        {"progressValues", progress}}.dump();
+	const auto text = Json {
+	    {"unlockedTrophies", unlocks.unlocked},
+	    {"unlockedAt", timestamps},
+	    {"statValues", stats},
+	    {"progressValues",
+	     progress}}.dump();
 	auto temporary = path;
 	temporary += ".tmp";
 	File file;
@@ -353,20 +376,22 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 	    !extraction["statsExtractionRuleArray"].is_array()) {
 		return {};
 	}
-	// Support direct unsigned latest values and nonnegative integer maxima.
+	// Support direct unsigned values, nonnegative maxima and unsigned count, sum and min
+	// aggregations. Bounded stats keep clamping semantics we have not verified.
 	std::map<uint64_t, UdsRule> stats;
 	for (const auto& definition: definitions["statDefinitionArray"]) {
 		if (!definition.is_object() || !definition.contains("statId") ||
-		    !definition.contains("aggregation") ||
-		    (definition["aggregation"] != "latest" && definition["aggregation"] != "max") ||
-		    !definition.contains("dataType")) {
+		    !definition.contains("aggregation") || !definition.contains("dataType")) {
 			continue;
 		}
-		const auto  id   = ReadUnsigned(definition["statId"]);
-		const auto& type = definition["dataType"];
-		const bool  maximum = definition["aggregation"] == "max";
-		if (!id || (type != "uint64" && type != "uint32" && type != "int64") ||
-		    (type == "int64" && (!maximum || !definition.contains("minValue")))) {
+		const auto  id          = ReadUnsigned(definition["statId"]);
+		const auto  aggregation = ReadAggregation(definition["aggregation"]);
+		const auto& type        = definition["dataType"];
+		if (!id || !aggregation || (type != "uint64" && type != "uint32" && type != "int64")) {
+			continue;
+		}
+		const bool maximum = *aggregation == Aggregation::Max;
+		if (type == "int64" && (!maximum || !definition.contains("minValue"))) {
 			continue;
 		}
 		const uint64_t limit   = type == "uint32"  ? UINT32_MAX
@@ -383,7 +408,7 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 		const auto value_type = type == "uint32"  ? UdsRule::Type::Uint32
 		                        : type == "int64" ? UdsRule::Type::Int64
 		                                          : UdsRule::Type::Uint64;
-		stats.emplace(*id, UdsRule {*id, {}, value_type, maximum, *initial});
+		stats.emplace(*id, UdsRule {*id, {}, value_type, *aggregation, *initial});
 	}
 	UdsRules events;
 	for (const auto& rule: extraction["statsExtractionRuleArray"]) {
@@ -394,21 +419,30 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 		const auto& action    = rule["action"];
 		if (!condition.is_object() || condition.size() != 1 || !condition.contains("eventName") ||
 		    !condition["eventName"].is_string() || !action.is_object() ||
-		    !action.contains("input") || !action["input"].is_string() ||
 		    !action.contains("output") || !action["output"].is_object() ||
 		    !action["output"].contains("statId")) {
 			continue;
 		}
-		const auto  id    = ReadUnsigned(action["output"]["statId"]);
-		const auto& input = action["input"].get_ref<const std::string&>();
-		if (!id || !stats.contains(*id) || !input.starts_with("$.") || input.size() == 2 ||
-		    input.find_first_not_of(
-		        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 2) !=
-		        std::string::npos) {
+		const auto id   = ReadUnsigned(action["output"]["statId"]);
+		const auto stat = id ? stats.find(*id) : stats.end();
+		if (stat == stats.end()) {
 			continue;
 		}
-		auto parsed  = stats.at(*id);
-		parsed.input = input.substr(2);
+		auto parsed = stat->second;
+		// Count stats tally matching events, so their extraction rules need no input.
+		if (parsed.aggregation != Aggregation::Count) {
+			if (!action.contains("input") || !action["input"].is_string()) {
+				continue;
+			}
+			const auto& input = action["input"].get_ref<const std::string&>();
+			if (!input.starts_with("$.") || input.size() == 2 ||
+			    input.find_first_not_of(
+			        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 2) !=
+			        std::string::npos) {
+				continue;
+			}
+			parsed.input = input.substr(2);
+		}
 		events[condition["eventName"].get<std::string>()].push_back(std::move(parsed));
 	}
 	return events;
@@ -426,31 +460,68 @@ UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks, std::string
 	}
 	UdsResult                                  result;
 	std::vector<std::pair<uint64_t, uint64_t>> values;
+	// Saturating add: sums and tallies clamp at their stat's range instead of overflowing.
+	const auto add = [](uint64_t base, uint64_t addend, UdsRule::Type type) {
+		const auto limit   = type == UdsRule::Type::Uint32 ? uint64_t {UINT32_MAX} : UINT64_MAX;
+		const auto current = std::min(base, limit);
+		return addend > limit - current ? limit : current + addend;
+	};
+	// Maxima floor at the configured initial value; minima, sums and tallies start from
+	// the first event or zero.
+	const auto update = [&](const UdsRule& rule, uint64_t input) {
+		auto       next    = input;
+		const bool counted = rule.aggregation == Aggregation::Count;
+		switch (rule.aggregation) {
+			case Aggregation::Latest: break;
+			case Aggregation::Max: {
+				auto [stat, inserted] = unlocks.stats.try_emplace(rule.stat_id, rule.initial_value);
+				next                  = std::max({stat->second, rule.initial_value, input});
+				result.stats_changed |= inserted || next != stat->second;
+				stat->second = next;
+				break;
+			}
+			case Aggregation::Min: {
+				auto [stat, inserted] = unlocks.stats.try_emplace(rule.stat_id, input);
+				next                  = std::min(stat->second, input);
+				result.stats_changed |= inserted || next != stat->second;
+				stat->second = next;
+				break;
+			}
+			case Aggregation::Sum:
+			case Aggregation::Count: {
+				auto [stat, inserted] = unlocks.stats.try_emplace(rule.stat_id, uint64_t {0});
+				next                  = add(stat->second, counted ? 1 : input, rule.type);
+				result.stats_changed |= inserted || next != stat->second;
+				stat->second = next;
+				break;
+			}
+		}
+		values.emplace_back(rule.stat_id, next);
+	};
 	for (const auto& rule: rules->second) {
 		const auto value = properties.find(rule.input);
-		if (value == properties.end()) continue;
+		// Count rules see every matching event, with or without integer properties.
+		if (rule.aggregation != Aggregation::Count && value == properties.end()) {
+			continue;
+		}
 		std::optional<uint64_t> number;
-		switch (rule.type) {
-			case UdsRule::Type::Uint32:
-				if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
-				break;
-			case UdsRule::Type::Uint64:
-				if (const auto* input = std::get_if<uint64_t>(&value->second)) number = *input;
-				break;
-			case UdsRule::Type::Int64:
-				if (const auto* input = std::get_if<int64_t>(&value->second); input && *input >= 0)
-					number = static_cast<uint64_t>(*input);
-				break;
+		if (rule.aggregation != Aggregation::Count) {
+			switch (rule.type) {
+				case UdsRule::Type::Uint32:
+					if (const auto* input = std::get_if<uint32_t>(&value->second)) number = *input;
+					break;
+				case UdsRule::Type::Uint64:
+					if (const auto* input = std::get_if<uint64_t>(&value->second)) number = *input;
+					break;
+				case UdsRule::Type::Int64:
+					if (const auto* input = std::get_if<int64_t>(&value->second);
+					    input && *input >= 0)
+						number = static_cast<uint64_t>(*input);
+					break;
+			}
+			if (!number) continue;
 		}
-		if (!number) continue;
-		if (rule.maximum) {
-			auto [stat, inserted] = unlocks.max_stats.try_emplace(rule.stat_id, rule.initial_value);
-			const auto next       = std::max({stat->second, rule.initial_value, *number});
-			result.stats_changed |= inserted || next != stat->second;
-			stat->second = next;
-			number       = next;
-		}
-		values.emplace_back(rule.stat_id, *number);
+		update(rule, number.value_or(0));
 	}
 	for (const auto& [id, trophy]: package.trophies) {
 		if (trophy.grade == 1 || unlocks.unlocked.contains(id) || !trophy.uds_stat_id ||
@@ -497,13 +568,15 @@ bool UpdateTrophyProgress(const Package& package, int trophy_id, uint64_t value,
 }
 
 std::optional<uint64_t> TrophyProgress(const Trophy& trophy, const UnlockData& unlocks) {
-	if (!IsProgressTrophy(trophy)) {
+	// Conditions that unlock when a value drops have no rising progress to report.
+	if (!IsProgressTrophy(trophy) || trophy.comparison == Comparison::LessEqual ||
+	    trophy.comparison == Comparison::Less) {
 		return std::nullopt;
 	}
 	std::optional<uint64_t> progress;
 	if (trophy.uds_stat_id) {
-		if (const auto stat = unlocks.max_stats.find(*trophy.uds_stat_id);
-		    stat != unlocks.max_stats.end()) {
+		if (const auto stat = unlocks.stats.find(*trophy.uds_stat_id);
+		    stat != unlocks.stats.end()) {
 			progress = stat->second;
 		}
 	}

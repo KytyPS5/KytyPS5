@@ -158,15 +158,15 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 			     package.event_rules.size(), uds_filename.c_str());
 		}
 	}
-	const bool guest = Config::IsGuestUserId(key.first);
-	auto       path  = guest ? std::filesystem::path {}
-	                         : Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
+	const bool guest   = Config::IsGuestUserId(key.first);
+	auto       path    = guest ? std::filesystem::path {}
+	                           : Trophies::UnlocksPath({}, title_id, key.first, key.second);
+	auto       unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
 	if (!guest) {
 		for (const auto& [event, rules]: package.event_rules) {
 			for (const auto& rule: rules) {
-				if (rule.maximum) {
-					auto& value = unlocks.max_stats[rule.stat_id];
+				if (rule.aggregation == Trophies::Aggregation::Max) {
+					auto& value = unlocks.stats[rule.stat_id];
 					value       = std::max(value, rule.initial_value);
 				}
 			}
@@ -749,7 +749,8 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 				     state->path.string().c_str());
 			}
 		}
-	} else if (!uds_event.properties.integers.empty()) {
+	} else {
+		// Count rules tally events even when they carry no integer properties.
 		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key);
 		    state != nullptr && !state->guest) {
 			const auto result = LibNpTrophy2::Trophies::ApplyUdsEvent(

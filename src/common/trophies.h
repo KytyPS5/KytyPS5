@@ -37,13 +37,15 @@ struct Trophy {
 	bool                    has_reward = false;
 };
 
+enum class Aggregation { Latest, Max, Min, Sum, Count };
+
 struct UdsRule {
 	enum class Type { Uint32, Uint64, Int64 };
 
 	uint64_t    stat_id;
-	std::string input;
+	std::string input; // Event property; empty for count stats, which tally events instead.
 	Type        type;
-	bool        maximum;
+	Aggregation aggregation;
 	uint64_t    initial_value;
 };
 
@@ -60,7 +62,7 @@ struct Package {
 struct UnlockData {
 	std::set<int>                unlocked;
 	std::map<int, uint64_t>      timestamps;
-	std::map<uint64_t, uint64_t> max_stats;
+	std::map<uint64_t, uint64_t> stats;    // UDS stat values, including maxima, sums and tallies.
 	std::map<int, uint64_t>      progress; // Reported by the game through _UpdateTrophyProgress.
 };
 

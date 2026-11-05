@@ -1807,12 +1807,17 @@ private:
 				return edge.positive && (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
 				       Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
-			LoopBoundProof proof(m_program, *phi, *compare);
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
-				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare;
+			const auto [found, inserted] = m_loop_proofs.try_emplace(compare);
+			if (inserted) {
+				LoopBoundProof proof(m_program, *phi, *compare);
+				found->second =
+				    GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
+					    return proof.Excludes(edge.condition, edge.positive);
+				    });
+			}
+			if (found->second) return compare;
 		}
 		return {};
 	}
@@ -3969,6 +3974,8 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		// Earlier proofs predate rewrites and erasures; planning only adds instructions.
+		m_loop_proofs.clear();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
@@ -4370,6 +4377,7 @@ private:
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
+	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
 	bool                                       m_shader_writes = false;
 };
 

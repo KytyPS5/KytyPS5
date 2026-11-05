@@ -2149,6 +2149,14 @@ public:
   [[nodiscard]] bool RasterizationSupported() const {
     return m_rasterization_supported;
   }
+  // A depth attachment that is sampled while it is written takes the feedback-loop layout
+  // only where the device supports it; the renderer falls back to eGeneral for the same
+  // simultaneous read/write, so the expected layout follows the enabled feature.
+  [[nodiscard]] vk::ImageLayout SampledDepthLayout() const {
+    return m_runtime_context.attachment_feedback_loop_enabled
+               ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+               : vk::ImageLayout::eGeneral;
+  }
   // Returns the first format the device can attach as depth-stencil at `samples`,
   // preferring `preferred`. Some drivers reject VK_FORMAT_D24_UNORM_S8_UINT
   // outright, and Image::Image exits the process rather than create such an
@@ -16571,7 +16579,7 @@ public:
       Require(name, "disjoint depth sampling during depth writes",
               !disjoint_feedback &&
                   disjoint_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      SampledDepthLayout() &&
                   disjoint_binding.images[0].layout ==
                       disjoint_rendering.depth_stencil_attachment.image_layout &&
                   disjoint_image.backing.state.layout ==
@@ -16614,7 +16622,7 @@ public:
               overlapping_view != nullptr &&
                   depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
                   depth_views_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      SampledDepthLayout() &&
                   MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
                       depth_views_rendering.depth_stencil_attachment.image_layout &&
                   MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
@@ -17012,7 +17020,7 @@ public:
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
         const auto &pixel_depth = bounds_bindings.pixel.images[0];
         const auto expected_layout = pass == 0
-            ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+            ? SampledDepthLayout()
             : vk::ImageLayout::eDepthReadOnlyOptimal;
         Require(name, "deferred clear with sampled depth bounds",
                 bounds_depth.image_id == depth_only.image_id &&
@@ -17457,7 +17465,7 @@ public:
             shared_bindings.pixel));
         const auto expected_layout =
             stencil_write
-                ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                ? SampledDepthLayout()
                 : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
         const auto expected_access =
             vk::AccessFlagBits2::eShaderRead |
@@ -19270,6 +19278,9 @@ public:
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
+    if (!m_rasterization_supported) {
+      return;
+    }
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};

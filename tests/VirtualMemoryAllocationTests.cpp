@@ -1327,8 +1327,8 @@ void TestGuestStackHandledFault() {
 }
 #endif
 
-void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
-	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
+void TestMainEntryUsesGuestStackAndRestoresHostBounds() {
+	const char* test = "MainEntryUsesGuestStackAndRestoresHostBounds";
 
 	Check(test, Loader::TestMainEntryUsesGuestStack(),
 	      "main-entry stack switch did not preserve the guest/host stack invariants");
@@ -5843,6 +5843,7 @@ int main(int argc, char** argv) {
 		RunTest(TestGuestStackNormalReturn);
 		RunTest(TestGuestStackPthreadExit);
 		RunTest(TestGuestStackHandledFault);
+		RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
@@ -5977,7 +5978,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestStackPthreadExit);
 	RunTest(TestGuestStackHandledFault);
 #endif
-	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
+	RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);

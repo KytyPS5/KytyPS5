@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -24,6 +26,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+// Thrown by Tracker::Fail when the program may be given up instead of exiting; it never leaves
+// TrackResources.
+struct TrackingFailure {};
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
@@ -597,6 +603,10 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (Frontend::TranslationNonFatal()) {
+			LOGF("%s\n", message.c_str());
+			throw TrackingFailure {};
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -4442,10 +4452,16 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 
 } // namespace
 
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
+bool TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
                     ShaderStageInputInfo input) {
-	Tracker(program, decoded, native_cfg, input).Run();
+	try {
+		Tracker(program, decoded, native_cfg, input).Run();
+	} catch (const TrackingFailure&) {
+		// The program is left half planned; the caller discards it.
+		return false;
+	}
 	program.uniform_fill = RecognizePatternFill(program, decoded, input);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

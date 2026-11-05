@@ -280,9 +280,12 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 uint32_t push_data_cursor) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+                                                 uint32_t push_data_cursor, bool& materialized) {
+	materialized = ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                          specialization);
+	if (!materialized) {
+		return nullptr;
+	}
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -355,6 +358,16 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
+// A descriptor source the program reads is not mapped or filled yet: this use is skipped.
+static const ShaderModule* SkipUnmaterialized(uint64_t hash, ShaderType stage) {
+	static std::atomic<uint32_t> reported = 0;
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("PipelineCache: skipping %s hash=0x%016" PRIx64 ": resource materialization failed\n",
+		     ShaderRecompiler::StageName(stage), hash);
+	}
+	return nullptr;
+}
+
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
@@ -400,13 +413,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
-		ShaderModule* module = nullptr;
+		ShaderModule* module       = nullptr;
+		bool          materialized = true;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+			if (!source_changed) {
+				module = cached.FindModule<true>(runtime, push_data_cursor, materialized);
+			}
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor);
+			module = cached.FindModule<false>(runtime, push_data_cursor, materialized);
 		}
+		if (!materialized) return SkipUnmaterialized(params.hash, options.stage);
 		if (module != nullptr) return bind(*module);
 	}
 
@@ -415,6 +432,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	options.non_fatal       = true;
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -441,6 +459,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	} else {
 		translated = ShaderRecompiler::TranslateProgram(params.code, options);
 	}
+	if (translated.unsupported) {
+		// Logged by the recompiler; the draws and dispatches that use it are skipped.
+		if (entry == m_program_cache.end()) {
+			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+		} else {
+			entry->second.skip_dispatch = true;
+		}
+		return nullptr;
+	}
 	if (entry == m_program_cache.end()) {
 		auto retained = !source.calls.empty()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
@@ -450,13 +477,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
-		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-		    program.resource_plan, runtime, program.resources, program.specialization));
+		if (!ShaderRecompiler::IR::MaterializeResources(
+		        program.resource_plan, runtime, program.resources, program.specialization)) {
+			return SkipUnmaterialized(params.hash, options.stage);
+		}
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
-			return bind(*module);
-		}
+		bool        materialized = true;
+		const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor, materialized);
+		if (!materialized) return SkipUnmaterialized(params.hash, options.stage);
+		if (module != nullptr) return bind(*module);
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor));
@@ -680,11 +710,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
 		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
 		                                   sh.m_vgtTfParam};
-		const auto [layout, inserted] = m_tess_layouts.try_emplace(
-		    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
+		const auto layout_hash = XXH3_64bits(layout_key, sizeof(layout_key));
+		if (m_rejected_tess_layouts.contains(layout_hash)) {
+			return;
+		}
+		const auto [layout, inserted] = m_tess_layouts.try_emplace(layout_hash, vertex_info[0].tess);
 		if (inserted) {
-			ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
-			                                              vertex_params[1].code, layout->second);
+			if (!ShaderRecompiler::AnalyzeTessellationPrograms(
+			        vertex_params[0].code, vertex_params[1].code, layout->second)) {
+				// Logged by the analysis; draws with this LS/HS pair are skipped.
+				m_tess_layouts.erase(layout);
+				m_rejected_tess_layouts.insert(layout_hash);
+				return;
+			}
 			StoreLayout(layout->first, layout->second);
 		}
 		for (auto& stage: vertex_info) {
@@ -853,8 +891,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
-		for (const auto& output: pixel_module.info.info.outputs) {
+		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		if (pixel_module == nullptr) {
+			return;
+		}
+		for (const auto& output: pixel_module->info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
 				state.mrt_mask |= 1u << output.location;
@@ -863,7 +904,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor) == nullptr) {
+			// A draw runs only with all of its stages; the caller checks stage 0.
+			vertex_info[0].stage = {};
+			return;
+		}
 	}
 }
 

@@ -112,7 +112,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
-	if (address == 0 || size == 0) {
+	// A base in guest page 0 is a null or garbage descriptor.
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		// Null descriptors read zero and drop writes, with or without shader bounds checks.
 		return {nullptr, 0, vk::WholeSize};
 	}
@@ -756,7 +757,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				// still needs its full payload when NumRecords is smaller than it.
 				size = std::max(size, uint64_t {metadata.max_byte_extent});
 			}
-			if (address == 0 || size == 0) {
+			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 				source = {};
 				continue;
 			}

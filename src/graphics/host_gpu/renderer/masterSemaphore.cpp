@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <cinttypes>
+
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -51,7 +53,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			DumpDeviceLossDiagnostics(m_graphics);
+		}
+		EXIT("MasterSemaphore: wait for tick %" PRIu64 " failed: %s (gpu tick %" PRIu64 ")\n", tick,
+		     vk::to_string(result).c_str(), m_gpu_tick.load(std::memory_order_acquire));
+	}
 	Refresh();
 }
 

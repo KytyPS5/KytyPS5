@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
@@ -37,9 +38,12 @@ void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::st
 	graph.unsupported_reason = message;
 }
 
-[[noreturn]] void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
+void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
                                    const std::string& message) {
 	SetFailure(graph, kind, block_id, message);
+	if (Frontend::TranslationNonFatal()) {
+		return;
+	}
 	EXIT("shader CFG build failed: %s", message.c_str());
 	std::abort();
 }
@@ -1413,6 +1417,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 	if (program.instructions.empty()) {
 		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
 		                 "cannot build CFG for empty shader");
+		return graph;
 	}
 
 	const auto first_pc = program.instructions.front().pc;
@@ -1424,6 +1429,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
 			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
 			                Decoder::InstructionToString(inst).c_str()));
+			return graph;
 		}
 	}
 
@@ -1439,6 +1445,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
 				                             inst.pc, inst.branch_target));
+				return graph;
 			}
 			labels.push_back(inst.branch_target);
 			if (next_pc <= end_pc) {
@@ -1450,6 +1457,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 				ExitBuildFailure(
 				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
+				return graph;
 			}
 			const auto target_pcs = target_info.indirect
 			                            ? std::span<const uint32_t>(target_info.target_pcs)
@@ -1460,6 +1468,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
 					                inst.pc, target));
+					return graph;
 				}
 				labels.push_back(target);
 			}
@@ -1484,6 +1493,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 			ExitBuildFailure(
 			    graph, FailureKind::InvalidLabel, UINT32_MAX,
 			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
+			return graph;
 		}
 
 		BasicBlock block;
@@ -1556,6 +1566,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 				    graph, FailureKind::MissingFallthrough, block.id,
 				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
 				                last.pc));
+				return graph;
 			}
 			block.terminator.false_block = fallthrough;
 		} else {

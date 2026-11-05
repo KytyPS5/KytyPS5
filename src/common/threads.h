@@ -21,6 +21,8 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+// Lowers the calling thread's priority so the game's own threads run first (the shader workers).
+void LowerPriority();
 
 } // namespace Thread
 

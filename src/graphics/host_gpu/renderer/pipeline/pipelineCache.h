@@ -14,9 +14,11 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -142,6 +144,9 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// Output: false when the draw must not be skipped while its shaders are built on workers,
+	// because it draws a small cached target (glyphs, UI layers) the game may not redraw.
+	bool                                 deferrable    = true;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -189,6 +194,8 @@ public:
 		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// A worker is still creating it; only the render thread reads or clears this.
+		bool                    pending               = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -197,6 +204,10 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
+	// With --async-shader-compile, starts the draw's pipeline on a worker if it has none and says
+	// whether it is ready; the draw is skipped until it is. Otherwise true, and
+	// GetGraphicsPipeline creates the pipeline.
+	[[nodiscard]] bool EnsureGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
@@ -208,7 +219,8 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// A deque, so pipelines being made on workers keep valid pointers to their modules.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -216,6 +228,9 @@ private:
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t                                push_data_cursor);
+		// The module of a program without calls that was built for these inputs, if any.
+		ShaderModule* FindCandidate(const ShaderRecompiler::IR::ResourceSpecialization& wanted,
+		                            uint32_t push_data_cursor);
 	};
 
 	struct ProgramKey {
@@ -247,20 +262,67 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	std::atomic<bool>             m_driver_cache_dirty {false};
+	// The periodic save runs on its own thread; Save() calls take turns.
+	std::mutex                    m_save_mutex;
+	std::atomic<bool>             m_save_running {false};
+	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created; closed without a shader store.
 	ShaderStoreWriter m_store;
 
+	// A stage built from its translation, before the cache holds it.
+	struct CompiledStage {
+		ShaderModule          module;
+		std::vector<uint32_t> spirv;
+	};
+	// What a worker needs to translate and compile one stage, copied from the draw that asked.
+	struct StageInputs;
+	// The worker threads and what they have finished (pipelineAsync.cpp); null unless
+	// --async-shader-compile is on.
+	struct Async;
+	// How much of a stage a GetProgram call may leave to the workers.
+	enum class AsyncMode {
+		Off,
+		// Null while the stage is not ready.
+		On,
+		// Only start the translation of a program the cache has never seen; always null.
+		PrefetchOnly,
+	};
+	std::unique_ptr<Async> m_async;
+
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	                               uint32_t& push_data_cursor, AsyncMode mode = AsyncMode::Off);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+	// The part of CompileModule that touches no cache state, so a worker can run it.
+	static CompiledStage CompileStage(vk::Device device, const ProgramKey& key,
+	                                  ShaderRecompiler::CompileOptions  options,
+	                                  ShaderRecompiler::TranslateResult translated,
+	                                  const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                  uint32_t push_data_cursor,
+	                                  std::span<const uint32_t> function_code);
+	ShaderModule& AddModule(Program& program, const ProgramKey& key, CompiledStage compiled);
+	// The pipeline's key, and in `stages` the modules it is made of.
+	GraphicsPipelineKey MakeGraphicsPipelineKey(const CommandBuffer&   command,
+	                                            const DrawRenderState& state,
+	                                            std::array<const ShaderModule*, 4>& stages);
+
+	// pipelineAsync.cpp
+	// Starts whatever work gets a stage the cache cannot serve; the caller then returns null.
+	template <typename InputInfo>
+	void RequestAsync(const ProgramKey& key, Program* program, const ShaderParams& params,
+	                  const InputInfo& input_info, const ShaderRecompiler::CompileOptions& options,
+	                  uint32_t push_data_cursor, AsyncMode mode);
+	// Applies the work the workers have finished. Render thread only.
+	void PumpAsync();
+	static uint64_t FlightId(const ProgramKey& key, uint32_t push_data_cursor,
+	                         const ShaderRecompiler::IR::ResourceSpecialization* specialization);
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 

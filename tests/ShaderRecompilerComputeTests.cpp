@@ -53947,6 +53947,119 @@ void CheckPm4LodStats(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// With --lod-stats, GET_LOD_STATS reports the counter of a bound T# as sampled at its BASE_LEVEL,
+// clamped when MIN_LOD lies above that level; image heap elements and other counters report no
+// samples. Bit 18 or 19 resets the counters after its report. Without --lod-stats no slot reports
+// samples.
+void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
+  constexpr const char *name = "Pm4LodStatsBoundTextures";
+  constexpr uintptr_t base = 0x0000000205100000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  Config::Load({.printf_direction = Config::LogDirection::Silent, .lod_stats_enabled = enabled});
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, 0x10000, 0, &direct_offset) == 0,
+          "texture allocation failed");
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+              mapped == reinterpret_cast<void *>(base),
+          "texture mapping failed");
+  {
+    RenderContext context(vulkan.RuntimeContext());
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    auto &scheduler = context.GetCommandScheduler();
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    CommandProcessor processor(context, 0);
+    alignas(64) std::array<uint32_t, 16 + 256 * 2> report{};
+    std::array<uint32_t, 5> packet{};
+    std::array<std::array<uint32_t, 2>, 256> unsampled{};
+    for (u32 counter = 0; counter < 256; counter++) {
+      unsampled[counter] = {counter << 24u, 15u << 24u};
+    }
+    const auto run = [&](uint8_t force_reset, uint8_t report_and_reset, const auto &expected) {
+      report.fill(0);
+      CommandBufferLayout dcb{packet.data(), packet.data() + packet.size(), packet.data(),
+                              packet.data() + packet.size(), nullptr, nullptr, 0};
+      Pm4Execution execution;
+      return Gen5::AgcDcbGetLodStats(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0,
+                                     report.data(), sizeof(report), 0, force_reset,
+                                     report_and_reset, 0) == packet.data() &&
+             processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+             report[0] != 0 && std::memcmp(&report[16], expected.data(), sizeof(expected)) == 0;
+    };
+
+    struct Binding {
+      u32 counter;
+      bool enabled;
+      u32 base_level;
+      u32 min_lod; // u4.8
+      bool heap;
+    };
+    // Counter 7 combines levels 1, 0 and 2; only the level 0 T# has MIN_LOD above its level.
+    const std::array bindings{Binding{3, true, 0, 0, false}, Binding{5, true, 1, 0x200, false},
+                              Binding{7, true, 1, 0x100, false}, Binding{7, true, 0, 0x80, false},
+                              Binding{7, true, 2, 0x200, false}, Binding{9, true, 0, 0x200, true},
+                              Binding{11, false, 0, 0x200, false}};
+    auto &executor = context.GetRenderExecutor();
+    const auto bind = [&] {
+      for (u32 index = 0; index < bindings.size(); index++) {
+        const auto &binding = bindings[index];
+        // 4x4 RGBA8 with levels 0-2.
+        const ShaderTextureResource descriptor{
+            {static_cast<u32>((base + index * 0x1000u) >> 8u),
+             (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) | (3u << 30u) |
+                 (binding.min_lod << 8u),
+             3u << 14u,
+             DstSel(4, 5, 6, 7) | (binding.base_level << 12u) | (2u << 16u) |
+                 (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                 (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+             0, 0x00700020u | (binding.enabled ? 1u << 25u : 0u), binding.counter, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = true;
+        resource.heap = binding.heap;
+        static_cast<void>(RenderExecutorTestAccess::ResolveTexture(executor, resource, value));
+      }
+    };
+    auto expected = unsampled;
+    if (enabled) {
+      expected[3] = {3u << 24u, 1u};
+      expected[5] = {(5u << 24u) | 1u, 1u << 24u};
+      expected[7] = {(7u << 24u) | 1u, 1u};
+    }
+    bind();
+    Require(name, "bound counters", run(0, 0, expected),
+            enabled ? "bound counters did not report their finest base level and clamping"
+                    : "bound counters reported samples without --lod-stats");
+    Require(name, "report and reset", run(0, 1, expected) && run(0, 0, unsampled),
+            "bit 19 did not report, then clear, the counters");
+    bind();
+    Require(name, "force reset", run(1, 0, expected) && run(0, 0, unsampled),
+            "bit 18 did not report, then clear, the counters");
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+  }
+  Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "texture mapping release failed");
+  Require(name, "release",
+          Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "texture allocation release failed");
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::printf("[gpu]     %-32s ok (--lod-stats %s)\n", name, enabled ? "on" : "off");
+}
+
 void CheckPm4MemSemaphore(RenderContext &renderer) {
   constexpr const char *name = "Pm4MemSemaphore";
   Loader::SymbolDatabase symbols;
@@ -55092,6 +55205,8 @@ int main(int argc, char **argv) {
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4LodStats(vulkan.RuntimeRenderer());
+    CheckPm4LodStatsBoundTextures(vulkan, false);
+    CheckPm4LodStatsBoundTextures(vulkan, true);
     CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -55405,6 +55520,8 @@ int main(int argc, char **argv) {
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4LodStats(vulkan.RuntimeRenderer());
+  CheckPm4LodStatsBoundTextures(vulkan, false);
+  CheckPm4LodStatsBoundTextures(vulkan, true);
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();

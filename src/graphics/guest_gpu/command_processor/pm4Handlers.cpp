@@ -481,6 +481,12 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto* dst = reinterpret_cast<volatile uint32_t*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	if (Config::LodStatsEnabled()) {
+		// Bit 18 or 19 resets the counters after the report.
+		cp.GetLodStats(dst, buffer_size, (buffer[3] & 0xc0000u) != 0);
+		return 4;
+	}
+
 	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
 	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
 	// samples. A non-zero dword 0 then marks the report complete.

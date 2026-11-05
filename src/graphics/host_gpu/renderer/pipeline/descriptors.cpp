@@ -494,6 +494,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
+	// Image heap resolves do not follow the draws that sample them: they report no samples.
+	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap) {
+		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
+		const uint8_t base    = descriptor.BaseLevel();
+		counter.finest_level  = std::min(counter.finest_level, base);
+		if (descriptor.MinLod() > base << 8u) {
+			counter.clamped = true;
+		} else {
+			counter.unclamped = true;
+		}
+	}
 
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;

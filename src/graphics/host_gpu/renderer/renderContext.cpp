@@ -63,7 +63,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
-	// Comes before the normal path, because that can relock the texture cache from a fault under it.
+	// Comes first because the normal path can relock the texture cache this fault is under.
 	if (m_texture_cache.ReadbackFaultWaitEnabled() && ResolveReadbackFault(access, fault_vaddr)) {
 		return true;
 	}
@@ -80,9 +80,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 bool RenderContext::ResolveReadbackFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	auto& guard = m_texture_cache.GetReadbackGuard();
 	if (CommandScheduler::InDeferredOperation()) {
-		// On the priority thread the landing runs on this very thread. A pending operation on the GPU
-		// thread can't wait on priority operations at all. So waiting could never end here, and the
-		// guest may see old data. The landing still arrives later.
+		// On the priority thread the landing runs on this very thread. A pending operation on the
+		// GPU thread can't wait on priority operations at all. So waiting could never end here, and
+		// the guest may see old data. The landing still arrives later.
 		if (guard.LiftAt(fault_vaddr)) {
 			return true;
 		}
@@ -99,9 +99,10 @@ bool RenderContext::ResolveReadbackFault(PageFaultAccess access, uint64_t fault_
 	} else if (guard.WaitAt(fault_vaddr) != ReadbackGuard::WaitResult::NotPending) {
 		return true;
 	}
-	// The hold may have ended just before this ran, and then only a retry is needed. Handling it
-	// normally could create a buffer for memory the GPU doesn't use. The caller has already found
-	// the page mapped, and a mapped page retries anyway, so this can't hide a real guest fault.
+	// Any watcher may have ended just before this ran, not only a hold, and then only a retry is
+	// needed. Handling it normally could create a buffer for memory the GPU doesn't use. The caller
+	// has already found the page mapped, and a mapped page retries anyway, so this can't hide a
+	// real guest fault.
 	return m_page_manager.WatchersAllowAccess(fault_vaddr, access);
 }
 

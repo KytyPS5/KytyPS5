@@ -734,6 +734,7 @@ static void FreeGuestStack(PthreadAttr attr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size) {
+
 	if (first_address == nullptr || second_address == nullptr || map_size == nullptr) {
 		return false;
 	}
@@ -944,6 +945,78 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	return func(arg);
 #endif
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS) && KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+struct GuestStackTestState {
+	bool      called      = false;
+	uintptr_t rsp         = 0;
+	uintptr_t stack_base  = 0;
+	uintptr_t stack_limit = 0;
+};
+
+static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
+	auto* state = static_cast<GuestStackTestState*>(arg);
+
+	asm volatile("movq %%rsp, %0\n\t"
+	             "movq %%gs:0x08, %1\n\t"
+	             "movq %%gs:0x10, %2\n\t"
+	             : "=r"(state->rsp), "=r"(state->stack_base), "=r"(state->stack_limit)
+	             :
+	             : "memory");
+
+	state->called = true;
+	return arg;
+}
+
+bool TestGuestStackNormalReturn() {
+	constexpr uint64_t stack_size = 0x10000;
+
+	const auto stack_low = Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "guest_stack_return_test");
+
+	if (stack_low == 0) {
+		return false;
+	}
+
+	GuestStackTestState state {};
+
+	uintptr_t original_stack_base  = 0;
+	uintptr_t original_stack_limit = 0;
+
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(original_stack_base), "=r"(original_stack_limit)
+	             :
+	             : "memory");
+
+	const auto stack_high = stack_low + stack_size;
+
+	void* result = RunOnGuestStack(&state, GuestStackTestEntry, reinterpret_cast<void*>(stack_high),
+	                               reinterpret_cast<void*>(stack_low), stack_high);
+
+	uintptr_t restored_stack_base  = 0;
+	uintptr_t restored_stack_limit = 0;
+
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(restored_stack_base), "=r"(restored_stack_limit)
+	             :
+	             : "memory");
+
+	const bool guest_ok = state.called && state.rsp >= stack_low && state.rsp < stack_high &&
+	                      state.stack_base == stack_high && state.stack_limit == stack_low &&
+	                      result == &state;
+
+	const bool host_ok =
+	    restored_stack_base == original_stack_base && restored_stack_limit == original_stack_limit;
+
+	const bool freed = Memory::FreeGuestMemory(stack_low, stack_size);
+
+	return guest_ok && host_ok && freed;
+}
+
+#endif
 
 static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 	if (attr == nullptr || *attr == nullptr) {

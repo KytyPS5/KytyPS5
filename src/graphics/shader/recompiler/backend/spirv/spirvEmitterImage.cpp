@@ -160,7 +160,6 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 		                      ? AddressF32(ctx, mem, address, first + index)
 		                      : ZeroF32(state);
 	}
-	if (count == 1u) return values[0];
 	if (cube) {
 		values[0] = CubeAxis(state, values[0]);
 		values[1] = CubeAxis(state, values[1]);
@@ -603,52 +602,6 @@ uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, u
 	return result;
 }
 
-uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                    uint32_t coord, Prospero::TextureNumericClass numeric_class) {
-	auto& state = ctx.state;
-	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto image = LoadImageDescriptor(state, mem.resource);
-	const auto size  = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 2), size, image,
-	                          ConstantU32(state, 0));
-	const auto width = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), width, size, 0u);
-	const auto width_f32 = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), width_f32, width);
-	const auto left = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), left, GlslStd450(state),
-	                          GLSLstd450Floor,
-	                          Binary(state, spv::OpFSub, TypeF32(state),
-	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
-	                                 ConstantF32(state, 0x3f000000u)));
-
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
-	const auto vector_type = ImageVectorType(state, numeric_class, 4);
-	const auto scalar_type = ImageScalarType(state, numeric_class);
-	const auto component = ImageGatherSource(state, mem);
-	uint32_t values[2] {};
-	for (uint32_t index = 0; index < 2u; index++) {
-		const auto x = Binary(state, spv::OpFDiv, TypeF32(state),
-		                      Binary(state, spv::OpFAdd, TypeF32(state), left,
-		                             ConstantF32(state, index == 0u ? 0x3f000000u : 0x3fc00000u)),
-		                      width_f32);
-		const auto sample_coord = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), sample_coord,
-		                          x, ConstantF32(state, 0x3f000000u));
-		const auto texel = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpImageSampleExplicitLod, vector_type, texel, sampled,
-		                          sample_coord, spv::ImageOperandsLodMask, ZeroF32(state));
-		values[index] = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, values[index], texel,
-		                          component);
-	}
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, values[0], values[1],
-	                          values[1], values[0]);
-	return result;
-}
-
 uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t data, bool integer) {
 	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
 	const auto info = ImageConversionFormat(ctx.state, mem);
@@ -1020,7 +973,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto  dimension      = image.dimension;
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);
 		const auto  layout         = Layout(mem);
-		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		IR::Value offset_value;
 		if (layout.offset != NoImageComponent) {
@@ -1034,25 +986,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
-			if (dimension == ImageDimension::Dim1D) {
-				if (image.indirect_root == mem.resource || dref ||
-				    !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-					ctx.Fail(inst, "has an unsupported 1D gather variant");
-					return;
-				}
-				const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-				                            dimension_info.coordinate_components, image.cube);
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-				                              numeric_class, false, mem, true));
-				return;
-			}
-			if (dimension == ImageDimension::Dim1DArray) {
-				ctx.Fail(inst, "has an unsupported 1D-array gather");
-				return;
-			}
 			uint32_t component_or_dref;
 			if (dref) {
 				component_or_dref = layout.dref != NoImageComponent
@@ -1088,11 +1021,23 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
 					return sample;
 				};
-				return candidate.mip_mode == IR::ImageMipMode::Dynamic && candidate.mip_count > 1u
-				           ? EmitIndexSwitch(
-				                 state, GatherMip(ctx, inst, mem, *address, layout, candidate.mip_count),
-				                 candidate.mip_count, result_type, EmitMip)
-				           : EmitMip(0u);
+				const auto gathered =
+				    candidate.mip_mode == IR::ImageMipMode::Dynamic && candidate.mip_count > 1u
+				        ? EmitIndexSwitch(
+				              state,
+				              GatherMip(ctx, inst, mem, *address, layout, candidate.mip_count),
+				              candidate.mip_count, result_type, EmitMip)
+				        : EmitMip(0u);
+				// Host row 0 holds a 1D image's texels in w and z; x and y read row 1, which is out
+				// of range. Horizontal gathers read row 0 in every component.
+				if (!ImageDimensionInfoFor(dimension).one_dimensional ||
+				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					return gathered;
+				}
+				const auto result = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVectorShuffle, result_type, result, gathered,
+				                          gathered, 3u, 2u, 2u, 3u);
+				return result;
 			};
 			ctx.Define(inst, EmitImageResult(ctx, inst, EmitGather));
 			return;

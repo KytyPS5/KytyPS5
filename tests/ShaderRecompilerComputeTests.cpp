@@ -1393,6 +1393,7 @@ struct TestCase {
   std::vector<std::vector<u32>> sampled_image_rgba_mips;
   vk::Format sampled_image_format = vk::Format::eR32G32B32A32Sfloat;
   vk::Filter sampler_filter = vk::Filter::eNearest;
+  vk::SamplerAddressMode sampler_address_mode = vk::SamplerAddressMode::eClampToEdge;
   u32 sampled_image_dwords_per_pixel = 4;
   vk::ImageType sampled_image_type = vk::ImageType::e2D;
   vk::ImageViewType sampled_image_view_type = vk::ImageViewType::e2D;
@@ -18757,15 +18758,17 @@ public:
   }
 
   vk::Sampler CreateSampler(const char *shader_name, u32 mip_levels = 1,
-                            vk::Filter filter = vk::Filter::eNearest) {
+                            vk::Filter filter = vk::Filter::eNearest,
+                            vk::SamplerAddressMode address_mode =
+                                vk::SamplerAddressMode::eClampToEdge) {
     vk::SamplerCreateInfo sampler_info{};
     sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
     sampler_info.magFilter = filter;
     sampler_info.minFilter = filter;
     sampler_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
-    sampler_info.addressModeU = vk::SamplerAddressMode::eClampToEdge;
-    sampler_info.addressModeV = vk::SamplerAddressMode::eClampToEdge;
-    sampler_info.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+    sampler_info.addressModeU = address_mode;
+    sampler_info.addressModeV = address_mode;
+    sampler_info.addressModeW = address_mode;
     sampler_info.minLod = 0.0f;
     sampler_info.maxLod = static_cast<float>(mip_levels - 1u);
     vk::Sampler sampler = nullptr;
@@ -23435,7 +23438,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (needs_sampler) {
     sampler = vulkan->CreateSampler(
         test.name, sampled_image.mip_levels - test.sampled_image_view_base_mip,
-        test.sampler_filter);
+        test.sampler_filter, test.sampler_address_mode);
   }
 
   vulkan->Dispatch(test, compiled, buffer, needs_gds ? &gds_buffer : nullptr,
@@ -41049,13 +41052,53 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = image;
+  // The host gather's second row is out of range: a border must not reach the result.
+  test.sampler_address_mode = vk::SamplerAddressMode::eClampToBorder;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"image_1", "OpImageQuerySizeLod",
-                         "OpImageSampleExplicitLod", "Floor"};
-  test.forbidden_spirv = {"OpImageGather"};
+  test.required_spirv = {"image_1", "OpImageGather"};
+  return test;
+}
+
+TestCase ImageGather1DArrayUsesLayerCoordinate() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f800000u);
+  code.push_back(EncodeMimg0(0x47, 0x1, 0, false, 4));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  // Row y of the image is layer y.
+  auto image = MakeRgbaImage(4, 2);
+  SetRgbaPixel(&image, 4, 1, 0, 0x40a00000u, 0, 0, 0);
+  SetRgbaPixel(&image, 4, 2, 0, 0x40e00000u, 0, 0, 0);
+  SetRgbaPixel(&image, 4, 1, 1, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&image, 4, 2, 1, 0x40400000u, 0, 0, 0);
+
+  TestCase test;
+  test.name = "ImageGather1DArrayUsesLayerCoordinate";
+  test.code = code;
+  test.expected = {0x40000000u, 0x40400000u, 0x40400000u, 0x40000000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.image_width = 4;
+  test.image_height = 1;
+  test.sampled_image_rgba = image;
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
+  test.sampled_image_layers = 2;
+  test.sampler_address_mode = vk::SamplerAddressMode::eClampToBorder;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+  test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1DArray)
+                      << 28u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageGather"};
   return test;
 }
 
@@ -48023,6 +48066,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
+  AddCase(ImageGather1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);

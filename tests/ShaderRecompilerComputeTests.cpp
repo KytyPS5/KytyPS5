@@ -383,6 +383,11 @@ struct TextureCacheTestAccess {
            cache.CanDownload(image) && cache.m_download_images.contains(id);
   }
 
+  // Whether a watcher or hold blocks a guest write to this page.
+  static bool WriteBlocked(const TextureCache &cache, uint64_t address) {
+    return !cache.m_page_manager.WatchersAllowAccess(address, PageFaultAccess::Write);
+  }
+
   static bool ReadBlocked(const TextureCache &cache, uint64_t address) {
     return !cache.m_page_manager.WatchersAllowAccess(address, PageFaultAccess::Read);
   }
@@ -11235,6 +11240,320 @@ public:
     Require(name, "unmap private mapping",
             Libs::LibKernel::Memory::FreeGuestMemory(private_base, allocation_size),
             "private allocation release failed");
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A fault on a held page has to end with the guest able to see the GPU's data, by the route each
+  // kind of thread can safely take. Reads and writes compare against a baseline with the switch
+  // off, and the other scenarios check their own starting state first.
+  void CheckReadbackFaultWait() {
+    constexpr const char *name = "ReadbackFaultWait";
+    constexpr uintptr_t base = 0x0000000241000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t page_size = TRACKER_PAGE_SIZE;
+    constexpr uint32_t page_width = page_size / sizeof(uint32_t);
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t stale_value = 0x2468ace0u;
+    constexpr uint32_t guest_value = 0x7a7a7a7au;
+    constexpr uint32_t label_value = 0x55u;
+    constexpr auto settle_time = std::chrono::milliseconds(50);
+    constexpr auto waiter_deadline = std::chrono::seconds(10);
+    constexpr uint64_t stale_page_index = 8;
+    constexpr uint64_t baseline_page_index = 16;
+    constexpr uint64_t pending_page_index = 24;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, allocation_size);
+    auto &texture_cache = context.GetTextureCache();
+    auto &guard = texture_cache.GetReadbackGuard();
+    CommandProcessor processor(context, 0);
+    // Polls rather than sleeping once, because a thread slow to start must not fail a correct build.
+    // The deadline lets a thread that never waits fail its own scenario by name, not hang the run.
+    const auto await_waiter = [&guard, waiter_deadline] {
+      const auto deadline = std::chrono::steady_clock::now() + waiter_deadline;
+      while (guard.ActiveWaiters() == 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          return false;
+        }
+        std::this_thread::yield();
+      }
+      return true;
+    };
+
+    alignas(uint64_t) uint32_t label = 0;
+    const auto label_address = reinterpret_cast<uint64_t>(&label);
+    constexpr uint32_t bottom_of_pipe_event = 0x28u;
+    constexpr uint32_t event_index = 5u;
+    std::array<uint32_t, 8> release{};
+    release[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+    release[1] = bottom_of_pipe_event | (event_index << 8u);
+    release[2] = 1u << 29u; // INT_SEL 0 (none), DATA_SEL 1 (32-bit value)
+    release[3] = static_cast<uint32_t>(label_address);
+    release[4] = static_cast<uint32_t>(label_address >> 32u);
+    release[5] = label_value;
+
+    const auto read_guest = [] {
+      uint32_t value = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value));
+      return value;
+    };
+    const auto prepare = [&] {
+      gpu.SendCommandSync([&] {
+        processor.BufferInit();
+        auto desc = MakeLinearDesc(base, page_size, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {page_width, 1, 1}, 1, 4, 1);
+        desc.type = BindingType::Storage;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        const auto image = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(image, desc);
+        Require(name, "image clear",
+                texture_cache.ClearImageFromBuffer(scheduler.Current(), base, page_size, gpu_value),
+                "failed to create GPU-current image contents");
+        TextureCacheTestAccess::TrackDownload(texture_cache, image);
+        Libs::LibKernel::Memory::WriteBacking(base, &stale_value, sizeof(stale_value));
+      });
+    };
+    const auto release_with_landing_parked = [&](std::binary_semaphore &parked) {
+      gpu.SendCommandSync([&] {
+        scheduler.DeferPriorityOperation([&] { parked.acquire(); });
+        Pm4Execution execution;
+        Require(name, "release",
+                processor.Process(execution, release) == Pm4ProcessResult::Complete,
+                "the release did not complete");
+      });
+    };
+    const auto finish = [&] {
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      });
+    };
+
+    TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+
+    // Baseline with the switch off. A read during the readback returns at once with old data, and
+    // a guest write in that window is lost when the landing writes its snapshot back.
+    {
+      prepare();
+      std::binary_semaphore parked{0};
+      release_with_landing_parked(parked);
+      const bool handled = context.HandleFault(PageFaultAccess::Read, base);
+      const bool old_data = read_guest() == stale_value;
+      Libs::LibKernel::Memory::WriteBacking(base, &guest_value, sizeof(guest_value));
+      parked.release();
+      finish();
+      Require(name, "off read", handled && old_data, "the baseline read did not return old data");
+      Require(name, "off write", read_guest() == gpu_value,
+              "the baseline guest write was not lost to the landing");
+    }
+
+    TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, true);
+
+    // A read waits for the landing, then sees the GPU's data.
+    {
+      prepare();
+      std::binary_semaphore parked{0};
+      release_with_landing_parked(parked);
+      uint32_t seen = 0;
+      std::thread reader([&] {
+        (void)context.HandleFault(PageFaultAccess::Read, base);
+        seen = read_guest();
+      });
+      const bool waited = await_waiter();
+      parked.release();
+      reader.join();
+      finish();
+      Require(name, "read waits", waited, "a read of a held page did not wait");
+      Require(name, "read data", seen == gpu_value, "a read did not see the landed data");
+      Require(name, "read counted", guard.GetCounters().waits == 1, "the wait was not counted");
+    }
+
+    // A write waits too, so it lands after the GPU's data and isn't lost as in the baseline.
+    {
+      prepare();
+      std::binary_semaphore parked{0};
+      release_with_landing_parked(parked);
+      std::thread writer([&] {
+        (void)context.HandleFault(PageFaultAccess::Write, base);
+        Libs::LibKernel::Memory::WriteBacking(base, &guest_value, sizeof(guest_value));
+      });
+      const bool waited = await_waiter();
+      parked.release();
+      writer.join();
+      finish();
+      Require(name, "write waits", waited, "a write to a held page did not wait");
+      Require(name, "write survives", read_guest() == guest_value,
+              "a guest write during a pending readback was lost");
+      gpu.SendCommandSync([&] { (void)context.InvalidateMemory(base, page_size); });
+    }
+
+    // The GPU thread can't wait on a guard, since only it can submit the landing. A fault there
+    // submits and waits directly, and must return with the data landed. The slow operation ahead of
+    // the landing means finishing the GPU's work alone doesn't land it. Pending operations must not
+    // run, because they can free resources the code that faulted is still preparing to use.
+    {
+      prepare();
+      bool handled = false;
+      bool landed = false;
+      bool pending_ran_during_fault = true;
+      gpu.SendCommandSync([&] {
+        bool pending_ran = false;
+        scheduler.DeferOperation([&pending_ran] { pending_ran = true; });
+        scheduler.DeferPriorityOperation([&] { std::this_thread::sleep_for(settle_time); });
+        texture_cache.ProcessDownloadImages(false);
+        const bool held_unsubmitted = guard.HasPending();
+        handled = context.HandleFault(PageFaultAccess::Read, base);
+        landed = held_unsubmitted && !guard.HasPending() && read_guest() == gpu_value;
+        pending_ran_during_fault = pending_ran;
+        scheduler.Finish();
+      });
+      Require(name, "gpu thread", handled && landed,
+              "a GPU-thread fault did not submit and wait for the landing");
+      Require(name, "gpu thread pending", !pending_ran_during_fault,
+              "a GPU-thread fault ran pending operations");
+    }
+
+    // A pending operation on the GPU thread can't wait on priority operations, so it has to lift
+    // the hold as the priority thread does, even though it runs on the GPU thread.
+    {
+      const GuestRange pending_range{base + page_size * pending_page_index, page_size};
+      const auto before = guard.GetCounters();
+      bool handled = false;
+      bool lifted = false;
+      gpu.SendCommandSync([&] {
+        Require(name, "pending hold", guard.Hold(pending_range), "the hold failed");
+        scheduler.DeferOperation([&] {
+          handled = context.HandleFault(PageFaultAccess::Read, pending_range.address);
+          const auto after = guard.GetCounters();
+          lifted = !guard.HasPending() && after.lifts == before.lifts + 1 &&
+                   after.waits == before.waits;
+        });
+        scheduler.Finish();
+      });
+      guard.Release(pending_range);
+      Require(name, "pending operation", handled && lifted,
+              "a fault in a pending operation did not lift the hold");
+    }
+
+    // The priority thread can't wait at all, because the landing runs on it. It lifts the hold, and
+    // the landing still arrives afterwards.
+    {
+      prepare();
+      bool handled = false;
+      bool lifted = false;
+      const auto before = guard.GetCounters();
+      std::binary_semaphore start{0};
+      gpu.SendCommandSync([&] {
+        scheduler.DeferPriorityOperation([&] {
+          start.acquire();
+          handled = context.HandleFault(PageFaultAccess::Read, base);
+          // No wait at all, because the landing runs on this thread and could never arrive.
+          const auto after = guard.GetCounters();
+          lifted = !guard.HasPending() && after.lifts == before.lifts + 1 &&
+                   after.waits == before.waits;
+        });
+        Pm4Execution execution;
+        Require(name, "release",
+                processor.Process(execution, release) == Pm4ProcessResult::Complete,
+                "the release did not complete");
+      });
+      start.release();
+      finish();
+      Require(name, "priority thread", handled && lifted,
+              "a fault on the priority thread did not lift the hold");
+      Require(name, "priority landing", read_guest() == gpu_value && guard.TrackedRanges() == 0,
+              "the landing after a lift did not arrive");
+    }
+
+    // A fault whose hold just ended only needs a retry. Handling it normally is the baseline, which
+    // would create a buffer here even though the GPU has no use for this memory.
+    {
+      const auto stale_page = base + page_size * stale_page_index;
+      const auto other_page = base + page_size * baseline_page_index;
+      Require(name, "stale pages clean",
+              !context.GetBufferCache().IsRegionRegistered(stale_page, page_size) &&
+                  !context.GetBufferCache().IsRegionRegistered(other_page, page_size),
+              "a test page already has a buffer");
+      const GuestRange stale_range{stale_page, page_size};
+      Require(name, "stale hold", guard.Hold(stale_range), "the hold failed");
+      guard.Release(stale_range);
+      Require(name, "stale handled", context.HandleFault(PageFaultAccess::Read, stale_page),
+              "a stale fault was not retried");
+      Require(name, "stale no buffer",
+              !context.GetBufferCache().IsRegionRegistered(stale_page, page_size),
+              "a stale fault went down the normal path");
+      TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, false);
+      Require(name, "baseline handled", context.HandleFault(PageFaultAccess::Read, other_page),
+              "the baseline fault failed");
+      Require(name, "baseline buffer",
+              context.GetBufferCache().IsRegionRegistered(other_page, page_size),
+              "the baseline fault should take the normal path");
+      TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, true);
+    }
+
+    // A fault that a watcher explains is no stale fault, and must reach the normal path, or the
+    // emulator would stop noticing guest writes. The image on this page tracks them.
+    {
+      prepare();
+      finish();
+      bool dirty_before = false;
+      bool dirty_after = false;
+      gpu.SendCommandSync([&] {
+        const auto image = texture_cache.FindImageFromRange(base, page_size);
+        const auto &owner = TextureCacheTestAccess::MutableImage(texture_cache, image);
+        dirty_before = owner.IsCpuDirty();
+        Require(name, "watched page blocked",
+                TextureCacheTestAccess::WriteBlocked(texture_cache, base),
+                "the image did not watch its page for writes");
+        (void)context.HandleFault(PageFaultAccess::Write, base);
+        dirty_after = owner.IsCpuDirty();
+      });
+      Require(name, "watched write", !dirty_before && dirty_after,
+              "a write fault on a watched page did not reach the normal path");
+    }
+
+    // An unmapped page in a tracked region has no watchers, so it looks allowed. It must still be
+    // reported as a real fault rather than retried forever.
+    {
+      const auto outside = base + allocation_size + page_size;
+      Require(name, "unmapped neighbour tracked",
+              !TextureCacheTestAccess::ReadBlocked(texture_cache, outside),
+              "the unmapped page should share a tracked region");
+      Require(name, "unmapped neighbour",
+              !context.HandleFault(PageFaultAccess::Read, outside),
+              "a fault on an unmapped page was retried");
+    }
+
+    TextureCacheTestAccess::SetReadbackFaultWait(texture_cache, false);
+    TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "direct-memory mapping release failed");
@@ -56141,6 +56460,7 @@ int main(int argc, char **argv) {
   vulkan.CheckTextureCacheDownloadDropAtLabel();
   vulkan.CheckReadbackAtLabel();
   vulkan.CheckReadbackHoldAtLabel();
+  vulkan.CheckReadbackFaultWait();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

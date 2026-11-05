@@ -96,6 +96,9 @@ public:
 	[[nodiscard]] bool HasReadbacksInFlight() const noexcept {
 		return m_readbacks_in_flight.load(std::memory_order_acquire) != 0;
 	}
+	/// @return true if qualifying readbacks hold their guest pages. It is set at construction (only
+	/// tests change it later), so it needs no lock.
+	[[nodiscard]] bool ReadbackFaultWaitEnabled() const noexcept { return m_readback_fault_wait; }
 	/// @return the guard holding the guest pages of pending readbacks.
 	[[nodiscard]] ReadbackGuard& GetReadbackGuard() noexcept { return m_readback_guard; }
 	void RunGarbageCollector();

@@ -307,6 +307,21 @@ void TestRealFaultWaitsForLanding() {
 	Check(guard.GetCounters().waits == 1, "wait not counted");
 }
 
+// Threads that can't block need to know whether an address is held without waiting.
+void TestCovers() {
+	Probe         probe;
+	PageManager   manager;
+	ReadbackGuard guard(manager, probe.Source(), NOTIFY_ONLY);
+	Pages         pages(3);
+	const auto    range = pages.Range(1, 1);
+	Check(!guard.Covers(pages.At(1)), "covered with nothing pending");
+	Check(guard.Hold(range), "hold failed");
+	Check(guard.Covers(pages.At(1)) && guard.Covers(pages.At(2) - 1), "held page not covered");
+	Check(!guard.Covers(pages.At(0)) && !guard.Covers(pages.At(2)), "neighbour reported covered");
+	Check(guard.LiftAt(pages.At(1)) && !guard.Covers(pages.At(1)), "lifted page still covered");
+	guard.Release(range);
+}
+
 // Waits only concern the held pages. Page 1 is held here, so its neighbours on both sides show the
 // range check works in each direction.
 void TestWaitNotPending() {
@@ -543,10 +558,12 @@ void TestLiftRangeWakesAndKeepsOthers() {
 	const auto    kept   = pages.Range(2, 1);
 	Check(guard.Hold(lifted) && guard.Hold(kept), "hold failed");
 
-	Waiter     waiter(guard, probe, lifted.address);
+	Waiter waiter(guard, probe, lifted.address);
+	Check(guard.ActiveWaiters() == 1, "waiter not counted while waiting");
 	const auto lifted_at = Clock::now();
 	guard.LiftRange(lifted.address, lifted.size);
 	Check(waiter.Finish(lifted_at) == WaitResult::Lifted, "lifted range did not wake its waiter");
+	Check(guard.ActiveWaiters() == 0, "waiter still counted after finishing");
 	Check(guard.HasPending(), "lift touched a range outside it");
 	WritePage(lifted.address, 1);
 	Check(guard.GetCounters().lifts == 1, "range lift not counted");
@@ -679,6 +696,7 @@ int main() {
 	TestFaultDuringHoldSeesPending();
 	TestRepeatHoldProtectsOnce();
 	TestRealFaultWaitsForLanding();
+	TestCovers();
 	TestWaitNotPending();
 	TestHugeRangeDoesNotOverflow();
 	TestTimeoutLiftsAndLandingStaysSafe();

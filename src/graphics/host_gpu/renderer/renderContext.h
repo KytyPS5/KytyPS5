@@ -66,6 +66,10 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	/// Handles a fault on a page a pending readback is holding, by waiting for the data if this
+	/// thread may block. Also recognises a fault whose hold ended just before it got here.
+	/// @return true when the access should simply retry, without the normal fault handling.
+	[[nodiscard]] bool ResolveReadbackFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;

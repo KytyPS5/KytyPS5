@@ -63,6 +63,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// Comes before the normal path, because that can relock the texture cache from a fault under it.
+	if (m_texture_cache.ReadbackFaultWaitEnabled() && ResolveReadbackFault(access, fault_vaddr)) {
+		return true;
+	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -71,6 +75,34 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+bool RenderContext::ResolveReadbackFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	auto& guard = m_texture_cache.GetReadbackGuard();
+	if (CommandScheduler::InDeferredOperation()) {
+		// On the priority thread the landing runs on this very thread. A pending operation on the GPU
+		// thread can't wait on priority operations at all. So waiting could never end here, and the
+		// guest may see old data. The landing still arrives later.
+		if (guard.LiftAt(fault_vaddr)) {
+			return true;
+		}
+	} else if (GuestGpu::IsGpuThread()) {
+		if (guard.Covers(fault_vaddr)) {
+			// The landing may still be unsubmitted, and only this thread can submit it. Wait leaves
+			// pending operations alone, because they can free resources that the code which faulted
+			// is still preparing to use.
+			const auto tick = m_command_scheduler.CurrentTick();
+			m_command_scheduler.Wait(tick);
+			m_command_scheduler.WaitPriorityOperations(tick);
+			return true;
+		}
+	} else if (guard.WaitAt(fault_vaddr) != ReadbackGuard::WaitResult::NotPending) {
+		return true;
+	}
+	// The hold may have ended just before this ran, and then only a retry is needed. Handling it
+	// normally could create a buffer for memory the GPU doesn't use. The caller has already found
+	// the page mapped, and a mapped page retries anyway, so this can't hide a real guest fault.
+	return m_page_manager.WatchersAllowAccess(fault_vaddr, access);
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {

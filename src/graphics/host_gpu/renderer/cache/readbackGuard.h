@@ -87,6 +87,9 @@ public:
 	/// Lifts all protection, and wakes waiters. Used at shutdown.
 	void LiftAll();
 
+	/// Returns whether a protected range covers an address, without waiting.
+	[[nodiscard]] bool Covers(uint64_t vaddr);
+
 	/// Waits until nothing pending covers an address. The wait path neither allocates nor logs,
 	/// because it runs inside a fault handler on a possibly small stack.
 	WaitResult WaitAt(uint64_t vaddr) noexcept;
@@ -96,6 +99,11 @@ public:
 	/// Cheap check that needs no lock, so faults unrelated to readbacks stay fast.
 	[[nodiscard]] bool HasPending() const noexcept {
 		return m_protected_ranges.load(std::memory_order_acquire) != 0;
+	}
+
+	/// Returns how many threads are waiting right now.
+	[[nodiscard]] uint32_t ActiveWaiters() const noexcept {
+		return m_active_waiters.load(std::memory_order_acquire);
 	}
 
 	/// Returns the totals so far.
@@ -134,6 +142,7 @@ private:
 	std::condition_variable     m_landed;
 	std::map<RangeKey, Pending> m_pending;
 	std::atomic<uint32_t>       m_protected_ranges {0};
+	std::atomic<uint32_t>       m_active_waiters {0};
 	uint32_t                    m_consecutive_timeouts = 0;
 	bool                        m_stop_logged          = false;
 	Counters                    m_counters;

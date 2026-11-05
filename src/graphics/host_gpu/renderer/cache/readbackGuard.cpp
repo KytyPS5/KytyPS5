@@ -158,6 +158,14 @@ bool ReadbackGuard::AnyLiftedOverlap(uint64_t address, uint64_t size) const noex
 	});
 }
 
+bool ReadbackGuard::Covers(uint64_t vaddr) {
+	if (!HasPending()) {
+		return false;
+	}
+	std::lock_guard lock(m_mutex);
+	return AnyProtectedOverlap(vaddr, ONE_BYTE);
+}
+
 ReadbackGuard::WaitResult ReadbackGuard::WaitAt(uint64_t vaddr) noexcept {
 	return WaitOverlap(vaddr, ONE_BYTE);
 }
@@ -175,6 +183,7 @@ ReadbackGuard::WaitResult ReadbackGuard::WaitOverlap(uint64_t address, uint64_t 
 	if (!AnyProtectedOverlap(address, size)) {
 		return WaitResult::NotPending;
 	}
+	m_active_waiters.fetch_add(1, std::memory_order_acq_rel);
 	const auto start          = Clock::now();
 	auto       last_progress  = start;
 	auto       progress_value = m_progress();
@@ -202,6 +211,7 @@ ReadbackGuard::WaitResult ReadbackGuard::WaitOverlap(uint64_t address, uint64_t 
 	    result,
 	    static_cast<uint64_t>(
 	        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count()));
+	m_active_waiters.fetch_sub(1, std::memory_order_acq_rel);
 	lock.unlock();
 	if (timed_out) {
 		m_landed.notify_all();

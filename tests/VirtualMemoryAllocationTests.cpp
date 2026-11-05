@@ -1316,6 +1316,15 @@ void TestGuestStackPthreadExit() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void TestGuestStackHandledFault() {
+	const char* test = "GuestStackHandledFault";
+
+	Check(test, Libs::LibKernel::TestGuestStackHandledFault(),
+	      "handled guest stack fault did not resume or restore the host stack bounds");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
 #endif
 
 void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
@@ -5833,6 +5842,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-only") == 0) {
 		RunTest(TestGuestStackNormalReturn);
 		RunTest(TestGuestStackPthreadExit);
+		RunTest(TestGuestStackHandledFault);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
@@ -5965,6 +5975,7 @@ int main(int argc, char** argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestGuestStackNormalReturn);
 	RunTest(TestGuestStackPthreadExit);
+	RunTest(TestGuestStackHandledFault);
 #endif
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);

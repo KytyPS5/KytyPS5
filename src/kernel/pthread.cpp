@@ -949,13 +949,41 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS) && KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 struct GuestStackTestState {
-	bool      called             = false;
-	bool      exit_via_pthread   = false;
-	bool      returned_from_exit = false;
-	uintptr_t rsp                = 0;
-	uintptr_t stack_base         = 0;
-	uintptr_t stack_limit        = 0;
+	bool      called                = false;
+	bool      exit_via_pthread      = false;
+	bool      returned_from_exit    = false;
+	bool      trigger_fault         = false;
+	bool      fault_handled         = false;
+	bool      continued_after_fault = false;
+	void*     fault_page            = nullptr;
+	uintptr_t fault_rsp             = 0;
+	uintptr_t rsp                   = 0;
+	uintptr_t stack_base            = 0;
+	uintptr_t stack_limit           = 0;
 };
+
+static thread_local GuestStackTestState* g_guest_stack_fault_state = nullptr;
+
+static LONG WINAPI GuestStackFaultHandler(PEXCEPTION_POINTERS exception) {
+	auto*       state  = g_guest_stack_fault_state;
+	const auto* record = exception->ExceptionRecord;
+
+	if (state == nullptr || !state->trigger_fault || state->fault_handled ||
+	    record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 ||
+	    record->ExceptionInformation[0] != 0 ||
+	    record->ExceptionInformation[1] != reinterpret_cast<ULONG_PTR>(state->fault_page)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	DWORD old_protection = 0;
+	if (!VirtualProtect(state->fault_page, 4096, PAGE_READWRITE, &old_protection)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	state->fault_handled = true;
+	state->fault_rsp     = exception->ContextRecord->Rsp;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
 
 static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
 	auto* state = static_cast<GuestStackTestState*>(arg);
@@ -969,6 +997,14 @@ static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
 
 	state->called = true;
 
+	if (state->trigger_fault) {
+		uint32_t value = 0;
+
+		asm volatile("movl (%1), %0" : "=r"(value) : "r"(state->fault_page) : "memory");
+
+		state->continued_after_fault = value == 0x12345678u;
+	}
+
 	if (state->exit_via_pthread) {
 		PthreadExit(arg);
 		state->returned_from_exit = true;
@@ -977,7 +1013,7 @@ static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
 	return arg;
 }
 
-static bool TestGuestStackReturn(bool exit_via_pthread) {
+static bool TestGuestStackReturn(bool exit_via_pthread, bool trigger_fault = false) {
 	constexpr uint64_t stack_size = 0x10000;
 
 	const auto stack_low = Memory::AllocateRuntimeMemory(
@@ -989,6 +1025,29 @@ static bool TestGuestStackReturn(bool exit_via_pthread) {
 
 	GuestStackTestState state {};
 	state.exit_via_pthread = exit_via_pthread;
+	state.trigger_fault    = trigger_fault;
+
+	void* fault_handler = nullptr;
+	if (trigger_fault) {
+		state.fault_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		if (state.fault_page == nullptr) {
+			Memory::FreeGuestMemory(stack_low, stack_size);
+			return false;
+		}
+		*static_cast<uint32_t*>(state.fault_page) = 0x12345678u;
+		DWORD old_protection                      = 0;
+		if (!VirtualProtect(state.fault_page, 4096, PAGE_NOACCESS, &old_protection)) {
+			VirtualFree(state.fault_page, 0, MEM_RELEASE);
+			Memory::FreeGuestMemory(stack_low, stack_size);
+			return false;
+		}
+		fault_handler = AddVectoredExceptionHandler(1, GuestStackFaultHandler);
+		if (fault_handler == nullptr) {
+			VirtualFree(state.fault_page, 0, MEM_RELEASE);
+			Memory::FreeGuestMemory(stack_low, stack_size);
+			return false;
+		}
+	}
 
 	uintptr_t original_stack_base  = 0;
 	uintptr_t original_stack_limit = 0;
@@ -1003,16 +1062,19 @@ static bool TestGuestStackReturn(bool exit_via_pthread) {
 
 	PthreadPrivate test_thread {};
 
-	const auto previous_self       = g_pthread_self;
-	const auto previous_return_rsp = g_guest_entry_return_rsp;
+	const auto previous_self        = g_pthread_self;
+	const auto previous_return_rsp  = g_guest_entry_return_rsp;
+	const auto previous_fault_state = g_guest_stack_fault_state;
 
-	g_pthread_self = &test_thread;
+	g_pthread_self            = &test_thread;
+	g_guest_stack_fault_state = trigger_fault ? &state : nullptr;
 
 	void* result = RunOnGuestStack(&state, GuestStackTestEntry, reinterpret_cast<void*>(stack_high),
 	                               reinterpret_cast<void*>(stack_low), stack_high);
 
-	g_pthread_self           = previous_self;
-	g_guest_entry_return_rsp = previous_return_rsp;
+	g_pthread_self            = previous_self;
+	g_guest_entry_return_rsp  = previous_return_rsp;
+	g_guest_stack_fault_state = previous_fault_state;
 
 	uintptr_t restored_stack_base  = 0;
 	uintptr_t restored_stack_limit = 0;
@@ -1029,10 +1091,17 @@ static bool TestGuestStackReturn(bool exit_via_pthread) {
 
 	const bool host_ok =
 	    restored_stack_base == original_stack_base && restored_stack_limit == original_stack_limit;
+	const bool fault_ok =
+	    !trigger_fault || (state.fault_handled && state.continued_after_fault &&
+	                       state.fault_rsp >= stack_low && state.fault_rsp < stack_high);
 
+	const bool handler_removed =
+	    fault_handler == nullptr || RemoveVectoredExceptionHandler(fault_handler) != 0;
+	const bool page_freed =
+	    state.fault_page == nullptr || VirtualFree(state.fault_page, 0, MEM_RELEASE) != 0;
 	const bool freed = Memory::FreeGuestMemory(stack_low, stack_size);
 
-	return guest_ok && host_ok && freed;
+	return guest_ok && host_ok && fault_ok && handler_removed && page_freed && freed;
 }
 
 bool TestGuestStackNormalReturn() {
@@ -1040,6 +1109,10 @@ bool TestGuestStackNormalReturn() {
 }
 bool TestGuestStackPthreadExit() {
 	return TestGuestStackReturn(true);
+}
+
+bool TestGuestStackHandledFault() {
+	return TestGuestStackReturn(false, true);
 }
 
 #endif

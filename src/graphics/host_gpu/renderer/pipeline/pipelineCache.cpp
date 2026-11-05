@@ -197,6 +197,8 @@ struct AheadWrites {
 	}
 };
 thread_local AheadWrites t_ahead_writes;
+// Whether the walk of the stage being resolved left a GPU-produced load unread.
+thread_local bool t_ahead_unread_load = false;
 
 // Bounds tested for zero that the execution thread found on pages the GPU owns (see
 // GuestReadLog::ZeroTestHolds()): a walk ahead of execution reads them before their writer runs.
@@ -229,7 +231,9 @@ void LearnGpuProducedBound(uint64_t address) {
 }
 
 bool AheadGpuProduced(uint64_t address) {
-	return t_ahead_writes.Contains(address);
+	if (!t_ahead_writes.Contains(address) && !g_gpu_produced_bounds.Contains(address)) return false;
+	t_ahead_unread_load = true;
+	return true;
 }
 
 void NoteAheadWrites(const ShaderRecompiler::IR::ResourcePlan&     plan,
@@ -1669,6 +1673,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
+	t_ahead_unread_load = false;
 	if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, resources,
 	                                                specialization)) {
 		ahead.reads.Fail();
@@ -1690,9 +1695,12 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if (module == modules.end()) {
 		// A specialization made of stale bytes of GPU-written memory is usually one the execution
 		// thread never asks for (in GTA V, V#s of garbage strides: thousands of permutations of
-		// some compute shaders, each compiled, stored and given a pipeline). Only the execution
+		// some compute shaders, each compiled, stored and given a pipeline). So is one whose walk
+		// left a GPU-produced branch condition unread: it reached both sides, and the resources
+		// of the side the shader does not run hold leftovers (in GTA SA, user data V#s with
+		// ADD_TID or reserved dst_sel that no vertex program compiles). Only the execution
 		// thread's own lookup compiles those.
-		if (!ahead.reads.MayHaveReadGpuWrites()) {
+		if (!ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load) {
 			QueueCompile(params, input_info, push_data_cursor, &specialization);
 		}
 		ahead.reads.Fail();

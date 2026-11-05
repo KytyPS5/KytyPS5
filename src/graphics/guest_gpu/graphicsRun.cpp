@@ -306,6 +306,27 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
+void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset) {
+	auto& counters = m_renderer.GetRenderExecutor().m_mip_stats;
+	// Each of up to 256 2-dword slots after the 16-dword header holds the clamped sample count
+	// (dword 0 bits 0-23), the slot id (bits 24-31), the unclamped sample count (dword 1 bits 0-23)
+	// and the finest mip sampled (bits 24-27, 15 for none). A non-zero header dword 0 then marks
+	// the report complete.
+	if (dst != nullptr && size >= 64) {
+		const auto slots = std::min((size - 64) / 8, 256u);
+		for (uint32_t slot = 0; slot < slots; slot++) {
+			const auto& counter = counters[slot];
+			dst[16 + slot * 2]  = (slot << 24u) | uint32_t {counter.clamped};
+			dst[16 + slot * 2 + 1] =
+			    (uint32_t {counter.finest_level} << 24u) | uint32_t {counter.unclamped};
+		}
+		dst[0] = 1;
+	}
+	if (reset) {
+		counters = {};
+	}
+}
+
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
 	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {

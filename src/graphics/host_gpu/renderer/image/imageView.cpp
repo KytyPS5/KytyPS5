@@ -19,11 +19,6 @@ namespace {
 
 [[nodiscard]] bool IsValidViewType(const VulkanImage& image, const ImageViewInfo& info) {
 	switch (image.image_type) {
-		case vk::ImageType::e1D:
-			if (info.type != vk::ImageViewType::e1D && info.type != vk::ImageViewType::e1DArray) {
-				return false;
-			}
-			return info.type != vk::ImageViewType::e1D || info.layer_count == 1;
 		case vk::ImageType::e2D:
 			switch (info.type) {
 				case vk::ImageViewType::e2D: return info.layer_count == 1;

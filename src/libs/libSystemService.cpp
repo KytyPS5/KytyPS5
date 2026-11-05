@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "emulator.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -221,9 +222,8 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	luminance->max_full_frame_tone_map_luminance = 80.0f;
-	luminance->max_tone_map_luminance            = 1000.0f;
-	luminance->min_tone_map_luminance            = 0.0f;
+	const auto display = Graphics::WindowGetDisplayLuminance();
+	*luminance         = {display.max_full_frame, display.max, display.min};
 
 	return OK;
 }

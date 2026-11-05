@@ -731,6 +731,13 @@ void TestFsync() {
   Check(FileSystem::KernelClose(fd) == OK && fsync(fd) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "closed fsync descriptor reports POSIX EBADF");
+
+  for (const auto& [path, flags] : {std::pair {"/savedata0", 0x00020000}, std::pair {Path, 0},
+                                    std::pair {"/dev/urandom", 0x2}}) {
+    const int descriptor = FileSystem::KernelOpen(path, flags, 0);
+    Check(descriptor >= 3 && fsync(descriptor) == OK && FileSystem::KernelClose(descriptor) == OK,
+          "fsync succeeds on a directory, a read-only file and a writable device");
+  }
 }
 
 void TestSaveTruncate() {

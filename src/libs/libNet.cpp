@@ -778,10 +778,11 @@ LIB_VERSION("Http2", 1, "Http2", 1, 1);
 
 namespace EventQueue = LibKernel::EventQueue;
 
-constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
-constexpr int HTTP2_ERROR_BEFORE_SEND  = -2122641307; /* 0x817B1065 */
-constexpr int HTTP2_ERROR_TIMEOUT      = -2122641304; /* 0x817B1068 */
-constexpr int HTTP2_ERROR_NULL_POINTER = -2122640859; /* 0x817B1225 */
+constexpr int HTTP2_ERROR_INVALID_ID    = -2122641152; /* 0x817B1100 */
+constexpr int HTTP2_ERROR_BEFORE_SEND   = -2122641307; /* 0x817B1065 */
+constexpr int HTTP2_ERROR_TIMEOUT       = -2122641304; /* 0x817B1068 */
+constexpr int HTTP2_ERROR_NULL_POINTER  = -2122640859; /* 0x817B1225 */
+constexpr int HTTP2_ERROR_INVALID_VALUE = -2122640898; /* 0x817B11FE */
 
 struct Http2Options {
 	bool     auth_enabled               = false;
@@ -805,6 +806,13 @@ struct Http2Context {
 	int    libssl_ctx_id           = 0;
 	size_t pool_size               = 0;
 	int    max_concurrent_requests = 0;
+};
+
+struct Http2MemoryPoolStats {
+	size_t  pool_size;
+	size_t  max_inuse_size;
+	size_t  current_inuse_size;
+	int32_t reserved;
 };
 
 struct Http2Template {
@@ -958,6 +966,23 @@ static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
 
 	g_http2_contexts.erase(context);
 
+	return 0;
+}
+
+static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int lib_http2_ctx_id, Http2MemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	if (stats == nullptr) {
+		return HTTP2_ERROR_INVALID_VALUE;
+	}
+
+	const auto context = g_http2_contexts.find(lib_http2_ctx_id);
+	if (context == g_http2_contexts.end()) {
+		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	// Requests use host storage, not allocations from the library pool
+	*stats = {context->second.pool_size, 0, 0, 0};
 	return 0;
 }
 
@@ -1497,6 +1522,7 @@ static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("3JCe3lCbQ8A", LibHttp2::Http2Init);
 	LIB_FUNC("YiBUtz-pGkc", LibHttp2::Http2Term);
+	LIB_FUNC("otUQuZa-mv0", LibHttp2::Http2GetMemoryPoolStats);
 	LIB_FUNC("+wCt7fCijgk", LibHttp2::Http2CreateTemplate);
 	LIB_FUNC("pDom5-078DA", LibHttp2::Http2DeleteTemplate);
 	LIB_FUNC("mmyOCxQMVYQ", LibHttp2::Http2CreateRequestWithURL);

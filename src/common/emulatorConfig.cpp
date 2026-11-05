@@ -217,6 +217,10 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
+bool LodStatsEnabled() {
+	return g_config->lod_stats_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

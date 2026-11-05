@@ -1349,8 +1349,13 @@ int KYTY_SYSV_ABI KernelFsync(int d) {
 		return KERNEL_ERROR_EBADF;
 	}
 
+	// Directories, devices and read-only descriptors have no written data to flush
+	if (!file->writable || file->special != SpecialFile::None) {
+		return OK;
+	}
+
 	Common::LockGuard lock(file->mutex);
-	if (file->f.IsInvalid() || !file->f.Flush()) {
+	if (!file->f.Flush()) {
 		return KERNEL_ERROR_EIO;
 	}
 

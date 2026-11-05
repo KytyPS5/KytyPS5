@@ -481,6 +481,12 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto* dst = reinterpret_cast<volatile uint32_t*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	if (Config::LodStatsEnabled()) {
+		// Bit 18 or 19 resets the counters after the report.
+		cp.GetLodStats(dst, buffer_size, (buffer[3] & 0xc0000u) != 0);
+		return 4;
+	}
+
 	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
 	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
 	// samples. A non-zero dword 0 then marks the report complete.
@@ -2150,8 +2156,9 @@ static constexpr auto MakeShaderIndirectTable() {
 	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
-	// GS-front allocation metadata; the native GS resource registers already carry it.
+	// GS- and HS-front allocation metadata; the fused GS and HS resource registers carry it.
 	table[0x0ca] = IgnoreRegister;
+	table[0x14a] = IgnoreRegister;
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		table[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_REG_ARGS) {

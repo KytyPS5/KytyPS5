@@ -427,17 +427,6 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		dynamic_state.SetStencilWriteMasks(front.writeMask, back.writeMask);
 		dynamic_state.SetStencilReferences(front.reference, back.reference);
 	}
-
-#if defined(__APPLE__)
-	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
-	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
-#else
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
-		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
-	}
-	dynamic_state.SetColorWriteEnables(std::span {enable}.first(rendering.num_color_attachments));
-#endif
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {

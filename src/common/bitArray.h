@@ -153,8 +153,6 @@ public:
 		return combined == 0;
 	}
 
-	[[nodiscard]] constexpr bool Any() const { return !None(); }
-
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

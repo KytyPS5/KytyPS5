@@ -550,9 +550,6 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	const bool dest_depth   = destination.info.IsDepth();
 	const bool direct_copy =
 	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
-	    (source.backing.image_type == destination.backing.image_type ||
-	     (source.backing.image_type != vk::ImageType::e1D &&
-	      destination.backing.image_type != vk::ImageType::e1D)) &&
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
@@ -1071,7 +1068,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			                            !image.IsBufferModified() && !image.IsCpuDirty();
 			// 2D-array attachment views select 2D layers or, of a volume, depth slices.
 			if (m_graphics.conditional_rendering_enabled &&
-			    image.backing.image_type != vk::ImageType::e1D &&
 			    count <= m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers &&
 			    (image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) &&
 			    (m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &

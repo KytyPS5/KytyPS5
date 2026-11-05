@@ -37,6 +37,7 @@ struct GraphicContext {
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
 	bool                               conditional_rendering_enabled         = false;
+	bool                               sampler_filter_minmax_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;

@@ -75,6 +75,7 @@ public:
 	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};
 	std::array<Value, NumScalarRegs> ssa_sreg_mask_tags {};
 	std::array<Value, NumVectorRegs> ssa_vreg_values {};
+	std::array<Value, 8>             ssa_flag_values {}; // SCC, EXEC(_LO/_HI), VCC(_LO/_HI), M0
 
 private:
 	InstructionList     instructions;

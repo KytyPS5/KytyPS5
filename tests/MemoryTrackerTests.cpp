@@ -589,10 +589,16 @@ void TestGpuDirtyBits() {
             !tracker.IsRegionGpuModified(address + page_size, page_size) &&
             Protection(memory) == PAGE_NOACCESS,
         "GPU dirty state escaped the requested range");
+  // CPU-dirtying the next page does not conflict with the GPU-dirty one.
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   Check(!tracker.IsRegionGpuModified(address, page_size) &&
             Protection(memory) == PAGE_READONLY,
         "GPU dirty state did not restore write-only tracking");
+  // Nor does CPU-dirtying the previous page.
+  MarkGpuModified(tracker, address + page_size, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size * 2);
   Release(memory);
 }

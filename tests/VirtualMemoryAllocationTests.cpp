@@ -1298,6 +1298,17 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestGuestStackNormalReturn() {
+	const char* test = "GuestStackNormalReturn";
+
+	Check(test, Libs::LibKernel::TestGuestStackNormalReturn(),
+		"guest stack bounds or host stack restoration failed");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
 
@@ -5809,6 +5820,12 @@ int main(int argc, char** argv) {
 		return RunTrinityTests();
 	}
 	InitSubsystems();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-only") == 0) {
+		RunTest(TestGuestStackNormalReturn);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
@@ -5935,6 +5952,9 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestGuestStackNormalReturn);
+#endif
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);

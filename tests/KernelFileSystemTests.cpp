@@ -2436,6 +2436,55 @@ void CheckEtherAddressFormatting() {
         "Ethernet formatting rejects invalid arguments without writing output");
 }
 
+void CheckSocketPeerName() {
+  namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  Libs::InitLibKernel_1(&symbols);
+  const auto *posix_symbol = symbols.Find(
+      {"TXFFFiNldU8", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  const auto *net_symbol = symbols.Find(
+      {"TCkRD0DWNLg", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *errno_symbol = symbols.Find(
+      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(posix_symbol && net_symbol && errno_symbol,
+        "POSIX and Net getpeername exports resolve");
+  using Getpeername = int(KYTY_SYSV_ABI *)(int, void *, uint32_t *);
+  using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto posix_getpeername =
+      reinterpret_cast<Getpeername>(posix_symbol->vaddr);
+  const auto net_getpeername = reinterpret_cast<Getpeername>(net_symbol->vaddr);
+  auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
+  const auto [reader, writer] = CreateTcpPair();
+  std::array<uint8_t, 16> reader_name{}, writer_name{}, peer{};
+  uint32_t reader_name_size = 16, writer_name_size = 16, peer_size = 16;
+  Check(Net::Getsockname(reader, reader_name.data(), &reader_name_size) == 0 &&
+            Net::Getsockname(writer, writer_name.data(), &writer_name_size) ==
+                0,
+        "get both ends of the getpeername pair");
+  // 007 First Light checks a loopback pair this way: the accepted end's peer
+  // is the connecting end's own address.
+  Check(posix_getpeername(reader, peer.data(), &peer_size) == 0 &&
+            peer_size == writer_name_size && peer == writer_name,
+        "POSIX getpeername returns the connecting end's address");
+  peer = {};
+  peer_size = 16;
+  Check(net_getpeername(writer, peer.data(), &peer_size) == 0 &&
+            peer_size == reader_name_size && peer == reader_name,
+        "Net getpeername returns the accepted end's address");
+  const int unconnected = Net::Socket(2, 1, 0);
+  uint32_t size = 16;
+  Check(unconnected >= 0 &&
+            posix_getpeername(unconnected, peer.data(), &size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOTCONN &&
+            net_getpeername(unconnected, peer.data(), &size) < 0 &&
+            *net_errno == Libs::Posix::POSIX_ENOTCONN,
+        "getpeername reports ENOTCONN for a socket without a peer");
+  Check(Net::SocketClose(unconnected) == 0 && Net::SocketClose(reader) == 0 &&
+            Net::SocketClose(writer) == 0,
+        "close getpeername sockets");
+}
+
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
@@ -2784,6 +2833,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__)
     TestNetCtlHostIpv4();
 #endif
+    CheckSocketPeerName();
     TestNpEmulation();
     TestNpAuthEmulation();
     subsystems.Destroy();
@@ -2833,6 +2883,7 @@ int main(int argc, char** argv) {
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   CheckSocketWakeup();
+  CheckSocketPeerName();
   FileSystem::Shutdown();
   CheckEtherAddressFormatting();
 #if defined(__linux__)

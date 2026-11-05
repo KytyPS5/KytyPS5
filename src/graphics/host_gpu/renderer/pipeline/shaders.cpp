@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <span>
 #include <vector>
 
@@ -378,7 +379,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		const auto hash = [&](size_t stage) {
+			return stages[stage] != nullptr ? stages[stage]->info.shader_hash : uint64_t {0};
+		};
+		EXIT("vkCreateGraphicsPipelines failed: %s, %s 0x%016" PRIx64 ", hs 0x%016" PRIx64
+		     ", ds 0x%016" PRIx64 ", ps 0x%016" PRIx64 "\n",
+		     vk::to_string(result).c_str(), mesh ? "ms" : "vs", hash(0), hash(1), hash(2), hash(3));
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -414,7 +422,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateComputePipelines failed: %s, cs 0x%016" PRIx64 "\n", vk::to_string(result).c_str(),
+		     module.info.shader_hash);
+	}
 }
 
 } // namespace Libs::Graphics

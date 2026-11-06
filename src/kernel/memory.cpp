@@ -169,6 +169,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t              g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+static uint32_t              g_test_backing_remaps_before_failure       = UINT32_MAX;
 static callback_func_t       g_test_before_backing_map                  = nullptr;
 static callback_func_t       g_test_backing_read                        = nullptr;
 static uint64_t              g_test_backing_bytes_zeroed                = 0;
@@ -2943,6 +2944,10 @@ void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
 
 void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps) {
 	g_test_backing_store_unmaps_before_failure = successful_unmaps;
+}
+
+void TestFailGuestBackingRemapAfter(uint32_t successful_remaps) {
+	g_test_backing_remaps_before_failure = successful_remaps;
 }
 
 void TestFailNextFixedReserveRangeRegistration() {

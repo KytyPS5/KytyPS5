@@ -2495,6 +2495,147 @@ void TestWindowsBackingViewPermissions() {
 	      "backing view permissions differ from the requested mode");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+// State shared with the callback that runs between the host unmap and the remap of a survivor.
+// The callback cannot throw through the memory code, so it only records what it saw.
+struct SurvivorWindow {
+	uint64_t              base         = 0;
+	std::vector<uint64_t> survivors    = {};
+	std::vector<uint64_t> words        = {};
+	unsigned              callbacks    = 0;
+	bool                  all_readable = true;
+	bool                  all_correct  = true;
+	// Whether every survivor was still a bare placeholder when the callback ran.
+	bool all_placeholders = true;
+};
+static SurvivorWindow g_survivor_window;
+
+// Distinct per page so a read of the wrong page cannot match.
+constexpr uint64_t SurvivorWordSeed = 0x5355525649564f52ull;
+
+// Reads every survivor's first word through the backing store while the whole host view is
+// unmapped. Backing reads copy from the store's own alias, so they must not need the host view.
+// VirtualQuery proves the host view really is gone at that moment, so a change that remaps the
+// survivors earlier cannot pass this test by accident.
+void ReadSurvivorsInRemapWindow(uintptr_t, size_t) {
+	auto& window = g_survivor_window;
+	++window.callbacks;
+	for (const auto page: window.survivors) {
+		MEMORY_BASIC_INFORMATION host {};
+		const auto address = window.base + page * SceKernelPageSize;
+		const bool queried = VirtualQuery(reinterpret_cast<void*>(address), &host, sizeof(host)) != 0;
+		window.all_placeholders = window.all_placeholders && queried && host.State == MEM_RESERVE;
+		uint64_t word = 0;
+		const bool ok = Libs::LibKernel::Memory::TryReadBacking(
+		    window.base + page * SceKernelPageSize, &word, sizeof(word));
+		window.all_readable = window.all_readable && ok;
+		window.all_correct  = window.all_correct && ok && word == window.words[page];
+	}
+}
+
+// Cuts the head, the tail and the middle out of a direct view. While the host view is unmapped,
+// the surviving pages must still read through the backing store with the right bytes. A forced
+// remap failure must give back one view and the original translation.
+void TestPartialUnmapKeepsSurvivorsReadable() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "PartialUnmapKeepsSurvivorsReadable";
+	constexpr uint64_t page = SceKernelPageSize;
+	constexpr uint64_t pages = 4;
+	// Pages removed from a four-page view. The tail and the head leave one survivor, the middle
+	// leaves two so the second remap also runs.
+	struct Cut {
+		uint64_t first;
+		uint64_t count;
+	};
+	for (const auto cut: {Cut {3, 1}, Cut {0, 1}, Cut {1, 2}}) {
+		int64_t physical = -1;
+		CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), pages * page,
+		                                         page, SceKernelMtypeC, &physical),
+		        "KernelAllocateDirectMemory");
+		void* address = nullptr;
+		CheckOk(test, KernelMapNamedDirectMemory(&address, pages * page, SceKernelProtCpuRw, 0,
+		                                         physical, page, "survivor_window"),
+		        "KernelMapNamedDirectMemory");
+		const auto base = reinterpret_cast<uint64_t>(address);
+		auto&      window = g_survivor_window;
+		window = {};
+		window.base = base;
+		for (uint64_t i = 0; i < pages; ++i) {
+			window.words.push_back(SurvivorWordSeed + i);
+			*reinterpret_cast<uint64_t*>(base + i * page) = window.words[i];
+			if (i < cut.first || i >= cut.first + cut.count) {
+				window.survivors.push_back(i);
+			}
+		}
+
+		// A remap that fails must hand back the original view, even though survivors were
+		// readable the whole time. The middle cut fails its second remap, with the first mapped.
+		const uint32_t remaps_before_failure = cut.count == 2 ? 1 : 0;
+		TestBeforeNextBackingMap(ReadSurvivorsInRemapWindow);
+		TestFailGuestBackingRemapAfter(remaps_before_failure);
+		CheckFailed(test, KernelMunmap(base + cut.first * page, cut.count * page),
+		            "KernelMunmap(injected remap failure)");
+		Check(test, window.callbacks == 1, "the remap window callback did not run exactly once");
+		Check(test, window.all_placeholders,
+		      "the callback did not run while the survivors were bare placeholders");
+		Check(test, window.all_readable && window.all_correct,
+		      "survivors were not readable through the backing store during the failed remap");
+		// The injected failure must not leave several tiled views behind. A tiled rollback would
+		// still pass the guest-level range query above.
+		for (uint64_t i = 0; i < pages; ++i) {
+			MEMORY_BASIC_INFORMATION host {};
+			const bool queried =
+			    VirtualQuery(reinterpret_cast<void*>(base + i * page), &host, sizeof(host)) != 0;
+			Check(test, queried && reinterpret_cast<uint64_t>(host.AllocationBase) == base &&
+			                host.Type == MEM_MAPPED,
+			      "failed remap did not restore one mapped host view");
+		}
+		ExpectRange(test, Query(test, base), base, base + pages * page, SceKernelProtCpuRw, 0, 1,
+		            0, 1, "survivor_window", physical);
+		std::vector<uint8_t> whole(pages * page);
+		Check(test, TryReadBacking(base, whole.data(), whole.size()),
+		      "failed remap left a gap in the translation of the original view");
+		for (uint64_t i = 0; i < pages; ++i) {
+			uint64_t word = 0;
+			Check(test, TryReadBacking(base + i * page, &word, sizeof(word)) &&
+			                word == window.words[i] &&
+			                *reinterpret_cast<uint64_t*>(base + i * page) == window.words[i],
+			      "failed remap changed a page or lost its backing translation");
+		}
+
+		// The failed attempt consumed its injected failure, which CheckFailed above proves because
+		// the unmap could not otherwise have failed. Reset anyway so nothing leaks to the next
+		// case, then run the real cut.
+		TestFailGuestBackingRemapAfter(UINT32_MAX);
+		TestBeforeNextBackingMap(nullptr);
+		window.callbacks = 0;
+		TestBeforeNextBackingMap(ReadSurvivorsInRemapWindow);
+		CheckOk(test, KernelMunmap(base + cut.first * page, cut.count * page), "KernelMunmap");
+		Check(test, window.callbacks == 1, "the remap window callback did not run exactly once");
+		Check(test, window.all_placeholders,
+		      "the callback did not run while the survivors were bare placeholders");
+		Check(test, window.all_readable && window.all_correct,
+		      "survivors were not readable through the backing store during the remap");
+		TestBeforeNextBackingMap(nullptr);
+		for (uint64_t i = 0; i < pages; ++i) {
+			uint64_t   word = 0;
+			const bool survives = std::find(window.survivors.begin(), window.survivors.end(), i) !=
+			                      window.survivors.end();
+			Check(test, TryReadBacking(base + i * page, &word, sizeof(word)) == survives &&
+			                (!survives || (word == window.words[i] &&
+			                               *reinterpret_cast<uint64_t*>(base + i * page) ==
+			                                   window.words[i])),
+			      "partial unmap changed which pages translate or what they hold");
+		}
+		for (const auto survivor: window.survivors) {
+			CheckOk(test, KernelMunmap(base + survivor * page, page), "KernelMunmap(survivor)");
+		}
+		TestFailGuestBackingRemapAfter(UINT32_MAX);
+		CheckOk(test, KernelReleaseDirectMemory(physical, pages * page),
+		        "KernelReleaseDirectMemory");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
 #endif
 
 void TestDirectMappingNamesTypesAndValidation() {
@@ -5956,6 +6097,7 @@ int main(int argc, char** argv) {
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);
+	RunTest(TestPartialUnmapKeepsSurvivorsReadable);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);

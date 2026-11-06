@@ -3050,6 +3050,12 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
+bool IsGuestExecutable(uint64_t vaddr) {
+	VirtualRanges::Range range;
+	return g_virtual_ranges != nullptr && g_virtual_ranges->Query(vaddr, 0, &range) &&
+	       (range.protection & PROT_CPU_EXEC) != 0;
+}
+
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 

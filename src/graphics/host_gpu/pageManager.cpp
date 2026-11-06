@@ -268,6 +268,25 @@ bool PageManager::IsWatched(uint64_t vaddr) const {
 	return region->pages[page].write_watchers != 0 || region->pages[page].access_watchers != 0;
 }
 
+bool PageManager::AllowExecute(uint64_t vaddr) {
+	using Mode   = Common::VirtualMemory::Mode;
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	SpinGuard  lock(region->lock);
+	const auto perms = region->pages[page].Perms();
+	if (perms == Mode::NoAccess) {
+		return false;
+	}
+	// A watcher change after this drops the permission again; the next instruction fetch faults
+	// back here.
+	return Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	    Common::AlignDown(vaddr, PAGE_SIZE), PAGE_SIZE,
+	    static_cast<Mode>(static_cast<uint32_t>(perms) | static_cast<uint32_t>(Mode::Execute)));
+}
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);

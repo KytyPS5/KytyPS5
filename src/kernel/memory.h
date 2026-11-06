@@ -256,6 +256,8 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// Whether the guest mapped the byte at vaddr for execution.
+[[nodiscard]] bool IsGuestExecutable(uint64_t vaddr);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

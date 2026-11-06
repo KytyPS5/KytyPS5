@@ -69,6 +69,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	// The caches also watch pages of guest code, and their protections carry no execute
+	// permission. Once no read watcher holds the page (the read below lets them go), it gets the
+	// watchers' access back plus execute.
+	if (access == PageFaultAccess::Execute && LibKernel::Memory::IsGuestExecutable(fault_vaddr) &&
+	    m_page_manager.AllowExecute(fault_vaddr)) {
+		return true;
+	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		// Cache tracking may still protect a page whose range left the GPU-mapped set; that
 		// fault is ours to resolve, not a guest access violation.

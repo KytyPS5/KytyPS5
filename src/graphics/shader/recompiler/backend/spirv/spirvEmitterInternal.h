@@ -111,6 +111,7 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 
 	uint32_t                                         lane_count              = 1;
+	uint32_t                                         host_subgroup_size      = 64;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
@@ -258,6 +259,7 @@ struct ValueEmitContext {
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
 	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
 	uint32_t              Ballot(IR::Value predicate);
+	uint32_t              HalfBallotWord(uint32_t ballot);
 	uint32_t              FirstLane(uint32_t ballot);
 	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);

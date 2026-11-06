@@ -30049,6 +30049,35 @@ TestCase VectorLaneWave32RuntimeSelectorWraps() {
   return test;
 }
 
+TestCase VectorBranchVoteStaysInsideWave32() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovU32(&code, 2, 32);
+  code.push_back(EncodeVopc(0xc1, Vgpr(0), 2)); // v_cmp_lt_u32 vcc, v0, v2
+  code.push_back(EncodeSopp(0x07, 1));                     // s_cbranch_vccnz over the marker
+  AppendVMovU32(&code, 1, 7);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorBranchVoteStaysInsideWave32";
+  test.code = code;
+  test.expected.assign(32, 0);  // Only the wave whose lanes compare true takes the branch.
+  test.expected.resize(64, 7u);
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_LT_U32, O::S_CBRANCH_VCCNZ,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.forbidden_spirv = {"OpGroupNonUniformAny", "OpGroupNonUniformAll"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+
 TestCase VectorReadlaneSelectsTwoKeysWithinWave() {
   using O = ShaderOpcode;
 
@@ -34395,7 +34424,10 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
                   upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
                   O::V_READLANE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformAny"};
+  // A 32-lane guest wave votes with its own ballot word, so the wave sharing its native
+  // subgroup cannot leak EXEC into the vote; wave64 still votes over the whole subgroup.
+  test.required_spirv = {wave_size == 32 ? "OpGroupNonUniformBallot" : "OpGroupNonUniformAny"};
+  test.forbidden_spirv = {wave_size == 32 ? "OpGroupNonUniformAny" : "OpGroupNonUniformBallot"};
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = threads;
   test.compute_info.thread_ids_num = 1;
@@ -47979,6 +48011,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
+  AddCase(VectorBranchVoteStaysInsideWave32);
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
   for (const u32 op_sel : {0u, 1u, 2u})

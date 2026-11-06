@@ -3644,6 +3644,17 @@ public:
                 second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
             "a GDS release interrupt overtook an earlier interrupt");
 
+    // Repeats of the newest undelivered data count in its event instead of queuing.
+    for (const uint32_t data : {1u, 1u, 2u, 3u, 3u}) {
+      context.TriggerInterrupt(0, data);
+    }
+    const bool coalesced =
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.fflags == 2 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3;
+    Require("GpuCommandLane", "interrupt coalescing", coalesced,
+            "undelivered interrupts with the same data were not counted in one event");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);

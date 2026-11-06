@@ -65,6 +65,16 @@ struct GpuDispatchArgs {
 	uint64_t args_addr      = 0; // Indirect dispatches.
 };
 
+// A callback that writes guest memory with bytes the command processor already has (WRITE_DATA).
+// The bytes are in the command buffer and stay valid until the operation executed.
+struct GpuGuestWrite {
+	uint64_t        address     = 0;
+	const uint32_t* data        = nullptr;
+	uint32_t        dwords      = 0;
+	// Every dword goes to `address`: the last one stays.
+	bool            one_address = false;
+};
+
 // Callbacks of queued operations live in the operation itself; the largest ones capture about
 // ten words.
 using GpuCallback = Common::InlineFunction<96>;
@@ -105,6 +115,8 @@ struct GpuOperation {
 		GpuDispatchArgs     dispatch;
 	};
 	GpuCallback callback;
+	// Callbacks: the guest memory they write with known bytes (see GuestGpu::ResolveThread()).
+	GpuGuestWrite guest_write;
 
 	GpuOperation(): draw_index {} {}
 };

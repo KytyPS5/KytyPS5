@@ -411,6 +411,18 @@ void GuestGpu::ResolveThread() {
 				break;
 			}
 		}
+		// Walks ahead of the operations after a WRITE_DATA read its bytes until it executed: the
+		// backing store gets them only then.
+		if (operation->kind == GpuOperationKind::Callback) {
+			const auto& write = operation->guest_write;
+			if (write.dwords != 0 && write.data != nullptr) {
+				PipelineCache::NoteAheadGuestWrite(operation->sequence, write.address,
+				                                   std::span(write.data, write.dwords),
+				                                   write.one_address);
+			}
+		} else {
+			PipelineCache::RetireAheadGuestWrites(m_executed.Load());
+		}
 		if (operation->kind == GpuOperationKind::DrawIndex ||
 		    operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.
@@ -598,9 +610,10 @@ void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* va
 	CopyFromGuest(value, address, size);
 }
 
-uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
-	auto operation     = MakeOperation(GpuOperationKind::Callback);
-	operation.callback = std::move(callback);
+uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWrite& write) {
+	auto operation        = MakeOperation(GpuOperationKind::Callback);
+	operation.callback    = std::move(callback);
+	operation.guest_write = write;
 	return Emit(std::move(operation));
 }
 
@@ -840,7 +853,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 			*output = src[i];
 			output += !write_one_address;
 		}
-	});
+	}, {.address = reinterpret_cast<uint64_t>(dst), .data = src, .dwords = dw_num,
+	    .one_address = write_one_address});
 	if (write_one_address) {
 		NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), sizeof(uint32_t),
 		               src + dw_num - 1);

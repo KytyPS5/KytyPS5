@@ -173,6 +173,7 @@ thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 thread_local bool                         t_walker_ahead   = false;
 thread_local bool                         t_walker_faulted = false;
 thread_local bool (*t_gpu_produced)(uint64_t address)   = nullptr;
+thread_local bool (*t_pending_write)(uint64_t address, uint32_t& value) = nullptr;
 // Guest memory starts here: a table pointer below it is null.
 constexpr uint64_t GuestMemoryStart = 0x40000;
 
@@ -200,7 +201,16 @@ constexpr uint32_t WalkerPageCacheSlots = 4;
 // Bit 32 set: the low dword is the value at the address; clear: load it directly.
 uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache) {
 	constexpr uint64_t PageSize = 4096;
-	if (address < GuestMemoryStart || !g_guest_memory_set.load(std::memory_order_acquire)) {
+	if (address < GuestMemoryStart) {
+		return 0;
+	}
+	if (t_walker_ahead && t_pending_write != nullptr) {
+		uint32_t pending = 0;
+		if (t_pending_write(address, pending)) {
+			return uint64_t {1} << 32u | pending;
+		}
+	}
+	if (!g_guest_memory_set.load(std::memory_order_acquire)) {
 		return 0;
 	}
 	const auto page   = address & ~(PageSize - 1);
@@ -1801,12 +1811,14 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_walker_ahead   = runtime.record_load != nullptr;
 	t_walker_faulted = false;
 	t_gpu_produced   = runtime.gpu_produced;
+	t_pending_write  = runtime.pending_write;
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	t_walker_ahead   = false;
 	t_gpu_produced   = nullptr;
+	t_pending_write  = nullptr;
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {

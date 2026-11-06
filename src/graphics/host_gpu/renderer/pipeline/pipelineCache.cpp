@@ -190,6 +190,67 @@ struct AheadWrites {
 	}
 };
 thread_local AheadWrites t_ahead_writes;
+
+// Guest memory writes with known bytes (WRITE_DATA) of operations the resolution thread passed
+// and the execution thread has not run yet, oldest first: walks ahead of later operations read
+// their bytes, which the backing store gets only when they execute. GTA V's ray tracing writes
+// the parameters of each BVH build pass (cs 5c02d7970bd792ec, f85e944c4ed88b61) with WRITE_DATA
+// just before its dispatch, over the previous frame's.
+struct AheadGuestWrites {
+	struct Write {
+		uint64_t              sequence = 0;
+		uint64_t              address  = 0;
+		std::vector<uint32_t> dwords;
+
+		[[nodiscard]] uint64_t End() const { return address + dwords.size() * sizeof(uint32_t); }
+	};
+	static constexpr size_t   FilterBits = 12;
+	static constexpr uint64_t PageShift  = 12;
+	std::deque<Write>                              writes;
+	// How many writes touch each 4 KB page, by hash: most reads touch none.
+	std::array<uint16_t, size_t {1} << FilterBits> filter {};
+
+	static size_t Slot(uint64_t page) {
+		return static_cast<size_t>((page * 0x9e3779b97f4a7c15ull) >> (64u - FilterBits));
+	}
+	void Count(const Write& write, int delta) {
+		for (auto page = write.address >> PageShift; page <= (write.End() - 1) >> PageShift; page++) {
+			auto& count = filter[Slot(page)];
+			count       = static_cast<uint16_t>(count + delta);
+		}
+	}
+	[[nodiscard]] bool MayTouch(uint64_t address, uint64_t size) const {
+		if (writes.empty() || size == 0) return false;
+		for (auto page = address >> PageShift; page <= (address + size - 1) >> PageShift; page++) {
+			if (filter[Slot(page)] != 0) return true;
+		}
+		return false;
+	}
+	// Writes the bytes of [address, address + size) that the writes leave, oldest first, into
+	// `data`; false when none touches the range.
+	bool Apply(uint64_t address, void* data, uint64_t size) const {
+		if (!MayTouch(address, size)) return false;
+		bool applied = false;
+		for (const auto& write: writes) {
+			const auto begin = std::max(address, write.address);
+			const auto end   = std::min(address + size, write.End());
+			if (begin >= end) continue;
+			std::memcpy(static_cast<uint8_t*>(data) + (begin - address),
+			            reinterpret_cast<const uint8_t*>(write.dwords.data()) + (begin - write.address),
+			            end - begin);
+			applied = true;
+		}
+		return applied;
+	}
+};
+thread_local AheadGuestWrites t_ahead_guest_writes;
+
+bool AheadPendingWrite(uint64_t address, uint32_t& value) {
+	auto& state = t_ahead_guest_writes;
+	if (!state.MayTouch(address, sizeof(value))) return false;
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, &value, sizeof(value))) value = 0;
+	return state.Apply(address, &value, sizeof(value));
+}
 // Whether the walk of the stage being resolved left a GPU-produced load unread.
 thread_local bool t_ahead_unread_load = false;
 
@@ -470,6 +531,7 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 		m_failed = true;
 		return false;
 	}
+	t_ahead_guest_writes.Apply(address, data, size);
 	Append(address, data, static_cast<uint32_t>(size), strict);
 	return true;
 }
@@ -1713,6 +1775,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	    .read_specialization_memory = ReadAheadStrict,
 	    .record_load                = RecordAheadLoad,
 	    .gpu_produced               = AheadGpuProduced,
+	    .pending_write              = AheadPendingWrite,
 	};
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		// As GetProgram(): descriptor tables indexed by the workgroup id probe one entry per group.
@@ -2210,6 +2273,31 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 		m_guest_traversal = false;
 	}
 	return module;
+}
+
+void PipelineCache::NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
+                                        std::span<const uint32_t> data, bool one_address) {
+	if (address == 0 || data.empty()) {
+		return;
+	}
+	auto& state    = t_ahead_guest_writes;
+	auto& write    = state.writes.emplace_back();
+	write.sequence = sequence;
+	write.address  = address;
+	if (one_address) {
+		write.dwords.assign(1, data.back());
+	} else {
+		write.dwords.assign(data.begin(), data.end());
+	}
+	state.Count(write, 1);
+}
+
+void PipelineCache::RetireAheadGuestWrites(uint64_t executed) {
+	auto& state = t_ahead_guest_writes;
+	while (!state.writes.empty() && state.writes.front().sequence <= executed) {
+		state.Count(state.writes.front(), -1);
+		state.writes.pop_front();
+	}
 }
 
 const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,

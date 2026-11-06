@@ -519,6 +519,36 @@ void TestAheadWalkNamesDescriptorWordLoads() {
         "descriptor refresh masks changed");
 }
 
+void TestAheadWalkReadsPendingWrites() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // An operation before the walked one writes the flattened dword with WRITE_DATA, which has not
+  // executed yet: a walk ahead of execution reads the written value, and logs it.
+  auto plan = Extract(SrtProgram(0x41000u));
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address != 0x41000u) return false;
+        words[0] = 0x1111u;
+        return true;
+      });
+  const auto pending = +[](uint64_t address, uint32_t &value) {
+    if (address != 0x41000u) return false;
+    value = 0x2222u;
+    return true;
+  };
+  std::vector<uint32_t> loads;
+  const auto record = +[](void *data, uint64_t, uint32_t value, uint32_t) {
+    static_cast<std::vector<uint32_t> *>(data)->push_back(value);
+  };
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(plan, {.userdata = &loads, .record_load = record, .pending_write = pending}, flat,
+                nullptr) &&
+            flat == std::vector<uint32_t>{0x2222u} && loads == std::vector<uint32_t>{0x2222u},
+        "ahead walk did not read the pending write");
+  // The execution thread's walk runs after the write: it reads guest memory.
+  Check(WalkSrt(plan, {.pending_write = pending}, flat, nullptr) &&
+            flat == std::vector<uint32_t>{0x1111u},
+        "walk on the execution thread read a pending write");
+}
+
 void TestAheadWalkNamesZeroTestedBounds() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
@@ -1698,6 +1728,7 @@ int main() {
   TestAheadWalkNamesFlatOnlyLoads();
   TestAheadWalkNamesDescriptorWordLoads();
   TestAheadWalkNamesZeroTestedBounds();
+  TestAheadWalkReadsPendingWrites();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();

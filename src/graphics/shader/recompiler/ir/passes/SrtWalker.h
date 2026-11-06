@@ -94,6 +94,10 @@ struct SrtRuntime {
 	// that only branch conditions depend on stays unknown, which reaches both sides. Its bytes may
 	// not be written yet.
 	bool (*gpu_produced)(uint64_t address) = nullptr;
+	// A walk ahead of execution: the dword that writes of earlier operations leave at an address
+	// before they execute (false when none covers it). The walk reads it instead of guest memory,
+	// which gets it only when the write executes.
+	bool (*pending_write)(uint64_t address, uint32_t& value) = nullptr;
 	// The runtime words of an expanded program (ShaderSource::call_words): they follow the
 	// walked SRT words in the flattened SRT, where ReadCallWord reads them.
 	std::span<const uint32_t> call_words;

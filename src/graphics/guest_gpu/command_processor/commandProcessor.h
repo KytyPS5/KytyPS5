@@ -184,7 +184,7 @@ private:
 	[[nodiscard]] GpuRegisterState SnapshotState(uint64_t sequence);
 	// Both return the sequence of a pipelined operation, 0 once it executed.
 	uint64_t                   Emit(GpuOperation&& operation);
-	uint64_t                   EmitCallback(GpuCallback&& callback);
+	uint64_t                   EmitCallback(GpuCallback&& callback, const GpuGuestWrite& write = {});
 	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
 	                    const void* value = nullptr);
 

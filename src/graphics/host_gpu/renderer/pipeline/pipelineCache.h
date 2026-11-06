@@ -382,6 +382,13 @@ public:
 	                                      ShaderComputeInputInfo&      input_info);
 	// The resolve thread: as GetGraphicsProgramsAhead, for a dispatch; null when the execution
 	// thread resolves it itself.
+	// Resolution thread: a write of guest memory with known bytes (WRITE_DATA) that an operation
+	// it passed makes when it executes. Walks ahead of later operations read its bytes until
+	// RetireAheadGuestWrites() learns that the execution thread ran it (`executed`: the last
+	// operation it ran).
+	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
+	                                std::span<const uint32_t> data, bool one_address);
+	static void RetireAheadGuestWrites(uint64_t executed);
 	const ShaderModule* GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
 	                                           ShaderComputeInputInfo&      input_info,
 	                                           ProgramResolution&           ahead);

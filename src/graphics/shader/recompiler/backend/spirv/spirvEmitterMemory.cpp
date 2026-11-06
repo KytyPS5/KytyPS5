@@ -77,8 +77,12 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 }
 
 uint32_t BufferLane(EmitterState& state) {
+	// ADD_TID adds the guest wave's lane. Two wave-32 shaders can share one 64-wide host
+	// subgroup, so the subgroup lane alone would let the upper wave address lanes 32..63
+	// instead of restarting at lane zero.
+	const auto lanes = state.program.wave_size >= 64u ? 63u : 31u;
 	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+	              ConstantU32(state, lanes));
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {

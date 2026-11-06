@@ -134,6 +134,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
 	    "                                       draws that need them while they compile.\n");
+	::printf("  --rt-stats                           With --native-rt: count on the GPU the\n"
+	         "                                       rays that go back to the game's own traversal\n"
+	         "                                       (in the [RT] summaries of the log).\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -281,6 +284,7 @@ static constexpr Flag FLAGS[] = {
     {"--native-raytracing", &ConfigOptions::native_rt}, // alias of --native-rt
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
+    {"--rt-stats", &ConfigOptions::rt_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},

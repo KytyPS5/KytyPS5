@@ -278,6 +278,9 @@ struct ShaderModule {
 	// buffer atomics alone make the driver run the depth and stencil tests after a shader that can
 	// discard.
 	std::shared_ptr<const ShaderModule>          plain;
+	// A compute program built without the native ray tracing patch while it is on: the program of
+	// a dispatch without a TLAS (see PipelineCache::GetComputeProgram()).
+	bool                                         guest_traversal = false;
 };
 
 // ShaderModule::plain of `module` from the variant's SPIR-V; null when the module fails.

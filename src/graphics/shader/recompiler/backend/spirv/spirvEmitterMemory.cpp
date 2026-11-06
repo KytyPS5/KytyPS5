@@ -1490,6 +1490,32 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	}
 }
 
+void EmitGuestRayCount(EmitterState& state, uint32_t count) {
+	EXIT_IF(state.fault_buffer_variable == 0);
+	const auto hash  = state.program.shader_hash;
+	const auto first = BufferCache::HACK_MARKS_OFFSET / sizeof(uint32_t) +
+	                   uint64_t {BufferCache::HackMarkEntry(hash)} * BufferCache::HACK_MARK_DWORDS;
+	const auto low   = static_cast<uint32_t>(hash);
+	const auto high  = static_cast<uint32_t>(hash >> 32u);
+	const std::array<std::pair<uint32_t, uint32_t>, 5> updates {{
+	    {0, ConstantU32(state, low)},
+	    {1, ConstantU32(state, high)},
+	    {2, ConstantU32(state, ~low)},
+	    {3, ConstantU32(state, ~high)},
+	    {BufferCache::HACK_MARK_GUEST_RAYS, count},
+	}};
+	const auto pointer_type = TypeStorageBufferElementPointer(state);
+	const auto scope        = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed      = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	for (const auto& [dword, value]: updates) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, state.fault_buffer_variable,
+		                          ConstantU32(state, 0), ConstantU32(state, static_cast<uint32_t>(first + dword)));
+		state.builder.AddFunction(dword < BufferCache::HACK_MARK_COUNTS ? spv::OpAtomicOr : spv::OpAtomicIAdd,
+		                          TypeU32(state), state.builder.AllocateId(), pointer, scope, relaxed, value);
+	}
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;

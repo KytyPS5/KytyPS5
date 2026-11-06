@@ -102,6 +102,10 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true) {
 	if (native && stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
 		key.push_back(0x52545041u);
+		// They count the rays they send back to the guest traversal (--rt-stats).
+		if (Config::RayTracingStatsEnabled()) {
+			key.push_back(0x52545354u);
+		}
 	}
 }
 
@@ -876,6 +880,8 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
+	} else if (key.stage == ShaderType::Compute) {
+		module.guest_traversal = NativeRayTracing::PatchShaders() && !options.native_ray_tracing;
 	}
 	if (!result.spirv_plain.empty()) {
 		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);
@@ -1031,6 +1037,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	options.native_ray_tracing = NativeRayTracing::PatchShaders() && !m_guest_traversal;
+	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -1863,6 +1870,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.native_ray_tracing = NativeRayTracing::PatchShaders();
+		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// compiles them.
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);

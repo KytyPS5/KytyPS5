@@ -61,9 +61,12 @@ public:
 	static constexpr uint32_t HACK_MARK_ENTRIES   = 256;
 	static constexpr uint32_t HACK_MARK_DWORDS    = 8;
 	static constexpr uint32_t HACK_MARK_COUNTS    = 4; // dword of the count of HackMark 0
+	// With --rt-stats, the rays that the native ray tracing patch of the shader sent back to the
+	// guest traversal (added, see EmitRayQueryInit): not a workaround, reported by NativeRayTracing.
+	static constexpr uint32_t HACK_MARK_GUEST_RAYS = HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count);
 	static constexpr uint64_t HACK_MARKS_SIZE     = uint64_t {HACK_MARK_ENTRIES} * HACK_MARK_DWORDS * 4;
 	static constexpr uint64_t FAULT_BUFFER_SIZE   = HACK_MARKS_OFFSET + HACK_MARKS_SIZE;
-	static_assert(HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count) <= HACK_MARK_DWORDS);
+	static_assert(HACK_MARK_GUEST_RAYS < HACK_MARK_DWORDS);
 
 	static constexpr uint32_t HackMarkEntry(uint64_t shader_hash) {
 		return (static_cast<uint32_t>(shader_hash) ^ static_cast<uint32_t>(shader_hash >> 32u)) %

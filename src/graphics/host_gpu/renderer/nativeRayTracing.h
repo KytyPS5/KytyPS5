@@ -95,9 +95,10 @@ public:
 	// Records, before the dispatch, the walk of the guest TLAS whose header the 64-bit value at
 	// `user_pointer + source.header_offset` points to (the dwords at `source.header_slots` of
 	// `flattened_srt`, the dispatch's flattened SRT, when it has them), the builds of pending
-	// BLASes and the TLAS build. Outside a render pass.
+	// BLASes and the TLAS build. Outside a render pass. `shader_hash`: the dispatch's program (for
+	// the "[RT]" summaries).
 	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
-	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame);
+	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash);
 
 	// The TLAS formats of the generations of sce::Psr (see hle_tlas.comp): the header and the
 	// instance records of GTA V 01.010/01.011 (Base460) and of 01.005 (Base252).
@@ -155,6 +156,16 @@ public:
 	// builds it at the next preparation by walking the guest BLAS, instead of waiting for a walk of a
 	// TLAS to find it.
 	void NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_size);
+
+	// The dispatches of programs that walk a guest BVH without tracing natively, for the "[RT]"
+	// summaries of the log (every 10 s, only when something did not trace natively): the program
+	// without the patch of a dispatch without a TLAS, and a program whose walk the patch does not
+	// recognize. On the execution thread, before the dispatch.
+	enum class GuestDispatch : uint32_t { NullTlas, Unpatched, Count };
+	static void NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept;
+	// --rt-stats: the rays that the patched program `shader_hash` (0: not known) sent back to its
+	// guest traversal, read back from the fault buffer.
+	static void NoteGuestRays(uint64_t shader_hash, uint64_t rays);
 
 	// The device address of the context table the shaders look their TLAS up in (see
 	// ContextEntry in rt_tlas_walk.comp), 0 when disabled.
@@ -295,6 +306,8 @@ private:
 		uint32_t                source_key  = 0;
 		// The frame of the preparation: the slots its TLAS referenced were used then.
 		uint64_t                frame       = 0;
+		// The program of the dispatch.
+		uint64_t                shader_hash = 0;
 	};
 
 	void CreatePipelines();

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -124,6 +126,8 @@ struct RtState {
 static_assert(sizeof(RtState) == StateSize);
 constexpr uint32_t StateDispatch = offsetof(RtState, dispatch);
 constexpr uint32_t StateVerify   = offsetof(RtState, verify);
+// RtState::overflow: part of the TLAS is in memory the host has not cached (kUnmapped).
+constexpr uint32_t StateUnmapped = 4u;
 
 // The readback area: the state, the missing BLASes, the build jobs with their results and the
 // slots whose BLAS changed.
@@ -349,7 +353,131 @@ vk::AccelerationStructureGeometryKHR TriangleGeometry(uint64_t address, uint32_t
 namespace {
 // Set when the device is created, before any shader compiles.
 std::atomic<bool> g_device_support {false};
+
+// A counter of the "[RT]" summaries. One thread at a time adds to it (the execution thread; the
+// readbacks under m_mutex), so an increment is a load and a store, without a locked instruction.
+struct RtCounter {
+	std::atomic<uint64_t> total {0};
+	uint64_t              reported = 0; // The summary's own.
+
+	void Add() noexcept { total.store(total.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+	uint64_t TakeDelta() noexcept {
+		const auto now   = total.load(std::memory_order_relaxed);
+		const auto delta = now - reported;
+		reported         = now;
+		return delta;
+	}
+};
+
+constexpr int64_t RtSummaryNs = 10000000000;
+
+struct RtStats {
+	// Dispatches whose guest TLAS the host walked (Prepare()).
+	RtCounter native;
+	// NativeRayTracing::GuestDispatch, with the last shader of each.
+	std::array<RtCounter, static_cast<size_t>(NativeRayTracing::GuestDispatch::Count)>             guest;
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(NativeRayTracing::GuestDispatch::Count)> last_guest {};
+	uint32_t                                                                                        guest_calls = 0;
+	// Walks that published no context (rt_tlas_walk.comp): with a null TLAS header (read through
+	// the user data pointer, so the program without the patch could not be chosen), with a header
+	// that is not that of a TLAS in memory the host knows, or with TLAS memory the host has not
+	// cached. Their dispatches take the guest traversal. The last program of each.
+	RtCounter             walks_null_header;
+	RtCounter             walks_bad_header;
+	RtCounter             walks_uncached;
+	std::atomic<uint64_t> last_unpublished {0};
+	// --rt-stats: rays sent back to the guest traversal.
+	std::atomic<uint64_t>                guest_rays {0};
+	uint64_t                             guest_rays_reported = 0;
+	std::atomic<uint64_t>                last_guest_rays {0};
+	ShaderRecompiler::RayTracingPrograms programs_reported {};
+	std::atomic<int64_t>                 next_summary_ns {0};
+};
+
+RtStats g_rt_stats;
+
+std::string RtShader(uint64_t shader_hash) {
+	return shader_hash == 0 ? std::string("unknown") : fmt::format("0x{:016x}", shader_hash);
+}
+
+// Every 10 s (whoever calls first after that), when something did not trace natively: why.
+void SummarizeRayTracing() {
+	auto&      stats = g_rt_stats;
+	const auto now   = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+	auto next = stats.next_summary_ns.load(std::memory_order_relaxed);
+	if (now < next || !stats.next_summary_ns.compare_exchange_strong(next, now + RtSummaryNs)) {
+		return;
+	}
+	using Kind           = NativeRayTracing::GuestDispatch;
+	const auto native    = stats.native.TakeDelta();
+	const auto guest     = [&](Kind kind) { return stats.guest[static_cast<size_t>(kind)].TakeDelta(); };
+	const auto last      = [&](Kind kind) {
+		return RtShader(stats.last_guest[static_cast<size_t>(kind)].load(std::memory_order_relaxed));
+	};
+	const auto null_tlas  = guest(Kind::NullTlas);
+	const auto unpatched  = guest(Kind::Unpatched);
+	const auto null_header = stats.walks_null_header.TakeDelta();
+	const auto bad_header  = stats.walks_bad_header.TakeDelta();
+	const auto uncached    = stats.walks_uncached.TakeDelta();
+	const auto unpublished = null_header + bad_header + uncached;
+	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
+	const auto rays       = rays_total - stats.guest_rays_reported;
+	stats.guest_rays_reported  = rays_total;
+	const auto programs        = ShaderRecompiler::GetRayTracingPrograms();
+	const auto new_unpatched   = programs.unpatched - stats.programs_reported.unpatched;
+	const auto new_guest_sites = programs.guest_sites - stats.programs_reported.guest_sites;
+	stats.programs_reported    = programs;
+	// The first call starts the period; dispatches without a TLAS alone trace nothing.
+	if (next == 0 || unpatched + unpublished + rays + new_unpatched + new_guest_sites == 0) {
+		return;
+	}
+	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
+	log(fmt::format("[RT] summary of the last 10 s: {} dispatches traced through host TLASes, {} walked the guest BVH",
+	                native, null_tlas + unpatched));
+	if (unpatched != 0) {
+		log(fmt::format("[RT]   {} of programs whose BVH walk the patch does not recognize (last cs {})", unpatched,
+		                last(Kind::Unpatched)));
+	}
+	if (null_tlas != 0) {
+		log(fmt::format("[RT]   {} without a TLAS (the program without the patch)", null_tlas));
+	}
+	if (unpublished != 0) {
+		log(fmt::format("[RT]   {} TLAS walks published no context ({} with a null header, {} with a header that is "
+		                "not a TLAS the host knows, {} with TLAS memory not cached yet; last cs {}): their dispatches "
+		                "walked the guest BVH",
+		                unpublished, null_header, bad_header, uncached,
+		                RtShader(stats.last_unpublished.load(std::memory_order_relaxed))));
+	}
+	if (rays != 0) {
+		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
+		                RtShader(stats.last_guest_rays.load(std::memory_order_relaxed))));
+	}
+	if (new_unpatched + new_guest_sites != 0) {
+		log(fmt::format("[RT]   programs compiled so far: {} patched, {} whose BVH walk the patch does not recognize "
+		                "(last cs {}), {} with sites that always walk the guest BVH (last cs {})",
+		                programs.patched, programs.unpatched, RtShader(programs.last_unpatched), programs.guest_sites,
+		                RtShader(programs.last_guest_sites)));
+	}
+}
 } // namespace
+
+void NativeRayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept {
+	auto& stats = g_rt_stats;
+	stats.guest[static_cast<size_t>(kind)].Add();
+	stats.last_guest[static_cast<size_t>(kind)].store(shader_hash, std::memory_order_relaxed);
+	// Without dispatches traced natively there are no readbacks to summarize from.
+	if ((++stats.guest_calls & 63u) == 0) {
+		SummarizeRayTracing();
+	}
+}
+
+void NativeRayTracing::NoteGuestRays(uint64_t shader_hash, uint64_t rays) {
+	g_rt_stats.guest_rays.fetch_add(rays, std::memory_order_relaxed);
+	g_rt_stats.last_guest_rays.store(shader_hash, std::memory_order_relaxed);
+	SummarizeRayTracing();
+}
 
 void NativeRayTracing::SetDeviceSupport(bool supported) noexcept {
 	g_device_support.store(supported, std::memory_order_relaxed);
@@ -1205,10 +1333,11 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 
 void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
                                const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
-                               uint64_t frame) {
+                               uint64_t frame, uint64_t shader_hash) {
 	if (!m_enabled) {
 		return;
 	}
+	g_rt_stats.native.Add();
 	auto& readback = m_readbacks[m_readback_index];
 	if (readback.tick != 0) {
 		// The ring is full: the oldest readback must complete first (rare).
@@ -1220,6 +1349,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	const auto source_key = source.user_sgpr << 16u | source.header_offset;
 	readback.source_key   = source_key;
 	readback.frame        = frame;
+	readback.shader_hash  = shader_hash;
 	uint32_t              tlas_count = 0;
 	std::vector<uint32_t> retry;
 	// Slots released this preparation (index and table entry), and slots that got new memory
@@ -1540,6 +1670,16 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	std::vector<PendingSlot> pending;
 	std::vector<uint32_t>    retry;
 	Common::LockGuard        lock(m_mutex);
+	// The walk ends without publishing the context (nor the indirect BLAS dispatch) when the header
+	// is not that of a TLAS in memory the host knows.
+	if (state.dispatch[1] == 0 || (state.overflow & StateUnmapped) != 0) {
+		(state.dispatch[1] != 0 ? g_rt_stats.walks_uncached
+		 : state.header_va == 0 ? g_rt_stats.walks_null_header
+		                        : g_rt_stats.walks_bad_header)
+		    .Add();
+		g_rt_stats.last_unpublished.store(readback.shader_hash, std::memory_order_relaxed);
+	}
+	SummarizeRayTracing();
 	for (uint32_t i = 0; i < missing_count; i++) {
 		MissingEntry entry {};
 		std::memcpy(&entry, bytes + ReadbackMissing + uint64_t {i} * MissingStride, sizeof(entry));

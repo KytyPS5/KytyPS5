@@ -73,12 +73,22 @@ static bool MayWriteThroughDeviceAddresses(const ShaderRecompiler::IR::CompiledS
 // memory).
 static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorder& command,
                                     const HW::ComputeShaderInfo& cs_regs, const PreparedBindings& bindings) {
-	auto&       native_rt = context.GetNativeRayTracing();
-	const auto& info      = bindings.runtime->module->info.info;
-	if (NativeRayTracing::TlasSource source; native_rt.Enabled() && NativeRayTracing::FindTlasSource(info, source)) {
+	auto& native_rt = context.GetNativeRayTracing();
+	if (!native_rt.Enabled()) {
+		return;
+	}
+	const auto& module = *bindings.runtime->module;
+	const auto& info   = module.info.info;
+	if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(info, source)) {
 		const auto& user    = cs_regs.cs_user_sgpr.value;
 		const auto  pointer = uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
-		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum());
+		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
+		                  module.info.shader_hash);
+	} else if (info.bvh) {
+		// It walks a guest BVH on its own (see the "[RT]" summaries).
+		using Kind = NativeRayTracing::GuestDispatch;
+		NativeRayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unpatched,
+		                                    module.info.shader_hash);
 	}
 }
 

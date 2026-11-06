@@ -274,6 +274,10 @@ bool NativeRayTracingEnabled() {
 	return g_config->native_rt;
 }
 
+bool RayTracingStatsEnabled() {
+	return g_config->native_rt && g_config->rt_stats_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

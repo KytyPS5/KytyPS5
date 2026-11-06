@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 // windows.h defines these.
 #undef near
@@ -1161,12 +1162,18 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto context     = Load(s, wide, entry);
 	const auto variant     = IR::RayQueryVariant(inst.Flags<uint32_t>());
 	const bool geometry_opacity = (variant & IR::RayQueryInitGeometryOpacity) != 0;
-	// A site whose opacity comes from the geometry has no guest leaf code to run for its alpha
-	// tested candidates: without the per-lane alpha test it keeps the guest traversal.
-	const auto has_context = geometry_opacity && !(s.ray_query_alpha_sites[site] && s.ray_query_alpha_sample != nullptr)
-	                             ? ConstantBool(s, false)
-	                             : Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
-	const auto native = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
+	// A site whose opacity comes from the geometry, or without guest leaf code, has no guest leaf
+	// code to run for its alpha tested candidates: without the per-lane alpha test it keeps the
+	// guest traversal (unless its triangles that are not opaque are no hit).
+	const bool no_leaf      = (variant & IR::RayQueryInitNoLeaf) != 0;
+	const bool opaque_only  = (variant & IR::RayQueryInitOpaqueOnly) != 0;
+	const bool always_guest = (geometry_opacity || no_leaf) && !s.ray_query_alpha_sites[site] && !opaque_only;
+	if (always_guest) {
+		NoteRayTracingProgram(RayTracingProgramKind::AlwaysGuest, s.program.shader_hash);
+	}
+	const auto has_context = always_guest ? ConstantBool(s, false)
+	                                      : Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
+	const auto host = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
 		const auto valid = Binary(s, spv::OpINotEqual, b,
 		                          LoadAddressU32(s, AddressPlus(s, context, ContextValid)), U32(s, 0));
 		const auto same = Equal(s, LoadAddressU64(s, AddressPlus(s, context, ContextHeader)), header);
@@ -1176,6 +1183,28 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// (the same in every lane).
 	const auto& allow  = inst.Arg(14);
 	const auto  native = allow.IsImmediate() && allow.U1() ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
+	if (s.ray_stats) {
+		// --rt-stats: one ballot per wave, and one lane adds the rays that go back to the guest
+		// traversal (an emulated wave of 64 lanes adds both halves at once).
+		const auto guest  = LogicalAnd(s, exec, LogicalNot(s, native));
+		const auto ballot = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(s, 4), ballot,
+		                      U32(s, spv::ScopeSubgroup), guest);
+		auto count = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformBallotBitCount, u, count, U32(s, spv::ScopeSubgroup),
+		                      spv::GroupOperationReduce, ballot);
+		if (ctx.half != 0) {
+			count = Add(s, count, s.ray_stats_first_half[site]);
+		}
+		if (ctx.half + 1 < s.lane_count) {
+			s.ray_stats_first_half[site] = count;
+		} else {
+			const auto elected = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpGroupNonUniformElect, b, elected, U32(s, spv::ScopeSubgroup));
+			EmitIfCondition(s, LogicalAnd(s, elected, Binary(s, spv::OpINotEqual, b, count, U32(s, 0))),
+			                [&] { EmitGuestRayCount(s, count); });
+		}
+	}
 	// Lanes whose ray the hardware cannot take (NaN, infinite or negative extents) find nothing,
 	// as the guest's box tests would not.
 	auto lane_ok = LogicalAnd(s, native, exec);

@@ -338,10 +338,13 @@ void TestRayTracingClosestLeafCalls() {
   layout.inline_offset = 0x80;
   layout.inline_root = 0x25;
   layout.flip_facing = false;
+  // --rt-stats: the site counts the rays it sends back to the guest traversal with a ballot per
+  // wave; without it the program has no ballot count.
   for (const bool stats : {false, true}) {
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.wave_size = 64;
     options.native_ray_tracing = true;
+    options.ray_stats = stats;
     auto translated = ShaderRecompiler::TranslateProgram(program, options);
     const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
     ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -361,6 +364,10 @@ void TestRayTracingClosestLeafCalls() {
               info.ray_query_layout == layout.Pack() && SpirvInstructionOpcodeCount(compiled.spirv, 4473u) != 0,
           "the closest hit traversal with any-hit calls does not trace with ray queries, or has the wrong TLAS "
           "source or instance record layout");
+    // OpGroupNonUniformBallotBitCount
+    Check((SpirvInstructionOpcodeCount(compiled.spirv, 342u) != 0) == stats,
+          stats ? "a traversal compiled with ray statistics does not count its guest rays"
+                : "a traversal compiled without ray statistics counts its guest rays");
     CheckSpirvBinaryValidates(compiled.spirv);
   }
 }

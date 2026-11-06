@@ -54,7 +54,7 @@ bool UsesMipStats(const IR::Program& program) {
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info,
-                                  bool mip_stats_records) {
+                                  bool mip_stats_records, bool ray_stats) {
 	using namespace Emitter;
 
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -72,6 +72,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.builder.EnableNames();
 	}
 	state.mip_stats_records     = mip_stats_records;
+	state.ray_stats             = ray_stats && program.info.ray_query;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

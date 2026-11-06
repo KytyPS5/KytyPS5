@@ -29,6 +29,9 @@ struct CompileOptions {
 	// Replace known guest BVH traversal loops with host ray queries (see
 	// IR::TraceNativeTraversals).
 	bool                        native_ray_tracing         = false;
+	// With native_ray_tracing: patched traversals count the rays they send back to the guest
+	// walk in the fault buffer (BufferCache::HACK_MARK_GUEST_RAYS; --rt-stats).
+	bool                        ray_stats                  = false;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
@@ -90,6 +93,22 @@ struct ShaderSource {
 
 	[[nodiscard]] bool HasCalls() const { return !calls.empty() || expand_calls; }
 };
+
+// The programs with a guest BVH walk compiled with native ray tracing, by distinct shader hash (see
+// the "[RT]" summary of NativeRayTracing): those whose walk the patch replaced, those whose walk it
+// does not recognize, and those with a patched site that always takes the guest walk (its alpha
+// tested triangles have no per lane alpha test, see EmitRayQueryInit); the last hash of the
+// latter two.
+enum class RayTracingProgramKind : uint32_t { Patched, Unpatched, GuestSites };
+struct RayTracingPrograms {
+	uint64_t patched          = 0;
+	uint64_t unpatched        = 0;
+	uint64_t guest_sites      = 0;
+	uint64_t last_unpatched   = 0;
+	uint64_t last_guest_sites = 0;
+};
+void                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
+[[nodiscard]] RayTracingPrograms GetRayTracingPrograms();
 
 [[nodiscard]] const char* StageName(ShaderType stage);
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,

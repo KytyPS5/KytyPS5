@@ -747,25 +747,7 @@ struct TarjanState {
 	std::vector<StronglyConnectedComponent> components;
 };
 
-void TarjanVisit(TarjanState& state, uint32_t block_id) {
-	state.index[block_id]   = state.next_index;
-	state.lowlink[block_id] = state.next_index;
-	state.next_index++;
-	state.stack.push_back(block_id);
-	state.on_stack[block_id] = true;
-
-	const auto* block = state.graph->FindBlock(block_id);
-	if (block != nullptr) {
-		for (auto succ: block->successors) {
-			if (state.index[succ] == UINT32_MAX) {
-				TarjanVisit(state, succ);
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
-			} else if (state.on_stack[succ]) {
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
-			}
-		}
-	}
-
+void TarjanFinish(TarjanState& state, uint32_t block_id) {
 	if (state.lowlink[block_id] != state.index[block_id]) {
 		return;
 	}
@@ -799,6 +781,41 @@ void TarjanVisit(TarjanState& state, uint32_t block_id) {
 	SortUnique(component.entry_blocks);
 	component.irreducible = cyclic && component.entry_blocks.size() > 1u;
 	state.components.push_back(std::move(component));
+}
+
+// Iterative, so a long block path cannot overflow the translating thread's stack.
+void TarjanVisit(TarjanState& state, uint32_t root) {
+	struct Frame {
+		uint32_t block;
+		uint32_t next_successor;
+	};
+	std::vector<Frame> frames {{root, 0}};
+	while (!frames.empty()) {
+		const auto block_id = frames.back().block;
+		if (state.index[block_id] == UINT32_MAX) {
+			state.index[block_id] = state.lowlink[block_id] = state.next_index++;
+			state.stack.push_back(block_id);
+			state.on_stack[block_id] = true;
+		}
+
+		const auto* block = state.graph->FindBlock(block_id);
+		if (block != nullptr && frames.back().next_successor < block->successors.size()) {
+			const auto succ = block->successors[frames.back().next_successor++];
+			if (state.index[succ] == UINT32_MAX) {
+				frames.push_back({succ, 0});
+			} else if (state.on_stack[succ]) {
+				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
+			}
+			continue;
+		}
+
+		frames.pop_back();
+		if (!frames.empty()) {
+			const auto parent     = frames.back().block;
+			state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[block_id]);
+		}
+		TarjanFinish(state, block_id);
+	}
 }
 
 void ComputeComponents(Graph& graph) {

@@ -53,6 +53,7 @@
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -6677,6 +6678,44 @@ void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
         "dispatcher SPIR-V lacks OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void TestNewShaderRecompilerCfgComponentsOfLongPath() {
+  using namespace ShaderRecompiler;
+  // Each s_branch to the next instruction ends a block, so the loop below spans blocks 1..path.
+  constexpr uint32_t path = 1024;
+  std::vector<uint32_t> shader(path, EncodeSopp(0x02, 0));
+  shader.push_back(EncodeSopp(0x04, 0u - path)); // s_cbranch_scc0 back to block 1
+  shader.push_back(EncodeSopp(0x01));            // s_endpgm
+  struct Build {
+    Decoder::Program decoded;
+    CFG::Graph graph;
+  } build;
+  Decoder::DecodeProgram(std::span{shader}, build.decoded);
+
+  // A 64 KiB stack holds far fewer host frames than the path has blocks.
+  pthread_attr_t attributes;
+  Check(pthread_attr_init(&attributes) == 0 &&
+            pthread_attr_setstacksize(&attributes, 64 * 1024) == 0,
+        "configure a small translation stack");
+  pthread_t thread;
+  Check(pthread_create(&thread, &attributes, [](void *opaque) -> void * {
+    auto &build = *static_cast<Build *>(opaque);
+    build.graph = CFG::BuildGraph(build.decoded);
+    return nullptr;
+  }, &build) == 0 && pthread_join(thread, nullptr) == 0,
+        "build the CFG on a 64 KiB stack");
+  pthread_attr_destroy(&attributes);
+
+  const auto &components = build.graph.components;
+  Check(components.size() == 3u &&
+            components[0].blocks == std::vector<uint32_t>{path + 1u} &&
+            components[1].blocks.size() == path &&
+            components[1].entry_blocks == std::vector<uint32_t>{1u} &&
+            components[2].blocks == std::vector<uint32_t>{0u},
+        "long block path lost its loop component or the completion order");
+}
+#endif
 
 void TestNewShaderRecompilerDispatcherSpillsU32x3() {
   using namespace ShaderRecompiler;
@@ -13556,6 +13595,9 @@ int main() {
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  TestNewShaderRecompilerCfgComponentsOfLongPath();
+#endif
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerPlanningOnlyLoads();
   TestNewShaderRecompilerNativeU64Translation();

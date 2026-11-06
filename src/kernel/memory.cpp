@@ -169,6 +169,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t              g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+static callback_func_t       g_test_before_guest_reserve                = nullptr;
 static callback_func_t       g_test_before_backing_map                  = nullptr;
 static callback_func_t       g_test_backing_read                        = nullptr;
 static uint64_t              g_test_backing_bytes_zeroed                = 0;
@@ -2923,6 +2924,10 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void TestSetGpuRangeCallback(void (*callback)(bool, uint64_t, size_t)) {
 	g_test_gpu_range = callback;
+}
+
+void TestBeforeNextGuestReserve(callback_func_t callback) {
+	g_test_before_guest_reserve = callback;
 }
 
 void TestBeforeNextBackingMap(callback_func_t callback) {

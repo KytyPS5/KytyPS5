@@ -716,6 +716,10 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	            PerformanceOverlayRevision()};
 }
 
+bool SystemOverlayInputActive() noexcept {
+	return g_input_active;
+}
+
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {

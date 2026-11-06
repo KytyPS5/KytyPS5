@@ -840,7 +840,19 @@ uint32_t EmitLiveMask(EmitterState& state) {
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
+	if (ctx.state.program.wave_size == 32u) {
+		// The guest ballot of a wave32 lives in the caller's half of the native ballot, and its
+		// first active lane is numbered from zero within that half.
+		const auto word = EmitNative<spv::OpVectorExtractDynamic, IR::Type::U32>(
+		    ctx.state, ballot,
+		    Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
+		           EmitSubgroupLocalInvocationId(ctx.state), ConstantU32(ctx.state, 5)));
+		const auto bits = EmitGlsl<GLSLstd450FindILsb, IR::Type::U32>(ctx.state, word);
+		const auto lane = EmitGlsl<GLSLstd450SMax, IR::Type::U32>(ctx.state, bits,
+		                                                          ConstantU32(ctx.state, 0));
+		return ctx.Shuffle(inst, 0, lane);
+	}
+	const auto lane = ctx.FirstLane(ballot);
 	return ctx.Shuffle(inst, 0, lane);
 }
 
@@ -877,8 +889,11 @@ uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), hit,
-	                          EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2));
+	// A 32-lane guest wave numbers its lanes from zero in either half of a 64-lane subgroup.
+	const auto self = state.program.wave_size == 32u
+	                      ? EmitAndConstant(state, EmitSubgroupLocalInvocationId(state), 31)
+	                      : EmitSubgroupLocalInvocationId(state);
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), hit, self, ctx.Arg(inst, 2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, hit, ctx.Arg(inst, 1),
 	                                                ctx.Arg(inst, 0));
 }

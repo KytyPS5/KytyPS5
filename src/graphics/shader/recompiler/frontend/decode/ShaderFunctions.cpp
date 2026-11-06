@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
@@ -47,6 +48,23 @@ bool Writes(const Instruction& inst, uint32_t reg, uint32_t wave_size) {
 	        reg < inst.dst.reg + DestinationWords(inst, wave_size)) ||
 	       (inst.dst2.kind == OperandKind::Sgpr && reg >= inst.dst2.reg &&
 	        reg < inst.dst2.reg + wave_size / 32u);
+}
+
+// Whether the instruction can write VGPR `reg` (image results conservatively wide).
+bool WritesVgpr(const Instruction& inst, uint32_t reg) {
+	uint32_t count = 1;
+	switch (inst.family) {
+		case Family::MIMG: count = 8; break;
+		case Family::MUBUF:
+		case Family::MTBUF:
+		case Family::FLAT: count = std::max(inst.data_dwords, 1u); break;
+		case Family::DS: count = std::max(inst.data_dwords, 1u) * 2u; break;
+		default: count = magic_enum::enum_name(inst.opcode).find("64") != std::string_view::npos ? 2u : 1u; break;
+	}
+	const auto covers = [&](const Operand& operand) {
+		return operand.kind == OperandKind::Vgpr && reg >= operand.reg && reg < operand.reg + count;
+	};
+	return covers(inst.dst) || covers(inst.dst2);
 }
 
 struct Function {
@@ -343,7 +361,119 @@ struct ShaderAnalysis {
 	std::set<uint32_t>    labels;
 	bool                  has_calls = false;
 	bool                  has_setpc = false;
+	// DominatingWriter's answers (they depend on the code alone): (register, use, wave size).
+	mutable std::map<std::tuple<uint32_t, size_t, uint32_t>, std::optional<size_t>> dominating_writers;
 };
+
+// What an instruction does to the register a reaching definition is looked for.
+enum class Definition { None, Writes, Unknown };
+
+// The instruction whose write of a register reaches instruction `use` on every path: walking back
+// from `use`, every path meets that same writer before any other one and before the entry (a call
+// returns to the instruction after it). `defines` tells what an instruction does to the register.
+template <typename Defines>
+std::optional<size_t> ReachingWriter(const Program& program, size_t use, const Defines& defines) {
+	const auto& instructions = program.instructions;
+	if (use >= instructions.size()) {
+		return {};
+	}
+	std::unordered_map<uint32_t, size_t> index_of_pc;
+	for (size_t i = 0; i < instructions.size(); i++) {
+		index_of_pc.emplace(instructions[i].pc, i);
+	}
+	std::vector<std::vector<size_t>> predecessors(instructions.size());
+	for (size_t i = 0; i < instructions.size(); i++) {
+		const auto& inst = instructions[i];
+		if (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SETPC_B64) {
+			continue;
+		}
+		if (IsDirectBranch(inst.opcode)) {
+			const auto target = index_of_pc.find(inst.branch_target);
+			if (target == index_of_pc.end()) {
+				return {};
+			}
+			predecessors[target->second].push_back(i);
+			if (inst.opcode == Opcode::S_BRANCH) {
+				continue;
+			}
+		}
+		if (i + 1 < instructions.size()) {
+			predecessors[i + 1].push_back(i);
+		}
+	}
+	std::optional<size_t> writer;
+	std::vector<bool>     seen(instructions.size(), false);
+	std::vector<size_t>   pending {use};
+	while (!pending.empty()) {
+		const auto i = pending.back();
+		pending.pop_back();
+		if (i == 0) {
+			return {}; // The entry: a path without a write.
+		}
+		for (const auto j: predecessors[i]) {
+			if (seen[j]) {
+				continue;
+			}
+			seen[j] = true;
+			switch (defines(instructions[j])) {
+				case Definition::Unknown: return {};
+				case Definition::Writes:
+					if (writer && *writer != j) {
+						return {};
+					}
+					writer = j;
+					break;
+				case Definition::None: pending.push_back(j); break;
+			}
+		}
+	}
+	return writer;
+}
+
+// The instruction whose write of SGPR `reg` reaches instruction `use` on every path, with no other
+// write of it in between: the register holds that write's value at `use` (Gran Turismo 7 loads the
+// V# of its any-hit call table once, before its traversal loop, and reuses the SGPRs after it).
+std::optional<size_t> DominatingWriter(const ShaderAnalysis& analysis, uint32_t reg, size_t use, uint32_t wave_size) {
+	const auto key = std::tuple {reg, use, wave_size};
+	if (const auto found = analysis.dominating_writers.find(key); found != analysis.dominating_writers.end()) {
+		return found->second;
+	}
+	const auto writer = ReachingWriter(analysis.program, use, [&](const Instruction& inst) {
+		return Writes(inst, reg, wave_size) ? Definition::Writes : Definition::None;
+	});
+	analysis.dominating_writers.emplace(key, writer);
+	return writer;
+}
+
+// The V_WRITELANE_B32 <vgpr>, <sgpr>, `lane` whose write reaches instruction `use` on every path
+// (other writes of the VGPR in between must be V_WRITELANE_B32s of other constant lanes): a
+// V_READLANE_B32 of the lane at `use` reads the SGPR the compiler spilled there (Gran Turismo 7
+// keeps the pointer to a table of V#s so).
+std::optional<size_t> SpillWriter(const ShaderAnalysis& analysis, uint32_t vgpr, uint32_t lane, size_t use,
+                                  uint32_t wave_size) {
+	const auto key = std::tuple {0x80000000u | (vgpr << 8u) | lane, use, wave_size};
+	if (const auto found = analysis.dominating_writers.find(key); found != analysis.dominating_writers.end()) {
+		return found->second;
+	}
+	const auto writer = ReachingWriter(analysis.program, use, [&](const Instruction& inst) {
+		if (!WritesVgpr(inst, vgpr)) {
+			return Definition::None;
+		}
+		const auto written = inst.opcode == Opcode::V_WRITELANE_B32 && inst.dst.reg == vgpr &&
+		                             inst.src1.kind != OperandKind::Null
+		                         ? Immediate(inst.src1)
+		                         : std::nullopt;
+		if (!written) {
+			return Definition::Unknown;
+		}
+		if (*written % wave_size != lane) {
+			return Definition::None;
+		}
+		return inst.src0.kind == OperandKind::Sgpr ? Definition::Writes : Definition::Unknown;
+	});
+	analysis.dominating_writers.emplace(key, writer);
+	return writer;
+}
 
 void AnalyzeShader(std::span<const uint32_t> code, ShaderAnalysis& analysis) {
 	analysis.code.assign(code.begin(), code.end());
@@ -356,6 +486,112 @@ void AnalyzeShader(std::span<const uint32_t> code, ShaderAnalysis& analysis) {
 	}
 }
 
+// Whether a function returns with SGPR `reg` holding the value it had at the call: it does not
+// write the register, or every path restores it (Gran Turismo 7's any-hit functions save the
+// SGPRs they use, s_mov_b32 s<n>, s84 at the entry and s_mov_b32 s84, s<n> before returning).
+// Values are followed through S_MOV_B32/S_MOV_B64 and through VGPR lanes (V_WRITELANE_B32 and
+// V_READLANE_B32 of constant lanes); any other write loses them.
+bool ReturnsWithEntryValue(const Function& function, uint32_t reg, uint32_t wave_size) {
+	const auto& instructions = function.instructions;
+	if (std::ranges::none_of(instructions, [&](const Instruction& inst) { return Writes(inst, reg, wave_size); })) {
+		return true;
+	}
+	// What each register holds: the entry value of an SGPR (Unknown: anything else). An SGPR
+	// that is not in the map holds its own entry value; a VGPR lane that is not, nothing known.
+	constexpr uint32_t Unknown = UINT32_MAX;
+	struct State {
+		std::map<uint32_t, uint32_t>                       sgprs;
+		std::map<std::pair<uint32_t, uint32_t>, uint32_t> lanes;
+		bool operator==(const State&) const = default;
+	};
+	const auto sgpr = [](const State& state, uint32_t r) {
+		const auto found = state.sgprs.find(r);
+		return found != state.sgprs.end() ? found->second : r;
+	};
+	const auto join = [&](State& into, const State& from) {
+		State joined;
+		std::set<uint32_t> keys;
+		for (const auto& [r, value]: into.sgprs) keys.insert(r);
+		for (const auto& [r, value]: from.sgprs) keys.insert(r);
+		for (const auto r: keys) {
+			const auto a = sgpr(into, r), b = sgpr(from, r);
+			if (a != r || b != r) joined.sgprs[r] = a == b ? a : Unknown;
+		}
+		for (const auto& [lane, value]: into.lanes) {
+			const auto other = from.lanes.find(lane);
+			if (other != from.lanes.end() && other->second == value) joined.lanes[lane] = value;
+		}
+		const bool changed = !(joined == into);
+		into               = std::move(joined);
+		return changed;
+	};
+	std::unordered_map<uint32_t, size_t> index_of_pc;
+	for (size_t i = 0; i < instructions.size(); i++) {
+		index_of_pc.emplace(instructions[i].pc, i);
+	}
+	std::vector<std::optional<State>> in(instructions.size());
+	in[0] = State {};
+	std::vector<size_t> pending {0};
+	while (!pending.empty()) {
+		const auto i = pending.back();
+		pending.pop_back();
+		auto        state = *in[i];
+		const auto& inst  = instructions[i];
+		if (inst.opcode == Opcode::S_SETPC_B64) {
+			if (sgpr(state, reg) != reg) {
+				return false;
+			}
+			continue;
+		}
+		const auto lane_of = [&](const Operand& operand) -> std::optional<uint32_t> {
+			const auto lane = operand.kind == OperandKind::Null ? std::nullopt : Immediate(operand);
+			return lane ? std::optional<uint32_t> {*lane % wave_size} : std::nullopt;
+		};
+		if ((inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOV_B64) && inst.dst.kind == OperandKind::Sgpr &&
+		    inst.src0.kind == OperandKind::Sgpr) {
+			const auto words = inst.opcode == Opcode::S_MOV_B64 ? 2u : 1u;
+			std::array<uint32_t, 2> values {};
+			for (uint32_t w = 0; w < words; w++) values[w] = sgpr(state, inst.src0.reg + w);
+			for (uint32_t w = 0; w < words; w++) state.sgprs[inst.dst.reg + w] = values[w];
+		} else if (inst.opcode == Opcode::V_WRITELANE_B32 && inst.dst.kind == OperandKind::Vgpr &&
+		           inst.src0.kind == OperandKind::Sgpr && lane_of(inst.src1)) {
+			state.lanes[{inst.dst.reg, *lane_of(inst.src1)}] = sgpr(state, inst.src0.reg);
+		} else if (inst.opcode == Opcode::V_READLANE_B32 && inst.dst.kind == OperandKind::Sgpr &&
+		           inst.src0.kind == OperandKind::Vgpr && lane_of(inst.src1)) {
+			const auto found = state.lanes.find({inst.src0.reg, *lane_of(inst.src1)});
+			state.sgprs[inst.dst.reg] = found != state.lanes.end() ? found->second : Unknown;
+		} else {
+			for (uint32_t r = 0; r < 128; r++) {
+				if (Writes(inst, r, wave_size)) state.sgprs[r] = Unknown;
+			}
+			std::erase_if(state.lanes, [&](const auto& entry) { return WritesVgpr(inst, entry.first.first); });
+		}
+		const auto flow = [&](size_t to) {
+			if (to >= instructions.size()) {
+				return;
+			}
+			if (!in[to]) {
+				in[to] = state;
+				pending.push_back(to);
+			} else if (join(*in[to], state)) {
+				pending.push_back(to);
+			}
+		};
+		if (IsDirectBranch(inst.opcode)) {
+			const auto target = index_of_pc.find(inst.branch_target);
+			if (target == index_of_pc.end()) {
+				return false;
+			}
+			flow(target->second);
+			if (inst.opcode == Opcode::S_BRANCH) {
+				continue;
+			}
+		}
+		flow(i + 1);
+	}
+	return true;
+}
+
 // One call instruction and every address it can reach.
 struct CallSite {
 	uint32_t              pc         = 0;
@@ -363,6 +599,11 @@ struct CallSite {
 	uint32_t              return_reg = 0;
 	bool                  dynamic    = false;
 	std::vector<uint64_t> addresses; // ascending
+	// The registers its targets were read through outside the call's block, each with the
+	// instruction whose value of it was read: user data, a register written before the loop,
+	// a VGPR (VgprHeld + n) whose lane held a spilled SGPR. A callee may write one only if no call
+	// returns into a path that reaches that instruction (ascending).
+	std::vector<std::pair<uint32_t, uint32_t>> consumed;
 
 	bool operator==(const CallSite&) const = default;
 };
@@ -376,6 +617,7 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
                   std::set<uint32_t>& dependencies, std::string& reason) {
 	const auto& program = analysis.program;
 	const auto& labels  = analysis.labels;
+	std::set<std::pair<uint32_t, uint32_t>> consumed;
 	const auto resolve = [&](auto&& self, uint32_t reg, size_t before, size_t first, uint32_t depth,
 	                         bool load_memory = false) -> std::optional<uint32_t> {
 		if (reg >= 128 || depth > 32) return {};
@@ -386,12 +628,37 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 		        [&](const auto& inst) { return Writes(inst, reg, wave_size); });
 		if (initial) {
 			dependencies.insert(reg);
+			consumed.emplace(reg, static_cast<uint32_t>(before));
 			return user_data[reg];
 		}
+		const auto block_of = [&](size_t at) {
+			while (at > 0 && !labels.contains(program.instructions[at].pc) &&
+			       !IsDirectBranch(program.instructions[at - 1].opcode))
+				--at;
+			return at;
+		};
+		// Past the start of the block, a register the shader writes once, on every path to here
+		// (only in memory loads: the value read stays what the shader saw).
+		const auto earlier = [&]() -> std::optional<uint32_t> {
+			const auto writer = load_memory ? DominatingWriter(analysis, reg, before, wave_size) : std::nullopt;
+			if (!writer) return {};
+			consumed.emplace(reg, static_cast<uint32_t>(before));
+			return self(self, reg, *writer + 1u, block_of(*writer), depth + 1, load_memory);
+		};
 		for (size_t i = before; i > first;) {
 			const auto& inst = program.instructions[--i];
 			if (IsDirectBranch(inst.opcode) || IsCall(inst.raw[0])) return {};
 			if (Writes(inst, reg, wave_size)) {
+				if (load_memory && inst.opcode == Opcode::V_READLANE_B32 && inst.src0.kind == OperandKind::Vgpr) {
+					// An SGPR spilled into a lane of a VGPR, read back: the SGPR at the spill.
+					const auto lane  = Immediate(inst.src1);
+					const auto spill = lane ? SpillWriter(analysis, inst.src0.reg, *lane % wave_size, i, wave_size)
+					                        : std::nullopt;
+					if (!spill) return {};
+					consumed.emplace(VgprHeld + inst.src0.reg, static_cast<uint32_t>(i));
+					return self(self, program.instructions[*spill].src0.reg, *spill, block_of(*spill), depth + 1,
+					            load_memory);
+				}
 				if (inst.opcode == Opcode::S_GETPC_B64 && inst.dst.kind == OperandKind::Sgpr) {
 					const auto pc = base + inst.pc + 4u;
 					return static_cast<uint32_t>(pc >> ((reg - inst.dst.reg) * 32u));
@@ -423,9 +690,9 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 					return inst.src0.value;
 				return {};
 			}
-			if (labels.contains(inst.pc)) return {};
+			if (labels.contains(inst.pc)) return earlier();
 		}
-		return {};
+		return earlier();
 	};
 	// Follow only straight-line scalar copies back to one buffer load. The
 	// runtime load and its data arguments are retained in the expanded program.
@@ -455,6 +722,7 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 		while (first > 0 && !labels.contains(program.instructions[first].pc) &&
 		       !IsDirectBranch(program.instructions[first - 1].opcode))
 			--first;
+		consumed.clear();
 		const auto low  = resolve(resolve, src, i, first, 0);
 		const auto high = resolve(resolve, src + 1u, i, first, 0);
 		if (src >= 105u || dst >= 105u) {
@@ -535,7 +803,8 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 				return false;
 			}
 		}
-		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()}});
+		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()},
+		                 {consumed.begin(), consumed.end()}});
 	}
 	return true;
 }
@@ -636,17 +905,114 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			}
 		}
 	}
-	// A callee must not invalidate the user-data assumptions used to resolve later calls.
-	for (const auto& [pc, call]: calls) {
-		for (const auto& target: call.targets) {
-			for (const auto& inst: target.function.instructions) {
-				for (const auto reg: dependencies) {
-					if (Writes(inst, reg, wave_size)) {
-						reason = "shader function modifies a call-target dependency";
-						return false;
-					}
+	// A callee must not invalidate the values the targets were resolved from: a register a callee
+	// writes must not reach, from the return of its call, an instruction whose value of it was read
+	// (the shader's own writes of it on the way end the path). A function that saves an SGPR and
+	// restores it on every path leaves its value. Of a call through a table, a function that does
+	// overwrite one is not a target: after it the caller would read its next target through the
+	// overwritten registers, on the console too (Gran Turismo 7's table also names functions that
+	// load their own descriptors over the caller's table V#). It is left out of the expansion, and
+	// its rows, if one were reached, end at the miss trap. A call through an immutable pointer, or
+	// a table with no target left, fails.
+	{
+		const auto writes = [&](const Instruction& inst, uint32_t reg) {
+			return reg >= VgprHeld ? WritesVgpr(inst, reg - VgprHeld) : Writes(inst, reg, wave_size);
+		};
+		std::unordered_map<uint32_t, size_t> index_of_pc;
+		for (size_t i = 0; i < program.instructions.size(); i++) {
+			index_of_pc.emplace(program.instructions[i].pc, i);
+		}
+		std::set<std::pair<uint32_t, uint32_t>> consumed;
+		for (const auto& site: sites) {
+			consumed.insert(site.consumed.begin(), site.consumed.end());
+		}
+		std::map<std::pair<std::vector<uint32_t>, uint32_t>, bool> preserved;
+		// The instruction of `target` that leaves `reg` overwritten, if any.
+		const auto overwrite = [&](const CallTarget& target, uint32_t reg) -> const Instruction* {
+			const auto found = std::ranges::find_if(target.function.instructions,
+			                                        [&](const Instruction& inst) { return writes(inst, reg); });
+			if (found == target.function.instructions.end()) {
+				return nullptr;
+			}
+			if (reg < VgprHeld) {
+				const auto key   = std::pair {target.function.code, reg};
+				auto       known = preserved.find(key);
+				if (known == preserved.end()) {
+					known = preserved.emplace(key, ReturnsWithEntryValue(target.function, reg, wave_size)).first;
+				}
+				if (known->second) {
+					return nullptr;
 				}
 			}
+			return &*found;
+		};
+		// Whether the instruction at `at` is reached from `from` on a path that does not write `reg`.
+		const auto reaches = [&](size_t from, uint32_t reg, size_t at) {
+			std::vector<bool>   seen(program.instructions.size(), false);
+			std::vector<size_t> pending {from};
+			while (!pending.empty()) {
+				const auto i = pending.back();
+				pending.pop_back();
+				if (i >= program.instructions.size() || seen[i]) {
+					continue;
+				}
+				seen[i] = true;
+				if (i == at) {
+					return true;
+				}
+				const auto& inst = program.instructions[i];
+				if (writes(inst, reg) || inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SETPC_B64) {
+					continue;
+				}
+				if (IsDirectBranch(inst.opcode)) {
+					if (const auto target = index_of_pc.find(inst.branch_target); target != index_of_pc.end()) {
+						pending.push_back(target->second);
+					}
+					if (inst.opcode == Opcode::S_BRANCH) {
+						continue;
+					}
+				}
+				pending.push_back(i + 1u);
+			}
+			return false;
+		};
+		const auto name = [](uint32_t reg) {
+			return reg >= VgprHeld ? "v" + std::to_string(reg - VgprHeld) : "s" + std::to_string(reg);
+		};
+		for (auto& [pc, call]: calls) {
+			const auto call_index = index_of_pc.at(pc);
+			// The registers whose read the return of the call reaches.
+			std::vector<std::pair<uint32_t, uint32_t>> exposed;
+			for (const auto& [reg, at]: consumed) {
+				if (std::ranges::any_of(call.targets, [&](const CallTarget& target) { return overwrite(target, reg); }) &&
+				    reaches(call_index + 1u, reg, at)) {
+					exposed.emplace_back(reg, at);
+				}
+			}
+			if (exposed.empty()) {
+				continue;
+			}
+			std::vector<CallTarget> kept;
+			std::string             first;
+			for (auto& target: call.targets) {
+				const auto clobbered = std::ranges::find_if(exposed, [&](const auto& entry) {
+					return overwrite(target, entry.first) != nullptr;
+				});
+				if (clobbered == exposed.end()) {
+					kept.push_back(std::move(target));
+				} else if (first.empty()) {
+					first = name(clobbered->first) + ", read at pc " +
+					        std::to_string(program.instructions[clobbered->second].pc) + ", written at +" +
+					        std::to_string(overwrite(target, clobbered->first)->pc) + " of the function at " +
+					        std::to_string(target.address);
+				}
+			}
+			if (!call.dynamic || kept.empty()) {
+				reason = "shader function modifies a call-target dependency (" + first + ", call at pc " +
+				         std::to_string(pc) + ")";
+				return false;
+			}
+			call.targets = std::move(kept);
 		}
 	}
 	std::vector<uint32_t>                      result;

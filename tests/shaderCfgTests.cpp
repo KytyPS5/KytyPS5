@@ -7998,6 +7998,131 @@ void TestCallTableDependencyWrites() {
   }
 }
 
+void TestCallTableThroughSpilledPointer() {
+  // Gran Turismo 7's BVH walks keep the pointer to their table of V#s in lanes of a VGPR and load
+  // the call table's V# from it inside the loop, while the registers are reused after the loop:
+  //   s_load_dwordx2 s[2:3], s[0:1], 0; s_waitcnt; v_writelane_b32 v85, s2, 11;
+  //   v_writelane_b32 v85, s3, 12; s_mov_b32 s2, 0; s_mov_b32 s3, 0
+  // loop:
+  //   v_readlane_b32 s2, v85, 11; v_readlane_b32 s3, v85, 12; s_load_dwordx4 s[4:7], s[2:3], 0x10;
+  //   s_lshl_b32 vcc_lo, s8, 4; s_waitcnt; s_buffer_load_dwordx2 s[14:15], s[4:7], vcc_lo; s_waitcnt;
+  //   s_swappc_b64 s[14:15], s[14:15]; s_add_u32 s9, s9, -1; s_cmp_lg_u32 s9, 0; s_cbranch_scc1 loop
+  //   s_load_dwordx8 s[0:7], s[10:11], 0; s_waitcnt; s_endpgm
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base     = 0xfe0040000ull;
+  constexpr uint64_t pointers = base + 0x40;
+  constexpr uint64_t table    = base + 0x100;
+  constexpr uint64_t function = base + 0x200;
+  struct Memory {
+    std::array<uint32_t, 0x100> words{};
+  } memory;
+  memory.words[0] = static_cast<uint32_t>(pointers);
+  memory.words[1] = static_cast<uint32_t>(pointers >> 32u);
+  const std::array<uint32_t, 4> vsharp{static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32u) | (16u << 16u),
+                                       8u, 0x5204u};
+  std::copy(vsharp.begin(), vsharp.end(), memory.words.begin() + (pointers + 0x10 - base) / 4);
+  for (uint32_t slot = 0; slot < 8; slot++) {
+    memory.words[(table - base) / 4 + slot * 4] = static_cast<uint32_t>(function);
+    memory.words[(table - base) / 4 + slot * 4 + 1] = static_cast<uint32_t>(function >> 32u);
+  }
+  // The function overwrites s2 and s4, which the loop loads again before it reads them.
+  memory.words[(function - base) / 4]     = 0x7e0e0280u; // v_mov_b32 v7, 0
+  memory.words[(function - base) / 4 + 1] = 0xbe820380u; // s_mov_b32 s2, 0
+  memory.words[(function - base) / 4 + 2] = 0xbe840380u; // s_mov_b32 s4, 0
+  memory.words[(function - base) / 4 + 3] = 0xbe80200eu; // s_setpc_b64 s[14:15]
+  const auto read = [](void* data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (address < base || address + out.size_bytes() > base + sizeof(m.words)) return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  std::array<uint32_t, 16> user_data{};
+  user_data[0] = static_cast<uint32_t>(base);
+  user_data[1] = static_cast<uint32_t>(base >> 32u);
+  user_data[9] = 2;
+  auto options      = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  options.wave_size = 64;
+  IR::SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                         .read_specialization_memory = read};
+  const std::vector<uint32_t> shader = {
+      0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xd7610055u, 0x00011602u, 0xd7610055u, 0x00011803u,
+      0xbe820380u, 0xbe830380u, 0xd7600002u, 0x00011755u, 0xd7600003u, 0x00011955u, 0xf4080101u,
+      0xfa000010u, 0x8f6a8408u, 0xbf8cc07fu, 0xf4240382u, 0xd4000000u, 0xbf8cc07fu, 0xbe8e210eu,
+      0x8009c109u, 0xbf078009u, 0xbf85fff1u, 0xf40c0005u, 0xfa000000u, 0xbf8cc07fu, 0xbf810000u};
+  {
+    auto source = PrepareShaderSource(shader, options);
+    Check(source.expand_calls, "a call through a table did not take the expansion path");
+    (void)RefreshShaderSource(source, runtime);
+    if (source.refresh_failed) std::fprintf(stderr, "%s\n", source.refresh_failure.c_str());
+    Check(!source.refresh_failed && source.linked.has_value() && source.linked->decoded.call_bodies.size() == 1u,
+          "a call table read through a pointer spilled to a VGPR lane did not expand");
+  }
+  // A function that overwrites the VGPR of the spill would change the pointer the next
+  // iteration reads.
+  memory.words[(function - base) / 4 + 2] = 0x7eaa0280u; // v_mov_b32 v85, 0
+  {
+    auto source = PrepareShaderSource(shader, options);
+    (void)RefreshShaderSource(source, runtime);
+    Check(source.refresh_failed &&
+              source.refresh_failure.find("modifies a call-target dependency") != std::string::npos,
+          "a function that overwrites the spilled pointer's VGPR was inlined");
+  }
+  // Without the spill the loop reads s[2:3], loaded before it: a function may overwrite s2 only
+  // if it restores it on every path (through an SGPR or a lane of a VGPR).
+  auto unspilled = shader;
+  std::fill(unspilled.begin() + 3, unspilled.begin() + 13, 0xbf800000u); // s_nop 0
+  const auto expands = [&](std::initializer_list<uint32_t> code) {
+    std::copy(code.begin(), code.end(), memory.words.begin() + (function - base) / 4);
+    Decoder::ShaderFunctionExpander expander;
+    std::vector<uint32_t> expanded;
+    std::string reason;
+    return expander.Expand(
+        unspilled, 0x300000000ull, user_data,
+        [&](uint64_t address, std::span<uint32_t> out) { return read(&memory, address, out); }, expanded, reason,
+        64u);
+  };
+  Check(expands({0x7e0e0280u,               // v_mov_b32 v7, 0
+                 0xbe940302u,               // s_mov_b32 s20, s2
+                 0xbe820380u,               // s_mov_b32 s2, 0
+                 0xbe820314u,               // s_mov_b32 s2, s20
+                 0xbe80200eu}),             // s_setpc_b64 s[14:15]
+        "a function that restores s2 from an SGPR was not inlined");
+  Check(expands({0xd761005au, 0x00010602u,  // v_writelane_b32 v90, s2, 3
+                 0xbe820380u,               // s_mov_b32 s2, 0
+                 0xd7600002u, 0x0001075au,  // v_readlane_b32 s2, v90, 3
+                 0xbe80200eu}),             // s_setpc_b64 s[14:15]
+        "a function that restores s2 from a VGPR lane was not inlined");
+  Check(!expands({0xbe940302u,              // s_mov_b32 s20, s2
+                  0xbe820380u,              // s_mov_b32 s2, 0
+                  0xbf850001u,              // s_cbranch_scc1 +1
+                  0xbe820314u,              // s_mov_b32 s2, s20
+                  0xbe80200eu}),            // s_setpc_b64 s[14:15]
+        "a function that leaves s2 overwritten on one path was inlined");
+  // A table that also names a function that overwrites s2 (Gran Turismo 7's names functions that
+  // load their own descriptors over the caller's table V#): the call keeps the other one only.
+  constexpr uint64_t clobbering = base + 0x300;
+  for (uint32_t slot = 1; slot < 8; slot += 2) {
+    memory.words[(table - base) / 4 + slot * 4] = static_cast<uint32_t>(clobbering);
+    memory.words[(table - base) / 4 + slot * 4 + 1] = static_cast<uint32_t>(clobbering >> 32u);
+  }
+  memory.words[(clobbering - base) / 4]     = 0xbe820380u; // s_mov_b32 s2, 0
+  memory.words[(clobbering - base) / 4 + 1] = 0xbe80200eu; // s_setpc_b64 s[14:15]
+  Check(expands({0x7e0e0280u, 0xbe80200eu}), "a table naming a function that overwrites s2 did not expand");
+  {
+    Decoder::ShaderFunctionExpander expander;
+    std::vector<uint32_t> expanded;
+    std::string reason;
+    Check(expander.Expand(
+              unspilled, 0x300000000ull, user_data,
+              [&](uint64_t address, std::span<uint32_t> out) { return read(&memory, address, out); }, expanded,
+              reason, 64u) &&
+              expander.Bodies().size() == 1u && expander.Bodies()[0].address == function,
+          "the function that overwrites s2 was inlined into the table call");
+  }
+}
+
 void TestNewShaderRecompilerSetpcBranch() {
   const uint32_t shader[] = {
       EncodeSop1(0x1f, 4, 0),      // s_getpc_b64 s[4:5]
@@ -14328,6 +14453,7 @@ int main() {
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestCallTableDependencyWrites();
+  TestCallTableThroughSpilledPointer();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

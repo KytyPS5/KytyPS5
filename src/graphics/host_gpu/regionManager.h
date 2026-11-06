@@ -16,11 +16,18 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#undef min
+#undef max
 #undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
+#include <sched.h>
 #elif defined(__linux__)
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -31,15 +38,9 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		if (m_lock.test_and_set(std::memory_order_acquire)) [[unlikely]] {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
+			LockContended();
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -50,9 +51,31 @@ public:
 	}
 
 private:
+	void LockContended() noexcept {
+		for (;;) {
+			// Wait on reads, so the holder's cache line is not written until the lock is free.
+			if (!m_lock.test(std::memory_order_relaxed) &&
+			    !m_lock.test_and_set(std::memory_order_acquire)) {
+				return;
+			}
+			Pause();
+		}
+	}
+
+	static void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#elif defined(_M_ARM64)
+		__yield();
+#elif defined(__aarch64__)
+		asm volatile("yield");
+#endif
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		static thread_local const uint32_t tid = GetCurrentThreadId();
+		return tid;
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		static thread_local const uint32_t tid =

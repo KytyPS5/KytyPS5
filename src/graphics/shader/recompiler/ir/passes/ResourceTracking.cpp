@@ -3545,7 +3545,7 @@ private:
 		if (table_source.dword_count == 2u) {
 			if (!MatchPackedScalarKey(key, indirect)) {
 				// EXEC implications must describe the same iteration as the selected value.
-				if (m_native_cfg.irreducible || !m_native_cfg.back_edges.empty()) return false;
+				if (m_program.cyclic) return false;
 				const auto* lane = key.Resolve().TryInstruction();
 				if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane ||
 				    !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
@@ -3735,8 +3735,8 @@ private:
 				if (!initial.IsEmpty()) return SelectorMaximum(initial, bounds, depth + 1u, guard);
 				const auto post_test = PostTestLoopMaximum(value);
 				if (post_test != UINT32_MAX) return post_test;
-				if (m_native_cfg.irreducible || !m_native_cfg.back_edges.empty() ||
-				    inst->NumArgs() == 0u || (inst->Parent() != nullptr && InCycle(inst->Parent())))
+				if (m_program.cyclic || inst->NumArgs() == 0u ||
+				    (inst->Parent() != nullptr && InCycle(inst->Parent())))
 					return UINT32_MAX;
 				uint32_t result = 0u;
 				for (uint32_t arm = 0; arm < inst->NumArgs(); ++arm) {

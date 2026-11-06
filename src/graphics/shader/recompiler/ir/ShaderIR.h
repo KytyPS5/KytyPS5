@@ -737,6 +737,9 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// A block may repeat: the structured CFG has a back edge, or the dispatcher runs the native
+	// CFG, whose back edges miss multi-entry cycles.
+	bool cyclic = false;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.

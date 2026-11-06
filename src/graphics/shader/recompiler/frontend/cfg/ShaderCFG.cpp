@@ -3,7 +3,6 @@
 #include "common/assert.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -30,18 +29,8 @@ struct SetpcTargetInfo {
 	std::vector<uint32_t> selector_target_pcs;
 };
 
-void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::string& message) {
-	graph.unsupported        = true;
-	graph.failure_kind       = kind;
-	graph.failure_block      = block_id;
-	graph.unsupported_reason = message;
-}
-
-[[noreturn]] void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
-                                   const std::string& message) {
-	SetFailure(graph, kind, block_id, message);
+[[noreturn]] void ExitBuildFailure(const std::string& message) {
 	EXIT("shader CFG build failed: %s", message.c_str());
-	std::abort();
 }
 
 uint32_t InstructionEndPc(const Instruction& inst) {
@@ -626,7 +615,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 	}
 
 	graph.entry_block   = RemapId(graph.entry_block, id_map);
-	graph.failure_block = RemapId(graph.failure_block, id_map);
 	graph.blocks        = std::move(blocks);
 	for (auto& block: graph.blocks) {
 		block.id = RemapId(block.id, id_map);
@@ -737,103 +725,10 @@ void ComputeNaturalLoops(Graph& graph) {
 	}
 }
 
-struct TarjanState {
-	const Graph*                            graph      = nullptr;
-	uint32_t                                next_index = 0;
-	std::vector<uint32_t>                   index;
-	std::vector<uint32_t>                   lowlink;
-	std::vector<bool>                       on_stack;
-	std::vector<uint32_t>                   stack;
-	std::vector<StronglyConnectedComponent> components;
-};
-
-void TarjanVisit(TarjanState& state, uint32_t block_id) {
-	state.index[block_id]   = state.next_index;
-	state.lowlink[block_id] = state.next_index;
-	state.next_index++;
-	state.stack.push_back(block_id);
-	state.on_stack[block_id] = true;
-
-	const auto* block = state.graph->FindBlock(block_id);
-	if (block != nullptr) {
-		for (auto succ: block->successors) {
-			if (state.index[succ] == UINT32_MAX) {
-				TarjanVisit(state, succ);
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
-			} else if (state.on_stack[succ]) {
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
-			}
-		}
-	}
-
-	if (state.lowlink[block_id] != state.index[block_id]) {
-		return;
-	}
-
-	StronglyConnectedComponent component;
-	for (;;) {
-		const auto member = state.stack.back();
-		state.stack.pop_back();
-		state.on_stack[member] = false;
-		component.blocks.push_back(member);
-		if (member == block_id) {
-			break;
-		}
-	}
-	SortUnique(component.blocks);
-
-	bool cyclic = component.blocks.size() > 1u;
-	for (auto member: component.blocks) {
-		const auto* member_block = state.graph->FindBlock(member);
-		if (member_block != nullptr && Contains(member_block->successors, member)) {
-			cyclic = true;
-		}
-		if (member_block != nullptr) {
-			for (auto pred: member_block->predecessors) {
-				if (!Contains(component.blocks, pred)) {
-					AddUnique(component.entry_blocks, member);
-				}
-			}
-		}
-	}
-	SortUnique(component.entry_blocks);
-	component.irreducible = cyclic && component.entry_blocks.size() > 1u;
-	state.components.push_back(std::move(component));
-}
-
-void ComputeComponents(Graph& graph) {
-	TarjanState state;
-	state.graph = &graph;
-	state.index.assign(graph.blocks.size(), UINT32_MAX);
-	state.lowlink.assign(graph.blocks.size(), UINT32_MAX);
-	state.on_stack.assign(graph.blocks.size(), false);
-	state.stack.reserve(graph.blocks.size());
-	state.components.reserve(graph.blocks.size());
-
-	for (const auto& block: graph.blocks) {
-		if (state.index[block.id] == UINT32_MAX) {
-			TarjanVisit(state, block.id);
-		}
-	}
-
-	graph.components = std::move(state.components);
-	for (const auto& component: graph.components) {
-		if (component.irreducible) {
-			graph.irreducible   = true;
-			graph.failure_kind  = FailureKind::IrreducibleControlFlow;
-			graph.failure_block = component.entry_blocks.empty() ? component.blocks.front()
-			                                                     : component.entry_blocks.front();
-			graph.unsupported_reason = "irreducible CFG: cyclic component has multiple entries";
-			break;
-		}
-	}
-}
-
 void RecomputeAnalyses(Graph& graph) {
 	ComputeDominators(graph);
 	ComputeBackEdges(graph);
 	ComputeNaturalLoops(graph);
-	ComputeComponents(graph);
 }
 
 std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> blocks) {
@@ -1020,17 +915,14 @@ public:
 			return Failed();
 		}
 		RecomputeAnalyses(m_graph);
-		if (m_graph.irreducible) {
-			Fail("goto elimination produced irreducible control flow");
-			return Failed();
-		}
 		return std::move(m_graph);
 	}
 
 private:
 	void Fail(const char* reason) { m_failure = reason; }
 	Graph Failed() {
-		SetFailure(m_graph, FailureKind::StructuredControlFlow, UINT32_MAX, m_failure);
+		m_graph.unsupported        = true;
+		m_graph.unsupported_reason = m_failure;
 		return std::move(m_graph);
 	}
 	uint32_t CaptureVariable(uint32_t block) const {
@@ -1399,8 +1291,7 @@ private:
 Graph BuildGraph(const Decoder::Program& program) {
 	Graph graph;
 	if (program.instructions.empty()) {
-		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
-		                 "cannot build CFG for empty shader");
+		ExitBuildFailure("cannot build CFG for empty shader");
 	}
 
 	const auto first_pc = program.instructions.front().pc;
@@ -1409,9 +1300,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (const auto& inst: program.instructions) {
 		if (inst.opcode == Opcode::UNSUPPORTED) {
 			ExitBuildFailure(
-			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
 			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
-			                Decoder::InstructionToString(inst).c_str()));
+				            Decoder::InstructionToString(inst).c_str()));
 		}
 	}
 
@@ -1424,8 +1314,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 		if (Decoder::IsDirectBranch(inst.opcode) ||
 		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
-				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
+				ExitBuildFailure(fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
 				                             inst.pc, inst.branch_target));
 			}
 			labels.push_back(inst.branch_target);
@@ -1436,7 +1325,6 @@ Graph BuildGraph(const Decoder::Program& program) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
 				ExitBuildFailure(
-				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
 			const auto target_pcs = target_info.indirect
@@ -1444,10 +1332,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			                            : std::span<const uint32_t>(&target_info.target, 1);
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, program.instructions, end_pc)) {
-					ExitBuildFailure(
-					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
-					                inst.pc, target));
+					ExitBuildFailure(fmt::format(
+					    "S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}", inst.pc, target));
 				}
 				labels.push_back(target);
 			}
@@ -1470,7 +1356,6 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto begin = std::ranges::lower_bound(program.instructions, start, {}, &Instruction::pc);
 		if (start != end_pc && (begin == program.instructions.end() || begin->pc != start)) {
 			ExitBuildFailure(
-			    graph, FailureKind::InvalidLabel, UINT32_MAX,
 			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
 		}
 
@@ -1540,10 +1425,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			block.terminator.true_block = block_at_pc(last.branch_target);
 			const auto fallthrough      = block_at_pc(next_pc);
 			if (fallthrough == UINT32_MAX) {
-				ExitBuildFailure(
-				    graph, FailureKind::MissingFallthrough, block.id,
-				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
-				                last.pc));
+				ExitBuildFailure(fmt::format(
+				    "conditional branch at pc 0x{:08x} has no fallthrough block", last.pc));
 			}
 			block.terminator.false_block = fallthrough;
 		} else {
@@ -1620,32 +1503,10 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 
 	RecomputeAnalyses(graph);
-
-	if (indirect_setpc) {
-		graph.irreducible  = true;
-		graph.unsupported  = false;
-		graph.failure_kind = FailureKind::IrreducibleControlFlow;
-		const auto indirect =
-		    std::find_if(graph.blocks.begin(), graph.blocks.end(), [](const auto& block) {
-			    return block.terminator.kind == TerminatorKind::IndirectBranch;
-		    });
-		graph.failure_block = indirect != graph.blocks.end() ? indirect->id : graph.entry_block;
-		graph.unsupported_reason = "indirect S_SETPC_B64 jump table requires dispatcher fallback";
-	}
-
-	if (graph.irreducible) {
-		graph.unsupported = false;
-	}
-
 	return graph;
 }
 
 Graph Structurize(const Graph& graph) {
-	if (graph.unsupported || graph.irreducible) {
-		Graph failed;
-		SetFailure(failed, graph.failure_kind, graph.failure_block, graph.unsupported_reason);
-		return failed;
-	}
 	return GotoStructurizer(graph).Run();
 }
 
@@ -1733,26 +1594,10 @@ std::string BranchConditionToString(BranchCondition condition) {
 	}
 }
 
-std::string FailureKindToString(FailureKind kind) {
-	switch (kind) {
-		case FailureKind::None: return "None";
-		case FailureKind::InvalidInput: return "InvalidInput";
-		case FailureKind::UnsupportedInstruction: return "UnsupportedInstruction";
-		case FailureKind::InvalidBranchTarget: return "InvalidBranchTarget";
-		case FailureKind::MissingFallthrough: return "MissingFallthrough";
-		case FailureKind::InvalidLabel: return "InvalidLabel";
-		case FailureKind::IrreducibleControlFlow: return "IrreducibleControlFlow";
-		case FailureKind::StructuredControlFlow: return "StructuredControlFlow";
-		default: return "Unknown";
-	}
-}
-
 std::string GraphToString(const Graph& graph) {
 	std::string text;
-	text +=
-	    fmt::format("entry_block={} irreducible={} unsupported={} failure={} failure_block={}\n",
-	                graph.entry_block, graph.irreducible ? 1u : 0u, graph.unsupported ? 1u : 0u,
-	                FailureKindToString(graph.failure_kind).c_str(), graph.failure_block);
+	text += fmt::format("entry_block={} unsupported={}\n", graph.entry_block,
+	                    graph.unsupported ? 1u : 0u);
 	if (!graph.unsupported_reason.empty()) {
 		text += "unsupported_reason=";
 		text += graph.unsupported_reason;
@@ -1794,12 +1639,6 @@ std::string GraphToString(const Graph& graph) {
 	for (const auto& loop: graph.natural_loops) {
 		text += fmt::format("loop header={} latch={} body=[{}]\n", loop.header, loop.latch,
 		                    VectorToString(loop.body_blocks).c_str());
-	}
-	for (const auto& component: graph.components) {
-		text += fmt::format("scc blocks=[{}] entries=[{}] irreducible={}\n",
-		                    VectorToString(component.blocks).c_str(),
-		                    VectorToString(component.entry_blocks).c_str(),
-		                    component.irreducible ? 1u : 0u);
 	}
 	return text;
 }

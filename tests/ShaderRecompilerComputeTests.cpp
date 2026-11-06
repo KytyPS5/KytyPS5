@@ -29843,20 +29843,28 @@ TestCase VectorLaneIsolationAcrossWaves32() {
   // Only lane 31 of each wave keeps the written value; every other lane keeps zero.
   AppendVop3(&code, 0x361, 2, Vgpr(1), InlineU32(31)); // v_writelane_b32 v2, v1, 31
   AppendVop3(&code, 0x360, 5, Vgpr(1), InlineU32(5));  // v_readlane_b32 s5, v1, 5
+  AppendVMovU32(&code, 4, 0);
+  AppendVop3(&code, 0x361, 4, Vgpr(1), InlineU32(31)); // v_writelane_b32 v4, v1, 31
+  AppendVop3(&code, 0x360, 6, Vgpr(4), InlineU32(31)); // v_readlane_b32 s6, v4, 31
   AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
   AppendStoreSgprAtLaneDwordOffset(&code, 5, 0, 64);
+  AppendStoreSgprAtLaneDwordOffset(&code, 6, 0, 128);
   AppendEnd(&code);
 
   TestCase test;
   test.name = "VectorLaneIsolationAcrossWaves32";
   test.code = code;
-  test.initial.resize(128);
+  test.initial.resize(192);
   for (u32 thread = 0; thread < 64; ++thread) {
     test.expected.push_back(thread % 32u == 31u ? 1000u + thread : 0u);
   }
   // Each wave reads lane 5 of its own wave, not lane 5 of the wave sharing the subgroup.
   for (u32 thread = 0; thread < 64; ++thread) {
     test.expected.push_back(1000u + (thread / 32u) * 32u + 5u);
+  }
+  // Reading the written lane broadcasts that lane's value to the whole wave.
+  for (u32 thread = 0; thread < 64; ++thread) {
+    test.expected.push_back(1000u + (thread / 32u) * 32u + 31u);
   }
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_WRITELANE_B32,
                   O::V_READLANE_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,

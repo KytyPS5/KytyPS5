@@ -46590,6 +46590,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
   compiled.program.shader_info_complete = false;
   CollectShaderInfo(compiled.program, {.compute = &compute});
+  const auto query_candidates =
+      static_cast<size_t>(compiled.program.info.images[0].indirect_resources.size());
   for (const u32 wave_size : {32u, 64u}) {
     compute.wave_size = wave_size;
     compute.threads_num[0] = wave_size;
@@ -46598,11 +46600,13 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
     ValidateSpirv(test.name, compiled.spirv);
     const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+    // A lane-selected descriptor cannot drive a query, so the emitter materializes one static
+    // slot body per candidate: the budget is the candidate count, not the image type count.
     Require(test.name, "typed query body count", tools.Disassemble(compiled.spirv, &text) &&
-                CountText(text, "OpImageQuerySizeLod") == 3u * halves &&
-                CountText(text, "OpImageQueryLevels") == 3u * halves &&
+                CountText(text, "OpImageQuerySizeLod") == query_candidates * halves &&
+                CountText(text, "OpImageQueryLevels") == query_candidates * halves &&
                 compiled.spirv.size() <= 8192u * halves,
-            "indirect geometry queries exceeded their per-type body or emitted-size budget");
+            "indirect geometry queries exceeded their per-candidate body or emitted-size budget");
     std::vector<u32> decorated, queried;
     for (size_t offset = 5; offset < compiled.spirv.size();) {
       const auto *words = compiled.spirv.data() + offset;
@@ -46611,9 +46615,13 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       if (op == spv::OpImageQuerySizeLod) queried.push_back(words[3]);
       offset += words[0] >> 16u;
     }
-    Require(test.name, "nonuniform query image", std::ranges::count_if(queried, [&](u32 operand) {
+    // Each body reads a static descriptor slot, so no query operand may need the nonuniform
+    // decoration: the per-lane answer comes from the selector switch instead of the index.
+    Require(test.name, "per-lane query selection",
+            std::ranges::none_of(queried, [&](u32 operand) {
               return std::ranges::find(decorated, operand) != decorated.end();
-            }) == halves, "the dynamic query image lacks its nonuniform decoration");
+            }) && text.find("OpSwitch") != std::string::npos,
+            "a query body read a per-lane descriptor index or lost its per-lane selection");
     test.initial.assign(wave_size * 4u, 0xdeadbeefu);
     test.expected.clear();
     for (u32 lane = 0; lane < wave_size; ++lane) {

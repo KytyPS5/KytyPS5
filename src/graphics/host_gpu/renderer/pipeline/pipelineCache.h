@@ -638,7 +638,7 @@ private:
 	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 	void ManifestWorker(const std::stop_token& stop);
 	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
-	                         std::span<const uint32_t> back_code);
+	                         std::span<const uint32_t> back_code, bool guest_traversal = false);
 	void CreateManifestPipeline(uint32_t index);
 	// `spirv` is the module's, or empty when another thread compiled it.
 	void CreateManifestComputePipeline(const ShaderModule& module, const std::vector<uint32_t>& spirv);
@@ -652,6 +652,12 @@ private:
 	void ManifestProgress(bool force);
 	void SaveManifestRecording();
 };
+
+// Compute programs compiled with native ray tracing on (see IR::TraceNativeTraversals: the
+// compiler rewrites the traversal loops it recognizes) differ from the stored software ones: they
+// get their own program keys. `native`: false for the program of a dispatch without
+// a TLAS (see PipelineCache::GetComputeProgram()).
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true);
 
 // The running title's id as cache file names use it; empty when unknown.
 std::string PipelineCacheTitleId();

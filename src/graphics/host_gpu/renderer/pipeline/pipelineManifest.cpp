@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -1733,7 +1734,7 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop) {
 }
 
 void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
-                                        std::span<const uint32_t> back_code) {
+                                        std::span<const uint32_t> back_code, bool guest_traversal) {
 	auto&       state  = *m_manifest;
 	const auto& record = state.warm.modules[index];
 	const auto  start  = std::chrono::steady_clock::now();
@@ -1768,16 +1769,31 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		    BuildStageStaticKey(info, key.static_state);
 	    },
 	    input);
-	options.shader_hash     = key.hash;
-	options.user_data       = user_data;
-	options.back_code       = back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	// With native ray tracing on, dispatches look compute programs up as the compiler patches
+	// them, under their own keys (AppendNativeRayTracingKey()); unpatched, the manifest's would
+	// serve none, and each dispatch would translate its program and create its pipeline on the
+	// execution thread. The guest traversal serves the dispatches without a TLAS
+	// (GetComputeProgram()): `guest_traversal` builds that variant of a patched program.
+	const bool native = NativeRayTracing::PatchShaders() && !guest_traversal;
+	AppendNativeRayTracingKey(options.stage, key.static_state, native);
+	options.shader_hash        = key.hash;
+	options.user_data          = user_data;
+	options.back_code          = back_code;
+	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
+	options.native_ray_tracing = native;
+	options.ray_stats          = native && Config::RayTracingStatsEnabled();
 	// The SPIR-V of the module this thread builds (none for one another thread compiled).
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 
 	const auto finish = [&](const ShaderModule* module, bool built) {
+		if (guest_traversal) {
+			if (module != nullptr && module->info.stage == ShaderType::Compute) {
+				CreateManifestComputePipeline(*module, built ? spirv : std::vector<uint32_t> {});
+			}
+			return;
+		}
 		const auto elapsed =
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                              std::chrono::steady_clock::now() - start)
@@ -1807,6 +1823,10 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		state.available.notify_all();
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
 			CreateManifestComputePipeline(*module, built ? spirv : std::vector<uint32_t> {});
+		}
+		if (native && record.stage == ShaderType::Compute &&
+		    (module == nullptr || module->info.info.ray_query)) {
+			BuildManifestModule(index, code, back_code, true);
 		}
 	};
 	const ShaderModule* compiled = nullptr;
@@ -1983,11 +2003,6 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 	if (m_manifest == nullptr || m_manifest->record_path.empty()) {
 		return;
 	}
-	// A program the native ray tracing patched is a variant of this host: the manifest builds
-	// every program unpatched, so the record would build a program that was never this one.
-	if (module.info.info.ray_query) {
-		return;
-	}
 	ManifestModule record {.stage            = key.stage,
 	                       .code_hash        = key.hash,
 	                       .user_data_count  = key.user_data_count,
@@ -2006,7 +2021,14 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 		default: record.input = *options.input_info.vertex; break;
 	}
 	NormalizeManifestInput(record);
-	const auto       identity = ManifestModuleIdentity(record, key.static_state);
+	// A program the native ray tracing patches is recorded as asked for: the patch keeps the guest
+	// walk and adds no resources (device addresses only), so the record's specialization is the
+	// unpatched program's too. The manifest builds it as the host does, patched or not
+	// (BuildManifestModule()). Its identity is the manifest's, without this host's static key
+	// marks (AppendNativeRayTracingKey()), as the records loaded and built have it.
+	auto host = record;
+	SetHostInput(host);
+	const auto       identity = ManifestModuleIdentity(record, StaticKey(host));
 	auto&            state    = *m_manifest;
 	std::scoped_lock lock(state.mutex);
 	const auto [found, inserted] = state.module_index.try_emplace(

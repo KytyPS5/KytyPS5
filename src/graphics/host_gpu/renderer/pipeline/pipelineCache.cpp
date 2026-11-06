@@ -95,20 +95,6 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-// Compute programs compiled with the native ray tracing patching on (see RayTracingPatch.h: the
-// compiler patches the ones whose traversal loops it recognizes) differ from the stored software
-// ones: they get their own program keys. `native`: false for the program of a dispatch without
-// a TLAS (see PipelineCache::GetComputeProgram()).
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true) {
-	if (native && stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
-		key.push_back(0x52545041u);
-		// They count the rays they send back to the guest traversal (--rt-stats).
-		if (Config::RayTracingStatsEnabled()) {
-			key.push_back(0x52545354u);
-		}
-	}
-}
-
 // Whether the dispatch of a patched program reads a null TLAS header address from its flattened
 // SRT (ShaderInfo::ray_query_header_slots): it has nothing to trace with the host structures.
 bool ReadsNullTlas(const ShaderModule& module, const ShaderRecompiler::IR::ResourceSnapshot& resources) {
@@ -407,6 +393,16 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 }
 
 } // namespace
+
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
+	if (native && stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
+		key.push_back(0x52545041u);
+		// They count the rays they send back to the guest traversal (--rt-stats).
+		if (Config::RayTracingStatsEnabled()) {
+			key.push_back(0x52545354u);
+		}
+	}
+}
 
 std::string PipelineCacheTitleId() {
 	std::string title_id;

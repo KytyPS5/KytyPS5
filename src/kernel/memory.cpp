@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -896,6 +897,32 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+	SysFileRecoverableDestination probe = nullptr;
+	if (resources != nullptr) {
+		probe = [](const void* data, uint64_t size) {
+			if (g_virtual_ranges == nullptr) {
+				return false;
+			}
+			auto addr = reinterpret_cast<uint64_t>(data);
+			if (size > UINT64_MAX - addr) {
+				return false;
+			}
+			const auto end = addr + size;
+			while (addr < end) {
+				VirtualRanges::Range range {};
+				if (!g_virtual_ranges->Query(addr, 0, &range)) {
+					return false;
+				}
+				const auto next = std::min(end, range.start + range.size);
+				if ((range.protection & PROT_CPU_WRITE) == 0) {
+					return false;
+				}
+				addr = next;
+			}
+			return true;
+		};
+	}
+	SysFileSetRecoverableDestination(probe);
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {

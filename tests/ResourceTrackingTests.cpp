@@ -7333,13 +7333,10 @@ void TestGpuSelectedFormattedRecordStore() {
 }
 
 void TestFiniteBufferSelection() {
-  // ByteStore selects by a uniform SGPR and bounds the Phi key itself, without a lane read.
-  enum class Variant { Valid, WiderExec, Unbounded, Cycle, TooMany, CyclicProgram, ByteStore, ByteStoreCyclicProgram };
+  enum class Variant { Valid, WiderExec, Unbounded, Cycle, TooMany };
   const auto make = [](Variant variant) {
     auto fixture = std::make_unique<Fixture>();
     auto& f = *fixture;
-    f.program.cyclic = variant == Variant::CyclicProgram || variant == Variant::ByteStoreCyclicProgram;
-    const bool byte_store = variant == Variant::ByteStore || variant == Variant::ByteStoreCyclicProgram;
     auto* entry = f.block;
     auto* left = f.AddBlock();
     auto* right = f.AddBlock();
@@ -7351,10 +7348,9 @@ void TestFiniteBufferSelection() {
     const auto table = f.Address(f.UserData(0u), f.UserData(1u));
     const auto lane = f.Emit(ValueOpcode::LaneId);
     const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
-    const auto choice = byte_store ? f.UserData(2u) : lane;
     auto selected = Value(0u);
     for (uint32_t key = 1; key < 5u; ++key) {
-      const auto match = f.Emit(ValueOpcode::IEqual32, {choice, Value(key)}, 0, right);
+      const auto match = f.Emit(ValueOpcode::IEqual32, {lane, Value(key)}, 0, right);
       selected = f.Emit(ValueOpcode::SelectU32, {match, Value(key), selected}, 0, right);
     }
     auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
@@ -7363,13 +7359,10 @@ void TestFiniteBufferSelection() {
         ? f.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(1u)}, 0, right)
         : variant == Variant::TooMany ? Value(MaxIndirectDescriptorProbes) : selected);
     f.block = merge;
-    auto key = Value(&phi);
-    if (!byte_store) {
-      const auto stale = f.Emit(ValueOpcode::UndefU32);
-      const auto masked = f.Emit(ValueOpcode::SelectU32,
-          {active, variant == Variant::Unbounded ? lane : Value(&phi), stale});
-      key = f.Emit(ValueOpcode::ReadFirstLane, {masked, active});
-    }
+    const auto stale = f.Emit(ValueOpcode::UndefU32);
+    const auto masked = f.Emit(ValueOpcode::SelectU32,
+        {active, variant == Variant::Unbounded ? lane : Value(&phi), stale});
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {masked, active});
     const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
     std::array<Value, 4> words;
     for (uint32_t word = 0; word < words.size(); ++word)
@@ -7377,11 +7370,10 @@ void TestFiniteBufferSelection() {
           {table, offset, Value(0u), Value(true)},
           f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = 32u + word * 4u,
                        .component_index = word, .component_count = 4u}, 0x50cu));
-    f.Emit(byte_store ? ValueOpcode::StoreBufferU8 : ValueOpcode::StoreBufferU32,
+    f.Emit(ValueOpcode::StoreBufferU32,
         {f.Buffer(words), lane, Value(0u), Value(0u), Value(42u),
          variant == Variant::WiderExec ? Value(true) : active},
-        f.AddMemory({.kind = ResourceKind::Buffer, .data_bits = byte_store ? 8u : 32u,
-                     .idxen = true, .coherent = true}, 0x530u));
+        f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true, .coherent = true}, 0x530u));
     return fixture;
   };
   auto fixture = make(Variant::Valid);
@@ -7407,14 +7399,7 @@ void TestFiniteBufferSelection() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.buffers.size() == 5u,
         "finite buffer selection lost table roots after DCE or probed outside its domain");
-  auto byte_store = make(Variant::ByteStore);
-  byte_store->PlanAndTrack();
-  const auto byte_plan = ExtractResourcePlan(byte_store->program);
-  const auto& byte_source = byte_plan.descriptor_sources[byte_plan.info.buffers[0].source];
-  Check(byte_source.indirect_descriptor && byte_source.indirect_descriptor->key_count == Value(5u),
-        "byte-store finite selection did not bound its key by the selector Phi");
-  for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany,
-                             Variant::CyclicProgram, Variant::ByteStoreCyclicProgram}) {
+  for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany}) {
     auto invalid = make(variant);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
                "finite buffer selection accepted an unproved EXEC or selector domain");

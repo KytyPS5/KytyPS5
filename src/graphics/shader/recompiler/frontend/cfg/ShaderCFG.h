@@ -32,6 +32,17 @@ struct ConditionExpression {
 
 enum class TerminatorKind { Branch, ConditionalBranch, IndirectBranch, Return, Unsupported };
 
+enum class FailureKind {
+	None,
+	InvalidInput,
+	UnsupportedInstruction,
+	InvalidBranchTarget,
+	MissingFallthrough,
+	InvalidLabel,
+	IrreducibleControlFlow,
+	StructuredControlFlow
+};
+
 struct Terminator {
 	TerminatorKind        kind                   = TerminatorKind::Return;
 	BranchCondition       condition              = BranchCondition::Always;
@@ -75,15 +86,25 @@ struct NaturalLoop {
 	std::vector<uint32_t> body_blocks;
 };
 
+struct StronglyConnectedComponent {
+	std::vector<uint32_t> blocks;
+	std::vector<uint32_t> entry_blocks;
+	bool                  irreducible = false;
+};
+
 struct Graph {
-	std::vector<BasicBlock>          blocks;
-	std::vector<ConditionExpression> expressions;
-	std::vector<BackEdge>            back_edges;
-	std::vector<NaturalLoop>         natural_loops;
-	std::vector<uint32_t>            code_table_load_pcs;
-	uint32_t                         entry_block = UINT32_MAX;
-	bool                             unsupported = false;
-	std::string                      unsupported_reason;
+	std::vector<BasicBlock>                 blocks;
+	std::vector<ConditionExpression>        expressions;
+	std::vector<BackEdge>                   back_edges;
+	std::vector<NaturalLoop>                natural_loops;
+	std::vector<StronglyConnectedComponent> components;
+	std::vector<uint32_t>                   code_table_load_pcs;
+	uint32_t                                entry_block   = UINT32_MAX;
+	bool                                    irreducible   = false;
+	bool                                    unsupported   = false;
+	FailureKind                             failure_kind  = FailureKind::None;
+	uint32_t                                failure_block = UINT32_MAX;
+	std::string                             unsupported_reason;
 
 	const BasicBlock* FindBlock(uint32_t id) const;
 	BasicBlock*       FindBlock(uint32_t id);
@@ -101,8 +122,10 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
                                              uint32_t before, uint32_t code, uint32_t wave_size,
                                              std::vector<uint32_t>& crossed_calls);
 // Returns structured control flow or failure diagnostics without changing the native graph.
+// On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);
 std::string BranchConditionToString(BranchCondition condition);
+std::string FailureKindToString(FailureKind kind);
 std::string GraphToString(const Graph& graph);
 
 } // namespace Libs::Graphics::ShaderRecompiler::CFG

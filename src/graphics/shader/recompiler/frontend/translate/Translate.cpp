@@ -1022,8 +1022,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			EXIT("shader translation has unsupported stage %u",
 			     static_cast<uint32_t>(options.stage));
 	}
-	result.dispatcher_fallback = cfg.unsupported;
-	result.cyclic              = cfg.unsupported || !cfg.back_edges.empty();
+	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;

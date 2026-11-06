@@ -40,6 +40,23 @@ std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	return dump;
 }
 
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
+	const auto* block        = cfg.FindBlock(cfg.failure_block);
+	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
+	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
+	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
+	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
+	LOGF("ShaderRecompiler %s CFG dispatcher fallback: hash=0x%016" PRIx64
+	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
+	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
+	     " reason=%s\n",
+	     StageName(options.stage), options.shader_hash, phase,
+	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
+	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
+	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
+}
+
 enum class EmbeddedFetchValueType {
 	Unknown,
 	Constant,
@@ -758,30 +775,39 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG BuildGraph\n", stage,
 	     options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
+	CFG::Graph structured_cfg;
+	auto* selected_cfg = &native_cfg;
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG Structurize\n", stage,
-	     options.shader_hash);
-	auto structured_cfg = CFG::Structurize(native_cfg);
-	if (structured_cfg.unsupported) {
-		native_cfg.unsupported        = true;
-		native_cfg.unsupported_reason = std::move(structured_cfg.unsupported_reason);
-		LOGF("ShaderRecompiler %s CFG dispatcher fallback: hash=0x%016" PRIx64 " reason=%s\n",
-		     stage, options.shader_hash, native_cfg.unsupported_reason.c_str());
+	if (native_cfg.irreducible) {
+		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
-		LOGF("ShaderRecompiler %s structured CFG success: blocks=%" PRIu64 "\n", stage,
-		     static_cast<uint64_t>(structured_cfg.blocks.size()));
+		LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG Structurize\n", stage,
+		     options.shader_hash);
+		structured_cfg = CFG::Structurize(native_cfg);
+		if (structured_cfg.unsupported) {
+			native_cfg.unsupported = true;
+			native_cfg.failure_kind = structured_cfg.failure_kind;
+			native_cfg.failure_block = structured_cfg.failure_block;
+			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
+			LogDispatcherFallback(options, native_cfg, "structurize");
+		} else {
+			selected_cfg = &structured_cfg;
+			LOGF("ShaderRecompiler %s structured CFG success: blocks=%" PRIu64 "\n", stage,
+			     static_cast<uint64_t>(selected_cfg->blocks.size()));
+		}
+		LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+		     stage, options.shader_hash,
+		     static_cast<uint64_t>(selected_cfg->blocks.size()),
+		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
-	const auto& cfg = structured_cfg.unsupported ? native_cfg : structured_cfg;
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
-	     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash, static_cast<uint64_t>(cfg.blocks.size()),
-	     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
 
+	const auto& cfg = *selected_cfg;
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex->has_dynamic_vertex_fetch) {

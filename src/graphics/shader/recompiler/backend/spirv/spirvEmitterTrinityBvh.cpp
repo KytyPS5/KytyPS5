@@ -54,14 +54,7 @@ struct Bvh8Emitter {
 	Vec3 Unpack3(uint32_t value) {
 		return {Extract(f, value, 0), Extract(f, value, 1), Extract(f, value, 2)};
 	}
-	uint32_t Word(uint32_t block, uint32_t index) {
-		const auto offset = Unary(s, spv::OpUConvert, w, Shl(index, 2));
-		const auto address = Binary(s, spv::OpIAdd, w, block, offset);
-		const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
-		const auto id = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpLoad, u, id, pointer, spv::MemoryAccessAlignedMask, 4u);
-		return id;
-	}
+	uint32_t Word(uint32_t block, uint32_t index) { return BvhNodeWord(s, block, index); }
 	uint32_t Call(uint32_t type, uint32_t function, std::span<const uint32_t> args) {
 		const auto id = s.builder.AllocateId();
 		std::vector<uint32_t> call {spv::OpFunctionCall, type, id, function};
@@ -102,7 +95,7 @@ struct Bvh8Emitter {
 	void DefineTriangle() {
 		const auto a = Begin(triangle_function, "trinity_triangle", v4,
 		    std::array{w, u, u, u, v3, v3});
-		const auto block = a[0], slot = a[1], flags = a[2], descriptor = a[3];
+		const auto block = BvhNode(s, a[0]), slot = a[1], flags = a[2], descriptor = a[3];
 		const auto origin = Unpack3(a[4]), direction = Unpack3(a[5]);
 		const auto flag_word = Word(block, C(15));
 		const auto remap = Binary(s, spv::OpShiftRightLogical, u, flag_word, Shl(slot, 3));
@@ -204,7 +197,7 @@ void Bvh8Emitter::DefineBoxes() {
 	const auto result_type = s.builder.Type(spv::OpTypeStruct, v4, v4);
 	const auto a = Begin(boxes_function, "trinity_box_slot", result_type,
 	    std::array{w, w, b, b, u, u, f, v3, v3});
-	const auto first = a[0], second = a[1], full = a[2], compressed = a[3];
+	const auto first = BvhNode(s, a[0]), full = a[2], compressed = a[3];
 	const auto flags = a[4], descriptor = a[5], extent = a[6];
 	const auto org = Unpack3(a[7]), dir = Unpack3(a[8]);
 	const auto zero = ConstantF32Value(s, 0.0f), infinity = ConstantF32(s, 0x7f800000);
@@ -258,7 +251,8 @@ void Bvh8Emitter::DefineBoxes() {
 		} else if (encoding == 1) {
 			for (uint32_t component = 0; component < 6; ++component) {
 				const auto word = Add(C(4 + component), Binary(s, spv::OpIMul, u, child, C(6)));
-				const auto block = Select(s, w, Binary(s, spv::OpULessThan, b, word, C(16)), first, second);
+				const auto low = Binary(s, spv::OpULessThan, b, word, C(16));
+				const auto block = BvhNode(s, Select(s, w, low, a[0], a[1]));
 				bounds[component] = Float(Word(block, And(word, C(15))));
 			}
 		} else {
@@ -378,6 +372,7 @@ void Bvh8Emitter::DefineIntersect() {
 	};
 	const auto second = tail(address, first);
 	const auto available = Both(present(first), Either(Not(full), present(second)));
+	const auto block = BvhNode(s, first);
 	std::array<uint32_t, 10> invalid;
 	invalid.fill(C(~0u));
 	for (uint32_t slot = 0; slot < 2; ++slot) {
@@ -387,7 +382,7 @@ void Bvh8Emitter::DefineIntersect() {
 	}
 	const auto default_result = Result(invalid, org, dir, C(0));
 	const auto value = EmitValueOrDefaultIfCondition(s, Both(instance, available), result_type, default_result, [&] {
-		return Instance(first, flags, mask, org, dir);
+		return Instance(block, flags, mask, org, dir);
 	});
 	const auto result = EmitValueOrDefaultIfCondition(s, Both(Not(instance), valid), result_type, value, [&] {
 		const auto second_address = Binary(s, spv::OpIAdd, w, address, fetch_size);
@@ -405,7 +400,7 @@ void Bvh8Emitter::DefineIntersect() {
 					return Call(v4, triangle_function, std::array{first, C(slot), flags, d[3], a[5], a[6]});
 				});
 				for (uint32_t i = 0; i < 4; ++i) dst[slot * 4 + i] = Extract(u, hit, i);
-				dst[8 + slot] = EmitValueOrDefaultIfCondition(s, active, u, C(~0u), [&] { return Word(first, C(14)); });
+				dst[8 + slot] = EmitValueOrDefaultIfCondition(s, active, u, C(~0u), [&] { return Word(block, C(14)); });
 			}
 			return Result(dst, org, dir, C(0));
 		});

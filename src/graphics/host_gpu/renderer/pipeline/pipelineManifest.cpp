@@ -20,6 +20,8 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -1412,6 +1414,10 @@ struct PipelineCache::ManifestState {
 	std::vector<const ShaderModule*>   modules;          // By module record, once compiled.
 	std::vector<std::vector<uint32_t>> module_pipelines; // By module record.
 	std::vector<uint8_t>               missing_modules;  // By pipeline record.
+	// The place of each module record's program in the order of use (UseRank()).
+	std::vector<uint32_t>              module_rank;
+	// Both in the order of use, and after those the game used before, the rest: modules as they
+	// came, pipelines as QueuePipeline() says.
 	std::deque<uint32_t>               module_jobs;
 	std::deque<uint32_t>               pipeline_jobs;
 	std::condition_variable_any        available;
@@ -1433,10 +1439,178 @@ struct PipelineCache::ManifestState {
 
 	std::vector<std::jthread> threads;
 	std::jthread              saver;
+
+	// Queues a module whose code is there: after those the game used before it.
+	void QueueModule(uint32_t index) {
+		module_jobs.insert(std::upper_bound(module_jobs.begin(), module_jobs.end(), module_rank[index],
+		                                    [this](uint32_t value, uint32_t job) {
+			                                    return value < module_rank[job];
+		                                    }),
+		                   index);
+	}
+
+	// The place of a graphics pipeline in the order of use: that of the last of its shaders the
+	// game used, or NoRank when it did not use them all.
+	[[nodiscard]] uint32_t PipelineRank(uint32_t index) const {
+		uint32_t rank = 0;
+		for (const auto stage: warm.pipelines[index].stages) {
+			if (stage != ManifestPipeline::NoStage) {
+				rank = std::max(rank, module_rank[stage]);
+			}
+		}
+		return rank;
+	}
+
+	// Queues a graphics pipeline whose modules are built: those of the shaders the game used
+	// before in its order, then the largest first (by their SPIR-V, which the driver's time
+	// follows): one left for the end would keep a thread busy alone.
+	void QueuePipeline(uint32_t index) {
+		const auto words = [this](uint32_t pipeline) {
+			uint64_t total = 0;
+			for (const auto stage: warm.pipelines[pipeline].stages) {
+				if (stage != ManifestPipeline::NoStage && modules[stage] != nullptr) {
+					total += modules[stage]->spirv_words;
+				}
+			}
+			return total;
+		};
+		const auto key = std::pair {PipelineRank(index), words(index)};
+		pipeline_jobs.insert(
+		    std::upper_bound(pipeline_jobs.begin(), pipeline_jobs.end(), key,
+		                     [&](const std::pair<uint32_t, uint64_t>& value, uint32_t job) {
+			                     const auto rank = PipelineRank(job);
+			                     return value.first != rank ? value.first < rank
+			                                                : value.second > words(job);
+		                     }),
+		    index);
+	}
 };
 
 void PipelineCache::ManifestStateDeleter::operator()(ManifestState* state) const {
 	delete state;
+}
+
+// The file: a header line, then a line "S" where a session begins and one line per program the
+// session used for the first time, its hash, in the order of use. Sessions only append to it.
+struct PipelineCache::UseOrder {
+	static constexpr std::string_view Header  = "# kyty shader use order v1";
+	// A file this long is written again as one session.
+	static constexpr uintmax_t        MaxSize = 4u << 20u;
+
+	// Earlier sessions, immutable once loaded.
+	std::unordered_map<uint64_t, uint32_t> rank;
+
+	std::filesystem::path        path;
+	std::mutex                   mutex;
+	// This session: the programs noted, and their lines not written yet.
+	std::unordered_set<uint64_t> noted;
+	std::string                  pending;
+	bool                         session_started = false;
+	std::jthread                 writer;
+
+	void Write() {
+		std::string lines;
+		{
+			std::scoped_lock lock(mutex);
+			lines.swap(pending);
+		}
+		if (lines.empty()) {
+			return;
+		}
+		Common::File::CreateDirectories(path.parent_path());
+		std::ofstream file(path, std::ios::binary | std::ios::app);
+		if (!session_started) {
+			if (file.tellp() == std::streampos(0)) {
+				file << Header << '\n';
+			}
+			file << "S\n";
+			session_started = true;
+		}
+		file << lines;
+	}
+};
+
+void PipelineCache::UseOrderDeleter::operator()(UseOrder* order) const {
+	order->writer = {};
+	delete order;
+}
+
+void PipelineCache::OpenUseOrder(const std::filesystem::path& path) {
+	m_use_order.reset(new UseOrder());
+	auto& order = *m_use_order;
+	order.path  = path;
+	// The last session first: the game most likely goes on where it was.
+	std::vector<std::vector<uint64_t>> sessions;
+	const auto                         bytes = ReadFile(path);
+	const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+	for (const auto line: Split(text, '\n')) {
+		if (line == "S") {
+			sessions.emplace_back();
+		} else if (uint64_t hash = 0;
+		           !sessions.empty() && line.size() == 16 && ParseNumber(line, hash, 16)) {
+			sessions.back().push_back(hash);
+		}
+	}
+	std::vector<uint64_t> programs;
+	for (const auto& session: sessions | std::views::reverse) {
+		for (const auto hash: session) {
+			if (order.rank.try_emplace(hash, static_cast<uint32_t>(programs.size())).second) {
+				programs.push_back(hash);
+			}
+		}
+	}
+	if (bytes.size() > UseOrder::MaxSize) {
+		std::string out = fmt::format("{}\nS\n", UseOrder::Header);
+		for (const auto hash: programs) {
+			out += fmt::format("{:016x}\n", hash);
+		}
+		auto temporary = path;
+		temporary += ".tmp";
+		{
+			std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+			file << out;
+		}
+		std::error_code error;
+		std::filesystem::rename(temporary, path, error);
+	}
+	if (!programs.empty()) {
+		ManifestLog("Pipeline manifest: the {} shaders used in {} earlier sessions go first ({})",
+		            programs.size(), sessions.size(), Common::PathToString(path));
+	}
+	order.writer = std::jthread([&order](const std::stop_token& stop) {
+		constexpr auto Period = std::chrono::seconds(2);
+		auto           next   = std::chrono::steady_clock::now() + Period;
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (std::chrono::steady_clock::now() >= next) {
+				order.Write();
+				next = std::chrono::steady_clock::now() + Period;
+			}
+		}
+		order.Write();
+	});
+}
+
+void PipelineCache::NoteUse(Pipeline& pipeline, std::span<const ShaderModule* const> stages) {
+	pipeline.use_noted = true;
+	if (m_use_order == nullptr) {
+		return;
+	}
+	auto&            order = *m_use_order;
+	std::scoped_lock lock(order.mutex);
+	for (const auto* stage: stages) {
+		if (stage != nullptr && order.noted.insert(stage->info.shader_hash).second) {
+			order.pending += fmt::format("{:016x}\n", stage->info.shader_hash);
+		}
+	}
+}
+
+uint32_t PipelineCache::UseRank(uint64_t program_hash) const {
+	if (m_use_order == nullptr) {
+		return PipelineHelpers::NoRank;
+	}
+	const auto found = m_use_order->rank.find(program_hash);
+	return found != m_use_order->rank.end() ? found->second : PipelineHelpers::NoRank;
 }
 
 void PipelineCache::SetHostInput(ManifestModule& module) const {
@@ -1486,7 +1660,9 @@ void PipelineCache::OpenManifest() {
 	}
 	std::string version;
 	Loader::SystemContentParamSfoGetString("APP_VER", &version);
-	const auto name = SafeFileName(version.empty() ? title : title + "_" + version) + ".kpm";
+	const auto stem = SafeFileName(version.empty() ? title : title + "_" + version);
+	const auto name = stem + ".kpm";
+	OpenUseOrder(std::filesystem::path("_PipelineCache") / (stem + ".use"));
 	// The manifests built with the emulator, then the one this computer records.
 	std::vector<std::filesystem::path> folders;
 	if (const char* base = SDL_GetBasePath(); base != nullptr) {
@@ -1600,6 +1776,10 @@ void PipelineCache::OpenManifest() {
 	}
 	const auto module_count = state.warm.modules.size();
 	state.missing_code.assign(module_count, 0);
+	state.module_rank.resize(module_count);
+	for (uint32_t i = 0; i < module_count; i++) {
+		state.module_rank[i] = UseRank(state.warm.modules[i].ProgramHash());
+	}
 	state.modules.assign(module_count, nullptr);
 	state.module_pipelines.assign(module_count, {});
 	state.missing_modules.assign(state.warm.pipelines.size(), 0);
@@ -1672,7 +1852,7 @@ void PipelineCache::OnShaderMapped(void* userdata, uint64_t hash, std::span<cons
 		entry.mapped = true;
 		for (const auto index: entry.waiting) {
 			if (--state.missing_code[index] == 0) {
-				state.module_jobs.push_back(index);
+				state.QueueModule(index);
 			}
 		}
 		entry.waiting     = {};
@@ -1692,13 +1872,17 @@ void PipelineCache::ManifestWorker(const std::stop_token& stop) {
 		bool                                         pipeline = false;
 		{
 			std::unique_lock lock(state.mutex);
-			// Pipelines first: their modules are ready, and they are what stalls a draw.
+			// What the game used first before goes first. Otherwise pipelines first: their
+			// modules are ready, and they are what stalls a draw.
 			if (!state.available.wait(lock, stop, [&] {
 				    return !state.pipeline_jobs.empty() || !state.module_jobs.empty();
 			    })) {
 				return;
 			}
-			pipeline   = !state.pipeline_jobs.empty();
+			pipeline = !state.pipeline_jobs.empty() &&
+			           (state.module_jobs.empty() ||
+			            state.PipelineRank(state.pipeline_jobs.front()) <=
+			                state.module_rank[state.module_jobs.front()]);
 			auto& jobs = pipeline ? state.pipeline_jobs : state.module_jobs;
 			index      = jobs.front();
 			jobs.pop_front();
@@ -1816,7 +2000,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 					state.missing_modules[pipeline] = UINT8_MAX;
 				} else if (state.missing_modules[pipeline] != UINT8_MAX &&
 				           --state.missing_modules[pipeline] == 0) {
-					state.pipeline_jobs.push_back(pipeline);
+					state.QueuePipeline(pipeline);
 				}
 			}
 		}

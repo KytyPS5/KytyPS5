@@ -45,9 +45,12 @@ public:
 	~PipelineHelpers();
 	KYTY_CLASS_NO_COPY(PipelineHelpers);
 
-	// Queues the compute pipeline of `module` (EncodeComputeModule()); jobs are sent in order,
-	// urgent ones (a dispatch will want them soon) before the others.
-	void Queue(uint64_t ticket, std::vector<uint8_t>&& module, bool urgent);
+	// A job without a place in the order of use (see PipelineCache::UseOrder).
+	static constexpr uint32_t NoRank = UINT32_MAX;
+	// Queues the compute pipeline of `module` (EncodeComputeModule()); jobs are sent in order:
+	// urgent ones (a dispatch will want them soon), then those of the shaders the game used in
+	// earlier sessions, in the order it first used them (`rank`), then the others.
+	void Queue(uint64_t ticket, std::vector<uint8_t>&& module, bool urgent, uint32_t rank = NoRank);
 	// Takes back a job no helper was sent yet; false when there is none (sent, or done).
 	bool Withdraw(uint64_t ticket);
 	// Writes the counts to the log.

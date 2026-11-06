@@ -365,6 +365,8 @@ public:
 		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Its shaders are in the title's order of use (NoteUse()).
+		bool                    use_noted             = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -651,6 +653,23 @@ private:
 	    uint32_t push_data_cursor) const;
 	void ManifestProgress(bool force);
 	void SaveManifestRecording();
+
+	// pipelineManifest.cpp: the order in which the title first used its shaders in earlier
+	// sessions on this computer (<title>_<version>.use next to its recorded manifest). A title maps
+	// far more shaders than it uses soon (Demon's Souls maps thousands while it boots, and its
+	// manifest lists them all), and with a cold driver cache the driver takes minutes to compile
+	// their pipelines: those the game used before are compiled first, in the order it used them.
+	struct UseOrder;
+	struct UseOrderDeleter {
+		void operator()(UseOrder* order) const;
+	};
+	std::unique_ptr<UseOrder, UseOrderDeleter> m_use_order;
+	void OpenUseOrder(const std::filesystem::path& path);
+	// The threads that run the game's GPU work: a pipeline is used for the first time.
+	void NoteUse(Pipeline& pipeline, std::span<const ShaderModule* const> stages);
+	// The place of a program (by its hash) in the order of use; PipelineHelpers::NoRank when no
+	// earlier session used it.
+	[[nodiscard]] uint32_t UseRank(uint64_t program_hash) const;
 };
 
 // Compute programs compiled with native ray tracing on (see IR::TraceNativeTraversals: the

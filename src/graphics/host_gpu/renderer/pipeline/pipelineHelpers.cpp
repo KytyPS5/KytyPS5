@@ -233,6 +233,8 @@ struct PipelineHelpers::Impl {
 	struct Job {
 		uint64_t             ticket = 0;
 		std::vector<uint8_t> module;
+		bool                 urgent = false;
+		uint32_t             rank   = NoRank;
 	};
 	struct Helper {
 		uint32_t                     number    = 0;
@@ -636,13 +638,24 @@ std::unique_ptr<PipelineHelpers> PipelineHelpers::Start(const GraphicContext& gr
 	return std::unique_ptr<PipelineHelpers>(new PipelineHelpers(std::move(impl)));
 }
 
-void PipelineHelpers::Queue(uint64_t ticket, std::vector<uint8_t>&& module, bool urgent) {
+void PipelineHelpers::Queue(uint64_t ticket, std::vector<uint8_t>&& module, bool urgent,
+                            uint32_t rank) {
 	{
 		std::scoped_lock lock(m_impl->mutex);
+		auto&            queue = m_impl->queue;
 		if (urgent) {
-			m_impl->queue.push_front({.ticket = ticket, .module = std::move(module)});
+			queue.push_front({.ticket = ticket, .module = std::move(module), .urgent = true});
 		} else {
-			m_impl->queue.push_back({.ticket = ticket, .module = std::move(module)});
+			// After the urgent jobs, those the game used before, in its order: they are what it
+			// waits for first. Then the largest first: the driver's time follows the size of the
+			// SPIR-V closely, from ~1 s to minutes (GTA V's 0b41af19). Started last, a long one keeps
+			// one helper busy alone at the end while the others are done.
+			const auto size  = module.size();
+			const auto first = std::ranges::find_if(queue, [](const Impl::Job& job) { return !job.urgent; });
+			const auto at    = std::upper_bound(first, queue.end(), rank, [&](uint32_t value, const Impl::Job& job) {
+                return value != job.rank ? value < job.rank : size > job.module.size();
+            });
+			queue.insert(at, {.ticket = ticket, .module = std::move(module), .rank = rank});
 		}
 		m_impl->queued++;
 		m_impl->logged_done = UINT64_MAX;
@@ -845,7 +858,8 @@ std::unique_ptr<PipelineHelpers> PipelineHelpers::Start(const GraphicContext& /*
 	return nullptr;
 }
 
-void PipelineHelpers::Queue(uint64_t /*ticket*/, std::vector<uint8_t>&& /*module*/, bool /*urgent*/) {}
+void PipelineHelpers::Queue(uint64_t /*ticket*/, std::vector<uint8_t>&& /*module*/, bool /*urgent*/,
+                            uint32_t /*rank*/) {}
 
 bool PipelineHelpers::Withdraw(uint64_t /*ticket*/) {
 	return false;

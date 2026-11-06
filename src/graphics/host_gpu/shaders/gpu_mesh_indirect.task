@@ -1,0 +1,61 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// One workgroup per indirect record of a mesh draw: it launches the record's groups, instances
+// along y, and passes the record's draw parameters to the mesh shader in the payload
+// (IR::PushData::MeshTaskPayloadDwordCount).
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Record {
+	uint dwords[5];
+};
+// MeshTaskParams in renderDraw.cpp.
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Params {
+	uint64_t records;
+	uint64_t index_address;
+	uint     stride;
+	uint     index_size;
+	uint     index_limit;
+	uint     primitive_size;
+	uint     group_step;
+	uint     max_groups;
+	uint     max_instances;
+	uint     max_total;
+};
+layout(push_constant) uniform Push {
+	Params params;
+};
+
+taskPayloadSharedEXT uint payload[6];
+
+void main() {
+	Record   record        = Record(params.records + uint64_t(gl_WorkGroupID.x) * params.stride);
+	uint     count         = record.dwords[0];
+	uint     instances     = record.dwords[1];
+	uint64_t index_address = params.index_address;
+	// The base vertex and first instance follow the first index in indexed records.
+	uint base = 2;
+	if (params.index_size != 0) {
+		// Indices past INDEX_BUFFER_SIZE are never read.
+		const uint first = record.dwords[2];
+		count = min(count, params.index_limit - min(first, params.index_limit));
+		index_address += uint64_t(first) * params.index_size;
+		base = 3;
+	}
+	payload[0] = count;
+	payload[1] = record.dwords[base];
+	payload[2] = params.index_size;
+	payload[3] = uint(index_address);
+	payload[4] = uint(index_address >> 32);
+	payload[5] = record.dwords[base + 1];
+	uint groups =
+	    count < params.primitive_size ? 0 : (count - params.primitive_size) / params.group_step + 1;
+	// Past the host launch limits, where direct draws exit, the record draws nothing.
+	if (groups > params.max_groups || instances > params.max_instances ||
+	    uint64_t(groups) * instances > params.max_total) {
+		groups = 0;
+	}
+	EmitMeshTasksEXT(groups, instances, 1);
+}

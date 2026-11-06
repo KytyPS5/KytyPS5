@@ -122,7 +122,9 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x18u, Opcode::S_CBRANCH_CDBGUSER},
     {0x19u, Opcode::S_CBRANCH_CDBGSYS_OR_USER},
     {0x1au, Opcode::S_CBRANCH_CDBGSYS_AND_USER},
+    {0x1eu, Opcode::S_ENDPGM}, // s_endpgm_ordered_ps_done
     {0x20u, Opcode::S_INST_PREFETCH},
+    {0x21u, Opcode::S_CLAUSE},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
 };
 

@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -139,7 +140,6 @@ const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "vertex";
 		case ShaderType::Pixel: return "pixel";
-		case ShaderType::Fetch: return "fetch";
 		case ShaderType::Compute: return "compute";
 		default: return "unknown";
 	}
@@ -163,7 +163,7 @@ public:
 	bool Excludes(Value condition, bool positive) {
 		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
 			m_incoming = m_induction.PhiBlock(incoming);
-			m_values[1].clear();
+			m_current  = 1u + incoming;
 			if (Evaluate(condition, true) != (positive ? 0u : 1u)) return false;
 		}
 		return true;
@@ -298,7 +298,7 @@ private:
 		}
 		const auto* inst = value.TryInstruction();
 		if (current && m_exclude_bound && inst == &m_bound) return 0u;
-		auto& values = m_values[current];
+		auto& values = m_values[current ? m_current : 0u];
 		if (const auto found = values.find(inst); found != values.end()) {
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
 			return found->second;
@@ -362,11 +362,13 @@ private:
 	const Inst& m_induction;
 	const Inst& m_bound;
 	const Block* m_incoming = nullptr;
+	uint32_t m_current = 1;
 	uint32_t m_variables = 0;
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
-	std::array<std::map<const Inst*, uint32_t>, 2> m_values;
+	// Previous-iteration values, then current ones per incoming edge, kept across conditions.
+	std::array<std::map<const Inst*, uint32_t>, 3> m_values;
 	std::map<std::array<uint32_t, 3>, uint32_t> m_nodes_by_key;
 	std::map<std::array<uint32_t, 3>, uint32_t> m_choices;
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
@@ -383,6 +385,7 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
+		m_info.address_bases.clear();
 		m_info.uses_dma = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
@@ -401,7 +404,6 @@ public:
 				Collect(inst);
 			}
 		}
-		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -1623,6 +1625,13 @@ private:
 			else return nullptr;
 			read = ActiveValue(value, active).TryInstruction();
 		}
+		if (read != nullptr && read->GetOpcode() == ValueOpcode::SMax32) {
+			if (read->Arg(1).Resolve() == Value(0u)) value = read->Arg(0);
+			else if (read->Arg(0).Resolve() == Value(0u)) value = read->Arg(1);
+			else return nullptr;
+			selector.non_negative = true;
+			read = ActiveValue(value, active).TryInstruction();
+		}
 		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitFieldUExtract) {
 			uint32_t width;
 			if (!ImmediateU32(read->Arg(1), selector.bit_offset) ||
@@ -1660,7 +1669,7 @@ private:
 
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
-	                                DescriptorSource& material_source, bool indexed) {
+	                                DescriptorSource& material_source, bool indexed, bool heap = false) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
@@ -1668,17 +1677,25 @@ private:
 		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
 		if (indexed) {
 			read = IndexedMaterialRead(read, active, selector);
-			// Bounded heaps fall back when the material aliases a written buffer; pointer
-			// tables rely on the renderer's specialization-read alias check. Other stages
-			// and unbounded/image writes keep the original domain.
+			// Bounded heaps keep their full domain when the material may alias a write: written
+			// buffers are checked at dispatch, storage images and address writes here. Pointer
+			// tables have no such domain, so a key that a same-dispatch write changes selects
+			// the root descriptor. Other stages keep the original domain.
 			if (read == nullptr || m_program.stage != ShaderType::Compute ||
-			    std::ranges::any_of(m_program.blocks, [](const Block* block) {
+			    (heap && std::ranges::any_of(m_program.blocks, [](const Block* block) {
 				    return std::ranges::any_of(*block, [](const Inst& inst) {
 					    const auto op = inst.GetOpcode();
 					    return ImageOpcodeInfoOf(op).resource_class == ImageResourceClass::Storage ||
 					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
 				    });
-			    }) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			    })) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			// The record index is assumed not to wrap U32; an affine one then reaches only
+			// records offset + k * stride.
+			AffineOffset row;
+			if (MatchAffineOffset(read->Arg(1), active, row) && row.stride != 0u) {
+				selector.first_record = static_cast<uint32_t>(row.offset);
+				selector.record_step = static_cast<uint32_t>(row.stride);
+			}
 			selector.source = InternSource(material_source);
 			indirect.selector = std::move(selector);
 			return true;
@@ -1790,12 +1807,17 @@ private:
 				return edge.positive && (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
 				       Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
-			LoopBoundProof proof(m_program, *phi, *compare);
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
-				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare;
+			const auto [found, inserted] = m_loop_proofs.try_emplace(compare);
+			if (inserted) {
+				LoopBoundProof proof(m_program, *phi, *compare);
+				found->second =
+				    GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
+					    return proof.Excludes(edge.condition, edge.positive);
+				    });
+			}
+			if (found->second) return compare;
 		}
 		return {};
 	}
@@ -2140,9 +2162,10 @@ private:
 			if (candidate.IsEmpty()) candidate = UnsignedBoundOnEntry(key, access.Parent(), false, active);
 			if (candidate.IsEmpty()) {
 				// A waterfall key inherits the local value's bound only where this same
-				// EXEC predicate proves both their equality and the local range.
+				// EXEC predicate proves both their equality and the local range. Otherwise
+				// the key itself is bounded, with this predicate witnessing its own !(A & Q).
 				const auto local = EqualLocalKey(active, key);
-				if (!local.IsEmpty()) candidate = UnsignedBound(active, local, true, false, active);
+				candidate = UnsignedBound(active, local.IsEmpty() ? key : local, true, false, active);
 			}
 			if (candidate.IsEmpty() ||
 			    !ValidateRuntimeValue(m_program, candidate, RuntimeValueType::Integer)) return {};
@@ -3236,7 +3259,7 @@ private:
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
 		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
-		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true)) {
+		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true, true)) {
 			// Preserve the heap's byte-offset key so runtime geometry can choose the
 			// tighter selector domain without changing the GPU's descriptor reads.
 			indirect.table_scalar = true;
@@ -3759,6 +3782,11 @@ private:
 				if (result <= UINT32_MAX) return static_cast<uint32_t>(result);
 				break;
 			}
+			case ValueOpcode::IMul32: {
+				const auto result = uint64_t {maximum(0)} * maximum(1);
+				if (result <= UINT32_MAX) return static_cast<uint32_t>(result);
+				break;
+			}
 			case ValueOpcode::ShiftRightLogical32:
 			case ValueOpcode::ShiftLeftLogical32: {
 				uint32_t shift;
@@ -3946,6 +3974,8 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		// Earlier proofs predate rewrites and erasures; planning only adds instructions.
+		m_loop_proofs.clear();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
@@ -4080,6 +4110,7 @@ private:
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
+				image.cube |= memory.image_cube;
 				Merge(image, op, pc);
 				return i;
 			}
@@ -4095,6 +4126,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.cube           = memory.image_cube;
 		image.atomic64       = atomic64;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
@@ -4255,7 +4287,7 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					Fail(flags.pc, "scratch operation requires a nonzero per-thread scratch size");
 				}
 				return;
 			}
@@ -4263,6 +4295,18 @@ private:
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 			}
+			handle = inst.Arg(0).Resolve().TryInstruction();
+			std::array<uint32_t, 2> base {};
+			for (uint32_t word = 0; word < base.size(); ++word) {
+				const auto* read = handle->Arg(word).Resolve().TryInstruction();
+				base[word]       = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst
+				                       ? read->Arg(1).Resolve().U32()
+				                       : UINT32_MAX;
+			}
+			auto& bases = m_info.address_bases;
+			if (std::ranges::max(base) != UINT32_MAX &&
+			    std::ranges::find(bases, base) == bases.end())
+				bases.push_back(base);
 			m_info.uses_dma = true;
 			return;
 		}
@@ -4319,31 +4363,6 @@ private:
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
 	}
 
-	void LinkImageAliases() {
-		for (auto& buffer: m_info.buffers) {
-			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
-				continue;
-			}
-			for (uint32_t image = 0; image < m_info.images.size(); image++) {
-				const auto* image_source = Source(m_info.images[image].source);
-				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_descriptor.has_value()) {
-					continue;
-				}
-				bool alias = true;
-				for (uint32_t dword = 0; dword < 4; dword++) {
-					alias = alias && EquivalentValue(m_program, buffer_source->dwords[dword],
-					                                 image_source->dwords[dword]);
-				}
-				if (alias) {
-					buffer.image_alias = image;
-					break;
-				}
-			}
-		}
-	}
-
 	Program&                                   m_program;
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
@@ -4360,6 +4379,7 @@ private:
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
+	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
 	bool                                       m_shader_writes = false;
 };
 

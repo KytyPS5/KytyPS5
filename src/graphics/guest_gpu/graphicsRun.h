@@ -51,14 +51,13 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
 
 	struct Submission {
-		SubmissionType            type     = SubmissionType::Graphics;
+		SubmissionType            type     = SubmissionType::Commands;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
-		bool                      started         = false;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 	};
@@ -90,8 +89,7 @@ private:
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
-	uint64_t        m_submit_id = 0;
-	std::atomic_int m_done_num  = 0;
+	std::atomic_int m_done_num = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

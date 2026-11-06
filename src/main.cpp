@@ -1,11 +1,8 @@
 #include "common/archive.h"
 #include "common/common.h"
-#include "common/dateTime.h"
-#include "common/debug.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -15,34 +12,15 @@
 #include <filesystem>
 #include <string_view>
 #include <vector>
-#include <fmt/format.h>
 #include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;
 
-static std::string GetBuildString() {
-	Date date = Date::FromMacros(std::string(__DATE__));
-
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	std::string type = "Debug";
-#elif KYTY_BUILD == KYTY_BUILD_RELEASE
-	std::string type = "Release";
-#else
-	std::string type = "????";
-#endif
-
-	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
-
-	std::string str =
-	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
-	                KYTY_VERSION, KYTY_GIT_VERSION, date.ToString().c_str());
-
-	return str;
-}
-
 static void PrintUsage() {
-	::printf("%s\n", GetBuildString().c_str());
+	::printf("%s, %s, ver = %s, git = %s, date = %s\n",
+	         KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release", KYTY_TOOLCHAIN, KYTY_VERSION,
+	         KYTY_GIT_VERSION, __DATE__);
 	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
@@ -77,6 +55,7 @@ static void PrintUsage() {
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
 	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
@@ -88,7 +67,7 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
-	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
+	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -209,6 +188,7 @@ static constexpr Flag FLAGS[] = {
     {"--vr", &ConfigOptions::vr_enabled},
     {"--trinity", &ConfigOptions::pro_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
+    {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
@@ -217,6 +197,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
@@ -400,11 +381,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
-		} else if (arg == "--shader-optimization-type") {
-			if (!ParseEnum(value, options.config.shader_optimization_type)) {
-				::printf("invalid shader optimization type: %s\n", value.c_str());
-				return false;
-			}
 		} else if (arg == "--shader-log-direction") {
 			if (!ParseEnum(value, options.config.shader_log_direction)) {
 				::printf("invalid shader log direction: %s\n", value.c_str());
@@ -442,7 +418,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
-	VirtualMemory::Init();
 	InitializeThreads();
 
 	RunOptions options;

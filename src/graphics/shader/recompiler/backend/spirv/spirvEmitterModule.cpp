@@ -159,6 +159,11 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
 
+uint32_t TypePhysicalU32BufferPointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+	                   StorageBufferType(state, state.storage_buffers[2]));
+}
+
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPushConstant, TypeU32(state));
 }
@@ -734,6 +739,13 @@ void DefineModule(EmitterState& state) {
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
+		if (state.input_info.vertex->indirect_draw) {
+			// The task shader's payload (gpu_mesh_indirect.task).
+			const auto count   = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
+			state.mesh_payload = DefineInterfaceVariable(
+			    state, state.builder.Type(spv::OpTypeArray, TypeU32(state), count),
+			    spv::StorageClassTaskPayloadWorkgroupEXT, "payload");
+		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {

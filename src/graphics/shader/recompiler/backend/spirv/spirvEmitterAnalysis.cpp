@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
@@ -66,10 +68,10 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 	std::abort();
 }
 
-uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
-                                  uint32_t variable_id, uint32_t array_index,
-                                  IR::DescriptorBindingKind kind, uint32_t resource,
-                                  const char* variable_name) {
+static uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
+                                         uint32_t variable_id, uint32_t array_index,
+                                         IR::DescriptorBindingKind kind, uint32_t resource,
+                                         const char* variable_name) {
 	if (variable_id == 0) {
 		ExitDescriptorBindingFailure(state, kind, resource, variable_name);
 	}
@@ -127,10 +129,6 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	} else {
 		EXIT("invalid image resource class");
 	}
-	if (image.dimension == ImageDimension::Dim1D || image.dimension == ImageDimension::Dim1DArray) {
-		state.builder.RequireCapability(sampled == 1 ? spv::CapabilitySampled1D
-		                                             : spv::CapabilityImage1D);
-	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
 	if (sampled == 2 && info.multisampled != 0u) {
 		state.builder.RequireCapability(spv::CapabilityStorageImageMultisample);
@@ -143,12 +141,8 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
-	switch (ImageDimensionInfoFor(dimension).coordinate_components) {
-		case 1u: return TypeU32(state);
-		case 2u: return TypeU32Vector(state, 2);
-		case 3u: return TypeU32Vector(state, 3);
-		default: return 0;
-	}
+	const auto& info = ImageDimensionInfoFor(dimension);
+	return TypeU32Vector(state, info.coordinate_components + (info.one_dimensional ? 1u : 0u));
 }
 
 namespace {

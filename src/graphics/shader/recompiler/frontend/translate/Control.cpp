@@ -14,12 +14,6 @@ bool IsExecOrVcc(const Decoder::Operand& operand) {
 	}
 }
 
-Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
-	Decoder::Operand operand;
-	operand.kind = kind;
-	return operand;
-}
-
 } // namespace
 
 void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) {
@@ -429,7 +423,13 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto value = ReadU32(inst.src0);
 	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                 IR::U32(IR::Value(0xffu)));
+	// Between its first lane write and last lane read a VGPR holds spilled SGPRs, which no
+	// indexed register tuple overlaps, so the first such VGPR above the base ends the tuple.
 	for (uint32_t index = base; index < current_vector_limit; index++) {
+		const auto [first_write, last_read] = lane_spills[index];
+		if (index != base && first_write < current_pc && current_pc < last_read) {
+			break;
+		}
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);

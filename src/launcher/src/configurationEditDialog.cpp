@@ -314,6 +314,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_pro->setChecked(info.pro_enabled);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -322,7 +323,6 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
-	// ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
@@ -546,11 +546,10 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 	info.pro_enabled               = ui.checkBox_pro->isChecked();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
-	// info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
-	//     ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();

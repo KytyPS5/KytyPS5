@@ -121,6 +121,10 @@ bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
 
+bool GuestTscEnabled() {
+	return g_config->guest_tsc_enabled;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
@@ -147,10 +151,6 @@ bool ShaderValidationEnabled() {
 
 bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
-}
-
-ShaderOptimizationType GetShaderOptimizationType() {
-	return g_config->shader_optimization_type;
 }
 
 LogDirection GetShaderLogDirection() {
@@ -215,6 +215,10 @@ bool TessellationEnabled() {
 
 bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
+}
+
+bool LodStatsEnabled() {
+	return g_config->lod_stats_enabled;
 }
 
 bool TrophyEnabled() {

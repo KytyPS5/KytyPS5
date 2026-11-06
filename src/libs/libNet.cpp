@@ -202,7 +202,7 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 }
 
 int KYTY_SYSV_ABI NetSendto(int s, const void* buf, size_t len, int flags, const void* addr,
-                         uint32_t addrlen) {
+                            uint32_t addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
 	return FinishSocketCall(
 	    static_cast<int>(Net::Sendto(s, buf, size, flags | 0x20000, addr, addrlen)));
@@ -218,7 +218,7 @@ int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
 }
 
 int KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, size_t len, int flags, void* addr,
-                               uint32_t* addrlen) {
+                              uint32_t* addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
 	return FinishSocketCall(static_cast<int>(Net::Recvfrom(s, buf, size, flags, addr, addrlen)));
 }
@@ -670,8 +670,10 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		}
 	}
 
-	const bool with_username = (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
-	const bool with_password = (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
+	const bool with_username =
+	    (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
+	const bool with_password =
+	    (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
 	if (with_username) {
 		uri.append(src_element->username);
 	}
@@ -969,7 +971,8 @@ static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int lib_http2_ctx_id, Http2MemoryPoolStats* stats) {
+static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int                   lib_http2_ctx_id,
+                                                 Http2MemoryPoolStats* stats) {
 	PRINT_NAME();
 
 	if (stats == nullptr) {
@@ -1504,6 +1507,21 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	return 0;
 }
 
+static int KYTY_SYSV_ABI Http2AbortRequest(int req_id) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d\n", req_id);
+
+	// Requests stop at the send step here, so an abort has nothing to cancel. It still
+	// reports the same thing the library does: unknown ids fail, known ones succeed.
+	auto request = g_http2_requests.find(req_id);
+	if (request == g_http2_requests.end()) {
+		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	return 0;
+}
+
 static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 	PRINT_NAME();
 
@@ -1544,6 +1562,7 @@ LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("YrWX+DhPHQY", LibHttp2::Http2SetSslCallback);
 	LIB_FUNC("rbqZig38AT8", LibHttp2::Http2SendRequest);
 	LIB_FUNC("A+NVAFu4eCg", LibHttp2::Http2SendRequestAsync);
+	LIB_FUNC("IZ-qjhRqvjk", LibHttp2::Http2AbortRequest);
 	LIB_FUNC("o0DBQpFE13o", LibHttp2::Http2GetResponseContentLength);
 	LIB_FUNC("9XYJwCf3lEA", LibHttp2::Http2GetStatusCode);
 	LIB_FUNC("-rdXUi2XW90", LibHttp2::Http2GetAllResponseHeaders);
@@ -1923,10 +1942,10 @@ static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 		return NP_AUTH_ERROR_ABORTED;
 	}
 
-	request->state  = NpAuthRequestState::Complete;
+	request->state = NpAuthRequestState::Complete;
 	// Emulating sign-in cannot provide a real authorization code or ID token.
-	request->result = Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN
-	                                                        : NP_ERROR_SIGNED_OUT;
+	request->result =
+	    Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN : NP_ERROR_SIGNED_OUT;
 
 	return request->async ? 0 : request->result;
 }
@@ -1949,9 +1968,9 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
-    int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
-    int* issuer_id) {
+static int KYTY_SYSV_ABI
+NpAuthGetAuthorizationCodeV3(int req_id, const NpAuthGetAuthorizationCodeParameterV3* param,
+                             void* auth_code, int* issuer_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1983,7 +2002,7 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
 }
 
 static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
-                                        void* id_token) {
+                                            void* id_token) {
 	PRINT_NAME();
 
 	LOGF("\t req_id   = %d\n", req_id);
@@ -2167,8 +2186,8 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 	return id;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
-                                                   NpWebApi2MemoryPoolStats* stats) {
+static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int                       lib_ctx_id,
+                                                     NpWebApi2MemoryPoolStats* stats) {
 	if (stats == nullptr) {
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 	}
@@ -2176,7 +2195,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
 		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
 	}
 	std::lock_guard lock(g_np_webapi2_context_mutex);
-	const auto context = g_np_webapi2_contexts.find(lib_ctx_id);
+	const auto      context = g_np_webapi2_contexts.find(lib_ctx_id);
 	if (context == g_np_webapi2_contexts.end()) {
 		return NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 	}
@@ -2472,7 +2491,8 @@ static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
 	}
 	std::lock_guard lock(g_np_webapi2_context_mutex);
-	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
+	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK
+	                                                    : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 }
 
 LIB_DEFINE(InitNet_1_NpWebApi2) {
@@ -2852,7 +2872,8 @@ static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingSta
 	return OK;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int       type,
+                                                                         uint32_t* count) {
 	PRINT_NAME();
 
 	if (type < 1 || type > 3 || count == nullptr) {

@@ -468,6 +468,14 @@ bool WideWave32(const EmitterState& state) {
 	return state.program.wave_size == 32u && state.host_subgroup_size != 32u;
 }
 
+// An indirect image table long enough to share one query body per descriptor run.
+bool UsesSharedIndirectImageQuery(const EmitterState& state) {
+	return std::ranges::any_of(state.program.info.images, [](const IR::ImageResource& image) {
+		return image.indirect_root != IR::ImageResource::NoIndirectImage &&
+		       image.indirect_resources.size() > MaxIndirectQueryBodies;
+	});
+}
+
 void DefineInputs(EmitterState& state) {
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
@@ -577,7 +585,8 @@ void DefineInputs(EmitterState& state) {
 	}
 	if (state.program.info.subgroup_local_invocation_id ||
 	    (WideWave32(state) &&
-	     (state.program.info.subgroup_vote || state.program.info.subgroup_arithmetic))) {
+	     (state.program.info.subgroup_vote || state.program.info.subgroup_arithmetic ||
+	      UsesSharedIndirectImageQuery(state)))) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -811,11 +820,13 @@ void DefineModule(EmitterState& state) {
 	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
 	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
 	    state.program.info.subgroup_shuffle ||
-	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
+	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id ||
+	    (WideWave32(state) && UsesSharedIndirectImageQuery(state))) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (state.lane_count == 2 || state.program.info.subgroup_ballot ||
-	    (WideWave32(state) && state.program.info.subgroup_vote)) {
+	    (WideWave32(state) &&
+	     (state.program.info.subgroup_vote || UsesSharedIndirectImageQuery(state)))) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.program.info.subgroup_vote) {

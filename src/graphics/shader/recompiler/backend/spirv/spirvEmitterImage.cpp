@@ -662,8 +662,8 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 }
 
 // Every indirect geometry query needs its own static descriptor, so a candidate list longer than
-// this stops using one body per candidate and folds runs of consecutive slots into loops instead.
-constexpr uint32_t MaxIndirectQueryBodies = 16u;
+// the shared-query budget stops using one body per candidate and folds runs of consecutive slots
+// into loops instead.
 
 // A materialized image array can hold hundreds of candidates. One query body per candidate is
 // exact but grows the module with the array, so long runs of consecutive descriptor slots share a
@@ -734,11 +734,21 @@ uint32_t EmitSharedIndirectImageQuery(ValueEmitContext& ctx, uint32_t result_typ
 		const auto hit = Binary(state, spv::OpIEqual, TypeBool(state), selected,
 		                        Binary(state, spv::OpIAdd, TypeU32(state), index,
 		                               ConstantU32(state, first)));
-		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
-		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 		const auto wanted = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), wanted,
-		                          ConstantU32(state, spv::ScopeSubgroup), hit);
+		if (state.program.wave_size == 32u && state.host_subgroup_size != 32u) {
+			// The wave sharing this native subgroup sits at a different instruction, so the vote may
+			// only read the caller's ballot word.
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+			const auto word = ctx.HalfBallotWord(ctx.BallotOf(hit));
+			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), wanted, word,
+			                          ConstantU32(state, 0u));
+		} else {
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+			state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), wanted,
+			                          ConstantU32(state, spv::ScopeSubgroup), hit);
+		}
 		const auto taken  = state.builder.AllocateId();
 		const auto joined = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelectionMerge, joined, spv::SelectionControlMaskNone);

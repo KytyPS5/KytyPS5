@@ -53996,6 +53996,17 @@ void CheckPm4Flip() {
               flipped_arg == flip_arg,
           "R_FLIP did not publish the occlusion counters or flip");
 
+  // Vblanks while the event is undelivered count in that one event.
+  Require(name, "vblank event",
+          VideoOut::VideoOutAddVblankEvent(flips, handle, nullptr) == 0,
+          "vblank event registration failed");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  timeout = 0;
+  Require(name, "vblank count",
+          EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
+              VideoOut::VideoOutGetEventCount(&event) >= 2,
+          "undelivered vblanks were queued as separate events");
+
   gpu.WaitForIdle();
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
           "video-out close failed");

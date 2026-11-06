@@ -303,6 +303,66 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 			                               (void)m_buffer_cache.FindBuffer(start, end - start);
 		                               });
 	}
+	CacheTlasMemory(runtime);
+}
+
+void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
+	// The guest's traversal, and the walk that builds the host TLAS when the program traces
+	// natively, read zeros from TLAS memory without a cached buffer as well. ASTRO BOT writes its
+	// TLASes with the CPU into memory that no other GPU work reads, new ones in each level (three
+	// that it rotates through, another for a pass of 64 dispatches in a single frame): the first
+	// walks of each found no TLAS, or a part of it. The BLASes they reference that the CPU wrote
+	// are cached as well.
+	const auto&                  program = runtime.module->info;
+	NativeRayTracing::TlasSource source;
+	if (!NativeRayTracing::FindGuestTlasSource(program.info, source)) {
+		return;
+	}
+	const auto& resources = *runtime.resources;
+	// Memory the CPU wrote last: its current bytes are in guest memory.
+	const auto readable = [this](uint64_t address, uint64_t size) {
+		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
+		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
+		         m_buffer_cache.IsRegionGpuModified(address, size));
+	};
+	// The header address as the walk reads it (see NativeRayTracing::Prepare()).
+	uint64_t    header = 0;
+	const auto& srt    = resources.flattened_srt;
+	const auto  in_srt = [&](uint32_t slot) {
+		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot && slot < srt.size();
+	};
+	if (in_srt(source.header_slots[0]) && in_srt(source.header_slots[1])) {
+		header = srt[source.header_slots[0]] | (uint64_t {srt[source.header_slots[1]]} << 32u);
+	} else {
+		const auto& user_data = resources.user_data;
+		const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
+		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
+			return;
+		}
+		const auto pointer = user_data[index] | (uint64_t {user_data[index + 1u]} << 32u);
+		if (pointer > UINT64_MAX - source.header_offset ||
+		    !readable(pointer + source.header_offset, sizeof(header))) {
+			return;
+		}
+		std::memcpy(&header, reinterpret_cast<const void*>(pointer + source.header_offset), sizeof(header));
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	const auto tlas = m_native_ray_tracing.ReadGuestTlas(header, source, readable, ranges);
+	if (tlas.end != 0) {
+		ranges.emplace_back(header, tlas.end);
+	}
+	// Pinned, as memory the device-address faults cache: the walks, often the only readers, do not
+	// record their use of it.
+	for (const auto& [first, last]: ranges) {
+		m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t stop) {
+			if (const auto id = m_buffer_cache.FindBuffer(start, stop - start)) {
+				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
+			}
+		});
+	}
+	if (program.info.ray_query && m_native_ray_tracing.Enabled()) {
+		m_native_ray_tracing.NoteTlasInstances(tlas.instances);
+	}
 }
 
 bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages) {

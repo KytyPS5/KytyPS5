@@ -23,6 +23,7 @@
 #include <cstring>
 #include <iterator>
 #include <string>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -128,6 +129,8 @@ constexpr uint32_t StateDispatch = offsetof(RtState, dispatch);
 constexpr uint32_t StateVerify   = offsetof(RtState, verify);
 // RtState::overflow: part of the TLAS is in memory the host has not cached (kUnmapped).
 constexpr uint32_t StateUnmapped = 4u;
+// RtState::overflow: the walk's box node queue (1) or the host TLAS (2) was full.
+constexpr uint32_t StateFull = 3u;
 
 // The readback area: the state, the missing BLASes, the build jobs with their results and the
 // slots whose BLAS changed.
@@ -141,6 +144,10 @@ constexpr uint64_t ReadbackSize    = ReadbackUsed + uint64_t {SlotCapacity} * 4;
 // TlasPush::header_offset when the walk finds the header address in its state (kHeaderInState in
 // rt_tlas_walk.comp).
 constexpr uint32_t HeaderInState = 0xffffffffu;
+
+// The descriptors of the walks (RT_RECORD_PAGES in rt_common.inc): the BDA page table, then the
+// fault bitmap of the fault buffer.
+constexpr uint32_t WalkBindings = 2;
 
 struct TlasPush {
 	uint64_t user_ptr_va;
@@ -379,13 +386,19 @@ struct RtStats {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(NativeRayTracing::GuestDispatch::Count)> last_guest {};
 	uint32_t                                                                                        guest_calls = 0;
 	// Walks that published no context (rt_tlas_walk.comp): with a null TLAS header (read through
-	// the user data pointer, so the program without the patch could not be chosen), with a header
-	// that is not that of a TLAS in memory the host knows, or with TLAS memory the host has not
-	// cached. Their dispatches take the guest traversal. The last program of each.
+	// the user data pointer, so the program without the patch could not be chosen) or with a header
+	// that is not that of a TLAS. Their dispatches take the guest traversal. The last program.
 	RtCounter             walks_null_header;
 	RtCounter             walks_bad_header;
-	RtCounter             walks_uncached;
 	std::atomic<uint64_t> last_unpublished {0};
+	// Walks that found part of the TLAS in memory the host had not cached yet: they traced what
+	// they read, and the host caches the rest for the next walks. The last program.
+	RtCounter             walks_uncached;
+	std::atomic<uint64_t> last_uncached {0};
+	// Walks that found more box nodes or instances than the host structures hold (the rest is
+	// left out). The last program.
+	RtCounter             walks_overflow;
+	std::atomic<uint64_t> last_overflow {0};
 	// --rt-stats: rays sent back to the guest traversal.
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
@@ -421,7 +434,8 @@ void SummarizeRayTracing() {
 	const auto null_header = stats.walks_null_header.TakeDelta();
 	const auto bad_header  = stats.walks_bad_header.TakeDelta();
 	const auto uncached    = stats.walks_uncached.TakeDelta();
-	const auto unpublished = null_header + bad_header + uncached;
+	const auto overflow    = stats.walks_overflow.TakeDelta();
+	const auto unpublished = null_header + bad_header;
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
 	stats.guest_rays_reported  = rays_total;
@@ -430,7 +444,7 @@ void SummarizeRayTracing() {
 	const auto new_guest_sites = programs.guest_sites - stats.programs_reported.guest_sites;
 	stats.programs_reported    = programs;
 	// The first call starts the period; dispatches without a TLAS alone trace nothing.
-	if (next == 0 || unpatched + unpublished + rays + new_unpatched + new_guest_sites == 0) {
+	if (next == 0 || unpatched + unpublished + uncached + overflow + rays + new_unpatched + new_guest_sites == 0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
@@ -445,10 +459,19 @@ void SummarizeRayTracing() {
 	}
 	if (unpublished != 0) {
 		log(fmt::format("[RT]   {} TLAS walks published no context ({} with a null header, {} with a header that is "
-		                "not a TLAS the host knows, {} with TLAS memory not cached yet; last cs {}): their dispatches "
-		                "walked the guest BVH",
-		                unpublished, null_header, bad_header, uncached,
+		                "not a TLAS; last cs {}): their dispatches walked the guest BVH",
+		                unpublished, null_header, bad_header,
 		                RtShader(stats.last_unpublished.load(std::memory_order_relaxed))));
+	}
+	if (uncached != 0) {
+		log(fmt::format("[RT]   {} TLAS walks found TLAS memory not cached yet (last cs {}): their rays missed what "
+		                "it holds, cached for the next walks",
+		                uncached, RtShader(stats.last_uncached.load(std::memory_order_relaxed))));
+	}
+	if (overflow != 0) {
+		log(fmt::format("[RT]   {} TLAS walks found more box nodes or instances than the host structures hold "
+		                "(last cs {}): their rays missed the rest",
+		                overflow, RtShader(stats.last_overflow.load(std::memory_order_relaxed))));
 	}
 	if (rays != 0) {
 		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
@@ -496,6 +519,163 @@ bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& in
 	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
 	          info.ray_query_header_slots, info.ray_query_header_vsharp};
 	return true;
+}
+
+uint64_t NativeRayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
+                                       const std::function<bool(uint64_t, uint64_t)>& readable) {
+	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
+		return pointer;
+	}
+	std::array<uint32_t, 2> vsharp {};
+	if (pointer > UINT64_MAX - source.header_vsharp || !readable(pointer + source.header_vsharp, sizeof(vsharp))) {
+		return 0;
+	}
+	std::memcpy(vsharp.data(), reinterpret_cast<const void*>(pointer + source.header_vsharp), sizeof(vsharp));
+	return uint64_t {vsharp[0]} | (uint64_t {vsharp[1] & 0xffffu} << 32u);
+}
+
+bool NativeRayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+                                           TlasSource& source) noexcept {
+	if (FindTlasSource(info, source)) {
+		return true;
+	}
+	// A layout is never all zero (Decoder::RayTracingLayout::Pack()).
+	if (!info.bvh || info.ray_query_layout == std::array<uint32_t, 4> {}) {
+		return false;
+	}
+	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
+	          {ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot, ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot},
+	          info.ray_query_header_vsharp};
+	return true;
+}
+
+NativeRayTracing::GuestTlas NativeRayTracing::ReadGuestTlas(
+    uint64_t header, const TlasSource& source, const std::function<bool(uint64_t, uint64_t)>& readable,
+    std::vector<std::pair<uint64_t, uint64_t>>& blases) {
+	// As rt_tlas_walk.comp reads the TLAS (Decoder::RayTracingLayout::Pack() for the layout).
+	if (header == 0 || (header & 255u) != 0) {
+		return {};
+	}
+	for (const auto& [known, tlas]: m_guest_tlases) {
+		if (known == header) {
+			return tlas;
+		}
+	}
+	constexpr uint64_t HeaderSize = 256;
+	// Larger TLASes are not plausible (the walk's queue holds no more box nodes).
+	constexpr uint64_t MaxExtent = uint64_t {64} * 1024 * 1024;
+	if (header > UINT64_MAX - MaxExtent || !readable(header, HeaderSize)) {
+		return {};
+	}
+	const auto load = [](uint64_t address, auto& value) {
+		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+	};
+	const auto& layout = source.layout;
+	// The node limit of a BVH header (BlasNodeLimit() in rt_blas_walk.comp).
+	const auto node_limit_at = [&](uint64_t bvh) {
+		uint32_t count = 0;
+		load(bvh + (((layout[3] >> 29u) & 1u) != 0 ? 80 : 88), count);
+		return ((layout[3] >> 29u) & 1u) != 0 ? count - 1u : count;
+	};
+	const uint32_t node_limit = node_limit_at(header);
+	uint64_t       instance_offset = 0;
+	load(header + ((layout[1] >> 16u) & 15u) * 8u, instance_offset);
+	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent) {
+		return {};
+	}
+	const auto nodes_end = header + (uint64_t {node_limit} + 1) * 64;
+	if (!readable(header, nodes_end - header)) {
+		return {};
+	}
+	// The box nodes from the root (no more than the TLAS has) and the instance leaves they reach
+	// (the largest index); inline instances have their record in the header.
+	const bool     inline_layout = ((layout[3] >> 19u) & 1u) != 0;
+	const uint32_t inline_type   = (layout[3] >> 16u) & 7u;
+	std::vector<uint32_t> queue {source.root};
+	std::vector<uint32_t> leaves;
+	bool                  inline_leaf   = false;
+	int64_t               last_instance = -1;
+	uint32_t              instances     = 0;
+	for (size_t i = 0; i < queue.size() && i <= node_limit; i++) {
+		const auto address = header + (uint64_t {queue[i] >> 3u} << 6u);
+		if (address + 16 > nodes_end) {
+			continue;
+		}
+		std::array<uint32_t, 4> children {};
+		load(address, children);
+		for (const auto child: children) {
+			const auto type = child & 7u;
+			if (child == 0xffffffffu) {
+				continue;
+			}
+			if (type == 4u || type == 5u) {
+				queue.push_back(child);
+			} else if (type < 4u || (inline_layout && type == inline_type)) {
+				instances++;
+				if (inline_layout && type == inline_type) {
+					inline_leaf = true;
+				} else {
+					leaves.push_back(child >> 3u);
+					last_instance = std::max<int64_t>(last_instance, child >> 3u);
+				}
+			}
+		}
+	}
+	const auto stride        = uint64_t {128} + ((layout[1] >> 30u) & 3u) * 32u;
+	const auto instances_end = header + instance_offset + static_cast<uint64_t>(last_instance + 1) * stride;
+	const auto inline_end    = inline_layout ? header + (layout[3] & 0xffu) * 8u + 4u + stride : 0;
+	const auto end = std::min(std::max({nodes_end, instances_end, inline_end}), header + MaxExtent);
+
+	// The BLASes of the instances (LoadGuestInstance() in rt_common.inc), when the CPU wrote them as
+	// well (one in ASTRO BOT before Go-Go Archipelago): their nodes, and the table of the geometry
+	// of each triangle node of a Psr BLAS (rt_blas_walk.comp).
+	std::vector<uint64_t> blas_list;
+	const auto            record_blas = [&](uint64_t record) {
+		const auto dword = ((layout[1] >> 20u) & 15u) | (((layout[3] >> 20u) & 3u) << 4u);
+		// Records of 128 bytes are read up to 64 bytes.
+		if ((dword + 2u) * 4u > (stride > 128u ? 160u : 64u) || !readable(record, (dword + 2u) * 4u)) {
+			return;
+		}
+		std::array<uint32_t, 2> words {};
+		load(record + dword * 4u, words);
+		const auto blas = ((layout[1] >> 24u) & 1u) != 0
+		                      ? (uint64_t {words[0]} | (uint64_t {words[1] & 0x3fffffu} << 32u)) << 3u
+		                      : uint64_t {words[0]} | (uint64_t {words[1]} << 32u);
+		if (blas != 0 && (blas & 255u) == 0) {
+			blas_list.push_back(blas);
+		}
+	};
+	for (const auto leaf: leaves) {
+		record_blas(header + instance_offset + uint64_t {leaf} * stride);
+	}
+	if (inline_leaf) {
+		record_blas(header + (layout[3] & 0xffu) * 8u + ((layout[3] >> 28u) & 1u) * 4u);
+	}
+	std::sort(blas_list.begin(), blas_list.end());
+	blas_list.erase(std::unique(blas_list.begin(), blas_list.end()), blas_list.end());
+	for (const auto blas: blas_list) {
+		if (blas > UINT64_MAX - MaxExtent || !readable(blas, HeaderSize)) {
+			continue;
+		}
+		const auto limit = node_limit_at(blas);
+		if (limit >= MaxExtent / 64) {
+			continue;
+		}
+		auto                    blas_end = blas + (uint64_t {limit} + 1) * 64;
+		std::array<uint32_t, 2> magic {};
+		uint32_t                version = 0;
+		uint32_t                table   = 0;
+		load(blas, magic);
+		load(blas + 252, version);
+		load(blas + 40, table);
+		if (magic[0] == 0x5f525350u && magic[1] == 0x4c485642u && version == 9u && table < MaxExtent) {
+			blas_end = std::max(blas_end, blas + table + (uint64_t {limit} + 1) * 4);
+		}
+		blases.emplace_back(blas, std::min(blas_end, blas + MaxExtent));
+	}
+	const GuestTlas tlas {end, instances};
+	m_guest_tlases[m_guest_tlas_next++ % m_guest_tlases.size()] = {header, tlas};
+	return tlas;
 }
 
 NativeRayTracing::Allocation NativeRayTracing::Arena::Allocate(uint64_t size, uint64_t alignment) {
@@ -679,12 +859,16 @@ NativeRayTracing::~NativeRayTracing() {
 
 void NativeRayTracing::CreatePipelines() {
 	auto device = m_graphics.device;
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1,
-	                                              vk::ShaderStageFlagBits::eCompute, nullptr};
+	// The BDA page table, and the fault and use bitmaps the walks record their pages in (the HLE
+	// passes only read the page table).
+	std::array<vk::DescriptorSetLayoutBinding, WalkBindings> bindings {};
+	for (uint32_t i = 0; i < WalkBindings; i++) {
+		bindings[i] = {i, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr};
+	}
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	layout_info.bindingCount = 1;
-	layout_info.pBindings    = &binding;
+	layout_info.bindingCount = WalkBindings;
+	layout_info.pBindings    = bindings.data();
 	RequireVulkanSuccess(device.createDescriptorSetLayout(&layout_info, nullptr, &m_descriptor_layout),
 	                     "create native ray tracing descriptor layout");
 	const auto make = [&](std::span<const uint32_t> code, uint32_t push_size,
@@ -1454,7 +1638,11 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 			}
 			return false;
 		});
-		const auto last = m_last_instance_counts[source_key];
+		// The count of the last walk of the source, or of the TLAS the CPU read for this dispatch
+		// (NoteTlasInstances()) when larger: the first walks of a new one got a host TLAS of the
+		// size of the source's previous one (ASTRO BOT's island in Go-Go Archipelago: 1024 of its
+		// 4242 instances, in a pass of 64 dispatches in one frame).
+		const auto last = std::max(m_last_instance_counts[source_key], std::exchange(m_next_instances, 0u));
 		tlas_count      = std::min(m_tlas_capacity, std::max(1024u, (last + last / 4 + 255u) &
 		                                                           ~255u));
 	}
@@ -1537,14 +1725,24 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 		                  vk::AccessFlagBits2::eTransferWrite);
 	}
 
-	auto* page_table = m_buffer_cache.GetBdaPageTableBuffer();
-	const vk::DescriptorBufferInfo page_info {page_table->Handle(), 0, page_table->Size()};
-	vk::WriteDescriptorSet write {};
-	write.dstBinding      = 0;
-	write.descriptorCount = 1;
-	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
-	write.pBufferInfo     = &page_info;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, 1, &write);
+	// The walks record the pages without a buffer that they read in the fault buffer, which must
+	// start clear (the program's own device-address accesses usually cleared it already).
+	m_buffer_cache.PrepareFaultBuffer();
+	auto*       page_table   = m_buffer_cache.GetBdaPageTableBuffer();
+	const auto* fault_buffer = m_buffer_cache.GetFaultBuffer();
+	const std::array<vk::DescriptorBufferInfo, WalkBindings> infos {{
+	    {page_table->Handle(), 0, page_table->Size()},
+	    {fault_buffer->Handle(), 0, BufferCache::WRITE_BITMAP_OFFSET},
+	}};
+	std::array<vk::WriteDescriptorSet, WalkBindings> writes {};
+	for (uint32_t i = 0; i < WalkBindings; i++) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[i].pBufferInfo     = &infos[i];
+	}
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
+	                             writes.data());
 
 	// The BVHs of the traversal's layout (Decoder::RayTracingLayout::Pack() word 3).
 	m_blas_flags = ((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u;
@@ -1554,7 +1752,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_tlas_layout, 0, 1, &write);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_tlas_layout, 0, WalkBindings,
+	                             writes.data());
 
 	const TlasPush tlas_push {
 	    .user_ptr_va       = user_pointer,
@@ -1592,7 +1791,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 
 	// Counts the leaves of the BLASes the walk found missing, and checks the built ones it uses.
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_blas_pipeline);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, 1, &write);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
+	                             writes.data());
 	BlasPush blas_push {m_missing->BufferDeviceAddress(), m_pool->BufferDeviceAddress(),
 	                    m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
 	                    m_changed->BufferDeviceAddress(), ModeCount,
@@ -1671,13 +1871,17 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	std::vector<uint32_t>    retry;
 	Common::LockGuard        lock(m_mutex);
 	// The walk ends without publishing the context (nor the indirect BLAS dispatch) when the header
-	// is not that of a TLAS in memory the host knows.
-	if (state.dispatch[1] == 0 || (state.overflow & StateUnmapped) != 0) {
-		(state.dispatch[1] != 0 ? g_rt_stats.walks_uncached
-		 : state.header_va == 0 ? g_rt_stats.walks_null_header
-		                        : g_rt_stats.walks_bad_header)
-		    .Add();
+	// is not that of a TLAS; it publishes what it read when part of the TLAS is not cached yet.
+	if (state.dispatch[1] == 0) {
+		(state.header_va == 0 ? g_rt_stats.walks_null_header : g_rt_stats.walks_bad_header).Add();
 		g_rt_stats.last_unpublished.store(readback.shader_hash, std::memory_order_relaxed);
+	} else if ((state.overflow & StateUnmapped) != 0) {
+		g_rt_stats.walks_uncached.Add();
+		g_rt_stats.last_uncached.store(readback.shader_hash, std::memory_order_relaxed);
+	}
+	if ((state.overflow & StateFull) != 0) {
+		g_rt_stats.walks_overflow.Add();
+		g_rt_stats.last_overflow.store(readback.shader_hash, std::memory_order_relaxed);
 	}
 	SummarizeRayTracing();
 	for (uint32_t i = 0; i < missing_count; i++) {

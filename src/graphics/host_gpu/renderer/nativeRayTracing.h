@@ -10,11 +10,13 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -27,6 +29,15 @@ class BufferCache;
 class CommandRecorder;
 class CommandScheduler;
 struct GraphicContext;
+
+// NativeRayTracing::ReadGuestTlas(): the end of a guest TLAS's memory and its instance count.
+// Outside the class so that it is complete where the class stores it in a std::pair: a nested
+// class with default member initializers is not default constructible until the enclosing class
+// is complete, and libstdc++'s pair constrains its default constructor on that.
+struct NativeGuestTlas {
+	uint64_t end       = 0;
+	uint32_t instances = 0;
+};
 
 // Host acceleration structures for guest ray tracing (VK_KHR_acceleration_structure).
 //
@@ -91,6 +102,24 @@ public:
 	// The source of a program that traces through a guest TLAS (its info), or false.
 	[[nodiscard]] static bool FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
 	                                         TlasSource& source) noexcept;
+	// The source of the guest TLAS of a program whose BVH walk the patch recognizes, traced
+	// natively or not (without header slots when the guest walks it), or false.
+	[[nodiscard]] static bool FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+	                                              TlasSource& source) noexcept;
+
+	// The guest TLAS at `header` as the CPU reads it, where `readable(address, size)` holds (memory
+	// the CPU wrote last), before the dispatch that traces it: the end of its memory (its box
+	// nodes and the instance records of the leaves they reach), 0 when it cannot be read, and its
+	// instance count. When it reads the TLAS (not one of the last it read: execution thread), it
+	// adds to `blases` the memory ([first, second)) of the BLASes its instances reference that it
+	// can read as well.
+	using GuestTlas = NativeGuestTlas;
+	[[nodiscard]] GuestTlas ReadGuestTlas(uint64_t header, const TlasSource& source,
+	                                      const std::function<bool(uint64_t, uint64_t)>& readable,
+	                                      std::vector<std::pair<uint64_t, uint64_t>>& blases);
+	// The instance count of the TLAS that the next Prepare() walks, read on the CPU (0: not known):
+	// the host TLAS of a TLAS the walks have not seen yet has room for all its instances.
+	void NoteTlasInstances(uint32_t count) noexcept { m_next_instances = count; }
 
 	// Records, before the dispatch, the walk of the guest TLAS whose header the 64-bit value at
 	// `user_pointer + source.header_offset` points to (the dwords at `source.header_slots` of
@@ -433,6 +462,10 @@ private:
 	uint64_t                  m_last_scan_prepare = 0;
 	// The instance count of the last walk of each TLAS source (shaders trace different TLASes).
 	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
+	// ReadGuestTlas(): the last TLASes it read (by header), replaced in turn; NoteTlasInstances().
+	std::array<std::pair<uint64_t, GuestTlas>, 8> m_guest_tlases {};
+	uint32_t                                      m_guest_tlas_next = 0;
+	uint32_t                                      m_next_instances  = 0;
 	uint32_t                  m_prepare_id          = 0;
 	// BlasPush::flags of the last preparation's layout.
 	uint32_t                  m_blas_flags          = 0;

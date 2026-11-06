@@ -110,6 +110,10 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	// CacheDmaBases() for the guest TLAS of a program (see NativeRayTracing::FindGuestTlasSource()),
+	// with m_mapped_ranges_mutex held.
+	void CacheTlasMemory(const ShaderStageRuntime& runtime);
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;

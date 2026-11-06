@@ -7,6 +7,7 @@
 // host has no slot for yet are reported once each (see nativeRayTracing.cpp), and the built ones
 // the TLAS references are listed for verification.
 
+#define RT_RECORD_PAGES
 #include "rt_common.inc"
 
 layout(local_size_x = 256) in;
@@ -59,9 +60,10 @@ layout(push_constant, std430) uniform Push {
 // QueueCapacity and MissingCapacity in nativeRayTracing.cpp.
 const uint kQueueCapacity   = 1u << 16;
 const uint kMissingCapacity = 256;
-// RtState::overflow: part of the TLAS (a box node or an instance record) is in memory the host has
-// not cached. The context stays invalid, so the guest traverses the TLAS itself this time, and its
-// own reads of that memory get it cached.
+// RtState::overflow: part of the TLAS (the header, a box node or an instance record) is in memory
+// the host has not cached. The walk records those pages (RT_RECORD_PAGES), so the host caches them
+// for the next walks, and publishes the TLAS of what it could read: the rays miss the rest this
+// time, instead of a guest traversal that would read zeros there.
 const uint kUnmapped = 4u;
 // Push::header_offset when the host copied the header address into the state (from the dwords
 // the tracing shader reads it from; HeaderInState in nativeRayTracing.cpp).
@@ -191,16 +193,21 @@ void main() {
 		                            ? state.header_va
 		                            : LoadGuestU64(pc.user_ptr_va + pc.header_offset);
 		s_header              = header;
-		s_valid               = header != 0 && (header & 255) == 0 && HostAddress(header) != 0 ? 1u : 0u;
+		s_valid               = header != 0 && (header & 255) == 0 ? 1u : 0u;
 		state.header_va       = header;
-		if (s_valid != 0) {
+		// A header in memory the host has not cached yet (recorded: cached for the next walk)
+		// gives an empty TLAS.
+		const bool cached = s_valid != 0 && HostAddress(header) != 0;
+		if (cached) {
 			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
 			state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
 			                                                              : LoadGuestU32(header + 88);
+		} else if (s_valid != 0) {
+			atomicOr(state.overflow, kUnmapped);
 		}
 		U32Ref(pc.queue).v = pc.root;
 		s_head             = 0;
-		s_tail             = 1;
+		s_tail             = cached ? 1 : 0;
 	}
 	barrier();
 	if (s_valid == 0) {
@@ -374,7 +381,7 @@ void main() {
 			context.slots          = pc.slots;
 			context.instance_count = count;
 			context.instance_base  = instance_base;
-			context.valid          = pc.tlas_address != 0 && (state.overflow & kUnmapped) == 0 ? 1u : 0u;
+			context.valid          = pc.tlas_address != 0 ? 1u : 0u;
 		}
 	}
 }

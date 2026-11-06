@@ -930,8 +930,9 @@ struct Program {
 	std::vector<InlinedCallBody> call_bodies;
 	std::vector<LongBranch>      long_branches; // ascending pc
 	std::vector<RuntimeLiteral>  runtime_literals; // ascending pc
-	// The guest TLAS of the native ray tracing patch (see RayTracingPatch.h), when applied: the
-	// header address is the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
+	// The guest TLAS of the native ray tracing forms (see IR::TraceNativeTraversals), set by
+	// TranslateProgram() for resource tracking (also without native ray tracing): the header
+	// address is the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
 	struct RayTracingSource {
 		uint32_t                user_sgpr     = 0;
 		uint32_t                header_offset = 0;

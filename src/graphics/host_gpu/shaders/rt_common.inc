@@ -26,6 +26,24 @@ const uint64_t kLowerAddressSize   = 1ul << 40;
 const uint     kPageMask           = (1u << CACHING_PAGEBITS) - 1u;
 const uint     kInvalidNode        = 0xffffffffu;
 
+#ifdef RT_RECORD_PAGES
+// The fault bitmap of the BufferCache fault buffer (see faultManager.h). The walks record the
+// caching pages without a buffer that they read as the device-address accesses of guest shaders
+// do, so that the host caches (and keeps) them for the next walks. Pages with a buffer are not
+// recorded as used: a load of the use bitmap in each read made GTA V's walks three times slower.
+layout(set = 0, binding = 1, std430) buffer FaultPages {
+	uint fault_pages[];
+};
+
+void RecordFault(uint page) {
+	const uint word = page >> 5;
+	if (word < uint(fault_pages.length())) {
+		// Not the entry after the last page (the native ray tracing context).
+		atomicOr(fault_pages[word], 1u << (page & 31u));
+	}
+}
+#endif
+
 // The host address of guest address `va`, 0 when it has no cached buffer.
 uint64_t HostAddress(uint64_t va) {
 	const uint64_t packed = va >= kExtendedMemoryBase ? va - kExtendedMemoryBase + kLowerAddressSize : va;
@@ -34,6 +52,11 @@ uint64_t HostAddress(uint64_t va) {
 		return 0;
 	}
 	const uint64_t base = pages[uint(page)];
+#ifdef RT_RECORD_PAGES
+	if (base == 0) {
+		RecordFault(uint(page));
+	}
+#endif
 	return base == 0 ? 0 : base + (va & uint64_t(kPageMask));
 }
 

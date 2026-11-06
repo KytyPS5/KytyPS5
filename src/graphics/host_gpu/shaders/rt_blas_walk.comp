@@ -23,6 +23,7 @@
 // magic and version 9, or with another geometry count: released and reused, or rebuilt since),
 // without placing anything. The host gives up such slots.
 
+#define RT_RECORD_PAGES
 #include "rt_common.inc"
 
 layout(local_size_x = 256) in;

@@ -8,12 +8,14 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineHelpers.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -552,6 +554,29 @@ private:
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_claimed_graphics;
 	std::unordered_set<uint64_t>                                     m_claimed_compute;
 
+	// Compute pipelines compiled by helper processes (see PipelineHelpers), with the manifest:
+	// those of its modules and those of the modules the compile workers add. A job's ticket is
+	// the module id; the helper's pipeline cache data is kept, and written with the driver cache.
+	std::unique_ptr<PipelineHelpers> m_helpers;
+	// Under m_async_mutex: the jobs of the helpers (also in m_async_pending_compute).
+	std::unordered_map<uint64_t, const ShaderModule*> m_helper_jobs;
+	// Caches of the helpers' pipelines not written yet, and those written (store thread).
+	std::mutex                                        m_helper_caches_mutex;
+	std::vector<vk::PipelineCache>                    m_helper_caches;
+	vk::PipelineCache                                 m_helper_cache = nullptr;
+	std::atomic<uint64_t> m_helper_found {0}, m_helper_created {0}, m_helper_compiled_here {0},
+	    m_helper_taken_back {0};
+	void StartHelpers();
+	void StopHelpers();
+	// Creates the compute pipeline of `module` from the driver cache, or has a helper compile it;
+	// false, with nothing done, when there are no helpers. The pipeline is claimed and pending.
+	bool CreateComputePipelineElsewhere(const ShaderModule& module, const std::vector<uint32_t>& spirv,
+	                                    bool urgent);
+	void OnHelperResult(PipelineHelpers::Result&& result);
+	// Publishes a pipeline a background thread created (m_async_ready_compute).
+	void PublishComputePipeline(const ShaderModule& module, const Pipeline& pipeline,
+	                            std::chrono::steady_clock::time_point started);
+
 	void QueueAsyncPipeline(const AsyncPipelineJob& job);
 	// Under m_async_mutex: removes a queued job no thread has started; false when none matches.
 	template <typename Matches>
@@ -559,7 +584,7 @@ private:
 	void AsyncPipelineWorker();
 	void StopAsyncPipelines();
 	// A compile worker added a compute module: its pipeline is created in the background.
-	void CreateComputePipelineAhead(const ShaderModule& module);
+	void CreateComputePipelineAhead(const ShaderModule& module, const std::vector<uint32_t>& spirv);
 	// Under m_async_mutex: notes that a thread creates the pipeline (see m_claimed_graphics).
 	void ClaimPipeline(const GraphicsPipelineKey& key);
 	void ClaimComputePipeline(uint64_t module_id);
@@ -572,7 +597,7 @@ private:
 	// Has the store thread write the driver cache if it changed and is due. The caller holds
 	// m_driver_cache_mutex.
 	void PostDueDriverCache();
-	void WriteDriverCache() const;
+	void WriteDriverCache();
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);
@@ -612,7 +637,8 @@ private:
 	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
 	                         std::span<const uint32_t> back_code);
 	void CreateManifestPipeline(uint32_t index);
-	void CreateManifestComputePipeline(const ShaderModule& module);
+	// `spirv` is the module's, or empty when another thread compiled it.
+	void CreateManifestComputePipeline(const ShaderModule& module, const std::vector<uint32_t>& spirv);
 	// The stage input of a manifest module with the running host's limits.
 	void SetHostInput(ManifestModule& module) const;
 	// Under the program lock: the module of `key` that the specialization and push data cursor
@@ -639,6 +665,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             vk::PipelineCache                          driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& module, vk::PipelineCache driver_cache);
+// Creates the compute pipeline of `module` only when `cache` holds it (without compiling, where
+// GraphicContext::pipeline_cache_lookup_enabled); false, with nothing created, otherwise.
+bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                         const ShaderModule& module, vk::PipelineCache cache);
+
+// A compute module and its SPIR-V for a pipeline helper (PipelineHelpers); the decoded module has
+// no Vulkan module yet.
+[[nodiscard]] std::vector<uint8_t> EncodeComputeModule(const ShaderModule&          module,
+                                                       const std::vector<uint32_t>& spirv);
+bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
+                         std::vector<uint32_t>& spirv);
 
 } // namespace Libs::Graphics
 

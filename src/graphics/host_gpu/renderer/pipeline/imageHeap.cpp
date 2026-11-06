@@ -90,23 +90,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	                               limits.maxPerStageUpdateAfterBindResources}) <
 	                     IR::ImageHeapCapacity);
 
-	const vk::DescriptorBindingFlags binding_flags =
-	    vk::DescriptorBindingFlagBits::ePartiallyBound |
-	    vk::DescriptorBindingFlagBits::eUpdateAfterBind |
-	    vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
-	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
-	flags_info.bindingCount  = 1;
-	flags_info.pBindingFlags = &binding_flags;
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
-	                                              IR::ImageHeapCapacity,
-	                                              vk::ShaderStageFlagBits::eAll, nullptr};
-	vk::DescriptorSetLayoutCreateInfo layout_info {};
-	layout_info.pNext        = &flags_info;
-	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
-	layout_info.bindingCount = 1;
-	layout_info.pBindings    = &binding;
-	EXIT_IF(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout) !=
-	        vk::Result::eSuccess);
+	m_layout = CreateLayout(graphics.device);
 	const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eSampledImage,
 	                                        IR::ImageHeapCapacity};
 	vk::DescriptorPoolCreateInfo pool_info {};
@@ -126,6 +110,27 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	m_elements.emplace_back();
 	m_writes.push_back({0u, {nullptr, nullptr, vk::ImageLayout::eShaderReadOnlyOptimal}});
 	WriteDescriptors();
+}
+
+vk::DescriptorSetLayout ImageHeap::CreateLayout(vk::Device device) {
+	const vk::DescriptorBindingFlags binding_flags =
+	    vk::DescriptorBindingFlagBits::ePartiallyBound |
+	    vk::DescriptorBindingFlagBits::eUpdateAfterBind |
+	    vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
+	flags_info.bindingCount  = 1;
+	flags_info.pBindingFlags = &binding_flags;
+	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
+	                                              IR::ImageHeapCapacity,
+	                                              vk::ShaderStageFlagBits::eAll, nullptr};
+	vk::DescriptorSetLayoutCreateInfo layout_info {};
+	layout_info.pNext        = &flags_info;
+	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
+	layout_info.bindingCount = 1;
+	layout_info.pBindings    = &binding;
+	vk::DescriptorSetLayout layout = nullptr;
+	EXIT_IF(device.createDescriptorSetLayout(&layout_info, nullptr, &layout) != vk::Result::eSuccess);
+	return layout;
 }
 
 ImageHeap::~ImageHeap() {

@@ -393,8 +393,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	graphics.device.destroyShaderModule(task_module, nullptr);
 }
 
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+// With `lookup`, only from the cache (VK_PIPELINE_COMPILE_REQUIRED when it does not hold it).
+static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                        const ShaderModule& module, vk::PipelineCache driver_cache,
+                                        bool lookup) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -417,15 +419,38 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (module.info.info.uses_gds) {
 		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
 	}
+	if (lookup) {
+		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	}
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
-	const auto result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+	const auto result = CreateComputePipeline(graphics, pipeline, module, driver_cache, false);
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkCreateComputePipelines failed: %s, cs 0x%016" PRIx64 "\n", vk::to_string(result).c_str(),
 		     module.info.shader_hash);
 	}
+}
+
+bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                         const ShaderModule& module, vk::PipelineCache cache) {
+	if (!graphics.pipeline_cache_lookup_enabled || cache == nullptr) {
+		return false;
+	}
+	if (CreateComputePipeline(graphics, pipeline, module, cache, true) == vk::Result::eSuccess &&
+	    pipeline.pipeline != nullptr) {
+		return true;
+	}
+	graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	pipeline = {};
+	return false;
 }
 
 } // namespace Libs::Graphics

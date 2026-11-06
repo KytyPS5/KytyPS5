@@ -59,6 +59,9 @@ constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
 constexpr auto SlowCreation             = std::chrono::seconds {5};
 constexpr auto SlowCreationSaveInterval = std::chrono::seconds {20};
 constexpr auto DriverCacheTimerPeriod   = std::chrono::milliseconds {250};
+// While a dispatch waits for a helper compiling its pipeline (see PipelineHelpers): how often it
+// looks for the result. It sleeps, so that its core goes to the helper.
+constexpr auto HelperPoll = std::chrono::milliseconds {1};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -1097,6 +1100,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	} else {
 		WarmUp(shader_store);
 	}
+	// Before the manifest's threads, which give them work.
+	StartHelpers();
 	OpenManifest();
 	for (uint32_t i = 0; i < CompileWorkers; i++) {
 		m_workers.emplace_back([this] { CompileWorker(); });
@@ -1107,14 +1112,21 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 			m_async_threads.emplace_back([this] { AsyncPipelineWorker(); });
 		}
 	}
-	m_async_handoff = !m_async_threads.empty() || m_manifest_warm;
+	// The execution thread takes the pipelines background threads and helpers created from the
+	// m_async_ready maps.
+	m_async_handoff = !m_async_threads.empty() || m_manifest_warm || m_helpers != nullptr;
 }
 
 PipelineCache::~PipelineCache() {
 	StopWorkers();
 	CloseManifest();
+	StopHelpers();
 	StopAsyncPipelines();
 	Save();
+	for (const auto cache: m_helper_caches) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
+	m_graphics.device.destroyPipelineCache(m_helper_cache, nullptr);
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
 			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
@@ -1262,23 +1274,54 @@ void PipelineCache::Save() {
 	}
 }
 
-void PipelineCache::WriteDriverCache() const {
+void PipelineCache::WriteDriverCache() {
+	// What the helpers compiled goes into the file with the driver cache. No pipeline is created
+	// from the caches merged into, which only this thread touches; the others are only read.
+	std::vector<vk::PipelineCache> helper_caches;
+	{
+		std::scoped_lock lock(m_helper_caches_mutex);
+		helper_caches.swap(m_helper_caches);
+	}
+	const vk::PipelineCacheCreateInfo empty {};
+	if (!helper_caches.empty() && m_helper_cache == nullptr &&
+	    m_graphics.device.createPipelineCache(&empty, nullptr, &m_helper_cache) != vk::Result::eSuccess) {
+		m_helper_cache = nullptr;
+	}
+	if (m_helper_cache != nullptr && !helper_caches.empty()) {
+		(void)m_graphics.device.mergePipelineCaches(m_helper_cache,
+		                                            static_cast<uint32_t>(helper_caches.size()),
+		                                            helper_caches.data());
+	}
+	for (const auto cache: helper_caches) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
+	vk::PipelineCache source = m_driver_cache;
+	vk::PipelineCache merged = nullptr;
+	if (m_helper_cache != nullptr &&
+	    m_graphics.device.createPipelineCache(&empty, nullptr, &merged) == vk::Result::eSuccess) {
+		const std::array sources {m_driver_cache, m_helper_cache};
+		if (m_graphics.device.mergePipelineCaches(merged, static_cast<uint32_t>(sources.size()),
+		                                          sources.data()) == vk::Result::eSuccess) {
+			source = merged;
+		}
+	}
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+		result = m_graphics.device.getPipelineCacheData(source, &size, nullptr);
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
 		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+		result = m_graphics.device.getPipelineCacheData(source, &size, payload.data());
 		if (result != vk::Result::eIncomplete) {
 			break;
 		}
 	}
+	m_graphics.device.destroyPipelineCache(merged, nullptr);
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
@@ -1854,6 +1897,8 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			                     job.push_data_cursor, spirv, plain_spirv);
 		}
 	}();
+	// A compute module added: its pipeline is created ahead of its dispatch.
+	const ShaderModule* ahead = nullptr;
 	LockPrograms();
 	if (module) {
 		auto entry = m_program_cache.find(job.key);
@@ -1874,9 +1919,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			AddedModule(job.key, entry->second, added, spirv, plain_spirv, options, job.params.code,
 			            job.push_data_cursor);
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-				if (!m_async_threads.empty()) {
-					CreateComputePipelineAhead(added);
-				}
+				ahead = &added;
 			}
 		}
 	}
@@ -1884,6 +1927,9 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		m_in_flight.erase(job_count);
 	}
 	UnlockPrograms();
+	if (ahead != nullptr) {
+		CreateComputePipelineAhead(*ahead, spirv);
+	}
 }
 
 void PipelineCache::CompileWorker() {
@@ -2004,7 +2050,11 @@ void PipelineCache::ClaimComputePipeline(uint64_t module_id) {
 	}
 }
 
-void PipelineCache::CreateComputePipelineAhead(const ShaderModule& module) {
+void PipelineCache::CreateComputePipelineAhead(const ShaderModule&          module,
+                                               const std::vector<uint32_t>& spirv) {
+	if (m_helpers == nullptr && m_async_threads.empty()) {
+		return;
+	}
 	{
 		std::lock_guard lock(m_async_mutex);
 		if (m_async_ready_compute.contains(module.id) ||
@@ -2014,7 +2064,123 @@ void PipelineCache::CreateComputePipelineAhead(const ShaderModule& module) {
 		}
 		ClaimComputePipeline(module.id);
 	}
+	// The game has just compiled its shader: a dispatch will want it soon.
+	if (CreateComputePipelineElsewhere(module, spirv, true)) {
+		return;
+	}
+	if (m_async_threads.empty()) {
+		// Nobody creates it ahead: the manifest or the dispatch does.
+		std::lock_guard lock(m_async_mutex);
+		m_async_pending_compute.erase(module.id);
+		m_claimed_compute.erase(module.id);
+		return;
+	}
 	QueueAsyncPipeline({.compute = true, .module = &module});
+}
+
+void PipelineCache::StartHelpers() {
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	m_helpers = PipelineHelpers::Start(m_graphics, PipelineHelperProcesses(m_graphics),
+	                                   [this](PipelineHelpers::Result&& result) {
+		                                   OnHelperResult(std::move(result));
+	                                   });
+}
+
+void PipelineCache::StopHelpers() {
+	if (m_helpers == nullptr) {
+		return;
+	}
+	m_helpers->LogProgress();
+	PipelineCacheLog("Pipeline helpers: {} compute pipelines found in the driver cache, {} created "
+	                 "from a helper's cache data, {} compiled here after a helper failed, {} taken "
+	                 "back by a dispatch",
+	                 m_helper_found.load(), m_helper_created.load(), m_helper_compiled_here.load(),
+	                 m_helper_taken_back.load());
+	m_helpers.reset();
+}
+
+bool PipelineCache::CreateComputePipelineElsewhere(const ShaderModule&          module,
+                                                   const std::vector<uint32_t>& spirv, bool urgent) {
+	if (m_helpers == nullptr || spirv.empty()) {
+		return false;
+	}
+	const auto started = std::chrono::steady_clock::now();
+	Pipeline   pipeline;
+	if (FindComputePipeline(m_graphics, pipeline, module, m_driver_cache)) {
+		m_helper_found++;
+		PublishComputePipeline(module, pipeline, started);
+		return true;
+	}
+	{
+		std::lock_guard lock(m_async_mutex);
+		m_helper_jobs.emplace(module.id, &module);
+	}
+	m_helpers->Queue(module.id, EncodeComputeModule(module, spirv), urgent);
+	return true;
+}
+
+void PipelineCache::OnHelperResult(PipelineHelpers::Result&& result) {
+	const ShaderModule* module = nullptr;
+	{
+		std::lock_guard lock(m_async_mutex);
+		const auto      job = m_helper_jobs.find(result.ticket);
+		// A dispatch took it back.
+		if (job == m_helper_jobs.end()) {
+			return;
+		}
+		module = job->second;
+		m_helper_jobs.erase(job);
+	}
+	const auto started = std::chrono::steady_clock::now();
+	Pipeline   pipeline;
+	bool       found = false;
+	if (result.ok && !result.cache_data.empty()) {
+		vk::PipelineCacheCreateInfo create {};
+		create.initialDataSize  = result.cache_data.size();
+		create.pInitialData     = result.cache_data.data();
+		vk::PipelineCache cache = nullptr;
+		if (m_graphics.device.createPipelineCache(&create, nullptr, &cache) == vk::Result::eSuccess) {
+			found = FindComputePipeline(m_graphics, pipeline, *module, cache);
+			if (found) {
+				std::lock_guard lock(m_helper_caches_mutex);
+				m_helper_caches.push_back(cache);
+			} else {
+				m_graphics.device.destroyPipelineCache(cache, nullptr);
+			}
+		}
+	}
+	if (found) {
+		m_helper_created++;
+	} else {
+		// The helper failed, or its pipeline is not one this device finds: created here.
+		m_helper_compiled_here++;
+		Common::SoftExitScope soft_exit;
+		try {
+			CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
+		} catch (const std::exception& error) {
+			PipelineCacheLog("Pipeline helpers: cs {:016x}: {}", module->info.shader_hash, error.what());
+			pipeline = {};
+		}
+	}
+	PublishComputePipeline(*module, pipeline, started);
+}
+
+void PipelineCache::PublishComputePipeline(const ShaderModule& module, const Pipeline& pipeline,
+                                           std::chrono::steady_clock::time_point started) {
+	const bool created = pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
+	if (created) {
+		NoteCreatedPipeline(started);
+	}
+	std::lock_guard lock(m_async_mutex);
+	if (created) {
+		m_async_ready_compute.try_emplace(module.id, pipeline);
+	} else {
+		// A dispatch creates it, and reports the error.
+		m_claimed_compute.erase(module.id);
+	}
+	m_async_pending_compute.erase(module.id);
 }
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -2393,8 +2559,27 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 				ClaimComputePipeline(module.id);
 				break;
 			}
+			// A helper's job still queued is created here. Once a helper has it, its result is
+			// awaited: creating it again here would start from nothing (GTA V's take up to ~90 s),
+			// and a helper that returns nothing for a long time is ended, and its job created by
+			// OnHelperResult.
+			bool in_helper = false;
+			if (const auto job = m_helper_jobs.find(module.id); job != m_helper_jobs.end()) {
+				if (m_helpers->Withdraw(module.id)) {
+					m_helper_jobs.erase(job);
+					m_async_pending_compute.erase(module.id);
+					ClaimComputePipeline(module.id);
+					m_helper_taken_back++;
+					break;
+				}
+				in_helper = true;
+			}
 			lock.unlock();
-			std::this_thread::yield();
+			if (in_helper) {
+				std::this_thread::sleep_for(HelperPoll);
+			} else {
+				std::this_thread::yield();
+			}
 			lock.lock();
 		}
 	}

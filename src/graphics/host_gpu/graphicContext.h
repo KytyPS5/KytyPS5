@@ -45,6 +45,8 @@ struct GraphicContext {
 	// Draws whose arguments the GPU writes read them on the GPU (vkCmdDraw*Indirect*).
 	bool                               indirect_draws_enabled                = false;
 	bool                               supports_block_texel_view              = false;
+	// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (pipelineCreationCacheControl).
+	bool                               pipeline_cache_lookup_enabled          = false;
 	bool                                      mesh_shader_enabled                   = false;
 	// VK_KHR_acceleration_structure + VK_KHR_ray_query (see NativeRayTracing).
 	bool                                      native_ray_tracing_enabled            = false;

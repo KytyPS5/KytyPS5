@@ -35,6 +35,10 @@ public:
 	~ImageHeap();
 	KYTY_CLASS_NO_COPY(ImageHeap);
 
+	// The descriptor set layout of the array (GraphicContext::image_heap_layout), which pipelines
+	// whose programs use the heap take as their second set.
+	[[nodiscard]] static vk::DescriptorSetLayout CreateLayout(vk::Device device);
+
 	// Starts a draw or dispatch, before its programs acquire views.
 	void BeginDraw() { ++m_draw; }
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,

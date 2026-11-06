@@ -4,6 +4,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineHelpers.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -558,6 +559,17 @@ static void ReportUncaughtException() {
 
 static int Main(int argc, char* argv[]) {
 	std::set_terminate(ReportUncaughtException);
+	// A pipeline helper of an emulator (see PipelineHelpers): its spec, then the emulator's own
+	// options, for the device.
+	if (argc >= 3 && std::string_view(argv[1]) == "--pipeline-helper") {
+		InitializeThreads();
+		std::vector<char*> arguments {argv[0]};
+		arguments.insert(arguments.end(), argv + 3, argv + argc);
+		RunOptions options;
+		bool       show_help = false;
+		(void)ParseArgs(static_cast<int>(arguments.size()), arguments.data(), options, show_help);
+		return Libs::Graphics::RunPipelineHelper(argv[2], options.config);
+	}
 	// After a LoadExec, the guest memory of the process that started this one must be gone first.
 	Emulator::WaitForLoadExecParent();
 	InitializeThreads();

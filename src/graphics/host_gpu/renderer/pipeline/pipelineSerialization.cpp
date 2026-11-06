@@ -320,6 +320,22 @@ void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo&
 	m_store.Append(std::move(record.bytes));
 }
 
+std::vector<uint8_t> EncodeComputeModule(const ShaderModule& module, const std::vector<uint32_t>& spirv) {
+	Writer record;
+	IoModule(record, module);
+	IoAll(record, spirv);
+	return std::move(record.bytes);
+}
+
+bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
+                         std::vector<uint32_t>& spirv) {
+	Reader reader {bytes};
+	IoModule(reader, module);
+	IoAll(reader, spirv);
+	module.spirv_words = static_cast<uint32_t>(spirv.size());
+	return reader.ok && reader.bytes.empty() && module.info.stage == ShaderType::Compute;
+}
+
 PipelineCache::ModuleMap PipelineCache::MapModules() const {
 	ModuleMap modules {{0, nullptr}};
 	for (const auto& program: m_program_cache | std::views::values) {

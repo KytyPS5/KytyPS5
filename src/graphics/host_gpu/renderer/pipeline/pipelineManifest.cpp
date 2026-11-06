@@ -1773,6 +1773,9 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	options.back_code       = back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	// The SPIR-V of the module this thread builds (none for one another thread compiled).
+	std::vector<uint32_t> spirv;
+	std::vector<uint32_t> plain_spirv;
 
 	const auto finish = [&](const ShaderModule* module, bool built) {
 		const auto elapsed =
@@ -1803,7 +1806,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		}
 		state.available.notify_all();
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-			CreateManifestComputePipeline(*module);
+			CreateManifestComputePipeline(*module, built ? spirv : std::vector<uint32_t> {});
 		}
 	};
 	const ShaderModule* compiled = nullptr;
@@ -1820,10 +1823,8 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		finish(nullptr, false);
 		return;
 	}
-	auto                  translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-	auto                  plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-	std::vector<uint32_t> spirv;
-	std::vector<uint32_t> plain_spirv;
+	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 	auto module = BuildModule(key, options, std::move(translated), record.specialization, {},
 	                          record.push_data_cursor, spirv, plain_spirv);
 	bool added  = false;
@@ -1905,13 +1906,18 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 	                                               .count());
 }
 
-void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module) {
+void PipelineCache::CreateManifestComputePipeline(const ShaderModule&          module,
+                                                  const std::vector<uint32_t>& spirv) {
 	{
 		std::scoped_lock lock(m_async_mutex);
 		if (!m_claimed_compute.insert(module.id).second) {
 			return;
 		}
 		m_async_pending_compute.insert(module.id);
+	}
+	// Helper processes compile it, side by side (see PipelineHelpers).
+	if (CreateComputePipelineElsewhere(module, spirv, false)) {
+		return;
 	}
 	const auto start = std::chrono::steady_clock::now();
 	Pipeline   pipeline;

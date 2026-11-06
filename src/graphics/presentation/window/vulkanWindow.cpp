@@ -35,6 +35,11 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 // IWYU pragma: no_include <intrin.h>
 
 namespace Libs::Graphics {
@@ -641,6 +646,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		features13.shaderIntegerDotProduct     = supported13.shaderIntegerDotProduct;
 		features13.computeFullSubgroups        = supported13.computeFullSubgroups;
 	}
+	// Looks a pipeline up in a cache without compiling it (see PipelineHelpers).
+	features13.pipelineCreationCacheControl = supported13.pipelineCreationCacheControl;
+	graphics.pipeline_cache_lookup_enabled  = supported13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -817,6 +825,28 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 			r.enable_validation_layers = false;
 		}
 	}
+}
+
+// The device extensions every device needs; VulkanCreateDevice() adds the optional ones the
+// device has.
+static std::vector<const char*> RequiredDeviceExtensions() {
+	std::vector<const char*> device_extensions = {
+	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
+
+#if defined(__APPLE__)
+	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
+	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
+	device_extensions.push_back("VK_KHR_portability_subset");
+#else
+	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+#endif
+
+	if (Config::SpirvDebugPrintfEnabled()) {
+		device_extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+	}
+	return device_extensions;
 }
 
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
@@ -1004,22 +1034,7 @@ void WindowContext::CreateVulkan() {
 
 	RecreateSurface();
 
-	std::vector<const char*> device_extensions = {
-	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
-
-#if defined(__APPLE__)
-	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
-	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
-	device_extensions.push_back("VK_KHR_portability_subset");
-#else
-	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-#endif
-
-	if (Config::SpirvDebugPrintfEnabled()) {
-		device_extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
-	}
+	auto device_extensions = RequiredDeviceExtensions();
 
 	std::string rejected_devices;
 	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions,
@@ -1065,6 +1080,111 @@ void WindowContext::CreateVulkan() {
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
 	Vr::OpenXrStartSession(graphic_ctx);
+}
+
+VulkanDeviceIdentity GetVulkanDeviceIdentity(const GraphicContext& graphics) {
+	const auto&          properties = graphics.GetPhysicalDeviceProperties();
+	VulkanDeviceIdentity identity {.vendor_id      = properties.vendorID,
+	                               .device_id      = properties.deviceID,
+	                               .driver_version = properties.driverVersion,
+	                               .queue_family   = graphics.queue_family};
+	std::memcpy(identity.cache_uuid.data(), properties.pipelineCacheUUID.data(),
+	            identity.cache_uuid.size());
+	return identity;
+}
+
+bool CreateHeadlessVulkan(GraphicContext& graphics, const VulkanDeviceIdentity* identity,
+                          std::string& error) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// No SDL video here: the loader the window would load.
+	HMODULE library = ::LoadLibraryW(L"vulkan-1.dll");
+	if (library == nullptr) {
+		error = "vulkan-1.dll not found";
+		return false;
+	}
+	auto get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+	    reinterpret_cast<void*>(::GetProcAddress(library, "vkGetInstanceProcAddr")));
+	if (get_instance_proc_addr == nullptr) {
+		error = "vkGetInstanceProcAddr not found";
+		return false;
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	VulkanCheckInstanceVersion();
+
+	const vk::ApplicationInfo app_info {.pApplicationName   = "Kyty",
+	                                    .applicationVersion = 1,
+	                                    .pEngineName        = "Kyty",
+	                                    .engineVersion      = 1,
+	                                    .apiVersion         = VULKAN_TARGET_API_VERSION};
+	// The surface extensions the window's instance has: the device enables VK_KHR_swapchain.
+	const auto available = EnumerateVulkan<vk::ExtensionProperties>(
+	    "vkEnumerateInstanceExtensionProperties", [](uint32_t* count, vk::ExtensionProperties* values) {
+		    return vk::enumerateInstanceExtensionProperties(nullptr, count, values);
+	    });
+	std::vector<const char*> extensions;
+	for (const char* name: {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_win32_surface"}) {
+		if (HasExtension(available, name)) {
+			extensions.push_back(name);
+		}
+	}
+	vk::InstanceCreateInfo inst_info {};
+	inst_info.pApplicationInfo        = &app_info;
+	inst_info.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
+	inst_info.ppEnabledExtensionNames = extensions.data();
+	if (vk::createInstance(&inst_info, nullptr, &graphics.instance) != vk::Result::eSuccess) {
+		error = "vkCreateInstance failed";
+		return false;
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.instance);
+
+	const auto devices = EnumerateVulkan<vk::PhysicalDevice>(
+	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
+		    return graphics.instance.enumeratePhysicalDevices(count, values);
+	    });
+	for (const auto& device: devices) {
+		vk::PhysicalDeviceProperties properties {};
+		device.getProperties(&properties);
+		if (identity == nullptr) {
+			if (graphics.physical_device == nullptr ||
+			    properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+				graphics.physical_device = device;
+			}
+			continue;
+		}
+		if (properties.vendorID == identity->vendor_id && properties.deviceID == identity->device_id &&
+		    properties.driverVersion == identity->driver_version &&
+		    std::memcmp(properties.pipelineCacheUUID.data(), identity->cache_uuid.data(),
+		                identity->cache_uuid.size()) == 0) {
+			graphics.physical_device = device;
+			break;
+		}
+	}
+	if (graphics.physical_device == nullptr) {
+		error = "the emulator's GPU was not found";
+		return false;
+	}
+	if (identity != nullptr) {
+		graphics.queue_family = identity->queue_family;
+	} else {
+		const auto families = graphics.physical_device.getQueueFamilyProperties();
+		const auto required = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute;
+		for (uint32_t family = 0; family < families.size(); family++) {
+			if ((families[family].queueFlags & required) == required) {
+				graphics.queue_family = family;
+				break;
+			}
+		}
+	}
+	graphics.physical_device.getMemoryProperties(&graphics.physical_device_memory_properties);
+	graphics.device = VulkanCreateDevice(graphics, RequiredDeviceExtensions());
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
+	return true;
+#else
+	(void)graphics;
+	(void)identity;
+	error = "not supported on this platform";
+	return false;
+#endif
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {

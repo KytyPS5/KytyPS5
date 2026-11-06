@@ -495,6 +495,14 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	return ballot;
 }
 
+uint32_t ValueEmitContext::BallotOf(uint32_t predicate) {
+	// A wide wave32 context never has a peer half, so the hardware ballot is one instruction.
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+	return ballot;
+}
+
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	// An empty ballot (EXEC zero) gives lane 0, which V_READFIRSTLANE reads on hardware. FindILsb
 	// returns -1 for zero, unlike BallotFindLSB, whose result is then undefined.

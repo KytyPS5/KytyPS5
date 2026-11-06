@@ -46630,6 +46630,57 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     CompareWords(test, "selected dimensions, mip levels and unmapped root", test.expected, actual);
   }
   std::printf("[compute] %-32s ok\n", test.name);
+  // A candidate run longer than the shared-query budget folds into one loop, so its "does any
+  // lane want this descriptor" gate is a vote. On a wider native subgroup that vote must only
+  // read the caller's ballot word, or the other wave would keep the loop body alive.
+  {
+    const auto saved_images = compiled.program.info.images;
+    auto long_root = saved_images[0];
+    long_root.indirect_search_iterations = 0;
+    long_root.indirect_resources = {0u};
+    auto child = saved_images[1];
+    child.indirect_root = ImageResource::NoIndirectImage;
+    child.indirect_search_iterations = 0;
+    child.indirect_resources.clear();
+    child.dimension = long_root.dimension;
+    child.cube = long_root.cube;
+    for (u32 ordinal = 1; ordinal <= 18u; ++ordinal) {
+      auto candidate_child = child;
+      candidate_child.descriptor_index = ordinal - 1u;
+      long_root.indirect_resources.push_back(
+          static_cast<u32>(compiled.program.info.images.size()));
+      compiled.program.info.images.push_back(candidate_child);
+    }
+    compiled.program.info.images[0] = long_root;
+    compiled.program.wave_size = 32u;
+    compute.wave_size = 32u;
+    compute.threads_num[0] = 32u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.host_subgroup_size = 64u;
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    ValidateSpirv(test.name, compiled.spirv);
+    Require(test.name, "shared query vote disassembly",
+            tools.Disassemble(compiled.spirv, &text),
+            "failed to disassemble the shared indirect query");
+    Require(test.name, "shared query vote stays in the caller's wave",
+            text.find("OpGroupNonUniformAny") == std::string::npos &&
+                CountText(text, "OpGroupNonUniformBallot") == 1u &&
+                CountText(text, "OpImageQuerySizeLod") == 2u,
+            "the shared indirect query voted across the whole native subgroup");
+    compute.host_subgroup_size = 32u;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    ValidateSpirv(test.name, compiled.spirv);
+    Require(test.name, "native subgroup query vote",
+            tools.Disassemble(compiled.spirv, &text) &&
+                text.find("OpGroupNonUniformAny") != std::string::npos,
+            "a 32-lane host lost the native subgroup vote");
+    compiled.program.info.images = saved_images;
+    compute.host_subgroup_size = vulkan.SubgroupSize();
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
+  }
   query_store.Invalidate();
   compiled.program.info.images[3].numeric_class = Prospero::TextureNumericClass::Float;
   vulkan.Device().destroySampler(native_sampler);

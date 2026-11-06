@@ -832,6 +832,7 @@ struct Http2Request {
 	uint64_t                                         content_length = 0;
 	std::vector<std::pair<std::string, std::string>> headers;
 	int                                              send_result = HTTP2_ERROR_BEFORE_SEND;
+	bool                                             aborted     = false;
 	int                                              status_code = 0;
 	std::string                                      response_headers;
 	std::string                                      response_body;
@@ -1283,6 +1284,13 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	// An aborted request never reached the send step, so it keeps the result it already
+	// carries instead of being moved to a timeout. The console's own code for this case
+	// is not published.
+	if (request->second.aborted) {
+		return request->second.send_result;
+	}
+
 	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
 	return request->second.send_result;
@@ -1312,6 +1320,13 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.aborted) {
+		request->second.async_result = request->second.send_result;
+		request->second.async_event  = 0;
+		Http2TriggerUserEvent(kqueue_option);
+		return 0;
 	}
 
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
@@ -1512,11 +1527,16 @@ static int KYTY_SYSV_ABI Http2AbortRequest(int req_id) {
 
 	LOGF("\t req_id = %d\n", req_id);
 
-	// Requests stop at the send step here, so an abort has nothing to cancel. It still
-	// reports the same thing the library does: unknown ids fail, known ones succeed.
+	// Abort only moves an unsent request to an aborted state; DeleteRequest is still
+	// the call that frees it. A request that already reached the send step keeps its
+	// result.
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.send_result == HTTP2_ERROR_BEFORE_SEND) {
+		request->second.aborted = true;
 	}
 
 	return 0;

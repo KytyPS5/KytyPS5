@@ -38,7 +38,13 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 	entry[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
-	const auto read     = [&](const Operand& operand) -> Address {
+	// The packed HS ID holds the patch ordinal in bits 7:0 and the control point ID in bits
+	// 12:8. Addresses vary with the control point ID at patch 0, as the frontend initializes v1,
+	// or with the patch ordinal when one output control point makes each HS lane one patch.
+	const bool single = !local && control_points == 1u;
+	const auto patch  = single ? Address {Kind::Affine, 1u, 0u} : constant(0u);
+	const auto point  = single ? constant(0u) : Address {Kind::Affine, 1u, 0u};
+	const auto read   = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
 			return {};
@@ -49,9 +55,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		} else if (operand.kind == OperandKind::Vgpr) {
 			value = registers.at(operand.reg);
 		}
-		// The native packed HS ID's low byte is the patch ordinal. The logical
-		// interface addresses one patch, as in the frontend's v1 initialization.
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
+		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return patch;
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -77,13 +81,10 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		                             : Address {};
 	};
 	const auto low24 = [&](Address value) {
-		if (value.kind == Kind::Affine && value.coefficient == 0u)
-			return constant(value.constant & 0xffffffu);
-		return value.kind == Kind::Affine &&
-		               uint64_t {value.coefficient} * (control_points - 1u) + value.constant <=
-		                   0xffffffu
-		           ? value
-		           : Address {};
+		if (value.kind != Kind::Affine) return Address {};
+		if (value.coefficient == 0u) return constant(value.constant & 0xffffffu);
+		const uint64_t maximum = single ? 0xffu : control_points - 1u;
+		return value.coefficient * maximum + value.constant <= 0xffffffu ? value : Address {};
 	};
 	// A branch joins its target with the fallthrough path. Definitions that differ between
 	// the paths are unknown there. Loop headers repeat the walk until back edges are stable.
@@ -129,12 +130,12 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					EXIT("%s tessellation address is not affine at pc 0x%08x\n",
 					     local ? "LS" : "HS", inst.pc);
 				}
-				if (address.coefficient != 0u) {
+				if (static_cast<int32_t>(address.coefficient) > 0) {
 					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
 					                     (stride != 0u && stride != address.coefficient));
 					stride = address.coefficient;
 				} else if (control_store) {
-					// Control-point-independent HS outputs are patch constants.
+					// Other HS outputs are patch constants; later patches sit lower in the ring.
 					const auto begin = address.constant + inst.offset;
 					patch_begin      = std::min(patch_begin, begin);
 					patch_end        = std::max(patch_end, begin + 4u * inst.data_dwords);
@@ -151,17 +152,16 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
 					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
 					    third.coefficient == 0u) {
-						if (rhs.constant == 8u && third.constant == 5u)
-							value = {Kind::Affine, 1u, 0u};
-						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+						if (rhs.constant == 8u && third.constant == 5u) value = point;
+						if (rhs.constant == 0u && third.constant == 8u) value = patch;
 					}
 					break;
 				case Opcode::V_AND_B32: {
 					const auto mask = lhs.kind == Kind::PackedControlPoint ? rhs
 					                : rhs.kind == Kind::PackedControlPoint ? lhs
 					                                                       : Address {};
-					if (mask == constant(0xffu)) value = constant(0u);
-					if (mask == constant(0x1f00u)) value = {Kind::Affine, 256u, 0u};
+					if (mask == constant(0xffu)) value = patch;
+					if (mask == constant(0x1f00u)) value = multiply(point, constant(256u));
 					break;
 				}
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
@@ -180,9 +180,9 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					break;
 				case Opcode::V_SUB_NC_U32:
 					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-					    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-						value =
-						    affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
+					    lhs.constant >= rhs.constant)
+						value = {Kind::Affine, lhs.coefficient - rhs.coefficient,
+						         lhs.constant - rhs.constant};
 					break;
 				default: break;
 			}

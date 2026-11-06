@@ -20455,6 +20455,48 @@ public:
               "the draw's cull mode or front face did not reach the host GPU");
       registers.SetModeControl({});
 
+      // DRAW_INDEX_MULTI_INST draws the packet's instance count, not NUM_INSTANCES; only
+      // instance 1 covers the target, and zero instances draw nothing.
+      {
+        static const auto second_instance_vertex = [] {
+          auto code = native_vertex;
+          code.insert(std::ranges::find(code, EncodeExp0(0x0c, 0xf)),
+                      {EncodeVopc(0xc2, InlineU32(1), 8), EncodeVop2(0x01, 3, Vgpr(1), 3),
+                       EncodeVop2(0x01, 4, Vgpr(1), 4)});
+          return code;
+        }();
+        const auto second_instance_vs = reinterpret_cast<uint64_t>(second_instance_vertex.data());
+        ShaderMapUserData(second_instance_vs,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+             .code_size_bytes =
+                 static_cast<uint32_t>(second_instance_vertex.size() * sizeof(u32))});
+        shaders.SetEsShaderBase(second_instance_vs);
+        CommandProcessor processor(context, 0);
+        processor.SetIndexType(1);
+        // Zeroed guest memory: read as indices, the table draws no triangle.
+        constexpr uint64_t object_ids_address = index_address + 0x100;
+        for (const auto [instances, num_instances] : {std::pair{2u, 1u}, std::pair{0u, 2u}}) {
+          processor.SetNumInstances(num_instances);
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const std::array<uint32_t, 9> packet{
+              KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0), instances,
+              static_cast<uint32_t>(object_ids_address),
+              static_cast<uint32_t>(object_ids_address >> 32u), 3,
+              static_cast<uint32_t>(index_address), static_cast<uint32_t>(index_address >> 32u),
+              3, 0x80};
+          Pm4Execution execution;
+          const bool complete =
+              processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          const bool drawn = std::ranges::any_of(pixels, [](u32 word) { return word != 0; });
+          Require("DrawIndexMultiInst", instances != 0 ? "instances" : "no instances",
+                  complete && drawn == (instances != 0),
+                  "the packet's instance count, index buffer or index count was misread");
+        }
+      }
+
       // Indirect records come from the GPU copy; the CPU backing holds zeros. Embedded
       // fetches use vertex offset 7. Native shaders receive raw vertex/instance IDs when
       // the packet does not patch either offset SGPR, even with nonzero record offsets.

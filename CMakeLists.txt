@@ -813,6 +813,19 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+# Optimizing this 57 000-line file was the longest step of the build. The code it tests is in the
+# emulator objects; the file itself only builds the cases and checks their results. Unoptimized,
+# main() keeps a stack slot for every case it builds (750 KB): on Windows the test gets the 8 MB
+# main thread stack that Linux and macOS give by default.
+if(KYTY_CLANG_CL)
+	set_source_files_properties("${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp" PROPERTIES COMPILE_OPTIONS /Od)
+	target_link_options(shader_recompiler_compute_tests PRIVATE /STACK:8388608)
+else()
+	set_source_files_properties("${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp" PROPERTIES COMPILE_OPTIONS -O0)
+	if(WIN32)
+		target_link_options(shader_recompiler_compute_tests PRIVATE -Wl,--stack,8388608)
+	endif()
+endif()
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 foreach(test_shader gpu_test_ms_depth gpu_test_ray_query)

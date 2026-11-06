@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <cstdint>
+#include <vector>
+
 // IWYU pragma: no_include <pthread.h>
 
 extern "C" {
@@ -115,6 +118,8 @@ void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
+// The host thread ids of the guest's live threads, its main thread included.
+std::vector<uint64_t>  PthreadGuestHostThreadIds();
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);

@@ -125,6 +125,10 @@ static void PrintUsage() {
 	         "                                       title's pipeline manifest ahead of their draws.\n");
 	::printf("  --record-pipeline-manifest           Add the shaders and pipelines this session creates\n"
 	         "                                       to the title's manifest in _PipelineCache.\n");
+	::printf("  --pipeline-precompile <value>        When the pipelines to compile ahead of the game\n"
+	         "                                       would take long: ask whether to wait for them,\n"
+	         "                                       wait, or play at once (ask, wait, play).\n"
+	         "                                       Default: ask.\n");
 	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
 	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
@@ -483,6 +487,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
 		} else if (arg == "--fsr-folder") {
 			options.config.fsr_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--pipeline-precompile") {
+			if (value == "ask") {
+				options.config.pipeline_precompile = Config::PipelinePrecompile::Ask;
+			} else if (value == "wait") {
+				options.config.pipeline_precompile = Config::PipelinePrecompile::Wait;
+			} else if (value == "play") {
+				options.config.pipeline_precompile = Config::PipelinePrecompile::Play;
+			} else {
+				::printf("invalid pipeline precompile mode (ask, wait or play): %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());

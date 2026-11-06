@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/precompileNotice.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -710,14 +711,17 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled,
+	            cursor.enabled || PrecompileNoticeVisible(),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
-	            PerformanceOverlayRevision()};
+	            PerformanceOverlayRevision() + PrecompileNoticeRevision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
+	if (ProcessPrecompileNoticeInput(event)) {
+		return true;
+	}
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
 		VisibilityUpdate update {};
 		{
@@ -1802,7 +1806,8 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
+		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
+		    !PrecompileNoticeVisible()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1843,6 +1848,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now, performance_bottom);
+		DrawPrecompileNotice(frame_extent);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;

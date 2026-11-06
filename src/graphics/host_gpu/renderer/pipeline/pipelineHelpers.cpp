@@ -24,8 +24,9 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <ranges>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -43,6 +44,10 @@ namespace {
 constexpr uint32_t PipelinesPerHelper = 100;
 // Pipelines a helper is given at once: one, so that urgent jobs wait for no queued job.
 constexpr uint32_t JobsPerHelper = 1;
+// A module this large (64k words of SPIR-V), and the least its pipeline is taken to need per byte
+// (see Impl::Expected()).
+constexpr size_t LargeJobBytes   = 256u * 1024u;
+constexpr double LargeJobSeconds = 15e-6;
 // A helper without work for this long exits.
 constexpr auto IdleHelper = std::chrono::seconds(20);
 // After this many helpers that ended without a result, no more are started.
@@ -243,7 +248,10 @@ struct PipelineHelpers::Impl {
 		HANDLE                       results   = nullptr; // Our end of its result pipe.
 		std::filesystem::path        disk_cache;
 		std::thread                  reader;
-		std::unordered_set<uint64_t> in_flight;
+		// The jobs it was sent and has not answered, with when they were sent.
+		std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> in_flight;
+		// Their sizes (Job::module).
+		std::unordered_map<uint64_t, size_t>                                in_flight_bytes;
 		uint32_t                     sent     = 0;
 		uint32_t                     results_received = 0;
 		bool                         retiring = false; // Gets no more jobs.
@@ -272,6 +280,25 @@ struct PipelineHelpers::Impl {
 	uint64_t                             done     = 0;
 	uint64_t                             failed   = 0;
 	uint64_t                             withdrawn = 0;
+	// What a helper took per pipeline lately.
+	PrecompileMean                       job_time;
+	// The time and the size of the helpers' latest pipelines (older ones count less and less).
+	double                               sized_seconds = 0.0;
+	double                               sized_bytes   = 0.0;
+	uint32_t                             sized_jobs    = 0;
+
+	// What a job of `bytes` takes, by the latest pipelines; 0 before a few results. A large one
+	// takes at least LargeJobSeconds a byte, whatever the latest took: the driver's time grows
+	// faster than the size, and the small pipelines, which a title's helpers finish first, say
+	// nothing of its large ones (GTA V's helpers took ~3 us a byte for its 230 pipelines of up to
+	// 50k words of SPIR-V, and 20-75 us a byte for the 52 of 64k-570k words that were left).
+	[[nodiscard]] double Expected(size_t bytes) const {
+		constexpr uint32_t MinJobs = 8;
+		const double       size    = static_cast<double>(bytes);
+		const double       latest  =
+		    sized_jobs >= MinJobs && sized_bytes > 0.0 ? size * sized_seconds / sized_bytes : 0.0;
+		return bytes >= LargeJobBytes ? std::max(latest, size * LargeJobSeconds) : latest;
+	}
 	bool                                 stopping = false;
 	// Results and lost jobs are not reported any more.
 	std::atomic<bool>                    closing {false};
@@ -440,9 +467,23 @@ struct PipelineHelpers::Impl {
 			result.cache_data.assign(bytes.begin(), bytes.end());
 			{
 				std::scoped_lock lock(mutex);
-				helper.in_flight.erase(result.ticket);
+				const auto now  = std::chrono::steady_clock::now();
+				const auto sent = helper.in_flight.find(result.ticket);
+				if (sent != helper.in_flight.end()) {
+					const auto seconds = std::chrono::duration<double>(now - sent->second).count();
+					job_time.Add(seconds);
+					if (const auto bytes = helper.in_flight_bytes.find(result.ticket);
+					    bytes != helper.in_flight_bytes.end()) {
+						constexpr double Decay = 0.97;
+						sized_seconds = sized_seconds * Decay + seconds;
+						sized_bytes   = sized_bytes * Decay + static_cast<double>(bytes->second);
+						sized_jobs++;
+						helper.in_flight_bytes.erase(bytes);
+					}
+					helper.in_flight.erase(sent);
+				}
 				helper.results_received++;
-				helper.last_progress = std::chrono::steady_clock::now();
+				helper.last_progress = now;
 				(result.ok ? done : failed)++;
 			}
 			changed.notify_all();
@@ -454,8 +495,11 @@ struct PipelineHelpers::Impl {
 		{
 			std::scoped_lock lock(mutex);
 			helper.exited = true;
-			lost.assign(helper.in_flight.begin(), helper.in_flight.end());
+			for (const auto ticket: helper.in_flight | std::views::keys) {
+				lost.push_back(ticket);
+			}
 			helper.in_flight.clear();
+			helper.in_flight_bytes.clear();
 			failed += lost.size();
 			if (helper.results_received == 0) {
 				broken++;
@@ -515,6 +559,13 @@ struct PipelineHelpers::Impl {
 				lock.lock();
 				continue;
 			}
+			// More helpers than may run now (SetProcesses) get no more jobs.
+			uint32_t allowed = 0;
+			for (auto& helper: helpers) {
+				if (!helper->retiring && ++allowed > max_processes) {
+					helper->retiring = true;
+				}
+			}
 			// Helpers done with their share (or idle) get their job pipe closed and exit; one that
 			// is stuck is ended.
 			for (auto& helper: helpers) {
@@ -571,7 +622,8 @@ struct PipelineHelpers::Impl {
 				if (target->in_flight.empty()) {
 					target->last_progress = now;
 				}
-				target->in_flight.insert(job.ticket);
+				target->in_flight.emplace(job.ticket, now);
+				target->in_flight_bytes.emplace(job.ticket, job.module.size());
 				target->last_job = now;
 				if (++target->sent >= PipelinesPerHelper) {
 					target->retiring = true;
@@ -675,6 +727,39 @@ bool PipelineHelpers::Withdraw(uint64_t ticket) {
 	return true;
 }
 
+void PipelineHelpers::SetProcesses(uint32_t processes) {
+	{
+		std::scoped_lock lock(m_impl->mutex);
+		m_impl->max_processes = std::max(processes, 1u);
+	}
+	m_impl->changed.notify_all();
+}
+
+PipelineHelpers::Stats PipelineHelpers::GetStats() const {
+	std::scoped_lock lock(m_impl->mutex);
+	Stats stats {.queued      = m_impl->queued,
+	             .done        = m_impl->done,
+	             .failed      = m_impl->failed,
+	             .withdrawn   = m_impl->withdrawn,
+	             .waiting     = static_cast<uint32_t>(m_impl->queue.size()),
+	             .processes   = m_impl->max_processes,
+	             .job_seconds = m_impl->job_time.Get()};
+	const auto now = std::chrono::steady_clock::now();
+	for (const auto& helper: m_impl->helpers) {
+		for (const auto& [ticket, sent]: helper->in_flight) {
+			stats.running.push_back(std::chrono::duration<double>(now - sent).count());
+			const auto bytes = helper->in_flight_bytes.find(ticket);
+			stats.running_expected.push_back(
+			    bytes != helper->in_flight_bytes.end() ? m_impl->Expected(bytes->second) : 0.0);
+		}
+	}
+	for (const auto& job: m_impl->queue) {
+		stats.waiting_seconds += m_impl->Expected(job.module.size());
+	}
+	stats.in_flight = static_cast<uint32_t>(stats.running.size());
+	return stats;
+}
+
 void PipelineHelpers::LogProgress() const {
 	std::scoped_lock lock(m_impl->mutex);
 	HelperLog("Pipeline helpers: {} compute pipelines queued, {} compiled, {} failed, {} taken back, "
@@ -704,6 +789,27 @@ uint32_t PipelineHelperProcesses(const GraphicContext& graphics) {
 	// where the game needs the rest.
 	const auto processors = static_cast<uint32_t>(std::popcount(process_mask));
 	return processors / 2u > 2u ? processors / 2u - 2u : 1u;
+}
+
+uint32_t PipelineHelperProcessesAlone(uint32_t processes) {
+	if (std::getenv("KYTY_PIPELINE_HELPERS") != nullptr) {
+		return processes;
+	}
+	DWORD_PTR process_mask = 0;
+	DWORD_PTR system_mask  = 0;
+	if (!::GetProcessAffinityMask(::GetCurrentProcess(), &process_mask, &system_mask)) {
+		return processes;
+	}
+	const auto processors = static_cast<uint32_t>(std::popcount(process_mask));
+	auto       alone      = std::clamp(processors > 4u ? processors - 4u : 1u, processes, processes * 2u);
+	// A helper takes ~400 MB: the extra ones may take half the free memory.
+	MEMORYSTATUSEX memory {};
+	memory.dwLength = sizeof(memory);
+	if (::GlobalMemoryStatusEx(&memory) != 0) {
+		const auto extra = static_cast<uint32_t>(memory.ullAvailPhys / 2u / (512ull << 20u));
+		alone            = std::min(alone, processes + extra);
+	}
+	return alone;
 }
 
 // The helper process.
@@ -866,10 +972,20 @@ bool PipelineHelpers::Withdraw(uint64_t /*ticket*/) {
 	return false;
 }
 
+void PipelineHelpers::SetProcesses(uint32_t /*processes*/) {}
+
+PipelineHelpers::Stats PipelineHelpers::GetStats() const {
+	return {};
+}
+
 void PipelineHelpers::LogProgress() const {}
 
 uint32_t PipelineHelperProcesses(const GraphicContext& /*graphics*/) {
 	return 0;
+}
+
+uint32_t PipelineHelperProcessesAlone(uint32_t processes) {
+	return processes;
 }
 
 int RunPipelineHelper(std::string_view /*spec*/, Config::ConfigOptions /*config*/) {

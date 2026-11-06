@@ -186,6 +186,10 @@ bool PipelineManifestRecord() {
 	return g_config->pipeline_manifest_record;
 }
 
+PipelinePrecompile GetPipelinePrecompile() {
+	return g_config->pipeline_precompile;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }

@@ -1625,6 +1625,23 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	return nullptr;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> RuntimeLinker::GetCodeRanges() {
+	Common::LockGuard lock(m_mutex);
+
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	for (const auto* p: m_programs) {
+		const auto* ehdr = p->elf->GetEhdr();
+		const auto* phdr = p->elf->GetPhdr();
+		for (Elf64_Half i = 0; ehdr != nullptr && phdr != nullptr && i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X) != 0 && phdr[i].p_memsz != 0) {
+				const uint64_t begin = phdr[i].p_vaddr + p->base_vaddr;
+				ranges.emplace_back(begin, begin + GetAlignedSize(phdr + i));
+			}
+		}
+	}
+	return ranges;
+}
+
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	Common::LockGuard lock(m_mutex);
 

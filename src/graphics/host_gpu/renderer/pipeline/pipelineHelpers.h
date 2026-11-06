@@ -55,6 +55,30 @@ public:
 	bool Withdraw(uint64_t ticket);
 	// Writes the counts to the log.
 	void LogProgress() const;
+	// How many helpers may run at once from now on; with fewer, the others exit after their job.
+	void SetProcesses(uint32_t processes);
+
+	struct Stats {
+		uint64_t queued    = 0;
+		uint64_t done      = 0;
+		uint64_t failed    = 0;
+		uint64_t withdrawn = 0;
+		// Jobs no helper was sent yet, and jobs sent that have no result yet.
+		uint32_t waiting   = 0;
+		uint32_t in_flight = 0;
+		// Helpers that may run at once.
+		uint32_t processes = 0;
+		// The time a helper took per pipeline lately; 0 before a few results.
+		double   job_seconds = 0.0;
+		// How long each of the jobs sent has run, in seconds.
+		std::vector<double> running;
+		// What the jobs take by their size, as the helpers' pipelines took lately (the driver's time
+		// follows the size of the SPIR-V: a title's largest pipelines take a hundred times the mean):
+		// each of the jobs sent, as `running`, and all the waiting ones. 0 before a few results.
+		std::vector<double> running_expected;
+		double              waiting_seconds = 0.0;
+	};
+	[[nodiscard]] Stats GetStats() const;
 
 	struct Impl;
 
@@ -66,6 +90,11 @@ private:
 // How many helpers the emulator starts: KYTY_PIPELINE_HELPERS=<n> (0 turns them off), else, with
 // NVIDIA's driver, two fewer than half the logical processors (10 of 24); none with other drivers.
 [[nodiscard]] uint32_t PipelineHelperProcesses(const GraphicContext& graphics);
+
+// How many helpers may run while the game is stopped (PipelineCache::Precompile): all the
+// processors but four, at most twice `processes` (the count while it runs) and as many more as half
+// the free memory holds; `processes` with KYTY_PIPELINE_HELPERS.
+[[nodiscard]] uint32_t PipelineHelperProcessesAlone(uint32_t processes);
 
 // The helper process: --pipeline-helper <spec>, then the emulator's own options (`config`, for
 // the device). Returns the exit code.

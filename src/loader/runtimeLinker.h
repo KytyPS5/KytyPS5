@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Loader {
@@ -177,6 +178,8 @@ public:
 
 	static uint64_t ReadFromElf(Program* program, uint64_t vaddr);
 	Program*        FindProgramByAddr(uint64_t vaddr);
+	// The address ranges [begin, end) of the executable segments of the loaded programs.
+	std::vector<std::pair<uint64_t, uint64_t>> GetCodeRanges();
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
 

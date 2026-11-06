@@ -17,6 +17,8 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -38,6 +40,17 @@ struct DriverCreation {
 
 thread_local DriverCreation t_driver_creation;
 
+// When each pipeline the driver is creating in this process began (steady clock, ns; 0 is a free
+// slot), whichever thread creates it: the game's, a background or manifest thread.
+constexpr size_t                                   MaxDriverCreations = 64;
+std::array<std::atomic<int64_t>, MaxDriverCreations> g_driver_creations {};
+
+int64_t SteadyNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
 class ScopedDriverCreation {
 public:
 	ScopedDriverCreation(const std::array<const char*, 4>& names,
@@ -47,14 +60,48 @@ public:
 			t_driver_creation.names[i]  = names[i];
 			t_driver_creation.hashes[i] = hashes[i];
 		}
+		const int64_t now = SteadyNs();
+		for (size_t i = 0; i < MaxDriverCreations; i++) {
+			int64_t free = 0;
+			if (g_driver_creations[i].compare_exchange_strong(free, now, std::memory_order_acq_rel)) {
+				m_slot = static_cast<int>(i);
+				break;
+			}
+		}
 	}
-	~ScopedDriverCreation() { t_driver_creation = {}; }
+	~ScopedDriverCreation() {
+		t_driver_creation = {};
+		if (m_slot >= 0) {
+			g_driver_creations[static_cast<size_t>(m_slot)].store(0, std::memory_order_release);
+		}
+	}
 
 	ScopedDriverCreation(const ScopedDriverCreation&)            = delete;
 	ScopedDriverCreation& operator=(const ScopedDriverCreation&) = delete;
+
+private:
+	int m_slot = -1;
 };
 
 } // namespace
+
+DriverCreations GetDriverCreations(double slow_seconds) {
+	DriverCreations result;
+	const int64_t   now = SteadyNs();
+	for (const auto& slot: g_driver_creations) {
+		const int64_t began = slot.load(std::memory_order_acquire);
+		if (began == 0) {
+			continue;
+		}
+		const double seconds = static_cast<double>(now - began) / 1e9;
+		result.running++;
+		if (seconds >= slow_seconds) {
+			result.slow++;
+		}
+		result.longest = std::max(result.longest, seconds);
+	}
+	return result;
+}
 
 void DescribeDriverPipelineCreation(std::string& report) {
 	const auto& creation = t_driver_creation;

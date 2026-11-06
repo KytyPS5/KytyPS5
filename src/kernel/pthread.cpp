@@ -584,6 +584,7 @@ public:
 	Pthread Create();
 
 	void FreeDetachedThreads();
+	void HostThreadIds(std::vector<uint64_t>& ids);
 
 private:
 	std::vector<Pthread> m_threads;
@@ -1576,6 +1577,18 @@ void PthreadPool::FreeDetachedThreads() {
 	for (auto* p: m_threads) {
 		if (p->detached && p->almost_done && !p->free) {
 			PthreadJoin(p, nullptr);
+		}
+	}
+}
+
+void PthreadPool::HostThreadIds(std::vector<uint64_t>& ids) {
+	Common::LockGuard lock(m_mutex);
+
+	for (const auto* p: m_threads) {
+		// A thread that has not started yet has no unique id and may keep the host id of the
+		// thread that used the entry before.
+		if (!p->free && !p->almost_done && p->unique_id != -1 && p->host_thread_id != 0) {
+			ids.push_back(p->host_thread_id);
 		}
 	}
 }
@@ -3125,6 +3138,17 @@ Pthread PthreadSwapSelfForSignal(Pthread thread) {
 
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
+}
+
+std::vector<uint64_t> PthreadGuestHostThreadIds() {
+	std::vector<uint64_t> ids;
+	if (g_pthread_main != nullptr && g_pthread_main->host_thread_id != 0) {
+		ids.push_back(g_pthread_main->host_thread_id);
+	}
+	if (g_pthread_context != nullptr) {
+		g_pthread_context->GetPthreadPool()->HostThreadIds(ids);
+	}
+	return ids;
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

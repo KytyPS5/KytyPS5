@@ -1436,6 +1436,10 @@ struct PipelineCache::ManifestState {
 	uint32_t                              compute          = 0;
 	uint64_t                              build_ns         = 0;
 	uint64_t                              pipeline_ns      = 0;
+	// What building a module and creating a graphics pipeline took lately, for the
+	// precompilation's estimates.
+	PrecompileMean                        module_time;
+	PrecompileMean                        pipeline_time;
 
 	std::vector<std::jthread> threads;
 	std::jthread              saver;
@@ -1990,6 +1994,9 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			} else {
 				(built ? state.built : state.found)++;
 				state.build_ns += built ? elapsed : 0u;
+				if (built) {
+					state.module_time.Add(static_cast<double>(elapsed) / 1e9);
+				}
 				state.module_records[module->id] = {index, false};
 				if (module->plain != nullptr) {
 					state.module_records[module->plain->id] = {index, true};
@@ -2110,11 +2117,14 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 		}
 		m_async_pending_graphics.erase(key);
 	}
+	const auto elapsed = std::chrono::steady_clock::now() - start;
 	std::scoped_lock lock(state.mutex);
 	(created ? state.pipelines : state.pipelines_failed)++;
-	state.pipeline_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                                               std::chrono::steady_clock::now() - start)
-	                                               .count());
+	state.pipeline_ns += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+	if (created) {
+		state.pipeline_time.Add(std::chrono::duration<double>(elapsed).count());
+	}
 }
 
 void PipelineCache::CreateManifestComputePipeline(const ShaderModule&          module,
@@ -2150,6 +2160,26 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule&          m
 	state.pipeline_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                               std::chrono::steady_clock::now() - start)
 	                                               .count());
+}
+
+PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
+	ManifestBacklog backlog;
+	if (m_manifest == nullptr) {
+		return backlog;
+	}
+	auto&            state = *m_manifest;
+	std::scoped_lock lock(state.mutex);
+	backlog.modules   = static_cast<uint32_t>(state.module_jobs.size());
+	backlog.pipelines = static_cast<uint32_t>(state.pipeline_jobs.size());
+	backlog.running   = state.running;
+	for (const auto index: state.module_jobs) {
+		backlog.compute_modules += state.warm.modules[index].stage == ShaderType::Compute ? 1u : 0u;
+	}
+	backlog.pipelines_done   = state.pipelines + state.pipelines_known + state.pipelines_failed;
+	backlog.threads          = static_cast<uint32_t>(state.threads.size());
+	backlog.module_seconds   = state.module_time.Get();
+	backlog.pipeline_seconds = state.pipeline_time.Get();
+	return backlog;
 }
 
 void PipelineCache::ManifestProgress(bool force) {

@@ -28,6 +28,10 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 
 enum class PssrUpscaler { Linear, DLSS, FSR };
 
+// What the emulator does when the pipelines it has to compile ahead of the game would take long:
+// ask the player whether to wait for them or play at once, wait without asking, or play at once.
+enum class PipelinePrecompile { Ask, Wait, Play };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -97,6 +101,7 @@ struct ConfigOptions {
 	bool                   shader_cache_enabled        = false;
 	bool                   pipeline_manifest_enabled   = true;
 	bool                   pipeline_manifest_record    = false;
+	PipelinePrecompile     pipeline_precompile         = PipelinePrecompile::Ask;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -182,6 +187,8 @@ bool                   PipelineManifestEnabled();
 // The programs and pipelines the session creates are added to the title's manifest in
 // _PipelineCache.
 bool                   PipelineManifestRecord();
+// --pipeline-precompile: see PipelinePrecompile.
+PipelinePrecompile     GetPipelinePrecompile();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 

@@ -1,18 +1,18 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
+#include "common/emulatorConfig.h"
+#include "common/archive.h"
+#include "common/file.h"
 #include "ArchiveTestFixture.h"
 #include "FileTimeTestUtil.h"
-#include "common/archive.h"
-#include "common/emulatorConfig.h"
-#include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysFileIO.h"
 #include "common/singleton.h"
-#include "common/stringUtils.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"

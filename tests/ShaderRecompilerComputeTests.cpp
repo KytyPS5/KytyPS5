@@ -5521,7 +5521,10 @@ public:
       const std::array<uint32_t, 3> prot_payload{0x31415926u, 0x2718281au,
                                                  0x3b5d3b11u};
       const std::filesystem::path prot_read_path =
-          std::filesystem::temp_directory_path() / "kyty-protread-cache.bin";
+          std::filesystem::temp_directory_path() /
+          fmt::format(
+              "kyty-protread-cache-{}.bin",
+              std::chrono::steady_clock::now().time_since_epoch().count());
       Common::File prot_read_file;
       uint32_t prot_wrote = 0;
       uint32_t prot_bytes = 0;

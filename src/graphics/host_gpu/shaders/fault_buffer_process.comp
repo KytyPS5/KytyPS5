@@ -17,19 +17,47 @@ layout(std430, binding = 1) buffer output_buf32 {
     uint download_buffer32[];
 };
 
+// The page bitmap is followed by one summary bit per summary_span bitmap words.
+layout(push_constant) uniform Parameters {
+    uint bitmap_words;
+    uint summary_words;
+    uint summary_span;
+};
+
 void main() {
     const uint id = gl_GlobalInvocationID.x;
-    uint word = fault_buffer[id];
-    fault_buffer[id] = 0u;
-    const uint base_bit = id * 32u;
-    while (word != 0u) {
-        const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
-        if (store_index >= MAX_PAGE_FAULTS) {
-            return;
+    if (id >= summary_words) {
+        return;
+    }
+    uint groups = fault_buffer[bitmap_words + id];
+    if (groups == 0u) {
+        return;
+    }
+    fault_buffer[bitmap_words + id] = 0u;
+    while (groups != 0u) {
+        const uint group = id * 32u + findLSB(groups);
+        groups &= groups - 1u;
+        for (uint offset = 0u; offset < summary_span; offset++) {
+            const uint index = group * summary_span + offset;
+            uint word = fault_buffer[index];
+            if (word == 0u) {
+                continue;
+            }
+            fault_buffer[index] = 0u;
+            const uint base_bit = index * 32u;
+            while (word != 0u) {
+                const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+                if (store_index >= MAX_PAGE_FAULTS) {
+                    // The download area is full: leave the rest for the next pass.
+                    fault_buffer[index] = word;
+                    atomicOr(fault_buffer[bitmap_words + id], groups | (1u << (group & 31u)));
+                    return;
+                }
+                const uint bit = findLSB(word);
+                word &= word - 1;
+                const uint page = base_bit + bit;
+                download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+            }
         }
-        const uint bit = findLSB(word);
-        word &= word - 1;
-        const uint page = base_bit + bit;
-        download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
     }
 }

@@ -2202,7 +2202,7 @@ int KYTY_SYSV_ABI Getpeername(int s, void* addr, uint32_t* addrlen) {
 	if (!GetSocketBackend(s, &socket)) {
 		return -1;
 	}
-	if (addr == nullptr || addrlen == nullptr) {
+	if (addrlen == nullptr) {
 		return SetGuestSocketError(Posix::POSIX_EFAULT);
 	}
 
@@ -2212,7 +2212,22 @@ int KYTY_SYSV_ABI Getpeername(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	return ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen);
+	// Like FreeBSD, copy out at most the caller's capacity and write back the truncated length.
+	uint8_t  guest_addr[16] = {};
+	uint32_t guest_addrlen  = sizeof(guest_addr);
+	if (ConvertHostSockaddr(&host_addr, host_addrlen, guest_addr, &guest_addrlen) != 0) {
+		return -1;
+	}
+
+	const uint32_t len = std::min<uint32_t>(*addrlen, guest_addrlen);
+	if (len != 0) {
+		if (addr == nullptr) {
+			return SetGuestSocketError(Posix::POSIX_EFAULT);
+		}
+		std::memcpy(addr, guest_addr, len);
+	}
+	*addrlen = len;
+	return 0;
 }
 
 int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {

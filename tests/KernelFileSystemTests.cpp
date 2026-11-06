@@ -2472,6 +2472,32 @@ void CheckSocketPeerName() {
   Check(net_getpeername(writer, peer.data(), &peer_size) == 0 &&
             peer_size == reader_name_size && peer == reader_name,
         "Net getpeername returns the accepted end's address");
+  // FreeBSD truncates the address to the caller's buffer and writes back the
+  // truncated length, not the full 16 bytes.
+  const auto check_truncated = [&](Getpeername call, int fd,
+                                   const std::array<uint8_t, 16> &expected,
+                                   const char *partial_message,
+                                   const char *empty_message) {
+    const auto untouched = [](uint8_t value) { return value == 0xab; };
+    std::array<uint8_t, 16> small;
+    small.fill(0xab);
+    uint32_t small_size = 8;
+    Check(call(fd, small.data(), &small_size) == 0 && small_size == 8 &&
+              std::equal(small.begin(), small.begin() + 8, expected.begin()) &&
+              std::all_of(small.begin() + 8, small.end(), untouched),
+          partial_message);
+    small.fill(0xab);
+    small_size = 0;
+    Check(call(fd, small.data(), &small_size) == 0 && small_size == 0 &&
+              std::all_of(small.begin(), small.end(), untouched),
+          empty_message);
+  };
+  check_truncated(posix_getpeername, reader, writer_name,
+                  "POSIX getpeername truncates to a smaller buffer",
+                  "POSIX getpeername copies nothing for a zero capacity");
+  check_truncated(net_getpeername, writer, reader_name,
+                  "Net getpeername truncates to a smaller buffer",
+                  "Net getpeername copies nothing for a zero capacity");
   const int unconnected = Net::Socket(2, 1, 0);
   uint32_t size = 16;
   Check(unconnected >= 0 &&

@@ -243,7 +243,7 @@ TestCase TrinityBvhIntersections(bool compressed, bool bary, bool sorted,
   test.has_compute_info = true;
   test.decoded_counts = {{"IMAGE_BVH8_INTERSECT_RAY", 1}};
   test.required_spirv = {"trinity_bvh_intersect"};
-  test.max_spirv_words = wave_size == 32 ? 11550 : 13950;
+  test.max_spirv_words = wave_size == 32 ? 10950 : 13300;
   return test;
 }
 

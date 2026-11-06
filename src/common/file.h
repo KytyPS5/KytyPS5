@@ -84,7 +84,6 @@ public:
 	static bool IsFileExisting(const std::filesystem::path& name);
 	static bool CreateDirectory(const std::filesystem::path& path);
 	static bool CreateDirectories(const std::filesystem::path& path);
-	static bool DeleteDirectory(const std::filesystem::path& path);
 	static bool DeleteFile(const std::filesystem::path& name);
 
 	static std::vector<DirEntry> GetDirEntries(const std::filesystem::path& path);

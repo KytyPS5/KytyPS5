@@ -1,4 +1,6 @@
 #include "common/abi.h"
+#include "kernel/eventQueue.h"
+#include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 
 #include <cstddef>
@@ -10,6 +12,8 @@ void InitNet_1_Http2(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
+
+namespace EventQueue = Libs::LibKernel::EventQueue;
 
 // 0x817B1100, the value libSceHttp2 uses for an id it does not know.
 constexpr int kHttp2ErrorInvalidId = -2122641152;
@@ -34,10 +38,34 @@ using Http2CreateRequestWithURL = int(KYTY_SYSV_ABI *)(int, const char *,
                                                        const char *, uint64_t);
 using Http2AbortRequest = int(KYTY_SYSV_ABI *)(int);
 using Http2SendRequest = int(KYTY_SYSV_ABI *)(int, const void *, size_t);
-using Http2SendRequestAsync = int(KYTY_SYSV_ABI *)(int, const void *, size_t,
-                                                   const void *, void *);
 using Http2SetRequestContentLength = int(KYTY_SYSV_ABI *)(int, uint64_t);
 using Http2GetResponseContentLength = int(KYTY_SYSV_ABI *)(int, int *, uint64_t *);
+
+// Layouts from src/libs/libNet.cpp.
+struct Http2AsyncResult {
+  int event_type;
+  int req_id;
+  int result;
+  uint8_t padding[4];
+  void *reserved;
+};
+
+struct Http2TriggerUserEventArgs {
+  EventQueue::KernelEqueue eq;
+  int uniq_id;
+  uint8_t padding[4];
+  void *udata;
+  void *reserved;
+};
+
+static_assert(sizeof(Http2TriggerUserEventArgs) == 32);
+
+using Http2ReadDataAsync = int(KYTY_SYSV_ABI *)(int, void *, size_t,
+                                                const void *, void *);
+using Http2SendRequestAsync = int(KYTY_SYSV_ABI *)(int, const void *, size_t,
+                                                   const void *, void *);
+using Http2WaitAsync = int(KYTY_SYSV_ABI *)(int, Http2AsyncResult *, uint32_t *,
+                                            void *);
 
 template <typename T>
 T GetHttp2Function(const Loader::SymbolDatabase &symbols, const char *nid) {
@@ -82,17 +110,47 @@ void TestAbortBeforeSendPreserved(Http2AbortRequest abort,
         kHttp2ErrorBeforeSend);
 }
 
-// The async path reports the same result and does not overwrite it either.
+// The async path reports the same result, clears the event type a completed read
+// left behind, and still wakes the caller's queue.
 void TestAsyncAbortBeforeSendPreserved(
     Http2AbortRequest abort, Http2SendRequestAsync send_async,
-    Http2GetResponseContentLength get_content_length, int req_id) {
-  CHECK(abort(req_id) == 0);
-  CHECK(send_async(req_id, nullptr, 0, nullptr, nullptr) == 0);
+    Http2ReadDataAsync read_async, Http2WaitAsync wait_async, int req_id) {
+  constexpr int kUserEventId = 7;
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  CHECK(EventQueue::KernelCreateEqueue(&queue, "http2-abort") == OK);
+  // Edge, so a second delivery proves the aborted send triggered the event again.
+  CHECK(EventQueue::KernelAddUserEventEdge(queue, kUserEventId) == OK);
 
-  int result = 0;
-  uint64_t content_length = 0;
-  CHECK(get_content_length(req_id, &result, &content_length) ==
-        kHttp2ErrorBeforeSend);
+  Http2TriggerUserEventArgs kqueue_option{};
+  kqueue_option.eq = queue;
+  kqueue_option.uniq_id = kUserEventId;
+
+  EventQueue::KernelEvent events[4]{};
+  Libs::LibKernel::KernelUseconds timeout = 0;
+  int out = 0;
+
+  CHECK(abort(req_id) == 0);
+
+  // A completed read leaves event type 1 behind; the aborted send has to clear it.
+  CHECK(read_async(req_id, nullptr, 0, &kqueue_option, nullptr) == 0);
+  Http2AsyncResult result{};
+  CHECK(wait_async(req_id, &result, nullptr, nullptr) == 0);
+  CHECK(result.event_type == 1);
+  CHECK(result.result == kHttp2ErrorBeforeSend);
+
+  CHECK(EventQueue::KernelWaitEqueue(queue, events, 4, &out, &timeout) == OK);
+  CHECK(out == 1 && events[0].ident == kUserEventId);
+
+  CHECK(send_async(req_id, nullptr, 0, &kqueue_option, nullptr) == 0);
+  CHECK(wait_async(req_id, &result, nullptr, nullptr) == 0);
+  CHECK(result.event_type == 0);
+  CHECK(result.result == kHttp2ErrorBeforeSend);
+
+  out = 0;
+  CHECK(EventQueue::KernelWaitEqueue(queue, events, 4, &out, &timeout) == OK);
+  CHECK(out == 1 && events[0].ident == kUserEventId);
+
+  CHECK(EventQueue::KernelDeleteEqueue(queue) == OK);
 }
 
 // An abort after the send step changes nothing: the request already has a result.
@@ -120,13 +178,18 @@ int main() {
   const auto send = GetHttp2Function<Http2SendRequest>(symbols, "rbqZig38AT8");
   const auto send_async =
       GetHttp2Function<Http2SendRequestAsync>(symbols, "A+NVAFu4eCg");
+  const auto read_async =
+      GetHttp2Function<Http2ReadDataAsync>(symbols, "bGN-6zbo7ms");
+  const auto wait_async =
+      GetHttp2Function<Http2WaitAsync>(symbols, "MOp-AUhdfi8");
   const auto set_content_length =
       GetHttp2Function<Http2SetRequestContentLength>(symbols, "FSAFOzi0FpM");
   const auto get_content_length =
       GetHttp2Function<Http2GetResponseContentLength>(symbols, "o0DBQpFE13o");
   if (init == nullptr || create_template == nullptr ||
       create_request == nullptr || abort == nullptr || send == nullptr ||
-      send_async == nullptr || set_content_length == nullptr ||
+      send_async == nullptr || read_async == nullptr ||
+      wait_async == nullptr || set_content_length == nullptr ||
       get_content_length == nullptr) {
     return 1;
   }
@@ -148,7 +211,7 @@ int main() {
 
   const int unsent_async = create_request(tmpl, "GET", "https://example.com/", 0);
   CHECK(unsent_async > 0);
-  TestAsyncAbortBeforeSendPreserved(abort, send_async, get_content_length,
+  TestAsyncAbortBeforeSendPreserved(abort, send_async, read_async, wait_async,
                                     unsent_async);
 
   const int sent = create_request(tmpl, "GET", "https://example.com/", 0);

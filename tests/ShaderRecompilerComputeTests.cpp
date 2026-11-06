@@ -57,6 +57,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/dialog.h"
@@ -1063,6 +1064,7 @@ void EnsureConfigInitialized() {
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
     ShaderInit();
     config_initialized = true;
   }
@@ -5543,6 +5545,63 @@ public:
       const auto prot_owner =
           BufferCacheTestAccess::PageOwner(cache, base + prot_owner_offset);
       LibKernel::Memory::InstallGpuResources(&resources);
+
+      namespace FileSystem = LibKernel::FileSystem;
+
+      constexpr uint64_t kernel_read_offset = prot_fault_offset - sizeof(uint32_t);
+      FileSystem::Mount(prot_read_path.parent_path(), "/protread");
+      const auto kernel_path = "/protread/" + prot_read_path.filename().string();
+      const int  kernel_fd   = FileSystem::KernelOpen(kernel_path.c_str(), 0, 0);
+      Require(name, "kernel-read open", kernel_fd >= 3, "open protected-read fixture");
+      for (const bool partial_gpu_range: {false, true}) {
+        std::memset(memory + kernel_read_offset, 0, sizeof(prot_payload));
+        if (partial_gpu_range) {
+          resources.UnmapMemory(base + prot_owner_offset, BufferCache::CACHING_PAGESIZE);
+        }
+        MarkGpuWrite(base + prot_fault_offset, BufferCache::CACHING_PAGESIZE);
+        cache.FillBuffer(base + prot_fault_offset, BufferCache::CACHING_PAGESIZE,
+                         prot_fill_value, false);
+        Require(name, "kernel-read setup",
+                resources.IsMapped(base + kernel_read_offset, sizeof(prot_payload)) ==
+                        !partial_gpu_range &&
+                    cache.IsRegionGpuModified(base + prot_fault_offset, 1) &&
+                    cache.HasGpuDirtyBytes(base + prot_fault_offset, 1) &&
+                    !cache.IsRegionCpuModified(base + prot_fault_offset, 1),
+                "kernel-read fixture is not GPU-written and watched");
+        const auto kernel_bytes = FileSystem::KernelPread(
+            kernel_fd, memory + kernel_read_offset, sizeof(prot_payload), 0);
+        Require(name, "kernel-read bytes",
+                kernel_bytes == sizeof(prot_payload) &&
+                    std::memcmp(memory + kernel_read_offset, prot_payload.data(),
+                                sizeof(prot_payload)) == 0,
+                "KernelPread lost protected guest bytes");
+        Require(
+            name, "kernel-read invalidation",
+            !cache.IsRegionGpuModified(base + kernel_read_offset, sizeof(prot_payload)) &&
+                !cache.HasGpuDirtyBytes(base + kernel_read_offset, sizeof(prot_payload)) &&
+                cache.IsRegionCpuModified(base + kernel_read_offset, 1) &&
+                cache.IsRegionCpuModified(base + prot_fault_offset, 1),
+            "KernelPread did not establish CPU ownership");
+        if (partial_gpu_range) {
+          resources.MapMemory(base + prot_owner_offset, BufferCache::CACHING_PAGESIZE);
+        }
+        const auto [kernel_buffer, kernel_buffer_offset] =
+            cache.ObtainBuffer(base + prot_owner_offset, prot_owner_size, false);
+        for (size_t word = 0; word < prot_payload.size(); ++word) {
+          Require(name, "kernel-read re-upload",
+                  ReadNativeValue(*kernel_buffer,
+                                  kernel_buffer_offset + kernel_read_offset -
+                                      prot_owner_offset + word * sizeof(uint32_t)) ==
+                      prot_payload[word],
+                  "the next Buffer lookup served stale KernelPread bytes");
+        }
+      }
+      Require(name, "kernel-read close", FileSystem::KernelClose(kernel_fd) == 0,
+              "close protected-read descriptor");
+      FileSystem::Umount("/protread");
+      std::memset(memory + prot_read_offset, 0, sizeof(prot_payload));
+      MarkGpuWrite(base + prot_owner_offset, prot_owner_size);
+      cache.FillBuffer(base + prot_owner_offset, prot_owner_size, prot_fill_value, false);
       prot_read_file.Seek(0);
       prot_read_file.Read(memory + prot_read_offset, sizeof(prot_payload),
                           &prot_bytes);

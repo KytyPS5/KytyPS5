@@ -73,7 +73,6 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 					break;
 				}
 			}
-			fseeko(f.f, start + static_cast<off_t>(w), SEEK_SET);
 		}
 	}
 	if (bytes_read != nullptr) {

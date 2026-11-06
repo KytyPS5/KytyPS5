@@ -49163,9 +49163,11 @@ void CheckTessellationSingleControlPoint() {
   local.push_back(EncodeDs1Ex(0, 5, 2, 16));
   local.push_back(EncodeSop1(0x20, 0, 6));
 
-  // v_lshlrev_b32_sdwa v33, 7, v1 src1_sel:BYTE_0
-  control.push_back(EncodeVop2(0x1a, 33, 249u, 1));
-  control.push_back(EncodeVop2Sdwa(InlineU32(7), 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
+  // SDWA takes no literal: s_movk_i32 vcc_lo, hs_stride
+  control.push_back(EncodeSopk(0x00, 106, hs_stride));
+  // v_mul_u32_u24_sdwa v33, vcc_lo, v1 src1_sel:BYTE_0
+  control.push_back(EncodeVop2(0x0b, 33, 249u, 1));
+  control.push_back(EncodeVop2Sdwa(106, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
   control.push_back(EncodeMubuf0(0x1d)); // buffer_store_dwordx2 v[10:11], v33, s[8:11], s2 offen
   control.push_back(EncodeMubuf1(10, 2, 33, 2));
   control.push_back(EncodeVop2(0x1b, 32, 255u, 1)); // v_and_b32 v32, 0xff, v1
@@ -49193,6 +49195,14 @@ void CheckTessellationSingleControlPoint() {
           "patch-ordinal control point stores and descending patch constants must reflect "
           "the layout");
   std::printf("[host]    %-32s ok\n", name);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // v_cmp_lt_f32 vcc, 0, v10 after s_movk_i32 replaces the staged stride.
+  control.insert(control.begin() + 1, EncodeVopc(0x01, InlineU32(0), 10));
+  ExpectFatal("TessellationClobberedScalar", [&] {
+    ShaderTessellationInputInfo info{.input_control_points = 1, .output_control_points = 1};
+    AnalyzeTessellationPrograms(local, control, info);
+  });
+#endif
 }
 
 void CheckTessellationPrograms() {

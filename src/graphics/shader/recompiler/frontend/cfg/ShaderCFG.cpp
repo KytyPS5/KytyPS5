@@ -70,18 +70,6 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 	}
 }
 
-bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
-	switch (operand.kind) {
-		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
-		case Decoder::OperandKind::VccLo: code = 106u; return true;
-		case Decoder::OperandKind::VccHi: code = 107u; return true;
-		case Decoder::OperandKind::M0: code = 124u; return true;
-		case Decoder::OperandKind::ExecLo: code = 126u; return true;
-		case Decoder::OperandKind::ExecHi: code = 127u; return true;
-		default: return false;
-	}
-}
-
 bool IsScalarCode(const Decoder::Operand& operand, uint32_t code) {
 	uint32_t operand_code = 0;
 	return ScalarOperandCode(operand, operand_code) && operand_code == code;
@@ -1659,6 +1647,18 @@ Graph Structurize(const Graph& graph) {
 		return failed;
 	}
 	return GotoStructurizer(graph).Run();
+}
+
+bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
+	switch (operand.kind) {
+		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
+		case Decoder::OperandKind::VccLo: code = 106u; return true;
+		case Decoder::OperandKind::VccHi: code = 107u; return true;
+		case Decoder::OperandKind::M0: code = 124u; return true;
+		case Decoder::OperandKind::ExecLo: code = 126u; return true;
+		case Decoder::OperandKind::ExecHi: code = 127u; return true;
+		default: return false;
+	}
 }
 
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {

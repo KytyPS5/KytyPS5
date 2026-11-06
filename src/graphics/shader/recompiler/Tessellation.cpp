@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -28,10 +29,12 @@ struct TessellationAddress {
 // Reflects the LS output stride, or the HS output stride and patch constant range.
 void ReflectTessellationLayout(const Decoder::Program& program, bool local,
                                ShaderTessellationInputInfo& info) {
+	// Registers tracks the VGPRs, then the SGPR codes through VCC_HI.
+	constexpr uint32_t scalars = IR::NumScalarRegs + 2u;
 	using namespace Decoder;
 	using Address   = TessellationAddress;
 	using Kind      = Address::Kind;
-	using Registers = std::array<Address, IR::NumVectorRegs>;
+	using Registers = std::array<Address, IR::NumVectorRegs + scalars>;
 
 	const auto control_points = local ? info.input_control_points : info.output_control_points;
 	Registers  entry {}, registers;
@@ -54,6 +57,8 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			value = constant(operand.value);
 		} else if (operand.kind == OperandKind::Vgpr) {
 			value = registers.at(operand.reg);
+		} else if (uint32_t code = 0; CFG::ScalarOperandCode(operand, code) && code < scalars) {
+			value = registers[IR::NumVectorRegs + code];
 		}
 		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return patch;
 		return operand.sdwa_sel == 6u ? value : Address {};
@@ -141,6 +146,16 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					patch_end        = std::max(patch_end, begin + 4u * inst.data_dwords);
 				}
 			}
+			// SDWA takes no literal, so S_MOVK_I32 stages factors in SGPRs. Other writes clear
+			// them; a lane mask may span two SGPRs, as in wave64.
+			for (uint32_t code = 0; code < scalars; code++) {
+				auto& scalar = registers[IR::NumVectorRegs + code];
+				if (scalar != Address {} && CFG::MayWriteScalarRegister(inst, code, 64u))
+					scalar = {};
+			}
+			if (uint32_t code = 0; inst.opcode == Opcode::S_MOVK_I32 &&
+			                       CFG::ScalarOperandCode(inst.dst, code) && code < scalars)
+				registers[IR::NumVectorRegs + code] = constant(inst.src0.value);
 			// Store vdata is a source, despite occupying the decoder's dst field.
 			if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
 			const auto lhs   = read(inst.src0);
@@ -190,7 +205,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			    inst.dst.dpp)
 				value = {};
 			for (uint32_t index = 0;
-			     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size();
+			     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < IR::NumVectorRegs;
 			     index++) {
 				registers[inst.dst.reg + index] = {};
 			}

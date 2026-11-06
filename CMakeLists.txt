@@ -175,11 +175,13 @@ add_dependencies(kyty_git_version KytyGitVersion)
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
 		kyty_emulator
+		kyty_emulator_objects
 		common
 		#launcher
 	)
 	list(APPEND KYTY_CLANG_TIDY
 		kyty_emulator
+		kyty_emulator_objects
 		#common
 		launcher
 	)
@@ -525,9 +527,23 @@ list(APPEND check_headers
 	${KYTY_SOURCE_DIR}
 )
 
+# A test that needs the whole emulator links the objects of kyty_emulator_objects. OWN_SOURCES
+# compiles its own copy of the emulator sources instead, for a test that builds them with its own
+# definitions (virtual_memory_allocation_tests).
 function(add_kyty_full_emulator_test target source)
-	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
-	target_link_libraries(${target} ${kyty_emulator_link_libraries})
+	cmake_parse_arguments(PARSE_ARGV 2 arg "OWN_SOURCES" "" "")
+	if(arg_OWN_SOURCES)
+		add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+		target_link_libraries(${target} ${kyty_emulator_link_libraries})
+		# The macOS x86_64 guest address space needs its .zerofill segments anchored
+		# by linker flags, or the kernel kills the binary on load (posix_spawn EIO).
+		configure_macos_guest_address_space(${target})
+	else()
+		# The guest address space settings come with the objects. The libraries are named again so
+		# that the link line keeps their order.
+		add_executable(${target} EXCLUDE_FROM_ALL ${source})
+		target_link_libraries(${target} kyty_emulator_objects ${kyty_emulator_link_libraries})
+	endif()
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi dxgi)
@@ -536,20 +552,28 @@ function(add_kyty_full_emulator_test target source)
 		target_link_libraries(${target} onecore)
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
-	# The macOS x86_64 guest address space needs its .zerofill segments anchored
-	# by linker flags, or the kernel kills the binary on load (posix_spawn EIO).
-	configure_macos_guest_address_space(${target})
 endfunction()
 
+# PUBLIC: on kyty_emulator_objects, the definition and the segment addresses also reach the
+# executables that link its objects.
 function(configure_macos_guest_address_space target)
 	if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 			(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
 		target_sources(${target} PRIVATE "${KYTY_SOURCE_DIR}/kernel/macosGuestAddressSpace.cpp")
-		target_compile_definitions(${target} PRIVATE KYTY_LINKED_GUEST_ADDRESS_SPACE=1)
-		target_link_options(${target} PRIVATE
+		target_compile_definitions(${target} PUBLIC KYTY_LINKED_GUEST_ADDRESS_SPACE=1)
+		target_link_options(${target} PUBLIC
 			-Wl,-ld_classic,-no_pie,-no_fixup_chains,-no_huge,-pagezero_size,0x40000,-segaddr,SYSTEM_MANAGED,0x40000,-segaddr,SYSTEM_RESERVED,0x7ffffc000,-segaddr,USER_AREA,0x7000000000,-image_base,0x700000000000)
 	endif()
 endfunction()
+
+# The emulator sources are compiled once, here, and linked into kyty_emulator and the tests that
+# need the whole emulator (add_kyty_full_emulator_test), instead of once per executable.
+add_library(kyty_emulator_objects OBJECT ${kyty_emulator_src})
+target_link_libraries(kyty_emulator_objects PUBLIC ${kyty_emulator_link_libraries})
+target_include_directories(kyty_emulator_objects PRIVATE ${inc_headers})
+configure_macos_guest_address_space(kyty_emulator_objects)
+clang_tidy_check(kyty_emulator_objects "" "${check_headers}" "${inc_headers}")
+include_what_you_use(kyty_emulator_objects "${inc_headers}")
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
@@ -809,7 +833,9 @@ foreach(test_shader gpu_test_ms_depth gpu_test_ray_query)
 	target_sources(shader_recompiler_compute_tests PRIVATE "${test_shader_header}")
 endforeach()
 
-add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+# It compiles the emulator sources with KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS (below).
+add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp"
+	OWN_SOURCES)
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
 	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
 target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
@@ -1058,8 +1084,7 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
-add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
-configure_macos_guest_address_space(kyty_emulator)
+add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp")
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound
@@ -1102,7 +1127,8 @@ add_custom_target(kyty_noto_sans_fonts
 add_dependencies(kyty_emulator kyty_noto_sans_fonts)
 install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
-target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+# The libraries again, so that the link line keeps their order.
+target_link_libraries(kyty_emulator kyty_emulator_objects ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <tuple>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -235,15 +236,18 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
-uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
+// What a dword of a page that no buffer backs yet reads as: zero, except in BVH traversal shaders:
+// there it reads as all ones, the absent-node link bvh_intersect returns, because guest list walks
+// end on negative links and would advance over zero entries forever.
+uint32_t MissingBdaDword(EmitterState& state) {
+	return ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
+}
+
+// The dword at a pointer of get_bda_pointer, or `missing` without a cached page (`bda` 0).
+uint32_t LoadBdaPointerDword(ValueEmitContext& ctx, uint32_t bda, bool coherent, uint32_t missing) {
 	auto&      state   = ctx.state;
-	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
-	// A page that no buffer backs yet reads as zero, except in BVH traversal shaders: there it
-	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
-	// on negative links and would advance over zero entries forever.
-	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
 	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
 		auto pointer = state.builder.AllocateId();
 		if (coherent) {
@@ -272,24 +276,89 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	});
 }
 
+uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
+	return LoadBdaPointerDword(ctx, GetBdaPointer(ctx.state, address), coherent,
+	                           MissingBdaDword(ctx.state));
+}
+
+// The two dwords of a read that may cross into the next dword, with one get_bda_pointer: NVIDIA's
+// compiler inlines a copy at each call, and the copies for the next dword were half of them in
+// Demon's Souls' compute programs. The next dword is on the first one's page unless the first ends
+// the page; only then a second pass of the loop looks it up. The loads are in the loop, which
+// carries only the first dword into its second pass.
+std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint32_t aligned,
+                                                    uint32_t low, uint32_t crosses, bool coherent) {
+	auto&      state = ctx.state;
+	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
+	static_assert(BufferCache::CACHING_PAGESIZE <= (uint64_t {1} << 32u));
+	const auto last_dword =
+	    ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_PAGESIZE - 1u) & ~3u);
+	const auto next_page = Binary(
+	    state, spv::OpLogicalAnd, boolean, crosses,
+	    Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, low, last_dword),
+	           last_dword));
+	const auto same_page = Binary(state, spv::OpLogicalAnd, boolean, crosses,
+	                              Unary(state, spv::OpLogicalNot, boolean, next_page));
+	const auto preheader = state.current_label;
+	const auto header    = state.builder.AllocateId();
+	const auto body      = state.builder.AllocateId();
+	const auto latch     = state.builder.AllocateId();
+	const auto merge     = state.builder.AllocateId();
+	const auto pass      = state.builder.AllocateId();
+	const auto kept      = state.builder.AllocateId();
+	const auto first     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, header);
+	state.builder.AddFunction(spv::OpPhi, boolean, pass, ConstantBool(state, false), preheader,
+	                          ConstantBool(state, true), latch);
+	state.builder.AddFunction(spv::OpPhi, u32, kept, ConstantU32(state, 0), preheader, first, latch);
+	state.builder.AddFunction(spv::OpLoopMerge, merge, latch, spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranch, body);
+	EmitLabel(state, body);
+	const auto zero    = ConstantU64(state, 0);
+	const auto step    = Select(state, u64, pass, ConstantU64(state, sizeof(uint32_t)), zero);
+	const auto bda     = GetBdaPointer(state, Binary(state, spv::OpIAdd, u64, aligned, step));
+	const auto at      = LoadBdaPointerDword(ctx, bda, coherent, MissingBdaDword(state));
+	const auto next_at = Select(
+	    state, u64,
+	    Binary(state, spv::OpLogicalAnd, boolean, same_page,
+	           Binary(state, spv::OpINotEqual, boolean, bda, zero)),
+	    Binary(state, spv::OpIAdd, u64, bda, ConstantU64(state, sizeof(uint32_t))), zero);
+	// next_at is 0 for a missing page, but also for a read that stays in its dword, whose next
+	// dword must read zero (it is ORed in unshifted when the read is aligned).
+	const auto missing_next =
+	    state.program.info.bvh
+	        ? Select(state, u32, same_page, MissingBdaDword(state), ConstantU32(state, 0))
+	        : ConstantU32(state, 0);
+	const auto following = LoadBdaPointerDword(ctx, next_at, coherent, missing_next);
+	state.builder.AddFunction(spv::OpCopyObject, u32, first, Select(state, u32, pass, kept, at));
+	const auto second = Select(state, u32, pass, at, following);
+	state.builder.AddFunction(spv::OpBranch, latch);
+	EmitLabel(state, latch);
+	const auto again = Binary(state, spv::OpLogicalAnd, boolean, next_page,
+	                          Unary(state, spv::OpLogicalNot, boolean, pass));
+	state.builder.AddFunction(spv::OpBranchConditional, again, header, merge);
+	EmitLabel(state, merge);
+	return {first, second};
+}
+
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
                  bool coherent = false) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
 		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned, coherent);
-		const auto byte =
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-		const auto crosses =
-		    bits == 8u ? ConstantBool(state, false)
-		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
-		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))), coherent);
-		});
+		const auto low  = Unary(state, spv::OpUConvert, TypeU32(state), address);
+		const auto byte = Binary(state, spv::OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, 3));
+		uint32_t   first = 0, second = 0;
+		if (bits == 8u) {
+			first  = LoadBdaDword(ctx, aligned, coherent);
+			second = ConstantU32(state, 0);
+		} else {
+			const auto crosses = Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
+			                            TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
+			std::tie(first, second) = LoadBdaCrossingDwords(ctx, aligned, low, crosses, coherent);
+		}
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
 		const auto upper_shift =

@@ -10442,14 +10442,35 @@ public:
               "image lookup mishandled a partial overlap or adjacent range");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
+      // An image that only holds guest data is freed without finishing the GPU:
+      // its objects live until the queued work is done.
       const auto image_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(image_address + 0x1000, 0x1000);
       Require(name, "partial image unmap tracking",
               partial_unmap_image_id &&
-                  scheduler.CurrentTick() == image_unmap_tick + 1 &&
+                  scheduler.CurrentTick() == image_unmap_tick &&
                   !texture_cache.IsRegionRegistered(image_address, 0x2000) &&
                   !texture_cache.FindImageFromRange(image_address, 0x2000, false),
-              "partial image unmap skipped its drain or retained the image");
+              "partial image unmap drained the GPU or retained the image");
+      // An image the GPU wrote still finishes the GPU first.
+      auto written_unmap_image =
+          MakeLinearDesc(base + partial_unmap_image_offset + 0x10000, 0x2000,
+                         vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                         Prospero::ImageType::kColor2D, {2048, 1, 1}, 1, 4, 1);
+      const auto written_unmap_image_id =
+          texture_cache.FindImage(written_unmap_image);
+      texture_cache.MarkGpuWritten(written_unmap_image_id);
+      const auto written_address = written_unmap_image.info.data.address;
+      const auto written_unmap_tick = scheduler.CurrentTick();
+      resources.UnmapMemory(written_address + 0x1000, 0x1000);
+      Require(name, "partial GPU-written image unmap tracking",
+              written_unmap_image_id &&
+                  scheduler.CurrentTick() == written_unmap_tick + 1 &&
+                  !texture_cache.IsRegionRegistered(written_address, 0x2000) &&
+                  !texture_cache.FindImageFromRange(written_address, 0x2000,
+                                                    false),
+              "partial GPU-written image unmap skipped its drain or retained "
+              "the image");
 
       constexpr uint64_t unformatted_alias_offset = 0x2500000;
       auto unformatted_alias =

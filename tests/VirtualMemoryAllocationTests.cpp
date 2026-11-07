@@ -1298,8 +1298,41 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
-	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+/// Reports failures from the Windows normal-return guest-stack fixture.
+void TestGuestStackNormalReturn() {
+	const char* test = "GuestStackNormalReturn";
+
+	Check(test, Libs::LibKernel::TestGuestStackNormalReturn(),
+		"guest stack bounds or host stack restoration failed");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+/// Reports failures from the Windows PthreadExit guest-stack fixture.
+void TestGuestStackPthreadExit() {
+	const char* test = "GuestStackPthreadExit";
+
+	Check(test, Libs::LibKernel::TestGuestStackPthreadExit(),
+		"PthreadExit did not preserve the return value or restore the host stack bounds");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+/// Reports failures when a handled guest-stack read fault cannot resume and return correctly.
+void TestGuestStackHandledFault() {
+	const char* test = "GuestStackHandledFault";
+
+	Check(test, Libs::LibKernel::TestGuestStackHandledFault(),
+	      "handled guest stack fault did not resume or restore the host stack bounds");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
+/// Reports failures in the loader's main-entry stack and host-bound restoration checks.
+void TestMainEntryUsesGuestStackAndRestoresHostBounds() {
+	const char* test = "MainEntryUsesGuestStackAndRestoresHostBounds";
 
 	Check(test, Loader::TestMainEntryUsesGuestStack(),
 	      "main-entry stack switch did not preserve the guest/host stack invariants");
@@ -5804,11 +5837,22 @@ void TestTlsStubsPreserveFlags() {
 
 int RunTrinityTests();
 
+/// Initializes the test subsystems and runs the suite or the subset selected by one option.
+/// Returns a nonzero exit status if a selected test fails.
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
 	InitSubsystems();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-only") == 0) {
+		RunTest(TestGuestStackNormalReturn);
+		RunTest(TestGuestStackPthreadExit);
+		RunTest(TestGuestStackHandledFault);
+		RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
@@ -5935,7 +5979,12 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
-	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestGuestStackNormalReturn);
+	RunTest(TestGuestStackPthreadExit);
+	RunTest(TestGuestStackHandledFault);
+#endif
+	RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);

@@ -336,15 +336,15 @@ struct PthreadMutexPrivate {
 		Waiter*                 previous = nullptr;
 		Waiter*                 next     = nullptr;
 	};
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	Pthread                 owner     = nullptr;
-	uint32_t                count     = 0;
-	int                     type      = 1;
-	int                     pprotocol = PTHREAD_PRIO_NONE;
-	Waiter*                 first_waiter = nullptr;
-	Waiter*                 last_waiter  = nullptr;
+	uint8_t     reserved[256];
+	std::string name;
+	std::mutex  m;
+	Pthread     owner        = nullptr;
+	uint32_t    count        = 0;
+	int         type         = 1;
+	int         pprotocol    = PTHREAD_PRIO_NONE;
+	Waiter*     first_waiter = nullptr;
+	Waiter*     last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -379,23 +379,23 @@ struct PthreadGuestData {
 static_assert(sizeof(PthreadGuestData) == 4096);
 
 struct PthreadPrivate {
-	PthreadGuestData      guest;
-	std::string           name;
-	pthread_t             p;
-	PthreadAttr           attr;
-	pthread_entry_func_t  entry;
-	void*                 arg;
-	int                   unique_id;
-	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free;
-	uint64_t              host_thread_id;
-	uintptr_t             guest_host_rbx;
-	uintptr_t             guest_host_rsp;
-	uintptr_t             guest_host_rbp;
-	uint64_t              cond_sequence = 0;
+	PthreadGuestData        guest;
+	std::string             name;
+	pthread_t               p;
+	PthreadAttr             attr;
+	pthread_entry_func_t    entry;
+	void*                   arg;
+	int                     unique_id;
+	std::atomic_bool        detached;
+	std::atomic_bool        almost_done;
+	std::atomic_bool        free;
+	uint64_t                host_thread_id;
+	uintptr_t               guest_host_rbx;
+	uintptr_t               guest_host_rsp;
+	uintptr_t               guest_host_rbp;
+	uint64_t                cond_sequence = 0;
 	std::condition_variable cond_cv;
-	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic<uint64_t>   pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -446,11 +446,11 @@ struct PthreadCondattrPrivate {
 };
 
 struct PthreadCondPrivate {
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
-	std::vector<Pthread>    waiters;
+	uint8_t              reserved[256];
+	std::string          name;
+	std::mutex           m;
+	KernelClockid        clock_id = KERNEL_CLOCK_REALTIME;
+	std::vector<Pthread> waiters;
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -732,8 +732,10 @@ static void FreeGuestStack(PthreadAttr attr) {
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+/// Checks private guest-stack allocation, release, and reuse for one stack owner.
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size) {
+
 	if (first_address == nullptr || second_address == nullptr || map_size == nullptr) {
 		return false;
 	}
@@ -804,7 +806,14 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 }
 #endif
 
-static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
+/**
+ * Calls func(arg) on the supplied guest stack and returns its result.
+ * stack_limit is the allocation's low address; stack_base is its exclusive high address.
+ * On Windows, publishes these bounds in the TEB during guest execution and restores
+ * the host bounds on return. The PthreadExit fast path uses the saved host frame too.
+ */
+static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top,
+                                           void* stack_limit, uintptr_t stack_base) {
 #if defined(__x86_64__) || defined(_M_X64)
 	void*      ret = nullptr;
 	const auto aligned_stack_top =
@@ -877,16 +886,29 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "pushq %%r14\n\t"
 	             "pushq %%r15\n\t"
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "pushq %[guest_rsp]\n\t"
+	             "pushq %[guest_rbp]\n\t"
+	             "pushq %[stack_base]\n\t"
+	             "pushq %[stack_limit]\n\t"
+
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
+	             "popq %%rcx\n\t"
 	             "movq %%rcx, %%gs:0x10\n\t"
+	             "popq %%rcx\n\t"
+	             "movq %%rcx, %%gs:0x08\n\t"
+	             "popq %%rdx\n\t"
+	             "popq %%rcx\n\t"
 #endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "movq %%rcx, %%rsp\n\t"
+	             "movq %%rdx, %%rbp\n\t"
+#else
 	             "movq %[guest_rsp], %%rsp\n\t"
 	             "movq %[guest_rbp], %%rbp\n\t"
+#endif
 	             "callq *%%rsi\n\t"
 	             "movq %%r13, %%rbp\n\t"
 	             "movq %%r12, %%rsp\n\t"
@@ -901,6 +923,8 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	                                               ,
+	               [stack_base] "r"(stack_base), [stack_limit] "r"(stack_limit)
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
 	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
@@ -928,6 +952,190 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	return func(arg);
 #endif
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS) && KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+struct GuestStackTestState {
+	bool      called                = false;
+	bool      exit_via_pthread      = false;
+	bool      returned_from_exit    = false;
+	bool      trigger_fault         = false;
+	bool      fault_handled         = false;
+	bool      continued_after_fault = false;
+	void*     fault_page            = nullptr;
+	uintptr_t fault_rsp             = 0;
+	uintptr_t rsp                   = 0;
+	uintptr_t stack_base            = 0;
+	uintptr_t stack_limit           = 0;
+};
+
+static thread_local GuestStackTestState* g_guest_stack_fault_state = nullptr;
+
+/**
+ * Handles only the active test's first read fault on its private protected page.
+ * Makes the page readable and lets Windows retry the instruction; leaves other faults unhandled.
+ */
+static LONG WINAPI GuestStackFaultHandler(PEXCEPTION_POINTERS exception) {
+	auto*       state  = g_guest_stack_fault_state;
+	const auto* record = exception->ExceptionRecord;
+
+	if (state == nullptr || !state->trigger_fault || state->fault_handled ||
+	    record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 ||
+	    record->ExceptionInformation[0] != 0 ||
+	    record->ExceptionInformation[1] != reinterpret_cast<ULONG_PTR>(state->fault_page)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	DWORD old_protection = 0;
+	if (!VirtualProtect(state->fault_page, 4096, PAGE_READWRITE, &old_protection)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	state->fault_handled = true;
+	state->fault_rsp     = exception->ContextRecord->Rsp;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/// Records guest RSP and TEB bounds, then exercises the requested fault or exit path.
+static KYTY_SYSV_ABI void* GuestStackTestEntry(void* arg) {
+	auto* state = static_cast<GuestStackTestState*>(arg);
+
+	asm volatile("movq %%rsp, %0\n\t"
+	             "movq %%gs:0x08, %1\n\t"
+	             "movq %%gs:0x10, %2\n\t"
+	             : "=r"(state->rsp), "=r"(state->stack_base), "=r"(state->stack_limit)
+	             :
+	             : "memory");
+
+	state->called = true;
+
+	if (state->trigger_fault) {
+		uint32_t value = 0;
+
+		asm volatile("movl (%1), %0" : "=r"(value) : "r"(state->fault_page) : "memory");
+
+		state->continued_after_fault = value == 0x12345678u;
+	}
+
+	if (state->exit_via_pthread) {
+		PthreadExit(arg);
+		state->returned_from_exit = true;
+	}
+
+	return arg;
+}
+
+/**
+ * Runs a guest-stack fixture through normal return, PthreadExit, or a handled read fault.
+ * Returns true only if guest state, host-bound restoration, and resource cleanup pass.
+ * The local thread record exercises the exit fast path, not the full pthread lifecycle.
+ */
+static bool TestGuestStackReturn(bool exit_via_pthread, bool trigger_fault = false) {
+	constexpr uint64_t stack_size = 0x10000;
+
+	const auto stack_low = Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "guest_stack_return_test");
+
+	if (stack_low == 0) {
+		return false;
+	}
+
+	GuestStackTestState state {};
+	state.exit_via_pthread = exit_via_pthread;
+	state.trigger_fault    = trigger_fault;
+
+	void* fault_handler = nullptr;
+	if (trigger_fault) {
+		state.fault_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		if (state.fault_page == nullptr) {
+			Memory::FreeGuestMemory(stack_low, stack_size);
+			return false;
+		}
+		*static_cast<uint32_t*>(state.fault_page) = 0x12345678u;
+		DWORD old_protection                      = 0;
+		if (!VirtualProtect(state.fault_page, 4096, PAGE_NOACCESS, &old_protection)) {
+			VirtualFree(state.fault_page, 0, MEM_RELEASE);
+			Memory::FreeGuestMemory(stack_low, stack_size);
+			return false;
+		}
+		fault_handler = AddVectoredExceptionHandler(1, GuestStackFaultHandler);
+		if (fault_handler == nullptr) {
+			VirtualFree(state.fault_page, 0, MEM_RELEASE);
+			Memory::FreeGuestMemory(stack_low, stack_size);
+			return false;
+		}
+	}
+
+	uintptr_t original_stack_base  = 0;
+	uintptr_t original_stack_limit = 0;
+
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(original_stack_base), "=r"(original_stack_limit)
+	             :
+	             : "memory");
+
+	const auto stack_high = stack_low + stack_size;
+
+	PthreadPrivate test_thread {};
+
+	const auto previous_self        = g_pthread_self;
+	const auto previous_return_rsp  = g_guest_entry_return_rsp;
+	const auto previous_fault_state = g_guest_stack_fault_state;
+
+	g_pthread_self            = &test_thread;
+	g_guest_stack_fault_state = trigger_fault ? &state : nullptr;
+
+	void* result = RunOnGuestStack(&state, GuestStackTestEntry, reinterpret_cast<void*>(stack_high),
+	                               reinterpret_cast<void*>(stack_low), stack_high);
+
+	g_pthread_self            = previous_self;
+	g_guest_entry_return_rsp  = previous_return_rsp;
+	g_guest_stack_fault_state = previous_fault_state;
+
+	uintptr_t restored_stack_base  = 0;
+	uintptr_t restored_stack_limit = 0;
+
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(restored_stack_base), "=r"(restored_stack_limit)
+	             :
+	             : "memory");
+
+	const bool guest_ok = state.called && state.rsp >= stack_low && state.rsp < stack_high &&
+	                      state.stack_base == stack_high && state.stack_limit == stack_low &&
+	                      result == &state && !state.returned_from_exit;
+
+	const bool host_ok =
+	    restored_stack_base == original_stack_base && restored_stack_limit == original_stack_limit;
+	const bool fault_ok =
+	    !trigger_fault || (state.fault_handled && state.continued_after_fault &&
+	                       state.fault_rsp >= stack_low && state.fault_rsp < stack_high);
+
+	const bool handler_removed =
+	    fault_handler == nullptr || RemoveVectoredExceptionHandler(fault_handler) != 0;
+	const bool page_freed =
+	    state.fault_page == nullptr || VirtualFree(state.fault_page, 0, MEM_RELEASE) != 0;
+	const bool freed = Memory::FreeGuestMemory(stack_low, stack_size);
+
+	return guest_ok && host_ok && fault_ok && handler_removed && page_freed && freed;
+}
+
+/// Checks guest bounds, the result, host-bound restoration, and cleanup after normal return.
+bool TestGuestStackNormalReturn() {
+	return TestGuestStackReturn(false);
+}
+/// Checks the PthreadExit fast path's result, stack restoration, and fixture cleanup.
+bool TestGuestStackPthreadExit() {
+	return TestGuestStackReturn(true);
+}
+
+/// Checks Windows exception continuation on a guest stack and restoration after return.
+bool TestGuestStackHandledFault() {
+	return TestGuestStackReturn(false, true);
+}
+
+#endif
 
 static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 	if (attr == nullptr || *attr == nullptr) {
@@ -1235,8 +1443,9 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
-static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
-                                     PthreadMutexPrivate::Waiter* waiter) {
+/// Unlinks a waiter from both ends of the queue; the caller holds mutex->m.
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate*         mutex,
+                                    PthreadMutexPrivate::Waiter* waiter) {
 	if (waiter->previous != nullptr) {
 		waiter->previous->next = waiter->next;
 	} else {
@@ -1249,6 +1458,11 @@ static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
 	}
 }
 
+/**
+ * Acquires the guest mutex, respecting recursion and an optional timeout in microseconds.
+ * Disables host cancellation while queued and polls pending guest signals between waits.
+ * Returns OK on acquisition or an error for recursion, contention timeout, or overflow.
+ */
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1288,12 +1502,11 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	} else {
 		mutex->first_waiter = &waiter;
 	}
-	mutex->last_waiter = &waiter;
-	const auto deadline = timeout_us != nullptr
-	                          ? std::chrono::steady_clock::now() +
-	                                std::chrono::microseconds(*timeout_us)
-	                          : std::chrono::steady_clock::time_point::max();
-	int result = OK;
+	mutex->last_waiter  = &waiter;
+	const auto deadline = timeout_us != nullptr ? std::chrono::steady_clock::now() +
+	                                                  std::chrono::microseconds(*timeout_us)
+	                                            : std::chrono::steady_clock::time_point::max();
+	int        result   = OK;
 	while (mutex->owner != self) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
@@ -1301,8 +1514,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			result = ETIMEDOUT;
 			break;
 		}
-		waiter.cv.wait_until(lock, std::min(deadline, now +
-		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		waiter.cv.wait_until(
+		    lock, std::min(deadline, now + std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		if (mutex->owner != self) {
 			lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
@@ -3189,6 +3402,8 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// Initializes a host worker's guest-thread state, invokes its entry on the guest stack,
+/// and runs the registered cleanup handler before returning the guest result.
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3231,10 +3446,15 @@ static void* RunThread(void* arg) {
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_push(CleanupThread, thread);
 
+	const auto stack_base =
+	    reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size;
+
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
-	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
+
+	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top, thread->attr->stack_addr,
+	                      stack_base);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_pop(1);

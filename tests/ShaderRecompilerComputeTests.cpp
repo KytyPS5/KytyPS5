@@ -2173,8 +2173,55 @@ public:
   [[nodiscard]] bool RasterizationSupported() const {
     return m_rasterization_supported;
   }
+  // A depth attachment that is sampled while it is written takes the feedback-loop layout
+  // only where the device supports it; the renderer falls back to eGeneral for the same
+  // simultaneous read/write, so the expected layout follows the enabled feature.
+  [[nodiscard]] vk::ImageLayout SampledDepthLayout() const {
+    return m_runtime_context.attachment_feedback_loop_enabled
+               ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+               : vk::ImageLayout::eGeneral;
+  }
+  // Returns the first format the device can attach as depth-stencil at `samples`,
+  // preferring `preferred`. Some drivers reject VK_FORMAT_D24_UNORM_S8_UINT
+  // outright, and Image::Image exits the process rather than create such an
+  // image, so a caller that hardcodes one can never run on those devices.
+  // eUndefined means no depth-stencil attachment is available at all.
+  [[nodiscard]] vk::Format SupportedDepthStencilFormat(
+      vk::Format preferred, vk::SampleCountFlagBits samples) const {
+    // Mirror ImageUsageFlags exactly: a depth format only gains the sampled bit
+    // when the device advertises sampled-image support for it, and only then
+    // gains the feedback-loop bit. Probing a larger mask than the constructor
+    // ends up requesting rejects formats that would have worked, and probing a
+    // smaller one admits formats that still exit inside Image::Image.
+    for (const auto candidate:
+         {preferred, vk::Format::eD32SfloatS8Uint, vk::Format::eD16UnormS8Uint}) {
+      auto usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                   vk::ImageUsageFlagBits::eTransferSrc |
+                   vk::ImageUsageFlagBits::eTransferDst;
+      const auto format_properties =
+          m_runtime_context.GetFormatProperties(candidate);
+      if (static_cast<bool>(format_properties.optimalTilingFeatures &
+                            vk::FormatFeatureFlagBits::eSampledImage)) {
+        usage |= vk::ImageUsageFlagBits::eSampled;
+        if (m_runtime_context.attachment_feedback_loop_enabled) {
+          usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+        }
+      }
+      vk::ImageFormatProperties properties {};
+      if (m_runtime_context.GetImageFormatProperties(
+              candidate, vk::ImageType::e2D, vk::ImageTiling::eOptimal, usage,
+              {}, &properties) == vk::Result::eSuccess &&
+          static_cast<bool>(properties.sampleCounts & samples)) {
+        return candidate;
+      }
+    }
+    return vk::Format::eUndefined;
+  }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  void SkipComputeCase() { ++m_skipped_compute_cases; }
+  [[nodiscard]] bool RobustPipelinesSupported() const { return m_robust_pipelines; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
+  [[nodiscard]] u32 SkippedComputeCaseCount() const { return m_skipped_compute_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -4389,31 +4436,37 @@ public:
                 depth.views.size() == 3,
             "unified depth view cache lost sampled/attachment identity");
 
-    auto depth_stencil_info = depth_info;
-    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
-    depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
-    depth_stencil_info.bytes_per_block = 2;
-    Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
-                                        depth_stencil_info);
-    auto depth_only_info = depth_sampled;
-    depth_only_info.format = depth_stencil_info.pixel_format;
-    const auto depth_only = depth_stencil.FindView(depth_only_info);
-    auto combined_info = depth_only_info;
-    combined_info.aspect =
-        vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-    combined_info.mapping = {};
-    combined_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
-    const auto combined = depth_stencil.FindView(combined_info);
-    Require(name, "depth/stencil aspects",
-            depth_only != nullptr && combined != nullptr &&
-                depth_only != combined &&
-                depth_stencil.views.size() == 2 &&
-                depth_stencil.views[0].info.aspect ==
-                    vk::ImageAspectFlagBits::eDepth &&
-                depth_stencil.views[1].info.aspect ==
-                    (vk::ImageAspectFlagBits::eDepth |
-                     vk::ImageAspectFlagBits::eStencil),
-            "explicit depth-only and combined aspects shared one image view");
+    // D24S8 is not universally attachable; ask the device before using it.
+    const auto depth_stencil_format = SupportedDepthStencilFormat(
+        vk::Format::eD24UnormS8Uint, vk::SampleCountFlagBits::e1);
+    if (depth_stencil_format == vk::Format::eUndefined) {
+      SkipRasterizationCases(1);
+    } else {
+      auto depth_stencil_info = depth_info;
+      depth_stencil_info.pixel_format = depth_stencil_format;
+      depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
+      depth_stencil_info.bytes_per_block = 2;
+      Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
+                                          depth_stencil_info);
+      auto depth_only_info = depth_sampled;
+      depth_only_info.format = depth_stencil_info.pixel_format;
+      const auto depth_only = depth_stencil.FindView(depth_only_info);
+      auto combined_info = depth_only_info;
+      combined_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      combined_info.mapping = {};
+      combined_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto combined = depth_stencil.FindView(combined_info);
+      Require(name, "depth/stencil aspects",
+              depth_only != nullptr && combined != nullptr &&
+                  depth_only != combined && depth_stencil.views.size() == 2 &&
+                  depth_stencil.views[0].info.aspect ==
+                      vk::ImageAspectFlagBits::eDepth &&
+                  depth_stencil.views[1].info.aspect ==
+                      (vk::ImageAspectFlagBits::eDepth |
+                       vk::ImageAspectFlagBits::eStencil),
+              "explicit depth-only and combined aspects shared one image view");
+    }
     Require(name, "role-free backing",
             color.backing.image_type == vk::ImageType::e2D &&
                 color.backing.layers == 2 &&
@@ -6384,6 +6437,16 @@ public:
     constexpr uint64_t allocation_size = 0x3000000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
+    // Some drivers cannot attach D24S8 in any configuration, and Image::Image
+    // exits the process instead of creating such an image. Everything below
+    // needs a depth-stencil target; resolve one single-sample format up front
+    // and let the two-sample target below re-probe against its own samples.
+    const auto host_depth_stencil = SupportedDepthStencilFormat(
+        vk::Format::eD24UnormS8Uint, vk::SampleCountFlagBits::e1);
+    if (host_depth_stencil == vk::Format::eUndefined) {
+      SkipRasterizationCases(1);
+      return;
+    }
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -7729,12 +7792,22 @@ public:
       auto ms_depth_desc = color_desc;
       ms_depth_desc.type = BindingType::DepthTarget;
       ms_depth_desc.info.stencil = {base + ms_stencil_offset, ms_stencil_size};
-      ms_depth_desc.info.pixel_format = vk::Format::eD24UnormS8Uint;
+      // D24S8 is not universally attachable, so ask the device first. Everything
+      // below this point drives a depth-stencil target, so a device with no such
+      // format cannot run any of it.
+      const auto ms_depth_format =
+          SupportedDepthStencilFormat(host_depth_stencil,
+                                      vk::SampleCountFlagBits::e2);
+      if (ms_depth_format == vk::Format::eUndefined) {
+        SkipRasterizationCases(1);
+        return;
+      }
+      ms_depth_desc.info.pixel_format = ms_depth_format;
       ms_depth_desc.info.guest_format = Prospero::BufferFormat::k16UNorm;
       ms_depth_desc.info.bytes_per_block = 2;
       ms_depth_desc.info.samples = 2;
       ms_depth_desc.info.type = Prospero::ImageType::kColor2D;
-      ms_depth_desc.view_info.format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.view_info.format = ms_depth_format;
       ms_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       ms_depth_desc.view_info.usage =
@@ -10254,7 +10327,7 @@ public:
       std::memset(memory + d16_fallback_stencil_offset, 0x6d, 4);
       auto d16_depth_desc = MakeLinearDesc(
           base + d16_fallback_offset, sizeof(d16_fallback_values),
-          vk::Format::eD24UnormS8Uint, Prospero::BufferFormat::k16UNorm,
+          host_depth_stencil, Prospero::BufferFormat::k16UNorm,
           Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2, 1);
       d16_depth_desc.type = BindingType::DepthTarget;
       d16_depth_desc.info.stencil = {base + d16_fallback_stencil_offset, 4};
@@ -10339,10 +10412,24 @@ public:
           texture_cache.FindImage(d16_stenciled_desc);
       const auto d16_restenciled_words =
           read_texels(d16_restenciled_image, vk::ImageAspectFlagBits::eDepth);
+      // The promotion target is whatever depth-stencil format the device
+      // supports, so the D16 value is stored either widened into a 24-bit depth
+      // or converted to float. Read the host format back instead of assuming
+      // D24S8, which some drivers reject outright.
+      const auto d16_promoted_format =
+          texture_cache.GetImage(d16_restenciled_image).backing.format;
+      const bool d16_promoted_to_float =
+          d16_promoted_format == vk::Format::eD32SfloatS8Uint ||
+          d16_promoted_format == vk::Format::eD32Sfloat;
       bool d16_promoted = d16_restenciled_image != d16_native_image;
       for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
-        d16_promoted &= (d16_restenciled_words[i] & 0x00ffffffu) ==
-                        EncodeD16AsD24(d16_fallback_values[i]);
+        if (d16_promoted_to_float) {
+          d16_promoted &= d16_restenciled_words[i] ==
+                          EncodeD16AsD32(d16_fallback_values[i]);
+        } else {
+          d16_promoted &= (d16_restenciled_words[i] & 0x00ffffffu) ==
+                          EncodeD16AsD24(d16_fallback_values[i]);
+        }
       }
       Require(name, "D16 native depth/fallback depth copy", d16_promoted,
               "D16 depth lost its values when its target regained the stencil");
@@ -16634,7 +16721,7 @@ public:
       Require(name, "disjoint depth sampling during depth writes",
               !disjoint_feedback &&
                   disjoint_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      SampledDepthLayout() &&
                   disjoint_binding.images[0].layout ==
                       disjoint_rendering.depth_stencil_attachment.image_layout &&
                   disjoint_image.backing.state.layout ==
@@ -16677,7 +16764,7 @@ public:
               overlapping_view != nullptr &&
                   depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
                   depth_views_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      SampledDepthLayout() &&
                   MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
                       depth_views_rendering.depth_stencil_attachment.image_layout &&
                   MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
@@ -17075,7 +17162,7 @@ public:
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
         const auto &pixel_depth = bounds_bindings.pixel.images[0];
         const auto expected_layout = pass == 0
-            ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+            ? SampledDepthLayout()
             : vk::ImageLayout::eDepthReadOnlyOptimal;
         Require(name, "deferred clear with sampled depth bounds",
                 bounds_depth.image_id == depth_only.image_id &&
@@ -17520,7 +17607,7 @@ public:
             shared_bindings.pixel));
         const auto expected_layout =
             stencil_write
-                ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                ? SampledDepthLayout()
                 : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
         const auto expected_access =
             vk::AccessFlagBits2::eShaderRead |
@@ -19335,6 +19422,9 @@ public:
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
+    if (!m_rasterization_supported) {
+      return;
+    }
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
@@ -22657,7 +22747,9 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_robust_pipelines = true;
   u32   m_skipped_cases          = 0;
+  u32   m_skipped_compute_cases  = 0;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -22866,11 +22958,30 @@ private:
     m_physical_device.getProperties2(&properties2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_robustness2.robustBufferAccess2 == true &&
-                available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
-            "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    m_robust_pipelines =
+        std::ranges::any_of(extensions,
+                            [](const vk::ExtensionProperties &extension) {
+                              return std::strcmp(extension.extensionName.data(),
+                                                 VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0;
+                            }) &&
+        available_robustness2.robustBufferAccess2 == true &&
+        available_pipeline_robustness.pipelineRobustness == true &&
+        robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+    if (!m_robust_pipelines) {
+      std::printf(
+          "[host]    RobustBufferPipelines     unavailable, robust buffer cases "
+          "will be skipped\n");
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -23007,7 +23118,8 @@ private:
     pipeline_robustness.pNext = &maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
-    robustness2.pNext = &pipeline_robustness;
+    robustness2.pNext = m_robust_pipelines ? static_cast<void *>(&pipeline_robustness)
+                                           : static_cast<void *>(&maintenance8);
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
@@ -23037,12 +23149,14 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
         VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
         VK_EXT_MESH_SHADER_EXTENSION_NAME};
+    if (m_robust_pipelines) {
+      device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -23451,6 +23565,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   }
   if (test.compile_only) {
     std::printf("[compute] %-32s ok\n", test.name);
+    return;
+  }
+  if (test.profile->robust_buffer_access && vulkan != nullptr &&
+      !vulkan->RobustPipelinesSupported()) {
+    std::printf("[compute] %-32s skipped, no byte-granular robustBufferAccess2\n", test.name);
+    vulkan->SkipComputeCase();
     return;
   }
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -55932,6 +56052,10 @@ int main(int argc, char **argv) {
   if (vulkan.SkippedCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
                 vulkan.SkippedCaseCount());
+  }
+  if (vulkan.SkippedComputeCaseCount() > 0) {
+    std::printf("ShaderRecompilerComputeTests: %u compute cases skipped\n",
+                vulkan.SkippedComputeCaseCount());
   }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

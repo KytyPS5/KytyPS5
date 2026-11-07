@@ -51113,6 +51113,17 @@ void CheckDepthTextureEncoding() {
   Require("DepthTextureEncoding", "DCC control with a counter id",
           !IsSupportedDepthTextureEncoding(dcc_counter_id),
           "a counter id hid an unsupported metadata control");
+  auto counting = [](ShaderTextureResource descriptor) {
+    descriptor.fields[5] |= 1u << 25u;
+    return descriptor;
+  };
+  Require("DepthTextureEncoding", "counted depth with a counter id",
+          IsSupportedDepthTextureEncoding(counting(counter_id_depth)) &&
+              IsSupportedDepthTextureEncoding(counting(compressed_counter_id)) &&
+              IsSupportedDepthTextureEncoding(counting(msaa_counter_id)) &&
+              IsSupportedDepthTextureEncoding(counting(pipe_aligned_counter_id)) &&
+              !IsSupportedDepthTextureEncoding(counting(dcc_counter_id)),
+          "enabled mip statistics changed how the counter id is read");
 
   auto missing_metadata = compressed_descriptor;
   missing_metadata.fields[6] &= 0x00ffffffu;

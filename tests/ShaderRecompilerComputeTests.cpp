@@ -14657,6 +14657,21 @@ public:
       Require(name, "block-compressed sampled view",
               cache.FindTexture(binding.image_id, binding.desc) != nullptr,
               "a block-compressed MetaCompress texture did not produce a view");
+      auto mipped = value;
+      mipped.dwords[0] = static_cast<uint32_t>((bc_address + 0x100000) >> 8u);
+      mipped.dwords[1] = 0xca900000u;
+      mipped.dwords[2] = 0x00ffc0ffu;
+      mipped.dwords[3] = 0xd051102cu;
+      mipped.dwords[5] = 0x00700000u;
+      const auto mipped_binding =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, mipped);
+      Require(name, "block-compressed mip view past MAX_MIP",
+              mipped_binding.desc.info.extent == vk::Extent3D{512, 512, 1} &&
+                  mipped_binding.desc.info.resources.levels == 1 &&
+                  mipped_binding.desc.view_info.base_level == 0 &&
+                  mipped_binding.desc.info.metadata.kind == ImageMetadataKind::None &&
+                  cache.FindTexture(mipped_binding.image_id, mipped_binding.desc) != nullptr,
+              "a block-compressed mip view past MAX_MIP kept DCC metadata");
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();

@@ -555,7 +555,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
-	const auto    image_layers = layered ? depth : 1u;
+	auto          image_layers = layered ? depth : 1u;
+	// A cube holds six faces even when DEPTH, its last face slice, ends before them (Teardown's
+	// sky cube has DEPTH 0).
+	if (descriptor.Type() == Prospero::ImageType::kCube) {
+		image_layers = std::max(image_layers, 6u);
+	}
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	auto pixel_format = surface_format.vk_format;
 	if (resource.depth_compare) {

@@ -217,11 +217,6 @@ void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, si
 void     TestBeforeNextGuestReserve(callback_func_t callback);
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
-void     TestFailNextPhysicalMemoryUnmap();
-void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
-void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
-void     TestFailNextFixedReserveRangeRegistration();
-void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();

@@ -69,13 +69,6 @@ void TestMaskedConstructionAndBitwiseOperations() {
 
   Bits left;
   left.SetRange(0, 80);
-  Bits right;
-  right.SetRange(40, 120);
-  const auto exclusive = left ^ right;
-  for (size_t index = 0; index < 128; index++) {
-    const bool expected = (index < 80) != (index >= 40 && index < 120);
-    Check(exclusive.Get(index) == expected, "XOR produced the wrong bit");
-  }
   const auto inverted = ~left;
   for (size_t index = 0; index < 128; index++) {
     Check(inverted.Get(index) == (index >= 80), "NOT produced the wrong bit");

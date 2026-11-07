@@ -195,20 +195,31 @@ uint32_t PushConstantBlockType(EmitterState& state) {
 	                                   PushConstantArrayType(state));
 }
 
-uint32_t PerVertexType(EmitterState& state) {
+uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
+	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
+}
+
+// gl_PerVertex: the position, then the clip distances when there are any. Built-ins only take part
+// in interface matching inside this block, so the next stage (the rect list control shader) can
+// declare the same block.
+uint32_t PerVertexType(EmitterState& state, uint32_t clip_distance_count) {
+	if (clip_distance_count == 0) {
+		return state.builder.DecoratedType(
+		    spv::OpTypeStruct,
+		    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    TypeF32Vector(state, 4));
+	}
 	return state.builder.DecoratedType(
 	    spv::OpTypeStruct,
 	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+	     {spv::OpMemberDecorate, {1, spv::DecorationBuiltIn, spv::BuiltInClipDistance}},
 	     {spv::OpDecorate, {spv::DecorationBlock}}},
-	    TypeF32Vector(state, 4));
+	    TypeF32Vector(state, 4), F32ArrayType(state, clip_distance_count));
 }
 
 uint32_t SampleMaskArrayType(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeArray, TypeI32(state), ConstantU32(state, 1));
-}
-
-uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
-	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
 void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR::ImageResource& image,
@@ -591,39 +602,50 @@ void DefineInputs(EmitterState& state) {
 
 void DefineOutputs(EmitterState& state) {
 	state.outputs.reserve(state.program.info.outputs.size());
-	uint32_t clip_distance_count = 0;
-	uint32_t cull_distance_count = 0;
 	for (const auto& output: state.program.info.outputs) {
 		state.outputs.push_back({output});
-		if (output.kind == IR::StageOutputKind::ClipDistance) {
-			clip_distance_count = std::max(clip_distance_count, output.index + 1);
-		} else if (output.kind == IR::StageOutputKind::CullDistance) {
-			cull_distance_count = std::max(cull_distance_count, output.index + 1);
-		}
 	}
 	const bool position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		return output.kind == IR::StageOutputKind::Position;
 	});
-	if (position && state.input_info.vertex->user_clip_planes != 0) {
+	const auto distances =
+	    IR::CountOutputDistances(state.program.stage, state.program.info.outputs,
+	                             position ? state.input_info.vertex->user_clip_planes : 0u);
+	const uint32_t clip_distance_count = distances.clip;
+	const uint32_t cull_distance_count = distances.cull;
+	if (distances.user_clip_planes != 0) {
 		// PipelineCache rejects UCP_ENA with shader clip or cull distances.
-		EXIT_IF(clip_distance_count + cull_distance_count != 0);
+		EXIT_IF(cull_distance_count != 0 ||
+		        clip_distance_count !=
+		            distances.user_clip_planes + (distances.invalid_position_plane ? 1u : 0u));
 		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
-		for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
+		for (uint32_t index = 0; index < distances.user_clip_planes; index++) {
 			state.outputs.push_back(
-			    {{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0, "gl_ClipDistance"}});
+			    {{IR::StageOutputKind::ClipDistance, index, 0, "gl_ClipDistance"}});
 		}
 	}
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex &&
-	    clip_distance_count + cull_distance_count < 8u && position) {
+	if (distances.invalid_position_plane) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
-		state.invalid_position_clip_distance = clip_distance_count++;
+		state.invalid_position_clip_distance = clip_distance_count - 1u;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
 		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
 	}
+	// With a position, the clip distances are member 1 of gl_PerVertex rather than a variable.
+	state.clip_distance_in_per_vertex = clip_distance_count != 0 && position;
+	const auto PerVertex              = [&]() {
+		if (state.per_vertex_variable == 0) {
+			const auto type =
+			    PerVertexType(state, state.clip_distance_in_per_vertex ? clip_distance_count : 0u);
+			state.builder.AddName(type, "gl_PerVertex");
+			state.per_vertex_variable =
+			    DefineInterfaceVariable(state, type, spv::StorageClassOutput, "outPerVertex");
+		}
+		return state.per_vertex_variable;
+	};
 	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
 	                         spv::BuiltIn builtin) {
 		if (variable == 0) {
@@ -634,20 +656,16 @@ void DefineOutputs(EmitterState& state) {
 	};
 	for (auto& binding: state.outputs) {
 		switch (binding.kind) {
-			case IR::StageOutputKind::Position:
-				if (state.per_vertex_variable == 0) {
-					const auto type = PerVertexType(state);
-					state.builder.AddName(type, "gl_PerVertex");
-					state.per_vertex_variable = DefineInterfaceVariable(
-					    state, type, spv::StorageClassOutput, "outPerVertex");
-				}
-				binding.variable_id = state.per_vertex_variable;
-				break;
+			case IR::StageOutputKind::Position: binding.variable_id = PerVertex(); break;
 			case IR::StageOutputKind::PointSize:
 				binding.variable_id = BuiltIn(state.point_size_variable, TypeF32(state),
 				                              "gl_PointSize", spv::BuiltInPointSize);
 				break;
 			case IR::StageOutputKind::ClipDistance:
+				if (state.clip_distance_in_per_vertex) {
+					binding.variable_id = PerVertex();
+					break;
+				}
 				binding.variable_id =
 				    BuiltIn(state.clip_distance_variable, F32ArrayType(state, clip_distance_count),
 				            "gl_ClipDistance", spv::BuiltInClipDistance);
@@ -777,7 +795,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
 		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
 	}
-	if (state.clip_distance_variable != 0) {
+	if (state.clip_distance_variable != 0 || state.clip_distance_in_per_vertex) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
 	}
 	if (state.cull_distance_variable != 0) {

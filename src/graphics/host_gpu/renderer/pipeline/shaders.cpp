@@ -162,7 +162,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (rect_list) {
 		std::span<const RectListParameter> parameters;
 		if (pixel != nullptr) parameters = pixel->rect_parameters;
-		const auto shaders = BuildRectListShaders(parameters, vertex.info.param_export_mask);
+		const auto shaders         = BuildRectListShaders(parameters, vertex.info.param_export_mask,
+		                                                  RectListClipDistances(vertex.info));
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
 		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}

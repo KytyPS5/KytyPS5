@@ -156,6 +156,8 @@ struct EmitterState {
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
+	// The clip distances are member 1 of per_vertex_variable (the shader exports a position).
+	bool                       clip_distance_in_per_vertex           = false;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
 	uint32_t                   user_clip_planes                      = 0;
 	uint32_t                   cull_distance_variable                = 0;

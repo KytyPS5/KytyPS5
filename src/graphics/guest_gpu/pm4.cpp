@@ -73,7 +73,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_SET_QUEUE_REG]             = "IT_SET_QUEUE_REG";
 	names[IT_SET_UCONFIG_REG]           = "IT_SET_UCONFIG_REG";
 	names[IT_SET_UCONFIG_REG_INDEX]     = "IT_SET_UCONFIG_REG_INDEX";
-	names[IT_DISPATCH_DRAW_PREAMBLE]    = "IT_DISPATCH_DRAW_PREAMBLE";
+	names[IT_DRAW_INDEX_MULTI_INST]     = "IT_DRAW_INDEX_MULTI_INST";
 	names[IT_DISPATCH_DRAW]             = "IT_DISPATCH_DRAW";
 	names[IT_GET_LOD_STATS]             = "IT_GET_LOD_STATS";
 	names[IT_WAIT_REG_MEM_64]           = "IT_WAIT_REG_MEM_64";

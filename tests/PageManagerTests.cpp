@@ -603,12 +603,13 @@ void TestConcurrentSharedWatchers() {
     const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
     const auto page = static_cast<size_t>((address - region_base) / page_size);
     mask.Set(page);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    for (uint32_t count = 0; count < 256; count++) {
+      manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    }
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count < 256; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }

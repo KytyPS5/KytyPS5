@@ -283,14 +283,6 @@ bool File::CreateDirectory(const std::filesystem::path& path) {
         WithoutTrailingSeparator(path));
 }
 
-bool File::DeleteDirectory(const std::filesystem::path& path) {
-	if (IsArchivePath(path)) {
-		return false;
-	}
-    return SysFileDeleteDirectory(
-        WithoutTrailingSeparator(path));
-}
-
 bool File::CreateDirectories(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;

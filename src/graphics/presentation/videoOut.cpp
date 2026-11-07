@@ -338,16 +338,10 @@ static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
 static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    triggered_event.fflags < 0xfu ? triggered_event.fflags + 1u : triggered_event.fflags;
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-		return;
-	}
-	event->event     = triggered_event;
-	event->triggered = true;
+	// One event counts every occurrence until it is delivered.
+	event->event.fflags = std::min(event->event.fflags + 1u, 0xfu);
+	event->event.data   = MakeVideoOutEventData(event->event.data, trigger_data);
+	event->triggered    = true;
 }
 
 static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,

@@ -174,24 +174,30 @@
              </widget>
             </item>
             <item row="7" column="1">
+             <widget class="QCheckBox" name="checkBox_readback_storage">
+              <property name="toolTip"><string>Read back shader-written images when the game flushes the GPU cache for the CPU. Images from linear and tiled readback are read back then too.</string></property>
+              <property name="text"><string>Enable storage readback</string></property>
+             </widget>
+            </item>
+            <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
               <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
               <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
-            <item row="8" column="1">
+            <item row="9" column="1">
              <widget class="QCheckBox" name="checkBox_occlusion_queries">
               <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
               <property name="text"><string>Enable occlusion queries</string></property>
              </widget>
             </item>
-            <item row="9" column="1">
+            <item row="10" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
              </widget>
             </item>
-            <item row="10" column="1">
+            <item row="11" column="1">
              <widget class="QCheckBox" name="checkBox_shader_cache">
               <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
               <property name="text"><string>Cache shaders</string></property>

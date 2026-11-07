@@ -141,11 +141,6 @@ bool SysFileCreateDirectory(const std::filesystem::path& path) {
 	return CreateDirectoryW(wide.c_str(), nullptr) != 0;
 }
 
-bool SysFileDeleteDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
-	return RemoveDirectoryW(wide.c_str()) != 0;
-}
-
 bool SysFileDeleteFile(const std::filesystem::path& name) {
 	auto wide = name.wstring();
 	return DeleteFileW(wide.c_str()) != 0;

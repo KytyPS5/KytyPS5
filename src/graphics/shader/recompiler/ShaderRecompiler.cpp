@@ -520,7 +520,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		auto& producer = entry->second;
 		if (inserted) {
 			Block translated;
-			Frontend::Translator translator(query, &translated, 1u,
+			Frontend::Translator translator(query, &translated, 1u, Frontend::NoLaneSpills,
 			    (options.input_info.compute->float_mode & 0x10u) == 0u,
 			    !options.input_info.compute->async_compute);
 			translator.TranslateInstruction(source.decoded.instructions[index]);

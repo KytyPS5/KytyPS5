@@ -2866,6 +2866,27 @@ void TestMunmapGpuRuns() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestRangeNamesCoverWholePages() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "RangeNamesCoverWholePages";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto         base     = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "names");
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page + 0x100), 0x200, "inner"),
+	        "name part of the middle page");
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, SceKernelProtCpuRw, 1,
+	            0, 0, 1, "inner");
+	CheckOk(test, KernelClearVirtualRangeName(reinterpret_cast<void*>(base + page - 1), 2),
+	        "clear names across a page boundary");
+	ExpectRange(test, Query(test, base), base, base + 2 * page, SceKernelProtCpuRw, 1, 0, 0, 1, "");
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 3 * page,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "names");
+	CheckOk(test, KernelMunmap(base, 3 * page), "unmap the renamed pages");
+	Check(test, AvailableFlexibleMemory(test) == baseline, "renamed pages leaked flexible budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	const char* test = "NonzeroDirectOffsetAliasesSharedBacking";
 
@@ -6001,6 +6022,7 @@ int main(int argc, char** argv) {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestMunmapGpuRuns);
+	RunTest(TestRangeNamesCoverWholePages);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);

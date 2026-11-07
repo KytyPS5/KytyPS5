@@ -523,6 +523,22 @@ LIB_DEFINE(InitAudio_1_Voice) {
 
 } // namespace LibVoice
 
+namespace LibVoiceChat {
+
+LIB_VERSION("VoiceChat", 1, "VoiceChat", 1, 1);
+
+static int KYTY_SYSV_ABI VoiceChatStub() {
+	return OK;
+}
+
+LIB_DEFINE(InitAudio_1_VoiceChat) {
+	LIB_FUNC("spdS-hedavE", VoiceChatStub);
+	LIB_FUNC("Ptmkf9UnWBg", VoiceChatStub);
+	LIB_FUNC("CscDZAFA5+c", VoiceChatStub);
+}
+
+} // namespace LibVoiceChat
+
 namespace LibAjm {
 
 LIB_VERSION("Ajm", 1, "Ajm", 1, 1);
@@ -1184,6 +1200,7 @@ LIB_DEFINE(InitAudio_1) {
 	LibAudioIn::InitAudio_1_AudioIn(s);
 	LibVoiceQoS::InitAudio_1_VoiceQoS(s);
 	LibVoice::InitAudio_1_Voice(s);
+	LibVoiceChat::InitAudio_1_VoiceChat(s);
 	LibAjm::InitAudio_1_Ajm(s);
 	LibAcm::InitAudio_1_Acm(s);
 	LibAvPlayer::InitAudio_1_AvPlayer(s);

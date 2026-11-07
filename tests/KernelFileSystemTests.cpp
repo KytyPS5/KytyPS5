@@ -1420,11 +1420,15 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
         "directory SEEK_END uses padded stream size");
   FileSystem::FileStat stat{};
   Check(FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == end &&
-            stat.st_blksize == 512,
+            stat.st_blksize == 0x10000,
         "directory stat agrees with seek and enumeration");
   Check(FileSystem::KernelStat("/app0/", &stat) == OK && stat.st_size == end &&
-            stat.st_blocks == end / 512,
+            stat.st_blocks == end / 512 && stat.st_blksize == 0x10000,
         "path and descriptor directory stat agree");
+  std::vector<char> whole(stat.st_blksize);
+  Check(FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelGetdents(fd, whole.data(), whole.size()) == end,
+        "one getdents of st_blksize bytes reads the whole directory");
   Check(FileSystem::KernelLseek(fd, 0, 0) == 0,
         "rewind directory for asset read");
   std::vector<char> raw(static_cast<size_t>(end));

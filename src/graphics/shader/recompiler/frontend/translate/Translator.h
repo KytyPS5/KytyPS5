@@ -148,7 +148,8 @@ private:
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool is64 = false);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered,
+	                             IR::Type type = IR::Type::F32);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool half = false);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);

@@ -117,6 +117,7 @@ public:
 	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
+	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
@@ -162,6 +163,7 @@ public:
 		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		readback_tiled_images       = other.readback_tiled_images;
+		readback_storage_images     = other.readback_storage_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;

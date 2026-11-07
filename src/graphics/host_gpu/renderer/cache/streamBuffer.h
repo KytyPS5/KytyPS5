@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -96,12 +97,22 @@ private:
 
 class StreamBuffer final: public Buffer {
 public:
+	// A committed download range, in a buffer of its own when the ring cannot hold it. `owner`
+	// keeps that buffer alive until the host reads it.
+	struct Download {
+		Buffer*                 buffer;
+		uint8_t*                mapped;
+		uint64_t                offset;
+		std::unique_ptr<Buffer> owner;
+	};
+
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	             uint64_t size);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
+	[[nodiscard]] Download                      MapDownload(uint64_t size, uint64_t alignment);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
 private:

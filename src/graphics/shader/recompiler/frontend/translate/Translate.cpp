@@ -1346,7 +1346,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
 			                              IR::U32(IR::Value(8u))));
 		} else if (options.stage == ShaderType::TessellationEvaluation) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			// GS_TG_INFO and the merged wave info both count one full wave of vertices.
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
+			                      IR::U32(IR::Value(options.wave_size << 12u)));
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+			                      IR::U32(IR::Value(options.wave_size)));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(4),
 			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));

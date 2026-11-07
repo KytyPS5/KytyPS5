@@ -1391,7 +1391,6 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, VirtualMemory::Mode mode) {
 	}
 	if (remaining != 0) return false;
 
-	size_t mapped = 0;
 	for (const auto& block: blocks) {
 		const auto reused = block.backing_offset < m_backing_high_water
 		                        ? std::min(block.size, m_backing_high_water - block.backing_offset)
@@ -1399,20 +1398,10 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, VirtualMemory::Mode mode) {
 		if (reused != 0) {
 			g_guest_address_space->ZeroBacking(block.backing_offset, reused);
 		}
-		// Never roll this back: a successfully exposed view can be written before a later failure.
 		m_backing_high_water = std::max(m_backing_high_water, block.backing_offset + block.size);
-		if (!g_guest_address_space->MapBacking(block.vaddr, block.size, block.backing_offset,
-		                                       mode)) {
-			while (mapped != 0) {
-				const auto& previous = blocks[--mapped];
-				EXIT_IF(!g_guest_address_space->UnmapBacking(previous.vaddr, previous.size));
-			}
-			return false;
-		}
-		++mapped;
-	}
-
-	for (const auto& block: blocks) {
+		// The caller validated the target; failing here is an emulator fault.
+		EXIT_IF(!g_guest_address_space->MapBacking(block.vaddr, block.size, block.backing_offset,
+		                                           mode));
 		RemoveFreeRange(m_free, block.backing_offset, block.size);
 		EXIT_IF(!m_mappings.emplace(block.vaddr, block).second);
 	}

@@ -231,18 +231,6 @@ public:
 		                gap);
 	}
 
-	bool ProtectViews(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::shared_lock lock(m_mutex);
-		bool             ok = true;
-		ForEachSparseRange(
-		    m_maps, vaddr, size,
-		    [&](const auto&, uint64_t start, uint64_t bytes) {
-			    ok = ok && VirtualMemory::Protect(start, bytes, mode);
-		    },
-		    [&](uint64_t, uint64_t) { ok = false; });
-		return ok;
-	}
-
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -273,114 +261,51 @@ public:
 					return false;
 				}
 				const auto part_size = std::min(end, entry->vaddr + entry->size) - current;
-				targets.push_back({current, part_size,
-				                   entry->backing_offset + current - entry->vaddr, entry->mode});
+				targets.push_back({current, part_size});
 				current += part_size;
 			}
 		}
 
-		size_t removed  = 0;
-		auto   rollback = [&] {
-			while (removed != 0) {
-				const auto& previous = targets[--removed];
-				EXIT_IF(!MapFixed(previous.vaddr, previous.size, previous.backing_offset,
-				                  previous.mode));
-			}
-		};
-		for (const auto& entry: targets) {
-			if (!UnmapOne(entry.vaddr, entry.size)) {
-				rollback();
-				return false;
-			}
-			++removed;
-		}
-
+		// Collecting the views validated the span; failing after it is an emulator fault.
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (const auto& entry: targets) {
+			UnmapOne(entry.vaddr, entry.size);
+		}
 		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
 		// records this contiguous guest span as one free range, so normalize fragmented backing
 		// views into one placeholder before publishing it there.
-		if (removed > 1 && !CoalescePlaceholders(vaddr, size)) {
-			rollback();
-			return false;
-		}
-#endif
+		EXIT_IF(targets.size() > 1 && !CoalescePlaceholders(vaddr, size));
+#else
+		// Replace only the requested range so concurrent accesses and GPU watch
+		// protections on the surviving mappings remain intact.
+		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size));
 
+		std::lock_guard lock(m_mutex);
+		RemoveMappingsUnlocked(vaddr, size);
+#endif
 		return true;
 	}
 
-	bool UnmapOne(uint64_t vaddr, uint64_t size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void UnmapOne(uint64_t vaddr, uint64_t size) {
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
 			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
 		}
-		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
-			std::lock_guard lock(m_mutex);
-			m_maps.emplace(old.vaddr, old);
-			return false;
-		}
+		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size));
 
 		const uint64_t left_size  = vaddr - old.vaddr;
 		const uint64_t right_addr = vaddr + size;
 		const uint64_t right_size = old.vaddr + old.size - right_addr;
-		bool           ok         = true;
-		if (left_size != 0) {
-			ok = SplitPlaceholder(old.vaddr, left_size) && ok;
-		}
-		if (right_size != 0) {
-			ok = SplitPlaceholder(vaddr, size) && ok;
-		}
-		if (left_size != 0) {
-			ok = MapFixed(old.vaddr, left_size, old.backing_offset, old.mode) && ok;
-		}
-		if (right_size != 0) {
-			ok = MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
-			              old.mode) &&
-			     ok;
-		}
-		if (ok) {
-			return true;
-		}
-
-		if (left_size != 0 && Contains(old.vaddr, left_size)) {
-			EXIT_IF(!UnmapOne(old.vaddr, left_size));
-		}
-		if (right_size != 0 && Contains(right_addr, right_size)) {
-			EXIT_IF(!UnmapOne(right_addr, right_size));
-		}
-		EXIT_IF(!CoalescePlaceholders(old.vaddr, old.size));
-		EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
-		return false;
-#else
-		// Replace only the requested range so concurrent accesses and GPU watch
-		// protections on the surviving mappings remain intact.
-		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
-			return false;
-		}
-
-		std::lock_guard lock(m_mutex);
-		RemoveMappingsUnlocked(vaddr, size);
-
-		return true;
+		EXIT_IF(left_size != 0 && !SplitPlaceholder(old.vaddr, left_size));
+		EXIT_IF(right_size != 0 && !SplitPlaceholder(vaddr, size));
+		EXIT_IF(left_size != 0 && !MapFixed(old.vaddr, left_size, old.backing_offset, old.mode));
+		EXIT_IF(right_size != 0 &&
+		        !MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
+		                  old.mode));
+	}
 #endif
-	}
-
-	bool Contains(uint64_t vaddr, uint64_t size) {
-		std::shared_lock lock(m_mutex);
-		const auto      end     = vaddr + size;
-		auto            current = vaddr;
-
-		while (current < end) {
-			const auto* entry = FindContainingUnlocked(current);
-			if (entry == nullptr) {
-				return false;
-			}
-			current = std::min(end, entry->vaddr + entry->size);
-		}
-
-		return true;
-	}
 
 private:
 	struct MapEntry {
@@ -850,16 +775,6 @@ private:
 			if (range_start >= range_end) {
 				continue;
 			}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			// Rollback can split a backing view without changing the owner interval.
-			// Windows protection calls must stay within each actual view.
-			if (region.type == MappingType::Backing) {
-				if (!m_backing->ProtectViews(range_start, range_end - range_start, mode)) {
-					return false;
-				}
-				continue;
-			}
-#endif
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}

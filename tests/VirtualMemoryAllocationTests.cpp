@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -32,6 +33,10 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
@@ -5684,6 +5689,149 @@ void TestSmallFiberStacksAndMigration() {
 		std::printf("[host]    %s stack=%zu ok\n", test, stack_size);
 	}
 }
+struct FpState {
+	uint32_t mxcsr;
+	uint16_t cw;
+};
+
+FpState ReadFp() {
+	FpState state {_mm_getcsr(), 0};
+	asm volatile("fnstcw %0" : "=m"(state.cw));
+	return state;
+}
+
+void WriteFp(FpState state) {
+	_mm_setcsr(state.mxcsr);
+	asm volatile("fldcw %0" : : "m"(state.cw) : "memory");
+}
+
+struct FpGuard {
+	FpState saved = ReadFp();
+	FpGuard()               = default;
+	FpGuard(const FpGuard&) = delete;
+	FpGuard& operator=(const FpGuard&) = delete;
+	~FpGuard() { WriteFp(saved); }
+};
+
+[[gnu::noinline]] uint32_t FpWitness() {
+	volatile float a          = std::bit_cast<float>(0x007fffffu);
+	volatile float b          = 2.0f;
+	float          result     = a;
+	const float    multiplier = b;
+	asm volatile("mulss %1, %0" : "+x"(result) : "x"(multiplier));
+	return std::bit_cast<uint32_t>(result);
+}
+
+constexpr FpState HostFp {0x1f80, 0x027f};
+constexpr FpState GuestFp {0x9fc0, 0x037f};
+constexpr uint32_t MxcsrFlags = 0x3f;
+
+bool HasControls(FpState state, FpState expected) {
+	return (state.mxcsr & ~MxcsrFlags) == expected.mxcsr && state.cw == expected.cw;
+}
+
+struct PthreadFpData {
+	FpState                     entry {};
+	FpState                     destructor {};
+	uint32_t                    product = 0;
+	Libs::LibKernel::PthreadKey key     = 0;
+};
+
+void KYTY_SYSV_ABI PthreadFpKeyDestructor(void* value) {
+	static_cast<PthreadFpData*>(value)->destructor = ReadFp();
+}
+
+void* KYTY_SYSV_ABI PthreadFpEntry(void* arg) {
+	auto& data   = *static_cast<PthreadFpData*>(arg);
+	data.entry   = ReadFp();
+	data.product = FpWitness();
+	Libs::LibKernel::PthreadSetspecific(data.key, &data);
+	return arg;
+}
+
+void TestGuestPthreadFp() {
+	const char* test = "GuestPthreadFp";
+	FpGuard     guard;
+	WriteFp(HostFp);
+	Check(test, FpWitness() == 0x00fffffeu, "a subnormal product is kept without DAZ");
+	WriteFp(GuestFp);
+	Check(test, FpWitness() == 0, "a subnormal product is zero with DAZ");
+	WriteFp(HostFp);
+	static const bool ready = [] {
+		Common::Singleton<Loader::RuntimeLinker>::Instance();
+		Libs::LibKernel::Initialize();
+		Libs::LibKernel::PthreadInitSelfForMainThread();
+		return true;
+	}();
+	(void)ready;
+	PthreadFpData data;
+	CheckOk(test, Libs::LibKernel::PthreadKeyCreate(&data.key, PthreadFpKeyDestructor),
+	        "PthreadKeyCreate");
+	Libs::LibKernel::Pthread thread = nullptr;
+	CheckOk(test, Libs::LibKernel::PthreadCreate(&thread, nullptr, PthreadFpEntry, &data, "fp-test"),
+	        "PthreadCreate");
+	void* result = nullptr;
+	CheckOk(test, Libs::LibKernel::PthreadJoin(thread, &result), "PthreadJoin");
+	Check(test, result == &data, "the guest thread returned its argument");
+	Check(test, HasControls(data.entry, GuestFp),
+	      "a guest thread did not start with MXCSR 0x9fc0 and x87 control 0x037f");
+	Check(test, data.product == 0, "a guest thread kept a subnormal product");
+	Check(test, HasControls(data.destructor, GuestFp),
+	      "a key destructor of the guest thread ran without the guest FP environment");
+	CheckOk(test, Libs::LibKernel::PthreadKeyDelete(data.key), "PthreadKeyDelete");
+	Check(test, HasControls(ReadFp(), HostFp), "the host thread lost its own controls");
+}
+
+struct FiberFpData {
+	FpState  entry {};
+	FpState  resumed {};
+	uint32_t product = 0;
+	int      error   = 0;
+};
+
+[[noreturn]] void KYTY_SYSV_ABI FiberFpEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data   = *reinterpret_cast<FiberFpData*>(initial);
+	data.entry   = ReadFp();
+	data.product = FpWitness();
+	WriteFp({0xffc4, 0x0f7f});
+	data.error |= Libs::Fiber::FiberReturnToThread(1, nullptr);
+	data.resumed = ReadFp();
+	for (;;) {
+		data.error |= Libs::Fiber::FiberReturnToThread(2, nullptr);
+	}
+}
+
+void TestFiberFp() {
+	const char*                              test = "FiberFp";
+	FpGuard                                  guard;
+	alignas(8) std::array<uint8_t, 256>      object {};
+	alignas(16) std::array<uint8_t, 0x20000> stack {};
+	auto* fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+	FiberFpData data;
+	WriteFp(HostFp);
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(fiber, "fp", FiberFpEntry, reinterpret_cast<uint64_t>(&data),
+	                                     stack.data(), stack.size(), nullptr, 0x0a000000),
+	        "FiberInitialize");
+	uint64_t returned = 0;
+	CheckOk(test, Libs::Fiber::FiberRun(fiber, 0, &returned), "first FiberRun");
+	const auto caller       = ReadFp();
+	const auto first_return = returned;
+	WriteFp({0x1fa0, 0x027f});
+	CheckOk(test, Libs::Fiber::FiberRun(fiber, 0, &returned), "resume FiberRun");
+	const auto caller_again = ReadFp();
+	CheckOk(test, Libs::Fiber::FiberFinalize(fiber), "FiberFinalize");
+	Check(test, data.error == 0 && first_return == 1 && returned == 2, "fiber transfer");
+	Check(test, HasControls(data.entry, GuestFp),
+	      "a fiber of SDK 3.50 or later did not start with MXCSR 0x9fc0 and x87 control 0x037f");
+	Check(test, data.product == 0, "a fiber kept a subnormal product");
+	Check(test, HasControls(caller, HostFp), "the fiber's controls leaked to its caller");
+	Check(test, (caller.mxcsr & MxcsrFlags) == 4, "returning dropped the current exception flags");
+	Check(test, HasControls(data.resumed, {0xffc0, 0x0f7f}), "the fiber lost its controls on resume");
+	Check(test, (data.resumed.mxcsr & MxcsrFlags) == 0x20,
+	      "resuming dropped the current exception flags");
+	Check(test, HasControls(caller_again, HostFp), "the caller lost its controls after resume");
+}
 #endif
 
 } // namespace
@@ -5815,6 +5963,11 @@ int main(int argc, char** argv) {
 		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--fp-only") == 0) {
+		RunTest(TestGuestPthreadFp);
+		RunTest(TestFiberFp);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
@@ -5841,6 +5994,8 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleZeroingTracksBackingLifetime);
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
+	RunTest(TestGuestPthreadFp);
+	RunTest(TestFiberFp);
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);

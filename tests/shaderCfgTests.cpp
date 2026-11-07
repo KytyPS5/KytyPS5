@@ -13206,6 +13206,42 @@ void TestSpirvWave32HalfReductions() {
         "wave32 reductions on a 32-lane subgroup lost their native reduction");
 }
 
+void TestSpirvPixelWave32Reductions() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {EncodeSopp(0x01)};
+  const auto emit = [&](uint32_t host) {
+    ShaderPixelInputInfo pixel{};
+    pixel.wave_size = 32;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = 32;
+    options.host_subgroup_size = host;
+    options.input_info.pixel = &pixel;
+    auto compiled = RecompileForTest(shader, options);
+    IR::IREmitter emitter(compiled.program.blocks.front());
+    const auto lane = emitter.Emit(IR::ValueOpcode::LaneId, {});
+    const auto value = emitter.Emit(IR::ValueOpcode::IAdd32, {lane, IR::Value(1000u)});
+    const auto reduced = emitter.Emit(IR::ValueOpcode::SubgroupUMinU32, {value});
+    const auto alive = emitter.Emit(IR::ValueOpcode::IEqual32, {reduced, IR::Value(0u)});
+    compiled.program.blocks.front()->AppendNewInst(IR::ValueOpcode::Reference, {alive});
+    compiled.program.shader_info_complete = false;
+    IR::CollectShaderInfo(compiled.program, options.input_info);
+    return Spirv::EmitProgram(compiled.program, options.input_info, 0,
+                              Spirv::DefaultProfile, false, host);
+  };
+
+  const auto wide = emit(64);
+  CheckSpirvBinaryValidates(wide);
+  Check(SpirvInstructionOpcodeCount(wide, spv::OpGroupNonUniformShuffleXor) == 5u &&
+            SpirvInstructionOpcodeCount(wide, spv::OpGroupNonUniformUMin) == 0u,
+        "wave32 pixel reductions on a 64-lane subgroup did not stay in the caller's half");
+
+  const auto native = emit(32);
+  CheckSpirvBinaryValidates(native);
+  Check(SpirvInstructionOpcodeCount(native, spv::OpGroupNonUniformShuffleXor) == 0u &&
+            SpirvInstructionOpcodeCount(native, spv::OpGroupNonUniformUMin) == 1u,
+        "wave32 pixel reductions on a 32-lane subgroup lost their native reduction");
+}
+
 void TestRepeatedExportsHaveOneInterface() {
   const uint32_t shader[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
                              EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
@@ -13548,6 +13584,7 @@ int main() {
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
   TestSpirvWave32HalfReductions();
+  TestSpirvPixelWave32Reductions();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();

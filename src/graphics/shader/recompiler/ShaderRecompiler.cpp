@@ -931,7 +931,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
+	                                options.emit_debug_info, options.host_subgroup_size);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
 	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,

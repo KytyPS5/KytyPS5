@@ -650,7 +650,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    binding == BindingType::Texture && cached.info.IsDepth() && !cached.info.HasStencil() &&
 	    !requested.IsVolume() && requested.samples == cached.info.samples &&
 	    IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = !cached.info.resources.Contains(requested.resources) ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -861,7 +861,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                              requested.resources.levels == cached.info.resources.levels;
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
 		if ((requested.pixel_format == cached.info.pixel_format || compatible_array) &&
-		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    requested.type == cached.info.type &&
+		    !cached.info.resources.Contains(requested.resources) &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
 		      requested.extent == cached.info.extent &&
@@ -1392,7 +1393,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                             desc.info.guest_format;
 			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
 				FreeImage(result);
 				result = {};
 			}

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <optional>
@@ -34,7 +35,8 @@ ChainResult SearchChain(Value value, uint32_t lane, uint32_t wave_size) {
 	}
 }
 
-bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size) {
+bool IsPossibleToEliminate(const Program& program, Value source, uint32_t lane,
+                           uint32_t wave_size) {
 	std::queue<Value>         queue;
 	std::unordered_set<Inst*> visited;
 	queue.push(source);
@@ -43,6 +45,9 @@ bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size) {
 		const auto chain = SearchChain(queue.front(), lane, wave_size);
 		queue.pop();
 		if (chain.write != nullptr) {
+			if (!ValidateWaveUniformValue(program, chain.write->Arg(1))) {
+				return false;
+			}
 			continue;
 		}
 		auto* inst = chain.value.TryInstruction();
@@ -229,13 +234,17 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 			const auto lane  = selector.U32() % wave_size;
 			const auto chain = SearchChain(inst.Arg(0), lane, wave_size);
 			if (chain.write != nullptr) {
-				inst.ReplaceUsesWith(chain.write->Arg(1));
-				stats.rewritten_reads++;
+				// V_READLANE broadcasts the value the selected lane wrote; substituting this lane's
+				// own value is only equivalent when the written value is uniform across the wave.
+				if (ValidateWaveUniformValue(program, chain.write->Arg(1))) {
+					inst.ReplaceUsesWith(chain.write->Arg(1));
+					stats.rewritten_reads++;
+				}
 				continue;
 			}
 			auto* producer = chain.value.TryInstruction();
 			if (producer == nullptr || producer->GetOpcode() != ValueOpcode::Phi ||
-			    !IsPossibleToEliminate(chain.value, lane, wave_size)) {
+			    !IsPossibleToEliminate(program, chain.value, lane, wave_size)) {
 				continue;
 			}
 

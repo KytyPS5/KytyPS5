@@ -521,8 +521,18 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
+		auto source = lane;
+		if (state.program.wave_size == 32u) {
+			// A 32-lane guest wave owns one half of a 64-lane native subgroup and numbers its lanes
+			// from zero there, so a guest lane selects the matching lane of the caller's half.
+			source = EmitBinaryU32(
+			    state, spv::OpBitwiseOr,
+			    EmitBinaryU32(state, spv::OpBitwiseAnd, EmitSubgroupLocalInvocationId(state),
+			                  ConstantU32(state, ~31u)),
+			    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31)));
+		}
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
-		                          lane);
+		                          source);
 		return low;
 	}
 	const auto physical_lane =

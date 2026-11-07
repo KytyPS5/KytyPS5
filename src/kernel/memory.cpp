@@ -2017,9 +2017,11 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	     "\t len   = 0x%016" PRIx64 "\n",
 	     vaddr, len);
 
-	if (len == 0 || UINT64_MAX - vaddr < len) {
+	constexpr uint64_t page_size = 0x4000;
+	if (len == 0 || (vaddr & (page_size - 1)) != 0 || len > UINT64_MAX - vaddr - (page_size - 1)) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	len = (len + page_size - 1) & ~(page_size - 1);
 	std::vector<VirtualRanges::Range> ranges;
 	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;

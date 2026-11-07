@@ -2866,6 +2866,24 @@ void TestMunmapGpuRuns() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMunmapRoundsToPages() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "MunmapRoundsToPages";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto         base     = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "round");
+	Check(test, KernelMunmap(base + page / 4, page) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "munmap accepted an unaligned address");
+	CheckOk(test, KernelMunmap(base, 0x100), "unmap part of the first page");
+	ExpectUnmapped(test, base + 0x100);
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, SceKernelProtCpuRw, 1,
+	            0, 0, 1, "round");
+	CheckOk(test, KernelMunmap(base + page, 1), "unmap one byte of the second page");
+	ExpectUnmapped(test, base + page);
+	Check(test, AvailableFlexibleMemory(test) == baseline, "munmap leaked flexible budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestRangeNamesCoverWholePages() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "RangeNamesCoverWholePages";
@@ -6022,6 +6040,7 @@ int main(int argc, char** argv) {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestMunmapGpuRuns);
+	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);

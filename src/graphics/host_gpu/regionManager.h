@@ -80,8 +80,6 @@ public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
-		m_writable.Fill();
-		m_readable.Fill();
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -100,16 +98,17 @@ public:
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
-		auto& bits = GetBits<source>();
+		auto&      bits = GetBits<source>();
+		RegionBits changed(enable ? ~bits : bits, start, end);
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			UpdateProtection<!enable, false>();
+			UpdateProtection<!enable, false>(changed);
 		} else {
-			UpdateProtection<enable, true>();
+			UpdateProtection<enable, true>(changed);
 		}
 	}
 
@@ -124,9 +123,9 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
-				UpdateProtection<true, false>();
+				UpdateProtection<true, false>(mask);
 			} else {
-				UpdateProtection<false, true>();
+				UpdateProtection<false, true>(mask);
 			}
 		}
 		for (const auto [first, last]: mask) {
@@ -137,16 +136,12 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched.
 	template <bool track, bool is_read>
-	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
-		auto&      previous   = is_read ? m_readable : m_writable;
-		auto       mask       = protection ^ previous;
-		if (mask.None()) {
-			return;
+	void UpdateProtection(RegionBits& changed) {
+		if (!changed.None()) {
+			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
 		}
-		previous = protection;
-		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
 	template <DirtySource source>
@@ -176,8 +171,6 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
-	RegionBits   m_writable;
-	RegionBits   m_readable;
 };
 
 } // namespace Libs::Graphics

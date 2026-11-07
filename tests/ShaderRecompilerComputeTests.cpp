@@ -6178,6 +6178,70 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A scan past its records creates buffers only for the records it stored, and the next scan
+  // reports the pages left.
+  void CheckFaultRecordsOverflow() {
+    constexpr const char *name = "FaultRecordsOverflow";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr u32 pages = 1216;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), pages * page, page, 0,
+                &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, pages * page, 0x3, 0, direct,
+                                                         32 * page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, pages * page);
+    // Faults the first `count` pages, a multiple of 32, then scans and processes the records.
+    const auto scan = [&](u32 count) {
+      const auto command = scheduler.Current().Handle();
+      if (count != 0) {
+        command.fillBuffer(cache.GetFaultBuffer()->Handle(), BufferCache::PageIndex(base) / 8,
+                           count / 8, ~0u);
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask =
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0,
+                                nullptr, 0, nullptr);
+      }
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+    };
+    // Area 1 keeps 32 records, more than the overflowing scan of area 0 counts past its own; read
+    // as a record, area 1's count is address 32, which no buffer can cover.
+    for (u32 area = 0; area < 8; area++) {
+      scan(area == 1 ? 32 : 0);
+    }
+    scan(pages);
+    scan(0);
+    bool reported = true;
+    for (u32 i = 0; i < pages; i++) {
+      reported &= static_cast<bool>(BufferCacheTestAccess::PageOwner(cache, base + i * page));
+    }
+    Require(name, "pages left", reported, "the pages past the records were not reported later");
+    context.UnmapMemory(base, pages * page);
+    scheduler.Finish();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, pages * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, pages * page) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -55724,6 +55788,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
     vulkan.CheckFaultBufferScan();
+    vulkan.CheckFaultRecordsOverflow();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -55986,6 +56051,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckFaultBufferScan();
+  vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

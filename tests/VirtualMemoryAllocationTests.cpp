@@ -4060,11 +4060,44 @@ void TestMemoryPoolMultiRangeDecommit() {
 	          decommitted.is_pooled == 1 && decommitted.is_committed == 0,
 	      "multi-range decommit did not restore the reserved pool span");
 
+	const auto split_span = base + 2 * SceKernelMemoryPoolCommitLen;
+	const auto renamed    = split_span + SceKernelMemoryPoolCommitLen;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelSetVirtualRangeName(
+	            reinterpret_cast<void*>(renamed), SceKernelMemoryPoolCommitLen, "pool_renamed"),
+	        "KernelSetVirtualRangeName(pool tail)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(reinterpret_cast<void*>(split_span),
+	                                                        expand_len, SceKernelMtypeC,
+	                                                        SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit(renamed span)");
+	ExpectRange(test, Query(test, split_span), split_span, renamed, SceKernelProtCpuRw, 0, 0, 1, 1);
+	ExpectRange(test, Query(test, renamed), renamed, split_span + expand_len, SceKernelProtCpuRw,
+	            0, 0, 1, 1, "pool_renamed");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolDecommit(reinterpret_cast<void*>(split_span),
+	                                                          expand_len, 0),
+	        "KernelMemoryPoolDecommit(renamed span)");
+	ExpectRange(test, Query(test, renamed), renamed, split_span + expand_len, 0, 0, 0, 1, 0,
+	            "pool_renamed");
+
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(mixed span)");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(arena, expand_len, SceKernelMtypeC,
+	                                                      SceKernelProtCpuRw, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EBUSY,
+	      "commit accepted a span with committed pool memory");
+	ExpectRange(test, Query(test, base), base, base + SceKernelMemoryPoolCommitLen, 0, 0, 0, 1, 0);
+	const auto pool_end = base + SceKernelMemoryPoolReserveLen;
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	          reinterpret_cast<void*>(pool_end - SceKernelMemoryPoolCommitLen), expand_len,
+	          SceKernelMtypeC, SceKernelProtCpuRw, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "commit accepted a span past the pool reserve");
 	g_gpu_range_events.clear();
 	Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, expand_len, 0),

@@ -3169,11 +3169,15 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	VirtualRanges::Range old_range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &old_range) ||
-	    old_range.type != VirtualRangeType::PoolReserved ||
-	    len > old_range.size - (vaddr - old_range.start)) {
-		return KERNEL_ERROR_EACCES;
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges) ||
+	    std::any_of(ranges.begin(), ranges.end(),
+	                [](const auto& range) { return !IsPooledRangeType(range.type); })) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (std::any_of(ranges.begin(), ranges.end(),
+	                [](const auto& range) { return range.type == VirtualRangeType::Pooled; })) {
+		return KERNEL_ERROR_EBUSY;
 	}
 
 	std::vector<PooledMemory::Mapping> mappings;
@@ -3181,33 +3185,19 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	size_t mapped_size = 0;
-	auto   rollback    = [&]() {
-		if (mapped_size != 0 && !g_guest_address_space->UnmapBacking(vaddr, mapped_size)) {
-			EXIT("failed to roll back pooled-memory backing maps\n");
-		}
-		if (!g_pooled_memory->Release(vaddr, len)) {
-			EXIT("failed to release pooled-memory rollback allocation\n");
-		}
-	};
-
+	// Validation precedes the first backing map; failing after it is an emulator fault.
 	for (const auto& mapping: mappings) {
-		auto       failure_reason = GuestBackingStore::FailureReason::None;
-		const bool ok = g_guest_address_space->MapBacking(mapping.vaddr, mapping.size,
-		                                                  mapping.phys_addr, mode, &failure_reason);
-		if (!ok) {
-			LOGF_COLOR(Log::Color::Red, "\t pool backing map failed: %s\n",
-			           GuestBackingStore::GetFailureReasonName(failure_reason));
-			rollback();
-			return KERNEL_ERROR_ENOMEM;
+		auto failure_reason = GuestBackingStore::FailureReason::None;
+		if (!g_guest_address_space->MapBacking(mapping.vaddr, mapping.size, mapping.phys_addr, mode,
+		                                       &failure_reason)) {
+			EXIT("failed to map pooled memory: %s\n",
+			     GuestBackingStore::GetFailureReasonName(failure_reason));
 		}
-		mapped_size += mapping.size;
 	}
-
-	if (!g_virtual_ranges->ReplaceSpan(vaddr, len, VirtualRangeType::PoolReserved, 0, prot, type,
-	                                   VirtualRangeType::Pooled, old_range.name)) {
-		rollback();
-		return KERNEL_ERROR_EBUSY;
+	for (const auto& range: ranges) {
+		EXIT_IF(!g_virtual_ranges->ReplaceSpan(range.start, range.size,
+		                                       VirtualRangeType::PoolReserved, 0, prot, type,
+		                                       VirtualRangeType::Pooled, range.name));
 	}
 
 	MapGpuRange(vaddr, len);

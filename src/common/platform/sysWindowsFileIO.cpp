@@ -12,6 +12,10 @@
 #include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_file_t {
@@ -30,11 +34,55 @@ constexpr DWORD FILE_SHARE_POSIX = static_cast<DWORD>(FILE_SHARE_READ) |
 constexpr DWORD READ_WRITE_DELETE = static_cast<DWORD>(GENERIC_READ) |
                                     static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE);
 
+static std::atomic<SysFileRecoverableDestination> g_recoverable_destination {nullptr};
+
+void SysFileSetRecoverableDestination(SysFileRecoverableDestination probe) {
+	g_recoverable_destination.store(probe, std::memory_order_release);
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
-	DWORD r = 0;
-	ReadFile(f.handle, data, size, &r, nullptr);
+	DWORD         w = 0;
+	LARGE_INTEGER zero {};
+	LARGE_INTEGER start {};
+	const bool    have_start = SetFilePointerEx(f.handle, zero, &start, FILE_CURRENT) != FALSE;
+	if (ReadFile(f.handle, data, size, &w, nullptr) == FALSE) {
+		const DWORD error = GetLastError();
+		if ((error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER) && have_start &&
+		    SetFilePointerEx(f.handle, start, nullptr, FILE_BEGIN) != FALSE) {
+			w                       = 0;
+			uint64_t      remaining = size;
+			LARGE_INTEGER file_size {};
+			if (GetFileSizeEx(f.handle, &file_size) != FALSE) {
+				remaining =
+				    file_size.QuadPart > start.QuadPart
+				        ? std::min<uint64_t>(
+				              remaining, static_cast<uint64_t>(file_size.QuadPart - start.QuadPart))
+				        : 0;
+			}
+			thread_local std::vector<uint8_t> chunk(1u << 20u);
+			while (remaining != 0) {
+				const auto request =
+				    static_cast<DWORD>(std::min<uint64_t>(remaining, chunk.size()));
+				const auto recoverable = g_recoverable_destination.load(std::memory_order_acquire);
+				if (recoverable == nullptr ||
+				    !recoverable(static_cast<uint8_t*>(data) + w, request)) {
+					break;
+				}
+				DWORD got = 0;
+				if (ReadFile(f.handle, chunk.data(), request, &got, nullptr) == FALSE || got == 0) {
+					break;
+				}
+				std::memcpy(static_cast<uint8_t*>(data) + w, chunk.data(), got);
+				w += got;
+				remaining -= got;
+				if (got < request) {
+					break;
+				}
+			}
+		}
+	}
 	if (bytes_read != nullptr) {
-		*bytes_read = r;
+		*bytes_read = w;
 	}
 }
 

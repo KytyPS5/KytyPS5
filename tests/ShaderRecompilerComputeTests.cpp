@@ -252,6 +252,9 @@ struct ImageHeapTestAccess {
   }
 };
 
+// Guest faults the GPU fault route handled.
+std::atomic<uint64_t> g_handled_gpu_faults{0};
+
 struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
@@ -363,6 +366,11 @@ struct TextureCacheTestAccess {
     return cache.m_download_images.contains(id);
   }
 
+  static bool WriteBacksPending(TextureCache &cache) {
+    std::scoped_lock lock{cache.m_write_back_mutex};
+    return !cache.m_write_backs.empty();
+  }
+
   static void TrackDownload(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.TrackImageDownload(id, cache.m_slot_images[id]);
@@ -376,6 +384,10 @@ struct TextureCacheTestAccess {
 
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
     cache.m_readback_linear_images = enabled;
+  }
+
+  static void SetStorageReadback(TextureCache &cache, bool enabled) {
+    cache.m_readback_storage_images = enabled;
   }
 
   static std::pair<uint8_t *, uint64_t>
@@ -3851,7 +3863,7 @@ public:
             "unmap returned before an earlier guest-memory callback");
 
     constexpr uintptr_t fault_base = 0x0000000200500000ull;
-    constexpr uint64_t fault_size = 0x10000;
+    constexpr uint64_t fault_size = 0x40000;
     int64_t fault_direct_offset = -1;
     Require("GpuCommandLane", "processor fault direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -4206,6 +4218,289 @@ public:
     Require("GpuCommandLane", "RELEASE_MEM label on a clean cached page",
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
+
+    // With storage-image readback on, a GL2 writeback copies a tiled image's
+    // first shader write, or the first after a CPU write, back to guest
+    // memory, and guest accesses wait for the copy; a plain rewrite, a rewrite
+    // after a CPU write beside the image, or an image larger than the download
+    // ring, is not copied. Without it, a GL2 writeback copies nothing and a
+    // download blocks no access.
+    {
+      constexpr uint64_t storage_address = fault_base + 0x10000;
+      constexpr uint64_t storage_off_address = fault_base + 0x20000;
+      std::memset(reinterpret_cast<void *>(storage_address), 0x11, 0x30000);
+      // 2048x2304 RGBA32F, larger than the 64 MiB download ring.
+      constexpr uintptr_t large_address = 0x0000000210000000ull;
+      constexpr uint64_t large_size = 0x4800000;
+      int64_t large_direct_offset = -1;
+      void *large_memory = reinterpret_cast<void *>(large_address);
+      Require("GpuCommandLane", "storage readback large mapping",
+              LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, LibKernel::Memory::KernelGetDirectMemorySize(), large_size,
+                  0x10000, 0, &large_direct_offset) == 0 &&
+                  LibKernel::Memory::KernelMapDirectMemory(
+                      &large_memory, large_size, 0x3, 0x10, large_direct_offset,
+                      0x10000) == 0 &&
+                  large_memory == reinterpret_cast<void *>(large_address),
+              "the large storage-readback mapping failed");
+      resources.MapMemory(large_address, large_size);
+      std::memset(large_memory, 0x11, 0x10000);
+      constexpr std::array<float, 4> texel{1.0f, 2.0f, 3.0f, 0.0f};
+      constexpr std::array<uint32_t, 4> stale{0x11111111u, 0x11111111u,
+                                              0x11111111u, 0x11111111u};
+      constexpr auto written = std::bit_cast<std::array<uint32_t, 4>>(texel);
+      // Two linear images share a page, so two write-backs arm it; they are
+      // copied back behind a parked priority thread. The page's last KiB lies
+      // beside them.
+      constexpr uint64_t shared_page = fault_base + 0x34000;
+      constexpr uint64_t beside_images = shared_page + 0xc00;
+      constexpr uint64_t suspended_address = fault_base + 0x3c000;
+      uint64_t suspended_tick = 0;
+      std::binary_semaphore parked{0};
+      bool signalled = false;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      gpu.SendCommandSync([&] {
+        auto &texture_cache = resources.GetTextureCache();
+        auto processor = std::make_unique<CommandProcessor>(context, 0);
+        processor->BufferInit();
+        const auto shader_write = [&](uint64_t address,
+                                      vk::Extent3D extent = {8, 8, 1},
+                                      Prospero::TileMode tile =
+                                          Prospero::TileMode::kRenderTarget) {
+          auto desc =
+              MakeLinearDesc(address, 0, vk::Format::eR32G32B32A32Sfloat,
+                             Prospero::BufferFormat::k32_32_32_32Float,
+                             Prospero::ImageType::kColor2D, extent, 1, 16, 1);
+          desc.type = TextureCache::BindingType::Storage;
+          desc.info.tile_mode = tile;
+          desc.info.pitch = 0;
+          desc.info.UpdateSize();
+          desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+          const auto image = texture_cache.FindImage(desc);
+          (void)texture_cache.FindTexture(image, desc);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, resources.GetCommandScheduler().Current(), image,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+              vk::ClearValue{vk::ClearColorValue{texel}});
+          return image;
+        };
+        // Whether the release completed with the guest texel at (0, 0) as
+        // expected. Without a label, only an interrupt is raised.
+        const auto release = [&](uint32_t gcr_cntl, uint64_t address,
+                                 const std::array<uint32_t, 4> &expected,
+                                 bool label_write = true) {
+          uint64_t label = 0;
+          auto packet =
+              label_write ? make_interrupt_packet(2, 0, &label, label_value, 0)
+                          : make_interrupt_packet(0, 2, nullptr, 0, 0);
+          packet[1] |= gcr_cntl << 12u;
+          Pm4Execution execution;
+          std::array<uint32_t, 4> guest{};
+          if (processor->Process(execution, packet) !=
+                  Pm4ProcessResult::Complete ||
+              label != (label_write ? label_value : 0)) {
+            return false;
+          }
+          std::memcpy(guest.data(), reinterpret_cast<const void *>(address),
+                      sizeof(guest));
+          return guest == expected;
+        };
+        const auto off_image = shader_write(storage_off_address);
+        Require("GpuCommandLane", "storage readback off",
+                !TextureCacheTestAccess::PendingDownload(texture_cache,
+                                                         off_image),
+                "storage readback off queued an image");
+        TextureCacheTestAccess::SetStorageReadback(texture_cache, true);
+        (void)shader_write(storage_address);
+        Require("GpuCommandLane", "storage readback without GL2 writeback",
+                release(0, storage_address, stale),
+                "a release without a GL2 writeback stored the image");
+        Require("GpuCommandLane", "storage readback after the label",
+                release(1u << 9u, storage_address, written),
+                "a read after a GL2-writeback label saw a stale image");
+        const auto image = shader_write(storage_address);
+        Require("GpuCommandLane", "storage readback of a rewrite",
+                !TextureCacheTestAccess::PendingDownload(texture_cache, image),
+                "a rewrite of a GPU-written image was queued again");
+        LibKernel::Memory::WriteBacking(storage_address, stale.data(),
+                                        sizeof(stale));
+        texture_cache.InvalidateMemory(storage_address, sizeof(stale));
+        (void)shader_write(storage_address);
+        Require(
+            "GpuCommandLane", "storage readback after a CPU write",
+            release(1u << 9u, storage_address, written, false),
+            "a CPU-written storage image was not stored at a GL2 interrupt");
+        // A CPU write beside a 2 KiB linear image, in its page, queues no
+        // rewrite.
+        constexpr uint64_t linear_address = fault_base + 0x30000;
+        constexpr Prospero::TileMode linear = Prospero::TileMode::kLinear;
+        (void)shader_write(linear_address, {8, 8, 1}, linear);
+        const bool linear_stored = release(1u << 9u, linear_address, written);
+        texture_cache.InvalidateMemory(linear_address + 0xc00, sizeof(stale));
+        const auto linear_image =
+            shader_write(linear_address, {8, 8, 1}, linear);
+        Require("GpuCommandLane", "storage readback beside a CPU write",
+                linear_stored && !TextureCacheTestAccess::PendingDownload(
+                                     texture_cache, linear_image),
+                "a CPU write beside a GPU-written image queued its rewrite");
+        // Nor does a new image's first write over GPU data in the buffer cache,
+        // unless that data covers only part of the image.
+        constexpr uint64_t buffered_address = fault_base + 0x3f800;
+        constexpr uint64_t half_buffered_address = fault_base + 0x3f000;
+        (void)buffer_cache.ObtainBuffer(fault_base + 0x3f400, 0xc00, true,
+                                        false);
+        const auto buffered = shader_write(buffered_address, {8, 8, 1}, linear);
+        const auto half_buffered =
+            shader_write(half_buffered_address, {8, 8, 1}, linear);
+        Require(
+            "GpuCommandLane", "storage readback over buffered GPU data",
+            !TextureCacheTestAccess::PendingDownload(texture_cache, buffered) &&
+                TextureCacheTestAccess::PendingDownload(texture_cache,
+                                                        half_buffered),
+            "a write over GPU data in the buffer cache was queued, or one "
+            "only partly over it was not");
+        TextureCacheTestAccess::DeleteImage(texture_cache, half_buffered);
+        (void)shader_write(large_address, {2048, 2304, 1});
+        Require("GpuCommandLane", "storage readback past the download ring",
+                release(1u << 9u, large_address, stale),
+                "an image larger than the download ring was read back");
+        // Without storage readback, an image enrolled for linear readback is
+        // copied back at the suspend point only, without trapping its pages.
+        TextureCacheTestAccess::SetStorageReadback(texture_cache, false);
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+        constexpr uint64_t enrolled_address = fault_base + 0x38000;
+        const auto enrolled = shader_write(enrolled_address, {8, 8, 1}, linear);
+        const bool left =
+            release(1u << 9u, enrolled_address, stale) &&
+            TextureCacheTestAccess::PendingDownload(texture_cache, enrolled);
+        texture_cache.ProcessDownloadImages();
+        Require("GpuCommandLane", "linear readback without storage readback",
+                left &&
+                    !TextureCacheTestAccess::WriteBacksPending(texture_cache),
+                "without storage readback, a GL2 release copied an image back "
+                "or a download blocked guest accesses");
+        // With storage readback too, linear readback still queues a rewrite,
+        // and a GL2 writeback copies it back.
+        TextureCacheTestAccess::SetStorageReadback(texture_cache, true);
+        const bool requeued = TextureCacheTestAccess::PendingDownload(
+            texture_cache, shader_write(enrolled_address, {8, 8, 1}, linear));
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+        Require("GpuCommandLane", "linear readback with storage readback",
+                requeued && release(1u << 9u, enrolled_address, written),
+                "with storage readback, linear readback did not queue a "
+                "rewrite, or a GL2 writeback did not copy it back");
+        // An acquire's GL2 writeback of the whole GL2 copies a first write
+        // back too; a ranged one or an acquire without a writeback does not.
+        const auto acquire = [&](uint32_t gcr_cntl) {
+          std::array<uint32_t, 8> packet{KYTY_PM4(8, Pm4::IT_ACQUIRE_MEM, 0)};
+          packet[7] = gcr_cntl;
+          Pm4Execution execution;
+          return processor->Process(execution, packet) ==
+                 Pm4ProcessResult::Complete;
+        };
+        constexpr uint64_t acquired_address = fault_base + 0x3d000;
+        const auto acquired = shader_write(acquired_address, {8, 8, 1}, linear);
+        Require("GpuCommandLane", "storage readback at a GL2 acquire",
+                acquire(0x0380u) && acquire(0x9000u) &&
+                    TextureCacheTestAccess::PendingDownload(texture_cache,
+                                                            acquired) &&
+                    acquire(0x8000u) && release(0, acquired_address, written),
+                "an acquire copied an image back without a whole-GL2 "
+                "writeback, or not with one");
+        // So does a GL2-writeback release without a label or interrupt.
+        constexpr uint64_t silent_address = fault_base + 0x3e000;
+        (void)shader_write(silent_address, {8, 8, 1}, linear);
+        auto silent = make_interrupt_packet(0, 0, nullptr, 0, 0);
+        silent[1] |= (1u << 9u) << 12u;
+        Pm4Execution silent_execution;
+        Require("GpuCommandLane", "storage readback at an unsignalled release",
+                processor->Process(silent_execution, silent) ==
+                        Pm4ProcessResult::Complete &&
+                    release(0, silent_address, written),
+                "a GL2-writeback release without a signal copied nothing back");
+        (void)shader_write(shared_page, {8, 8, 1}, linear);
+        (void)shader_write(shared_page + 0x800, {8, 4, 1}, linear);
+        resources.GetCommandScheduler().DeferPriorityOperation(
+            [&] { parked.acquire(); });
+        uint64_t label = 0;
+        auto packet = make_interrupt_packet(2, 0, &label, label_value, 0);
+        packet[1] |= (1u << 9u) << 12u;
+        Pm4Execution execution;
+        signalled = processor->Process(execution, packet) ==
+                        Pm4ProcessResult::Complete &&
+                    label == label_value;
+        // A download recorded without a submit, as ProcessDownloadImages
+        // leaves it, is submitted by the read that needs it.
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
+        (void)shader_write(suspended_address, {8, 8, 1}, linear);
+        texture_cache.ProcessDownloadImages();
+        suspended_tick = resources.GetCommandScheduler().CurrentTick();
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+      });
+      // The label landed at once. A read waits for the copies instead of
+      // faulting in a loop, and so does an invalidation beside them before
+      // host I/O.
+      const auto faults = g_handled_gpu_faults.load();
+      std::array<uint32_t, 4> read{};
+      std::atomic<bool> read_done{false};
+      std::atomic<bool> invalidated{false};
+      bool stored = false;
+      std::thread reader([&] {
+        std::memcpy(read.data(), reinterpret_cast<const void *>(shared_page),
+                    sizeof(read));
+        read_done = true;
+      });
+      std::thread writer([&] {
+        (void)resources.InvalidateMemory(beside_images, sizeof(stale));
+        invalidated = true;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        int fds[2] = {-1, -1};
+        stored = ::pipe(fds) == 0 &&
+                 ::write(fds[1], stale.data(), sizeof(stale)) ==
+                     static_cast<ssize_t>(sizeof(stale)) &&
+                 ::read(fds[0], reinterpret_cast<void *>(beside_images),
+                        sizeof(stale)) == static_cast<ssize_t>(sizeof(stale));
+        ::close(fds[0]);
+        ::close(fds[1]);
+#else
+        std::memcpy(reinterpret_cast<void *>(beside_images), stale.data(),
+                    sizeof(stale));
+        stored = true;
+#endif
+      });
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const bool waited = !read_done && !invalidated;
+      parked.release();
+      reader.join();
+      writer.join();
+      const auto wait_faults = g_handled_gpu_faults.load() - faults;
+      const bool unsubmitted =
+          resources.GetCommandScheduler().CurrentTick() == suspended_tick;
+      std::array<uint32_t, 4> suspended{};
+      std::memcpy(suspended.data(),
+                  reinterpret_cast<const void *>(suspended_address),
+                  sizeof(suspended));
+      gpu.SendCommandSync([&] {
+        TextureCacheTestAccess::SetStorageReadback(resources.GetTextureCache(),
+                                                   false);
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      Require("GpuCommandLane", "linear readback at the suspend point",
+              unsubmitted && suspended == written,
+              "a read did not wait for an unsubmitted write-back");
+      Require("GpuCommandLane", "storage readback while the copy lands",
+              signalled && waited && read == written && wait_faults < 16 &&
+                  stored &&
+                  !TextureCacheTestAccess::WriteBacksPending(
+                      resources.GetTextureCache()),
+              "a GL2 label waited for its copies, or an access did not");
+      resources.UnmapMemory(large_address, large_size);
+      Require("GpuCommandLane", "storage readback large release",
+              LibKernel::Memory::KernelMunmap(large_address, large_size) == 0 &&
+                  LibKernel::Memory::KernelReleaseDirectMemory(
+                      large_direct_offset, large_size) == 0,
+              "the large storage-readback mapping release failed");
+    }
 
     resources.UnmapMemory(fault_base, fault_size);
     Require("GpuCommandLane", "processor fault unmap",
@@ -22863,7 +23158,12 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              if (!LibKernel::Memory::HandleGpuFault(
+                      access, info.access_violation_vaddr)) {
+                return false;
+              }
+              g_handled_gpu_faults.fetch_add(1, std::memory_order_relaxed);
+              return true;
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;

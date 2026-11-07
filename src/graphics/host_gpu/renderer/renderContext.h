@@ -71,6 +71,9 @@ private:
 		int                                 event_id = 0;
 	};
 
+	// Waits for the image write-backs over the range's pages; returns whether any overlapped.
+	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
+
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;

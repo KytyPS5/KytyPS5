@@ -123,9 +123,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -1395,6 +1395,13 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
+	// Storage readback also queues the first GPU write since the CPU last wrote the image: an
+	// image rewritten every frame would otherwise be downloaded at every GL2 writeback. GPU data
+	// in the buffer cache over the whole image is not a CPU write. Read before RefreshImage
+	// uploads the CPU write.
+	const bool first_write =
+	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
+	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
 	RefreshImage(id);
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
@@ -1413,6 +1420,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Storage:
 			CommitGpuWrite(image);
 			TrackImageDownload(id, image);
+			if (first_write) {
+				m_download_images.insert(id);
+			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -1792,11 +1802,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (image.depth_id) {
 		return false;
 	}
-	if (!image.SafeToDownload() || !CanDownload(image)) {
-		return false;
-	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	if (!image.SafeToDownload() || !CanDownload(image) || range.size > download.Size()) {
+		return false;
+	}
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
@@ -1823,11 +1833,44 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+	// With storage readback, guest accesses to its pages wait until the stored data lands.
+	const WriteBack write_back {range, m_scheduler.CurrentTick()};
+	if (m_readback_storage_images) {
+		{
+			std::scoped_lock write_back_lock {m_write_back_mutex};
+			m_write_backs.push_back(write_back);
+		}
+		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
+	}
+	m_scheduler.DeferPriorityOperation([this, &download, write_back, mapped, offset,
+	                                    trapped = m_readback_storage_images] {
+		download.Invalidate(offset, write_back.range.size);
+		LibKernel::Memory::WriteBacking(write_back.range.address, mapped, write_back.range.size);
+		if (trapped) {
+			m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
+			                                               write_back.range.size);
+			std::scoped_lock write_back_lock {m_write_back_mutex};
+			m_write_backs.erase(std::ranges::find(m_write_backs, write_back));
+		}
 	});
 	return true;
+}
+
+uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
+	if (!m_readback_storage_images) {
+		return 0;
+	}
+	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	uint64_t   tick  = 0;
+
+	std::scoped_lock write_back_lock {m_write_back_mutex};
+	for (const auto& write_back: m_write_backs) {
+		if (write_back.range.address < end && begin < write_back.range.End()) {
+			tick = std::max(tick, write_back.tick);
+		}
+	}
+	return tick;
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -1997,13 +2040,23 @@ void TextureCache::ProcessDownloadImages() {
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return;
 	}
+	(void)DownloadQueuedImages();
+}
+
+bool TextureCache::WriteBackImages() {
+	return m_readback_storage_images && DownloadQueuedImages();
+}
+
+bool TextureCache::DownloadQueuedImages() {
 	std::scoped_lock lock {m_lock};
+	bool             downloaded = false;
 	for (const auto id: m_download_images) {
 		if (m_slot_images[id].IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+			downloaded |= DownloadImageMemory(id);
 		}
 	}
 	m_download_images.clear();
+	return downloaded;
 }
 
 } // namespace Libs::Graphics

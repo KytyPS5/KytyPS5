@@ -184,6 +184,11 @@ public:
 	bool             is_depth_copy      = false;
 	ImageId          depth_copy_source {};
 	uint64_t         depth_copy_writes  = UINT64_MAX;
+	// A stencil copy (see TextureCache::FindStencilCopy()): depth_copy_source names the stencil
+	// association it copies, depth_copy_writes the write_count of its depth image it holds, and
+	// stencil_copy_writes its own write_count when it last matched that stencil.
+	bool             is_stencil_copy     = false;
+	uint64_t         stencil_copy_writes = 0;
 	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.

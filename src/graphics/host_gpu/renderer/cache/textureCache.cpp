@@ -36,6 +36,9 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 16;
+// Images a depth/color conversion replaced are kept for a conversion back (see ParkImage()).
+constexpr size_t   MaxParkedImages  = 8;
+constexpr uint64_t ParkedImageTicks = 2048;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 // Smallest GPU-written linear image (in bytes) that is only written back to guest memory once
@@ -360,6 +363,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	DisarmLazyReadback(image);
 	ReleaseDepthCopies(id);
+	ReleaseStencilCopies(id);
 	ReleaseDepthFeedbackCopy(id);
 	if (image.depth_id) {
 		std::erase(m_slot_images[image.depth_id].stencil_ids, id);
@@ -1022,7 +1026,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.first_tail_level   = cached.info.first_tail_level;
 	}
 	info.htile_initial_clear  = false;
-	const auto replacement_id = InsertImage(info);
+	// GTA V (PPSA04263) Fidelity binds two 4K depth targets as R32_UINT storage images (CS
+	// 0x24cbc249a5cf541a) and then as depth targets again, in most frames: the image converted back
+	// is the one kept from the last conversion.
+	auto replacement_id = UnparkImage(info);
+	if (!replacement_id) {
+		replacement_id = InsertImage(info);
+	}
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	replacement.StateChanged();
@@ -1054,7 +1064,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	FreeImage(cached_id);
+	if (cached.depth_id || cached.backing.samples != 1 || replacement.backing.samples != 1) {
+		FreeImage(cached_id);
+	} else {
+		ParkImage(cached_id);
+	}
 	return replacement_id;
 }
 
@@ -1617,6 +1631,8 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	auto& record = m_slot_images[association];
 	TouchImage(record);
 	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+		// Its copies hold another depth image's stencil.
+		ReleaseStencilCopies(association);
 		ImageInfo plane {};
 		plane.data         = stencil;
 		plane.pixel_format = vk::Format::eS8Uint;
@@ -1739,6 +1755,252 @@ void TextureCache::ReleaseDepthCopies(ImageId color_id) {
 	m_depth_copies.erase(found);
 }
 
+static bool SameParkedLayout(const ImageInfo& parked, const ImageInfo& wanted) {
+	return parked.data == wanted.data && parked.stencil == wanted.stencil &&
+	       parked.metadata.kind == wanted.metadata.kind &&
+	       parked.metadata.range == wanted.metadata.range &&
+	       parked.pixel_format == wanted.pixel_format &&
+	       parked.guest_format == wanted.guest_format && parked.type == wanted.type &&
+	       parked.extent == wanted.extent && parked.resources == wanted.resources &&
+	       parked.pitch == wanted.pitch && parked.bytes_per_block == wanted.bytes_per_block &&
+	       parked.samples == wanted.samples && parked.tile_mode == wanted.tile_mode &&
+	       parked.bgra16 == wanted.bgra16;
+}
+
+void TextureCache::ParkImage(ImageId id) {
+	// As FreeImage(), except that the image and its stencil associations stay: the replacement
+	// holds its guest memory, and its contents, until a conversion back.
+	auto& image = m_slot_images[id];
+	if (image.IsGpuModified()) {
+		NoteDiscardedTarget(id, image);
+	}
+	image.ClearGpuModified();
+	DisarmLazyReadback(image);
+	ReleaseDepthCopies(id);
+	ReleaseDepthFeedbackCopy(id);
+	m_download_images.erase(id);
+	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
+		const auto meta = m_surface_metas.find(image.info.metadata.range.address);
+		if (meta != m_surface_metas.end() && (!meta->second.owner || meta->second.owner == id)) {
+			m_surface_metas.erase(meta);
+		}
+	}
+	UnregisterImage(id);
+	StencilPlanesChanged(image);
+	image.binding.needs_rebind = true;
+	image.StateChanged();
+	m_parked_images.emplace_back(id, m_scheduler.CurrentTick());
+	if (m_parked_images.size() > MaxParkedImages) {
+		DiscardParkedImage(m_parked_images.front().first);
+		m_parked_images.erase(m_parked_images.begin());
+	}
+}
+
+ImageId TextureCache::UnparkImage(const ImageInfo& info) {
+	for (auto it = m_parked_images.begin(); it != m_parked_images.end(); ++it) {
+		const auto id    = it->first;
+		auto&      image = m_slot_images[id];
+		if (!SameParkedLayout(image.info, info)) {
+			continue;
+		}
+		m_parked_images.erase(it);
+		image.info    = info;
+		image.binding = {};
+		RegisterImage(id);
+		StencilPlanesChanged(image);
+		WriteBackStencilCopies(id);
+		return id;
+	}
+	return {};
+}
+
+void TextureCache::StencilPlanesChanged(const Image& depth) {
+	for (const auto association: depth.stencil_ids) {
+		const auto& plane = m_slot_images[association].info.data;
+		const auto  epoch = ++m_image_set_epoch;
+		m_image_set_changes[epoch % ImageSetChangeHistory] = {plane.address, plane.size};
+		ForEachPage(plane.address, plane.size,
+		            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
+	}
+}
+
+void TextureCache::DiscardParkedImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	for (const auto association: std::exchange(image.stencil_ids, {})) {
+		FreeImage(association);
+	}
+	// Queued work may still use it.
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferHostOperation([this, id] { m_slot_images.erase(id); });
+	} else {
+		m_slot_images.erase(id);
+	}
+}
+
+void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
+	const auto tick = m_scheduler.CurrentTick();
+	std::erase_if(m_parked_images, [&](const std::pair<ImageId, uint64_t>& parked) {
+		const auto& data = m_slot_images[parked.first].info.data;
+		const bool  discard =
+		    size == 0 ? tick - std::min(tick, parked.second) > ParkedImageTicks
+		              : data.address < address + size && address < data.End();
+		if (discard) {
+			DiscardParkedImage(parked.first);
+		}
+		return discard;
+	});
+}
+
+ImageId TextureCache::FindStencilCopy(ImageId association, const ImageInfo& requested) {
+	auto& copies = m_stencil_copies[association];
+	for (const auto copy_id: copies) {
+		const auto& copy = m_slot_images[copy_id].info;
+		if (copy.pixel_format == requested.pixel_format && copy.type == requested.type &&
+		    copy.extent == requested.extent && copy.resources == requested.resources) {
+			return copy_id;
+		}
+	}
+	auto info     = requested;
+	info.data     = {};
+	info.stencil  = {};
+	info.metadata = {};
+	const auto copy_id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	AttachImageVersion(copy_id);
+	auto& copy             = m_slot_images[copy_id];
+	copy.is_stencil_copy   = true;
+	copy.depth_copy_source = association;
+	copies.push_back(copy_id);
+	return copy_id;
+}
+
+void TextureCache::RefreshStencilCopy(ImageId copy_id) {
+	const auto  association_id = m_slot_images[copy_id].depth_copy_source;
+	const auto* association = association_id ? m_slot_images.try_get(association_id) : nullptr;
+	if (association == nullptr || !association->depth_id) {
+		// Released: the binding resolves its T# again before it is used.
+		return;
+	}
+	// Guest writes of the plane reach the depth image's stencil aspect first.
+	RefreshImage(association_id);
+	const auto range = association->stencil_subresources;
+	auto&      depth = m_slot_images[association->depth_id];
+	auto&      copy  = m_slot_images[copy_id];
+	// A copy written as a storage image holds the newest stencil until it is written back.
+	if (depth.write_count == copy.depth_copy_writes ||
+	    copy.write_count != copy.stencil_copy_writes) {
+		return;
+	}
+	const auto levels = std::min(copy.backing.mip_levels, range.level_count);
+	const auto layers = std::min(copy.backing.layers, range.layer_count);
+	EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 || copy.backing.samples != 1);
+	// Stencil texels are one byte, packed tightly per level (offsets aligned to 4 bytes, as copies
+	// of depth/stencil aspects require).
+	std::vector<vk::BufferImageCopy> stencil_copies;
+	std::vector<vk::BufferImageCopy> color_copies;
+	uint64_t                         size = 0;
+	for (uint32_t level = 0; level < levels; level++) {
+		const vk::Extent3D extent {
+		    std::min(std::max(depth.backing.extent.width >> level, 1u),
+		             std::max(copy.backing.extent.width >> level, 1u)),
+		    std::min(std::max(depth.backing.extent.height >> level, 1u),
+		             std::max(copy.backing.extent.height >> level, 1u)),
+		    1u};
+		vk::BufferImageCopy region {};
+		region.bufferOffset     = size;
+		region.imageSubresource = {vk::ImageAspectFlagBits::eStencil, level, range.base_layer,
+		                           layers};
+		region.imageExtent      = extent;
+		stencil_copies.push_back(region);
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, layers};
+		color_copies.push_back(region);
+		size += Common::AlignUp(uint64_t {extent.width} * extent.height * layers, uint64_t {4});
+	}
+	const auto scratch = m_tiler.GetScratchBuffer(size);
+	for (auto& region: stencil_copies) {
+		region.bufferOffset += scratch.offset;
+	}
+	for (auto& region: color_copies) {
+		region.bufferOffset += scratch.offset;
+	}
+	depth.Download(stencil_copies, scratch.buffer, scratch.offset, size);
+	copy.Upload(color_copies, scratch.buffer, scratch.offset, size);
+	copy.depth_copy_writes   = depth.write_count;
+	copy.stencil_copy_writes = copy.write_count;
+}
+
+void TextureCache::WriteBackStencilCopies(ImageId depth_id) {
+	for (const auto association_id: m_slot_images[depth_id].stencil_ids) {
+		const auto found = m_stencil_copies.find(association_id);
+		if (found == m_stencil_copies.end()) {
+			continue;
+		}
+		const auto range = m_slot_images[association_id].stencil_subresources;
+		for (const auto copy_id: found->second) {
+			auto& depth = m_slot_images[depth_id];
+			auto& copy  = m_slot_images[copy_id];
+			if (copy.write_count == copy.stencil_copy_writes) {
+				continue;
+			}
+			const auto levels = std::min(copy.backing.mip_levels, range.level_count);
+			const auto layers = std::min(copy.backing.layers, range.layer_count);
+			EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 ||
+			        copy.backing.samples != 1);
+			std::vector<vk::BufferImageCopy> stencil_copies;
+			std::vector<vk::BufferImageCopy> color_copies;
+			uint64_t                         size = 0;
+			for (uint32_t level = 0; level < levels; level++) {
+				const vk::Extent3D extent {
+				    std::min(std::max(depth.backing.extent.width >> level, 1u),
+				             std::max(copy.backing.extent.width >> level, 1u)),
+				    std::min(std::max(depth.backing.extent.height >> level, 1u),
+				             std::max(copy.backing.extent.height >> level, 1u)),
+				    1u};
+				vk::BufferImageCopy region {};
+				region.bufferOffset     = size;
+				region.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, layers};
+				region.imageExtent      = extent;
+				color_copies.push_back(region);
+				region.imageSubresource = {vk::ImageAspectFlagBits::eStencil, level,
+				                           range.base_layer, layers};
+				stencil_copies.push_back(region);
+				size += Common::AlignUp(uint64_t {extent.width} * extent.height * layers,
+				                        uint64_t {4});
+			}
+			const auto scratch = m_tiler.GetScratchBuffer(size);
+			for (auto& region: stencil_copies) {
+				region.bufferOffset += scratch.offset;
+			}
+			for (auto& region: color_copies) {
+				region.bufferOffset += scratch.offset;
+			}
+			copy.Download(color_copies, scratch.buffer, scratch.offset, size);
+			depth.Upload(stencil_copies, scratch.buffer, scratch.offset, size);
+			copy.stencil_copy_writes = copy.write_count;
+			copy.depth_copy_writes   = depth.write_count;
+		}
+	}
+}
+
+void TextureCache::ReleaseStencilCopies(ImageId association) {
+	const auto found = m_stencil_copies.find(association);
+	if (found == m_stencil_copies.end()) {
+		return;
+	}
+	for (const auto copy_id: found->second) {
+		auto& copy                = m_slot_images[copy_id];
+		copy.depth_copy_source    = {};
+		copy.binding.needs_rebind = true;
+		copy.StateChanged();
+		// The copy is never registered: queued work may still sample it.
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
+		} else {
+			m_slot_images.erase(copy_id);
+		}
+	}
+	m_stencil_copies.erase(found);
+}
+
 ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
                                     ImageId* depth_source) {
 	// The image description of a remembered lookup was validated when it was remembered.
@@ -1779,6 +2041,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 		ForEachImageInRegion(desc.info.data.address, desc.info.data.size,
 		                     [&](ImageId id, Image&) { candidates.push_back(id); });
 		bool block_alias = false;
+		ImageId stencil_copy {};
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1792,6 +2055,24 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 			    image.info.resources.layers >= desc.info.resources.layers &&
 			    desc.info.bytes_per_block == 1 &&
 			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+				if (!m_slot_images[image.depth_id].registered) {
+					// The depth image is kept while a color image holds its depth plane (see
+					// ParkImage()): textures and storage images bind a copy of its stencil (CS
+					// 0x24cbc249a5cf541a writes it); heaps delete it with the association, as the
+					// conversion did before.
+					if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+					    !desc.heap) {
+						stencil_copy = FindStencilCopy(id, desc.info);
+						break;
+					}
+					const auto depth_id = image.depth_id;
+					std::erase_if(m_parked_images,
+					              [depth_id](const std::pair<ImageId, uint64_t>& parked) {
+						              return parked.first == depth_id;
+					              });
+					DiscardParkedImage(depth_id);
+					continue;
+				}
 				result = id;
 				break;
 			}
@@ -1801,6 +2082,9 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 			           BcAlias::Matches(desc.info, image.info)) {
 				block_alias = true;
 			}
+		}
+		if (stencil_copy) {
+			return stencil_copy;
 		}
 		const bool same_backing = static_cast<bool>(result);
 
@@ -1914,6 +2198,9 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		const auto* owner = &image;
 		if (ensure_valid && owner->depth_id) {
 			owner = &m_slot_images[owner->depth_id];
+			if (!owner->registered) {
+				return;
+			}
 		}
 		if (ensure_valid && !owner->SafeToDownload()) {
 			return;
@@ -1942,6 +2229,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	if (m_slot_images[id].is_depth_copy && desc.type == BindingType::Texture) {
 		RefreshDepthCopy(id);
+		return m_slot_images[id].FindView(desc.view_info);
+	}
+	if (m_slot_images[id].is_stencil_copy &&
+	    (desc.type == BindingType::Texture || desc.type == BindingType::Storage)) {
+		RefreshStencilCopy(id);
 		return m_slot_images[id].FindView(desc.view_info);
 	}
 	auto&            image = m_slot_images[id];
@@ -2608,6 +2900,7 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
+	DiscardParkedImages(address, size);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
 	Common::SmallVector<ImageId, 16> deleted_images;
@@ -2624,6 +2917,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	DiscardParkedImages(0, 0);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

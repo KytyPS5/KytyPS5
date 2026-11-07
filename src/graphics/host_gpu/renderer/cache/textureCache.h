@@ -390,6 +390,27 @@ private:
 	// Caller holds m_lock.
 	void RefreshDepthCopy(ImageId copy_id);
 	void ReleaseDepthCopies(ImageId color_id);
+	// An image that a depth/color conversion replaces (see ResolveDepthOverlap()) is kept, without
+	// guest memory, instead of deleted: converting back reuses it, and a depth image keeps its
+	// stencil and stencil associations meanwhile. Kept images are deleted after ParkedImageTicks,
+	// beyond MaxParkedImages, or when their memory is unmapped. Callers hold m_lock.
+	void                  ParkImage(ImageId id);
+	[[nodiscard]] ImageId UnparkImage(const ImageInfo& info);
+	void                  DiscardParkedImage(ImageId id);
+	// A lookup of a stencil plane finds the depth image while it is registered, and a copy of its
+	// stencil while it is kept (see FindStencilCopy): keeping it and taking it back change what
+	// lookups over its planes find, as registrations do (see ImageEpochInRegion()).
+	void                  StencilPlanesChanged(const Image& depth);
+	// Discards the kept images over the range, or (size 0) the ones kept too long.
+	void                  DiscardParkedImages(uint64_t address, uint64_t size);
+	// A texture or storage image of a stencil plane whose depth image is kept binds a copy of its
+	// stencil aspect, never registered or tracked: refreshed on the GPU when the depth image was
+	// written since (RefreshStencilCopy()), written back into it when the depth image returns
+	// (WriteBackStencilCopies()), and released with the association. Callers hold m_lock.
+	[[nodiscard]] ImageId FindStencilCopy(ImageId association, const ImageInfo& requested);
+	void                  RefreshStencilCopy(ImageId copy_id);
+	void                  WriteBackStencilCopies(ImageId depth_id);
+	void                  ReleaseStencilCopies(ImageId association);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	// A copy between the depth aspect of a depth image and a color image of the same texel size with
 	// vkCmdCopyImage (VK_KHR_maintenance8); false when the device or the formats do not allow it.
@@ -459,6 +480,10 @@ private:
 	std::unordered_map<ImageId, std::vector<ImageId>> m_depth_copies;
 	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).
 	std::unordered_map<ImageId, ImageId>              m_depth_feedback_copies;
+	// Stencil association -> its stencil copies, one per layout (see FindStencilCopy).
+	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_copies;
+	// Kept images and the tick they were kept at (see ParkImage).
+	std::vector<std::pair<ImageId, uint64_t>>         m_parked_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
